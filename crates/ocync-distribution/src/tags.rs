@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
 use crate::client::RegistryClient;
-use crate::error::DistributionError;
+use crate::error::Error;
 
 /// Response body from the tag listing API.
 #[derive(Debug, Clone, Deserialize)]
@@ -47,7 +47,7 @@ impl RegistryClient {
     /// List all tags in a repository, automatically following pagination.
     ///
     /// Returns a complete list of tags by following `Link: rel="next"` headers.
-    pub async fn list_tags(&self, repository: &str) -> Result<Vec<String>, DistributionError> {
+    pub async fn list_tags(&self, repository: &str) -> Result<Vec<String>, Error> {
         let mut all_tags = Vec::new();
         let mut path = "tags/list".to_owned();
 

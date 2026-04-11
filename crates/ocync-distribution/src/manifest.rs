@@ -3,9 +3,9 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
 use crate::auth::Scope;
 use crate::client::{RegistryClient, build_url};
 use crate::digest::Digest;
-use crate::error::DistributionError;
+use crate::error::Error;
 use crate::sha256::Sha256;
-use crate::spec::{ImageIndex, Manifest, media_types};
+use crate::spec::{ImageIndex, ManifestKind, media_types};
 
 /// Result of a manifest HEAD request.
 #[derive(Debug, Clone)]
@@ -22,7 +22,7 @@ pub struct ManifestHead {
 #[derive(Debug, Clone)]
 pub struct ManifestPull {
     /// The parsed manifest.
-    pub manifest: Manifest,
+    pub manifest: ManifestKind,
     /// The raw bytes as received from the registry (preserved verbatim for push).
     pub raw_bytes: Vec<u8>,
     /// The media type reported by the registry.
@@ -62,7 +62,7 @@ impl RegistryClient {
         &self,
         repository: &str,
         reference: &str,
-    ) -> Result<Option<ManifestHead>, DistributionError> {
+    ) -> Result<Option<ManifestHead>, Error> {
         let path = manifest_path(reference);
         match self.head(repository, &path).await {
             Ok(resp) => {
@@ -73,7 +73,7 @@ impl RegistryClient {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or_default();
                 let digest: Digest = digest_str.parse().map_err(|_| {
-                    DistributionError::Other(format!(
+                    Error::Other(format!(
                         "invalid digest in Docker-Content-Digest header: {digest_str}"
                     ))
                 })?;
@@ -96,7 +96,7 @@ impl RegistryClient {
                     size,
                 }))
             }
-            Err(DistributionError::NotFound(_)) => Ok(None),
+            Err(Error::NotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -109,7 +109,7 @@ impl RegistryClient {
         &self,
         repository: &str,
         reference: &str,
-    ) -> Result<ManifestPull, DistributionError> {
+    ) -> Result<ManifestPull, Error> {
         let path = manifest_path(reference);
         let accept = manifest_accept_header();
         let resp = self.get(repository, &path, Some(&accept)).await?;
@@ -127,7 +127,7 @@ impl RegistryClient {
         let hash = Sha256::digest(&raw_bytes);
         let digest = Digest::from_sha256(hash);
 
-        let manifest = Manifest::from_json(&media_type, &raw_bytes)?;
+        let manifest = ManifestKind::from_json(&media_type, &raw_bytes)?;
 
         Ok(ManifestPull {
             manifest,
@@ -147,7 +147,7 @@ impl RegistryClient {
         reference: &str,
         media_type: &str,
         raw_bytes: Vec<u8>,
-    ) -> Result<Digest, DistributionError> {
+    ) -> Result<Digest, Error> {
         let hash = Sha256::digest(&raw_bytes);
         let digest = Digest::from_sha256(hash);
         let data_len = raw_bytes.len();
@@ -159,7 +159,7 @@ impl RegistryClient {
         let headers = self.auth_headers(&scopes).await?;
 
         let content_type = HeaderValue::from_str(media_type).map_err(|e| {
-            DistributionError::Other(format!("invalid media type header value: {e}"))
+            Error::Other(format!("invalid media type header value: {e}"))
         })?;
 
         let resp = self
@@ -191,14 +191,14 @@ impl RegistryClient {
             let status = resp.status().as_u16();
             if status != 201 && status != 200 {
                 let message = resp.text().await.unwrap_or_default();
-                return Err(DistributionError::RegistryError { status, message });
+                return Err(Error::RegistryError { status, message });
             }
             return Ok(digest);
         }
 
         if status != 201 && status != 200 {
             let message = resp.text().await.unwrap_or_default();
-            return Err(DistributionError::RegistryError { status, message });
+            return Err(Error::RegistryError { status, message });
         }
 
         Ok(digest)
@@ -213,7 +213,7 @@ impl RegistryClient {
         repository: &str,
         digest: &Digest,
         artifact_type: Option<&str>,
-    ) -> Result<Option<ImageIndex>, DistributionError> {
+    ) -> Result<Option<ImageIndex>, Error> {
         let path = referrers_path(digest);
         let accept = media_types::OCI_IMAGE_INDEX;
 
@@ -262,7 +262,7 @@ impl RegistryClient {
     async fn classify_referrers_response(
         &self,
         resp: reqwest::Response,
-    ) -> Result<Option<ImageIndex>, DistributionError> {
+    ) -> Result<Option<ImageIndex>, Error> {
         let status = resp.status().as_u16();
 
         match status {
@@ -273,7 +273,7 @@ impl RegistryClient {
             404 => Ok(None),
             _ => {
                 let message = resp.text().await.unwrap_or_default();
-                Err(DistributionError::RegistryError { status, message })
+                Err(Error::RegistryError { status, message })
             }
         }
     }
