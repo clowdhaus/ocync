@@ -6,7 +6,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use super::{AuthProvider, Scope, Token};
-use crate::error::DistributionError;
+use crate::error::Error;
 
 /// Anonymous auth provider that performs the Docker token-exchange flow.
 ///
@@ -22,7 +22,16 @@ pub struct AnonymousAuth {
     cached_token: RwLock<Option<Token>>,
 }
 
+impl std::fmt::Debug for AnonymousAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnonymousAuth")
+            .field("registry", &self.registry)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AnonymousAuth {
+    /// Create a new anonymous auth provider for the given registry.
     pub fn new(registry: impl Into<String>, http: reqwest::Client) -> Self {
         Self {
             registry: registry.into(),
@@ -40,14 +49,14 @@ impl AuthProvider for AnonymousAuth {
     fn get_token(
         &self,
         scopes: &[Scope],
-    ) -> Pin<Box<dyn Future<Output = Result<Token, DistributionError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
         let scopes = scopes.to_vec();
         Box::pin(async move { self.get_token_inner(&scopes).await })
     }
 }
 
 impl AnonymousAuth {
-    async fn get_token_inner(&self, scopes: &[Scope]) -> Result<Token, DistributionError> {
+    async fn get_token_inner(&self, scopes: &[Scope]) -> Result<Token, Error> {
         // Check cached token first.
         {
             let cached = self.cached_token.read().await;
@@ -72,7 +81,7 @@ impl AnonymousAuth {
 
     /// Ping the registry's `/v2/` endpoint, parse the WWW-Authenticate header,
     /// then exchange for a token.
-    async fn exchange_token(&self, scopes: &[Scope]) -> Result<Token, DistributionError> {
+    async fn exchange_token(&self, scopes: &[Scope]) -> Result<Token, Error> {
         let v2_url = format!("https://{}/v2/", self.registry);
         let resp = self.http.get(&v2_url).send().await?;
 
@@ -85,23 +94,21 @@ impl AnonymousAuth {
             .headers()
             .get("www-authenticate")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| DistributionError::AuthFailed {
+            .ok_or_else(|| Error::AuthFailed {
                 registry: self.registry.clone(),
                 reason: "401 response missing WWW-Authenticate header".into(),
             })?;
 
-        let challenge =
-            WwwAuthenticate::parse(www_auth).map_err(|reason| DistributionError::AuthFailed {
-                registry: self.registry.clone(),
-                reason,
-            })?;
+        let challenge = WwwAuthenticate::parse(www_auth).map_err(|reason| Error::AuthFailed {
+            registry: self.registry.clone(),
+            reason,
+        })?;
 
         // Build token request URL.
-        let mut url =
-            reqwest::Url::parse(&challenge.realm).map_err(|e| DistributionError::AuthFailed {
-                registry: self.registry.clone(),
-                reason: format!("invalid realm URL: {e}"),
-            })?;
+        let mut url = reqwest::Url::parse(&challenge.realm).map_err(|e| Error::AuthFailed {
+            registry: self.registry.clone(),
+            reason: format!("invalid realm URL: {e}"),
+        })?;
 
         {
             let mut query = url.query_pairs_mut();
@@ -125,7 +132,7 @@ impl AnonymousAuth {
         let token_value = token_resp
             .token
             .or(token_resp.access_token)
-            .ok_or_else(|| DistributionError::AuthFailed {
+            .ok_or_else(|| Error::AuthFailed {
                 registry: self.registry.clone(),
                 reason: "token response missing both 'token' and 'access_token' fields".into(),
             })?;

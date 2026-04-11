@@ -43,36 +43,70 @@ pub enum Error {
     #[error("manifest deserialization failed: {0}")]
     ManifestParse(#[from] serde_json::Error),
 
+    /// Authentication with the registry failed.
     #[error("authentication failed for registry '{registry}': {reason}")]
-    AuthFailed { registry: String, reason: String },
+    AuthFailed {
+        /// The registry that rejected authentication.
+        registry: String,
+        /// Why authentication failed.
+        reason: String,
+    },
 
+    /// An auth provider requires a feature that was not compiled in.
     #[error("auth provider '{provider}' not compiled; rebuild with --features {feature}")]
     ProviderNotCompiled {
+        /// The provider name (e.g. `"ecr"`).
         provider: &'static str,
+        /// The Cargo feature required.
         feature: &'static str,
     },
 
+    /// No credentials were found for the target registry.
     #[error("no credentials found for registry '{registry}'")]
-    NoCredentials { registry: String },
+    NoCredentials {
+        /// The registry hostname.
+        registry: String,
+    },
 
+    /// An external credential helper process failed.
     #[error("credential helper '{helper}' failed: {reason}")]
-    CredentialHelperFailed { helper: String, reason: String },
+    CredentialHelperFailed {
+        /// The credential helper command.
+        helper: String,
+        /// Why the helper failed.
+        reason: String,
+    },
 
+    /// An HTTP request to the registry failed.
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// The registry returned an unexpected HTTP status.
     #[error("registry returned {status}: {message}")]
-    RegistryError { status: u16, message: String },
+    RegistryError {
+        /// The HTTP status code.
+        status: u16,
+        /// The response body.
+        message: String,
+    },
 
+    /// The registry returned 401 Unauthorized.
     #[error("registry returned 401 Unauthorized for {registry}")]
-    Unauthorized { registry: String },
+    Unauthorized {
+        /// The registry hostname.
+        registry: String,
+    },
 
+    /// The registry returned 403 Forbidden.
     #[error("registry returned 403 Forbidden for {registry}/{repository}")]
     Forbidden {
+        /// The registry hostname.
         registry: String,
+        /// The repository that was denied.
         repository: String,
     },
 
+    /// The requested resource was not found.
     #[error("not found: {0}")]
     NotFound(String),
 

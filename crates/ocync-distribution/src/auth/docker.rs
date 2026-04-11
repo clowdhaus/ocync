@@ -7,7 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 
 use super::Credentials;
-use crate::error::DistributionError;
+use crate::error::Error;
 
 /// Docker Hub hostnames that all resolve to the same credential entry.
 const DOCKER_HUB_ALIASES: &[&str] = &[
@@ -46,22 +46,22 @@ pub struct AuthEntry {
 
 impl DockerConfig {
     /// Load from the default Docker config path (`~/.docker/config.json`).
-    pub fn load_default() -> Result<Self, DistributionError> {
+    pub fn load_default() -> Result<Self, Error> {
         let path = default_config_path()
-            .ok_or_else(|| DistributionError::Other("unable to determine home directory".into()))?;
+            .ok_or_else(|| Error::Other("unable to determine home directory".into()))?;
         Self::load_from(&path)
     }
 
     /// Load from a specific file path.
-    pub fn load_from(path: &Path) -> Result<Self, DistributionError> {
+    pub fn load_from(path: &Path) -> Result<Self, Error> {
         let contents = std::fs::read_to_string(path).map_err(|e| {
-            DistributionError::Other(format!(
+            Error::Other(format!(
                 "failed to read docker config at {}: {e}",
                 path.display()
             ))
         })?;
         serde_json::from_str(&contents).map_err(|e| {
-            DistributionError::Other(format!(
+            Error::Other(format!(
                 "failed to parse docker config at {}: {e}",
                 path.display()
             ))
@@ -76,7 +76,7 @@ impl DockerConfig {
 pub fn resolve_from_docker_config(
     config: &DockerConfig,
     registry: &str,
-) -> Result<Option<Credentials>, DistributionError> {
+) -> Result<Option<Credentials>, Error> {
     // Try static auths first.
     if let Some(creds) = lookup_auths(config, registry)? {
         return Ok(Some(creds));
@@ -107,10 +107,7 @@ pub fn resolve_from_docker_config(
 }
 
 /// Look up static credentials from the `auths` map.
-fn lookup_auths(
-    config: &DockerConfig,
-    registry: &str,
-) -> Result<Option<Credentials>, DistributionError> {
+fn lookup_auths(config: &DockerConfig, registry: &str) -> Result<Option<Credentials>, Error> {
     // Direct match.
     if let Some(entry) = config.auths.get(registry) {
         if let Some(creds) = entry_to_credentials(entry)? {
@@ -160,7 +157,7 @@ fn lookup_cred_helper(config: &DockerConfig, registry: &str) -> Option<String> {
 }
 
 /// Convert an `AuthEntry` to `Credentials`.
-fn entry_to_credentials(entry: &AuthEntry) -> Result<Option<Credentials>, DistributionError> {
+fn entry_to_credentials(entry: &AuthEntry) -> Result<Option<Credentials>, Error> {
     // Prefer the `auth` field (base64 encoded).
     if let Some(ref encoded) = entry.auth {
         if !encoded.is_empty() {
@@ -181,25 +178,21 @@ fn entry_to_credentials(entry: &AuthEntry) -> Result<Option<Credentials>, Distri
 }
 
 /// Decode a base64-encoded `username:password` string.
-pub fn decode_auth(encoded: &str) -> Result<(String, String), DistributionError> {
-    let decoded = BASE64
-        .decode(encoded)
-        .map_err(|e| DistributionError::AuthFailed {
-            registry: String::new(),
-            reason: format!("invalid base64 in auth field: {e}"),
-        })?;
+pub fn decode_auth(encoded: &str) -> Result<(String, String), Error> {
+    let decoded = BASE64.decode(encoded).map_err(|e| Error::AuthFailed {
+        registry: String::new(),
+        reason: format!("invalid base64 in auth field: {e}"),
+    })?;
 
-    let text = String::from_utf8(decoded).map_err(|e| DistributionError::AuthFailed {
+    let text = String::from_utf8(decoded).map_err(|e| Error::AuthFailed {
         registry: String::new(),
         reason: format!("auth field is not valid UTF-8: {e}"),
     })?;
 
-    let (username, password) =
-        text.split_once(':')
-            .ok_or_else(|| DistributionError::AuthFailed {
-                registry: String::new(),
-                reason: "auth field does not contain ':'".into(),
-            })?;
+    let (username, password) = text.split_once(':').ok_or_else(|| Error::AuthFailed {
+        registry: String::new(),
+        reason: "auth field does not contain ':'".into(),
+    })?;
 
     Ok((username.to_owned(), password.to_owned()))
 }
@@ -207,7 +200,7 @@ pub fn decode_auth(encoded: &str) -> Result<(String, String), DistributionError>
 /// Execute a Docker credential helper and return the credentials.
 ///
 /// Runs `docker-credential-{helper} get` with the registry on stdin.
-fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentials, DistributionError> {
+fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentials, Error> {
     let program = format!("docker-credential-{helper}");
 
     let output = Command::new(&program)
@@ -223,14 +216,14 @@ fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentials, Di
             }
             child.wait_with_output()
         })
-        .map_err(|e| DistributionError::CredentialHelperFailed {
+        .map_err(|e| Error::CredentialHelperFailed {
             helper: program.clone(),
             reason: format!("failed to execute: {e}"),
         })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(DistributionError::CredentialHelperFailed {
+        return Err(Error::CredentialHelperFailed {
             helper: program,
             reason: format!("exited with {}: {}", output.status, stderr.trim()),
         });
@@ -244,12 +237,11 @@ fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentials, Di
         secret: String,
     }
 
-    let resp: HelperResponse = serde_json::from_slice(&output.stdout).map_err(|e| {
-        DistributionError::CredentialHelperFailed {
+    let resp: HelperResponse =
+        serde_json::from_slice(&output.stdout).map_err(|e| Error::CredentialHelperFailed {
             helper: program,
             reason: format!("invalid JSON response: {e}"),
-        }
-    })?;
+        })?;
 
     Ok(Credentials::Basic {
         username: resp.username,

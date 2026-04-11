@@ -1,4 +1,8 @@
+//! Authentication providers and token management for OCI registries.
+
+/// Anonymous token-exchange authentication.
 pub mod anonymous;
+/// Docker config.json credential resolution.
 pub mod docker;
 
 use std::fmt;
@@ -7,7 +11,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use crate::error::DistributionError;
+use crate::error::Error;
 
 /// Minimum remaining lifetime before a token should be proactively refreshed.
 const REFRESH_THRESHOLD: Duration = Duration::from_secs(15 * 60);
@@ -18,11 +22,14 @@ const REFRESH_THRESHOLD: Duration = Duration::from_secs(15 * 60);
 /// list (e.g. `pull`, `push`, `pull,push`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
+    /// The repository this scope applies to.
     pub repository: String,
+    /// The actions requested (e.g. pull, push).
     pub actions: Vec<Action>,
 }
 
 impl Scope {
+    /// Create a scope for the given repository and actions.
     pub fn new(repository: impl Into<String>, actions: Vec<Action>) -> Self {
         Self {
             repository: repository.into(),
@@ -51,11 +58,14 @@ impl fmt::Display for Scope {
 /// An action that can be performed on a repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
+    /// Read-only access to a repository.
     Pull,
+    /// Write access to a repository.
     Push,
 }
 
 impl Action {
+    /// Return the string representation of this action.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pull => "pull",
@@ -130,7 +140,12 @@ impl Token {
 #[derive(Debug, Clone)]
 pub enum Credentials {
     /// HTTP Basic authentication.
-    Basic { username: String, password: String },
+    Basic {
+        /// The username.
+        username: String,
+        /// The password or token.
+        password: String,
+    },
     /// A pre-existing bearer token.
     Bearer(String),
     /// A file containing a token (read on demand).
@@ -152,7 +167,7 @@ pub trait AuthProvider: Send + Sync {
     fn get_token(
         &self,
         scopes: &[Scope],
-    ) -> Pin<Box<dyn Future<Output = Result<Token, DistributionError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>>;
 }
 
 #[cfg(test)]

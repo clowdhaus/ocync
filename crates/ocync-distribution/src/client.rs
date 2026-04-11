@@ -5,7 +5,7 @@ use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::auth::{AuthProvider, Scope};
-use crate::error::DistributionError;
+use crate::error::Error;
 
 const DEFAULT_MAX_CONCURRENT: usize = 8;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
@@ -17,6 +17,16 @@ pub struct RegistryClientBuilder {
     auth: Option<Box<dyn AuthProvider>>,
     max_concurrent: usize,
     chunk_size: usize,
+}
+
+impl std::fmt::Debug for RegistryClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryClientBuilder")
+            .field("url", &self.url)
+            .field("max_concurrent", &self.max_concurrent)
+            .field("chunk_size", &self.chunk_size)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RegistryClientBuilder {
@@ -57,7 +67,7 @@ impl RegistryClientBuilder {
     }
 
     /// Build the registry client.
-    pub fn build(self) -> Result<RegistryClient, DistributionError> {
+    pub fn build(self) -> Result<RegistryClient, Error> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT_VALUE)
             .build()?;
@@ -84,6 +94,15 @@ pub struct RegistryClient {
     chunk_size: usize,
 }
 
+impl std::fmt::Debug for RegistryClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryClient")
+            .field("base_url", &self.base_url)
+            .field("chunk_size", &self.chunk_size)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RegistryClient {
     /// Create a builder for this client.
     pub fn builder(url: Url) -> RegistryClientBuilder {
@@ -104,7 +123,7 @@ impl RegistryClient {
     ///
     /// Returns `Ok(())` if the registry responds with 200 or 401 (which confirms
     /// the endpoint exists and speaks the OCI Distribution protocol).
-    pub async fn ping(&self) -> Result<(), DistributionError> {
+    pub async fn ping(&self) -> Result<(), Error> {
         let url = build_v2_url(&self.base_url)?;
         let resp = self.http.get(url).send().await?;
         let status = resp.status();
@@ -113,7 +132,7 @@ impl RegistryClient {
             Ok(())
         } else {
             let message = resp.text().await.unwrap_or_default();
-            Err(DistributionError::RegistryError {
+            Err(Error::RegistryError {
                 status: status.as_u16(),
                 message,
             })
@@ -129,7 +148,7 @@ impl RegistryClient {
         repository: &str,
         path: &str,
         accept: Option<&str>,
-    ) -> Result<reqwest::Response, DistributionError> {
+    ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
@@ -150,11 +169,7 @@ impl RegistryClient {
     /// Perform an authenticated HEAD request.
     ///
     /// Same retry logic as [`get`](Self::get).
-    pub async fn head(
-        &self,
-        repository: &str,
-        path: &str,
-    ) -> Result<reqwest::Response, DistributionError> {
+    pub async fn head(&self, repository: &str, path: &str) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
@@ -176,7 +191,7 @@ impl RegistryClient {
         url: &Url,
         scopes: &[Scope],
         accept: Option<&str>,
-    ) -> Result<reqwest::Response, DistributionError> {
+    ) -> Result<reqwest::Response, Error> {
         let mut headers = self.auth_headers(scopes).await?;
         if let Some(accept) = accept {
             if let Ok(val) = HeaderValue::from_str(accept) {
@@ -188,17 +203,13 @@ impl RegistryClient {
     }
 
     /// Internal: send a HEAD with auth headers.
-    async fn send_head(
-        &self,
-        url: &Url,
-        scopes: &[Scope],
-    ) -> Result<reqwest::Response, DistributionError> {
+    async fn send_head(&self, url: &Url, scopes: &[Scope]) -> Result<reqwest::Response, Error> {
         let headers = self.auth_headers(scopes).await?;
         Ok(self.http.head(url.clone()).headers(headers).send().await?)
     }
 
     /// Build auth headers for a request.
-    async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, DistributionError> {
+    async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
         let mut headers = HeaderMap::new();
 
         if let Some(ref auth) = self.auth {
@@ -206,7 +217,7 @@ impl RegistryClient {
             let value = token.value();
             if !value.is_empty() {
                 let header_value = HeaderValue::from_str(&format!("Bearer {value}"))
-                    .map_err(|e| DistributionError::Other(format!("invalid auth header: {e}")))?;
+                    .map_err(|e| Error::Other(format!("invalid auth header: {e}")))?;
                 headers.insert(AUTHORIZATION, header_value);
             }
         }
@@ -230,7 +241,7 @@ async fn classify_response(
     resp: reqwest::Response,
     base_url: &Url,
     repository: &str,
-) -> Result<reqwest::Response, DistributionError> {
+) -> Result<reqwest::Response, Error> {
     let status = resp.status();
 
     if status.is_success() {
@@ -240,18 +251,18 @@ async fn classify_response(
     let registry = base_url.host_str().unwrap_or("unknown").to_owned();
 
     match status.as_u16() {
-        401 => Err(DistributionError::Unauthorized { registry }),
-        403 => Err(DistributionError::Forbidden {
+        401 => Err(Error::Unauthorized { registry }),
+        403 => Err(Error::Forbidden {
             registry,
             repository: repository.to_owned(),
         }),
         404 => {
             let message = resp.text().await.unwrap_or_default();
-            Err(DistributionError::NotFound(message))
+            Err(Error::NotFound(message))
         }
         _ => {
             let message = resp.text().await.unwrap_or_default();
-            Err(DistributionError::RegistryError {
+            Err(Error::RegistryError {
                 status: status.as_u16(),
                 message,
             })
@@ -260,16 +271,16 @@ async fn classify_response(
 }
 
 /// Construct a URL for the `/v2/` endpoint.
-fn build_v2_url(base: &Url) -> Result<Url, DistributionError> {
+fn build_v2_url(base: &Url) -> Result<Url, Error> {
     base.join("/v2/")
-        .map_err(|e| DistributionError::Other(format!("failed to build /v2/ URL: {e}")))
+        .map_err(|e| Error::Other(format!("failed to build /v2/ URL: {e}")))
 }
 
 /// Construct a URL for `/v2/{repository}/{path}`.
-pub fn build_url(base: &Url, repository: &str, path: &str) -> Result<Url, DistributionError> {
+pub fn build_url(base: &Url, repository: &str, path: &str) -> Result<Url, Error> {
     let full_path = format!("/v2/{repository}/{path}");
     base.join(&full_path)
-        .map_err(|e| DistributionError::Other(format!("failed to build URL '{full_path}': {e}")))
+        .map_err(|e| Error::Other(format!("failed to build URL '{full_path}': {e}")))
 }
 
 #[cfg(test)]
