@@ -120,13 +120,9 @@ impl RegistryClient {
         self.chunk_size
     }
 
-    /// The underlying HTTP client (for advanced use).
-    pub fn http(&self) -> &reqwest::Client {
-        &self.http
-    }
-
     /// A reference to the concurrency semaphore.
-    pub fn semaphore(&self) -> &Semaphore {
+    #[cfg(test)]
+    pub(crate) fn semaphore(&self) -> &Semaphore {
         &self.semaphore
     }
 

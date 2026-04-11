@@ -1,7 +1,5 @@
 //! Authentication providers and token management for OCI registries.
 
-/// Azure Container Registry auth provider.
-pub mod acr;
 /// Anonymous token-exchange authentication.
 pub mod anonymous;
 /// Hostname-based registry provider detection.
@@ -10,16 +8,11 @@ pub mod detect;
 pub mod docker;
 /// AWS ECR authentication provider.
 pub mod ecr;
-/// Google Container Registry / Artifact Registry auth provider.
-pub mod gcr;
-/// GitHub Container Registry auth provider.
-pub mod ghcr;
 
 pub use detect::{ProviderKind, detect_provider_kind};
 
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -158,10 +151,6 @@ pub enum Credentials {
         /// The password or token.
         password: String,
     },
-    /// A pre-existing bearer token.
-    Bearer(String),
-    /// A file containing a token (read on demand).
-    TokenFile(PathBuf),
 }
 
 /// Trait for providers that can obtain authentication tokens for registries.
@@ -263,17 +252,5 @@ mod tests {
             password: "pass".into(),
         };
         assert!(matches!(creds, Credentials::Basic { .. }));
-    }
-
-    #[test]
-    fn credentials_bearer_variant() {
-        let creds = Credentials::Bearer("token123".into());
-        assert!(matches!(creds, Credentials::Bearer(_)));
-    }
-
-    #[test]
-    fn credentials_token_file_variant() {
-        let creds = Credentials::TokenFile(PathBuf::from("/tmp/token"));
-        assert!(matches!(creds, Credentials::TokenFile(_)));
     }
 }
