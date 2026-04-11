@@ -120,6 +120,16 @@ impl RegistryClient {
         self.chunk_size
     }
 
+    /// The underlying HTTP client (for advanced use).
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// A reference to the concurrency semaphore.
+    pub fn semaphore(&self) -> &Arc<Semaphore> {
+        &self.semaphore
+    }
+
     /// Ping the registry's `/v2/` endpoint.
     ///
     /// Returns `Ok(())` if the registry responds with 200 or 401 (which confirms
@@ -367,7 +377,7 @@ mod tests {
             .max_concurrent(4)
             .build()
             .unwrap();
-        assert_eq!(client.semaphore.available_permits(), 4);
+        assert_eq!(client.semaphore().available_permits(), 4);
     }
 
     #[test]
