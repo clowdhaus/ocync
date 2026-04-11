@@ -31,18 +31,6 @@ pub enum ProviderKind {
     Chainguard,
 }
 
-impl std::str::FromStr for ProviderKind {
-    type Err = ();
-
-    /// Parse a registry hostname into a [`ProviderKind`].
-    ///
-    /// Returns `Err(())` for unrecognized hostnames. Equivalent to
-    /// [`detect_provider_kind`] but using the standard `FromStr` trait.
-    fn from_str(hostname: &str) -> Result<Self, Self::Err> {
-        detect_provider_kind(hostname).ok_or(())
-    }
-}
-
 /// Compiled regex for ECR private registry hostnames.
 ///
 /// Pattern: `<12-digit-account>.dkr[.-]ecr[-fips].<region>.<partition-domain>`
@@ -81,23 +69,21 @@ static ACR_RE: LazyLock<Regex> =
 
 /// Detect the registry provider kind from a hostname.
 ///
-/// Normalizes the hostname to lowercase before matching (DNS is case-insensitive).
-/// Returns `None` for unrecognized hostnames (e.g. Quay, Harbor, private
-/// registries) — these should fall through to the standard OCI token-exchange
-/// flow or Docker config credential resolution.
-///
-/// The hostname must not include a port number or trailing dot. Callers
-/// should strip these before calling (e.g. `ghcr.io:443` → `ghcr.io`).
+/// Normalizes the hostname to lowercase, strips any port number and trailing
+/// dot before matching. Returns `None` for unrecognized hostnames (e.g. Quay,
+/// Harbor, private registries) — these should fall through to the standard OCI
+/// token-exchange flow or Docker config credential resolution.
 pub fn detect_provider_kind(hostname: &str) -> Option<ProviderKind> {
     let hostname = hostname.to_ascii_lowercase();
-    let hostname = hostname.as_str();
+    let hostname = hostname.split(':').next().unwrap();
+    let hostname = hostname.trim_end_matches('.');
 
     match hostname {
         "public.ecr.aws" => Some(ProviderKind::EcrPublic),
         "ghcr.io" => Some(ProviderKind::Ghcr),
         "cgr.dev" => Some(ProviderKind::Chainguard),
-        "gcr.io" | "us.gcr.io" | "eu.gcr.io" | "asia.gcr.io" => Some(ProviderKind::Gcr),
         "docker.io" | "index.docker.io" | "registry-1.docker.io" => Some(ProviderKind::DockerHub),
+        _ if hostname == "gcr.io" || hostname.ends_with(".gcr.io") => Some(ProviderKind::Gcr),
         _ if ECR_RE.is_match(hostname) => Some(ProviderKind::Ecr),
         _ if GAR_RE.is_match(hostname) => Some(ProviderKind::Gcr),
         _ if ACR_RE.is_match(hostname) => Some(ProviderKind::Acr),
@@ -218,6 +204,19 @@ mod tests {
     }
 
     #[test]
+    fn detect_gcr_mirror() {
+        assert_eq!(
+            detect_provider_kind("mirror.gcr.io"),
+            Some(ProviderKind::Gcr)
+        );
+    }
+
+    #[test]
+    fn detect_gcr_k8s() {
+        assert_eq!(detect_provider_kind("k8s.gcr.io"), Some(ProviderKind::Gcr));
+    }
+
+    #[test]
     fn detect_gar_us_central() {
         assert_eq!(
             detect_provider_kind("us-central1-docker.pkg.dev"),
@@ -306,7 +305,6 @@ mod tests {
 
     #[test]
     fn detect_unknown_returns_none() {
-        // Quay, Harbor, and private registries use standard OCI auth.
         assert_eq!(detect_provider_kind("quay.io"), None);
         assert_eq!(detect_provider_kind("harbor.example.com"), None);
         assert_eq!(
@@ -315,16 +313,24 @@ mod tests {
         );
     }
 
-    // --- FromStr ---
+    // --- Port and trailing dot stripping ---
 
     #[test]
-    fn from_str_known_provider() {
-        assert_eq!("ghcr.io".parse::<ProviderKind>(), Ok(ProviderKind::Ghcr));
+    fn detect_strips_port() {
+        assert_eq!(
+            detect_provider_kind("ghcr.io:443"),
+            Some(ProviderKind::Ghcr)
+        );
+        assert_eq!(
+            detect_provider_kind("myregistry.azurecr.io:5000"),
+            Some(ProviderKind::Acr)
+        );
     }
 
     #[test]
-    fn from_str_unknown_provider() {
-        assert_eq!("quay.io".parse::<ProviderKind>(), Err(()));
+    fn detect_strips_trailing_dot() {
+        assert_eq!(detect_provider_kind("ghcr.io."), Some(ProviderKind::Ghcr));
+        assert_eq!(detect_provider_kind("gcr.io."), Some(ProviderKind::Gcr));
     }
 
     // --- Case insensitivity ---
@@ -382,8 +388,12 @@ mod tests {
 
     #[test]
     fn detect_acr_rejects_hyphens_in_name() {
-        // Azure requires alphanumeric-only registry names.
         assert_eq!(detect_provider_kind("my-registry.azurecr.io"), None);
+    }
+
+    #[test]
+    fn detect_acr_rejects_empty_name() {
+        assert_eq!(detect_provider_kind(".azurecr.io"), None);
     }
 
     #[test]

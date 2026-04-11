@@ -114,7 +114,7 @@ impl EcrApi for AwsEcrApi {
 ///
 /// ECR tokens are base64-encoded strings in the format `AWS:<token>`.
 /// Returns the password portion (everything after `AWS:`).
-pub fn decode_ecr_token(encoded: &str, registry: &str) -> Result<String, Error> {
+pub(crate) fn decode_ecr_token(encoded: &str, registry: &str) -> Result<String, Error> {
     let decoded = BASE64.decode(encoded).map_err(|e| Error::AuthFailed {
         registry: registry.to_owned(),
         reason: format!("invalid base64 in ECR token: {e}"),
@@ -138,7 +138,7 @@ pub fn decode_ecr_token(encoded: &str, registry: &str) -> Result<String, Error> 
 /// Handles both standard (`<account>.dkr.ecr[-fips].<region>.<domain>`)
 /// and dual-stack (`<account>.dkr-ecr[-fips].<region>.<domain>`) formats
 /// across all AWS partitions.
-pub fn ecr_region(hostname: &str) -> Option<&str> {
+pub(crate) fn ecr_region(hostname: &str) -> Option<&str> {
     let parts: Vec<&str> = hostname.split('.').collect();
     if parts.len() < 5 {
         return None;
@@ -201,13 +201,14 @@ impl EcrAuth {
             .await;
 
         let ecr_client = aws_sdk_ecr::Client::new(&config);
+        let registry = hostname.clone();
 
         Ok(Self {
-            hostname: hostname.clone(),
+            hostname,
             cached_token: RwLock::new(None),
             api: Box::new(AwsEcrApi {
                 ecr_client,
-                registry: hostname,
+                registry,
             }),
         })
     }
@@ -285,6 +286,7 @@ impl AuthProvider for EcrAuth {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::Arc;
 
     use tokio::sync::Mutex;
 
@@ -522,6 +524,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_expired_api_token_triggers_immediate_refresh() {
+        let expired = EcrTokenResponse {
+            encoded_token: BASE64.encode("AWS:expired"),
+            expires_in: Some(Duration::ZERO),
+        };
+        let fresh = EcrTokenResponse {
+            encoded_token: BASE64.encode("AWS:fresh"),
+            expires_in: None,
+        };
+        let auth = EcrAuth::with_api(
+            TEST_HOST,
+            MockEcrApi::with_responses(vec![Some(expired), Some(fresh)]),
+        );
+
+        let t1 = auth.get_token(&[]).await.unwrap();
+        assert_eq!(t1.value(), "expired");
+
+        // Token has Duration::ZERO TTL — next call must refresh.
+        let t2 = auth.get_token(&[]).await.unwrap();
+        assert_eq!(t2.value(), "fresh");
+    }
+
+    #[tokio::test]
     async fn auth_invalidation_forces_refetch() {
         let encoded1 = BASE64.encode("AWS:first-token");
         let encoded2 = BASE64.encode("AWS:second-token");
@@ -537,6 +562,28 @@ mod tests {
 
         let t2 = auth.get_token(&[]).await.unwrap();
         assert_eq!(t2.value(), "second-token");
+    }
+
+    #[tokio::test]
+    async fn auth_concurrent_access() {
+        // One response in the queue. 10 concurrent tasks all call get_token.
+        // If locking is broken, some tasks would fail (queue exhausted).
+        let encoded = BASE64.encode("AWS:concurrent");
+        let auth = Arc::new(EcrAuth::with_api(
+            TEST_HOST,
+            MockEcrApi::with_tokens(vec![Some(encoded)]),
+        ));
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let auth = Arc::clone(&auth);
+            handles.push(tokio::spawn(async move { auth.get_token(&[]).await }));
+        }
+
+        for handle in handles {
+            let token = handle.await.unwrap().unwrap();
+            assert_eq!(token.value(), "concurrent");
+        }
     }
 
     #[tokio::test]
@@ -568,5 +615,12 @@ mod tests {
         let scopes = [Scope::pull("library/nginx"), Scope::pull_push("myrepo")];
         let token = auth.get_token(&scopes).await.unwrap();
         assert_eq!(token.value(), "scoped-token");
+    }
+
+    #[tokio::test]
+    async fn new_rejects_non_ecr_hostname() {
+        let result = EcrAuth::new("ghcr.io").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("region"));
     }
 }
