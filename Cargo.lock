@@ -686,6 +686,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "hex",
+ "http",
  "olpc-cjson",
  "reqwest",
  "serde",

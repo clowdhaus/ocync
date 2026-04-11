@@ -237,7 +237,7 @@ async fn get_500_returns_registry_error() {
     let result = client.get("repo", "manifests/latest", None).await;
     assert!(matches!(
         result,
-        Err(Error::RegistryError { status: 500, .. })
+        Err(Error::RegistryError { status, .. }) if status == http::StatusCode::INTERNAL_SERVER_ERROR
     ));
 }
 

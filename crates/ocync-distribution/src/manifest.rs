@@ -1,5 +1,6 @@
 //! Manifest operations — pull, push, head checks, and referrers queries.
 
+use http::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
 
 use crate::auth::Scope;
@@ -7,7 +8,7 @@ use crate::client::{RegistryClient, build_url};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
-use crate::spec::{ImageIndex, ManifestKind, media_types};
+use crate::spec::{ImageIndex, ManifestKind, MediaType};
 
 /// Result of a manifest HEAD request.
 #[derive(Debug, Clone)]
@@ -15,7 +16,7 @@ pub struct ManifestHead {
     /// The digest of the manifest.
     pub digest: Digest,
     /// The media type reported by the registry.
-    pub media_type: String,
+    pub media_type: MediaType,
     /// The size in bytes.
     pub size: u64,
 }
@@ -28,20 +29,18 @@ pub struct ManifestPull {
     /// The raw bytes as received from the registry (preserved verbatim for push).
     pub raw_bytes: Vec<u8>,
     /// The media type reported by the registry.
-    pub media_type: String,
+    pub media_type: MediaType,
     /// The digest computed from the raw bytes.
     pub digest: Digest,
 }
 
 /// Build the Accept header value for manifest requests.
-///
-/// Includes all four supported manifest media types.
 fn manifest_accept_header() -> String {
     [
-        media_types::OCI_IMAGE_MANIFEST,
-        media_types::OCI_IMAGE_INDEX,
-        media_types::DOCKER_MANIFEST_V2,
-        media_types::DOCKER_MANIFEST_LIST,
+        MediaType::OciManifest.as_str(),
+        MediaType::OciIndex.as_str(),
+        MediaType::DockerManifestV2.as_str(),
+        MediaType::DockerManifestList.as_str(),
     ]
     .join(", ")
 }
@@ -80,11 +79,11 @@ impl RegistryClient {
                     ))
                 })?;
 
-                let media_type = headers
+                let media_type: MediaType = headers
                     .get(CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or_default()
-                    .to_owned();
+                    .into();
 
                 let size = headers
                     .get(CONTENT_LENGTH)
@@ -116,12 +115,12 @@ impl RegistryClient {
         let accept = manifest_accept_header();
         let resp = self.get(repository, &path, Some(&accept)).await?;
 
-        let media_type = resp
+        let media_type: MediaType = resp
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or(media_types::OCI_IMAGE_MANIFEST)
-            .to_owned();
+            .unwrap_or(MediaType::OciManifest.as_str())
+            .into();
 
         let raw_bytes = resp.bytes().await?.to_vec();
 
@@ -146,7 +145,7 @@ impl RegistryClient {
         &self,
         repository: &str,
         reference: &str,
-        media_type: &str,
+        media_type: &MediaType,
         raw_bytes: &[u8],
     ) -> Result<Digest, Error> {
         let hash = Sha256::digest(raw_bytes);
@@ -154,49 +153,24 @@ impl RegistryClient {
 
         let url = build_url(&self.base_url, repository, &manifest_path(reference))?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
-
         let scopes = [Scope::pull_push(repository)];
-        let headers = self.auth_headers(&scopes).await?;
 
-        let content_type = HeaderValue::from_str(media_type)
+        let content_type = HeaderValue::from_str(media_type.as_str())
             .map_err(|e| Error::Other(format!("invalid media type header value: {e}")))?;
 
         let resp = self
-            .http
-            .put(url.clone())
-            .headers(headers)
-            .header(CONTENT_TYPE, content_type.clone())
-            .header(CONTENT_LENGTH, raw_bytes.len().to_string())
-            .body(raw_bytes.to_vec())
-            .send()
+            .send_with_retry(&scopes, "manifest push", |headers| {
+                self.http
+                    .put(url.clone())
+                    .headers(headers)
+                    .header(CONTENT_TYPE, content_type.clone())
+                    .header(CONTENT_LENGTH, raw_bytes.len().to_string())
+                    .body(raw_bytes.to_vec())
+            })
             .await?;
 
-        let status = resp.status().as_u16();
-
-        // 401 — invalidate token and retry once.
-        if status == 401 {
-            tracing::debug!(url = %url, "got 401 on manifest push, refreshing auth token");
-            self.invalidate_auth().await;
-            let headers = self.auth_headers(&scopes).await?;
-            let resp = self
-                .http
-                .put(url)
-                .headers(headers)
-                .header(CONTENT_TYPE, content_type)
-                .header(CONTENT_LENGTH, raw_bytes.len().to_string())
-                .body(raw_bytes.to_vec())
-                .send()
-                .await?;
-
-            let status = resp.status().as_u16();
-            if status != 201 && status != 200 {
-                let message = resp.text().await.unwrap_or_default();
-                return Err(Error::RegistryError { status, message });
-            }
-            return Ok(digest);
-        }
-
-        if status != 201 && status != 200 {
+        let status = resp.status();
+        if !status.is_success() {
             let message = resp.text().await.unwrap_or_default();
             return Err(Error::RegistryError { status, message });
         }
@@ -207,7 +181,8 @@ impl RegistryClient {
     /// Query the referrers API for a given digest.
     ///
     /// Returns `None` if the registry does not support the referrers API (404).
-    /// Optionally filters by `artifact_type`.
+    /// Optionally filters by `artifact_type` (an OCI artifact MIME type string,
+    /// e.g. `application/vnd.dev.cosign.simplesigning.v1+json`).
     pub async fn referrers(
         &self,
         repository: &str,
@@ -215,7 +190,7 @@ impl RegistryClient {
         artifact_type: Option<&str>,
     ) -> Result<Option<ImageIndex>, Error> {
         let path = referrers_path(digest);
-        let accept = media_types::OCI_IMAGE_INDEX;
+        let accept = MediaType::OciIndex.as_str();
 
         // Build URL with optional artifactType filter.
         let mut url = build_url(&self.base_url, repository, &path)?;
@@ -225,36 +200,15 @@ impl RegistryClient {
 
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
         let scopes = [Scope::pull(repository)];
-        let headers = self.auth_headers(&scopes).await?;
-
-        let mut req_headers = headers;
-        if let Ok(val) = HeaderValue::from_str(accept) {
-            req_headers.insert(reqwest::header::ACCEPT, val);
-        }
 
         let resp = self
-            .http
-            .get(url.clone())
-            .headers(req_headers)
-            .send()
+            .send_with_retry(&scopes, "referrers", |mut headers| {
+                if let Ok(val) = HeaderValue::from_str(accept) {
+                    headers.insert(reqwest::header::ACCEPT, val);
+                }
+                self.http.get(url.clone()).headers(headers)
+            })
             .await?;
-
-        let status = resp.status().as_u16();
-
-        // 401 — invalidate and retry.
-        if status == 401 {
-            tracing::debug!(url = %url, "got 401 on referrers, refreshing auth token");
-            self.invalidate_auth().await;
-            let headers = self.auth_headers(&scopes).await?;
-            let mut req_headers = headers;
-            if let Ok(val) = HeaderValue::from_str(accept) {
-                req_headers.insert(reqwest::header::ACCEPT, val);
-            }
-
-            let resp = self.http.get(url).headers(req_headers).send().await?;
-
-            return classify_referrers_response(resp).await;
-        }
 
         classify_referrers_response(resp).await
     }
@@ -262,14 +216,14 @@ impl RegistryClient {
 
 /// Classify a referrers response.
 async fn classify_referrers_response(resp: reqwest::Response) -> Result<Option<ImageIndex>, Error> {
-    let status = resp.status().as_u16();
+    let status = resp.status();
 
     match status {
-        200 => {
+        StatusCode::OK => {
             let index: ImageIndex = resp.json().await?;
             Ok(Some(index))
         }
-        404 => Ok(None),
+        StatusCode::NOT_FOUND => Ok(None),
         _ => {
             let message = resp.text().await.unwrap_or_default();
             Err(Error::RegistryError { status, message })
@@ -300,11 +254,11 @@ mod tests {
     }
 
     #[test]
-    fn accept_header_contains_all_types() {
+    fn accept_header_contains_all_manifest_types() {
         let accept = manifest_accept_header();
-        assert!(accept.contains(media_types::OCI_IMAGE_MANIFEST));
-        assert!(accept.contains(media_types::OCI_IMAGE_INDEX));
-        assert!(accept.contains(media_types::DOCKER_MANIFEST_V2));
-        assert!(accept.contains(media_types::DOCKER_MANIFEST_LIST));
+        assert!(accept.contains(MediaType::OciManifest.as_str()));
+        assert!(accept.contains(MediaType::OciIndex.as_str()));
+        assert!(accept.contains(MediaType::DockerManifestV2.as_str()));
+        assert!(accept.contains(MediaType::DockerManifestList.as_str()));
     }
 }

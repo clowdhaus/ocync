@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use futures_util::Stream;
+use http::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, LOCATION};
 
 use crate::auth::Scope;
@@ -80,39 +81,18 @@ impl RegistryClient {
     ) -> Result<MountResult, Error> {
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
-
         let scopes = [Scope::pull_push(repository), Scope::pull(from_repo)];
-        let headers = self.auth_headers(&scopes).await?;
+        let digest_str = digest.to_string();
+        let from = from_repo.to_owned();
 
         let resp = self
-            .http
-            .post(url.clone())
-            .headers(headers)
-            .query(&[
-                ("mount", digest.to_string()),
-                ("from", from_repo.to_owned()),
-            ])
-            .send()
+            .send_with_retry(&scopes, "blob mount", |headers| {
+                self.http
+                    .post(url.clone())
+                    .headers(headers)
+                    .query(&[("mount", &digest_str), ("from", &from)])
+            })
             .await?;
-
-        // 401 — invalidate token and retry once.
-        if resp.status().as_u16() == 401 {
-            tracing::debug!(url = %url, "got 401 on blob mount, refreshing auth token");
-            self.invalidate_auth().await;
-            let headers = self.auth_headers(&scopes).await?;
-            let resp = self
-                .http
-                .post(url)
-                .headers(headers)
-                .query(&[
-                    ("mount", digest.to_string()),
-                    ("from", from_repo.to_owned()),
-                ])
-                .send()
-                .await?;
-
-            return classify_mount_response(resp).await;
-        }
 
         classify_mount_response(resp).await
     }
@@ -129,25 +109,17 @@ impl RegistryClient {
 
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
-
         let scopes = [Scope::pull_push(repository)];
-        let headers = self.auth_headers(&scopes).await?;
 
         // Step 1: Initiate upload with POST.
-        let resp = self.http.post(url.clone()).headers(headers).send().await?;
+        let resp = self
+            .send_with_retry(&scopes, "blob push initiate", |headers| {
+                self.http.post(url.clone()).headers(headers)
+            })
+            .await?;
 
-        // Handle 401 retry for initiation.
-        let resp = if resp.status().as_u16() == 401 {
-            tracing::debug!(url = %url, "got 401 on blob push initiate, refreshing auth token");
-            self.invalidate_auth().await;
-            let headers = self.auth_headers(&scopes).await?;
-            self.http.post(url).headers(headers).send().await?
-        } else {
-            resp
-        };
-
-        let status = resp.status().as_u16();
-        if status != 202 {
+        let status = resp.status();
+        if status != StatusCode::ACCEPTED {
             let message = resp.text().await.unwrap_or_default();
             return Err(Error::RegistryError { status, message });
         }
@@ -171,23 +143,24 @@ impl RegistryClient {
         };
 
         // Step 2: PUT the data with digest query param.
-        let headers = self.auth_headers(&scopes).await?;
+        let digest_str = digest.to_string();
         let resp = self
-            .http
-            .put(&put_url)
-            .headers(headers)
-            .query(&[("digest", digest.to_string())])
-            .header(CONTENT_LENGTH, data.len().to_string())
-            .header(
-                CONTENT_TYPE,
-                HeaderValue::from_static("application/octet-stream"),
-            )
-            .body(data.to_vec())
-            .send()
+            .send_with_retry(&scopes, "blob push upload", |headers| {
+                self.http
+                    .put(&put_url)
+                    .headers(headers)
+                    .query(&[("digest", &digest_str)])
+                    .header(CONTENT_LENGTH, data.len().to_string())
+                    .header(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    )
+                    .body(data.to_vec())
+            })
             .await?;
 
-        let status = resp.status().as_u16();
-        if status != 201 {
+        let status = resp.status();
+        if status != StatusCode::CREATED {
             let message = resp.text().await.unwrap_or_default();
             return Err(Error::RegistryError { status, message });
         }
@@ -201,30 +174,14 @@ impl RegistryClient {
     pub async fn blob_upload_delete(&self, upload_url: &str) -> Result<(), Error> {
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
-        let headers = self.auth_headers(&[]).await?;
-        let resp = self.http.delete(upload_url).headers(headers).send().await?;
+        let resp = self
+            .send_with_retry(&[], "upload delete", |headers| {
+                self.http.delete(upload_url).headers(headers)
+            })
+            .await?;
 
-        let status = resp.status().as_u16();
-
-        // 401 — invalidate and retry once.
-        if status == 401 {
-            tracing::debug!(
-                url = upload_url,
-                "got 401 on upload delete, refreshing auth token"
-            );
-            self.invalidate_auth().await;
-            let headers = self.auth_headers(&[]).await?;
-            let resp = self.http.delete(upload_url).headers(headers).send().await?;
-
-            let status = resp.status().as_u16();
-            if status != 204 && status != 202 {
-                let message = resp.text().await.unwrap_or_default();
-                return Err(Error::RegistryError { status, message });
-            }
-            return Ok(());
-        }
-
-        if status != 204 && status != 202 {
+        let status = resp.status();
+        if status != StatusCode::NO_CONTENT && status != StatusCode::ACCEPTED {
             let message = resp.text().await.unwrap_or_default();
             return Err(Error::RegistryError { status, message });
         }
@@ -235,13 +192,11 @@ impl RegistryClient {
 
 /// Classify a mount response into [`MountResult`].
 async fn classify_mount_response(resp: reqwest::Response) -> Result<MountResult, Error> {
-    let status = resp.status().as_u16();
+    let status = resp.status();
 
     match status {
-        // 201 Created — blob was successfully mounted.
-        201 => Ok(MountResult::Mounted),
-        // 202 Accepted — mount not supported; registry gave us an upload URL.
-        202 => {
+        StatusCode::CREATED => Ok(MountResult::Mounted),
+        StatusCode::ACCEPTED => {
             let upload_url = resp
                 .headers()
                 .get(LOCATION)

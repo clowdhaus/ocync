@@ -40,26 +40,16 @@ impl RegistryClient {
         let mut url = base_url.clone();
 
         loop {
-            // Acquire a permit per page, not for the entire loop.
             let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
-            let headers = self.auth_headers(&[]).await?;
-            let resp = self.http.get(url.clone()).headers(headers).send().await?;
+            let resp = self
+                .send_with_retry(&[], "catalog", |headers| {
+                    self.http.get(url.clone()).headers(headers)
+                })
+                .await?;
 
-            let status = resp.status().as_u16();
-
-            // 401 — invalidate token and retry once.
-            let resp = if status == 401 {
-                tracing::debug!(url = %url, "got 401 on catalog, refreshing auth token");
-                self.invalidate_auth().await;
-                let headers = self.auth_headers(&[]).await?;
-                self.http.get(url.clone()).headers(headers).send().await?
-            } else {
-                resp
-            };
-
-            let status = resp.status().as_u16();
-            if !(200..300).contains(&status) {
+            let status = resp.status();
+            if !status.is_success() {
                 let message = resp.text().await.unwrap_or_default();
                 return Err(Error::RegistryError { status, message });
             }
@@ -76,7 +66,6 @@ impl RegistryClient {
 
             match next_url {
                 Some(next) => {
-                    // Resolve relative or absolute URL.
                     if next.starts_with("http://") || next.starts_with("https://") {
                         url = next.parse().map_err(|e| {
                             Error::Other(format!("invalid catalog pagination URL: {e}"))

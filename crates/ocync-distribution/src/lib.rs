@@ -29,4 +29,4 @@ pub use digest::Digest;
 pub use error::Error;
 pub use manifest::{ManifestHead, ManifestPull};
 pub use reference::Reference;
-pub use spec::{Descriptor, ImageIndex, ImageManifest, ManifestKind, Platform};
+pub use spec::{Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, Platform};
