@@ -20,12 +20,10 @@ pub fn decode_ecr_token(encoded: &str) -> Result<String, Error> {
         reason: format!("ECR token is not valid UTF-8: {e}"),
     })?;
 
-    let password = text
-        .strip_prefix("AWS:")
-        .ok_or_else(|| Error::AuthFailed {
-            registry: String::new(),
-            reason: "ECR token does not start with 'AWS:'".into(),
-        })?;
+    let password = text.strip_prefix("AWS:").ok_or_else(|| Error::AuthFailed {
+        registry: String::new(),
+        reason: "ECR token does not start with 'AWS:'".into(),
+    })?;
 
     Ok(password.to_owned())
 }
@@ -153,13 +151,12 @@ mod provider {
                         reason: "ECR returned empty authorization data".into(),
                     })?;
 
-            let encoded =
-                auth_data
-                    .authorization_token()
-                    .ok_or_else(|| Error::AuthFailed {
-                        registry: self.hostname.clone(),
-                        reason: "ECR authorization data missing token".into(),
-                    })?;
+            let encoded = auth_data
+                .authorization_token()
+                .ok_or_else(|| Error::AuthFailed {
+                    registry: self.hostname.clone(),
+                    reason: "ECR authorization data missing token".into(),
+                })?;
 
             let password = decode_ecr_token(encoded)?;
             let token = Token::with_ttl(password, ECR_TOKEN_TTL);
@@ -185,6 +182,7 @@ mod stub {
     use crate::error::Error;
 
     /// Stub ECR provider returned when the `ecr` feature is not enabled.
+    #[derive(Debug)]
     pub struct EcrStub;
 
     impl AuthProvider for EcrStub {
@@ -272,8 +270,12 @@ mod tests {
         let result = rt.block_on(stub.get_token(&[]));
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            matches!(err, Error::ProviderNotCompiled { provider: "ecr", feature: "ecr" })
-        );
+        assert!(matches!(
+            err,
+            Error::ProviderNotCompiled {
+                provider: "ecr",
+                feature: "ecr"
+            }
+        ));
     }
 }

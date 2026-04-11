@@ -15,6 +15,8 @@ pub mod gcr;
 /// GitHub Container Registry auth provider.
 pub mod ghcr;
 
+pub use detect::{ProviderKind, detect_provider_kind};
+
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;

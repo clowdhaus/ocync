@@ -43,8 +43,7 @@ static GAR_RE: LazyLock<Regex> =
 /// Compiled regex for Azure Container Registry hostnames.
 ///
 /// Pattern: `<name>.azurecr.io`
-static ACR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9]+\.azurecr\.io$").unwrap());
+static ACR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z0-9]+\.azurecr\.io$").unwrap());
 
 /// Detect the registry provider kind from a hostname.
 ///
@@ -110,34 +109,22 @@ mod tests {
 
     #[test]
     fn detect_gcr_io() {
-        assert_eq!(
-            detect_provider_kind("gcr.io"),
-            Some(ProviderKind::Gcr)
-        );
+        assert_eq!(detect_provider_kind("gcr.io"), Some(ProviderKind::Gcr));
     }
 
     #[test]
     fn detect_gcr_us() {
-        assert_eq!(
-            detect_provider_kind("us.gcr.io"),
-            Some(ProviderKind::Gcr)
-        );
+        assert_eq!(detect_provider_kind("us.gcr.io"), Some(ProviderKind::Gcr));
     }
 
     #[test]
     fn detect_gcr_eu() {
-        assert_eq!(
-            detect_provider_kind("eu.gcr.io"),
-            Some(ProviderKind::Gcr)
-        );
+        assert_eq!(detect_provider_kind("eu.gcr.io"), Some(ProviderKind::Gcr));
     }
 
     #[test]
     fn detect_gcr_asia() {
-        assert_eq!(
-            detect_provider_kind("asia.gcr.io"),
-            Some(ProviderKind::Gcr)
-        );
+        assert_eq!(detect_provider_kind("asia.gcr.io"), Some(ProviderKind::Gcr));
     }
 
     #[test]
@@ -158,10 +145,7 @@ mod tests {
 
     #[test]
     fn detect_ghcr() {
-        assert_eq!(
-            detect_provider_kind("ghcr.io"),
-            Some(ProviderKind::Ghcr)
-        );
+        assert_eq!(detect_provider_kind("ghcr.io"), Some(ProviderKind::Ghcr));
     }
 
     #[test]
@@ -187,7 +171,10 @@ mod tests {
     #[test]
     fn detect_unknown() {
         assert_eq!(detect_provider_kind("quay.io"), None);
-        assert_eq!(detect_provider_kind("my-private-registry.example.com"), None);
+        assert_eq!(
+            detect_provider_kind("my-private-registry.example.com"),
+            None
+        );
     }
 
     #[test]

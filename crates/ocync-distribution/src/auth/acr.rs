@@ -64,6 +64,7 @@ mod stub {
     use crate::error::Error;
 
     /// Stub ACR provider returned when the `acr` feature is not enabled.
+    #[derive(Debug)]
     pub struct AcrStub;
 
     impl AuthProvider for AcrStub {

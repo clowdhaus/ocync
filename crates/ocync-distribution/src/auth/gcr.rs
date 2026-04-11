@@ -64,6 +64,7 @@ mod stub {
     use crate::error::Error;
 
     /// Stub GCR provider returned when the `gcr` feature is not enabled.
+    #[derive(Debug)]
     pub struct GcrStub;
 
     impl AuthProvider for GcrStub {
