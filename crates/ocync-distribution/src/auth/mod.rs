@@ -2,6 +2,8 @@
 
 /// Anonymous token-exchange authentication.
 pub mod anonymous;
+/// Hostname-based registry provider detection.
+pub mod detect;
 /// Docker config.json credential resolution.
 pub mod docker;
 
