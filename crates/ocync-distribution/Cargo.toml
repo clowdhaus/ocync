@@ -17,7 +17,6 @@ bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false }
 http = { version = "1", default-features = false }
 hex.workspace = true
-olpc-cjson = { version = "0.1", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 serde.workspace = true
 serde_json.workspace = true
