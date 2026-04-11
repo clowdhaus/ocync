@@ -6,6 +6,8 @@ pub mod anonymous;
 pub mod detect;
 /// Docker config.json credential resolution.
 pub mod docker;
+/// AWS ECR authentication provider.
+pub mod ecr;
 
 use std::fmt;
 use std::future::Future;
