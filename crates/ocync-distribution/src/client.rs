@@ -126,7 +126,7 @@ impl RegistryClient {
     }
 
     /// A reference to the concurrency semaphore.
-    pub fn semaphore(&self) -> &Arc<Semaphore> {
+    pub fn semaphore(&self) -> &Semaphore {
         &self.semaphore
     }
 

@@ -14,6 +14,7 @@ mod provider {
     ///
     /// Reads `GITHUB_TOKEN` from the environment. This is the standard
     /// authentication mechanism for GHCR in CI and local development.
+    #[derive(Debug)]
     pub struct GhcrAuth;
 
     impl GhcrAuth {

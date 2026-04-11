@@ -13,6 +13,7 @@ mod provider {
     /// Google Container Registry / Artifact Registry authentication provider.
     ///
     /// Placeholder -- full implementation will use Application Default Credentials.
+    #[derive(Debug)]
     pub struct GcrAuth {
         /// The registry hostname.
         hostname: String,

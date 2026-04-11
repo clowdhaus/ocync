@@ -13,6 +13,7 @@ mod provider {
     /// Azure Container Registry authentication provider.
     ///
     /// Placeholder -- full implementation will use Azure Identity credentials.
+    #[derive(Debug)]
     pub struct AcrAuth {
         /// The registry hostname.
         hostname: String,
