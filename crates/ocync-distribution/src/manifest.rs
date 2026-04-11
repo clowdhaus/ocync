@@ -158,9 +158,8 @@ impl RegistryClient {
         let scopes = [Scope::pull_push(repository)];
         let headers = self.auth_headers(&scopes).await?;
 
-        let content_type = HeaderValue::from_str(media_type).map_err(|e| {
-            Error::Other(format!("invalid media type header value: {e}"))
-        })?;
+        let content_type = HeaderValue::from_str(media_type)
+            .map_err(|e| Error::Other(format!("invalid media type header value: {e}")))?;
 
         let resp = self
             .http

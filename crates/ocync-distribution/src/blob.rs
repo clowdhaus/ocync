@@ -12,7 +12,10 @@ use crate::sha256::Sha256;
 #[derive(Debug)]
 pub enum BlobExistsResult {
     /// The blob exists with the given size in bytes.
-    Exists { size: u64 },
+    Exists {
+        /// Content length reported by the registry.
+        size: u64,
+    },
     /// The blob was not found.
     NotFound,
 }
@@ -23,7 +26,10 @@ pub enum MountResult {
     /// The blob was successfully mounted.
     Mounted,
     /// The registry did not support mounting; use the returned upload URL instead.
-    FallbackUpload { upload_url: String },
+    FallbackUpload {
+        /// The URL to use for a chunked upload.
+        upload_url: String,
+    },
 }
 
 /// Build the path segment for a blob: `/blobs/{digest}`.
@@ -127,10 +133,7 @@ impl RegistryClient {
     }
 
     /// Classify a mount response into `Mounted` or `FallbackUpload`.
-    async fn classify_mount_response(
-        &self,
-        resp: reqwest::Response,
-    ) -> Result<MountResult, Error> {
+    async fn classify_mount_response(&self, resp: reqwest::Response) -> Result<MountResult, Error> {
         let status = resp.status().as_u16();
 
         match status {
@@ -159,11 +162,7 @@ impl RegistryClient {
     /// 2. PUT the entire data with the computed digest.
     ///
     /// Returns the digest of the uploaded blob.
-    pub async fn blob_push(
-        &self,
-        repository: &str,
-        data: Vec<u8>,
-    ) -> Result<Digest, Error> {
+    pub async fn blob_push(&self, repository: &str, data: Vec<u8>) -> Result<Digest, Error> {
         // Compute digest of the data.
         let hash = Sha256::digest(&data);
         let digest = Digest::from_sha256(hash);
@@ -205,9 +204,7 @@ impl RegistryClient {
             .headers()
             .get(LOCATION)
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                Error::Other("missing Location header in upload response".into())
-            })?
+            .ok_or_else(|| Error::Other("missing Location header in upload response".into()))?
             .to_owned();
 
         // Resolve relative Location URLs against the base URL.
@@ -216,9 +213,7 @@ impl RegistryClient {
         } else {
             self.base_url
                 .join(&upload_url)
-                .map_err(|e| {
-                    Error::Other(format!("failed to resolve upload URL: {e}"))
-                })?
+                .map_err(|e| Error::Other(format!("failed to resolve upload URL: {e}")))?
                 .to_string()
         };
 

@@ -6,7 +6,9 @@ use crate::error::Error;
 /// Response body from the tag listing API.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TagListResponse {
+    /// The repository name.
     pub name: String,
+    /// The list of tags, or empty if none exist.
     #[serde(default, deserialize_with = "deserialize_null_as_empty")]
     pub tags: Vec<String>,
 }

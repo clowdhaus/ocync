@@ -8,6 +8,7 @@ use crate::tags::parse_next_link;
 /// Response body from the catalog API.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CatalogResponse {
+    /// The list of repository names.
     pub repositories: Vec<String>,
 }
 
@@ -71,9 +72,7 @@ impl RegistryClient {
                         })?;
                     } else {
                         url = self.base_url.join(&next).map_err(|e| {
-                            Error::Other(format!(
-                                "failed to resolve catalog pagination URL: {e}"
-                            ))
+                            Error::Other(format!("failed to resolve catalog pagination URL: {e}"))
                         })?;
                     }
                 }
