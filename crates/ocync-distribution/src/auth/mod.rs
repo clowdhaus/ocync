@@ -1,5 +1,7 @@
 //! Authentication providers and token management for OCI registries.
 
+/// Azure Container Registry auth provider.
+pub mod acr;
 /// Anonymous token-exchange authentication.
 pub mod anonymous;
 /// Hostname-based registry provider detection.
@@ -8,6 +10,10 @@ pub mod detect;
 pub mod docker;
 /// AWS ECR authentication provider.
 pub mod ecr;
+/// Google Container Registry / Artifact Registry auth provider.
+pub mod gcr;
+/// GitHub Container Registry auth provider.
+pub mod ghcr;
 
 use std::fmt;
 use std::future::Future;

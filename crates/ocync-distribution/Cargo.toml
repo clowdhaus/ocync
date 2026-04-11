@@ -10,6 +10,9 @@ description = "OCI Distribution client library"
 [features]
 default = []
 ecr = ["dep:aws-config", "dep:aws-sdk-ecr", "dep:aws-sdk-sts"]
+gcr = []
+acr = []
+ghcr = []
 
 [lints]
 workspace = true
