@@ -1,3 +1,5 @@
+//! HTTP client for a single OCI registry endpoint.
+
 use std::sync::Arc;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};

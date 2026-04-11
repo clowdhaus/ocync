@@ -1,3 +1,5 @@
+//! Docker `config.json` credential resolution and helper execution.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;

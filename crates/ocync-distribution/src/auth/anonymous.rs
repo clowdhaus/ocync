@@ -1,3 +1,5 @@
+//! Anonymous auth provider using the Docker token-exchange flow.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
