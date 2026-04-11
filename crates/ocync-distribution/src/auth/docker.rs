@@ -262,7 +262,7 @@ fn default_config_path() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("DOCKER_CONFIG") {
         return Some(PathBuf::from(dir).join("config.json"));
     }
-    dirs::home_dir().map(|h| h.join(".docker").join("config.json"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".docker").join("config.json"))
 }
 
 #[cfg(test)]

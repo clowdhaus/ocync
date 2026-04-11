@@ -12,17 +12,15 @@ workspace = true
 
 [dependencies]
 aws-lc-rs.workspace = true
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 hex.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-olpc-cjson = "0.1"
-tracing = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 tokio = { workspace = true, features = ["sync", "time"] }
-base64 = "0.22"
-dirs = "6"
-url = "2"
+tracing = { version = "0.1", default-features = false }
+url = { version = "2", default-features = false }
 
 [dev-dependencies]
 serde_json.workspace = true
