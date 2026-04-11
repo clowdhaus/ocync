@@ -12,6 +12,7 @@ pub mod manifest;
 pub mod reference;
 pub mod sha256;
 pub mod spec;
+pub mod tags;
 
 pub use client::RegistryClient;
 pub use digest::Digest;
