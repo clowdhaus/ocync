@@ -1,0 +1,13 @@
+[package]
+name = "ocync-sync"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCI registry sync orchestration"
+
+[dependencies]
+ocync-distribution.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
