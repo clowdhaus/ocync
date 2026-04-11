@@ -40,12 +40,10 @@ impl FromStr for Digest {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let algo_len = s
-            .find(':')
-            .ok_or_else(|| Error::InvalidDigest {
-                digest: s.into(),
-                reason: "missing ':' separator".into(),
-            })?;
+        let algo_len = s.find(':').ok_or_else(|| Error::InvalidDigest {
+            digest: s.into(),
+            reason: "missing ':' separator".into(),
+        })?;
 
         let algorithm = &s[..algo_len];
         let hex_part = &s[algo_len + 1..];

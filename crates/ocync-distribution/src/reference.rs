@@ -84,13 +84,10 @@ impl FromStr for Reference {
         // Split off @digest first.
         let (name_tag, digest) = if let Some(at) = s.rfind('@') {
             let digest_str = &s[at + 1..];
-            let digest: Digest =
-                digest_str
-                    .parse()
-                    .map_err(|_| Error::InvalidReference {
-                        input: s.into(),
-                        reason: format!("invalid digest '{digest_str}'"),
-                    })?;
+            let digest: Digest = digest_str.parse().map_err(|_| Error::InvalidReference {
+                input: s.into(),
+                reason: format!("invalid digest '{digest_str}'"),
+            })?;
             (&s[..at], Some(digest))
         } else {
             (s, None)
