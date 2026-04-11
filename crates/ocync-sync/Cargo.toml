@@ -1,0 +1,18 @@
+[package]
+name = "ocync-sync"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCI registry sync orchestration"
+
+[lints]
+workspace = true
+
+[dependencies]
+globset = { version = "0.4", default-features = false }
+ocync-distribution.workspace = true
+semver = { version = "1", default-features = false, features = ["std"] }
+thiserror.workspace = true
+tracing = { version = "0.1", default-features = false }
