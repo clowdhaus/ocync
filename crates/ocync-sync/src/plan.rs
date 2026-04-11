@@ -1,3 +1,5 @@
+//! Blob deduplication map and transfer ordering for cross-repo mount support.
+
 use std::collections::{HashMap, HashSet};
 
 use ocync_distribution::Digest;
@@ -20,6 +22,7 @@ pub enum BlobStatus {
 /// Metadata for a tracked blob.
 #[derive(Debug)]
 pub struct BlobInfo {
+    /// Current transfer status.
     pub status: BlobStatus,
     /// Set of repositories at the target that have this blob.
     pub repos: HashSet<String>,
@@ -35,6 +38,7 @@ pub struct BlobDedupMap {
 }
 
 impl BlobDedupMap {
+    /// Create an empty deduplication map.
     pub fn new() -> Self {
         Self {
             inner: HashMap::new(),

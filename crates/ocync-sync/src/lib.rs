@@ -1,10 +1,14 @@
 //! OCI registry sync orchestration — tag filtering, transfer planning, and execution.
 
+/// Sync engine with retry/backoff and concurrency control.
+pub mod engine;
 /// Error types for sync operations.
 pub mod error;
 
 /// Tag filtering pipeline: glob, semver, exclude, sort, and latest.
 pub mod filter;
+/// Sync planning and transfer ordering.
+pub mod plan;
 /// Progress reporting trait and types.
 pub mod progress;
 
@@ -17,9 +21,13 @@ use ulid::Ulid;
 /// Result of a complete sync run. The engine never "fails" as a whole.
 #[derive(Debug, Serialize)]
 pub struct SyncReport {
+    /// Unique identifier for this sync run.
     pub run_id: Ulid,
+    /// Per-image results.
     pub images: Vec<ImageResult>,
+    /// Aggregate statistics.
     pub stats: SyncStats,
+    /// Wall-clock duration of the entire run.
     pub duration: Duration,
 }
 
@@ -42,41 +50,73 @@ impl SyncReport {
     }
 }
 
+/// Result of syncing a single image.
 #[derive(Debug, Serialize)]
 pub struct ImageResult {
+    /// Unique identifier for this image transfer.
     pub image_id: Ulid,
+    /// Source image reference.
     pub source: String,
+    /// Target image reference.
     pub target: String,
+    /// Outcome of the transfer.
     pub status: ImageStatus,
+    /// Total bytes transferred for this image.
     pub bytes_transferred: u64,
+    /// Wall-clock duration of this image transfer.
     pub duration: Duration,
 }
 
+/// Outcome status for a single image transfer.
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ImageStatus {
+    /// Image was successfully synced.
     Synced,
-    Skipped { reason: SkipReason },
-    Failed { error: String, retries: u32 },
+    /// Image was skipped (already up-to-date or policy).
+    Skipped {
+        /// Why the image was skipped.
+        reason: SkipReason,
+    },
+    /// Image transfer failed after exhausting retries.
+    Failed {
+        /// Error message describing the failure.
+        error: String,
+        /// Number of retry attempts made.
+        retries: u32,
+    },
 }
 
+/// Reason an image was skipped during sync.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
+    /// Source and target digests already match.
     DigestMatch,
+    /// Configuration says to skip existing images.
     SkipExisting,
+    /// Tag is immutable and already exists at target.
     ImmutableTag,
 }
 
+/// Aggregate statistics for a sync run.
 #[derive(Debug, Default, Serialize)]
 pub struct SyncStats {
+    /// Number of images successfully synced.
     pub images_synced: u64,
+    /// Number of images skipped.
     pub images_skipped: u64,
+    /// Number of images that failed.
     pub images_failed: u64,
+    /// Total layers transferred across all images.
     pub layers_transferred: u64,
+    /// Unique layer references (before dedup).
     pub layers_unique_refs: u64,
+    /// Layers satisfied via cross-repo mount.
     pub layers_mounted: u64,
+    /// Total bytes transferred.
     pub bytes_transferred: u64,
+    /// Total logical size of all images.
     pub total_image_size: u64,
 }
 

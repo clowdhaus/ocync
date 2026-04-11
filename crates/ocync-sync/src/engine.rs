@@ -1,3 +1,5 @@
+//! Sync engine with retry/backoff and concurrency control.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,9 +13,13 @@ use crate::{SyncReport, SyncStats};
 /// Retry configuration with exponential backoff.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
+    /// Maximum number of retry attempts.
     pub max_retries: u32,
+    /// Initial backoff delay before the first retry.
     pub initial_backoff: Duration,
+    /// Upper bound on backoff delay.
     pub max_backoff: Duration,
+    /// Multiplier applied to backoff on each successive attempt.
     pub backoff_multiplier: u32,
 }
 
@@ -50,7 +56,9 @@ pub fn should_retry(status: u16, current_attempt: u32, max_retries: u32) -> bool
 /// Top-level engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
+    /// Maximum number of concurrent blob/manifest transfers.
     pub global_concurrent_transfers: usize,
+    /// Retry policy for transient failures.
     pub retry: RetryConfig,
 }
 
@@ -70,7 +78,16 @@ pub struct SyncEngine {
     _blob_dedup: Arc<Mutex<BlobDedupMap>>,
 }
 
+impl std::fmt::Debug for SyncEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncEngine")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SyncEngine {
+    /// Create a new sync engine with the given configuration.
     pub fn new(config: EngineConfig) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.global_concurrent_transfers));
         let blob_dedup = Arc::new(Mutex::new(BlobDedupMap::new()));
