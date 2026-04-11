@@ -183,4 +183,48 @@ mod tests {
         set.insert(d1.clone());
         assert!(set.contains(&d2));
     }
+
+    #[test]
+    fn parse_sha512() {
+        let hex = "a".repeat(128);
+        let input = format!("sha512:{hex}");
+        let d: Digest = input.parse().unwrap();
+        assert_eq!(d.algorithm(), "sha512");
+        assert_eq!(d.hex().len(), 128);
+    }
+
+    #[test]
+    fn parse_unknown_algorithm() {
+        let hex = "a".repeat(96);
+        let input = format!("sha384:{hex}");
+        let d: Digest = input.parse().unwrap();
+        assert_eq!(d.algorithm(), "sha384");
+    }
+
+    #[test]
+    fn uppercase_hex_accepted() {
+        let hex = "A".repeat(64);
+        let input = format!("sha256:{hex}");
+        let d: Digest = input.parse().unwrap();
+        assert_eq!(d.hex(), hex);
+    }
+
+    #[test]
+    fn leading_colon_error() {
+        let r = ":abcdef".parse::<Digest>();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn display_preserves_original() {
+        let input = TEST_DIGEST;
+        let d: Digest = input.parse().unwrap();
+        assert_eq!(d.to_string(), input);
+    }
+
+    #[test]
+    fn deserialize_non_string_errors() {
+        let result: Result<Digest, _> = serde_json::from_str("123");
+        assert!(result.is_err());
+    }
 }
