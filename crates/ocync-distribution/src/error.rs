@@ -4,7 +4,7 @@ use thiserror::Error;
 
 /// Errors returned by OCI distribution operations.
 #[derive(Debug, Error)]
-pub enum DistributionError {
+pub enum Error {
     /// The image reference string could not be parsed.
     #[error("invalid image reference '{input}': {reason}")]
     InvalidReference {
@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn display_invalid_reference() {
-        let err = DistributionError::InvalidReference {
+        let err = Error::InvalidReference {
             input: "!!!".into(),
             reason: "bad chars".into(),
         };
@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn display_invalid_digest() {
-        let err = DistributionError::InvalidDigest {
+        let err = Error::InvalidDigest {
             digest: "bad".into(),
             reason: "missing colon".into(),
         };
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn display_digest_mismatch() {
-        let err = DistributionError::DigestMismatch {
+        let err = Error::DigestMismatch {
             expected: "sha256:aaa".into(),
             actual: "sha256:bbb".into(),
         };
@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn display_unsupported_media_type() {
-        let err = DistributionError::UnsupportedMediaType {
+        let err = Error::UnsupportedMediaType {
             media_type: "text/plain".into(),
         };
         assert!(err.to_string().contains("text/plain"));
@@ -93,13 +93,13 @@ mod tests {
 
     #[test]
     fn display_other() {
-        let err = DistributionError::Other("something broke".into());
+        let err = Error::Other("something broke".into());
         assert_eq!(err.to_string(), "something broke");
     }
 
     #[test]
     fn is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<DistributionError>();
+        assert_send_sync::<Error>();
     }
 }

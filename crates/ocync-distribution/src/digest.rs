@@ -6,15 +6,15 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::DistributionError;
+use crate::error::Error;
 
 /// OCI content-addressable digest in `algorithm:hex` format (e.g. `sha256:abcd...`).
 #[derive(Debug, Clone, Eq)]
 pub struct Digest {
     /// The full `algorithm:hex` string.
     raw: String,
-    /// Byte offset of the colon separator.
-    colon: usize,
+    /// Length of the algorithm portion (byte offset of the `:` separator).
+    algo_len: usize,
 }
 
 impl Digest {
@@ -22,50 +22,50 @@ impl Digest {
     pub fn from_sha256(bytes: [u8; 32]) -> Self {
         let hex = hex::encode(bytes);
         let raw = format!("sha256:{hex}");
-        Self { raw, colon: 6 }
+        Self { raw, algo_len: 6 }
     }
 
     /// The algorithm portion (e.g. `sha256`).
     pub fn algorithm(&self) -> &str {
-        &self.raw[..self.colon]
+        &self.raw[..self.algo_len]
     }
 
     /// The hex-encoded hash portion.
     pub fn hex(&self) -> &str {
-        &self.raw[self.colon + 1..]
+        &self.raw[self.algo_len + 1..]
     }
 }
 
 impl FromStr for Digest {
-    type Err = DistributionError;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let colon = s
+        let algo_len = s
             .find(':')
-            .ok_or_else(|| DistributionError::InvalidDigest {
+            .ok_or_else(|| Error::InvalidDigest {
                 digest: s.into(),
                 reason: "missing ':' separator".into(),
             })?;
 
-        let algorithm = &s[..colon];
-        let hex_part = &s[colon + 1..];
+        let algorithm = &s[..algo_len];
+        let hex_part = &s[algo_len + 1..];
 
         if algorithm.is_empty() {
-            return Err(DistributionError::InvalidDigest {
+            return Err(Error::InvalidDigest {
                 digest: s.into(),
                 reason: "empty algorithm".into(),
             });
         }
 
         if hex_part.is_empty() {
-            return Err(DistributionError::InvalidDigest {
+            return Err(Error::InvalidDigest {
                 digest: s.into(),
                 reason: "empty hex portion".into(),
             });
         }
 
         if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(DistributionError::InvalidDigest {
+            return Err(Error::InvalidDigest {
                 digest: s.into(),
                 reason: "hex portion contains invalid characters".into(),
             });
@@ -73,7 +73,7 @@ impl FromStr for Digest {
 
         // SHA-256 must be exactly 64 hex chars
         if algorithm == "sha256" && hex_part.len() != 64 {
-            return Err(DistributionError::InvalidDigest {
+            return Err(Error::InvalidDigest {
                 digest: s.into(),
                 reason: format!("sha256 hex must be 64 characters, got {}", hex_part.len()),
             });
@@ -81,7 +81,7 @@ impl FromStr for Digest {
 
         Ok(Self {
             raw: s.to_owned(),
-            colon,
+            algo_len,
         })
     }
 }
@@ -122,12 +122,12 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const VALID_SHA256: &str =
+    const TEST_DIGEST: &str =
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     #[test]
     fn parse_valid() {
-        let d: Digest = VALID_SHA256.parse().unwrap();
+        let d: Digest = TEST_DIGEST.parse().unwrap();
         assert_eq!(d.algorithm(), "sha256");
         assert_eq!(
             d.hex(),
@@ -164,12 +164,12 @@ mod tests {
     fn from_sha256_bytes() {
         let hash = crate::sha256::Sha256::digest(b"");
         let d = Digest::from_sha256(hash);
-        assert_eq!(d.to_string(), VALID_SHA256);
+        assert_eq!(d.to_string(), TEST_DIGEST);
     }
 
     #[test]
     fn serde_roundtrip() {
-        let d: Digest = VALID_SHA256.parse().unwrap();
+        let d: Digest = TEST_DIGEST.parse().unwrap();
         let json = serde_json::to_string(&d).unwrap();
         let d2: Digest = serde_json::from_str(&json).unwrap();
         assert_eq!(d, d2);
@@ -177,8 +177,8 @@ mod tests {
 
     #[test]
     fn equality_and_hash() {
-        let d1: Digest = VALID_SHA256.parse().unwrap();
-        let d2: Digest = VALID_SHA256.parse().unwrap();
+        let d1: Digest = TEST_DIGEST.parse().unwrap();
+        let d2: Digest = TEST_DIGEST.parse().unwrap();
         assert_eq!(d1, d2);
 
         let mut set = HashSet::new();

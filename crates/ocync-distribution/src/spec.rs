@@ -6,7 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::digest::Digest;
-use crate::error::DistributionError;
+use crate::error::Error;
 
 /// OCI and Docker media type constants.
 pub mod media_types {
@@ -143,16 +143,16 @@ pub struct ImageIndex {
 
 /// A parsed manifest — either a single image or a multi-platform index.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Manifest {
+pub enum ManifestKind {
     /// A single-platform image manifest.
     Image(Box<ImageManifest>),
     /// A multi-platform image index.
     Index(Box<ImageIndex>),
 }
 
-impl Manifest {
+impl ManifestKind {
     /// Deserialize a manifest from JSON bytes, using the media type to discriminate.
-    pub fn from_json(media_type: &str, bytes: &[u8]) -> Result<Self, DistributionError> {
+    pub fn from_json(media_type: &str, bytes: &[u8]) -> Result<Self, Error> {
         match media_type {
             media_types::OCI_IMAGE_MANIFEST | media_types::DOCKER_MANIFEST_V2 => {
                 let m: ImageManifest = serde_json::from_slice(bytes)?;
@@ -162,7 +162,7 @@ impl Manifest {
                 let m: ImageIndex = serde_json::from_slice(bytes)?;
                 Ok(Self::Index(Box::new(m)))
             }
-            _ => Err(DistributionError::UnsupportedMediaType {
+            _ => Err(Error::UnsupportedMediaType {
                 media_type: media_type.to_owned(),
             }),
         }
@@ -188,12 +188,13 @@ impl Manifest {
 mod tests {
     use super::*;
 
-    const SHA: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const TEST_DIGEST: &str =
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     fn test_descriptor() -> serde_json::Value {
         serde_json::json!({
             "mediaType": "application/vnd.oci.image.config.v1+json",
-            "digest": SHA,
+            "digest": TEST_DIGEST,
             "size": 1234
         })
     }
@@ -201,7 +202,7 @@ mod tests {
     fn test_layer_descriptor() -> serde_json::Value {
         serde_json::json!({
             "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-            "digest": SHA,
+            "digest": TEST_DIGEST,
             "size": 5678
         })
     }
@@ -210,7 +211,7 @@ mod tests {
     fn deserialize_descriptor() {
         let d: Descriptor = serde_json::from_value(test_descriptor()).unwrap();
         assert_eq!(d.media_type, media_types::OCI_IMAGE_CONFIG);
-        assert_eq!(d.digest.to_string(), SHA);
+        assert_eq!(d.digest.to_string(), TEST_DIGEST);
         assert_eq!(d.size, 1234);
         assert!(d.platform.is_none());
         assert!(d.artifact_type.is_none());
@@ -271,7 +272,7 @@ mod tests {
             "mediaType": media_types::OCI_IMAGE_INDEX,
             "manifests": [{
                 "mediaType": media_types::OCI_IMAGE_MANIFEST,
-                "digest": SHA,
+                "digest": TEST_DIGEST,
                 "size": 1000,
                 "platform": {
                     "architecture": "amd64",
@@ -293,8 +294,8 @@ mod tests {
             "layers": [test_layer_descriptor()]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = Manifest::from_json(media_types::OCI_IMAGE_MANIFEST, &bytes).unwrap();
-        assert!(matches!(m, Manifest::Image(_)));
+        let m = ManifestKind::from_json(media_types::OCI_IMAGE_MANIFEST, &bytes).unwrap();
+        assert!(matches!(m, ManifestKind::Image(_)));
     }
 
     #[test]
@@ -305,8 +306,8 @@ mod tests {
             "layers": [test_layer_descriptor()]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = Manifest::from_json(media_types::DOCKER_MANIFEST_V2, &bytes).unwrap();
-        assert!(matches!(m, Manifest::Image(_)));
+        let m = ManifestKind::from_json(media_types::DOCKER_MANIFEST_V2, &bytes).unwrap();
+        assert!(matches!(m, ManifestKind::Image(_)));
     }
 
     #[test]
@@ -315,18 +316,18 @@ mod tests {
             "schemaVersion": 2,
             "manifests": [{
                 "mediaType": media_types::OCI_IMAGE_MANIFEST,
-                "digest": SHA,
+                "digest": TEST_DIGEST,
                 "size": 1000
             }]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = Manifest::from_json(media_types::OCI_IMAGE_INDEX, &bytes).unwrap();
-        assert!(matches!(m, Manifest::Index(_)));
+        let m = ManifestKind::from_json(media_types::OCI_IMAGE_INDEX, &bytes).unwrap();
+        assert!(matches!(m, ManifestKind::Index(_)));
     }
 
     #[test]
     fn manifest_from_json_unsupported() {
-        let r = Manifest::from_json("text/plain", b"{}");
+        let r = ManifestKind::from_json("text/plain", b"{}");
         assert!(r.is_err());
     }
 
@@ -338,7 +339,7 @@ mod tests {
             "layers": [test_layer_descriptor()]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = Manifest::from_json(media_types::OCI_IMAGE_MANIFEST, &bytes).unwrap();
+        let m = ManifestKind::from_json(media_types::OCI_IMAGE_MANIFEST, &bytes).unwrap();
         let digests = m.referenced_digests();
         assert_eq!(digests.len(), 2); // config + 1 layer
     }
@@ -350,18 +351,18 @@ mod tests {
             "manifests": [
                 {
                     "mediaType": media_types::OCI_IMAGE_MANIFEST,
-                    "digest": SHA,
+                    "digest": TEST_DIGEST,
                     "size": 1000
                 },
                 {
                     "mediaType": media_types::OCI_IMAGE_MANIFEST,
-                    "digest": SHA,
+                    "digest": TEST_DIGEST,
                     "size": 2000
                 }
             ]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = Manifest::from_json(media_types::OCI_IMAGE_INDEX, &bytes).unwrap();
+        let m = ManifestKind::from_json(media_types::OCI_IMAGE_INDEX, &bytes).unwrap();
         let digests = m.referenced_digests();
         assert_eq!(digests.len(), 2);
     }
@@ -370,7 +371,7 @@ mod tests {
     fn descriptor_with_artifact_type() {
         let json = serde_json::json!({
             "mediaType": "application/vnd.oci.image.config.v1+json",
-            "digest": SHA,
+            "digest": TEST_DIGEST,
             "size": 100,
             "artifactType": "application/vnd.example+type"
         });

@@ -7,7 +7,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::digest::Digest;
-use crate::error::DistributionError;
+use crate::error::Error;
 
 const DOCKER_HUB_REGISTRY: &str = "docker.io";
 const DOCKER_HUB_OFFICIAL_REPO_PREFIX: &str = "library/";
@@ -71,11 +71,11 @@ fn is_registry(s: &str) -> bool {
 }
 
 impl FromStr for Reference {
-    type Err = DistributionError;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.is_empty() {
-            return Err(DistributionError::InvalidReference {
+            return Err(Error::InvalidReference {
                 input: s.into(),
                 reason: "empty string".into(),
             });
@@ -87,7 +87,7 @@ impl FromStr for Reference {
             let digest: Digest =
                 digest_str
                     .parse()
-                    .map_err(|_| DistributionError::InvalidReference {
+                    .map_err(|_| Error::InvalidReference {
                         input: s.into(),
                         reason: format!("invalid digest '{digest_str}'"),
                     })?;
@@ -102,7 +102,7 @@ impl FromStr for Reference {
         let (name, tag) = split_name_tag(name_tag);
 
         if name.is_empty() {
-            return Err(DistributionError::InvalidReference {
+            return Err(Error::InvalidReference {
                 input: s.into(),
                 reason: "empty name".into(),
             });
@@ -126,7 +126,7 @@ impl FromStr for Reference {
         };
 
         if repository.is_empty() {
-            return Err(DistributionError::InvalidReference {
+            return Err(Error::InvalidReference {
                 input: s.into(),
                 reason: "empty repository".into(),
             });
@@ -209,7 +209,8 @@ impl<'de> Deserialize<'de> for Reference {
 mod tests {
     use super::*;
 
-    const SHA: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const TEST_DIGEST: &str =
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     #[test]
     fn full_with_tag() {
@@ -222,20 +223,20 @@ mod tests {
 
     #[test]
     fn full_with_digest() {
-        let input = format!("ghcr.io/clowdhaus/ocync@{SHA}");
+        let input = format!("ghcr.io/clowdhaus/ocync@{TEST_DIGEST}");
         let r: Reference = input.parse().unwrap();
         assert_eq!(r.registry(), "ghcr.io");
         assert_eq!(r.repository(), "clowdhaus/ocync");
         assert!(r.tag().is_none());
-        assert_eq!(r.digest().unwrap().to_string(), SHA);
+        assert_eq!(r.digest().unwrap().to_string(), TEST_DIGEST);
     }
 
     #[test]
     fn tag_and_digest() {
-        let input = format!("ghcr.io/clowdhaus/ocync:v1.0@{SHA}");
+        let input = format!("ghcr.io/clowdhaus/ocync:v1.0@{TEST_DIGEST}");
         let r: Reference = input.parse().unwrap();
         assert_eq!(r.tag(), Some("v1.0"));
-        assert_eq!(r.digest().unwrap().to_string(), SHA);
+        assert_eq!(r.digest().unwrap().to_string(), TEST_DIGEST);
     }
 
     #[test]
@@ -303,14 +304,14 @@ mod tests {
 
     #[test]
     fn display_roundtrip_with_digest() {
-        let input = format!("ghcr.io/clowdhaus/ocync@{SHA}");
+        let input = format!("ghcr.io/clowdhaus/ocync@{TEST_DIGEST}");
         let r: Reference = input.parse().unwrap();
         assert_eq!(r.to_string(), input);
     }
 
     #[test]
     fn from_parts() {
-        let d: Digest = SHA.parse().unwrap();
+        let d: Digest = TEST_DIGEST.parse().unwrap();
         let r = Reference::from_parts("ghcr.io", "clowdhaus/ocync", Some("v1.0".into()), Some(d));
         assert_eq!(r.registry(), "ghcr.io");
         assert_eq!(r.repository(), "clowdhaus/ocync");
