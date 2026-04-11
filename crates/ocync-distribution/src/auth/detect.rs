@@ -2,12 +2,17 @@
 
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex_lite::Regex;
 
 /// The kind of registry provider detected from a hostname.
 ///
 /// Not all variants have a corresponding [`AuthProvider`](super::AuthProvider)
 /// implementation. Currently only [`Ecr`](Self::Ecr) has a full auth provider.
+/// Hostnames that don't match any known provider return `None` from
+/// [`detect_provider_kind`] — these registries (e.g. Quay, Harbor, private
+/// registries) use the standard OCI token-exchange flow via
+/// [`AnonymousAuth`](super::anonymous::AnonymousAuth) or Docker config
+/// credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
     /// AWS Elastic Container Registry (private).
@@ -26,11 +31,17 @@ pub enum ProviderKind {
     Chainguard,
 }
 
-/// Known GCR hostnames (exact matches).
-const GCR_HOSTS: &[&str] = &["gcr.io", "us.gcr.io", "eu.gcr.io", "asia.gcr.io"];
+impl std::str::FromStr for ProviderKind {
+    type Err = ();
 
-/// Known Docker Hub hostnames (exact matches).
-const DOCKER_HUB_HOSTS: &[&str] = &["docker.io", "index.docker.io", "registry-1.docker.io"];
+    /// Parse a registry hostname into a [`ProviderKind`].
+    ///
+    /// Returns `Err(())` for unrecognized hostnames. Equivalent to
+    /// [`detect_provider_kind`] but using the standard `FromStr` trait.
+    fn from_str(hostname: &str) -> Result<Self, Self::Err> {
+        detect_provider_kind(hostname).ok_or(())
+    }
+}
 
 /// Compiled regex for ECR private registry hostnames.
 ///
@@ -40,6 +51,8 @@ const DOCKER_HUB_HOSTS: &[&str] = &["docker.io", "index.docker.io", "registry-1.
 /// (`.eu`), ISO (`.c2s.ic.gov`), and ISOB (`.sc2s.sgov.gov`). The `[-.]`
 /// separator between `dkr` and `ecr` handles both standard and dual-stack
 /// endpoint formats.
+///
+/// Source: <https://docs.aws.amazon.com/AmazonECR/latest/userguide/Registries.html>
 static ECR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^[0-9]{12}\.dkr[-.]ecr(-fips)?\.[-a-z0-9]+\.(?:amazonaws\.com(?:\.cn)?|amazonaws\.eu|c2s\.ic\.gov|sc2s\.sgov\.gov)$",
@@ -50,6 +63,8 @@ static ECR_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Compiled regex for Google Artifact Registry hostnames.
 ///
 /// Pattern: `<region>-docker.pkg.dev`
+///
+/// Source: <https://cloud.google.com/artifact-registry/docs/repositories/repo-locations>
 static GAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[-a-z0-9]+-docker\.pkg\.dev$").unwrap());
 
@@ -59,52 +74,35 @@ static GAR_RE: LazyLock<Regex> =
 ///
 /// Supports standard (`.io`), China (`.cn`), and US Government (`.us`) suffixes.
 /// ACR registry names are alphanumeric only (no hyphens per Azure naming rules).
+///
+/// Source: <https://learn.microsoft.com/en-us/azure/container-registry/container-registry-faq>
 static ACR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9]+\.azurecr\.(?:io|cn|us)$").unwrap());
 
 /// Detect the registry provider kind from a hostname.
 ///
 /// Normalizes the hostname to lowercase before matching (DNS is case-insensitive).
-/// Checks exact matches first (fast path), then falls through to regex
-/// patterns for cloud registries that use dynamic hostnames.
+/// Returns `None` for unrecognized hostnames (e.g. Quay, Harbor, private
+/// registries) — these should fall through to the standard OCI token-exchange
+/// flow or Docker config credential resolution.
 ///
 /// The hostname must not include a port number or trailing dot. Callers
 /// should strip these before calling (e.g. `ghcr.io:443` → `ghcr.io`).
-///
-/// Returns `None` if the hostname doesn't match any known provider.
 pub fn detect_provider_kind(hostname: &str) -> Option<ProviderKind> {
     let hostname = hostname.to_ascii_lowercase();
     let hostname = hostname.as_str();
 
-    // Exact matches (fast path).
-    if hostname == "public.ecr.aws" {
-        return Some(ProviderKind::EcrPublic);
+    match hostname {
+        "public.ecr.aws" => Some(ProviderKind::EcrPublic),
+        "ghcr.io" => Some(ProviderKind::Ghcr),
+        "cgr.dev" => Some(ProviderKind::Chainguard),
+        "gcr.io" | "us.gcr.io" | "eu.gcr.io" | "asia.gcr.io" => Some(ProviderKind::Gcr),
+        "docker.io" | "index.docker.io" | "registry-1.docker.io" => Some(ProviderKind::DockerHub),
+        _ if ECR_RE.is_match(hostname) => Some(ProviderKind::Ecr),
+        _ if GAR_RE.is_match(hostname) => Some(ProviderKind::Gcr),
+        _ if ACR_RE.is_match(hostname) => Some(ProviderKind::Acr),
+        _ => None,
     }
-    if hostname == "ghcr.io" {
-        return Some(ProviderKind::Ghcr);
-    }
-    if hostname == "cgr.dev" {
-        return Some(ProviderKind::Chainguard);
-    }
-    if GCR_HOSTS.contains(&hostname) {
-        return Some(ProviderKind::Gcr);
-    }
-    if DOCKER_HUB_HOSTS.contains(&hostname) {
-        return Some(ProviderKind::DockerHub);
-    }
-
-    // Regex matches (dynamic hostnames).
-    if ECR_RE.is_match(hostname) {
-        return Some(ProviderKind::Ecr);
-    }
-    if GAR_RE.is_match(hostname) {
-        return Some(ProviderKind::Gcr);
-    }
-    if ACR_RE.is_match(hostname) {
-        return Some(ProviderKind::Acr);
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -304,15 +302,29 @@ mod tests {
         );
     }
 
-    // --- Unknown ---
+    // --- Unknown / generic registries ---
 
     #[test]
-    fn detect_unknown() {
+    fn detect_unknown_returns_none() {
+        // Quay, Harbor, and private registries use standard OCI auth.
         assert_eq!(detect_provider_kind("quay.io"), None);
+        assert_eq!(detect_provider_kind("harbor.example.com"), None);
         assert_eq!(
             detect_provider_kind("my-private-registry.example.com"),
             None
         );
+    }
+
+    // --- FromStr ---
+
+    #[test]
+    fn from_str_known_provider() {
+        assert_eq!("ghcr.io".parse::<ProviderKind>(), Ok(ProviderKind::Ghcr));
+    }
+
+    #[test]
+    fn from_str_unknown_provider() {
+        assert_eq!("quay.io".parse::<ProviderKind>(), Err(()));
     }
 
     // --- Case insensitivity ---

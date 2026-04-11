@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aws_config::BehaviorVersion;
 use base64::Engine;
@@ -12,8 +12,21 @@ use tokio::sync::RwLock;
 use crate::auth::{AuthProvider, Scope, Token};
 use crate::error::Error;
 
-/// ECR token lifetime (12 hours).
-const ECR_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+/// Default ECR token lifetime (12 hours).
+///
+/// Used as a fallback when the API response does not include an expiry
+/// timestamp. The actual `GetAuthorizationToken` response includes an
+/// `expiresAt` field that is preferred when available.
+const ECR_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Response from an ECR `GetAuthorizationToken` call.
+#[derive(Clone)]
+pub(crate) struct EcrTokenResponse {
+    /// The raw base64-encoded authorization token (`AWS:<password>`).
+    pub encoded_token: String,
+    /// Time until the token expires, if provided by the API.
+    pub expires_in: Option<Duration>,
+}
 
 /// Abstraction over ECR `GetAuthorizationToken` for testability.
 ///
@@ -21,10 +34,10 @@ const ECR_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// The default ([`AwsEcrApi`]) holds a cached AWS SDK client constructed once
 /// at [`EcrAuth::new`] time.
 pub(crate) trait EcrApi: Send + Sync {
-    /// Fetch the raw base64-encoded authorization token from ECR.
+    /// Fetch an authorization token from ECR.
     fn get_authorization_token(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>>;
 }
 
 /// Default [`EcrApi`] backed by the AWS SDK.
@@ -46,7 +59,7 @@ impl std::fmt::Debug for AwsEcrApi {
 impl EcrApi for AwsEcrApi {
     fn get_authorization_token(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
         Box::pin(async move {
             let auth_output = self
                 .ecr_client
@@ -67,13 +80,32 @@ impl EcrApi for AwsEcrApi {
                         reason: "ECR returned empty authorization data".into(),
                     })?;
 
-            auth_data
+            let encoded_token = auth_data
                 .authorization_token()
                 .map(|s| s.to_owned())
                 .ok_or_else(|| Error::AuthFailed {
                     registry: self.registry.clone(),
                     reason: "ECR authorization data missing token".into(),
-                })
+                })?;
+
+            // Prefer the API-provided expiry over the hardcoded default.
+            let expires_in = auth_data.expires_at().map(|exp| {
+                let now_secs = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("system clock before UNIX epoch")
+                    .as_secs() as i64;
+                let remaining = exp.secs() - now_secs;
+                if remaining > 0 {
+                    Duration::from_secs(remaining as u64)
+                } else {
+                    Duration::ZERO
+                }
+            });
+
+            Ok(EcrTokenResponse {
+                encoded_token,
+                expires_in,
+            })
         })
     }
 }
@@ -126,7 +158,13 @@ pub fn ecr_region(hostname: &str) -> Option<&str> {
 /// Uses the AWS SDK to obtain authorization tokens via `GetAuthorizationToken`.
 /// The SDK client is created once at construction time. Tokens are cached with
 /// [`RwLock`] (read-fast-path for concurrent cache hits, write-lock for fetches)
-/// and refreshed when they approach expiry.
+/// and refreshed when they approach expiry. The actual token lifetime is read
+/// from the API response, falling back to 12 hours if not provided.
+///
+/// Supports all AWS credential sources via the default credential chain:
+/// environment variables, shared config/credential files, SSO, IMDS/ECS
+/// container credentials, IRSA (IAM Roles for Service Accounts), and
+/// EKS Pod Identity.
 pub struct EcrAuth {
     /// The ECR registry hostname.
     hostname: String,
@@ -213,9 +251,10 @@ impl EcrAuth {
             }
         }
 
-        let encoded = self.api.get_authorization_token().await?;
-        let password = decode_ecr_token(&encoded, &self.hostname)?;
-        let token = Token::with_ttl(password, ECR_TOKEN_TTL);
+        let response = self.api.get_authorization_token().await?;
+        let password = decode_ecr_token(&response.encoded_token, &self.hostname)?;
+        let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
+        let token = Token::with_ttl(password, ttl);
 
         *cached = Some(token.clone());
 
@@ -257,13 +296,17 @@ mod tests {
     /// queue returns an error, which lets tests verify caching by providing
     /// exactly N responses for N expected fetches.
     struct MockEcrApi {
-        responses: Mutex<VecDeque<Option<String>>>,
+        responses: Mutex<VecDeque<Option<EcrTokenResponse>>>,
     }
 
     impl MockEcrApi {
         /// Create a mock that returns the given encoded token on every call.
         fn succeeding(encoded_token: &str) -> Self {
-            let responses = std::iter::repeat_n(Some(encoded_token.to_owned()), 10).collect();
+            let response = EcrTokenResponse {
+                encoded_token: encoded_token.to_owned(),
+                expires_in: None,
+            };
+            let responses = std::iter::repeat_n(Some(response), 10).collect();
             Self {
                 responses: Mutex::new(responses),
             }
@@ -276,8 +319,24 @@ mod tests {
             }
         }
 
-        /// Create a mock with an explicit response sequence.
-        fn with_responses(responses: Vec<Option<String>>) -> Self {
+        /// Create a mock with an explicit encoded-token sequence.
+        fn with_tokens(tokens: Vec<Option<String>>) -> Self {
+            let responses = tokens
+                .into_iter()
+                .map(|t| {
+                    t.map(|encoded_token| EcrTokenResponse {
+                        encoded_token,
+                        expires_in: None,
+                    })
+                })
+                .collect();
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+
+        /// Create a mock with an explicit [`EcrTokenResponse`] sequence.
+        fn with_responses(responses: Vec<Option<EcrTokenResponse>>) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
             }
@@ -287,11 +346,11 @@ mod tests {
     impl EcrApi for MockEcrApi {
         fn get_authorization_token(
             &self,
-        ) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
             Box::pin(async move {
                 let mut responses = self.responses.lock().await;
                 match responses.pop_front() {
-                    Some(Some(token)) => Ok(token),
+                    Some(Some(response)) => Ok(response),
                     _ => Err(Error::AuthFailed {
                         registry: "mock".into(),
                         reason: "mock: no token available".into(),
@@ -414,7 +473,7 @@ mod tests {
         // Queue has exactly one response. If the second get_token call hits
         // the API it will fail (queue empty), proving the cache works.
         let encoded = BASE64.encode("AWS:cached-token");
-        let auth = EcrAuth::with_api(TEST_HOST, MockEcrApi::with_responses(vec![Some(encoded)]));
+        let auth = EcrAuth::with_api(TEST_HOST, MockEcrApi::with_tokens(vec![Some(encoded)]));
 
         let t1 = auth.get_token(&[]).await.unwrap();
         assert_eq!(t1.value(), "cached-token");
@@ -426,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn auth_refreshes_near_expiry_token() {
         let encoded = BASE64.encode("AWS:refreshed-token");
-        let auth = EcrAuth::with_api(TEST_HOST, MockEcrApi::with_responses(vec![Some(encoded)]));
+        let auth = EcrAuth::with_api(TEST_HOST, MockEcrApi::with_tokens(vec![Some(encoded)]));
 
         // Inject a near-expiry token (1 min remaining < 15 min threshold).
         auth.set_cached_token(Token::with_ttl("stale", Duration::from_secs(60)))
@@ -438,12 +497,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_respects_api_provided_expiry() {
+        // First response has a short TTL (5 min < 15 min threshold).
+        let short = EcrTokenResponse {
+            encoded_token: BASE64.encode("AWS:short-lived"),
+            expires_in: Some(Duration::from_secs(5 * 60)),
+        };
+        let fresh = EcrTokenResponse {
+            encoded_token: BASE64.encode("AWS:refreshed"),
+            expires_in: None,
+        };
+        let auth = EcrAuth::with_api(
+            TEST_HOST,
+            MockEcrApi::with_responses(vec![Some(short), Some(fresh)]),
+        );
+
+        // First call returns the short-lived token.
+        let t1 = auth.get_token(&[]).await.unwrap();
+        assert_eq!(t1.value(), "short-lived");
+
+        // Second call triggers refresh because the cached token is near expiry.
+        let t2 = auth.get_token(&[]).await.unwrap();
+        assert_eq!(t2.value(), "refreshed");
+    }
+
+    #[tokio::test]
     async fn auth_invalidation_forces_refetch() {
         let encoded1 = BASE64.encode("AWS:first-token");
         let encoded2 = BASE64.encode("AWS:second-token");
         let auth = EcrAuth::with_api(
             TEST_HOST,
-            MockEcrApi::with_responses(vec![Some(encoded1), Some(encoded2)]),
+            MockEcrApi::with_tokens(vec![Some(encoded1), Some(encoded2)]),
         );
 
         let t1 = auth.get_token(&[]).await.unwrap();

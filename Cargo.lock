@@ -1225,7 +1225,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http 1.4.0",
- "regex",
+ "regex-lite",
  "reqwest",
  "serde",
  "serde_json",
