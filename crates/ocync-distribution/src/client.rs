@@ -217,6 +217,16 @@ impl RegistryClient {
         Ok(self.http.head(url.clone()).headers(headers).send().await?)
     }
 
+    /// Invalidate the cached auth token.
+    ///
+    /// Call this before retrying a request after a 401 response so the auth
+    /// provider fetches a fresh token instead of returning the stale one.
+    pub(crate) async fn invalidate_auth(&self) {
+        if let Some(ref auth) = self.auth {
+            auth.invalidate().await;
+        }
+    }
+
     /// Build auth headers for a request.
     pub(crate) async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
         let mut headers = HeaderMap::new();

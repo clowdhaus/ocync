@@ -1,3 +1,5 @@
+//! Catalog listing with pagination for OCI registries.
+
 use reqwest::header::HeaderValue;
 use serde::Deserialize;
 
@@ -7,9 +9,19 @@ use crate::tags::parse_next_link;
 
 /// Response body from the catalog API.
 #[derive(Debug, Clone, Deserialize)]
-pub struct CatalogResponse {
-    /// The list of repository names.
-    pub repositories: Vec<String>,
+pub(crate) struct CatalogResponse {
+    /// The list of repository names, or empty if none exist.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty")]
+    pub(crate) repositories: Vec<String>,
+}
+
+/// Deserialize a `Vec<String>` that may be `null` or missing as an empty vec.
+fn deserialize_null_as_empty<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<Vec<String>> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
 }
 
 impl RegistryClient {
@@ -26,18 +38,20 @@ impl RegistryClient {
             .map_err(|e| Error::Other(format!("failed to build catalog URL: {e}")))?;
 
         let mut url = base_url.clone();
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
         loop {
-            let headers = self.auth_headers(&[]).await?;
+            // Acquire a permit per page, not for the entire loop.
+            let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
+            let headers = self.auth_headers(&[]).await?;
             let resp = self.http.get(url.clone()).headers(headers).send().await?;
 
             let status = resp.status().as_u16();
 
-            // 401 — refresh and retry once.
+            // 401 — invalidate token and retry once.
             let resp = if status == 401 {
                 tracing::debug!(url = %url, "got 401 on catalog, refreshing auth token");
+                self.invalidate_auth().await;
                 let headers = self.auth_headers(&[]).await?;
                 self.http.get(url.clone()).headers(headers).send().await?
             } else {
@@ -45,10 +59,7 @@ impl RegistryClient {
             };
 
             let status = resp.status().as_u16();
-            if !reqwest::StatusCode::from_u16(status)
-                .map(|s| s.is_success())
-                .unwrap_or(false)
-            {
+            if !(200..300).contains(&status) {
                 let message = resp.text().await.unwrap_or_default();
                 return Err(Error::RegistryError { status, message });
             }
@@ -101,6 +112,20 @@ mod tests {
     #[test]
     fn parse_catalog_response_empty() {
         let json = r#"{"repositories": []}"#;
+        let resp: CatalogResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.repositories.is_empty());
+    }
+
+    #[test]
+    fn parse_catalog_response_null_repositories() {
+        let json = r#"{"repositories": null}"#;
+        let resp: CatalogResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.repositories.is_empty());
+    }
+
+    #[test]
+    fn parse_catalog_response_missing_repositories() {
+        let json = r#"{}"#;
         let resp: CatalogResponse = serde_json::from_str(json).unwrap();
         assert!(resp.repositories.is_empty());
     }

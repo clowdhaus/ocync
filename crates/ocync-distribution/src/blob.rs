@@ -1,3 +1,5 @@
+//! Blob operations — existence checks, pull, push, mount, and upload management.
+
 use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, LOCATION};
@@ -7,18 +9,6 @@ use crate::client::{RegistryClient, build_url};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
-
-/// Result of a HEAD request to check blob existence.
-#[derive(Debug)]
-pub enum BlobExistsResult {
-    /// The blob exists with the given size in bytes.
-    Exists {
-        /// Content length reported by the registry.
-        size: u64,
-    },
-    /// The blob was not found.
-    NotFound,
-}
 
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
@@ -33,24 +23,20 @@ pub enum MountResult {
 }
 
 /// Build the path segment for a blob: `/blobs/{digest}`.
-pub fn blob_path(digest: &Digest) -> String {
+fn blob_path(digest: &Digest) -> String {
     format!("blobs/{digest}")
-}
-
-/// Build the path segment for blob uploads: `/blobs/uploads/`.
-pub fn uploads_path() -> String {
-    "blobs/uploads/".to_owned()
 }
 
 impl RegistryClient {
     /// Check whether a blob exists in the given repository.
     ///
     /// Issues a HEAD request to `/v2/{repository}/blobs/{digest}`.
+    /// Returns `Some(size)` if the blob exists, `None` if not found.
     pub async fn blob_exists(
         &self,
         repository: &str,
         digest: &Digest,
-    ) -> Result<BlobExistsResult, Error> {
+    ) -> Result<Option<u64>, Error> {
         let path = blob_path(digest);
         match self.head(repository, &path).await {
             Ok(resp) => {
@@ -60,9 +46,9 @@ impl RegistryClient {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(0);
-                Ok(BlobExistsResult::Exists { size })
+                Ok(Some(size))
             }
-            Err(Error::NotFound(_)) => Ok(BlobExistsResult::NotFound),
+            Err(Error::NotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -84,15 +70,15 @@ impl RegistryClient {
     /// Attempt a cross-repository blob mount.
     ///
     /// Issues a POST to `/v2/{repository}/blobs/uploads/?mount={digest}&from={from_repo}`.
-    /// If the registry supports it, returns `Mounted`. Otherwise, falls back to
-    /// a regular upload URL.
+    /// If the registry supports it, returns [`MountResult::Mounted`]. Otherwise,
+    /// falls back to a regular upload URL.
     pub async fn blob_mount(
         &self,
         repository: &str,
         digest: &Digest,
         from_repo: &str,
     ) -> Result<MountResult, Error> {
-        let url = build_url(&self.base_url, repository, &uploads_path())?;
+        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
         let scopes = [Scope::pull_push(repository), Scope::pull(from_repo)];
@@ -101,7 +87,7 @@ impl RegistryClient {
         let resp = self
             .http
             .post(url.clone())
-            .headers(headers.clone())
+            .headers(headers)
             .query(&[
                 ("mount", digest.to_string()),
                 ("from", from_repo.to_owned()),
@@ -109,11 +95,10 @@ impl RegistryClient {
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-
-        // 401 — refresh token and retry once.
-        if status == 401 {
+        // 401 — invalidate token and retry once.
+        if resp.status().as_u16() == 401 {
             tracing::debug!(url = %url, "got 401 on blob mount, refreshing auth token");
+            self.invalidate_auth().await;
             let headers = self.auth_headers(&scopes).await?;
             let resp = self
                 .http
@@ -126,34 +111,10 @@ impl RegistryClient {
                 .send()
                 .await?;
 
-            return self.classify_mount_response(resp).await;
+            return classify_mount_response(resp).await;
         }
 
-        self.classify_mount_response(resp).await
-    }
-
-    /// Classify a mount response into `Mounted` or `FallbackUpload`.
-    async fn classify_mount_response(&self, resp: reqwest::Response) -> Result<MountResult, Error> {
-        let status = resp.status().as_u16();
-
-        match status {
-            // 201 Created — blob was successfully mounted.
-            201 => Ok(MountResult::Mounted),
-            // 202 Accepted — mount not supported; registry gave us an upload URL.
-            202 => {
-                let upload_url = resp
-                    .headers()
-                    .get(LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned();
-                Ok(MountResult::FallbackUpload { upload_url })
-            }
-            _ => {
-                let message = resp.text().await.unwrap_or_default();
-                Err(Error::RegistryError { status, message })
-            }
-        }
+        classify_mount_response(resp).await
     }
 
     /// Push a blob to the given repository using a monolithic upload.
@@ -162,31 +123,23 @@ impl RegistryClient {
     /// 2. PUT the entire data with the computed digest.
     ///
     /// Returns the digest of the uploaded blob.
-    pub async fn blob_push(&self, repository: &str, data: Vec<u8>) -> Result<Digest, Error> {
-        // Compute digest of the data.
-        let hash = Sha256::digest(&data);
+    pub async fn blob_push(&self, repository: &str, data: &[u8]) -> Result<Digest, Error> {
+        let hash = Sha256::digest(data);
         let digest = Digest::from_sha256(hash);
-        let data_len = data.len();
 
-        let url = build_url(&self.base_url, repository, &uploads_path())?;
+        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
         let scopes = [Scope::pull_push(repository)];
         let headers = self.auth_headers(&scopes).await?;
 
         // Step 1: Initiate upload with POST.
-        let resp = self
-            .http
-            .post(url.clone())
-            .headers(headers.clone())
-            .send()
-            .await?;
-
-        let status = resp.status().as_u16();
+        let resp = self.http.post(url.clone()).headers(headers).send().await?;
 
         // Handle 401 retry for initiation.
-        let resp = if status == 401 {
+        let resp = if resp.status().as_u16() == 401 {
             tracing::debug!(url = %url, "got 401 on blob push initiate, refreshing auth token");
+            self.invalidate_auth().await;
             let headers = self.auth_headers(&scopes).await?;
             self.http.post(url).headers(headers).send().await?
         } else {
@@ -209,7 +162,7 @@ impl RegistryClient {
 
         // Resolve relative Location URLs against the base URL.
         let put_url = if upload_url.starts_with("http://") || upload_url.starts_with("https://") {
-            upload_url.clone()
+            upload_url
         } else {
             self.base_url
                 .join(&upload_url)
@@ -224,12 +177,12 @@ impl RegistryClient {
             .put(&put_url)
             .headers(headers)
             .query(&[("digest", digest.to_string())])
-            .header(CONTENT_LENGTH, data_len.to_string())
+            .header(CONTENT_LENGTH, data.len().to_string())
             .header(
                 CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
             )
-            .body(data)
+            .body(data.to_vec())
             .send()
             .await?;
 
@@ -248,20 +201,18 @@ impl RegistryClient {
     pub async fn blob_upload_delete(&self, upload_url: &str) -> Result<(), Error> {
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
 
-        // Upload URLs don't belong to a specific repo scope, but we still need auth.
-        // Use an empty scope list — the token from a previous request should still work.
         let headers = self.auth_headers(&[]).await?;
-
         let resp = self.http.delete(upload_url).headers(headers).send().await?;
 
         let status = resp.status().as_u16();
 
-        // 401 — retry once.
+        // 401 — invalidate and retry once.
         if status == 401 {
             tracing::debug!(
                 url = upload_url,
                 "got 401 on upload delete, refreshing auth token"
             );
+            self.invalidate_auth().await;
             let headers = self.auth_headers(&[]).await?;
             let resp = self.http.delete(upload_url).headers(headers).send().await?;
 
@@ -282,6 +233,30 @@ impl RegistryClient {
     }
 }
 
+/// Classify a mount response into [`MountResult`].
+async fn classify_mount_response(resp: reqwest::Response) -> Result<MountResult, Error> {
+    let status = resp.status().as_u16();
+
+    match status {
+        // 201 Created — blob was successfully mounted.
+        201 => Ok(MountResult::Mounted),
+        // 202 Accepted — mount not supported; registry gave us an upload URL.
+        202 => {
+            let upload_url = resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            Ok(MountResult::FallbackUpload { upload_url })
+        }
+        _ => {
+            let message = resp.text().await.unwrap_or_default();
+            Err(Error::RegistryError { status, message })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,10 +271,5 @@ mod tests {
             blob_path(&digest),
             "blobs/sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-    }
-
-    #[test]
-    fn uploads_path_format() {
-        assert_eq!(uploads_path(), "blobs/uploads/");
     }
 }

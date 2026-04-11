@@ -1,3 +1,5 @@
+//! Manifest operations — pull, push, head checks, and referrers queries.
+
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
 
 use crate::auth::Scope;
@@ -34,7 +36,7 @@ pub struct ManifestPull {
 /// Build the Accept header value for manifest requests.
 ///
 /// Includes all four supported manifest media types.
-pub fn manifest_accept_header() -> String {
+fn manifest_accept_header() -> String {
     [
         media_types::OCI_IMAGE_MANIFEST,
         media_types::OCI_IMAGE_INDEX,
@@ -45,12 +47,12 @@ pub fn manifest_accept_header() -> String {
 }
 
 /// Build the path segment for a manifest: `/manifests/{reference}`.
-pub fn manifest_path(reference: &str) -> String {
+fn manifest_path(reference: &str) -> String {
     format!("manifests/{reference}")
 }
 
 /// Build the path segment for the referrers API: `/referrers/{digest}`.
-pub fn referrers_path(digest: &Digest) -> String {
+fn referrers_path(digest: &Digest) -> String {
     format!("referrers/{digest}")
 }
 
@@ -123,7 +125,6 @@ impl RegistryClient {
 
         let raw_bytes = resp.bytes().await?.to_vec();
 
-        // Compute digest from the raw bytes.
         let hash = Sha256::digest(&raw_bytes);
         let digest = Digest::from_sha256(hash);
 
@@ -146,11 +147,10 @@ impl RegistryClient {
         repository: &str,
         reference: &str,
         media_type: &str,
-        raw_bytes: Vec<u8>,
+        raw_bytes: &[u8],
     ) -> Result<Digest, Error> {
-        let hash = Sha256::digest(&raw_bytes);
+        let hash = Sha256::digest(raw_bytes);
         let digest = Digest::from_sha256(hash);
-        let data_len = raw_bytes.len();
 
         let url = build_url(&self.base_url, repository, &manifest_path(reference))?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
@@ -166,24 +166,25 @@ impl RegistryClient {
             .put(url.clone())
             .headers(headers)
             .header(CONTENT_TYPE, content_type.clone())
-            .header(CONTENT_LENGTH, data_len.to_string())
-            .body(raw_bytes.clone())
+            .header(CONTENT_LENGTH, raw_bytes.len().to_string())
+            .body(raw_bytes.to_vec())
             .send()
             .await?;
 
         let status = resp.status().as_u16();
 
-        // 401 — refresh token and retry once.
+        // 401 — invalidate token and retry once.
         if status == 401 {
             tracing::debug!(url = %url, "got 401 on manifest push, refreshing auth token");
+            self.invalidate_auth().await;
             let headers = self.auth_headers(&scopes).await?;
             let resp = self
                 .http
                 .put(url)
                 .headers(headers)
                 .header(CONTENT_TYPE, content_type)
-                .header(CONTENT_LENGTH, data_len.to_string())
-                .body(raw_bytes)
+                .header(CONTENT_LENGTH, raw_bytes.len().to_string())
+                .body(raw_bytes.to_vec())
                 .send()
                 .await?;
 
@@ -226,7 +227,7 @@ impl RegistryClient {
         let scopes = [Scope::pull(repository)];
         let headers = self.auth_headers(&scopes).await?;
 
-        let mut req_headers = headers.clone();
+        let mut req_headers = headers;
         if let Ok(val) = HeaderValue::from_str(accept) {
             req_headers.insert(reqwest::header::ACCEPT, val);
         }
@@ -240,9 +241,10 @@ impl RegistryClient {
 
         let status = resp.status().as_u16();
 
-        // 401 — refresh and retry.
+        // 401 — invalidate and retry.
         if status == 401 {
             tracing::debug!(url = %url, "got 401 on referrers, refreshing auth token");
+            self.invalidate_auth().await;
             let headers = self.auth_headers(&scopes).await?;
             let mut req_headers = headers;
             if let Ok(val) = HeaderValue::from_str(accept) {
@@ -251,29 +253,26 @@ impl RegistryClient {
 
             let resp = self.http.get(url).headers(req_headers).send().await?;
 
-            return self.classify_referrers_response(resp).await;
+            return classify_referrers_response(resp).await;
         }
 
-        self.classify_referrers_response(resp).await
+        classify_referrers_response(resp).await
     }
+}
 
-    /// Classify a referrers response.
-    async fn classify_referrers_response(
-        &self,
-        resp: reqwest::Response,
-    ) -> Result<Option<ImageIndex>, Error> {
-        let status = resp.status().as_u16();
+/// Classify a referrers response.
+async fn classify_referrers_response(resp: reqwest::Response) -> Result<Option<ImageIndex>, Error> {
+    let status = resp.status().as_u16();
 
-        match status {
-            200 => {
-                let index: ImageIndex = resp.json().await?;
-                Ok(Some(index))
-            }
-            404 => Ok(None),
-            _ => {
-                let message = resp.text().await.unwrap_or_default();
-                Err(Error::RegistryError { status, message })
-            }
+    match status {
+        200 => {
+            let index: ImageIndex = resp.json().await?;
+            Ok(Some(index))
+        }
+        404 => Ok(None),
+        _ => {
+            let message = resp.text().await.unwrap_or_default();
+            Err(Error::RegistryError { status, message })
         }
     }
 }

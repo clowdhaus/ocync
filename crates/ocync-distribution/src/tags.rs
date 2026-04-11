@@ -1,3 +1,5 @@
+//! Tag listing with pagination for OCI repositories.
+
 use serde::Deserialize;
 
 use crate::client::RegistryClient;
@@ -5,12 +7,13 @@ use crate::error::Error;
 
 /// Response body from the tag listing API.
 #[derive(Debug, Clone, Deserialize)]
-pub struct TagListResponse {
-    /// The repository name.
-    pub name: String,
+pub(crate) struct TagListResponse {
+    /// The repository name (required by the spec but unused after deserialization).
+    #[allow(dead_code)]
+    name: String,
     /// The list of tags, or empty if none exist.
     #[serde(default, deserialize_with = "deserialize_null_as_empty")]
-    pub tags: Vec<String>,
+    pub(crate) tags: Vec<String>,
 }
 
 /// Deserialize a `Vec<String>` that may be `null` or missing as an empty vec.
@@ -26,7 +29,7 @@ where
 ///
 /// The OCI Distribution spec uses RFC 5988 Link headers for pagination:
 /// `<url>; rel="next"`.
-pub fn parse_next_link(link_header: &str) -> Option<String> {
+pub(crate) fn parse_next_link(link_header: &str) -> Option<String> {
     for part in link_header.split(',') {
         let part = part.trim();
         // Check if this link relation contains rel="next".
