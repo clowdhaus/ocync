@@ -2,6 +2,8 @@
 
 /// Authentication providers and token management.
 pub mod auth;
+/// Blob operations (upload, download, existence checks).
+pub mod blob;
 /// OCI registry HTTP client.
 pub mod client;
 pub mod digest;

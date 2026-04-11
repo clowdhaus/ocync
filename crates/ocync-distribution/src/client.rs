@@ -89,11 +89,11 @@ impl RegistryClientBuilder {
 /// Each `RegistryClient` targets one registry host and owns its auth provider
 /// and concurrency semaphore. Construct via [`RegistryClientBuilder`].
 pub struct RegistryClient {
-    base_url: Url,
-    http: reqwest::Client,
-    auth: Option<Box<dyn AuthProvider>>,
-    semaphore: Arc<Semaphore>,
-    chunk_size: usize,
+    pub(crate) base_url: Url,
+    pub(crate) http: reqwest::Client,
+    pub(crate) auth: Option<Box<dyn AuthProvider>>,
+    pub(crate) semaphore: Arc<Semaphore>,
+    pub(crate) chunk_size: usize,
 }
 
 impl std::fmt::Debug for RegistryClient {
@@ -218,7 +218,7 @@ impl RegistryClient {
     }
 
     /// Build auth headers for a request.
-    async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
+    pub(crate) async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
         let mut headers = HeaderMap::new();
 
         if let Some(ref auth) = self.auth {
