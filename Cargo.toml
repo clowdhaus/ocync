@@ -47,6 +47,7 @@ workspace = true
 ocync-distribution.workspace = true
 ocync-sync.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serde_yaml = { package = "serde_yaml_ng", version = "0.10", default-features = false }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
