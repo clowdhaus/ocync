@@ -1,1 +1,3 @@
-// OCI Distribution client library — modules added in subsequent commits.
+pub mod digest;
+pub mod error;
+pub mod sha256;

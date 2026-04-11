@@ -1,0 +1,186 @@
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::DistributionError;
+
+/// OCI content-addressable digest in `algorithm:hex` format (e.g. `sha256:abcd...`).
+#[derive(Debug, Clone, Eq)]
+pub struct Digest {
+    /// The full `algorithm:hex` string.
+    raw: String,
+    /// Byte offset of the colon separator.
+    colon: usize,
+}
+
+impl Digest {
+    /// Build a digest from a 32-byte SHA-256 hash.
+    pub fn from_sha256(bytes: [u8; 32]) -> Self {
+        let hex = hex::encode(bytes);
+        let raw = format!("sha256:{hex}");
+        Self { raw, colon: 6 }
+    }
+
+    /// The algorithm portion (e.g. `sha256`).
+    pub fn algorithm(&self) -> &str {
+        &self.raw[..self.colon]
+    }
+
+    /// The hex-encoded hash portion.
+    pub fn hex(&self) -> &str {
+        &self.raw[self.colon + 1..]
+    }
+}
+
+impl FromStr for Digest {
+    type Err = DistributionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let colon = s
+            .find(':')
+            .ok_or_else(|| DistributionError::InvalidDigest {
+                digest: s.into(),
+                reason: "missing ':' separator".into(),
+            })?;
+
+        let algorithm = &s[..colon];
+        let hex_part = &s[colon + 1..];
+
+        if algorithm.is_empty() {
+            return Err(DistributionError::InvalidDigest {
+                digest: s.into(),
+                reason: "empty algorithm".into(),
+            });
+        }
+
+        if hex_part.is_empty() {
+            return Err(DistributionError::InvalidDigest {
+                digest: s.into(),
+                reason: "empty hex portion".into(),
+            });
+        }
+
+        if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(DistributionError::InvalidDigest {
+                digest: s.into(),
+                reason: "hex portion contains invalid characters".into(),
+            });
+        }
+
+        // SHA-256 must be exactly 64 hex chars
+        if algorithm == "sha256" && hex_part.len() != 64 {
+            return Err(DistributionError::InvalidDigest {
+                digest: s.into(),
+                reason: format!("sha256 hex must be 64 characters, got {}", hex_part.len()),
+            });
+        }
+
+        Ok(Self {
+            raw: s.to_owned(),
+            colon,
+        })
+    }
+}
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+impl PartialEq for Digest {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Hash for Digest {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.raw.hash(state);
+    }
+}
+
+impl Serialize for Digest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const VALID_SHA256: &str =
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[test]
+    fn parse_valid() {
+        let d: Digest = VALID_SHA256.parse().unwrap();
+        assert_eq!(d.algorithm(), "sha256");
+        assert_eq!(
+            d.hex(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn missing_colon() {
+        let r = "sha256abc".parse::<Digest>();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn empty_hex() {
+        let r = "sha256:".parse::<Digest>();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn invalid_hex_chars() {
+        let r = "sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+            .parse::<Digest>();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn wrong_length() {
+        let r = "sha256:abcd".parse::<Digest>();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn from_sha256_bytes() {
+        let hash = crate::sha256::Sha256::digest(b"");
+        let d = Digest::from_sha256(hash);
+        assert_eq!(d.to_string(), VALID_SHA256);
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let d: Digest = VALID_SHA256.parse().unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        let d2: Digest = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, d2);
+    }
+
+    #[test]
+    fn equality_and_hash() {
+        let d1: Digest = VALID_SHA256.parse().unwrap();
+        let d2: Digest = VALID_SHA256.parse().unwrap();
+        assert_eq!(d1, d2);
+
+        let mut set = HashSet::new();
+        set.insert(d1.clone());
+        assert!(set.contains(&d2));
+    }
+}
