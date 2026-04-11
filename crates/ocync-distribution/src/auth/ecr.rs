@@ -1,9 +1,19 @@
-//! AWS ECR authentication provider with feature-gated SDK integration.
+//! AWS ECR authentication provider.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
+use aws_config::BehaviorVersion;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use tokio::sync::Mutex;
 
+use crate::auth::{AuthProvider, Scope, Token};
 use crate::error::Error;
+
+/// ECR token lifetime (12 hours).
+const ECR_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Decode an ECR authorization token.
 ///
@@ -43,173 +53,109 @@ pub fn ecr_region(hostname: &str) -> Option<&str> {
     parts.get(ecr_idx + 1).copied()
 }
 
-// -- Feature-gated implementation ---------------------------------------------
+/// AWS ECR authentication provider.
+///
+/// Uses the AWS SDK to obtain authorization tokens via `GetAuthorizationToken`.
+/// Tokens are cached with `Mutex` and refreshed when they approach expiry.
+pub struct EcrAuth {
+    /// The ECR registry hostname.
+    hostname: String,
+    /// Cached bearer token.
+    cached_token: Mutex<Option<Token>>,
+}
 
-#[cfg(feature = "ecr")]
-mod provider {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::time::Duration;
-
-    use aws_config::BehaviorVersion;
-    use tokio::sync::Mutex;
-
-    use super::{decode_ecr_token, ecr_region};
-    use crate::auth::{AuthProvider, Scope, Token};
-    use crate::error::Error;
-
-    /// ECR token lifetime (12 hours).
-    const ECR_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
-
-    /// AWS ECR authentication provider.
-    ///
-    /// Uses the AWS SDK to obtain authorization tokens via `GetAuthorizationToken`.
-    /// Tokens are cached with `Mutex` and refreshed when they approach expiry.
-    pub struct EcrAuth {
-        /// The ECR registry hostname.
-        hostname: String,
-        /// Cached bearer token.
-        cached_token: Mutex<Option<Token>>,
+impl std::fmt::Debug for EcrAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EcrAuth")
+            .field("hostname", &self.hostname)
+            .finish_non_exhaustive()
     }
+}
 
-    impl std::fmt::Debug for EcrAuth {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("EcrAuth")
-                .field("hostname", &self.hostname)
-                .finish_non_exhaustive()
+impl EcrAuth {
+    /// Create a new ECR auth provider for the given registry hostname.
+    pub fn new(hostname: impl Into<String>) -> Self {
+        Self {
+            hostname: hostname.into(),
+            cached_token: Mutex::new(None),
         }
     }
 
-    impl EcrAuth {
-        /// Create a new ECR auth provider for the given registry hostname.
-        pub fn new(hostname: impl Into<String>) -> Self {
-            Self {
-                hostname: hostname.into(),
-                cached_token: Mutex::new(None),
+    async fn get_token_inner(&self) -> Result<Token, Error> {
+        // Hold the mutex for the entire check-then-fetch to prevent thundering herd.
+        let mut cached = self.cached_token.lock().await;
+
+        if let Some(ref token) = *cached {
+            if !token.should_refresh() {
+                return Ok(token.clone());
             }
         }
-    }
 
-    impl AuthProvider for EcrAuth {
-        fn name(&self) -> &'static str {
-            "ecr"
-        }
+        let region = ecr_region(&self.hostname).ok_or_else(|| Error::AuthFailed {
+            registry: self.hostname.clone(),
+            reason: "unable to extract AWS region from ECR hostname".into(),
+        })?;
 
-        fn get_token(
-            &self,
-            _scopes: &[Scope],
-        ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
-            Box::pin(async move { self.get_token_inner().await })
-        }
+        let config = aws_config::defaults(BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.to_owned()))
+            .load()
+            .await;
 
-        fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            Box::pin(async move {
-                let mut cached = self.cached_token.lock().await;
-                *cached = None;
-            })
-        }
-    }
+        let ecr_client = aws_sdk_ecr::Client::new(&config);
 
-    impl EcrAuth {
-        async fn get_token_inner(&self) -> Result<Token, Error> {
-            // Hold the mutex for the entire check-then-fetch to prevent thundering herd.
-            let mut cached = self.cached_token.lock().await;
-
-            if let Some(ref token) = *cached {
-                if !token.should_refresh() {
-                    return Ok(token.clone());
-                }
-            }
-
-            let region = ecr_region(&self.hostname).ok_or_else(|| Error::AuthFailed {
+        let auth_output = ecr_client
+            .get_authorization_token()
+            .send()
+            .await
+            .map_err(|e| Error::AuthFailed {
                 registry: self.hostname.clone(),
-                reason: "unable to extract AWS region from ECR hostname".into(),
+                reason: format!("ECR GetAuthorizationToken failed: {e}"),
             })?;
 
-            let config = aws_config::defaults(BehaviorVersion::latest())
-                .region(aws_config::Region::new(region.to_owned()))
-                .load()
-                .await;
-
-            let ecr_client = aws_sdk_ecr::Client::new(&config);
-
-            let auth_output = ecr_client
-                .get_authorization_token()
-                .send()
-                .await
-                .map_err(|e| Error::AuthFailed {
-                    registry: self.hostname.clone(),
-                    reason: format!("ECR GetAuthorizationToken failed: {e}"),
-                })?;
-
-            let auth_data =
-                auth_output
-                    .authorization_data()
-                    .first()
-                    .ok_or_else(|| Error::AuthFailed {
-                        registry: self.hostname.clone(),
-                        reason: "ECR returned empty authorization data".into(),
-                    })?;
-
-            let encoded = auth_data
-                .authorization_token()
+        let auth_data =
+            auth_output
+                .authorization_data()
+                .first()
                 .ok_or_else(|| Error::AuthFailed {
                     registry: self.hostname.clone(),
-                    reason: "ECR authorization data missing token".into(),
+                    reason: "ECR returned empty authorization data".into(),
                 })?;
 
-            let password = decode_ecr_token(encoded)?;
-            let token = Token::with_ttl(password, ECR_TOKEN_TTL);
+        let encoded = auth_data
+            .authorization_token()
+            .ok_or_else(|| Error::AuthFailed {
+                registry: self.hostname.clone(),
+                reason: "ECR authorization data missing token".into(),
+            })?;
 
-            *cached = Some(token.clone());
+        let password = decode_ecr_token(encoded)?;
+        let token = Token::with_ttl(password, ECR_TOKEN_TTL);
 
-            Ok(token)
-        }
+        *cached = Some(token.clone());
+
+        Ok(token)
     }
 }
 
-#[cfg(feature = "ecr")]
-pub use provider::EcrAuth;
+impl AuthProvider for EcrAuth {
+    fn name(&self) -> &'static str {
+        "ecr"
+    }
 
-// -- Stub when feature is not compiled ----------------------------------------
+    fn get_token(
+        &self,
+        _scopes: &[Scope],
+    ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
+        Box::pin(async move { self.get_token_inner().await })
+    }
 
-#[cfg(not(feature = "ecr"))]
-mod stub {
-    use std::future::Future;
-    use std::pin::Pin;
-
-    use crate::auth::{AuthProvider, Scope, Token};
-    use crate::error::Error;
-
-    /// Stub ECR provider returned when the `ecr` feature is not enabled.
-    #[derive(Debug)]
-    pub struct EcrStub;
-
-    impl AuthProvider for EcrStub {
-        fn name(&self) -> &'static str {
-            "ecr"
-        }
-
-        fn get_token(
-            &self,
-            _scopes: &[Scope],
-        ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
-            Box::pin(async {
-                Err(Error::ProviderNotCompiled {
-                    provider: "ecr",
-                    feature: "ecr",
-                })
-            })
-        }
-
-        fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            Box::pin(async {})
-        }
+    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let mut cached = self.cached_token.lock().await;
+            *cached = None;
+        })
     }
 }
-
-#[cfg(not(feature = "ecr"))]
-pub use stub::EcrStub;
 
 #[cfg(test)]
 mod tests {
@@ -254,28 +200,5 @@ mod tests {
     fn parse_ecr_region_invalid_host() {
         assert_eq!(ecr_region("ghcr.io"), None);
         assert_eq!(ecr_region(""), None);
-    }
-
-    #[cfg(not(feature = "ecr"))]
-    #[test]
-    fn stub_returns_provider_not_compiled() {
-        use crate::auth::AuthProvider;
-
-        let stub = EcrStub;
-        assert_eq!(stub.name(), "ecr");
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let result = rt.block_on(stub.get_token(&[]));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            Error::ProviderNotCompiled {
-                provider: "ecr",
-                feature: "ecr"
-            }
-        ));
     }
 }

@@ -52,15 +52,6 @@ pub enum Error {
         reason: String,
     },
 
-    /// An auth provider requires a feature that was not compiled in.
-    #[error("auth provider '{provider}' not compiled; rebuild with --features {feature}")]
-    ProviderNotCompiled {
-        /// The provider name (e.g. `"ecr"`).
-        provider: &'static str,
-        /// The Cargo feature required.
-        feature: &'static str,
-    },
-
     /// No credentials were found for the target registry.
     #[error("no credentials found for registry '{registry}'")]
     NoCredentials {
