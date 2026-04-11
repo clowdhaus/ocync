@@ -24,4 +24,4 @@ url = { version = "2", default-features = false }
 
 [dev-dependencies]
 serde_json.workspace = true
-tokio = { workspace = true, features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["sync", "time", "test-util", "macros", "rt"] }
