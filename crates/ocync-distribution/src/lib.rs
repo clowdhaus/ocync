@@ -8,6 +8,7 @@ pub mod blob;
 pub mod client;
 pub mod digest;
 pub mod error;
+pub mod manifest;
 pub mod reference;
 pub mod sha256;
 pub mod spec;
