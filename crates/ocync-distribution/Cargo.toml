@@ -16,6 +16,15 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+olpc-cjson.workspace = true
+tracing.workspace = true
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+tokio = { workspace = true, features = ["sync", "time"] }
+base64 = "0.22"
+dirs = "6"
+url = "2"
 
 [dev-dependencies]
 serde_json.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }

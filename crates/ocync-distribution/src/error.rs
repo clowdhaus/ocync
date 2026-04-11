@@ -43,6 +43,39 @@ pub enum Error {
     #[error("manifest deserialization failed: {0}")]
     ManifestParse(#[from] serde_json::Error),
 
+    #[error("authentication failed for registry '{registry}': {reason}")]
+    AuthFailed { registry: String, reason: String },
+
+    #[error("auth provider '{provider}' not compiled; rebuild with --features {feature}")]
+    ProviderNotCompiled {
+        provider: &'static str,
+        feature: &'static str,
+    },
+
+    #[error("no credentials found for registry '{registry}'")]
+    NoCredentials { registry: String },
+
+    #[error("credential helper '{helper}' failed: {reason}")]
+    CredentialHelperFailed { helper: String, reason: String },
+
+    #[error("HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("registry returned {status}: {message}")]
+    RegistryError { status: u16, message: String },
+
+    #[error("registry returned 401 Unauthorized for {registry}")]
+    Unauthorized { registry: String },
+
+    #[error("registry returned 403 Forbidden for {registry}/{repository}")]
+    Forbidden {
+        registry: String,
+        repository: String,
+    },
+
+    #[error("not found: {0}")]
+    NotFound(String),
+
     /// Catch-all for errors without a dedicated variant.
     #[error("{0}")]
     Other(String),

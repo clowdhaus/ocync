@@ -1,5 +1,6 @@
 //! OCI distribution client library — types, authentication, and registry operations.
 
+pub mod auth;
 pub mod digest;
 pub mod error;
 pub mod reference;
