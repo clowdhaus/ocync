@@ -1266,6 +1266,7 @@ dependencies = [
  "ocync-distribution",
  "ocync-sync",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "thiserror",
  "tokio",
@@ -1303,7 +1304,9 @@ dependencies = [
  "ocync-distribution",
  "semver",
  "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
  "uuid",
 ]

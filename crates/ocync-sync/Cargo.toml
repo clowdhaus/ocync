@@ -16,6 +16,8 @@ http.workspace = true
 ocync-distribution.workspace = true
 semver = { version = "1", default-features = false, features = ["std"] }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread"] }
 tracing = { version = "0.1", default-features = false }
 uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
