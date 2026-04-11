@@ -263,9 +263,7 @@ mod tests {
     impl MockEcrApi {
         /// Create a mock that returns the given encoded token on every call.
         fn succeeding(encoded_token: &str) -> Self {
-            let responses = std::iter::repeat(Some(encoded_token.to_owned()))
-                .take(10)
-                .collect();
+            let responses = std::iter::repeat_n(Some(encoded_token.to_owned()), 10).collect();
             Self {
                 responses: Mutex::new(responses),
             }
