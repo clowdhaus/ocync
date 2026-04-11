@@ -7,7 +7,6 @@ pub mod docker;
 
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -146,10 +145,6 @@ pub enum Credentials {
         /// The password or token.
         password: String,
     },
-    /// A pre-existing bearer token.
-    Bearer(String),
-    /// A file containing a token (read on demand).
-    TokenFile(PathBuf),
 }
 
 /// Trait for providers that can obtain authentication tokens for registries.
@@ -168,6 +163,13 @@ pub trait AuthProvider: Send + Sync {
         &self,
         scopes: &[Scope],
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>>;
+
+    /// Invalidate any cached tokens, forcing the next `get_token` call to
+    /// perform a fresh exchange.
+    ///
+    /// Called by the client when a request returns 401, indicating the
+    /// current token was rejected by the registry.
+    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 #[cfg(test)]
@@ -244,17 +246,5 @@ mod tests {
             password: "pass".into(),
         };
         assert!(matches!(creds, Credentials::Basic { .. }));
-    }
-
-    #[test]
-    fn credentials_bearer_variant() {
-        let creds = Credentials::Bearer("token123".into());
-        assert!(matches!(creds, Credentials::Bearer(_)));
-    }
-
-    #[test]
-    fn credentials_token_file_variant() {
-        let creds = Credentials::TokenFile(PathBuf::from("/tmp/token"));
-        assert!(matches!(creds, Credentials::TokenFile(_)));
     }
 }

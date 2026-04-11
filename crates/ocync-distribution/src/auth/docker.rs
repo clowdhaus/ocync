@@ -180,7 +180,7 @@ fn entry_to_credentials(entry: &AuthEntry) -> Result<Option<Credentials>, Error>
 }
 
 /// Decode a base64-encoded `username:password` string.
-pub fn decode_auth(encoded: &str) -> Result<(String, String), Error> {
+fn decode_auth(encoded: &str) -> Result<(String, String), Error> {
     let decoded = BASE64.decode(encoded).map_err(|e| Error::AuthFailed {
         registry: String::new(),
         reason: format!("invalid base64 in auth field: {e}"),
@@ -447,5 +447,84 @@ mod tests {
         assert!(is_docker_hub("https://index.docker.io/v1/"));
         assert!(!is_docker_hub("ghcr.io"));
         assert!(!is_docker_hub("quay.io"));
+    }
+
+    #[test]
+    fn empty_auth_field_returns_none() {
+        let json = r#"{
+            "auths": {
+                "ghcr.io": { "auth": "" }
+            }
+        }"#;
+        let config: DockerConfig = serde_json::from_str(json).unwrap();
+        let result = resolve_from_docker_config(&config, "ghcr.io").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn empty_auth_object_returns_none() {
+        let json = r#"{
+            "auths": {
+                "ghcr.io": {}
+            }
+        }"#;
+        let config: DockerConfig = serde_json::from_str(json).unwrap();
+        let result = resolve_from_docker_config(&config, "ghcr.io").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn decode_auth_empty_password() {
+        let encoded = BASE64.encode("user:");
+        let (user, pass) = decode_auth(&encoded).unwrap();
+        assert_eq!(user, "user");
+        assert_eq!(pass, "");
+    }
+
+    #[test]
+    fn decode_auth_empty_username() {
+        let encoded = BASE64.encode(":password");
+        let (user, pass) = decode_auth(&encoded).unwrap();
+        assert_eq!(user, "");
+        assert_eq!(pass, "password");
+    }
+
+    #[test]
+    fn config_with_unknown_fields_ignored() {
+        let json = r#"{
+            "auths": {},
+            "experimental": "enabled",
+            "proxies": { "default": {} },
+            "stackOrchestrator": "swarm"
+        }"#;
+        let config: DockerConfig = serde_json::from_str(json).unwrap();
+        assert!(config.auths.is_empty());
+    }
+
+    #[test]
+    fn cred_helper_docker_hub_alias_lookup() {
+        let json = r#"{
+            "credHelpers": {
+                "https://index.docker.io/v1/": "desktop"
+            }
+        }"#;
+        let config: DockerConfig = serde_json::from_str(json).unwrap();
+        let helper = lookup_cred_helper(&config, "docker.io");
+        assert_eq!(helper.as_deref(), Some("desktop"));
+    }
+
+    #[test]
+    fn creds_store_not_checked_when_auths_match() {
+        let json = r#"{
+            "auths": {
+                "ghcr.io": { "auth": "dXNlcjpwYXNz" }
+            },
+            "credsStore": "desktop"
+        }"#;
+        let config: DockerConfig = serde_json::from_str(json).unwrap();
+        let creds = resolve_from_docker_config(&config, "ghcr.io")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(creds, Credentials::Basic { username, .. } if username == "user"));
     }
 }

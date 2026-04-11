@@ -323,4 +323,56 @@ mod tests {
         let r2: Reference = serde_json::from_str(&json).unwrap();
         assert_eq!(r, r2);
     }
+
+    #[test]
+    fn deeply_nested_repository() {
+        let r: Reference = "ghcr.io/a/b/c/d/e/f:tag".parse().unwrap();
+        assert_eq!(r.registry(), "ghcr.io");
+        assert_eq!(r.repository(), "a/b/c/d/e/f");
+        assert_eq!(r.tag(), Some("tag"));
+    }
+
+    #[test]
+    fn ip_address_with_port() {
+        let r: Reference = "192.168.1.1:5000/repo:tag".parse().unwrap();
+        assert_eq!(r.registry(), "192.168.1.1:5000");
+        assert_eq!(r.repository(), "repo");
+        assert_eq!(r.tag(), Some("tag"));
+    }
+
+    #[test]
+    fn localhost_without_port() {
+        let r: Reference = "localhost/repo:tag".parse().unwrap();
+        assert_eq!(r.registry(), "localhost");
+        assert_eq!(r.repository(), "repo");
+        assert_eq!(r.tag(), Some("tag"));
+    }
+
+    #[test]
+    fn tag_with_special_chars() {
+        let r: Reference = "ghcr.io/repo:v1.0-beta.1_rc".parse().unwrap();
+        assert_eq!(r.tag(), Some("v1.0-beta.1_rc"));
+    }
+
+    #[test]
+    fn single_char_components() {
+        let r: Reference = "a.io/b:c".parse().unwrap();
+        assert_eq!(r.registry(), "a.io");
+        assert_eq!(r.repository(), "b");
+        assert_eq!(r.tag(), Some("c"));
+    }
+
+    #[test]
+    fn trailing_colon_empty_tag() {
+        let r: Reference = "ghcr.io/repo:".parse().unwrap();
+        assert!(r.tag().is_none());
+    }
+
+    #[test]
+    fn docker_hub_nested_user_repo() {
+        let r: Reference = "myuser/myrepo:latest".parse().unwrap();
+        assert_eq!(r.registry(), "docker.io");
+        assert_eq!(r.repository(), "myuser/myrepo");
+        assert_eq!(r.tag(), Some("latest"));
+    }
 }

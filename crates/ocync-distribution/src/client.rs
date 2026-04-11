@@ -144,7 +144,7 @@ impl RegistryClient {
     /// Perform an authenticated GET request.
     ///
     /// Acquires a semaphore permit, attaches auth headers, and retries once
-    /// on 401 (refreshing the token).
+    /// on 401 (invalidating the cached token first).
     pub async fn get(
         &self,
         repository: &str,
@@ -162,8 +162,11 @@ impl RegistryClient {
             return classify_response(resp, &self.base_url, repository).await;
         }
 
-        // 401 — refresh token and retry once.
-        tracing::debug!(url = %url, "got 401, refreshing auth token");
+        // 401 — invalidate cached token and retry once.
+        tracing::debug!(url = %url, "got 401, invalidating token and retrying");
+        if let Some(ref auth) = self.auth {
+            auth.invalidate().await;
+        }
         let resp = self.send_get(&url, &scopes, accept).await?;
         classify_response(resp, &self.base_url, repository).await
     }
@@ -182,7 +185,11 @@ impl RegistryClient {
             return classify_response(resp, &self.base_url, repository).await;
         }
 
-        tracing::debug!(url = %url, "got 401, refreshing auth token");
+        // 401 — invalidate cached token and retry once.
+        tracing::debug!(url = %url, "got 401, invalidating token and retrying");
+        if let Some(ref auth) = self.auth {
+            auth.invalidate().await;
+        }
         let resp = self.send_head(&url, &scopes).await?;
         classify_response(resp, &self.base_url, repository).await
     }
@@ -225,16 +232,6 @@ impl RegistryClient {
         }
 
         Ok(headers)
-    }
-
-    /// The underlying HTTP client (for advanced use).
-    pub fn http(&self) -> &reqwest::Client {
-        &self.http
-    }
-
-    /// A reference to the concurrency semaphore.
-    pub fn semaphore(&self) -> &Arc<Semaphore> {
-        &self.semaphore
     }
 }
 
@@ -279,7 +276,7 @@ fn build_v2_url(base: &Url) -> Result<Url, Error> {
 }
 
 /// Construct a URL for `/v2/{repository}/{path}`.
-pub fn build_url(base: &Url, repository: &str, path: &str) -> Result<Url, Error> {
+pub(crate) fn build_url(base: &Url, repository: &str, path: &str) -> Result<Url, Error> {
     let full_path = format!("/v2/{repository}/{path}");
     base.join(&full_path)
         .map_err(|e| Error::Other(format!("failed to build URL '{full_path}': {e}")))
@@ -373,7 +370,7 @@ mod tests {
             .max_concurrent(4)
             .build()
             .unwrap();
-        assert_eq!(client.semaphore().available_permits(), 4);
+        assert_eq!(client.semaphore.available_permits(), 4);
     }
 
     #[test]
