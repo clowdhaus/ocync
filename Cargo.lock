@@ -683,7 +683,10 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64",
+ "bytes",
+ "futures-util",
  "hex",
+ "http",
  "reqwest",
  "serde",
  "serde_json",

@@ -85,7 +85,7 @@ pub enum Error {
     #[error("registry returned {status}: {message}")]
     RegistryError {
         /// The HTTP status code.
-        status: u16,
+        status: http::StatusCode,
         /// The response body.
         message: String,
     },

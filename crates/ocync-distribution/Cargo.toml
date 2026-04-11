@@ -13,6 +13,9 @@ workspace = true
 [dependencies]
 aws-lc-rs.workspace = true
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+bytes = { version = "1", default-features = false }
+futures-util = { version = "0.3", default-features = false }
+http = { version = "1", default-features = false }
 hex.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 serde.workspace = true

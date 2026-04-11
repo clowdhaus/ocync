@@ -8,31 +8,114 @@ use serde::{Deserialize, Serialize};
 use crate::digest::Digest;
 use crate::error::Error;
 
-/// OCI and Docker media type constants.
-pub mod media_types {
-    /// OCI image manifest.
-    pub const OCI_IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-    /// OCI image index (multi-platform manifest list).
-    pub const OCI_IMAGE_INDEX: &str = "application/vnd.oci.image.index.v1+json";
-    /// OCI image configuration.
-    pub const OCI_IMAGE_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
-    /// OCI image layer compressed with gzip.
-    pub const OCI_IMAGE_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
-    /// OCI image layer compressed with zstd.
-    pub const OCI_IMAGE_LAYER_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
-    /// OCI non-distributable image layer compressed with gzip.
-    pub const OCI_IMAGE_LAYER_NONDISTRIBUTABLE_GZIP: &str =
-        "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip";
+/// OCI and Docker media type.
+///
+/// Known types have dedicated variants for type-safe matching.
+/// Unknown or future types are represented by [`Other`](Self::Other).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MediaType {
+    /// `application/vnd.oci.image.manifest.v1+json`
+    OciManifest,
+    /// `application/vnd.oci.image.index.v1+json`
+    OciIndex,
+    /// `application/vnd.oci.image.config.v1+json`
+    OciConfig,
+    /// `application/vnd.oci.image.layer.v1.tar+gzip`
+    OciLayerGzip,
+    /// `application/vnd.oci.image.layer.v1.tar+zstd`
+    OciLayerZstd,
+    /// `application/vnd.oci.image.layer.nondistributable.v1.tar+gzip`
+    OciLayerNondistributableGzip,
+    /// `application/vnd.docker.distribution.manifest.v2+json`
+    DockerManifestV2,
+    /// `application/vnd.docker.distribution.manifest.list.v2+json`
+    DockerManifestList,
+    /// `application/vnd.docker.container.image.v1+json`
+    DockerConfig,
+    /// `application/vnd.docker.image.rootfs.diff.tar.gzip`
+    DockerLayerGzip,
+    /// An unrecognized media type.
+    Other(String),
+}
 
-    /// Docker v2 image manifest.
-    pub const DOCKER_MANIFEST_V2: &str = "application/vnd.docker.distribution.manifest.v2+json";
-    /// Docker v2 manifest list.
-    pub const DOCKER_MANIFEST_LIST: &str =
-        "application/vnd.docker.distribution.manifest.list.v2+json";
-    /// Docker v2 image configuration.
-    pub const DOCKER_IMAGE_CONFIG: &str = "application/vnd.docker.container.image.v1+json";
-    /// Docker v2 image layer compressed with gzip.
-    pub const DOCKER_IMAGE_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+impl MediaType {
+    /// The wire-format MIME type string.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::OciManifest => "application/vnd.oci.image.manifest.v1+json",
+            Self::OciIndex => "application/vnd.oci.image.index.v1+json",
+            Self::OciConfig => "application/vnd.oci.image.config.v1+json",
+            Self::OciLayerGzip => "application/vnd.oci.image.layer.v1.tar+gzip",
+            Self::OciLayerZstd => "application/vnd.oci.image.layer.v1.tar+zstd",
+            Self::OciLayerNondistributableGzip => {
+                "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip"
+            }
+            Self::DockerManifestV2 => "application/vnd.docker.distribution.manifest.v2+json",
+            Self::DockerManifestList => "application/vnd.docker.distribution.manifest.list.v2+json",
+            Self::DockerConfig => "application/vnd.docker.container.image.v1+json",
+            Self::DockerLayerGzip => "application/vnd.docker.image.rootfs.diff.tar.gzip",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+impl fmt::Display for MediaType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for MediaType {
+    fn from(s: &str) -> Self {
+        match s {
+            "application/vnd.oci.image.manifest.v1+json" => Self::OciManifest,
+            "application/vnd.oci.image.index.v1+json" => Self::OciIndex,
+            "application/vnd.oci.image.config.v1+json" => Self::OciConfig,
+            "application/vnd.oci.image.layer.v1.tar+gzip" => Self::OciLayerGzip,
+            "application/vnd.oci.image.layer.v1.tar+zstd" => Self::OciLayerZstd,
+            "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip" => {
+                Self::OciLayerNondistributableGzip
+            }
+            "application/vnd.docker.distribution.manifest.v2+json" => Self::DockerManifestV2,
+            "application/vnd.docker.distribution.manifest.list.v2+json" => Self::DockerManifestList,
+            "application/vnd.docker.container.image.v1+json" => Self::DockerConfig,
+            "application/vnd.docker.image.rootfs.diff.tar.gzip" => Self::DockerLayerGzip,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+impl From<String> for MediaType {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "application/vnd.oci.image.manifest.v1+json" => Self::OciManifest,
+            "application/vnd.oci.image.index.v1+json" => Self::OciIndex,
+            "application/vnd.oci.image.config.v1+json" => Self::OciConfig,
+            "application/vnd.oci.image.layer.v1.tar+gzip" => Self::OciLayerGzip,
+            "application/vnd.oci.image.layer.v1.tar+zstd" => Self::OciLayerZstd,
+            "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip" => {
+                Self::OciLayerNondistributableGzip
+            }
+            "application/vnd.docker.distribution.manifest.v2+json" => Self::DockerManifestV2,
+            "application/vnd.docker.distribution.manifest.list.v2+json" => Self::DockerManifestList,
+            "application/vnd.docker.container.image.v1+json" => Self::DockerConfig,
+            "application/vnd.docker.image.rootfs.diff.tar.gzip" => Self::DockerLayerGzip,
+            _ => Self::Other(s),
+        }
+    }
+}
+
+impl Serialize for MediaType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MediaType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(MediaType::from(s))
+    }
 }
 
 /// OCI content descriptor.
@@ -40,7 +123,7 @@ pub mod media_types {
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
     /// MIME type of the referenced content.
-    pub media_type: String,
+    pub media_type: MediaType,
     /// Content-addressable digest of the referenced content.
     pub digest: Digest,
     /// Size of the referenced content in bytes.
@@ -98,7 +181,7 @@ pub struct ImageManifest {
     /// Must be `2` for OCI image manifests.
     pub schema_version: u32,
     /// Media type of this manifest.
-    pub media_type: Option<String>,
+    pub media_type: Option<MediaType>,
     /// Image configuration descriptor.
     pub config: Descriptor,
     /// Ordered list of layer descriptors.
@@ -124,7 +207,7 @@ pub struct ImageIndex {
     /// Must be `2` for OCI image indexes.
     pub schema_version: u32,
     /// Media type of this index.
-    pub media_type: Option<String>,
+    pub media_type: Option<MediaType>,
     /// List of platform-specific manifest descriptors.
     pub manifests: Vec<Descriptor>,
 
@@ -152,18 +235,18 @@ pub enum ManifestKind {
 
 impl ManifestKind {
     /// Deserialize a manifest from JSON bytes, using the media type to discriminate.
-    pub fn from_json(media_type: &str, bytes: &[u8]) -> Result<Self, Error> {
+    pub fn from_json(media_type: &MediaType, bytes: &[u8]) -> Result<Self, Error> {
         match media_type {
-            media_types::OCI_IMAGE_MANIFEST | media_types::DOCKER_MANIFEST_V2 => {
+            MediaType::OciManifest | MediaType::DockerManifestV2 => {
                 let m: ImageManifest = serde_json::from_slice(bytes)?;
                 Ok(Self::Image(Box::new(m)))
             }
-            media_types::OCI_IMAGE_INDEX | media_types::DOCKER_MANIFEST_LIST => {
+            MediaType::OciIndex | MediaType::DockerManifestList => {
                 let m: ImageIndex = serde_json::from_slice(bytes)?;
                 Ok(Self::Index(Box::new(m)))
             }
             _ => Err(Error::UnsupportedMediaType {
-                media_type: media_type.to_owned(),
+                media_type: media_type.to_string(),
             }),
         }
     }
@@ -207,10 +290,61 @@ mod tests {
         })
     }
 
+    // -- MediaType tests --
+
+    #[test]
+    fn media_type_from_known_string() {
+        assert_eq!(
+            MediaType::from("application/vnd.oci.image.manifest.v1+json"),
+            MediaType::OciManifest
+        );
+        assert_eq!(
+            MediaType::from("application/vnd.docker.distribution.manifest.v2+json"),
+            MediaType::DockerManifestV2
+        );
+    }
+
+    #[test]
+    fn media_type_from_unknown_string() {
+        let mt = MediaType::from("text/plain");
+        assert_eq!(mt, MediaType::Other("text/plain".to_owned()));
+        assert_eq!(mt.as_str(), "text/plain");
+    }
+
+    #[test]
+    fn media_type_display() {
+        assert_eq!(
+            MediaType::OciManifest.to_string(),
+            "application/vnd.oci.image.manifest.v1+json"
+        );
+        assert_eq!(
+            MediaType::Other("custom/type".into()).to_string(),
+            "custom/type"
+        );
+    }
+
+    #[test]
+    fn media_type_serde_roundtrip() {
+        let mt = MediaType::OciManifest;
+        let json = serde_json::to_string(&mt).unwrap();
+        assert_eq!(json, r#""application/vnd.oci.image.manifest.v1+json""#);
+        let parsed: MediaType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, mt);
+    }
+
+    #[test]
+    fn media_type_serde_unknown() {
+        let json = r#""application/x-custom""#;
+        let mt: MediaType = serde_json::from_str(json).unwrap();
+        assert_eq!(mt, MediaType::Other("application/x-custom".into()));
+    }
+
+    // -- Descriptor tests --
+
     #[test]
     fn deserialize_descriptor() {
         let d: Descriptor = serde_json::from_value(test_descriptor()).unwrap();
-        assert_eq!(d.media_type, media_types::OCI_IMAGE_CONFIG);
+        assert_eq!(d.media_type, MediaType::OciConfig);
         assert_eq!(d.digest.to_string(), TEST_DIGEST);
         assert_eq!(d.size, 1234);
         assert!(d.platform.is_none());
@@ -255,13 +389,13 @@ mod tests {
     fn deserialize_image_manifest() {
         let json = serde_json::json!({
             "schemaVersion": 2,
-            "mediaType": media_types::OCI_IMAGE_MANIFEST,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": test_descriptor(),
             "layers": [test_layer_descriptor()]
         });
         let m: ImageManifest = serde_json::from_value(json).unwrap();
         assert_eq!(m.schema_version, 2);
-        assert_eq!(m.config.media_type, media_types::OCI_IMAGE_CONFIG);
+        assert_eq!(m.config.media_type, MediaType::OciConfig);
         assert_eq!(m.layers.len(), 1);
     }
 
@@ -269,9 +403,9 @@ mod tests {
     fn deserialize_image_index() {
         let json = serde_json::json!({
             "schemaVersion": 2,
-            "mediaType": media_types::OCI_IMAGE_INDEX,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
             "manifests": [{
-                "mediaType": media_types::OCI_IMAGE_MANIFEST,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
                 "digest": TEST_DIGEST,
                 "size": 1000,
                 "platform": {
@@ -294,7 +428,7 @@ mod tests {
             "layers": [test_layer_descriptor()]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(media_types::OCI_IMAGE_MANIFEST, &bytes).unwrap();
+        let m = ManifestKind::from_json(&MediaType::OciManifest, &bytes).unwrap();
         assert!(matches!(m, ManifestKind::Image(_)));
     }
 
@@ -306,7 +440,7 @@ mod tests {
             "layers": [test_layer_descriptor()]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(media_types::DOCKER_MANIFEST_V2, &bytes).unwrap();
+        let m = ManifestKind::from_json(&MediaType::DockerManifestV2, &bytes).unwrap();
         assert!(matches!(m, ManifestKind::Image(_)));
     }
 
@@ -315,19 +449,19 @@ mod tests {
         let json = serde_json::json!({
             "schemaVersion": 2,
             "manifests": [{
-                "mediaType": media_types::OCI_IMAGE_MANIFEST,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
                 "digest": TEST_DIGEST,
                 "size": 1000
             }]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(media_types::OCI_IMAGE_INDEX, &bytes).unwrap();
+        let m = ManifestKind::from_json(&MediaType::OciIndex, &bytes).unwrap();
         assert!(matches!(m, ManifestKind::Index(_)));
     }
 
     #[test]
     fn manifest_from_json_unsupported() {
-        let r = ManifestKind::from_json("text/plain", b"{}");
+        let r = ManifestKind::from_json(&MediaType::Other("text/plain".into()), b"{}");
         assert!(r.is_err());
     }
 
@@ -339,7 +473,7 @@ mod tests {
             "layers": [test_layer_descriptor()]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(media_types::OCI_IMAGE_MANIFEST, &bytes).unwrap();
+        let m = ManifestKind::from_json(&MediaType::OciManifest, &bytes).unwrap();
         let digests = m.referenced_digests();
         assert_eq!(digests.len(), 2); // config + 1 layer
     }
@@ -350,19 +484,19 @@ mod tests {
             "schemaVersion": 2,
             "manifests": [
                 {
-                    "mediaType": media_types::OCI_IMAGE_MANIFEST,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "digest": TEST_DIGEST,
                     "size": 1000
                 },
                 {
-                    "mediaType": media_types::OCI_IMAGE_MANIFEST,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "digest": TEST_DIGEST,
                     "size": 2000
                 }
             ]
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(media_types::OCI_IMAGE_INDEX, &bytes).unwrap();
+        let m = ManifestKind::from_json(&MediaType::OciIndex, &bytes).unwrap();
         let digests = m.referenced_digests();
         assert_eq!(digests.len(), 2);
     }
@@ -383,10 +517,23 @@ mod tests {
     }
 
     #[test]
-    fn media_type_constants() {
-        assert!(media_types::OCI_IMAGE_MANIFEST.contains("oci"));
-        assert!(media_types::DOCKER_MANIFEST_V2.contains("docker"));
-        assert!(media_types::OCI_IMAGE_INDEX.contains("index"));
-        assert!(media_types::DOCKER_MANIFEST_LIST.contains("list"));
+    fn media_type_all_known_variants_roundtrip() {
+        let known = [
+            MediaType::OciManifest,
+            MediaType::OciIndex,
+            MediaType::OciConfig,
+            MediaType::OciLayerGzip,
+            MediaType::OciLayerZstd,
+            MediaType::OciLayerNondistributableGzip,
+            MediaType::DockerManifestV2,
+            MediaType::DockerManifestList,
+            MediaType::DockerConfig,
+            MediaType::DockerLayerGzip,
+        ];
+        for mt in &known {
+            let s = mt.as_str();
+            let parsed = MediaType::from(s);
+            assert_eq!(&parsed, mt, "roundtrip failed for {s}");
+        }
     }
 }

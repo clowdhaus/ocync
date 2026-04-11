@@ -1,7 +1,6 @@
 //! HTTP client for a single OCI registry endpoint.
 
-use std::sync::Arc;
-
+use http::StatusCode;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use tokio::sync::Semaphore;
 use url::Url;
@@ -78,7 +77,7 @@ impl RegistryClientBuilder {
             base_url: self.url,
             http,
             auth: self.auth,
-            semaphore: Arc::new(Semaphore::new(self.max_concurrent)),
+            semaphore: Semaphore::new(self.max_concurrent),
             chunk_size: self.chunk_size,
         })
     }
@@ -89,11 +88,11 @@ impl RegistryClientBuilder {
 /// Each `RegistryClient` targets one registry host and owns its auth provider
 /// and concurrency semaphore. Construct via [`RegistryClientBuilder`].
 pub struct RegistryClient {
-    base_url: Url,
-    http: reqwest::Client,
-    auth: Option<Box<dyn AuthProvider>>,
-    semaphore: Arc<Semaphore>,
-    chunk_size: usize,
+    pub(crate) base_url: Url,
+    pub(crate) http: reqwest::Client,
+    pub(crate) auth: Option<Box<dyn AuthProvider>>,
+    pub(crate) semaphore: Semaphore,
+    pub(crate) chunk_size: usize,
 }
 
 impl std::fmt::Debug for RegistryClient {
@@ -130,14 +129,11 @@ impl RegistryClient {
         let resp = self.http.get(url).send().await?;
         let status = resp.status();
 
-        if status.is_success() || status.as_u16() == 401 {
+        if status.is_success() || status == StatusCode::UNAUTHORIZED {
             Ok(())
         } else {
             let message = resp.text().await.unwrap_or_default();
-            Err(Error::RegistryError {
-                status: status.as_u16(),
-                message,
-            })
+            Err(Error::RegistryError { status, message })
         }
     }
 
@@ -153,21 +149,19 @@ impl RegistryClient {
     ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
-
         let scopes = [Scope::pull(repository)];
 
-        // First attempt.
-        let resp = self.send_get(&url, &scopes, accept).await?;
-        if resp.status().as_u16() != 401 {
-            return classify_response(resp, &self.base_url, repository).await;
-        }
+        let resp = self
+            .send_with_retry(&scopes, "GET", |mut headers| {
+                if let Some(accept) = accept {
+                    if let Ok(val) = HeaderValue::from_str(accept) {
+                        headers.insert(ACCEPT, val);
+                    }
+                }
+                self.http.get(url.clone()).headers(headers)
+            })
+            .await?;
 
-        // 401 — invalidate cached token and retry once.
-        tracing::debug!(url = %url, "got 401, invalidating token and retrying");
-        if let Some(ref auth) = self.auth {
-            auth.invalidate().await;
-        }
-        let resp = self.send_get(&url, &scopes, accept).await?;
         classify_response(resp, &self.base_url, repository).await
     }
 
@@ -177,48 +171,54 @@ impl RegistryClient {
     pub async fn head(&self, repository: &str, path: &str) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
-
         let scopes = [Scope::pull(repository)];
 
-        let resp = self.send_head(&url, &scopes).await?;
-        if resp.status().as_u16() != 401 {
-            return classify_response(resp, &self.base_url, repository).await;
-        }
+        let resp = self
+            .send_with_retry(&scopes, "HEAD", |headers| {
+                self.http.head(url.clone()).headers(headers)
+            })
+            .await?;
 
-        // 401 — invalidate cached token and retry once.
-        tracing::debug!(url = %url, "got 401, invalidating token and retrying");
-        if let Some(ref auth) = self.auth {
-            auth.invalidate().await;
-        }
-        let resp = self.send_head(&url, &scopes).await?;
         classify_response(resp, &self.base_url, repository).await
     }
 
-    /// Internal: send a GET with auth headers.
-    async fn send_get(
+    /// Send a request with 401 retry and token invalidation.
+    ///
+    /// Builds the request via `build_request` (called with fresh auth headers),
+    /// sends it, and if a 401 is returned, invalidates the cached token and
+    /// retries once. Does NOT acquire a semaphore permit — callers manage their
+    /// own permits.
+    pub(crate) async fn send_with_retry(
         &self,
-        url: &Url,
         scopes: &[Scope],
-        accept: Option<&str>,
+        context: &str,
+        build_request: impl Fn(HeaderMap) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, Error> {
-        let mut headers = self.auth_headers(scopes).await?;
-        if let Some(accept) = accept {
-            if let Ok(val) = HeaderValue::from_str(accept) {
-                headers.insert(ACCEPT, val);
-            }
+        let headers = self.auth_headers(scopes).await?;
+        let resp = build_request(headers).send().await?;
+
+        if resp.status() != StatusCode::UNAUTHORIZED {
+            return Ok(resp);
         }
 
-        Ok(self.http.get(url.clone()).headers(headers).send().await?)
+        tracing::debug!(context, "got 401, invalidating token and retrying");
+        self.invalidate_auth().await;
+        let headers = self.auth_headers(scopes).await?;
+        Ok(build_request(headers).send().await?)
     }
 
-    /// Internal: send a HEAD with auth headers.
-    async fn send_head(&self, url: &Url, scopes: &[Scope]) -> Result<reqwest::Response, Error> {
-        let headers = self.auth_headers(scopes).await?;
-        Ok(self.http.head(url.clone()).headers(headers).send().await?)
+    /// Invalidate the cached auth token.
+    ///
+    /// Call this before retrying a request after a 401 response so the auth
+    /// provider fetches a fresh token instead of returning the stale one.
+    pub(crate) async fn invalidate_auth(&self) {
+        if let Some(ref auth) = self.auth {
+            auth.invalidate().await;
+        }
     }
 
     /// Build auth headers for a request.
-    async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
+    pub(crate) async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
         let mut headers = HeaderMap::new();
 
         if let Some(ref auth) = self.auth {
@@ -249,22 +249,19 @@ async fn classify_response(
 
     let registry = base_url.host_str().unwrap_or("unknown").to_owned();
 
-    match status.as_u16() {
-        401 => Err(Error::Unauthorized { registry }),
-        403 => Err(Error::Forbidden {
+    match status {
+        StatusCode::UNAUTHORIZED => Err(Error::Unauthorized { registry }),
+        StatusCode::FORBIDDEN => Err(Error::Forbidden {
             registry,
             repository: repository.to_owned(),
         }),
-        404 => {
+        StatusCode::NOT_FOUND => {
             let message = resp.text().await.unwrap_or_default();
             Err(Error::NotFound(message))
         }
         _ => {
             let message = resp.text().await.unwrap_or_default();
-            Err(Error::RegistryError {
-                status: status.as_u16(),
-                message,
-            })
+            Err(Error::RegistryError { status, message })
         }
     }
 }
