@@ -1,3 +1,5 @@
+//! Error types for OCI distribution operations.
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

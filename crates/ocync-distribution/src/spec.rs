@@ -1,3 +1,5 @@
+//! OCI image spec types — manifests, descriptors, and platforms.
+
 use std::collections::HashMap;
 use std::fmt;
 

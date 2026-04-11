@@ -1,3 +1,5 @@
+//! OCI content-addressable digest in `algorithm:hex` format.
+
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;

@@ -1,3 +1,5 @@
+//! OCI image reference parser (`registry/repository:tag@digest`).
+
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;

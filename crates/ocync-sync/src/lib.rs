@@ -1,1 +1,1 @@
-// Sync orchestration — implemented in later PRs.
+//! Sync orchestration for copying OCI images between registries.

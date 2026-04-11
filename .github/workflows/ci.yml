@@ -1,17 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - ".github/workflows/ci.yml"
-      - ".github/actions/setup-rust/**"
-      - "clippy.toml"
-      - "rustfmt.toml"
-      - "deny.toml"
   pull_request:
     paths:
       - "**/*.rs"
@@ -67,7 +56,6 @@ jobs:
   test-arm64:
     name: Test (linux-arm64)
     runs-on: ubuntu-24.04-arm
-    if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
