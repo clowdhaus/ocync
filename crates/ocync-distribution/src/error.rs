@@ -2,23 +2,48 @@
 
 use thiserror::Error;
 
+/// Errors returned by OCI distribution operations.
 #[derive(Debug, Error)]
 pub enum DistributionError {
+    /// The image reference string could not be parsed.
     #[error("invalid image reference '{input}': {reason}")]
-    InvalidReference { input: String, reason: String },
+    InvalidReference {
+        /// The raw reference string that failed to parse.
+        input: String,
+        /// Why the reference is invalid.
+        reason: String,
+    },
 
+    /// The digest string could not be parsed.
     #[error("invalid digest '{digest}': {reason}")]
-    InvalidDigest { digest: String, reason: String },
+    InvalidDigest {
+        /// The raw digest string that failed to parse.
+        digest: String,
+        /// Why the digest is invalid.
+        reason: String,
+    },
 
+    /// A fetched digest did not match the expected value.
     #[error("digest mismatch: expected {expected}, got {actual}")]
-    DigestMismatch { expected: String, actual: String },
+    DigestMismatch {
+        /// The digest that was expected.
+        expected: String,
+        /// The digest that was computed.
+        actual: String,
+    },
 
+    /// The manifest media type is not recognized.
     #[error("unsupported manifest media type: {media_type}")]
-    UnsupportedMediaType { media_type: String },
+    UnsupportedMediaType {
+        /// The unrecognized media type string.
+        media_type: String,
+    },
 
+    /// A manifest could not be deserialized from JSON.
     #[error("manifest deserialization failed: {0}")]
     ManifestParse(#[from] serde_json::Error),
 
+    /// Catch-all for errors without a dedicated variant.
     #[error("{0}")]
     Other(String),
 }

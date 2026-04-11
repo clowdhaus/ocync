@@ -41,18 +41,22 @@ impl Reference {
         }
     }
 
+    /// The registry hostname (e.g. `docker.io`, `ghcr.io`).
     pub fn registry(&self) -> &str {
         &self.registry
     }
 
+    /// The repository path (e.g. `library/nginx`, `clowdhaus/ocync`).
     pub fn repository(&self) -> &str {
         &self.repository
     }
 
+    /// The tag, if present (e.g. `latest`, `v1.0`).
     pub fn tag(&self) -> Option<&str> {
         self.tag.as_deref()
     }
 
+    /// The digest, if present.
     pub fn digest(&self) -> Option<&Digest> {
         self.digest.as_ref()
     }

@@ -1,54 +1,35 @@
-//! SHA-256 wrapper that delegates to `sha2` by default or `aws-lc-rs` under `--features fips`.
+//! SHA-256 wrapper backed by aws-lc-rs (FIPS 140-3 validated, NIST Certificate #4816).
 
 /// SHA-256 hasher.
 pub struct Sha256 {
-    #[cfg(not(feature = "fips"))]
-    inner: sha2::Sha256,
-    #[cfg(feature = "fips")]
     inner: aws_lc_rs::digest::Context,
+}
+
+impl std::fmt::Debug for Sha256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sha256").finish_non_exhaustive()
+    }
 }
 
 impl Sha256 {
     /// Create a new SHA-256 hasher.
     pub fn new() -> Self {
         Self {
-            #[cfg(not(feature = "fips"))]
-            inner: {
-                use sha2::Digest;
-                sha2::Sha256::new()
-            },
-            #[cfg(feature = "fips")]
             inner: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
         }
     }
 
     /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
-        #[cfg(not(feature = "fips"))]
-        {
-            use sha2::Digest;
-            self.inner.update(data);
-        }
-        #[cfg(feature = "fips")]
-        {
-            self.inner.update(data);
-        }
+        self.inner.update(data);
     }
 
     /// Finalize and return the 32-byte SHA-256 hash.
     pub fn finalize(self) -> [u8; 32] {
-        #[cfg(not(feature = "fips"))]
-        {
-            use sha2::Digest;
-            self.inner.finalize().into()
-        }
-        #[cfg(feature = "fips")]
-        {
-            let result = self.inner.finish();
-            let mut out = [0u8; 32];
-            out.copy_from_slice(result.as_ref());
-            out
-        }
+        let result = self.inner.finish();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(result.as_ref());
+        out
     }
 
     /// Convenience: hash `data` in one shot and return the 32-byte digest.

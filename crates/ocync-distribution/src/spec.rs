@@ -10,20 +10,28 @@ use crate::error::DistributionError;
 
 /// OCI and Docker media type constants.
 pub mod media_types {
-    // OCI image spec
+    /// OCI image manifest.
     pub const OCI_IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+    /// OCI image index (multi-platform manifest list).
     pub const OCI_IMAGE_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+    /// OCI image configuration.
     pub const OCI_IMAGE_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
+    /// OCI image layer compressed with gzip.
     pub const OCI_IMAGE_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+    /// OCI image layer compressed with zstd.
     pub const OCI_IMAGE_LAYER_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+    /// OCI non-distributable image layer compressed with gzip.
     pub const OCI_IMAGE_LAYER_NONDISTRIBUTABLE_GZIP: &str =
         "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip";
 
-    // Docker v2
+    /// Docker v2 image manifest.
     pub const DOCKER_MANIFEST_V2: &str = "application/vnd.docker.distribution.manifest.v2+json";
+    /// Docker v2 manifest list.
     pub const DOCKER_MANIFEST_LIST: &str =
         "application/vnd.docker.distribution.manifest.list.v2+json";
+    /// Docker v2 image configuration.
     pub const DOCKER_IMAGE_CONFIG: &str = "application/vnd.docker.container.image.v1+json";
+    /// Docker v2 image layer compressed with gzip.
     pub const DOCKER_IMAGE_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 }
 
@@ -31,16 +39,22 @@ pub mod media_types {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Descriptor {
+    /// MIME type of the referenced content.
     pub media_type: String,
+    /// Content-addressable digest of the referenced content.
     pub digest: Digest,
-    pub size: i64,
+    /// Size of the referenced content in bytes.
+    pub size: u64,
 
+    /// Target platform, used in image index entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
 
+    /// Artifact type when the descriptor references an artifact.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_type: Option<String>,
 
+    /// Arbitrary metadata as key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
@@ -49,15 +63,20 @@ pub struct Descriptor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct Platform {
+    /// CPU architecture (e.g. `amd64`, `arm64`).
     pub architecture: String,
+    /// Operating system (e.g. `linux`, `windows`).
     pub os: String,
 
+    /// CPU variant (e.g. `v8` for `arm64`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
 
+    /// OS version (e.g. `10.0.17763.1999` for Windows).
     #[serde(rename = "os.version", skip_serializing_if = "Option::is_none")]
     pub os_version: Option<String>,
 
+    /// Required OS features.
     #[serde(rename = "os.features", skip_serializing_if = "Option::is_none")]
     pub os_features: Option<Vec<String>>,
 }
@@ -76,17 +95,24 @@ impl fmt::Display for Platform {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageManifest {
+    /// Must be `2` for OCI image manifests.
     pub schema_version: u32,
+    /// Media type of this manifest.
     pub media_type: Option<String>,
+    /// Image configuration descriptor.
     pub config: Descriptor,
+    /// Ordered list of layer descriptors.
     pub layers: Vec<Descriptor>,
 
+    /// Subject descriptor for referrers API.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<Descriptor>,
 
+    /// Artifact type when this manifest represents an artifact.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_type: Option<String>,
 
+    /// Arbitrary metadata as key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
@@ -95,16 +121,22 @@ pub struct ImageManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageIndex {
+    /// Must be `2` for OCI image indexes.
     pub schema_version: u32,
+    /// Media type of this index.
     pub media_type: Option<String>,
+    /// List of platform-specific manifest descriptors.
     pub manifests: Vec<Descriptor>,
 
+    /// Subject descriptor for referrers API.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<Descriptor>,
 
+    /// Artifact type when this index represents an artifact.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_type: Option<String>,
 
+    /// Arbitrary metadata as key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
 }
@@ -112,7 +144,9 @@ pub struct ImageIndex {
 /// A parsed manifest — either a single image or a multi-platform index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Manifest {
+    /// A single-platform image manifest.
     Image(Box<ImageManifest>),
+    /// A multi-platform image index.
     Index(Box<ImageIndex>),
 }
 
@@ -134,11 +168,11 @@ impl Manifest {
         }
     }
 
-    /// Return the digests of all blobs referenced by this manifest.
+    /// Return the digests of all content referenced by this manifest.
     ///
     /// For an image manifest this includes the config and all layers.
     /// For an index this includes the digests of the child manifests.
-    pub fn blob_digests(&self) -> Vec<&Digest> {
+    pub fn referenced_digests(&self) -> Vec<&Digest> {
         match self {
             Self::Image(m) => {
                 let mut digests = vec![&m.config.digest];
@@ -297,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_digests_image() {
+    fn referenced_digests_image() {
         let json = serde_json::json!({
             "schemaVersion": 2,
             "config": test_descriptor(),
@@ -305,12 +339,12 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&json).unwrap();
         let m = Manifest::from_json(media_types::OCI_IMAGE_MANIFEST, &bytes).unwrap();
-        let digests = m.blob_digests();
+        let digests = m.referenced_digests();
         assert_eq!(digests.len(), 2); // config + 1 layer
     }
 
     #[test]
-    fn blob_digests_index() {
+    fn referenced_digests_index() {
         let json = serde_json::json!({
             "schemaVersion": 2,
             "manifests": [
@@ -328,7 +362,7 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&json).unwrap();
         let m = Manifest::from_json(media_types::OCI_IMAGE_INDEX, &bytes).unwrap();
-        let digests = m.blob_digests();
+        let digests = m.referenced_digests();
         assert_eq!(digests.len(), 2);
     }
 
