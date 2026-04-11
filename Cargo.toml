@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/clowdhaus/ocync"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+aws-lc-rs = "1"
+thiserror = "2"
+olpc-cjson = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+ocync-distribution = { path = "crates/ocync-distribution" }
+ocync-sync = { path = "crates/ocync-sync" }
+
+[package]
+name = "ocync"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OCI registry sync tool"
+
+[dependencies]
+ocync-distribution.workspace = true
+ocync-sync.workspace = true
+tokio.workspace = true
