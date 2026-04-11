@@ -2,7 +2,9 @@ pub mod anonymous;
 pub mod docker;
 
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use crate::error::DistributionError;
@@ -137,16 +139,20 @@ pub enum Credentials {
 
 /// Trait for providers that can obtain authentication tokens for registries.
 ///
+/// Uses `Pin<Box<dyn Future>>` for object safety, allowing `Box<dyn AuthProvider>`.
 /// Implementations must be `Send + Sync` for use across async tasks.
 pub trait AuthProvider: Send + Sync {
     /// Human-readable name of this provider (e.g. "anonymous", "docker-config").
     fn name(&self) -> &'static str;
 
     /// Obtain a bearer token valid for the given scopes.
+    ///
+    /// The `scopes` slice is converted to owned data before the future is created,
+    /// so callers don't need to worry about borrow lifetimes.
     fn get_token(
         &self,
         scopes: &[Scope],
-    ) -> impl std::future::Future<Output = Result<Token, DistributionError>> + Send;
+    ) -> Pin<Box<dyn Future<Output = Result<Token, DistributionError>> + Send + '_>>;
 }
 
 #[cfg(test)]

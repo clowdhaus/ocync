@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -35,7 +37,17 @@ impl AuthProvider for AnonymousAuth {
         "anonymous"
     }
 
-    async fn get_token(&self, scopes: &[Scope]) -> Result<Token, DistributionError> {
+    fn get_token(
+        &self,
+        scopes: &[Scope],
+    ) -> Pin<Box<dyn Future<Output = Result<Token, DistributionError>> + Send + '_>> {
+        let scopes = scopes.to_vec();
+        Box::pin(async move { self.get_token_inner(&scopes).await })
+    }
+}
+
+impl AnonymousAuth {
+    async fn get_token_inner(&self, scopes: &[Scope]) -> Result<Token, DistributionError> {
         // Check cached token first.
         {
             let cached = self.cached_token.read().await;
@@ -57,9 +69,7 @@ impl AuthProvider for AnonymousAuth {
 
         Ok(token)
     }
-}
 
-impl AnonymousAuth {
     /// Ping the registry's `/v2/` endpoint, parse the WWW-Authenticate header,
     /// then exchange for a token.
     async fn exchange_token(&self, scopes: &[Scope]) -> Result<Token, DistributionError> {
