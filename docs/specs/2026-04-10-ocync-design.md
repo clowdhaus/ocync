@@ -352,6 +352,62 @@ recompress_level: 3              # zstd compression level (1-22, default: 3)
 
 **Dependencies:** `flate2` (gzip), `zstd` crate (zstd compression/decompression).
 
+### Registry-Specific Optimizations
+
+The standard OCI Distribution API is single-resource per request — no batch endpoints exist in the spec. However, ECR exposes native AWS APIs that dramatically reduce round-trips during the planning phase. ocync uses these when available, falling back to standard OCI calls for other registries.
+
+#### ECR Batch APIs (feature-gated behind `ecr`)
+
+When the target or source is an ECR registry, ocync uses the AWS SDK instead of individual OCI HEAD/GET calls for discovery:
+
+| ECR API | Replaces | Max per batch | Savings |
+|---|---|---|---|
+| `BatchCheckLayerAvailability` | `HEAD /v2/{repo}/blobs/{digest}` (1 per layer) | 100 digests | 200 HEAD calls → 2 batch calls |
+| `BatchGetImage` | `GET /v2/{repo}/manifests/{ref}` (1 per image) | 100 image IDs | 50 GET calls → 1 batch call |
+| `DescribeImages` | `HEAD /v2/{repo}/manifests/{tag}` (1 per tag) | 100 image IDs | Bulk digest+size for all images |
+| `ListImages` | `GET /v2/{repo}/tags/list` + N HEADs | 1000 per page | Tag+digest pairs in one call |
+
+**Planning phase with ECR batch APIs:**
+
+```
+1. ListImages on destination repo → all tag+digest pairs (1 paginated call)
+2. Compare with source tag list → identify tags needing sync
+3. BatchGetImage on source → pull all needed manifests at once (1-2 calls)
+4. Collect all blob digests from manifests
+5. BatchCheckLayerAvailability on destination → find missing blobs (2-3 calls)
+6. Build transfer plan from results
+```
+
+For 50 images with 200 unique layers, this replaces ~300 individual OCI API calls with ~6 batch calls — **98% fewer round-trips in the planning phase**.
+
+**ECR-specific constraints:**
+
+- `PutImage` has **no batch equivalent** and is rate-limited to **10 TPS** (adjustable via Service Quotas). This is the bottleneck for manifest pushes — 50 images takes a minimum of 5 seconds.
+- `BatchGetImage` is **not available on ECR Public** (`public.ecr.aws`). ECR Public source registries fall back to standard OCI manifest GETs.
+- All batch APIs are **regional** — cross-region requires separate calls per region.
+- Cross-account batch calls require repository policies granting the caller's IAM principal the relevant `ecr:Batch*` actions.
+- `InitiateLayerUpload` (100 TPS) and `CompleteLayerUpload` (100 TPS) are the upload-phase bottlenecks. `UploadLayerPart` is 500 TPS.
+
+**Implementation:** The `RegistryClient` detects ECR endpoints by hostname pattern (`*.dkr.ecr.*.amazonaws.com`) and delegates discovery operations to the AWS SDK when the `ecr` feature is enabled. The sync orchestrator calls a `plan()` trait method that ECR implements with batch APIs and other registries implement with standard OCI calls.
+
+#### Registry Capability Matrix
+
+| Registry | Cross-repo blob mount | Batch discovery APIs | Chunked upload | HEAD-free rate limit |
+|---|---|---|---|---|
+| **ECR (private)** | Yes (same account/region, opt-in) | Yes (`BatchCheck`, `BatchGet`, `ListImages`) | Yes | N/A (no pull limits) |
+| **ECR Public** | Yes | Partial (`BatchCheck` only, no `BatchGet`) | Yes | N/A |
+| **Docker Hub** | Yes | No | Yes | HEAD requests are free (don't count toward pull limits) |
+| **GAR** | Likely unsupported | No | **Monolithic only** | N/A |
+| **GHCR** | Yes (implicit global dedup) | No | Monolithic in practice | N/A |
+| **ACR** | Yes | No | Yes | N/A |
+| **Harbor** | Yes | No | Yes | N/A |
+| **Quay.io** | Unconfirmed | No | Yes | N/A |
+| **Chainguard** | Unconfirmed | No | Unknown | No rate limits |
+
+**GAR monolithic upload constraint:** GAR does not support chunked (`PATCH`) uploads. The blob upload pipeline must detect GAR endpoints and use monolithic `POST`+`PUT` (buffer entire blob in memory). This increases memory usage for large layers but is unavoidable.
+
+**Docker Hub rate limit awareness:** Docker Hub returns `ratelimit-limit` and `ratelimit-remaining` headers on manifest responses. ocync parses these and exposes them in sync reports. HEAD requests do NOT count toward the pull limit — this validates the HEAD-first `skip_existing` design.
+
 ---
 
 ## Rate Limiting and Retry
