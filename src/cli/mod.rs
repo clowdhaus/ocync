@@ -6,8 +6,9 @@ pub(crate) mod config;
 pub(crate) mod output;
 pub(crate) mod shutdown;
 
-use crate::{Cli, LogFormat};
 use tracing_subscriber::{EnvFilter, fmt};
+
+use crate::{Cli, LogFormat};
 
 /// Initialize the tracing subscriber based on CLI flags and environment.
 ///

@@ -1,6 +1,7 @@
 //! Docker `config.json` credential resolution and helper execution.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -46,8 +47,8 @@ pub struct AuthEntry {
     pub password: Option<String>,
 }
 
-impl std::fmt::Debug for AuthEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for AuthEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthEntry")
             .field("auth", &"[REDACTED]")
             .field("username", &self.username)
