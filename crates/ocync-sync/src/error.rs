@@ -45,16 +45,7 @@ pub enum Error {
         source: ocync_distribution::Error,
     },
 
-    /// A blob pull failed during sync.
-    #[error("blob pull failed for {digest}: {source}")]
-    BlobPull {
-        /// The digest of the blob that could not be pulled.
-        digest: String,
-        /// The underlying distribution error.
-        source: ocync_distribution::Error,
-    },
-
-    /// A blob push failed during sync.
+    /// A blob transfer (pull or push) failed during sync.
     #[error("blob push failed for {digest}: {source}")]
     BlobPush {
         /// The digest of the blob that could not be pushed.
@@ -68,9 +59,7 @@ impl Error {
     /// Extract the HTTP status code from the underlying distribution error, if any.
     pub fn status_code(&self) -> Option<http::StatusCode> {
         match self {
-            Self::Manifest { source, .. }
-            | Self::BlobPull { source, .. }
-            | Self::BlobPush { source, .. } => source.status_code(),
+            Self::Manifest { source, .. } | Self::BlobPush { source, .. } => source.status_code(),
             _ => None,
         }
     }
@@ -138,20 +127,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("latest"));
         assert!(msg.contains("manifest"));
-    }
-
-    #[test]
-    fn display_blob_pull_error() {
-        let err = Error::BlobPull {
-            digest: "sha256:abc".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::NOT_FOUND,
-                message: "missing".into(),
-            },
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("sha256:abc"));
-        assert!(msg.contains("blob pull"));
     }
 
     #[test]

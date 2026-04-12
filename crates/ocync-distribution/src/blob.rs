@@ -75,7 +75,7 @@ impl RegistryClient {
         &self,
         repository: &str,
         digest: &Digest,
-    ) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>>, Error> {
+    ) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>> + 'static, Error> {
         let path = blob_path(digest);
         let resp = self.get(repository, &path, None).await?;
         Ok(resp.bytes_stream())

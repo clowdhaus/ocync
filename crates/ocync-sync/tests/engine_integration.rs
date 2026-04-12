@@ -121,9 +121,9 @@ async fn mount_blob_exists(server: &MockServer, repo: &str, digest: &Digest) {
         .await;
 }
 
-/// Mount mock for blob push: POST initiate + PUT upload.
+/// Mount mock for blob push: POST initiate + PATCH chunked data + PUT finalize.
 async fn mount_blob_push(server: &MockServer, repo: &str) {
-    // POST initiate upload — return 202 with Location.
+    // POST: initiate upload.
     Mock::given(method("POST"))
         .and(path(format!("/v2/{repo}/blobs/uploads/")))
         .respond_with(
@@ -133,7 +133,17 @@ async fn mount_blob_push(server: &MockServer, repo: &str) {
         .mount(server)
         .await;
 
-    // PUT the blob data — return 201 Created.
+    // PATCH: accept chunked data (may be called 1+ times).
+    Mock::given(method("PATCH"))
+        .and(path(format!("/v2/{repo}/blobs/uploads/upload-id")))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", format!("/v2/{repo}/blobs/uploads/upload-id")),
+        )
+        .mount(server)
+        .await;
+
+    // PUT: finalize with digest query param.
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{repo}/blobs/uploads/upload-id")))
         .respond_with(ResponseTemplate::new(201))
@@ -906,8 +916,8 @@ async fn sync_retry_exhaustion_returns_final_error() {
     ));
     if let ImageStatus::Failed { error, retries } = &report.images[0].status {
         assert!(
-            error.contains("blob pull"),
-            "error should mention blob pull: {error}"
+            error.contains("blob push"),
+            "error should mention blob push: {error}"
         );
         assert_eq!(*retries, 2); // max_retries from fast_retry()
     }
@@ -1034,6 +1044,14 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
         )
         .mount(&target_server)
         .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v2/repo-b/blobs/uploads/fallback-id"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/repo-b/blobs/uploads/fallback-id"),
+        )
+        .mount(&target_server)
+        .await;
     Mock::given(method("PUT"))
         .and(path("/v2/repo-b/blobs/uploads/fallback-id"))
         .respond_with(ResponseTemplate::new(201))
@@ -1118,6 +1136,14 @@ async fn sync_cross_repo_mount_failure_falls_back() {
     // Subsequent POSTs succeed (fallback upload initiation).
     Mock::given(method("POST"))
         .and(path("/v2/repo-b/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/repo-b/blobs/uploads/retry-id"),
+        )
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v2/repo-b/blobs/uploads/retry-id"))
         .respond_with(
             ResponseTemplate::new(202)
                 .insert_header("location", "/v2/repo-b/blobs/uploads/retry-id"),
