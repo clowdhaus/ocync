@@ -50,7 +50,7 @@ impl wiremock::Match for ContentRangeMatcher {
             .headers
             .get(http::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
-            .map_or(false, |v| v == self.expected)
+            .is_some_and(|v| v == self.expected)
     }
 }
 
