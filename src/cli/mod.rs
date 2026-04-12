@@ -21,11 +21,16 @@ pub(crate) fn setup_logging(cli: &Cli) {
 
     let filter = verbosity_filter(cli.quiet, cli.verbose);
 
-    // Cap HTTP transport crates to prevent credential leakage at trace level.
-    let base_filter = format!("{filter},hyper=warn,h2=warn,reqwest=warn,rustls=warn,tower=warn");
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&base_filter));
+    // Cap HTTP transport crates to prevent credential leakage at trace level.
+    // These are appended unconditionally so they apply even when RUST_LOG is set.
+    let env_filter = env_filter
+        .add_directive("hyper=warn".parse().unwrap())
+        .add_directive("h2=warn".parse().unwrap())
+        .add_directive("reqwest=warn".parse().unwrap())
+        .add_directive("rustls=warn".parse().unwrap())
+        .add_directive("tower=warn".parse().unwrap());
 
     match format {
         LogFormat::Json => {
