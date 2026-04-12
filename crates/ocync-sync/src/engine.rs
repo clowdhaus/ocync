@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::plan::BlobDedupMap;
 use crate::retry::{self, RetryConfig};
-use crate::{ImageResult, ImageStatus, SkipReason};
+use crate::{ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats};
 
 /// A fully resolved mapping ready for the sync engine.
 ///
@@ -43,7 +43,6 @@ pub struct TargetEntry {
 }
 
 /// Collect all blob digests from an image manifest (config + layers).
-#[allow(dead_code)] // Called by sync_image_inner; public entry point `run()` added next.
 fn collect_image_blobs(manifest: &ImageManifest) -> Vec<Digest> {
     let mut digests = Vec::with_capacity(1 + manifest.layers.len());
     digests.push(manifest.config.digest.clone());
@@ -61,7 +60,6 @@ fn collect_image_blobs(manifest: &ImageManifest) -> Vec<Digest> {
 /// target registry.
 pub struct SyncEngine {
     retry: RetryConfig,
-    #[allow(dead_code)] // Used by transfer_blobs; public entry point `run()` added next.
     dedup: std::sync::Mutex<BlobDedupMap>,
 }
 
@@ -82,11 +80,64 @@ impl SyncEngine {
         }
     }
 
+    /// Run the sync engine across all resolved mappings.
+    ///
+    /// Processes mappings sequentially. For each mapping, iterates over every
+    /// tag and every target, calling [`sync_image`](Self::sync_image) for each
+    /// combination. Progress callbacks are invoked before and after each image.
+    /// Returns a [`SyncReport`] with per-image results and aggregate statistics.
+    pub async fn run(
+        &self,
+        mappings: Vec<ResolvedMapping>,
+        progress: &dyn crate::progress::ProgressReporter,
+    ) -> SyncReport {
+        let run_start = Instant::now();
+        let run_id = Uuid::now_v7();
+        let mut images = Vec::new();
+
+        for mapping in &mappings {
+            for tag in &mapping.tags {
+                for target in &mapping.targets {
+                    let source_ref = format!("{}:{}@{}", mapping.source_repo, tag, target.name);
+                    let target_ref = format!("{}:{}", mapping.target_repo, tag);
+
+                    progress.image_started(&source_ref, &target_ref);
+
+                    let result = self
+                        .sync_image(
+                            &mapping.source_client,
+                            &mapping.source_repo,
+                            &target.client,
+                            &target.name,
+                            &mapping.target_repo,
+                            tag,
+                        )
+                        .await;
+
+                    progress.image_completed(&result);
+                    images.push(result);
+                }
+            }
+        }
+
+        let stats = compute_stats(&images);
+        let duration = run_start.elapsed();
+
+        let report = SyncReport {
+            run_id,
+            images,
+            stats,
+            duration,
+        };
+
+        progress.run_completed(&report);
+        report
+    }
+
     /// Sync a single image (one tag) from source to one target.
     ///
     /// Returns an [`ImageResult`] — never panics. All errors are captured
     /// as [`ImageStatus::Failed`].
-    #[allow(dead_code)] // Public entry point `run()` added next.
     async fn sync_image(
         &self,
         source: &RegistryClient,
@@ -426,6 +477,26 @@ impl SyncEngine {
     }
 }
 
+/// Compute aggregate statistics from a list of image results.
+fn compute_stats(images: &[ImageResult]) -> SyncStats {
+    let mut stats = SyncStats::default();
+    for image in images {
+        match &image.status {
+            ImageStatus::Synced => {
+                stats.images_synced += 1;
+                stats.bytes_transferred += image.bytes_transferred;
+            }
+            ImageStatus::Skipped { .. } => {
+                stats.images_skipped += 1;
+            }
+            ImageStatus::Failed { .. } => {
+                stats.images_failed += 1;
+            }
+        }
+    }
+    stats
+}
+
 #[cfg(test)]
 mod tests {
     use ocync_distribution::spec::{Descriptor, MediaType};
@@ -492,5 +563,51 @@ mod tests {
         let blobs = collect_image_blobs(&manifest);
         assert_eq!(blobs.len(), 1);
         assert_eq!(blobs[0], config_digest);
+    }
+
+    fn make_image_result(status: ImageStatus, bytes: u64) -> ImageResult {
+        ImageResult {
+            image_id: Uuid::now_v7(),
+            source: "source/repo:tag".into(),
+            target: "target/repo:tag".into(),
+            status,
+            bytes_transferred: bytes,
+            duration: std::time::Duration::from_millis(100),
+        }
+    }
+
+    #[test]
+    fn compute_stats_mixed_results() {
+        let images = vec![
+            make_image_result(ImageStatus::Synced, 1024),
+            make_image_result(
+                ImageStatus::Skipped {
+                    reason: SkipReason::DigestMatch,
+                },
+                0,
+            ),
+            make_image_result(
+                ImageStatus::Failed {
+                    error: "timeout".into(),
+                    retries: 3,
+                },
+                0,
+            ),
+        ];
+
+        let stats = compute_stats(&images);
+        assert_eq!(stats.images_synced, 1);
+        assert_eq!(stats.images_skipped, 1);
+        assert_eq!(stats.images_failed, 1);
+        assert_eq!(stats.bytes_transferred, 1024);
+    }
+
+    #[test]
+    fn compute_stats_empty() {
+        let stats = compute_stats(&[]);
+        assert_eq!(stats.images_synced, 0);
+        assert_eq!(stats.images_skipped, 0);
+        assert_eq!(stats.images_failed, 0);
+        assert_eq!(stats.bytes_transferred, 0);
     }
 }
