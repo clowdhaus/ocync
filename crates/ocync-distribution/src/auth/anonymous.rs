@@ -261,11 +261,8 @@ struct TokenResponse {
 impl std::fmt::Debug for TokenResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenResponse")
-            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
-            .field(
-                "access_token",
-                &self.access_token.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("token", &"[REDACTED]")
+            .field("access_token", &"[REDACTED]")
             .field("expires_in", &self.expires_in)
             .finish()
     }

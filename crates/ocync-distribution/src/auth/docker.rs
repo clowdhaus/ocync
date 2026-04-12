@@ -49,9 +49,9 @@ pub struct AuthEntry {
 impl std::fmt::Debug for AuthEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthEntry")
-            .field("auth", &self.auth.as_ref().map(|_| "[REDACTED]"))
+            .field("auth", &"[REDACTED]")
             .field("username", &self.username)
-            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("password", &"[REDACTED]")
             .finish()
     }
 }
