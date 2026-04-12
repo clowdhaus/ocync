@@ -35,7 +35,7 @@ pub struct DockerConfig {
 }
 
 /// A single auth entry from the `auths` map.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct AuthEntry {
     /// Base64-encoded `username:password`.
@@ -44,6 +44,16 @@ pub struct AuthEntry {
     pub username: Option<String>,
     /// Password (when stored separately).
     pub password: Option<String>,
+}
+
+impl std::fmt::Debug for AuthEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthEntry")
+            .field("auth", &self.auth.as_ref().map(|_| "[REDACTED]"))
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl DockerConfig {

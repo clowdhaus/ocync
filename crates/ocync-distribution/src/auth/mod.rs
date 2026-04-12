@@ -1,7 +1,5 @@
 //! Authentication providers and token management for OCI registries.
 
-/// Azure Container Registry auth provider.
-pub mod acr;
 /// Anonymous token-exchange authentication.
 pub mod anonymous;
 /// Hostname-based registry provider detection.
@@ -10,10 +8,6 @@ pub mod detect;
 pub mod docker;
 /// AWS ECR authentication provider.
 pub mod ecr;
-/// Google Container Registry auth provider.
-pub mod gcr;
-/// GitHub Container Registry auth provider.
-pub mod ghcr;
 
 pub use detect::{ProviderKind, detect_provider_kind};
 
@@ -92,12 +86,21 @@ impl fmt::Display for Action {
 }
 
 /// A bearer token with optional expiry tracking.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Token {
     /// The raw bearer token string.
     value: String,
     /// When this token expires (if known).
     expires_at: Option<Instant>,
+}
+
+impl fmt::Debug for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Token")
+            .field("value", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl Token {
@@ -148,7 +151,7 @@ impl Token {
 }
 
 /// Credentials for authenticating to a registry.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Credentials {
     /// HTTP Basic authentication.
     Basic {
@@ -157,6 +160,18 @@ pub enum Credentials {
         /// The password or token.
         password: String,
     },
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Basic { username, .. } => f
+                .debug_struct("Credentials::Basic")
+                .field("username", username)
+                .field("password", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 /// Trait for providers that can obtain authentication tokens for registries.

@@ -1,4 +1,8 @@
-pub async fn run(_src: &str, _dst: &str) -> i32 {
+//! The `copy` subcommand — copies a single image between registries.
+
+use crate::CopyArgs;
+
+pub(crate) async fn run(_args: &CopyArgs) -> i32 {
     eprintln!("copy: not yet implemented");
     1
 }

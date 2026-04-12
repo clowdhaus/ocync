@@ -1,8 +1,10 @@
-pub mod auth;
-pub mod copy;
-pub mod expand;
-pub mod sync_cmd;
-pub mod tags;
-pub mod validate;
-pub mod version;
-pub mod watch;
+//! CLI command implementations.
+
+pub(crate) mod auth;
+pub(crate) mod copy;
+pub(crate) mod expand;
+pub(crate) mod synchronize;
+pub(crate) mod tags;
+pub(crate) mod validate;
+pub(crate) mod version;
+pub(crate) mod watch;

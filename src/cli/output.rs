@@ -1,12 +1,17 @@
+//! Output formatting and credential redaction utilities.
+
 use std::time::Duration;
 
 /// Format a byte count into a human-readable string (e.g., "1.5 MB").
-pub fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
+    const TB: u64 = 1024 * GB;
 
-    if bytes >= GB {
+    if bytes >= TB {
+        format!("{:.1} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
         format!("{:.1} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
         format!("{:.1} MB", bytes as f64 / MB as f64)
@@ -17,8 +22,8 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Format a duration into a short human-readable string (e.g., "5s", "1m 5s", "1h 1m").
-pub fn format_duration_short(d: Duration) -> String {
+/// Format a duration into a short human-readable string (e.g., "5s", "1m 5s", "1h 1m 5s").
+pub(crate) fn format_duration_short(d: Duration) -> String {
     let total_secs = d.as_secs();
     if total_secs == 0 {
         let millis = d.as_millis();
@@ -30,7 +35,7 @@ pub fn format_duration_short(d: Duration) -> String {
     let seconds = total_secs % 60;
 
     if hours > 0 {
-        format!("{hours}h {minutes}m")
+        format!("{hours}h {minutes}m {seconds}s")
     } else if minutes > 0 {
         format!("{minutes}m {seconds}s")
     } else {
@@ -39,7 +44,7 @@ pub fn format_duration_short(d: Duration) -> String {
 }
 
 /// Strip userinfo (username:password) from a URL for safe logging.
-pub fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     // Match pattern: scheme://user:pass@host...
     if let Some(scheme_end) = url.find("://") {
         let after_scheme = &url[scheme_end + 3..];
@@ -58,11 +63,15 @@ pub fn redact_url(url: &str) -> String {
 }
 
 /// Redact the value portion of an Authorization header for safe logging.
-pub fn redact_auth_header(header: &str) -> String {
-    if let Some(token) = header.strip_prefix("Bearer ") {
-        format!("Bearer [REDACTED (len={})]", token.len())
-    } else if let Some(token) = header.strip_prefix("Basic ") {
-        format!("Basic [REDACTED (len={})]", token.len())
+///
+/// Preserves the auth scheme (Bearer/Basic) but replaces the credential
+/// value with `[REDACTED]`. Does not expose token length to prevent
+/// fingerprinting of the auth mechanism.
+pub(crate) fn redact_auth_header(header: &str) -> String {
+    if header.strip_prefix("Bearer ").is_some() {
+        "Bearer [REDACTED]".to_string()
+    } else if header.strip_prefix("Basic ").is_some() {
+        "Basic [REDACTED]".to_string()
     } else {
         "[REDACTED]".to_string()
     }
@@ -77,6 +86,11 @@ mod tests {
     #[test]
     fn format_bytes_zero() {
         assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn format_bytes_one() {
+        assert_eq!(format_bytes(1), "1 B");
     }
 
     #[test]
@@ -99,7 +113,22 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
     }
 
+    #[test]
+    fn format_bytes_one_tb() {
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 1024), "1.0 TB");
+    }
+
+    #[test]
+    fn format_bytes_multi_tb() {
+        assert_eq!(format_bytes(10 * 1024 * 1024 * 1024 * 1024), "10.0 TB");
+    }
+
     // format_duration_short tests
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration_short(Duration::ZERO), "0ms");
+    }
 
     #[test]
     fn format_duration_millis() {
@@ -117,8 +146,18 @@ mod tests {
     }
 
     #[test]
-    fn format_duration_hours_minutes() {
-        assert_eq!(format_duration_short(Duration::from_secs(3661)), "1h 1m");
+    fn format_duration_exact_minute() {
+        assert_eq!(format_duration_short(Duration::from_secs(60)), "1m 0s");
+    }
+
+    #[test]
+    fn format_duration_hours_minutes_seconds() {
+        assert_eq!(format_duration_short(Duration::from_secs(3661)), "1h 1m 1s");
+    }
+
+    #[test]
+    fn format_duration_exact_hour() {
+        assert_eq!(format_duration_short(Duration::from_secs(3600)), "1h 0m 0s");
     }
 
     // redact_url tests
@@ -127,6 +166,14 @@ mod tests {
     fn redact_url_with_userinfo() {
         assert_eq!(
             redact_url("https://user:pass@registry.example.com/v2"),
+            "https://***@registry.example.com/v2"
+        );
+    }
+
+    #[test]
+    fn redact_url_username_only() {
+        assert_eq!(
+            redact_url("https://user@registry.example.com/v2"),
             "https://***@registry.example.com/v2"
         );
     }
@@ -144,26 +191,42 @@ mod tests {
         assert_eq!(redact_url("registry.example.com"), "registry.example.com");
     }
 
+    #[test]
+    fn redact_url_at_in_path() {
+        // @ after a slash is path content, not userinfo
+        assert_eq!(
+            redact_url("https://registry.example.com/repo@sha256:abc"),
+            "https://registry.example.com/repo@sha256:abc"
+        );
+    }
+
+    #[test]
+    fn redact_url_empty() {
+        assert_eq!(redact_url(""), "");
+    }
+
     // redact_auth_header tests
 
     #[test]
     fn redact_bearer() {
         assert_eq!(
             redact_auth_header("Bearer abc123def456"),
-            "Bearer [REDACTED (len=12)]"
+            "Bearer [REDACTED]"
         );
     }
 
     #[test]
     fn redact_basic() {
-        assert_eq!(
-            redact_auth_header("Basic dXNlcjpwYXNz"),
-            "Basic [REDACTED (len=12)]"
-        );
+        assert_eq!(redact_auth_header("Basic dXNlcjpwYXNz"), "Basic [REDACTED]");
     }
 
     #[test]
     fn redact_unknown_scheme() {
         assert_eq!(redact_auth_header("CustomScheme token"), "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_empty_header() {
+        assert_eq!(redact_auth_header(""), "[REDACTED]");
     }
 }

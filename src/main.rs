@@ -2,86 +2,164 @@
 
 mod cli;
 
-use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
-#[derive(Parser)]
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// OCI registry sync tool.
+#[derive(Debug, Parser)]
 #[command(name = "ocync", version, about = "OCI registry sync tool")]
-pub struct Cli {
+pub(crate) struct Cli {
+    /// Subcommand to execute.
     #[command(subcommand)]
-    pub command: Commands,
+    pub(crate) command: Commands,
 
-    /// Increase verbosity (-v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
-    pub verbose: u8,
+    /// Increase verbosity (-v, -vv, -vvv).
+    #[arg(short, long, action = clap::ArgAction::Count, global = true, conflicts_with = "quiet")]
+    pub(crate) verbose: u8,
 
-    /// Quiet mode (errors only)
+    /// Quiet mode (errors only).
     #[arg(short, long, global = true)]
-    pub quiet: bool,
+    pub(crate) quiet: bool,
 
-    /// Override log format (json or text)
-    #[arg(long, global = true)]
-    pub log_format: Option<String>,
-
-    /// Write detailed logs to file
-    #[arg(long, global = true)]
-    pub log_file: Option<String>,
+    /// Override log format.
+    #[arg(long, global = true, value_enum)]
+    pub(crate) log_format: Option<LogFormat>,
 }
 
-#[derive(Subcommand)]
-pub enum Commands {
-    /// Run all mappings from config
-    Sync {
-        #[arg(short, long, required = true)]
-        config: Vec<String>,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        output: Option<String>,
-        #[arg(long)]
-        output_format: Option<String>,
-    },
-    /// Copy a single image between registries
-    Copy { source: String, destination: String },
-    /// List and filter tags
-    Tags {
-        repository: String,
-        #[arg(long)]
-        glob: Option<String>,
-        #[arg(long)]
-        semver: Option<String>,
-        #[arg(long)]
-        exclude: Option<String>,
-        #[arg(long)]
-        sort: Option<String>,
-        #[arg(long)]
-        latest: Option<usize>,
-    },
-    /// Validate credentials
+/// Log output format.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum LogFormat {
+    /// Human-readable text output.
+    Text,
+    /// Structured JSON output.
+    Json,
+}
+
+/// Available CLI subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum Commands {
+    /// Run all mappings from config.
+    Sync(SyncArgs),
+    /// Copy a single image between registries.
+    Copy(CopyArgs),
+    /// List and filter tags.
+    Tags(TagsArgs),
+    /// Validate credentials.
     Auth {
+        /// Auth subcommand.
         #[command(subcommand)]
         action: AuthAction,
     },
-    /// Offline config validation
-    Validate { config: String },
-    /// Show resolved config
-    Expand {
-        config: String,
-        #[arg(long)]
-        show_secrets: bool,
-    },
-    /// Daemon mode
-    Watch {
-        #[arg(short, long, required = true)]
-        config: Vec<String>,
-    },
-    /// Show version and FIPS status
+    /// Offline config validation.
+    Validate(ValidateArgs),
+    /// Show resolved config.
+    Expand(ExpandArgs),
+    /// Daemon mode.
+    Watch(WatchArgs),
+    /// Show version information.
     Version,
 }
 
-#[derive(Subcommand)]
-pub enum AuthAction {
-    /// Check credentials for all registries
+/// Arguments for the `sync` subcommand.
+#[derive(Debug, clap::Args)]
+pub(crate) struct SyncArgs {
+    /// Config file path(s).
+    #[arg(short, long, required = true)]
+    pub(crate) config: Vec<PathBuf>,
+    /// Perform a dry run without making changes.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+    /// Write output to a file instead of stdout.
+    #[arg(long)]
+    pub(crate) output: Option<PathBuf>,
+    /// Output format for sync results.
+    #[arg(long, value_enum)]
+    pub(crate) output_format: Option<OutputFormat>,
+}
+
+/// Output format for sync results.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum OutputFormat {
+    /// Human-readable text output.
+    Text,
+    /// Structured JSON output.
+    Json,
+}
+
+/// Arguments for the `copy` subcommand.
+#[derive(Debug, clap::Args)]
+pub(crate) struct CopyArgs {
+    /// Source image reference.
+    pub(crate) source: String,
+    /// Destination image reference.
+    pub(crate) destination: String,
+}
+
+/// Arguments for the `tags` subcommand.
+#[derive(Debug, clap::Args)]
+pub(crate) struct TagsArgs {
+    /// Repository to list tags from.
+    pub(crate) repository: String,
+    /// Filter tags by glob pattern.
+    #[arg(long)]
+    pub(crate) glob: Option<String>,
+    /// Filter tags by semver range.
+    #[arg(long)]
+    pub(crate) semver: Option<String>,
+    /// Exclude tags matching pattern.
+    #[arg(long)]
+    pub(crate) exclude: Option<String>,
+    /// Sort order for results.
+    #[arg(long, value_enum)]
+    pub(crate) sort: Option<TagSortOrder>,
+    /// Return only the N most recent tags.
+    #[arg(long)]
+    pub(crate) latest: Option<usize>,
+}
+
+/// Sort order for tag listing.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum TagSortOrder {
+    /// Sort by semantic version.
+    Semver,
+    /// Sort alphabetically.
+    Alpha,
+}
+
+/// Auth subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum AuthAction {
+    /// Check credentials for all registries.
     Check,
+}
+
+/// Arguments for the `validate` subcommand.
+#[derive(Debug, clap::Args)]
+pub(crate) struct ValidateArgs {
+    /// Config file path to validate.
+    pub(crate) config: PathBuf,
+}
+
+/// Arguments for the `expand` subcommand.
+#[derive(Debug, clap::Args)]
+pub(crate) struct ExpandArgs {
+    /// Config file path to expand.
+    pub(crate) config: PathBuf,
+    /// Show secret values instead of redacting them.
+    ///
+    /// WARNING: This will print credentials to stdout. Do not use
+    /// when stdout is piped to a file or logging system.
+    #[arg(long)]
+    pub(crate) show_secrets: bool,
+}
+
+/// Arguments for the `watch` subcommand.
+#[derive(Debug, clap::Args)]
+pub(crate) struct WatchArgs {
+    /// Config file path(s).
+    #[arg(short, long, required = true)]
+    pub(crate) config: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -90,33 +168,15 @@ async fn main() {
     cli::setup_logging(&cli);
 
     let exit_code = match cli.command {
-        Commands::Sync {
-            config,
-            dry_run,
-            output,
-            output_format,
-        } => cli::commands::sync_cmd::run(config, dry_run, output, output_format).await,
-        Commands::Copy {
-            source,
-            destination,
-        } => cli::commands::copy::run(&source, &destination).await,
-        Commands::Tags {
-            repository,
-            glob,
-            semver,
-            exclude,
-            sort,
-            latest,
-        } => cli::commands::tags::run(&repository, glob, semver, exclude, sort, latest).await,
+        Commands::Sync(args) => cli::commands::synchronize::run(&args).await,
+        Commands::Copy(args) => cli::commands::copy::run(&args).await,
+        Commands::Tags(args) => cli::commands::tags::run(&args).await,
         Commands::Auth { action } => match action {
             AuthAction::Check => cli::commands::auth::run_check().await,
         },
-        Commands::Validate { config } => cli::commands::validate::run(&config),
-        Commands::Expand {
-            config,
-            show_secrets,
-        } => cli::commands::expand::run(&config, show_secrets),
-        Commands::Watch { config } => cli::commands::watch::run(config).await,
+        Commands::Validate(args) => cli::commands::validate::run(&args),
+        Commands::Expand(args) => cli::commands::expand::run(&args),
+        Commands::Watch(args) => cli::commands::watch::run(&args).await,
         Commands::Version => cli::commands::version::run(),
     };
 
@@ -136,27 +196,35 @@ mod tests {
     #[test]
     fn parse_sync() {
         let cli = Cli::parse_from(["ocync", "sync", "--config", "c.yaml"]);
-        assert!(matches!(cli.command, Commands::Sync { .. }));
+        assert!(matches!(cli.command, Commands::Sync(_)));
     }
 
     #[test]
     fn parse_sync_dry_run() {
         let cli = Cli::parse_from(["ocync", "sync", "--config", "c.yaml", "--dry-run"]);
-        if let Commands::Sync { dry_run, .. } = cli.command {
-            assert!(dry_run);
+        if let Commands::Sync(args) = cli.command {
+            assert!(args.dry_run);
+        }
+    }
+
+    #[test]
+    fn parse_sync_multiple_configs() {
+        let cli = Cli::parse_from(["ocync", "sync", "--config", "a.yaml", "--config", "b.yaml"]);
+        if let Commands::Sync(args) = cli.command {
+            assert_eq!(args.config.len(), 2);
         }
     }
 
     #[test]
     fn parse_copy() {
         let cli = Cli::parse_from(["ocync", "copy", "src", "dst"]);
-        assert!(matches!(cli.command, Commands::Copy { .. }));
+        assert!(matches!(cli.command, Commands::Copy(_)));
     }
 
     #[test]
     fn parse_tags() {
         let cli = Cli::parse_from(["ocync", "tags", "docker.io/nginx"]);
-        assert!(matches!(cli.command, Commands::Tags { .. }));
+        assert!(matches!(cli.command, Commands::Tags(_)));
     }
 
     #[test]
@@ -181,6 +249,31 @@ mod tests {
             "--config",
             "c.yaml",
         ]);
-        assert_eq!(cli.log_format.as_deref(), Some("json"));
+        assert!(matches!(cli.log_format, Some(LogFormat::Json)));
+    }
+
+    #[test]
+    fn verbose_and_quiet_conflict() {
+        let result = Cli::try_parse_from(["ocync", "-v", "-q", "sync", "--config", "c.yaml"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sync_requires_config() {
+        let result = Cli::try_parse_from(["ocync", "sync"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn log_format_rejects_invalid() {
+        let result = Cli::try_parse_from([
+            "ocync",
+            "--log-format",
+            "garbage",
+            "sync",
+            "--config",
+            "c.yaml",
+        ]);
+        assert!(result.is_err());
     }
 }

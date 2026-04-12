@@ -1,4 +1,8 @@
-pub async fn run(_config: Vec<String>) -> i32 {
+//! The `watch` subcommand — daemon mode for continuous sync.
+
+use crate::WatchArgs;
+
+pub(crate) async fn run(_args: &WatchArgs) -> i32 {
     eprintln!("watch: not yet implemented");
     1
 }

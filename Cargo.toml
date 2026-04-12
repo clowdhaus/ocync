@@ -16,6 +16,7 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
+tracing = { version = "0.1", default-features = false }
 ocync-distribution = { path = "crates/ocync-distribution" }
 ocync-sync = { path = "crates/ocync-sync" }
 
@@ -43,17 +44,13 @@ description = "OCI registry sync tool"
 [lints]
 workspace = true
 
-[features]
-fips = []
-
 [dependencies]
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 ocync-distribution.workspace = true
 ocync-sync.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 serde_yaml = { package = "serde_yaml_ng", version = "0.10", default-features = false }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
-tracing = { version = "0.1", default-features = false }
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "json", "fmt"] }
