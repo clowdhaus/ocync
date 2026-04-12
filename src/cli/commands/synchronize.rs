@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ocync_distribution::RegistryClient;
 use ocync_sync::SyncReport;
-use ocync_sync::engine::{ResolvedMapping, SyncEngine, TargetEntry};
+use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
 use ocync_sync::filter::FilterConfig;
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
@@ -148,7 +148,7 @@ async fn resolve_mapping(
         source_repo: mapping.from.clone(),
         target_repo,
         targets,
-        tags: filtered,
+        tags: filtered.into_iter().map(TagPair::same).collect(),
     }))
 }
 
@@ -194,8 +194,12 @@ fn print_dry_run(mappings: &[ResolvedMapping]) {
             mapping.tags.len(),
             target_names.join(", "),
         );
-        for tag in &mapping.tags {
-            println!("  {tag}");
+        for tag_pair in &mapping.tags {
+            if tag_pair.source == tag_pair.target {
+                println!("  {}", tag_pair.source);
+            } else {
+                println!("  {} -> {}", tag_pair.source, tag_pair.target);
+            }
         }
     }
 }

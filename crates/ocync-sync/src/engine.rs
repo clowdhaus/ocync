@@ -29,8 +29,8 @@ pub struct ResolvedMapping {
     pub target_repo: String,
     /// Target registries to sync to.
     pub targets: Vec<TargetEntry>,
-    /// Tags to sync (already filtered).
-    pub tags: Vec<String>,
+    /// Tag pairs to sync (already filtered).
+    pub tags: Vec<TagPair>,
 }
 
 /// A single target registry entry.
@@ -40,6 +40,37 @@ pub struct TargetEntry {
     pub name: String,
     /// Client for this target registry.
     pub client: Arc<RegistryClient>,
+}
+
+/// A source/target tag pair for syncing.
+///
+/// For most sync operations the source and target tags are identical.
+/// For `copy` with retagging they may differ.
+#[derive(Debug, Clone)]
+pub struct TagPair {
+    /// Tag name at the source registry.
+    pub source: String,
+    /// Tag name at the target registry.
+    pub target: String,
+}
+
+impl TagPair {
+    /// Create a pair where source and target tags are the same.
+    pub fn same(tag: impl Into<String>) -> Self {
+        let t = tag.into();
+        Self {
+            source: t.clone(),
+            target: t,
+        }
+    }
+
+    /// Create a pair with different source and target tags.
+    pub fn retag(source: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            target: target.into(),
+        }
+    }
 }
 
 /// Collect all blob digests from an image manifest (config + layers).
@@ -96,10 +127,13 @@ impl SyncEngine {
         let mut images = Vec::new();
 
         for mapping in &mappings {
-            for tag in &mapping.tags {
+            for tag_pair in &mapping.tags {
                 for target in &mapping.targets {
-                    let source_ref = format!("{}:{}@{}", mapping.source_repo, tag, target.name);
-                    let target_ref = format!("{}:{}", mapping.target_repo, tag);
+                    let source_ref = format!(
+                        "{}:{}@{}",
+                        mapping.source_repo, tag_pair.source, target.name
+                    );
+                    let target_ref = format!("{}:{}", mapping.target_repo, tag_pair.target);
 
                     progress.image_started(&source_ref, &target_ref);
 
@@ -110,7 +144,8 @@ impl SyncEngine {
                             &target.client,
                             &target.name,
                             &mapping.target_repo,
-                            tag,
+                            &tag_pair.source,
+                            &tag_pair.target,
                         )
                         .await;
 
@@ -138,6 +173,7 @@ impl SyncEngine {
     ///
     /// Returns an [`ImageResult`] — never panics. All errors are captured
     /// as [`ImageStatus::Failed`].
+    #[allow(clippy::too_many_arguments)]
     async fn sync_image(
         &self,
         source: &RegistryClient,
@@ -145,15 +181,24 @@ impl SyncEngine {
         target: &RegistryClient,
         target_name: &str,
         target_repo: &str,
-        tag: &str,
+        source_tag: &str,
+        target_tag: &str,
     ) -> ImageResult {
         let image_start = Instant::now();
         let image_id = Uuid::now_v7();
-        let source_ref = format!("{source_repo}:{tag}");
-        let target_ref = format!("{target_repo}:{tag}");
+        let source_ref = format!("{source_repo}:{source_tag}");
+        let target_ref = format!("{target_repo}:{target_tag}");
 
         let result = self
-            .sync_image_inner(source, source_repo, target, target_name, target_repo, tag)
+            .sync_image_inner(
+                source,
+                source_repo,
+                target,
+                target_name,
+                target_repo,
+                source_tag,
+                target_tag,
+            )
             .await;
 
         let duration = image_start.elapsed();
@@ -185,6 +230,7 @@ impl SyncEngine {
     }
 
     /// Inner implementation of image sync that returns Result for ergonomic error handling.
+    #[allow(clippy::too_many_arguments)]
     async fn sync_image_inner(
         &self,
         source: &RegistryClient,
@@ -192,21 +238,22 @@ impl SyncEngine {
         target: &RegistryClient,
         target_name: &str,
         target_repo: &str,
-        tag: &str,
+        source_tag: &str,
+        target_tag: &str,
     ) -> Result<(ImageStatus, u64), String> {
         // Step 1: Pull source manifest.
-        let pull = source
-            .manifest_pull(source_repo, tag)
-            .await
-            .map_err(|e| format!("failed to pull source manifest: {e}"))?;
+        let pull = self
+            .manifest_pull_with_retry(source, source_repo, source_tag)
+            .await?;
 
         // Step 2: HEAD target manifest — skip if digest matches.
-        match target.manifest_head(target_repo, tag).await {
+        match target.manifest_head(target_repo, target_tag).await {
             Ok(Some(head)) if head.digest == pull.digest => {
                 info!(
                     source_repo,
                     target_repo,
-                    tag,
+                    source_tag,
+                    target_tag,
                     digest = %pull.digest,
                     "skipping — digest matches at target"
                 );
@@ -221,7 +268,7 @@ impl SyncEngine {
             Err(e) => {
                 debug!(
                     target_repo,
-                    tag,
+                    target_tag,
                     error = %e,
                     "target manifest HEAD failed, proceeding with sync"
                 );
@@ -244,10 +291,14 @@ impl SyncEngine {
                     .await?;
 
                 // Push manifest by tag.
-                target
-                    .manifest_push(target_repo, tag, &pull.media_type, &pull.raw_bytes)
-                    .await
-                    .map_err(|e| format!("failed to push manifest: {e}"))?;
+                self.manifest_push_with_retry(
+                    target,
+                    target_repo,
+                    target_tag,
+                    &pull.media_type,
+                    &pull.raw_bytes,
+                )
+                .await?;
 
                 bytes
             }
@@ -257,12 +308,9 @@ impl SyncEngine {
                 // For each child descriptor, pull child manifest, transfer blobs, push child.
                 for child_desc in &index.manifests {
                     let child_digest_str = child_desc.digest.to_string();
-                    let child_pull = source
-                        .manifest_pull(source_repo, &child_digest_str)
-                        .await
-                        .map_err(|e| {
-                            format!("failed to pull child manifest {}: {e}", child_desc.digest)
-                        })?;
+                    let child_pull = self
+                        .manifest_pull_with_retry(source, source_repo, &child_digest_str)
+                        .await?;
 
                     if let ManifestKind::Image(child_image) = &child_pull.manifest {
                         let blobs = collect_image_blobs(child_image);
@@ -280,24 +328,25 @@ impl SyncEngine {
                     }
 
                     // Push child manifest to target by digest.
-                    target
-                        .manifest_push(
-                            target_repo,
-                            &child_digest_str,
-                            &child_pull.media_type,
-                            &child_pull.raw_bytes,
-                        )
-                        .await
-                        .map_err(|e| {
-                            format!("failed to push child manifest {}: {e}", child_desc.digest)
-                        })?;
+                    self.manifest_push_with_retry(
+                        target,
+                        target_repo,
+                        &child_digest_str,
+                        &child_pull.media_type,
+                        &child_pull.raw_bytes,
+                    )
+                    .await?;
                 }
 
                 // Push the index by tag.
-                target
-                    .manifest_push(target_repo, tag, &pull.media_type, &pull.raw_bytes)
-                    .await
-                    .map_err(|e| format!("failed to push index manifest: {e}"))?;
+                self.manifest_push_with_retry(
+                    target,
+                    target_repo,
+                    target_tag,
+                    &pull.media_type,
+                    &pull.raw_bytes,
+                )
+                .await?;
 
                 total_bytes
             }
@@ -305,7 +354,7 @@ impl SyncEngine {
 
         info!(
             source_repo,
-            target_repo, tag, bytes_transferred, "image synced"
+            target_repo, source_tag, target_tag, bytes_transferred, "image synced"
         );
 
         Ok((ImageStatus::Synced, bytes_transferred))
@@ -392,14 +441,22 @@ impl SyncEngine {
             }
 
             // Pull from source with retry.
-            let data = self
-                .pull_blob_with_retry(source, source_repo, digest)
-                .await?;
+            let data = match self.pull_blob_with_retry(source, source_repo, digest).await {
+                Ok(data) => data,
+                Err(e) => {
+                    let mut dedup = self.dedup.lock().expect("dedup lock poisoned");
+                    dedup.set_failed(target_name, digest, e.clone());
+                    return Err(e);
+                }
+            };
             let blob_size = data.len() as u64;
 
             // Push to target with retry.
-            self.push_blob_with_retry(target, target_repo, &data)
-                .await?;
+            if let Err(e) = self.push_blob_with_retry(target, target_repo, &data).await {
+                let mut dedup = self.dedup.lock().expect("dedup lock poisoned");
+                dedup.set_failed(target_name, digest, e.clone());
+                return Err(e);
+            }
 
             total_bytes = total_bytes.saturating_add(blob_size);
 
@@ -471,6 +528,77 @@ impl SyncEngine {
                         }
                     }
                     return Err(format!("failed to push blob: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Pull a manifest with retry logic for transient errors.
+    async fn manifest_pull_with_retry(
+        &self,
+        client: &RegistryClient,
+        repo: &str,
+        reference: &str,
+    ) -> Result<ocync_distribution::ManifestPull, String> {
+        let mut attempt = 0;
+        loop {
+            match client.manifest_pull(repo, reference).await {
+                Ok(pull) => return Ok(pull),
+                Err(e) => {
+                    if let Some(status) = e.status_code() {
+                        if retry::should_retry(status, attempt, self.retry.max_retries) {
+                            let backoff = self.retry.backoff_for(attempt);
+                            warn!(
+                                reference,
+                                attempt,
+                                status = %status,
+                                backoff_ms = backoff.as_millis(),
+                                "retrying manifest pull"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+                    return Err(format!("failed to pull manifest {reference}: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Push a manifest with retry logic for transient errors.
+    async fn manifest_push_with_retry(
+        &self,
+        client: &RegistryClient,
+        repo: &str,
+        reference: &str,
+        media_type: &ocync_distribution::MediaType,
+        raw_bytes: &[u8],
+    ) -> Result<Digest, String> {
+        let mut attempt = 0;
+        loop {
+            match client
+                .manifest_push(repo, reference, media_type, raw_bytes)
+                .await
+            {
+                Ok(digest) => return Ok(digest),
+                Err(e) => {
+                    if let Some(status) = e.status_code() {
+                        if retry::should_retry(status, attempt, self.retry.max_retries) {
+                            let backoff = self.retry.backoff_for(attempt);
+                            warn!(
+                                reference,
+                                attempt,
+                                status = %status,
+                                backoff_ms = backoff.as_millis(),
+                                "retrying manifest push"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+                    return Err(format!("failed to push manifest {reference}: {e}"));
                 }
             }
         }

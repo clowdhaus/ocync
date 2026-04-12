@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ocync_sync::engine::{ResolvedMapping, SyncEngine, TargetEntry};
+use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::{ImageStatus, SkipReason};
@@ -16,17 +16,7 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
         .source
         .tag()
         .ok_or_else(|| CliError::Input(format!("source '{}' has no tag", args.source)))?;
-    let dst_tag = args
-        .destination
-        .tag()
-        .ok_or_else(|| CliError::Input(format!("destination '{}' has no tag", args.destination)))?;
-
-    // Tags must match — the engine syncs a single tag from source to target.
-    if src_tag != dst_tag {
-        return Err(CliError::Input(format!(
-            "source tag '{src_tag}' does not match destination tag '{dst_tag}'"
-        )));
-    }
+    let dst_tag = args.destination.tag().unwrap_or(src_tag);
 
     let source_client = Arc::new(build_registry_client(args.source.registry(), None).await?);
     let target_client = Arc::new(build_registry_client(args.destination.registry(), None).await?);
@@ -39,7 +29,7 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
             name: args.destination.registry().to_owned(),
             client: target_client,
         }],
-        tags: vec![src_tag.to_owned()],
+        tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],
     };
 
     let engine = SyncEngine::new(RetryConfig::default());
