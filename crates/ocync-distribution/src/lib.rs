@@ -24,9 +24,13 @@ pub mod spec;
 pub mod tags;
 
 pub use blob::MountResult;
-pub use client::RegistryClient;
+pub use client::{RegistryClient, RegistryClientBuilder};
 pub use digest::Digest;
 pub use error::Error;
 pub use manifest::{ManifestHead, ManifestPull};
 pub use reference::Reference;
 pub use spec::{Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, Platform};
+
+/// Re-export `reqwest::Client` so downstream crates can construct auth providers
+/// without taking a direct dependency on reqwest.
+pub use reqwest;

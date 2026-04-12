@@ -1,10 +1,78 @@
 //! Configuration file schema types and YAML deserialization.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+
+/// Load and validate a config file from disk.
+///
+/// Reads the YAML, deserializes, validates mapping/tag rules and registry
+/// references, then returns the parsed config.
+pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::Parse(format!("failed to read {}: {e}", path.display())))?;
+    let config: Config = serde_yaml::from_str(&contents)
+        .map_err(|e| ConfigError::Parse(format!("failed to parse {}: {e}", path.display())))?;
+
+    // Structural validation.
+    for mapping in &config.mappings {
+        validate_mapping(mapping)?;
+        if let Some(ref tags) = mapping.tags {
+            validate_tags(tags)?;
+        }
+    }
+    validate_references(&config)?;
+
+    Ok(config)
+}
+
+/// Serialize a config to YAML with env vars expanded.
+///
+/// Walks all string fields, expanding `${VAR}` expressions. When
+/// `show_secrets` is false, auth-field values are redacted in the output.
+pub(crate) fn expand_config(config: &Config, show_secrets: bool) -> Result<String, ConfigError> {
+    // Re-serialize to YAML, then expand env vars in the output.
+    let yaml = serde_yaml::to_string(config)
+        .map_err(|e| ConfigError::Parse(format!("serialization failed: {e}")))?;
+
+    // Expand env vars line by line, treating auth-related lines specially.
+    let mut expanded = String::with_capacity(yaml.len());
+    for line in yaml.lines() {
+        let trimmed = line.trim_start();
+        let is_auth = trimmed.starts_with("url:")
+            || trimmed.starts_with("auth_type:")
+            || trimmed.starts_with("password:")
+            || trimmed.starts_with("token:")
+            || trimmed.starts_with("username:");
+
+        let expanded_line = expand_env_vars(line, is_auth)?;
+
+        if !show_secrets && is_auth && expanded_line.contains(':') {
+            // For auth fields, show the key but redact the expanded value
+            // if it differs from the original (meaning expansion happened).
+            if expanded_line != line {
+                if let Some(colon_pos) = expanded_line.find(':') {
+                    expanded.push_str(&expanded_line[..colon_pos + 1]);
+                    expanded.push_str(" [REDACTED]");
+                } else {
+                    expanded.push_str(&expanded_line);
+                }
+            } else {
+                expanded.push_str(&expanded_line);
+            }
+        } else {
+            expanded.push_str(&expanded_line);
+        }
+        expanded.push('\n');
+    }
+
+    Ok(expanded)
+}
 
 // ---------------------------------------------------------------------------
 // Error

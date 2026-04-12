@@ -128,11 +128,24 @@ pub(crate) enum TagSortOrder {
     Alpha,
 }
 
+impl From<TagSortOrder> for ocync_sync::filter::SortOrder {
+    fn from(s: TagSortOrder) -> Self {
+        match s {
+            TagSortOrder::Semver => Self::Semver,
+            TagSortOrder::Alpha => Self::Alpha,
+        }
+    }
+}
+
 /// Auth subcommands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum AuthAction {
-    /// Check credentials for all registries.
-    Check,
+    /// Check credentials for all registries in config.
+    Check {
+        /// Config file path(s) containing registry definitions.
+        #[arg(short, long, required = true)]
+        config: Vec<PathBuf>,
+    },
 }
 
 /// Arguments for the `validate` subcommand.
@@ -176,7 +189,7 @@ async fn main() {
         Commands::Copy(args) => cli::commands::copy::run(&args).await,
         Commands::Tags(args) => cli::commands::tags::run(&args).await,
         Commands::Auth { action } => match action {
-            AuthAction::Check => cli::commands::auth::run_check().await,
+            AuthAction::Check { config } => cli::commands::auth::run_check(&config).await,
         },
         Commands::Validate(args) => cli::commands::validate::run(&args),
         Commands::Expand(args) => cli::commands::expand::run(&args),
