@@ -1,12 +1,13 @@
 //! Tag filtering pipeline: glob -> semver -> exclude -> sort + latest.
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::Error;
 
 /// How to handle semver pre-release tags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SemverPrerelease {
     /// Include pre-release tags in results.
@@ -18,7 +19,7 @@ pub enum SemverPrerelease {
 }
 
 /// Sort order for the final tag list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SortOrder {
     /// Sort by semantic version (highest first).
