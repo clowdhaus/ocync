@@ -17,8 +17,7 @@ pub(crate) async fn run(args: &WatchArgs, shutdown: ShutdownSignal) -> Result<Ex
         let sync_args = SyncArgs {
             config: args.config.clone(),
             dry_run: false,
-            output: None,
-            output_format: None,
+            json: args.json,
         };
 
         match synchronize::run(&sync_args).await {
