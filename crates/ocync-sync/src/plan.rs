@@ -32,21 +32,12 @@ pub struct BlobInfo {
 }
 
 /// Result of attempting to claim a blob for transfer.
-///
-/// Non-[`Claimed`](ClaimResult::Claimed) variants mirror [`BlobStatus`] — they
-/// report the state that prevented the claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimResult {
     /// Successfully claimed — caller should proceed with transfer.
     Claimed,
-    /// Another task is already transferring this blob.
-    InProgress,
-    /// Blob was already transferred successfully.
-    Completed,
-    /// Blob already exists at the target.
-    ExistsAtTarget,
-    /// A previous transfer attempt failed.
-    Failed(String),
+    /// Claim denied — the blob is already in the given state.
+    Occupied(BlobStatus),
 }
 
 /// Per-registry index of tracked blobs.
@@ -98,10 +89,7 @@ impl BlobDedupMap {
                 entry.status = BlobStatus::InProgress;
                 ClaimResult::Claimed
             }
-            BlobStatus::InProgress => ClaimResult::InProgress,
-            BlobStatus::Completed => ClaimResult::Completed,
-            BlobStatus::ExistsAtTarget => ClaimResult::ExistsAtTarget,
-            BlobStatus::Failed(err) => ClaimResult::Failed(err.clone()),
+            other => ClaimResult::Occupied(other.clone()),
         }
     }
 
@@ -341,7 +329,10 @@ mod tests {
         let d = test_digest();
 
         map.set_in_progress("reg.io", &d);
-        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::InProgress);
+        assert_eq!(
+            map.try_claim("reg.io", &d),
+            ClaimResult::Occupied(BlobStatus::InProgress)
+        );
     }
 
     #[test]
@@ -350,7 +341,10 @@ mod tests {
         let d = test_digest();
 
         map.set_completed("reg.io", &d, "library/alpine");
-        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::Completed);
+        assert_eq!(
+            map.try_claim("reg.io", &d),
+            ClaimResult::Occupied(BlobStatus::Completed)
+        );
     }
 
     #[test]
@@ -359,7 +353,10 @@ mod tests {
         let d = test_digest();
 
         map.set_exists("reg.io", &d, "library/alpine");
-        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::ExistsAtTarget);
+        assert_eq!(
+            map.try_claim("reg.io", &d),
+            ClaimResult::Occupied(BlobStatus::ExistsAtTarget)
+        );
     }
 
     #[test]
@@ -370,7 +367,7 @@ mod tests {
         map.set_failed("reg.io", &d, "connection refused".into());
         assert_eq!(
             map.try_claim("reg.io", &d),
-            ClaimResult::Failed("connection refused".into())
+            ClaimResult::Occupied(BlobStatus::Failed("connection refused".into()))
         );
     }
 }
