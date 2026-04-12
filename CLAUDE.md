@@ -31,6 +31,17 @@ Before marking work complete, mechanically verify:
 4. **Visibility**: default to private; `pub(crate)` only when needed within the crate; `pub` only when consumed by another crate in this diff
 5. **CI gates**: `cargo fmt --check && cargo clippy -- -D warnings && cargo test && cargo deny check` must pass locally before push
 
+## Engine architecture
+
+The sync engine uses a **pull-once, fan-out** pattern for 1:N mappings:
+
+1. Pull source manifest once per tag (including child manifests for indexes)
+2. For each target: HEAD check, transfer blobs, push manifests
+
+Source-side work (manifest pulls) must NEVER be repeated per target. The loop structure must be `tag → pull_source → for target → push_to_target`, never `tag → for target → (pull + push)`. Blobs are inherently target-specific (dedup/mount decisions depend on target state) so blob pulls may repeat across targets, but manifest pulls are pure source-side work that is identical across all targets.
+
+OCI blobs are repo-scoped: a blob pushed to `registry/repo-a` is NOT accessible from `registry/repo-b` without a cross-repo mount or separate push. The blob dedup map must check `known_repos` for the current repo before skipping — never skip based on status alone.
+
 ## Code standards
 
 - **Naming**: stutter-free types (`Error` not `DistributionError`), spec terminology verbatim for OCI types, semantic field names
