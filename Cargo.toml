@@ -47,7 +47,8 @@ description = "OCI registry sync tool"
 workspace = true
 
 [dependencies]
-clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+anstyle = { version = "1", default-features = false }
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "color"] }
 ocync-distribution.workspace = true
 ocync-sync.workspace = true
 serde.workspace = true

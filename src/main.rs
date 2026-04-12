@@ -4,120 +4,211 @@ mod cli;
 
 use std::path::PathBuf;
 
+use anstyle::{Ansi256Color, Color, Style};
+use clap::builder::Styles;
 use clap::{Parser, Subcommand, ValueEnum};
 use ocync_distribution::Reference;
 
-/// OCI registry sync tool.
+const PINK: Option<Color> = Some(Color::Ansi256(Ansi256Color(213)));
+const PURPLE: Option<Color> = Some(Color::Ansi256(Ansi256Color(141)));
+const CYAN: Option<Color> = Some(Color::Ansi256(Ansi256Color(75)));
+
+/// CLI help color scheme: purple headers, cyan literals, pink placeholders.
+const STYLES: Styles = Styles::styled()
+    .header(Style::new().fg_color(PURPLE).bold())
+    .usage(Style::new().fg_color(PURPLE).bold())
+    .literal(Style::new().fg_color(CYAN).bold())
+    .placeholder(Style::new().fg_color(PINK))
+    .valid(Style::new().fg_color(CYAN))
+    .invalid(Style::new().fg_color(PINK).bold())
+    .error(Style::new().fg_color(PINK).bold());
+
+const MAIN_LONG_ABOUT: &str = "\
+Sync OCI container images across registries
+
+ocync copies container images between OCI-compliant registries with blob
+deduplication, cross-repo mounts, and streaming transfers — no local disk
+required.
+
+Examples:
+  ocync sync -c config.yaml
+  ocync sync -c config.yaml --dry-run
+  ocync copy docker.io/library/nginx:1.27 ghcr.io/myorg/nginx:1.27
+  ocync tags docker.io/library/nginx --semver '>=1.0' --latest 10";
+
+const SYNC_LONG_ABOUT: &str = "\
+Sync images across registries using a config file
+
+Reads a YAML config that defines source and target registry mappings, then syncs
+all matching images. Supports glob and semver tag filtering, dry-run previews,
+and structured output.
+
+Examples:
+  ocync sync -c config.yaml
+  ocync sync -c config.yaml --dry-run
+  ocync sync -c config.yaml --json > results.json";
+
+const COPY_LONG_ABOUT: &str = "\
+Copy a single image from one registry to another
+
+Copies a single tagged image between registries. Useful for one-off transfers
+without a config file.
+
+Examples:
+  ocync copy docker.io/library/nginx:1.27 ghcr.io/myorg/nginx:1.27
+  ocync copy 123456789.dkr.ecr.us-east-1.amazonaws.com/app:v2 ghcr.io/myorg/app:v2";
+
+const TAGS_LONG_ABOUT: &str = "\
+List, filter, and sort repository tags
+
+Query a registry for available tags and apply filters. Useful for discovering
+which tags exist before configuring a sync mapping.
+
+Examples:
+  ocync tags docker.io/library/nginx
+  ocync tags docker.io/library/nginx --semver '>=1.0, <2.0' --latest 5
+  ocync tags docker.io/library/nginx --glob 'alpine*' --exclude '*beta*' --sort semver";
+
+const WATCH_LONG_ABOUT: &str = "\
+Run sync continuously on a recurring schedule
+
+Runs the sync operation in a loop at the configured interval. Handles graceful
+shutdown on SIGINT/SIGTERM.
+
+Examples:
+  ocync watch -c config.yaml
+  ocync watch -c config.yaml --interval 60";
+
+/// Sync OCI container images across registries.
 #[derive(Debug, Parser)]
-#[command(name = "ocync", version, about = "OCI registry sync tool")]
+#[command(
+    name = "ocync",
+    version,
+    about = "Sync OCI container images across registries",
+    long_about = MAIN_LONG_ABOUT,
+    styles = STYLES,
+)]
 pub(crate) struct Cli {
     /// Subcommand to execute.
     #[command(subcommand)]
     pub(crate) command: Commands,
 
-    /// Increase verbosity (-v, -vv, -vvv).
-    #[arg(short, long, action = clap::ArgAction::Count, global = true, conflicts_with = "quiet")]
+    /// Increase log verbosity (-v, -vv, -vvv).
+    #[arg(short, long, action = clap::ArgAction::Count, global = true, conflicts_with = "quiet", help_heading = "Global options")]
     pub(crate) verbose: u8,
 
-    /// Quiet mode (errors only).
-    #[arg(short, long, global = true)]
+    /// Suppress all output except errors.
+    #[arg(short, long, global = true, help_heading = "Global options")]
     pub(crate) quiet: bool,
 
-    /// Override log format.
-    #[arg(long, global = true, value_enum)]
+    /// Set the log output format (auto-detected in Kubernetes).
+    #[arg(long, global = true, value_enum, help_heading = "Global options")]
     pub(crate) log_format: Option<LogFormat>,
 }
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum LogFormat {
-    /// Human-readable text output.
+    /// Human-readable log lines.
     Text,
-    /// Structured JSON output.
+    /// Structured JSON log entries.
     Json,
 }
 
-/// Available CLI subcommands.
+/// Available commands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
-    /// Run all mappings from config.
+    /// Sync images across registries using a config file.
+    #[command(long_about = SYNC_LONG_ABOUT)]
     Sync(SyncArgs),
-    /// Copy a single image between registries.
+
+    /// Copy a single image from one registry to another.
+    #[command(long_about = COPY_LONG_ABOUT)]
     Copy(CopyArgs),
-    /// List and filter tags.
+
+    /// List, filter, and sort repository tags.
+    #[command(long_about = TAGS_LONG_ABOUT)]
     Tags(TagsArgs),
-    /// Validate credentials.
+
+    /// Manage registry authentication.
+    #[command(long_about = "\
+Manage registry authentication
+
+Verify that credentials are valid for all registries defined in a config file.")]
     Auth {
         /// Auth subcommand.
         #[command(subcommand)]
         action: AuthAction,
     },
-    /// Offline config validation.
+
+    /// Validate a config file without connecting to registries.
+    #[command(long_about = "\
+Validate a config file without connecting to registries
+
+Checks config syntax, structure, and references without making any network
+requests. Catches errors before attempting a sync.")]
     Validate(ValidateArgs),
-    /// Show resolved config.
+
+    /// Display config with all environment variables resolved.
+    #[command(long_about = "\
+Display config with all environment variables resolved
+
+Shows the fully expanded config after variable substitution. Secrets are
+redacted by default unless --show-secrets is passed.")]
     Expand(ExpandArgs),
-    /// Daemon mode.
+
+    /// Run sync continuously on a recurring schedule.
+    #[command(long_about = WATCH_LONG_ABOUT)]
     Watch(WatchArgs),
-    /// Show version information.
+
+    /// Print version and build information.
     Version,
 }
 
 /// Arguments for the `sync` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct SyncArgs {
-    /// Config file path.
+    /// Path to the sync config file.
     #[arg(short, long)]
     pub(crate) config: PathBuf,
-    /// Perform a dry run without making changes.
+    /// Preview what would be synced without making changes.
     #[arg(long)]
     pub(crate) dry_run: bool,
-    /// Write output to a file instead of stdout.
+    /// Output the full sync report as JSON instead of a text summary.
     #[arg(long)]
-    pub(crate) output: Option<PathBuf>,
-    /// Output format for sync results.
-    #[arg(long, value_enum)]
-    pub(crate) output_format: Option<OutputFormat>,
-}
-
-/// Output format for sync results.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum OutputFormat {
-    /// Human-readable text output.
-    Text,
-    /// Structured JSON output.
-    Json,
+    pub(crate) json: bool,
 }
 
 /// Arguments for the `copy` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct CopyArgs {
-    /// Source image reference (e.g. `docker.io/library/nginx:latest`).
+    /// Source image reference (e.g., `docker.io/library/nginx:latest`).
     pub(crate) source: Reference,
-    /// Destination image reference (e.g. `ghcr.io/myorg/nginx:latest`).
+    /// Destination image reference (e.g., `ghcr.io/myorg/nginx:latest`).
     pub(crate) destination: Reference,
 }
 
 /// Arguments for the `tags` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct TagsArgs {
-    /// Repository to list tags from (e.g. `docker.io/library/nginx`).
+    /// Repository to list tags from (e.g., `docker.io/library/nginx`).
     pub(crate) repository: Reference,
-    /// Config file path for registry auth (optional).
+    /// Config file for registry credentials.
     #[arg(short, long)]
     pub(crate) config: Option<PathBuf>,
-    /// Filter tags by glob pattern (repeatable).
+    /// Include tags matching a glob pattern (repeatable).
     #[arg(long)]
     pub(crate) glob: Vec<String>,
-    /// Filter tags by semver range.
+    /// Include tags matching a semver range (e.g., `>=1.0, <2.0`).
     #[arg(long)]
     pub(crate) semver: Option<String>,
-    /// Exclude tags matching pattern (repeatable).
+    /// Exclude tags matching a pattern (repeatable).
     #[arg(long)]
     pub(crate) exclude: Vec<String>,
-    /// Sort order for results.
+    /// Sort order for listed tags.
     #[arg(long, value_enum)]
     pub(crate) sort: Option<TagSortOrder>,
-    /// Return only the N most recent tags.
+    /// Show only the N most recent tags.
     #[arg(long)]
     pub(crate) latest: Option<usize>,
 }
@@ -140,10 +231,10 @@ impl From<TagSortOrder> for ocync_sync::filter::SortOrder {
     }
 }
 
-/// Auth subcommands.
+/// Authentication subcommands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum AuthAction {
-    /// Check credentials for all registries in config.
+    /// Verify credentials for all registries in config.
     Check {
         /// Config file path(s) containing registry definitions.
         #[arg(short, long, required = true)]
@@ -154,14 +245,14 @@ pub(crate) enum AuthAction {
 /// Arguments for the `validate` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct ValidateArgs {
-    /// Config file path to validate.
+    /// Path to the config file to validate.
     pub(crate) config: PathBuf,
 }
 
 /// Arguments for the `expand` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct ExpandArgs {
-    /// Config file path to expand.
+    /// Path to the config file to expand.
     pub(crate) config: PathBuf,
     /// Show secret values instead of redacting them.
     ///
@@ -174,12 +265,15 @@ pub(crate) struct ExpandArgs {
 /// Arguments for the `watch` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct WatchArgs {
-    /// Config file path.
+    /// Path to the sync config file.
     #[arg(short, long)]
     pub(crate) config: PathBuf,
-    /// Sync interval in seconds (minimum 1).
+    /// Seconds between sync runs (minimum: 1).
     #[arg(long, default_value = "300", value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) interval: u64,
+    /// Output sync reports as JSON instead of text summaries.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[tokio::main]
@@ -234,6 +328,14 @@ mod tests {
         let cli = Cli::parse_from(["ocync", "sync", "--config", "c.yaml", "--dry-run"]);
         if let Commands::Sync(args) = cli.command {
             assert!(args.dry_run);
+        }
+    }
+
+    #[test]
+    fn parse_sync_json() {
+        let cli = Cli::parse_from(["ocync", "sync", "--config", "c.yaml", "--json"]);
+        if let Commands::Sync(args) = cli.command {
+            assert!(args.json);
         }
     }
 

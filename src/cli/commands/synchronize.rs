@@ -10,11 +10,11 @@ use ocync_sync::filter::FilterConfig;
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 
+use crate::SyncArgs;
 use crate::cli::config::{
     Config, GlobOrList, MappingConfig, TagsConfig, load_config, resolve_target_names,
 };
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
-use crate::{OutputFormat, SyncArgs};
 
 /// Run the sync command: load config, resolve mappings, and execute.
 pub(crate) async fn run(args: &SyncArgs) -> Result<ExitCode, CliError> {
@@ -40,7 +40,7 @@ pub(crate) async fn run(args: &SyncArgs) -> Result<ExitCode, CliError> {
     let progress = NullProgress;
     let report = engine.run(mappings, &progress).await;
 
-    write_output(args, &report)?;
+    write_output(&report, args.json)?;
 
     match report.exit_code() {
         0 => Ok(ExitCode::Success),
@@ -205,36 +205,13 @@ fn print_dry_run(mappings: &[ResolvedMapping]) {
 }
 
 /// Write sync output in the requested format.
-fn write_output(args: &SyncArgs, report: &SyncReport) -> Result<(), CliError> {
-    let is_json = matches!(args.output_format, Some(OutputFormat::Json));
-
-    if is_json {
+fn write_output(report: &SyncReport, json: bool) -> Result<(), CliError> {
+    if json {
         let json = serde_json::to_string_pretty(report)
             .map_err(|e| CliError::Input(format!("failed to serialize report: {e}")))?;
-
-        if let Some(ref path) = args.output {
-            std::fs::write(path, &json).map_err(|e| {
-                CliError::Input(format!(
-                    "failed to write output to '{}': {e}",
-                    path.display()
-                ))
-            })?;
-        } else {
-            println!("{json}");
-        }
+        println!("{json}");
     } else {
         print_summary(report);
-
-        if let Some(ref path) = args.output {
-            let json = serde_json::to_string_pretty(report)
-                .map_err(|e| CliError::Input(format!("failed to serialize report: {e}")))?;
-            std::fs::write(path, &json).map_err(|e| {
-                CliError::Input(format!(
-                    "failed to write output to '{}': {e}",
-                    path.display()
-                ))
-            })?;
-        }
     }
 
     Ok(())
