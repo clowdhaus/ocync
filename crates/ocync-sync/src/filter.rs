@@ -6,7 +6,8 @@ use tracing::warn;
 use crate::Error;
 
 /// How to handle semver pre-release tags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SemverPrerelease {
     /// Include pre-release tags in results.
     Include,
@@ -17,7 +18,8 @@ pub enum SemverPrerelease {
 }
 
 /// Sort order for the final tag list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SortOrder {
     /// Sort by semantic version (highest first).
     Semver,

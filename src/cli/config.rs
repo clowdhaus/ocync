@@ -168,25 +168,7 @@ pub(crate) enum GlobOrList {
     List(Vec<String>),
 }
 
-// NOTE: SortOrder and SemverPrerelease duplicate the enums in
-// ocync_sync::filter. These are serde-schema versions; the filter crate has
-// domain versions with Clone/Copy/Eq. Unify by adding serde derives to the
-// filter versions and re-exporting here when the CLI is wired up.
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum SortOrder {
-    Semver,
-    Alpha,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum SemverPrerelease {
-    Include,
-    Exclude,
-    Only,
-}
+pub(crate) use ocync_sync::filter::{SemverPrerelease, SortOrder};
 
 // ---------------------------------------------------------------------------
 // Environment variable expansion

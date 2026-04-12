@@ -5,6 +5,7 @@ mod cli;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use ocync_distribution::Reference;
 
 /// OCI registry sync tool.
 #[derive(Debug, Parser)]
@@ -90,10 +91,10 @@ pub(crate) enum OutputFormat {
 /// Arguments for the `copy` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct CopyArgs {
-    /// Source image reference.
-    pub(crate) source: String,
-    /// Destination image reference.
-    pub(crate) destination: String,
+    /// Source image reference (e.g. `docker.io/library/nginx:latest`).
+    pub(crate) source: Reference,
+    /// Destination image reference (e.g. `ghcr.io/myorg/nginx:latest`).
+    pub(crate) destination: Reference,
 }
 
 /// Arguments for the `tags` subcommand.
@@ -167,6 +168,9 @@ async fn main() {
     let cli = Cli::parse();
     cli::setup_logging(&cli);
 
+    let shutdown = cli::shutdown::ShutdownSignal::new();
+    cli::shutdown::install_signal_handlers(shutdown.clone());
+
     let exit_code = match cli.command {
         Commands::Sync(args) => cli::commands::synchronize::run(&args).await,
         Commands::Copy(args) => cli::commands::copy::run(&args).await,
@@ -217,8 +221,19 @@ mod tests {
 
     #[test]
     fn parse_copy() {
-        let cli = Cli::parse_from(["ocync", "copy", "src", "dst"]);
+        let cli = Cli::parse_from([
+            "ocync",
+            "copy",
+            "docker.io/library/nginx:latest",
+            "ghcr.io/myorg/nginx:latest",
+        ]);
         assert!(matches!(cli.command, Commands::Copy(_)));
+    }
+
+    #[test]
+    fn parse_copy_rejects_invalid_reference() {
+        let result = Cli::try_parse_from(["ocync", "copy", "", "dst"]);
+        assert!(result.is_err());
     }
 
     #[test]

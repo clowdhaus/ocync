@@ -248,7 +248,7 @@ fn split_params(s: &str) -> Vec<&str> {
 }
 
 /// Token response from a registry auth endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
     /// The token (Docker Hub uses this field).
     token: Option<String>,
@@ -256,6 +256,19 @@ struct TokenResponse {
     access_token: Option<String>,
     /// Token lifetime in seconds.
     expires_in: Option<u64>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 #[cfg(test)]

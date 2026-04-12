@@ -4,7 +4,6 @@ pub(crate) mod commands;
 pub(crate) mod config;
 #[allow(dead_code)]
 pub(crate) mod output;
-#[allow(dead_code)]
 pub(crate) mod shutdown;
 
 use crate::{Cli, LogFormat};
