@@ -1,5 +1,6 @@
 //! Error types for sync operations.
 
+use ocync_distribution::Digest;
 use thiserror::Error;
 
 /// Errors returned by sync operations.
@@ -45,20 +46,11 @@ pub enum Error {
         source: ocync_distribution::Error,
     },
 
-    /// A blob pull failed during sync.
-    #[error("blob pull failed for {digest}: {source}")]
-    BlobPull {
-        /// The digest of the blob that could not be pulled.
-        digest: String,
-        /// The underlying distribution error.
-        source: ocync_distribution::Error,
-    },
-
-    /// A blob push failed during sync.
-    #[error("blob push failed for {digest}: {source}")]
-    BlobPush {
-        /// The digest of the blob that could not be pushed.
-        digest: String,
+    /// A blob transfer failed during sync.
+    #[error("blob transfer failed for {digest}: {source}")]
+    BlobTransfer {
+        /// The digest of the blob that could not be transferred.
+        digest: Digest,
         /// The underlying distribution error.
         source: ocync_distribution::Error,
     },
@@ -68,9 +60,9 @@ impl Error {
     /// Extract the HTTP status code from the underlying distribution error, if any.
     pub fn status_code(&self) -> Option<http::StatusCode> {
         match self {
-            Self::Manifest { source, .. }
-            | Self::BlobPull { source, .. }
-            | Self::BlobPush { source, .. } => source.status_code(),
+            Self::Manifest { source, .. } | Self::BlobTransfer { source, .. } => {
+                source.status_code()
+            }
             _ => None,
         }
     }
@@ -141,28 +133,18 @@ mod tests {
     }
 
     #[test]
-    fn display_blob_pull_error() {
-        let err = Error::BlobPull {
-            digest: "sha256:abc".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::NOT_FOUND,
-                message: "missing".into(),
-            },
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("sha256:abc"));
-        assert!(msg.contains("blob pull"));
-    }
-
-    #[test]
-    fn display_blob_push_error() {
-        let err = Error::BlobPush {
-            digest: "sha256:def".into(),
+    fn display_blob_transfer_error() {
+        let digest: Digest =
+            "sha256:def0000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap();
+        let err = Error::BlobTransfer {
+            digest: digest.clone(),
             source: ocync_distribution::Error::Other("timeout".into()),
         };
         let msg = err.to_string();
-        assert!(msg.contains("blob push"));
-        assert!(msg.contains("sha256:def"));
+        assert!(msg.contains("blob transfer"));
+        assert!(msg.contains(&digest.to_string()));
     }
 
     #[test]

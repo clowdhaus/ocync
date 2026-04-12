@@ -6,10 +6,10 @@ use std::time::Instant;
 
 use std::time::Duration;
 
+use ocync_distribution::RegistryClient;
 use ocync_distribution::blob::MountResult;
 use ocync_distribution::manifest::ManifestPull;
-use ocync_distribution::spec::{ImageManifest, ManifestKind};
-use ocync_distribution::{Digest, RegistryClient};
+use ocync_distribution::spec::{Descriptor, ImageManifest, ManifestKind};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -94,14 +94,14 @@ struct Endpoint<'a> {
     name: &'a str,
 }
 
-/// Collect all blob digests from an image manifest (config + layers).
-fn collect_image_blobs(manifest: &ImageManifest) -> Vec<Digest> {
-    let mut digests = Vec::with_capacity(1 + manifest.layers.len());
-    digests.push(manifest.config.digest.clone());
+/// Collect all blob descriptors (config + layers) from an image manifest.
+fn collect_image_blobs(manifest: &ImageManifest) -> Vec<&Descriptor> {
+    let mut blobs = Vec::with_capacity(1 + manifest.layers.len());
+    blobs.push(&manifest.config);
     for layer in &manifest.layers {
-        digests.push(layer.digest.clone());
+        blobs.push(layer);
     }
-    digests
+    blobs
 }
 
 /// Source manifest data pre-pulled once per tag.
@@ -111,20 +111,14 @@ fn collect_image_blobs(manifest: &ImageManifest) -> Vec<Digest> {
 struct SourceData {
     /// The top-level manifest (image or index).
     pull: ManifestPull,
-    /// For index manifests: pre-pulled child image manifests with their blob lists.
+    /// For index manifests: pre-pulled child manifests.
     /// Empty for single-image manifests (blobs are derived from `pull.manifest`).
-    children: Vec<ChildData>,
+    children: Vec<ManifestPull>,
 }
 
-/// A pre-pulled child manifest within an index.
-struct ChildData {
-    pull: ManifestPull,
-    blobs: Vec<Digest>,
-}
-
-/// Per-target result of a fan-out blob transfer phase.
+/// Per-target outcome of the blob transfer phase.
 #[derive(Default)]
-struct BlobTransferResult {
+struct TargetBlobOutcome {
     bytes_transferred: u64,
     stats: BlobTransferStats,
     /// `Some` if a target-specific push failed. Other targets are unaffected.
@@ -301,47 +295,25 @@ impl SyncEngine {
             return;
         }
 
-        // Collect all blob digests from the source data.
-        let owned_blobs;
-        let all_blobs: Vec<&Digest> = match &source_data.pull.manifest {
-            ManifestKind::Image(m) => {
-                owned_blobs = collect_image_blobs(m);
-                owned_blobs.iter().collect()
-            }
-            ManifestKind::Index(_) => source_data.children.iter().flat_map(|c| &c.blobs).collect(),
+        // Collect all blob descriptors from the source data.
+        let all_blobs: Vec<&Descriptor> = match &source_data.pull.manifest {
+            ManifestKind::Image(m) => collect_image_blobs(m),
+            ManifestKind::Index(_) => source_data
+                .children
+                .iter()
+                .flat_map(|c| match &c.manifest {
+                    ManifestKind::Image(m) => collect_image_blobs(m),
+                    ManifestKind::Index(_) => Vec::new(),
+                })
+                .collect(),
         };
 
         // Phase 2: Fan-out blob transfer — pull each blob once, push to all active targets.
         let active_targets: Vec<&Endpoint<'_>> = active.iter().map(|&(i, _)| &targets[i]).collect();
 
-        let blob_results = match self
-            .transfer_blobs_fanout(source, &active_targets, &all_blobs)
-            .await
-        {
-            Ok(results) => results,
-            Err(err) => {
-                // Source blob pull failed — all active targets fail.
-                let error_str = err.to_string();
-                for &(i, start) in &active {
-                    let target = &targets[i];
-                    let result = ImageResult {
-                        image_id: Uuid::now_v7(),
-                        source: format!("{}:{source_tag}", source.repo),
-                        target: format!("{}:{target_tag}", target.repo),
-                        status: ImageStatus::Failed {
-                            error: error_str.clone(),
-                            retries: self.retry.max_retries,
-                        },
-                        bytes_transferred: 0,
-                        blob_stats: BlobTransferStats::default(),
-                        duration: start.elapsed(),
-                    };
-                    progress.image_completed(&result);
-                    images.push(result);
-                }
-                return;
-            }
-        };
+        let blob_results = self
+            .transfer_blobs(source, &active_targets, &all_blobs)
+            .await;
 
         // Phase 3: Push manifests to targets whose blobs all succeeded.
         for (br, &(i, start)) in blob_results.into_iter().zip(active.iter()) {
@@ -446,12 +418,8 @@ impl SyncEngine {
                     })?;
 
                     match &child_pull.manifest {
-                        ManifestKind::Image(child_image) => {
-                            let blobs = collect_image_blobs(child_image);
-                            children.push(ChildData {
-                                pull: child_pull,
-                                blobs,
-                            });
+                        ManifestKind::Image(_) => {
+                            children.push(child_pull);
                         }
                         ManifestKind::Index(_) => {
                             return Err(crate::Error::Manifest {
@@ -479,13 +447,13 @@ impl SyncEngine {
     ) -> Result<(), crate::Error> {
         // For index manifests, push each child by digest first.
         for child in &source_data.children {
-            let child_digest_str = child.pull.digest.to_string();
+            let child_digest_str = child.digest.to_string();
             with_retry(&self.retry, "manifest push", || {
                 target.client.manifest_push(
                     target.repo,
                     &child_digest_str,
-                    &child.pull.media_type,
-                    &child.pull.raw_bytes,
+                    &child.media_type,
+                    &child.raw_bytes,
                 )
             })
             .await
@@ -513,24 +481,26 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Fan-out blob transfer: pull each blob once from source, push to all targets.
+    /// Transfer blobs from source to each target that needs them.
     ///
-    /// For each digest, checks dedup/HEAD/mount per target. If any target
-    /// needs a pull, pulls from source once and pushes to all targets that need it.
-    /// Source pull failure is fatal (returns `Err`). Target push failures are
-    /// per-target (recorded in the returned results, other targets continue).
-    async fn transfer_blobs_fanout(
+    /// For each blob, checks dedup/HEAD/mount per target. If any target
+    /// needs a pull, streams from source directly to that target (one stream
+    /// per target since streams are consumed). Transfer failures are per-target
+    /// (recorded in the returned outcomes, other targets continue).
+    async fn transfer_blobs(
         &mut self,
         source: &Endpoint<'_>,
         targets: &[&Endpoint<'_>],
-        digests: &[&Digest],
-    ) -> Result<Vec<BlobTransferResult>, crate::Error> {
-        let mut results: Vec<BlobTransferResult> = targets
+        blobs: &[&Descriptor],
+    ) -> Vec<TargetBlobOutcome> {
+        let mut results: Vec<TargetBlobOutcome> = targets
             .iter()
-            .map(|_| BlobTransferResult::default())
+            .map(|_| TargetBlobOutcome::default())
             .collect();
 
-        for &digest in digests {
+        for blob in blobs {
+            let digest = &blob.digest;
+            let size = blob.size;
             // Determine which targets need this blob pulled+pushed.
             let mut needs_pull: Vec<usize> = Vec::new();
 
@@ -592,43 +562,42 @@ impl SyncEngine {
                 continue;
             }
 
-            // Pull from source ONCE.
-            let data = with_retry(&self.retry, "blob pull", || {
-                source.client.blob_pull_all(source.repo, digest)
-            })
-            .await
-            .map_err(|e| crate::Error::BlobPull {
-                digest: digest.to_string(),
-                source: e,
-            })?;
-            let blob_size = data.len() as u64;
-
-            // Push to each target that needs it.
+            // Stream from source to each target independently.
+            // Each target gets its own pull stream since streams are consumed.
+            // On retry, both pull and push are re-initiated (stream is not resumable).
             for &i in &needs_pull {
                 let target = targets[i];
                 self.dedup.set_in_progress(target.name, digest);
 
-                if let Err(e) = with_retry(&self.retry, "blob push", || {
-                    target.client.blob_push(target.repo, &data)
+                let transfer_result = with_retry(&self.retry, "blob transfer", || async {
+                    let stream = source.client.blob_pull(source.repo, digest).await?;
+                    target
+                        .client
+                        .blob_push_stream(target.repo, digest, stream)
+                        .await
                 })
-                .await
-                {
-                    let err = crate::Error::BlobPush {
-                        digest: digest.to_string(),
-                        source: e,
-                    };
-                    self.dedup.set_failed(target.name, digest, err.to_string());
-                    results[i].error = Some(err);
-                    continue; // other targets may still succeed
-                }
+                .await;
 
-                results[i].bytes_transferred += blob_size;
-                results[i].stats.transferred += 1;
-                self.dedup.set_completed(target.name, digest, target.repo);
+                match transfer_result {
+                    Ok(_digest) => {
+                        results[i].bytes_transferred += size;
+                        results[i].stats.transferred += 1;
+                        self.dedup.set_completed(target.name, digest, target.repo);
+                    }
+                    Err(e) => {
+                        let err = crate::Error::BlobTransfer {
+                            digest: digest.clone(),
+                            source: e,
+                        };
+                        self.dedup.set_failed(target.name, digest, err.to_string());
+                        results[i].error = Some(err);
+                        // other targets may still succeed
+                    }
+                }
             }
         }
 
-        Ok(results)
+        results
     }
 }
 
@@ -697,6 +666,7 @@ fn compute_stats(images: &[ImageResult]) -> SyncStats {
 
 #[cfg(test)]
 mod tests {
+    use ocync_distribution::Digest;
     use ocync_distribution::spec::{Descriptor, MediaType};
 
     use super::*;
@@ -724,14 +694,24 @@ mod tests {
         let layer1_digest = test_digest("a1");
         let layer2_digest = test_digest("b2");
 
+        let config_desc = Descriptor {
+            size: 50,
+            ..test_descriptor(config_digest.clone(), MediaType::OciConfig)
+        };
+        let layer1_desc = Descriptor {
+            size: 200,
+            ..test_descriptor(layer1_digest.clone(), MediaType::OciLayerGzip)
+        };
+        let layer2_desc = Descriptor {
+            size: 300,
+            ..test_descriptor(layer2_digest.clone(), MediaType::OciLayerGzip)
+        };
+
         let manifest = ImageManifest {
             schema_version: 2,
             media_type: None,
-            config: test_descriptor(config_digest.clone(), MediaType::OciConfig),
-            layers: vec![
-                test_descriptor(layer1_digest.clone(), MediaType::OciLayerGzip),
-                test_descriptor(layer2_digest.clone(), MediaType::OciLayerGzip),
-            ],
+            config: config_desc,
+            layers: vec![layer1_desc, layer2_desc],
             subject: None,
             artifact_type: None,
             annotations: None,
@@ -739,19 +719,27 @@ mod tests {
 
         let blobs = collect_image_blobs(&manifest);
         assert_eq!(blobs.len(), 3);
-        assert_eq!(blobs[0], config_digest);
-        assert_eq!(blobs[1], layer1_digest);
-        assert_eq!(blobs[2], layer2_digest);
+        assert_eq!(blobs[0].digest, config_digest);
+        assert_eq!(blobs[0].size, 50);
+        assert_eq!(blobs[1].digest, layer1_digest);
+        assert_eq!(blobs[1].size, 200);
+        assert_eq!(blobs[2].digest, layer2_digest);
+        assert_eq!(blobs[2].size, 300);
     }
 
     #[test]
     fn collect_blobs_no_layers() {
         let config_digest = test_digest("cc");
 
+        let config_desc = Descriptor {
+            size: 42,
+            ..test_descriptor(config_digest.clone(), MediaType::OciConfig)
+        };
+
         let manifest = ImageManifest {
             schema_version: 2,
             media_type: None,
-            config: test_descriptor(config_digest.clone(), MediaType::OciConfig),
+            config: config_desc,
             layers: vec![],
             subject: None,
             artifact_type: None,
@@ -760,7 +748,8 @@ mod tests {
 
         let blobs = collect_image_blobs(&manifest);
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0], config_digest);
+        assert_eq!(blobs[0].digest, config_digest);
+        assert_eq!(blobs[0].size, 42);
     }
 
     fn make_image_result(status: ImageStatus, bytes: u64) -> ImageResult {
