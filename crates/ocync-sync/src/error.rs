@@ -45,8 +45,8 @@ pub enum Error {
         source: ocync_distribution::Error,
     },
 
-    /// A blob transfer (pull or push) failed during sync.
-    #[error("blob push failed for {digest}: {source}")]
+    /// A blob transfer failed during sync.
+    #[error("blob transfer failed for {digest}: {source}")]
     BlobPush {
         /// The digest of the blob that could not be pushed.
         digest: String,
@@ -136,7 +136,7 @@ mod tests {
             source: ocync_distribution::Error::Other("timeout".into()),
         };
         let msg = err.to_string();
-        assert!(msg.contains("blob push"));
+        assert!(msg.contains("blob transfer"));
         assert!(msg.contains("sha256:def"));
     }
 
