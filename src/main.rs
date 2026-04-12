@@ -177,6 +177,9 @@ pub(crate) struct WatchArgs {
     /// Config file path(s).
     #[arg(short, long, required = true)]
     pub(crate) config: Vec<PathBuf>,
+    /// Sync interval in seconds.
+    #[arg(long, default_value = "300")]
+    pub(crate) interval: u64,
 }
 
 #[tokio::main]
@@ -184,11 +187,9 @@ async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     cli::setup_logging(&cli);
 
-    // Install signal handlers for graceful shutdown logging. The signal is not
-    // yet propagated to commands — sync/watch will need a clone passed down
-    // once they are implemented.
+    // Install signal handlers for graceful shutdown.
     let shutdown = cli::shutdown::ShutdownSignal::new();
-    cli::shutdown::install_signal_handlers(shutdown);
+    cli::shutdown::install_signal_handlers(shutdown.clone());
 
     let result = match cli.command {
         Commands::Sync(args) => cli::commands::synchronize::run(&args).await,
@@ -199,7 +200,7 @@ async fn main() -> std::process::ExitCode {
         },
         Commands::Validate(args) => cli::commands::validate::run(&args),
         Commands::Expand(args) => cli::commands::expand::run(&args),
-        Commands::Watch(args) => cli::commands::watch::run(&args).await,
+        Commands::Watch(args) => cli::commands::watch::run(&args, shutdown.clone()).await,
         Commands::Version => Ok(cli::commands::version::run()),
     };
 
@@ -331,5 +332,25 @@ mod tests {
             "c.yaml",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_watch() {
+        let cli = Cli::parse_from(["ocync", "watch", "--config", "c.yaml"]);
+        if let Commands::Watch(args) = cli.command {
+            assert_eq!(args.interval, 300);
+        } else {
+            panic!("expected Watch command");
+        }
+    }
+
+    #[test]
+    fn parse_watch_custom_interval() {
+        let cli = Cli::parse_from(["ocync", "watch", "--config", "c.yaml", "--interval", "60"]);
+        if let Commands::Watch(args) = cli.command {
+            assert_eq!(args.interval, 60);
+        } else {
+            panic!("expected Watch command");
+        }
     }
 }
