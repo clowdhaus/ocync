@@ -41,11 +41,16 @@ impl RetryConfig {
 }
 
 /// Determine whether a request should be retried based on HTTP status code.
+///
+/// Retries on 408 (Request Timeout), 429 (Too Many Requests), and all 5xx
+/// server errors. This matches the behavior of crane and regsync.
 pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) -> bool {
     if current_attempt >= max_retries {
         return false;
     }
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
 }
 
 #[cfg(test)]
@@ -115,6 +120,12 @@ mod tests {
         // 0^n = 0 for n > 0, so all subsequent attempts give zero backoff
         assert_eq!(cfg.backoff_for(1), Duration::ZERO);
         assert_eq!(cfg.backoff_for(5), Duration::ZERO);
+    }
+
+    #[test]
+    fn should_retry_on_408() {
+        assert!(should_retry(StatusCode::REQUEST_TIMEOUT, 0, 3));
+        assert!(!should_retry(StatusCode::REQUEST_TIMEOUT, 3, 3));
     }
 
     #[test]

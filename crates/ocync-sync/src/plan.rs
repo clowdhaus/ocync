@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use ocync_distribution::Digest;
+use tracing::warn;
 
 /// Status of a blob at the target registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +22,7 @@ pub enum BlobStatus {
 
 /// Metadata for a tracked blob.
 #[derive(Debug)]
-pub struct BlobInfo {
+pub(crate) struct BlobInfo {
     /// Current transfer status.
     pub status: BlobStatus,
     /// Set of repositories at the target that have this blob.
@@ -64,6 +65,18 @@ impl BlobDedupMap {
         }
     }
 
+    /// Get or create the `BlobInfo` entry for the given target and digest.
+    fn entry_mut(&mut self, target: &str, digest: &Digest) -> &mut BlobInfo {
+        self.inner
+            .entry(target.to_owned())
+            .or_default()
+            .entry(digest.clone())
+            .or_insert_with(|| BlobInfo {
+                status: BlobStatus::Unknown,
+                repos: BTreeSet::new(),
+            })
+    }
+
     /// Get the current status for a blob at the given target.
     pub fn status(&self, target: &str, digest: &Digest) -> Option<&BlobStatus> {
         self.inner.get(target)?.get(digest).map(|info| &info.status)
@@ -75,15 +88,7 @@ impl BlobDedupMap {
     /// only if the blob was previously [`BlobStatus::Unknown`]. All other states
     /// return a descriptive result without modifying the map.
     pub fn try_claim(&mut self, target: &str, digest: &Digest) -> ClaimResult {
-        let entry = self
-            .inner
-            .entry(target.to_owned())
-            .or_default()
-            .entry(digest.clone())
-            .or_insert_with(|| BlobInfo {
-                status: BlobStatus::Unknown,
-                repos: BTreeSet::new(),
-            });
+        let entry = self.entry_mut(target, digest);
         match &entry.status {
             BlobStatus::Unknown => {
                 entry.status = BlobStatus::InProgress;
@@ -95,59 +100,66 @@ impl BlobDedupMap {
 
     /// Mark a blob as existing at the target in the given repo.
     pub fn set_exists(&mut self, target: &str, digest: &Digest, repo: &str) {
-        let entry = self
-            .inner
-            .entry(target.to_owned())
-            .or_default()
-            .entry(digest.clone())
-            .or_insert_with(|| BlobInfo {
-                status: BlobStatus::Unknown,
-                repos: BTreeSet::new(),
-            });
+        let entry = self.entry_mut(target, digest);
+        if matches!(entry.status, BlobStatus::Completed | BlobStatus::Failed(_)) {
+            warn!(
+                target,
+                %digest,
+                from = ?entry.status,
+                to = "ExistsAtTarget",
+                "unexpected blob status transition"
+            );
+        }
         entry.status = BlobStatus::ExistsAtTarget;
         entry.repos.insert(repo.to_owned());
     }
 
     /// Mark a blob as in-progress at the target.
     pub fn set_in_progress(&mut self, target: &str, digest: &Digest) {
-        let entry = self
-            .inner
-            .entry(target.to_owned())
-            .or_default()
-            .entry(digest.clone())
-            .or_insert_with(|| BlobInfo {
-                status: BlobStatus::Unknown,
-                repos: BTreeSet::new(),
-            });
+        let entry = self.entry_mut(target, digest);
+        if matches!(entry.status, BlobStatus::Completed | BlobStatus::Failed(_)) {
+            warn!(
+                target,
+                %digest,
+                from = ?entry.status,
+                to = "InProgress",
+                "unexpected blob status transition"
+            );
+        }
         entry.status = BlobStatus::InProgress;
     }
 
     /// Mark a blob as completed at the target in the given repo.
     pub fn set_completed(&mut self, target: &str, digest: &Digest, repo: &str) {
-        let entry = self
-            .inner
-            .entry(target.to_owned())
-            .or_default()
-            .entry(digest.clone())
-            .or_insert_with(|| BlobInfo {
-                status: BlobStatus::Unknown,
-                repos: BTreeSet::new(),
-            });
+        let entry = self.entry_mut(target, digest);
+        if matches!(entry.status, BlobStatus::Failed(_)) {
+            warn!(
+                target,
+                %digest,
+                from = ?entry.status,
+                to = "Completed",
+                "unexpected blob status transition"
+            );
+        }
         entry.status = BlobStatus::Completed;
         entry.repos.insert(repo.to_owned());
     }
 
     /// Mark a blob as failed at the target.
     pub fn set_failed(&mut self, target: &str, digest: &Digest, error: String) {
-        let entry = self
-            .inner
-            .entry(target.to_owned())
-            .or_default()
-            .entry(digest.clone())
-            .or_insert_with(|| BlobInfo {
-                status: BlobStatus::Unknown,
-                repos: BTreeSet::new(),
-            });
+        let entry = self.entry_mut(target, digest);
+        if matches!(
+            entry.status,
+            BlobStatus::Completed | BlobStatus::ExistsAtTarget
+        ) {
+            warn!(
+                target,
+                %digest,
+                from = ?entry.status,
+                to = "Failed",
+                "unexpected blob status transition"
+            );
+        }
         entry.status = BlobStatus::Failed(error);
     }
 

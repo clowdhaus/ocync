@@ -34,6 +34,13 @@ mod tests {
     use super::*;
     use crate::{ImageStatus, SyncStats};
 
+    fn _assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn null_progress_is_send_sync() {
+        _assert_send_sync::<NullProgress>();
+    }
+
     #[test]
     fn null_progress_methods_do_not_panic() {
         let p = NullProgress;

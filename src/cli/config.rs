@@ -168,6 +168,11 @@ pub(crate) enum GlobOrList {
     List(Vec<String>),
 }
 
+// NOTE: SortOrder and SemverPrerelease duplicate the enums in
+// ocync_sync::filter. These are serde-schema versions; the filter crate has
+// domain versions with Clone/Copy/Eq. Unify by adding serde derives to the
+// filter versions and re-exporting here when the CLI is wired up.
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SortOrder {
@@ -205,6 +210,9 @@ fn is_blocked(var_name: &str) -> bool {
 }
 
 /// Expand `${VAR}`, `${VAR:-default}`, and `${VAR:?error}` expressions.
+///
+/// Only the `${...}` form is supported — bare `$VAR` without braces is
+/// treated as literal text. This avoids ambiguity with shell-like strings.
 ///
 /// When `is_auth_field` is false, variables matching [`BLOCKED_PATTERNS`]
 /// (SECRET, TOKEN, etc.) are rejected to prevent accidental secret leakage
@@ -287,6 +295,8 @@ pub(crate) fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+// TODO: When defaults merging is implemented, allow mappings to omit `tags`
+// and inherit from `defaults.tags`. This validation must become context-aware.
 pub(crate) fn validate_mapping(mapping: &MappingConfig) -> Result<(), ConfigError> {
     if mapping.tags.is_none() {
         return Err(ConfigError::Validation(format!(
