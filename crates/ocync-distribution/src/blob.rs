@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LOCATION};
+use tracing::{debug, warn};
 
 use crate::auth::Scope;
 use crate::client::{RegistryClient, build_url};
@@ -182,7 +183,7 @@ impl RegistryClient {
         &self,
         repository: &str,
         expected_digest: &Digest,
-        _content_length: u64,
+        content_length: u64,
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     ) -> Result<Digest, Error> {
         // GAR fallback: buffer entire stream and use monolithic push.
@@ -195,6 +196,14 @@ impl RegistryClient {
                 .blob_push_stream_gar_fallback(repository, expected_digest, stream)
                 .await;
         }
+
+        debug!(
+            repository,
+            %expected_digest,
+            content_length,
+            chunk_size = self.chunk_size,
+            "starting chunked blob upload"
+        );
 
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let _permit = self.semaphore.acquire().await.expect("semaphore closed");
@@ -303,6 +312,9 @@ impl RegistryClient {
             .map_err(|e| Error::Other(format!("failed to build Content-Range header: {e}")))?;
         let data_len = data.len();
         let url = upload_url.to_owned();
+        // Convert to Bytes so .clone() in the retry closure is a cheap
+        // reference-count increment instead of a full memcpy per chunk.
+        let data = Bytes::from(data);
 
         let resp = self
             .send_with_retry(scopes, "blob push stream patch", |headers| {
@@ -329,12 +341,20 @@ impl RegistryClient {
     }
 
     /// GAR fallback: buffer the entire stream and delegate to monolithic push.
+    ///
+    /// Google Artifact Registry does not support chunked uploads, so the
+    /// entire stream is buffered in memory and sent as a monolithic upload.
     async fn blob_push_stream_gar_fallback(
         &self,
         repository: &str,
         expected_digest: &Digest,
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     ) -> Result<Digest, Error> {
+        warn!(
+            repository,
+            host = self.base_url.host_str().unwrap_or("unknown"),
+            "GAR does not support chunked uploads; buffering entire blob in memory"
+        );
         let mut body = Vec::new();
         futures_util::pin_mut!(stream);
         while let Some(chunk) = stream.next().await {
