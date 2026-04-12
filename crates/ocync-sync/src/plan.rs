@@ -1,6 +1,6 @@
 //! Blob deduplication map and transfer ordering for cross-repo mount support.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use ocync_distribution::Digest;
 
@@ -25,16 +25,38 @@ pub struct BlobInfo {
     /// Current transfer status.
     pub status: BlobStatus,
     /// Set of repositories at the target that have this blob.
-    pub repos: HashSet<String>,
+    ///
+    /// `BTreeSet` guarantees deterministic iteration order, which makes
+    /// [`BlobDedupMap::mount_source`] return a consistent result.
+    pub repos: BTreeSet<String>,
 }
 
-/// Process-global deduplication map keyed by `(target_registry, digest)`.
+/// Result of attempting to claim a blob for transfer.
+///
+/// Used by the sync engine to atomically check-then-set blob status,
+/// avoiding TOCTOU races when multiple tasks check the same blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimResult {
+    /// Successfully claimed — caller should proceed with transfer.
+    Claimed,
+    /// Another task is already transferring this blob.
+    AlreadyInProgress,
+    /// Blob was already transferred successfully.
+    AlreadyCompleted,
+    /// Blob already exists at the target.
+    AlreadyExists,
+    /// A previous transfer attempt failed.
+    PreviouslyFailed(String),
+}
+
+/// Process-global deduplication map keyed by target registry, then by digest.
 ///
 /// Tracks which blobs have already been transferred or exist at a target so
-/// we never push the same layer twice.
+/// we never push the same layer twice. Uses a two-level map to avoid
+/// allocations on read-path lookups.
 #[derive(Debug)]
 pub struct BlobDedupMap {
-    inner: HashMap<(String, Digest), BlobInfo>,
+    inner: HashMap<String, HashMap<Digest, BlobInfo>>,
 }
 
 impl BlobDedupMap {
@@ -47,19 +69,46 @@ impl BlobDedupMap {
 
     /// Get the current status for a blob at the given target.
     pub fn status(&self, target: &str, digest: &Digest) -> Option<&BlobStatus> {
-        self.inner
-            .get(&(target.to_owned(), digest.clone()))
-            .map(|info| &info.status)
+        self.inner.get(target)?.get(digest).map(|info| &info.status)
+    }
+
+    /// Atomically check blob status and claim it for transfer if unclaimed.
+    ///
+    /// Returns [`ClaimResult::Claimed`] and sets status to [`BlobStatus::InProgress`]
+    /// only if the blob was previously [`BlobStatus::Unknown`]. All other states
+    /// return a descriptive result without modifying the map.
+    pub fn try_claim(&mut self, target: &str, digest: &Digest) -> ClaimResult {
+        let entry = self
+            .inner
+            .entry(target.to_owned())
+            .or_default()
+            .entry(digest.clone())
+            .or_insert_with(|| BlobInfo {
+                status: BlobStatus::Unknown,
+                repos: BTreeSet::new(),
+            });
+        match &entry.status {
+            BlobStatus::Unknown => {
+                entry.status = BlobStatus::InProgress;
+                ClaimResult::Claimed
+            }
+            BlobStatus::InProgress => ClaimResult::AlreadyInProgress,
+            BlobStatus::Completed => ClaimResult::AlreadyCompleted,
+            BlobStatus::ExistsAtTarget => ClaimResult::AlreadyExists,
+            BlobStatus::Failed(err) => ClaimResult::PreviouslyFailed(err.clone()),
+        }
     }
 
     /// Mark a blob as existing at the target in the given repo.
     pub fn set_exists(&mut self, target: &str, digest: &Digest, repo: &str) {
         let entry = self
             .inner
-            .entry((target.to_owned(), digest.clone()))
+            .entry(target.to_owned())
+            .or_default()
+            .entry(digest.clone())
             .or_insert_with(|| BlobInfo {
                 status: BlobStatus::Unknown,
-                repos: HashSet::new(),
+                repos: BTreeSet::new(),
             });
         entry.status = BlobStatus::ExistsAtTarget;
         entry.repos.insert(repo.to_owned());
@@ -69,10 +118,12 @@ impl BlobDedupMap {
     pub fn set_in_progress(&mut self, target: &str, digest: &Digest) {
         let entry = self
             .inner
-            .entry((target.to_owned(), digest.clone()))
+            .entry(target.to_owned())
+            .or_default()
+            .entry(digest.clone())
             .or_insert_with(|| BlobInfo {
                 status: BlobStatus::Unknown,
-                repos: HashSet::new(),
+                repos: BTreeSet::new(),
             });
         entry.status = BlobStatus::InProgress;
     }
@@ -81,10 +132,12 @@ impl BlobDedupMap {
     pub fn set_completed(&mut self, target: &str, digest: &Digest, repo: &str) {
         let entry = self
             .inner
-            .entry((target.to_owned(), digest.clone()))
+            .entry(target.to_owned())
+            .or_default()
+            .entry(digest.clone())
             .or_insert_with(|| BlobInfo {
                 status: BlobStatus::Unknown,
-                repos: HashSet::new(),
+                repos: BTreeSet::new(),
             });
         entry.status = BlobStatus::Completed;
         entry.repos.insert(repo.to_owned());
@@ -94,30 +147,32 @@ impl BlobDedupMap {
     pub fn set_failed(&mut self, target: &str, digest: &Digest, error: String) {
         let entry = self
             .inner
-            .entry((target.to_owned(), digest.clone()))
+            .entry(target.to_owned())
+            .or_default()
+            .entry(digest.clone())
             .or_insert_with(|| BlobInfo {
                 status: BlobStatus::Unknown,
-                repos: HashSet::new(),
+                repos: BTreeSet::new(),
             });
         entry.status = BlobStatus::Failed(error);
     }
 
     /// Return the set of known repos for a blob at a target.
-    pub fn known_repos(&self, target: &str, digest: &Digest) -> Option<&HashSet<String>> {
-        self.inner
-            .get(&(target.to_owned(), digest.clone()))
-            .map(|info| &info.repos)
+    pub fn known_repos(&self, target: &str, digest: &Digest) -> Option<&BTreeSet<String>> {
+        self.inner.get(target)?.get(digest).map(|info| &info.repos)
     }
 
     /// Find a repo that already has this blob at the target which differs from
     /// `target_repo`, suitable as a cross-repo mount source.
+    ///
+    /// Returns the alphabetically first candidate (deterministic via `BTreeSet`).
     pub fn mount_source<'a>(
         &'a self,
         target: &str,
         digest: &Digest,
         target_repo: &str,
     ) -> Option<&'a str> {
-        let info = self.inner.get(&(target.to_owned(), digest.clone()))?;
+        let info = self.inner.get(target)?.get(digest)?;
         info.repos
             .iter()
             .find(|r| r.as_str() != target_repo)
@@ -202,6 +257,37 @@ mod tests {
     }
 
     #[test]
+    fn mount_source_deterministic_with_multiple_repos() {
+        let mut map = BlobDedupMap::new();
+        let d = test_digest();
+
+        // Insert in non-alphabetical order to verify BTreeSet ordering
+        map.set_completed("reg.io", &d, "library/redis");
+        map.set_completed("reg.io", &d, "library/nginx");
+        map.set_completed("reg.io", &d, "library/alpine");
+
+        // BTreeSet iterates alphabetically: alpine, nginx, redis
+        let source = map.mount_source("reg.io", &d, "library/redis");
+        assert_eq!(source, Some("library/alpine"));
+
+        let source = map.mount_source("reg.io", &d, "library/alpine");
+        assert_eq!(source, Some("library/nginx"));
+    }
+
+    #[test]
+    fn different_targets_tracked_independently() {
+        let mut map = BlobDedupMap::new();
+        let d = test_digest();
+
+        map.set_completed("reg-a.io", &d, "library/alpine");
+        map.set_in_progress("reg-b.io", &d);
+
+        assert_eq!(map.status("reg-a.io", &d), Some(&BlobStatus::Completed));
+        assert_eq!(map.status("reg-b.io", &d), Some(&BlobStatus::InProgress));
+        assert!(map.status("reg-c.io", &d).is_none());
+    }
+
+    #[test]
     fn transfer_kind_ordering() {
         assert!(TransferKind::Blob < TransferKind::PlatformManifest);
         assert!(TransferKind::PlatformManifest < TransferKind::Index);
@@ -229,6 +315,56 @@ mod tests {
         assert_eq!(
             map.status("reg.io", &d),
             Some(&BlobStatus::Failed("connection refused".into()))
+        );
+    }
+
+    // -- try_claim tests --
+
+    #[test]
+    fn try_claim_unknown_becomes_in_progress() {
+        let mut map = BlobDedupMap::new();
+        let d = test_digest();
+
+        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::Claimed);
+        assert_eq!(map.status("reg.io", &d), Some(&BlobStatus::InProgress));
+    }
+
+    #[test]
+    fn try_claim_already_in_progress() {
+        let mut map = BlobDedupMap::new();
+        let d = test_digest();
+
+        map.set_in_progress("reg.io", &d);
+        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::AlreadyInProgress);
+    }
+
+    #[test]
+    fn try_claim_already_completed() {
+        let mut map = BlobDedupMap::new();
+        let d = test_digest();
+
+        map.set_completed("reg.io", &d, "library/alpine");
+        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::AlreadyCompleted);
+    }
+
+    #[test]
+    fn try_claim_already_exists() {
+        let mut map = BlobDedupMap::new();
+        let d = test_digest();
+
+        map.set_exists("reg.io", &d, "library/alpine");
+        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::AlreadyExists);
+    }
+
+    #[test]
+    fn try_claim_previously_failed() {
+        let mut map = BlobDedupMap::new();
+        let d = test_digest();
+
+        map.set_failed("reg.io", &d, "connection refused".into());
+        assert_eq!(
+            map.try_claim("reg.io", &d),
+            ClaimResult::PreviouslyFailed("connection refused".into())
         );
     }
 }

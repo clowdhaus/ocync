@@ -1,7 +1,5 @@
 //! OCI registry sync orchestration — tag filtering, transfer planning, and execution.
 
-/// Sync engine with retry/backoff and concurrency control.
-pub mod engine;
 /// Error types for sync operations.
 pub mod error;
 
@@ -11,6 +9,8 @@ pub mod filter;
 pub mod plan;
 /// Progress reporting trait and types.
 pub mod progress;
+/// Retry configuration and backoff logic.
+pub mod retry;
 
 use std::time::Duration;
 
@@ -141,6 +141,17 @@ mod tests {
             stats: SyncStats::default(),
             duration: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn exit_code_empty_report() {
+        let report = SyncReport {
+            run_id: Ulid::new(),
+            images: vec![],
+            stats: SyncStats::default(),
+            duration: Duration::ZERO,
+        };
+        assert_eq!(report.exit_code(), 0);
     }
 
     #[test]

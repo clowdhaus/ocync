@@ -11,6 +11,7 @@ repository = "https://github.com/clowdhaus/ocync"
 [workspace.dependencies]
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
+http = { version = "1", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
@@ -47,6 +48,6 @@ ocync-distribution.workspace = true
 ocync-sync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = { version = "0.9", default-features = false }
+serde_yaml = { package = "serde_yaml_ng", version = "0.10", default-features = false }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
