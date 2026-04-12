@@ -1,6 +1,7 @@
 //! Anonymous auth provider using the Docker token-exchange flow.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -26,8 +27,8 @@ pub struct AnonymousAuth {
     cache: Mutex<HashMap<String, Token>>,
 }
 
-impl std::fmt::Debug for AnonymousAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for AnonymousAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AnonymousAuth")
             .field("base_url", &self.base_url)
             .finish_non_exhaustive()
@@ -248,7 +249,7 @@ fn split_params(s: &str) -> Vec<&str> {
 }
 
 /// Token response from a registry auth endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
     /// The token (Docker Hub uses this field).
     token: Option<String>,
@@ -256,6 +257,16 @@ struct TokenResponse {
     access_token: Option<String>,
     /// Token lifetime in seconds.
     expires_in: Option<u64>,
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("token", &"[REDACTED]")
+            .field("access_token", &"[REDACTED]")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 #[cfg(test)]

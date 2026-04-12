@@ -17,5 +17,9 @@ ocync-distribution.workspace = true
 semver = { version = "1", default-features = false, features = ["std"] }
 serde.workspace = true
 thiserror.workspace = true
-tracing = { version = "0.1", default-features = false }
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

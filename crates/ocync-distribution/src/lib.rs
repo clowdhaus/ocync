@@ -24,7 +24,7 @@ pub mod spec;
 pub mod tags;
 
 pub use blob::MountResult;
-pub use client::RegistryClient;
+pub use client::{RegistryClient, RegistryClientBuilder};
 pub use digest::Digest;
 pub use error::Error;
 pub use manifest::{ManifestHead, ManifestPull};

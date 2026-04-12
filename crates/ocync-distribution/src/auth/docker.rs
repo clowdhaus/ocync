@@ -1,6 +1,7 @@
 //! Docker `config.json` credential resolution and helper execution.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,7 +36,7 @@ pub struct DockerConfig {
 }
 
 /// A single auth entry from the `auths` map.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct AuthEntry {
     /// Base64-encoded `username:password`.
@@ -44,6 +45,16 @@ pub struct AuthEntry {
     pub username: Option<String>,
     /// Password (when stored separately).
     pub password: Option<String>,
+}
+
+impl fmt::Debug for AuthEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthEntry")
+            .field("auth", &"[REDACTED]")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl DockerConfig {

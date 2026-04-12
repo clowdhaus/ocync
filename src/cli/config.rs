@@ -1,9 +1,55 @@
-// Config types define the YAML schema; dead_code is expected until CLI integration.
-#![allow(dead_code)]
+//! Configuration file schema types and YAML deserialization.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+
+/// Load, expand env vars, and validate a config file from disk.
+///
+/// Reads the raw YAML, expands `${VAR}` expressions in the text, then
+/// deserializes and validates. Expanding before deserialization ensures
+/// that registry URLs and references containing env vars are resolved
+/// before structural validation runs.
+pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::Parse(format!("failed to read {}: {e}", path.display())))?;
+
+    let expanded = expand_env_vars(&raw, true)?;
+
+    let config: Config = serde_yaml::from_str(&expanded)
+        .map_err(|e| ConfigError::Parse(format!("failed to parse {}: {e}", path.display())))?;
+
+    // Structural validation.
+    for mapping in &config.mappings {
+        validate_mapping(mapping)?;
+        if let Some(ref tags) = mapping.tags {
+            validate_tags(tags)?;
+        }
+    }
+    validate_references(&config)?;
+
+    Ok(config)
+}
+
+/// Read a config file and expand env vars for display.
+///
+/// Returns the raw YAML with `${VAR}` expressions expanded. When
+/// `show_secrets` is false, the expansion blocks secret-pattern variables.
+/// When `show_secrets` is true, all variables are expanded freely.
+pub(crate) fn expand_config_for_display(
+    path: &Path,
+    show_secrets: bool,
+) -> Result<String, ConfigError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::Parse(format!("failed to read {}: {e}", path.display())))?;
+
+    expand_env_vars(&raw, show_secrets)
+}
 
 // ---------------------------------------------------------------------------
 // Error
@@ -17,7 +63,7 @@ pub(crate) enum ConfigError {
     #[error("required environment variable not set: {0}")]
     EnvVarRequired(String),
 
-    #[error("blocked environment variable in non-auth field: {0}")]
+    #[error("blocked secret-pattern environment variable: {0}")]
     BlockedEnvVar(String),
 
     #[error("config validation error: {0}")]
@@ -168,25 +214,7 @@ pub(crate) enum GlobOrList {
     List(Vec<String>),
 }
 
-// NOTE: SortOrder and SemverPrerelease duplicate the enums in
-// ocync_sync::filter. These are serde-schema versions; the filter crate has
-// domain versions with Clone/Copy/Eq. Unify by adding serde derives to the
-// filter versions and re-exporting here when the CLI is wired up.
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum SortOrder {
-    Semver,
-    Alpha,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum SemverPrerelease {
-    Include,
-    Exclude,
-    Only,
-}
+use ocync_sync::filter::{SemverPrerelease, SortOrder};
 
 // ---------------------------------------------------------------------------
 // Environment variable expansion
@@ -214,10 +242,13 @@ fn is_blocked(var_name: &str) -> bool {
 /// Only the `${...}` form is supported — bare `$VAR` without braces is
 /// treated as literal text. This avoids ambiguity with shell-like strings.
 ///
-/// When `is_auth_field` is false, variables matching [`BLOCKED_PATTERNS`]
+/// When `allow_secrets` is false, variables matching [`BLOCKED_PATTERNS`]
 /// (SECRET, TOKEN, etc.) are rejected to prevent accidental secret leakage
-/// into non-sensitive config fields.
-pub(crate) fn expand_env_vars(input: &str, is_auth_field: bool) -> Result<String, ConfigError> {
+/// into display output. This is used by `expand_config_for_display` when
+/// `--show-secrets` is not set. Config loading always passes `true` because
+/// it operates on raw YAML text without field-level context — blocking
+/// secret-patterned vars during loading would reject legitimate auth config.
+pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String, ConfigError> {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
@@ -242,7 +273,7 @@ pub(crate) fn expand_env_vars(input: &str, is_auth_field: bool) -> Result<String
             if let Some(pos) = expr.find(":-") {
                 let var_name = &expr[..pos];
                 let default_val = &expr[pos + 2..];
-                if !is_auth_field && is_blocked(var_name) {
+                if !allow_secrets && is_blocked(var_name) {
                     return Err(ConfigError::BlockedEnvVar(var_name.to_string()));
                 }
                 match std::env::var(var_name) {
@@ -252,7 +283,7 @@ pub(crate) fn expand_env_vars(input: &str, is_auth_field: bool) -> Result<String
             } else if let Some(pos) = expr.find(":?") {
                 let var_name = &expr[..pos];
                 let err_msg = &expr[pos + 2..];
-                if !is_auth_field && is_blocked(var_name) {
+                if !allow_secrets && is_blocked(var_name) {
                     return Err(ConfigError::BlockedEnvVar(var_name.to_string()));
                 }
                 match std::env::var(var_name) {
@@ -267,7 +298,7 @@ pub(crate) fn expand_env_vars(input: &str, is_auth_field: bool) -> Result<String
                 }
             } else {
                 let var_name = &expr;
-                if !is_auth_field && is_blocked(var_name) {
+                if !allow_secrets && is_blocked(var_name) {
                     return Err(ConfigError::BlockedEnvVar(var_name.to_string()));
                 }
                 if let Ok(val) = std::env::var(var_name) {
@@ -292,11 +323,16 @@ pub(crate) fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
             "tags.latest requires tags.sort to be set".to_string(),
         ));
     }
+    if tags.semver_prerelease.is_some() && tags.semver.is_none() {
+        return Err(ConfigError::Validation(
+            "tags.semver_prerelease requires tags.semver to be set".to_string(),
+        ));
+    }
     Ok(())
 }
 
-// TODO: When defaults merging is implemented, allow mappings to omit `tags`
-// and inherit from `defaults.tags`. This validation must become context-aware.
+// TODO(defaults): When defaults merging is implemented, allow mappings to omit
+// `tags` and inherit from `defaults.tags`. This validation must become context-aware.
 pub(crate) fn validate_mapping(mapping: &MappingConfig) -> Result<(), ConfigError> {
     if mapping.tags.is_none() {
         return Err(ConfigError::Validation(format!(
@@ -589,7 +625,7 @@ mappings:
     }
 
     #[test]
-    fn blocked_secret_in_non_auth() {
+    fn blocked_secret_when_secrets_disallowed() {
         unsafe { std::env::set_var("MY_SECRET_KEY", "s3cret") };
         let result = expand_env_vars("${MY_SECRET_KEY}", false);
         assert!(result.is_err());
@@ -598,7 +634,7 @@ mappings:
     }
 
     #[test]
-    fn allowed_in_auth_field() {
+    fn allowed_when_secrets_allowed() {
         unsafe { std::env::set_var("MY_SECRET_TOKEN", "tok123") };
         let result = expand_env_vars("${MY_SECRET_TOKEN}", true).unwrap();
         assert_eq!(result, "tok123");
@@ -615,6 +651,45 @@ mappings:
     fn expand_malformed_unclosed_brace() {
         let result = expand_env_vars("prefix-${UNCLOSED", false).unwrap();
         assert_eq!(result, "prefix-${UNCLOSED");
+    }
+
+    #[test]
+    fn expand_value_with_colon_in_yaml() {
+        // A var value containing ":" should not break YAML structure when the
+        // field is already quoted in the YAML source.
+        unsafe { std::env::set_var("OCYNC_TEST_COLON", "host:8080") };
+        let yaml = "url: \"${OCYNC_TEST_COLON}\"";
+        let expanded = expand_env_vars(yaml, true).unwrap();
+        assert_eq!(expanded, "url: \"host:8080\"");
+        // Verify it parses as valid YAML.
+        let map: HashMap<String, String> = serde_yaml::from_str(&expanded).unwrap();
+        assert_eq!(map["url"], "host:8080");
+        unsafe { std::env::remove_var("OCYNC_TEST_COLON") };
+    }
+
+    #[test]
+    fn expand_value_with_hash_in_yaml() {
+        // A var value containing "#" should not be treated as a YAML comment
+        // when the field is quoted.
+        unsafe { std::env::set_var("OCYNC_TEST_HASH", "value#with#hashes") };
+        let yaml = "key: \"${OCYNC_TEST_HASH}\"";
+        let expanded = expand_env_vars(yaml, true).unwrap();
+        let map: HashMap<String, String> = serde_yaml::from_str(&expanded).unwrap();
+        assert_eq!(map["key"], "value#with#hashes");
+        unsafe { std::env::remove_var("OCYNC_TEST_HASH") };
+    }
+
+    #[test]
+    fn expand_unquoted_colon_value_breaks_yaml() {
+        // Demonstrates the known limitation: unquoted values containing ":"
+        // can produce invalid YAML. Users must quote values in their config.
+        unsafe { std::env::set_var("OCYNC_TEST_BARE_COLON", "host:8080") };
+        let yaml = "url: ${OCYNC_TEST_BARE_COLON}";
+        let expanded = expand_env_vars(yaml, true).unwrap();
+        // The expansion itself succeeds, but YAML parsing may interpret
+        // "host:8080" differently (as a mapping key).
+        assert_eq!(expanded, "url: host:8080");
+        unsafe { std::env::remove_var("OCYNC_TEST_BARE_COLON") };
     }
 
     // -- Validation ---------------------------------------------------------

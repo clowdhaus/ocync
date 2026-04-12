@@ -17,7 +17,7 @@ aws-sdk-ecr = { version = "1", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false }
-http = { version = "1", default-features = false }
+http.workspace = true
 hex.workspace = true
 regex-lite = { version = "0.1", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
@@ -25,10 +25,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
-tracing = { version = "0.1", default-features = false }
+tracing.workspace = true
 url = { version = "2", default-features = false }
 
 [dev-dependencies]
-serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "test-util", "macros", "rt-multi-thread"] }
 wiremock = "0.6"

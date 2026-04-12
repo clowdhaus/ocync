@@ -1,0 +1,47 @@
+//! The `tags` subcommand — lists and filters tags from a repository.
+
+use ocync_sync::filter::FilterConfig;
+
+use crate::TagsArgs;
+use crate::cli::config::load_config;
+use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
+
+pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
+    let registry = args.repository.registry();
+    let repository = args.repository.repository();
+
+    // Resolve auth_type from config if provided, otherwise use anonymous.
+    let auth_type = if let Some(ref config_path) = args.config {
+        let config = load_config(config_path)?;
+        config
+            .registries
+            .values()
+            .find(|r| bare_hostname(&r.url) == registry)
+            .and_then(|r| r.auth_type.clone())
+    } else {
+        None
+    };
+
+    let client = build_registry_client(registry, auth_type.as_ref()).await?;
+
+    let all_tags = client.list_tags(repository).await?;
+
+    let filter = FilterConfig {
+        glob: args.glob.clone(),
+        semver: args.semver.clone(),
+        semver_prerelease: None,
+        exclude: args.exclude.clone(),
+        sort: args.sort.map(|s| s.into()),
+        latest: args.latest,
+        min_tags: None,
+    };
+
+    let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
+    let filtered = filter.apply(&tag_refs)?;
+
+    for tag in &filtered {
+        println!("{tag}");
+    }
+
+    Ok(ExitCode::Success)
+}
