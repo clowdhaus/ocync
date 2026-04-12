@@ -18,4 +18,4 @@ semver = { version = "1", default-features = false, features = ["std"] }
 serde.workspace = true
 thiserror.workspace = true
 tracing = { version = "0.1", default-features = false }
-ulid = { version = "1", default-features = false, features = ["std", "serde"] }
+uuid = { version = "1", default-features = false, features = ["v7", "serde"] }

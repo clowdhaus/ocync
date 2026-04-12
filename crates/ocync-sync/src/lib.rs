@@ -16,13 +16,13 @@ use std::time::Duration;
 
 pub use error::Error;
 use serde::Serialize;
-use ulid::Ulid;
+use uuid::Uuid;
 
 /// Result of a complete sync run. The engine never "fails" as a whole.
 #[derive(Debug, Serialize)]
 pub struct SyncReport {
     /// Unique identifier for this sync run.
-    pub run_id: Ulid,
+    pub run_id: Uuid,
     /// Per-image results.
     pub images: Vec<ImageResult>,
     /// Aggregate statistics.
@@ -54,7 +54,7 @@ impl SyncReport {
 #[derive(Debug, Serialize)]
 pub struct ImageResult {
     /// Unique identifier for this image transfer.
-    pub image_id: Ulid,
+    pub image_id: Uuid,
     /// Source image reference.
     pub source: String,
     /// Target image reference.
@@ -126,11 +126,11 @@ mod tests {
 
     fn make_report(statuses: Vec<ImageStatus>) -> SyncReport {
         SyncReport {
-            run_id: Ulid::new(),
+            run_id: Uuid::now_v7(),
             images: statuses
                 .into_iter()
                 .map(|status| ImageResult {
-                    image_id: Ulid::new(),
+                    image_id: Uuid::now_v7(),
                     source: "src".into(),
                     target: "tgt".into(),
                     status,
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn exit_code_empty_report() {
         let report = SyncReport {
-            run_id: Ulid::new(),
+            run_id: Uuid::now_v7(),
             images: vec![],
             stats: SyncStats::default(),
             duration: Duration::ZERO,

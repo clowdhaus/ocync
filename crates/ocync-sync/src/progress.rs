@@ -29,7 +29,7 @@ impl ProgressReporter for NullProgress {
 mod tests {
     use std::time::Duration;
 
-    use ulid::Ulid;
+    use uuid::Uuid;
 
     use super::*;
     use crate::{ImageStatus, SyncStats};
@@ -41,7 +41,7 @@ mod tests {
         p.blob_progress("source/repo:tag", 512, 1024);
 
         let result = ImageResult {
-            image_id: Ulid::new(),
+            image_id: Uuid::now_v7(),
             source: "src".into(),
             target: "tgt".into(),
             status: ImageStatus::Synced,
@@ -51,7 +51,7 @@ mod tests {
         p.image_completed(&result);
 
         let report = SyncReport {
-            run_id: Ulid::new(),
+            run_id: Uuid::now_v7(),
             images: vec![],
             stats: SyncStats::default(),
             duration: Duration::from_secs(5),
