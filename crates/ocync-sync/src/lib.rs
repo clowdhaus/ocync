@@ -12,6 +12,9 @@ pub mod progress;
 /// Retry configuration and backoff logic.
 pub mod retry;
 
+/// Sync engine — two-phase orchestration of image transfers.
+pub mod engine;
+
 use std::time::Duration;
 
 pub use error::Error;
