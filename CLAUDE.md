@@ -2,6 +2,13 @@
 
 OCI registry sync tool. Rust workspace with 3 crates: `ocync` (CLI binary), `ocync-distribution` (OCI registry client), `ocync-sync` (sync engine).
 
+## Design priorities
+
+1. **Performance and efficiency** — this is the most important property of the tool. Every design decision must prioritize throughput, minimal API calls, low memory overhead, and wall-clock speed. Concurrent transfers, global blob deduplication, HEAD-before-pull skip checks, cross-repo mounts, streaming (no local disk), and chunked uploads exist to minimize time and bandwidth. Never trade performance for convenience. Never add unnecessary allocations, clones, or API round-trips. Measure before assuming something is fast enough.
+2. **User experience** — a very close second. Clear error messages with actionable context, structured output for CI/CD, progress reporting (TTY-aware), dry-run validation, and sensible defaults. Users should never have to guess what went wrong or what the tool is doing. But UX features must not compromise transfer performance — e.g., progress reporting must be zero-cost when disabled, output formatting must not block the transfer pipeline.
+
+When these conflict, performance wins — but look hard for solutions that satisfy both before accepting the tradeoff.
+
 ## Scope discipline
 
 Every PR must be self-contained. Code in the diff must be called, tested, and integrated within that same diff.
@@ -11,7 +18,7 @@ Every PR must be self-contained. Code in the diff must be called, tested, and in
 - No error variants that are never constructed
 - No struct fields that are never read
 - No enum variants for "future use"
-- No feature flags — single binary, all registries, always
+- No Cargo feature flags anywhere — single binary, all registries, always; this is a CLI tool, not a library
 - If you can't write a test that exercises a code path in this PR, it doesn't belong in this PR
 
 ## Pre-commit audit

@@ -737,3 +737,432 @@ async fn sync_index_manifest_multi_platform() {
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.blobs_transferred, 4);
 }
+
+#[tokio::test]
+async fn sync_head_different_digest_proceeds_with_sync() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_digest = test_digest("d0");
+    let layer_digest = test_digest("d1");
+    let manifest = simple_image_manifest(&config_digest, &layer_digest);
+    let (manifest_bytes, _manifest_digest) = serialize_manifest(&manifest);
+
+    // Source: serve manifest and blobs.
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_digest, b"config").await;
+    mount_blob_pull(&source_server, "repo", &layer_digest, b"layer").await;
+
+    // Target: manifest HEAD returns a DIFFERENT digest → should proceed.
+    let stale_digest = test_digest("5ca1e");
+    mount_manifest_head_matching(&target_server, "repo", "v1", &stale_digest).await;
+    mount_blob_not_found(&target_server, "repo", &config_digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_digest).await;
+    mount_blob_push(&target_server, "repo").await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: mock_client(&target_server),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let mut engine = SyncEngine::new(fast_retry());
+    let report = engine.run(vec![mapping], &NullProgress).await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.blobs_transferred, 2);
+}
+
+#[tokio::test]
+async fn sync_empty_tags_produces_no_images() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: mock_client(&target_server),
+        }],
+        tags: vec![],
+    };
+
+    let mut engine = SyncEngine::new(fast_retry());
+    let report = engine.run(vec![mapping], &NullProgress).await;
+
+    assert!(report.images.is_empty());
+    assert_eq!(report.stats.images_synced, 0);
+    assert_eq!(report.exit_code(), 0);
+}
+
+#[tokio::test]
+async fn sync_manifest_push_failure() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_digest = test_digest("c6");
+    let layer_digest = test_digest("b6");
+    let manifest = simple_image_manifest(&config_digest, &layer_digest);
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: serve everything normally.
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_digest, b"config").await;
+    mount_blob_pull(&source_server, "repo", &layer_digest, b"layer").await;
+
+    // Target: blobs succeed, but manifest PUT fails with 403.
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_blob_not_found(&target_server, "repo", &config_digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_digest).await;
+    mount_blob_push(&target_server, "repo").await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+        .mount(&target_server)
+        .await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: mock_client(&target_server),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let mut engine = SyncEngine::new(fast_retry());
+    let report = engine.run(vec![mapping], &NullProgress).await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(
+        report.images[0].status,
+        ImageStatus::Failed { .. }
+    ));
+    if let ImageStatus::Failed { error, .. } = &report.images[0].status {
+        assert!(
+            error.contains("manifest"),
+            "error should mention manifest: {error}"
+        );
+    }
+    assert_eq!(report.stats.images_failed, 1);
+}
+
+#[tokio::test]
+async fn sync_retry_exhaustion_returns_final_error() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_digest = test_digest("c7");
+    let layer_digest = test_digest("b7");
+    let manifest = simple_image_manifest(&config_digest, &layer_digest);
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_digest, b"config").await;
+
+    // Layer blob: always returns 429 (retryable) — should exhaust retries.
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{layer_digest}")))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&source_server)
+        .await;
+
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_blob_not_found(&target_server, "repo", &config_digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_digest).await;
+    mount_blob_push(&target_server, "repo").await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: mock_client(&target_server),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let mut engine = SyncEngine::new(fast_retry());
+    let report = engine.run(vec![mapping], &NullProgress).await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(
+        report.images[0].status,
+        ImageStatus::Failed { .. }
+    ));
+    if let ImageStatus::Failed { error, retries } = &report.images[0].status {
+        assert!(
+            error.contains("blob pull"),
+            "error should mention blob pull: {error}"
+        );
+        assert_eq!(*retries, 2); // max_retries from fast_retry()
+    }
+    assert_eq!(report.stats.images_failed, 1);
+}
+
+#[tokio::test]
+async fn sync_cross_repo_mount_success() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // Shared blobs across two different source repos.
+    let config_digest = test_digest("ac00");
+    let layer_digest = test_digest("ac01");
+
+    let manifest_a = simple_image_manifest(&config_digest, &layer_digest);
+    let (manifest_a_bytes, _) = serialize_manifest(&manifest_a);
+    let manifest_b = simple_image_manifest(&config_digest, &layer_digest);
+    let (manifest_b_bytes, _) = serialize_manifest(&manifest_b);
+
+    // Source: two repos with the same blobs.
+    mount_source_manifest(&source_server, "repo-a", "v1", &manifest_a_bytes).await;
+    mount_source_manifest(&source_server, "repo-b", "v1", &manifest_b_bytes).await;
+    mount_blob_pull(&source_server, "repo-a", &config_digest, b"config").await;
+    mount_blob_pull(&source_server, "repo-a", &layer_digest, b"layer").await;
+
+    // Target for repo-a: no manifest, no blobs, push succeeds.
+    mount_manifest_head_not_found(&target_server, "repo-a", "v1").await;
+    mount_blob_not_found(&target_server, "repo-a", &config_digest).await;
+    mount_blob_not_found(&target_server, "repo-a", &layer_digest).await;
+    mount_blob_push(&target_server, "repo-a").await;
+    mount_manifest_push(&target_server, "repo-a", "v1").await;
+
+    // Target for repo-b: no manifest, blobs not found, mount succeeds (201 Created).
+    mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
+    mount_blob_not_found(&target_server, "repo-b", &config_digest).await;
+    mount_blob_not_found(&target_server, "repo-b", &layer_digest).await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-b/blobs/uploads/"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo-b", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    // First mapping: repo-a syncs normally (pull+push).
+    let mapping_a = ResolvedMapping {
+        source_client: source_client.clone(),
+        source_repo: "repo-a".into(),
+        target_repo: "repo-a".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client.clone(),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    // Second mapping: repo-b should mount from repo-a.
+    let mapping_b = ResolvedMapping {
+        source_client,
+        source_repo: "repo-b".into(),
+        target_repo: "repo-b".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client,
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let mut engine = SyncEngine::new(fast_retry());
+    let report = engine.run(vec![mapping_a, mapping_b], &NullProgress).await;
+
+    assert_eq!(report.images.len(), 2);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert!(matches!(report.images[1].status, ImageStatus::Synced));
+    // First mapping: 2 blobs transferred.
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+    // Second mapping: 2 blobs mounted (not transferred).
+    assert_eq!(report.images[1].blob_stats.mounted, 2);
+    assert_eq!(report.images[1].blob_stats.transferred, 0);
+    assert_eq!(report.stats.blobs_mounted, 2);
+}
+
+#[tokio::test]
+async fn sync_cross_repo_mount_fallback_to_pull_push() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_digest = test_digest("f0");
+    let layer_digest = test_digest("f1");
+
+    let manifest_a = simple_image_manifest(&config_digest, &layer_digest);
+    let (manifest_a_bytes, _) = serialize_manifest(&manifest_a);
+    let manifest_b = simple_image_manifest(&config_digest, &layer_digest);
+    let (manifest_b_bytes, _) = serialize_manifest(&manifest_b);
+
+    // Source: two repos.
+    mount_source_manifest(&source_server, "repo-a", "v1", &manifest_a_bytes).await;
+    mount_source_manifest(&source_server, "repo-b", "v1", &manifest_b_bytes).await;
+    mount_blob_pull(&source_server, "repo-a", &config_digest, b"config").await;
+    mount_blob_pull(&source_server, "repo-a", &layer_digest, b"layer").await;
+    // repo-b blob pulls needed for fallback.
+    mount_blob_pull(&source_server, "repo-b", &config_digest, b"config").await;
+    mount_blob_pull(&source_server, "repo-b", &layer_digest, b"layer").await;
+
+    // Target for repo-a: normal sync.
+    mount_manifest_head_not_found(&target_server, "repo-a", "v1").await;
+    mount_blob_not_found(&target_server, "repo-a", &config_digest).await;
+    mount_blob_not_found(&target_server, "repo-a", &layer_digest).await;
+    mount_blob_push(&target_server, "repo-a").await;
+    mount_manifest_push(&target_server, "repo-a", "v1").await;
+
+    // Target for repo-b: mount returns 202 Accepted (fallback).
+    mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
+    mount_blob_not_found(&target_server, "repo-b", &config_digest).await;
+    mount_blob_not_found(&target_server, "repo-b", &layer_digest).await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-b/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/repo-b/blobs/uploads/fallback-id"),
+        )
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo-b/blobs/uploads/fallback-id"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo-b", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_a = ResolvedMapping {
+        source_client: source_client.clone(),
+        source_repo: "repo-a".into(),
+        target_repo: "repo-a".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client.clone(),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let mapping_b = ResolvedMapping {
+        source_client,
+        source_repo: "repo-b".into(),
+        target_repo: "repo-b".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client,
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let mut engine = SyncEngine::new(fast_retry());
+    let report = engine.run(vec![mapping_a, mapping_b], &NullProgress).await;
+
+    assert_eq!(report.images.len(), 2);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert!(matches!(report.images[1].status, ImageStatus::Synced));
+    // Second mapping: mount fallback → pull+push, so transferred not mounted.
+    assert_eq!(report.images[1].blob_stats.mounted, 0);
+    assert_eq!(report.images[1].blob_stats.transferred, 2);
+}
+
+#[tokio::test]
+async fn sync_cross_repo_mount_failure_falls_back() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_digest = test_digest("e0");
+    let layer_digest = test_digest("e1");
+
+    let manifest_a = simple_image_manifest(&config_digest, &layer_digest);
+    let (manifest_a_bytes, _) = serialize_manifest(&manifest_a);
+    let manifest_b = simple_image_manifest(&config_digest, &layer_digest);
+    let (manifest_b_bytes, _) = serialize_manifest(&manifest_b);
+
+    // Source: two repos.
+    mount_source_manifest(&source_server, "repo-a", "v1", &manifest_a_bytes).await;
+    mount_source_manifest(&source_server, "repo-b", "v1", &manifest_b_bytes).await;
+    mount_blob_pull(&source_server, "repo-a", &config_digest, b"config").await;
+    mount_blob_pull(&source_server, "repo-a", &layer_digest, b"layer").await;
+    mount_blob_pull(&source_server, "repo-b", &config_digest, b"config").await;
+    mount_blob_pull(&source_server, "repo-b", &layer_digest, b"layer").await;
+
+    // Target for repo-a: normal sync.
+    mount_manifest_head_not_found(&target_server, "repo-a", "v1").await;
+    mount_blob_not_found(&target_server, "repo-a", &config_digest).await;
+    mount_blob_not_found(&target_server, "repo-a", &layer_digest).await;
+    mount_blob_push(&target_server, "repo-a").await;
+    mount_manifest_push(&target_server, "repo-a", "v1").await;
+
+    // Target for repo-b: mount returns 500 (error), falls back to pull+push.
+    mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
+    mount_blob_not_found(&target_server, "repo-b", &config_digest).await;
+    mount_blob_not_found(&target_server, "repo-b", &layer_digest).await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-b/blobs/uploads/"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(2) // First two POSTs are mount attempts that fail.
+        .mount(&target_server)
+        .await;
+    // Subsequent POSTs succeed (fallback upload initiation).
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-b/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/repo-b/blobs/uploads/retry-id"),
+        )
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo-b/blobs/uploads/retry-id"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo-b", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_a = ResolvedMapping {
+        source_client: source_client.clone(),
+        source_repo: "repo-a".into(),
+        target_repo: "repo-a".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client.clone(),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let mapping_b = ResolvedMapping {
+        source_client,
+        source_repo: "repo-b".into(),
+        target_repo: "repo-b".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client,
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let mut engine = SyncEngine::new(fast_retry());
+    let report = engine.run(vec![mapping_a, mapping_b], &NullProgress).await;
+
+    assert_eq!(report.images.len(), 2);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert!(matches!(report.images[1].status, ImageStatus::Synced));
+    // Mount failed → fell back to pull+push.
+    assert_eq!(report.images[1].blob_stats.mounted, 0);
+    assert_eq!(report.images[1].blob_stats.transferred, 2);
+}

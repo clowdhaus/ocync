@@ -34,9 +34,16 @@ pub struct ResolvedMapping {
 }
 
 /// A single target registry entry.
+///
+/// `name` must be unique across targets within a [`ResolvedMapping`] — it is
+/// used as the key in the blob deduplication map to track which blobs have
+/// already been transferred to each target.
 #[derive(Debug)]
 pub struct TargetEntry {
-    /// Human-readable name from config (e.g. `us-ecr`).
+    /// Registry identifier used as the blob dedup key.
+    ///
+    /// Must be unique per mapping. Typically the config-defined registry name
+    /// (e.g. `us-ecr`) or the bare hostname for ad-hoc commands.
     pub name: String,
     /// Client for this target registry.
     pub client: Arc<RegistryClient>,
@@ -71,6 +78,17 @@ impl TagPair {
             target: target.into(),
         }
     }
+}
+
+/// A registry endpoint bundling client, repo, and identity for sync operations.
+///
+/// Used internally to pass source/target pairs through the engine without
+/// threading 4+ loose parameters.
+struct Endpoint<'a> {
+    client: &'a RegistryClient,
+    repo: &'a str,
+    /// Identity key — used as the blob dedup map key for targets.
+    name: &'a str,
 }
 
 /// Collect all blob digests from an image manifest (config + layers).
@@ -120,27 +138,27 @@ impl SyncEngine {
         let mut images = Vec::new();
 
         for mapping in &mappings {
+            let source = Endpoint {
+                client: &mapping.source_client,
+                repo: &mapping.source_repo,
+                name: &mapping.source_repo,
+            };
+
             for tag_pair in &mapping.tags {
-                for target in &mapping.targets {
-                    let source_ref = format!(
-                        "{}:{} -> {}",
-                        mapping.source_repo, tag_pair.source, target.name
-                    );
-                    let target_ref = format!("{}:{}", mapping.target_repo, tag_pair.target);
+                for target_entry in &mapping.targets {
+                    let target = Endpoint {
+                        client: &target_entry.client,
+                        repo: &mapping.target_repo,
+                        name: &target_entry.name,
+                    };
 
-                    progress.image_started(&source_ref, &target_ref);
+                    let source_display =
+                        format!("{}:{} -> {}", source.repo, tag_pair.source, target.name);
+                    let target_display = format!("{}:{}", target.repo, tag_pair.target);
 
-                    let result = self
-                        .sync_image(
-                            &mapping.source_client,
-                            &mapping.source_repo,
-                            &target.client,
-                            &target.name,
-                            &mapping.target_repo,
-                            &tag_pair.source,
-                            &tag_pair.target,
-                        )
-                        .await;
+                    progress.image_started(&source_display, &target_display);
+
+                    let result = self.sync_image(&source, &target, tag_pair).await;
 
                     progress.image_completed(&result);
                     images.push(result);
@@ -166,52 +184,37 @@ impl SyncEngine {
     ///
     /// Returns an [`ImageResult`] — never panics. All errors are captured
     /// as [`ImageStatus::Failed`].
-    #[allow(clippy::too_many_arguments)]
     async fn sync_image(
         &mut self,
-        source: &RegistryClient,
-        source_repo: &str,
-        target: &RegistryClient,
-        target_name: &str,
-        target_repo: &str,
-        source_tag: &str,
-        target_tag: &str,
+        source: &Endpoint<'_>,
+        target: &Endpoint<'_>,
+        tag_pair: &TagPair,
     ) -> ImageResult {
         let image_start = Instant::now();
         let image_id = Uuid::now_v7();
-        let source_ref = format!("{source_repo}:{source_tag}");
-        let target_ref = format!("{target_repo}:{target_tag}");
+        let source_display = format!("{}:{}", source.repo, tag_pair.source);
+        let target_display = format!("{}:{}", target.repo, tag_pair.target);
 
-        let result = self
-            .sync_image_inner(
-                source,
-                source_repo,
-                target,
-                target_name,
-                target_repo,
-                source_tag,
-                target_tag,
-            )
-            .await;
+        let result = self.try_sync_image(source, target, tag_pair).await;
 
         let duration = image_start.elapsed();
 
         match result {
             Ok((status, bytes_transferred, blob_stats)) => ImageResult {
                 image_id,
-                source: source_ref,
-                target: target_ref,
+                source: source_display,
+                target: target_display,
                 status,
                 bytes_transferred,
                 blob_stats,
                 duration,
             },
             Err(err) => {
-                warn!(source = %source_ref, target = %target_ref, error = %err, "image sync failed");
+                warn!(source = %source_display, target = %target_display, error = %err, "image sync failed");
                 ImageResult {
                     image_id,
-                    source: source_ref,
-                    target: target_ref,
+                    source: source_display,
+                    target: target_display,
                     status: ImageStatus::Failed {
                         error: err.to_string(),
                         retries: self.retry.max_retries,
@@ -224,21 +227,18 @@ impl SyncEngine {
         }
     }
 
-    /// Inner implementation of image sync that returns Result for ergonomic error handling.
-    #[allow(clippy::too_many_arguments)]
-    async fn sync_image_inner(
+    /// Attempt to sync a single image, returning `Result` for ergonomic `?` usage.
+    async fn try_sync_image(
         &mut self,
-        source: &RegistryClient,
-        source_repo: &str,
-        target: &RegistryClient,
-        target_name: &str,
-        target_repo: &str,
-        source_tag: &str,
-        target_tag: &str,
+        source: &Endpoint<'_>,
+        target: &Endpoint<'_>,
+        tag_pair: &TagPair,
     ) -> Result<(ImageStatus, u64, BlobTransferStats), crate::Error> {
+        let source_tag = &tag_pair.source;
+        let target_tag = &tag_pair.target;
         // Step 1: Pull source manifest.
         let pull = with_retry(&self.retry, "manifest pull", || {
-            source.manifest_pull(source_repo, source_tag)
+            source.client.manifest_pull(source.repo, source_tag)
         })
         .await
         .map_err(|e| crate::Error::Manifest {
@@ -247,11 +247,11 @@ impl SyncEngine {
         })?;
 
         // Step 2: HEAD target manifest — skip if digest matches.
-        match target.manifest_head(target_repo, target_tag).await {
+        match target.client.manifest_head(target.repo, target_tag).await {
             Ok(Some(head)) if head.digest == pull.digest => {
                 info!(
-                    source_repo,
-                    target_repo,
+                    source_repo = source.repo,
+                    target_repo = target.repo,
                     source_tag,
                     target_tag,
                     digest = %pull.digest,
@@ -267,8 +267,8 @@ impl SyncEngine {
             }
             Ok(_) => {} // manifest missing or digest differs — proceed
             Err(e) => {
-                debug!(
-                    target_repo,
+                warn!(
+                    target_repo = target.repo,
                     target_tag,
                     error = %e,
                     "target manifest HEAD failed, proceeding with sync"
@@ -282,21 +282,17 @@ impl SyncEngine {
         let bytes_transferred = match &pull.manifest {
             ManifestKind::Image(image_manifest) => {
                 let blobs = collect_image_blobs(image_manifest);
-                let (bytes, stats) = self
-                    .transfer_blobs(
-                        source,
-                        source_repo,
-                        target,
-                        target_name,
-                        target_repo,
-                        &blobs,
-                    )
-                    .await?;
+                let (bytes, stats) = self.transfer_blobs(source, target, &blobs).await?;
                 blob_stats = stats;
 
                 // Push manifest by tag.
                 with_retry(&self.retry, "manifest push", || {
-                    target.manifest_push(target_repo, target_tag, &pull.media_type, &pull.raw_bytes)
+                    target.client.manifest_push(
+                        target.repo,
+                        target_tag,
+                        &pull.media_type,
+                        &pull.raw_bytes,
+                    )
                 })
                 .await
                 .map_err(|e| crate::Error::Manifest {
@@ -313,7 +309,7 @@ impl SyncEngine {
                 for child_desc in &index.manifests {
                     let child_digest_str = child_desc.digest.to_string();
                     let child_pull = with_retry(&self.retry, "manifest pull", || {
-                        source.manifest_pull(source_repo, &child_digest_str)
+                        source.client.manifest_pull(source.repo, &child_digest_str)
                     })
                     .await
                     .map_err(|e| crate::Error::Manifest {
@@ -321,28 +317,30 @@ impl SyncEngine {
                         source: e,
                     })?;
 
-                    if let ManifestKind::Image(child_image) = &child_pull.manifest {
-                        let blobs = collect_image_blobs(child_image);
-                        let (bytes, child_stats) = self
-                            .transfer_blobs(
-                                source,
-                                source_repo,
-                                target,
-                                target_name,
-                                target_repo,
-                                &blobs,
-                            )
-                            .await?;
-                        total_bytes = total_bytes.saturating_add(bytes);
-                        blob_stats.transferred += child_stats.transferred;
-                        blob_stats.skipped += child_stats.skipped;
-                        blob_stats.mounted += child_stats.mounted;
+                    match &child_pull.manifest {
+                        ManifestKind::Image(child_image) => {
+                            let blobs = collect_image_blobs(child_image);
+                            let (bytes, child_stats) =
+                                self.transfer_blobs(source, target, &blobs).await?;
+                            total_bytes = total_bytes.saturating_add(bytes);
+                            blob_stats.transferred += child_stats.transferred;
+                            blob_stats.skipped += child_stats.skipped;
+                            blob_stats.mounted += child_stats.mounted;
+                        }
+                        ManifestKind::Index(_) => {
+                            return Err(crate::Error::Manifest {
+                                reference: child_digest_str,
+                                source: ocync_distribution::Error::Other(
+                                    "nested index manifests are not supported".into(),
+                                ),
+                            });
+                        }
                     }
 
                     // Push child manifest to target by digest.
                     with_retry(&self.retry, "manifest push", || {
-                        target.manifest_push(
-                            target_repo,
+                        target.client.manifest_push(
+                            target.repo,
                             &child_digest_str,
                             &child_pull.media_type,
                             &child_pull.raw_bytes,
@@ -357,7 +355,12 @@ impl SyncEngine {
 
                 // Push the index by tag.
                 with_retry(&self.retry, "manifest push", || {
-                    target.manifest_push(target_repo, target_tag, &pull.media_type, &pull.raw_bytes)
+                    target.client.manifest_push(
+                        target.repo,
+                        target_tag,
+                        &pull.media_type,
+                        &pull.raw_bytes,
+                    )
                 })
                 .await
                 .map_err(|e| crate::Error::Manifest {
@@ -370,8 +373,12 @@ impl SyncEngine {
         };
 
         info!(
-            source_repo,
-            target_repo, source_tag, target_tag, bytes_transferred, "image synced"
+            source_repo = source.repo,
+            target_repo = target.repo,
+            source_tag,
+            target_tag,
+            bytes_transferred,
+            "image synced"
         );
 
         Ok((ImageStatus::Synced, bytes_transferred, blob_stats))
@@ -384,35 +391,42 @@ impl SyncEngine {
     /// total bytes transferred and per-call blob statistics.
     async fn transfer_blobs(
         &mut self,
-        source: &RegistryClient,
-        source_repo: &str,
-        target: &RegistryClient,
-        target_name: &str,
-        target_repo: &str,
+        source: &Endpoint<'_>,
+        target: &Endpoint<'_>,
         digests: &[Digest],
     ) -> Result<(u64, BlobTransferStats), crate::Error> {
         let mut total_bytes = 0u64;
         let mut stats = BlobTransferStats::default();
 
         for digest in digests {
-            // Check dedup map — skip if already handled.
-            if let Some(status) = self.dedup.status(target_name, digest) {
-                use crate::plan::BlobStatus;
-                match status {
-                    BlobStatus::ExistsAtTarget | BlobStatus::Completed | BlobStatus::InProgress => {
-                        debug!(%digest, status = ?status, "blob already handled, skipping");
-                        stats.skipped += 1;
-                        continue;
-                    }
-                    BlobStatus::Unknown | BlobStatus::Failed(_) => {}
-                }
+            // Check dedup map — skip only if this repo already has the blob.
+            // OCI blobs are repo-scoped: a blob in repo-a is NOT accessible
+            // from repo-b at the same registry without a mount or push.
+            let current_repo_has_blob = self
+                .dedup
+                .known_repos(target.name, digest)
+                .is_some_and(|repos| repos.contains(target.repo));
+
+            if current_repo_has_blob {
+                debug!(%digest, repo = target.repo, "blob already in target repo, skipping");
+                stats.skipped += 1;
+                continue;
+            }
+
+            // Check if we should skip other status checks (in-progress elsewhere).
+            if let Some(crate::plan::BlobStatus::InProgress) =
+                self.dedup.status(target.name, digest)
+            {
+                debug!(%digest, "blob transfer in progress, skipping");
+                stats.skipped += 1;
+                continue;
             }
 
             // HEAD check at target — if exists, mark in dedup map and skip.
-            match target.blob_exists(target_repo, digest).await {
+            match target.client.blob_exists(target.repo, digest).await {
                 Ok(Some(_size)) => {
                     debug!(%digest, "blob exists at target, skipping");
-                    self.dedup.set_exists(target_name, digest, target_repo);
+                    self.dedup.set_exists(target.name, digest, target.repo);
                     stats.skipped += 1;
                     continue;
                 }
@@ -422,21 +436,22 @@ impl SyncEngine {
                 }
             }
 
-            // Mark in-progress.
-            self.dedup.set_in_progress(target_name, digest);
-
-            // Try cross-repo mount.
+            // Try cross-repo mount if another repo at this target has the blob.
             let mount_source = self
                 .dedup
-                .mount_source(target_name, digest, target_repo)
+                .mount_source(target.name, digest, target.repo)
                 .map(|s| s.to_owned());
 
             if let Some(from_repo) = mount_source {
                 debug!(%digest, %from_repo, "attempting cross-repo mount");
-                match target.blob_mount(target_repo, digest, &from_repo).await {
+                match target
+                    .client
+                    .blob_mount(target.repo, digest, &from_repo)
+                    .await
+                {
                     Ok(MountResult::Mounted) => {
                         debug!(%digest, %from_repo, "blob mounted");
-                        self.dedup.set_completed(target_name, digest, target_repo);
+                        self.dedup.set_completed(target.name, digest, target.repo);
                         stats.mounted += 1;
                         continue;
                     }
@@ -449,9 +464,12 @@ impl SyncEngine {
                 }
             }
 
+            // Mark in-progress before pull+push.
+            self.dedup.set_in_progress(target.name, digest);
+
             // Pull from source with retry.
             let data = match with_retry(&self.retry, "blob pull", || {
-                source.blob_pull_all(source_repo, digest)
+                source.client.blob_pull_all(source.repo, digest)
             })
             .await
             {
@@ -461,7 +479,7 @@ impl SyncEngine {
                         digest: digest.to_string(),
                         source: e,
                     };
-                    self.dedup.set_failed(target_name, digest, err.to_string());
+                    self.dedup.set_failed(target.name, digest, err.to_string());
                     return Err(err);
                 }
             };
@@ -469,7 +487,7 @@ impl SyncEngine {
 
             // Push to target with retry.
             if let Err(e) = with_retry(&self.retry, "blob push", || {
-                target.blob_push(target_repo, &data)
+                target.client.blob_push(target.repo, &data)
             })
             .await
             {
@@ -477,7 +495,7 @@ impl SyncEngine {
                     digest: digest.to_string(),
                     source: e,
                 };
-                self.dedup.set_failed(target_name, digest, err.to_string());
+                self.dedup.set_failed(target.name, digest, err.to_string());
                 return Err(err);
             }
 
@@ -485,7 +503,7 @@ impl SyncEngine {
             stats.transferred += 1;
 
             // Mark completed.
-            self.dedup.set_completed(target_name, digest, target_repo);
+            self.dedup.set_completed(target.name, digest, target.repo);
         }
 
         Ok((total_bytes, stats))

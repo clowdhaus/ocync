@@ -97,7 +97,7 @@ impl RegistryClient {
                     size,
                 }))
             }
-            Err(Error::NotFound(_)) => Ok(None),
+            Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e),
         }
     }

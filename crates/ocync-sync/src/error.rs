@@ -130,7 +130,10 @@ mod tests {
     fn display_manifest_error() {
         let err = Error::Manifest {
             reference: "latest".into(),
-            source: ocync_distribution::Error::NotFound("not found".into()),
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::NOT_FOUND,
+                message: "not found".into(),
+            },
         };
         let msg = err.to_string();
         assert!(msg.contains("latest"));
@@ -141,7 +144,10 @@ mod tests {
     fn display_blob_pull_error() {
         let err = Error::BlobPull {
             digest: "sha256:abc".into(),
-            source: ocync_distribution::Error::NotFound("missing".into()),
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::NOT_FOUND,
+                message: "missing".into(),
+            },
         };
         let msg = err.to_string();
         assert!(msg.contains("sha256:abc"));

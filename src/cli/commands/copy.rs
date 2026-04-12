@@ -8,7 +8,7 @@ use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 
 use crate::CopyArgs;
-use crate::cli::{CliError, ExitCode, build_registry_client};
+use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
 /// Run the copy command: transfer a single image from source to destination.
 pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
@@ -18,15 +18,17 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
         .ok_or_else(|| CliError::Input(format!("source '{}' has no tag", args.source)))?;
     let dst_tag = args.destination.tag().unwrap_or(src_tag);
 
-    let source_client = Arc::new(build_registry_client(args.source.registry(), None).await?);
-    let target_client = Arc::new(build_registry_client(args.destination.registry(), None).await?);
+    let source_client =
+        Arc::new(build_registry_client(bare_hostname(args.source.registry()), None).await?);
+    let target_client =
+        Arc::new(build_registry_client(bare_hostname(args.destination.registry()), None).await?);
 
     let mapping = ResolvedMapping {
         source_client,
         source_repo: args.source.repository().to_owned(),
         target_repo: args.destination.repository().to_owned(),
         targets: vec![TargetEntry {
-            name: args.destination.registry().to_owned(),
+            name: bare_hostname(args.destination.registry()).to_owned(),
             client: target_client,
         }],
         tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],

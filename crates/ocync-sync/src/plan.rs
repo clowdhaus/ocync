@@ -87,9 +87,13 @@ impl BlobDedupMap {
     }
 
     /// Mark a blob as in-progress at the target.
+    ///
+    /// `Completed → InProgress` is expected when re-processing a blob for a
+    /// different repo at the same target (cross-repo mount fallback). Only
+    /// `Failed → InProgress` is warned since it may indicate a logic error.
     pub fn set_in_progress(&mut self, target: &str, digest: &Digest) {
         let entry = self.entry_mut(target, digest);
-        if matches!(entry.status, BlobStatus::Completed | BlobStatus::Failed(_)) {
+        if matches!(entry.status, BlobStatus::Failed(_)) {
             warn!(
                 target,
                 %digest,
