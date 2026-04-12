@@ -18,7 +18,7 @@ use crate::{OutputFormat, SyncArgs};
 
 /// Run the sync command: load config, resolve mappings, and execute.
 pub(crate) async fn run(args: &SyncArgs) -> Result<ExitCode, CliError> {
-    let config = load_config(&args.config[0])?;
+    let config = load_config(&args.config)?;
 
     let clients = build_clients(&config).await?;
 
@@ -36,7 +36,7 @@ pub(crate) async fn run(args: &SyncArgs) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::Success);
     }
 
-    let engine = SyncEngine::new(RetryConfig::default());
+    let mut engine = SyncEngine::new(RetryConfig::default());
     let progress = NullProgress;
     let report = engine.run(mappings, &progress).await;
 
@@ -244,10 +244,13 @@ fn write_output(args: &SyncArgs, report: &SyncReport) -> Result<(), CliError> {
 fn print_summary(report: &SyncReport) {
     let s = &report.stats;
     println!(
-        "sync complete: {} synced, {} skipped, {} failed ({}, {:.1}s)",
+        "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {:.1}s",
         s.images_synced,
         s.images_skipped,
         s.images_failed,
+        s.blobs_transferred,
+        s.blobs_skipped,
+        s.blobs_mounted,
         format_bytes(s.bytes_transferred),
         report.duration.as_secs_f64(),
     );

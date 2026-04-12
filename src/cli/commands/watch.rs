@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::cli::commands::synchronize;
 use crate::cli::shutdown::ShutdownSignal;
 use crate::cli::{CliError, ExitCode};
-use crate::{OutputFormat, SyncArgs, WatchArgs};
+use crate::{SyncArgs, WatchArgs};
 
 /// Run the watch command: loop forever, running sync then waiting for the
 /// configured interval or a shutdown signal.
@@ -18,7 +18,7 @@ pub(crate) async fn run(args: &WatchArgs, shutdown: ShutdownSignal) -> Result<Ex
             config: args.config.clone(),
             dry_run: false,
             output: None,
-            output_format: Some(OutputFormat::Text),
+            output_format: None,
         };
 
         match synchronize::run(&sync_args).await {
@@ -30,28 +30,13 @@ pub(crate) async fn run(args: &WatchArgs, shutdown: ShutdownSignal) -> Result<Ex
             }
         }
 
-        if wait_or_shutdown(interval, &shutdown).await {
-            tracing::info!("shutdown signal received, exiting watch mode");
-            return Ok(ExitCode::Success);
+        // Wait for the interval to elapse, or return early on shutdown.
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            () = shutdown.notified() => {
+                tracing::info!("shutdown signal received, exiting watch mode");
+                return Ok(ExitCode::Success);
+            }
         }
     }
-}
-
-/// Wait for the given duration, polling the shutdown signal every 500ms.
-///
-/// Returns `true` if shutdown was triggered before the duration elapsed,
-/// `false` if the full duration elapsed without a shutdown signal.
-async fn wait_or_shutdown(duration: Duration, shutdown: &ShutdownSignal) -> bool {
-    let poll_interval = Duration::from_millis(500);
-    let mut elapsed = Duration::ZERO;
-
-    while elapsed < duration {
-        if shutdown.is_triggered() {
-            return true;
-        }
-        tokio::time::sleep(poll_interval).await;
-        elapsed += poll_interval;
-    }
-
-    shutdown.is_triggered()
 }

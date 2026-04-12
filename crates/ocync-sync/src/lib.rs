@@ -66,8 +66,21 @@ pub struct ImageResult {
     pub status: ImageStatus,
     /// Total bytes transferred for this image.
     pub bytes_transferred: u64,
+    /// Per-image blob transfer statistics.
+    pub blob_stats: BlobTransferStats,
     /// Wall-clock duration of this image transfer.
     pub duration: Duration,
+}
+
+/// Per-image blob transfer statistics.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct BlobTransferStats {
+    /// Blobs transferred over the network (pull+push).
+    pub transferred: u64,
+    /// Blobs skipped because they already existed at the target (dedup or HEAD).
+    pub skipped: u64,
+    /// Blobs satisfied via cross-repo mount.
+    pub mounted: u64,
 }
 
 /// Outcome status for a single image transfer.
@@ -102,6 +115,16 @@ pub enum SkipReason {
     ImmutableTag,
 }
 
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DigestMatch => f.write_str("digest match"),
+            Self::SkipExisting => f.write_str("skip existing"),
+            Self::ImmutableTag => f.write_str("immutable tag"),
+        }
+    }
+}
+
 /// Aggregate statistics for a sync run.
 #[derive(Debug, Default, Serialize)]
 pub struct SyncStats {
@@ -111,16 +134,14 @@ pub struct SyncStats {
     pub images_skipped: u64,
     /// Number of images that failed.
     pub images_failed: u64,
-    /// Total layers transferred across all images.
-    pub layers_transferred: u64,
-    /// Unique layer references (before dedup).
-    pub layers_unique_refs: u64,
-    /// Layers satisfied via cross-repo mount.
-    pub layers_mounted: u64,
+    /// Total blobs transferred over the network (pull+push).
+    pub blobs_transferred: u64,
+    /// Blobs skipped because they already existed at the target.
+    pub blobs_skipped: u64,
+    /// Blobs satisfied via cross-repo mount.
+    pub blobs_mounted: u64,
     /// Total bytes transferred over the network.
     pub bytes_transferred: u64,
-    /// Total logical size of all images (before dedup/skip).
-    pub bytes_total: u64,
 }
 
 #[cfg(test)]
@@ -138,6 +159,7 @@ mod tests {
                     target: "tgt".into(),
                     status,
                     bytes_transferred: 0,
+                    blob_stats: BlobTransferStats::default(),
                     duration: Duration::ZERO,
                 })
                 .collect(),
@@ -204,10 +226,24 @@ mod tests {
         assert_eq!(stats.images_synced, 0);
         assert_eq!(stats.images_skipped, 0);
         assert_eq!(stats.images_failed, 0);
-        assert_eq!(stats.layers_transferred, 0);
-        assert_eq!(stats.layers_unique_refs, 0);
-        assert_eq!(stats.layers_mounted, 0);
+        assert_eq!(stats.blobs_transferred, 0);
+        assert_eq!(stats.blobs_skipped, 0);
+        assert_eq!(stats.blobs_mounted, 0);
         assert_eq!(stats.bytes_transferred, 0);
-        assert_eq!(stats.bytes_total, 0);
+    }
+
+    #[test]
+    fn skip_reason_display() {
+        assert_eq!(SkipReason::DigestMatch.to_string(), "digest match");
+        assert_eq!(SkipReason::SkipExisting.to_string(), "skip existing");
+        assert_eq!(SkipReason::ImmutableTag.to_string(), "immutable tag");
+    }
+
+    #[test]
+    fn blob_transfer_stats_default_is_zeroed() {
+        let stats = BlobTransferStats::default();
+        assert_eq!(stats.transferred, 0);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.mounted, 0);
     }
 }

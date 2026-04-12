@@ -35,6 +35,45 @@ pub enum Error {
         /// The configured minimum.
         minimum: usize,
     },
+
+    /// A manifest pull or push failed during sync.
+    #[error("manifest operation failed for {reference}: {source}")]
+    Manifest {
+        /// The manifest reference (tag or digest) involved.
+        reference: String,
+        /// The underlying distribution error.
+        source: ocync_distribution::Error,
+    },
+
+    /// A blob pull failed during sync.
+    #[error("blob pull failed for {digest}: {source}")]
+    BlobPull {
+        /// The digest of the blob that could not be pulled.
+        digest: String,
+        /// The underlying distribution error.
+        source: ocync_distribution::Error,
+    },
+
+    /// A blob push failed during sync.
+    #[error("blob push failed for {digest}: {source}")]
+    BlobPush {
+        /// The digest of the blob that could not be pushed.
+        digest: String,
+        /// The underlying distribution error.
+        source: ocync_distribution::Error,
+    },
+}
+
+impl Error {
+    /// Extract the HTTP status code from the underlying distribution error, if any.
+    pub fn status_code(&self) -> Option<http::StatusCode> {
+        match self {
+            Self::Manifest { source, .. }
+            | Self::BlobPull { source, .. }
+            | Self::BlobPush { source, .. } => source.status_code(),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -85,5 +124,56 @@ mod tests {
     fn is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Error>();
+    }
+
+    #[test]
+    fn display_manifest_error() {
+        let err = Error::Manifest {
+            reference: "latest".into(),
+            source: ocync_distribution::Error::NotFound("not found".into()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("latest"));
+        assert!(msg.contains("manifest"));
+    }
+
+    #[test]
+    fn display_blob_pull_error() {
+        let err = Error::BlobPull {
+            digest: "sha256:abc".into(),
+            source: ocync_distribution::Error::NotFound("missing".into()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("sha256:abc"));
+        assert!(msg.contains("blob pull"));
+    }
+
+    #[test]
+    fn display_blob_push_error() {
+        let err = Error::BlobPush {
+            digest: "sha256:def".into(),
+            source: ocync_distribution::Error::Other("timeout".into()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("blob push"));
+        assert!(msg.contains("sha256:def"));
+    }
+
+    #[test]
+    fn status_code_from_manifest_error() {
+        let err = Error::Manifest {
+            reference: "v1".into(),
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::TOO_MANY_REQUESTS,
+                message: "rate limited".into(),
+            },
+        };
+        assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn status_code_none_for_filter_errors() {
+        let err = Error::LatestWithoutSort;
+        assert_eq!(err.status_code(), None);
     }
 }

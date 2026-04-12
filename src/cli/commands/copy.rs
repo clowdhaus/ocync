@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
+use ocync_sync::ImageStatus;
 use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
-use ocync_sync::{ImageStatus, SkipReason};
 
 use crate::CopyArgs;
 use crate::cli::{CliError, ExitCode, build_registry_client};
@@ -32,7 +32,7 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
         tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],
     };
 
-    let engine = SyncEngine::new(RetryConfig::default());
+    let mut engine = SyncEngine::new(RetryConfig::default());
     let progress = NullProgress;
     let report = engine.run(vec![mapping], &progress).await;
 
@@ -59,8 +59,7 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
                 );
             }
             ImageStatus::Skipped { reason } => {
-                let reason_str = skip_reason_label(reason);
-                println!("Skipped {src_display} -> {dst_display} (reason: {reason_str})");
+                println!("Skipped {src_display} -> {dst_display} (reason: {reason})");
             }
             ImageStatus::Failed { error, retries } => {
                 eprintln!("Failed {src_display} -> {dst_display}: {error} (retries: {retries})");
@@ -72,14 +71,5 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
         0 => Ok(ExitCode::Success),
         1 => Ok(ExitCode::Failure),
         _ => Ok(ExitCode::Error),
-    }
-}
-
-/// Human-readable label for a skip reason.
-fn skip_reason_label(reason: &SkipReason) -> &'static str {
-    match reason {
-        SkipReason::DigestMatch => "DigestMatch",
-        SkipReason::SkipExisting => "SkipExisting",
-        SkipReason::ImmutableTag => "ImmutableTag",
     }
 }

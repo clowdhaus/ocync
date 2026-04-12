@@ -65,9 +65,9 @@ pub(crate) enum Commands {
 /// Arguments for the `sync` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct SyncArgs {
-    /// Config file path(s).
-    #[arg(short, long, required = true)]
-    pub(crate) config: Vec<PathBuf>,
+    /// Config file path.
+    #[arg(short, long)]
+    pub(crate) config: PathBuf,
     /// Perform a dry run without making changes.
     #[arg(long)]
     pub(crate) dry_run: bool,
@@ -174,11 +174,11 @@ pub(crate) struct ExpandArgs {
 /// Arguments for the `watch` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct WatchArgs {
-    /// Config file path(s).
-    #[arg(short, long, required = true)]
-    pub(crate) config: Vec<PathBuf>,
-    /// Sync interval in seconds.
-    #[arg(long, default_value = "300")]
+    /// Config file path.
+    #[arg(short, long)]
+    pub(crate) config: PathBuf,
+    /// Sync interval in seconds (minimum 1).
+    #[arg(long, default_value = "300", value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) interval: u64,
 }
 
@@ -234,14 +234,6 @@ mod tests {
         let cli = Cli::parse_from(["ocync", "sync", "--config", "c.yaml", "--dry-run"]);
         if let Commands::Sync(args) = cli.command {
             assert!(args.dry_run);
-        }
-    }
-
-    #[test]
-    fn parse_sync_multiple_configs() {
-        let cli = Cli::parse_from(["ocync", "sync", "--config", "a.yaml", "--config", "b.yaml"]);
-        if let Commands::Sync(args) = cli.command {
-            assert_eq!(args.config.len(), 2);
         }
     }
 
@@ -352,5 +344,12 @@ mod tests {
         } else {
             panic!("expected Watch command");
         }
+    }
+
+    #[test]
+    fn watch_interval_zero_rejected() {
+        let result =
+            Cli::try_parse_from(["ocync", "watch", "--config", "c.yaml", "--interval", "0"]);
+        assert!(result.is_err());
     }
 }

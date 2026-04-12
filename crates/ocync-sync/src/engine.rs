@@ -1,6 +1,6 @@
 //! Sync engine — two-phase orchestrator for image transfers.
 
-use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::plan::BlobDedupMap;
 use crate::retry::{self, RetryConfig};
-use crate::{ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats};
+use crate::{BlobTransferStats, ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats};
 
 /// A fully resolved mapping ready for the sync engine.
 ///
@@ -89,17 +89,10 @@ fn collect_image_blobs(manifest: &ImageManifest) -> Vec<Digest> {
 /// to every target. Blob deduplication is tracked globally so that layers
 /// shared across images or repositories are transferred at most once per
 /// target registry.
+#[derive(Debug)]
 pub struct SyncEngine {
     retry: RetryConfig,
-    dedup: std::sync::Mutex<BlobDedupMap>,
-}
-
-impl fmt::Debug for SyncEngine {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SyncEngine")
-            .field("retry", &self.retry)
-            .finish_non_exhaustive()
-    }
+    dedup: BlobDedupMap,
 }
 
 impl SyncEngine {
@@ -107,7 +100,7 @@ impl SyncEngine {
     pub fn new(retry: RetryConfig) -> Self {
         Self {
             retry,
-            dedup: std::sync::Mutex::new(BlobDedupMap::new()),
+            dedup: BlobDedupMap::new(),
         }
     }
 
@@ -118,7 +111,7 @@ impl SyncEngine {
     /// combination. Progress callbacks are invoked before and after each image.
     /// Returns a [`SyncReport`] with per-image results and aggregate statistics.
     pub async fn run(
-        &self,
+        &mut self,
         mappings: Vec<ResolvedMapping>,
         progress: &dyn crate::progress::ProgressReporter,
     ) -> SyncReport {
@@ -130,7 +123,7 @@ impl SyncEngine {
             for tag_pair in &mapping.tags {
                 for target in &mapping.targets {
                     let source_ref = format!(
-                        "{}:{}@{}",
+                        "{}:{} -> {}",
                         mapping.source_repo, tag_pair.source, target.name
                     );
                     let target_ref = format!("{}:{}", mapping.target_repo, tag_pair.target);
@@ -175,7 +168,7 @@ impl SyncEngine {
     /// as [`ImageStatus::Failed`].
     #[allow(clippy::too_many_arguments)]
     async fn sync_image(
-        &self,
+        &mut self,
         source: &RegistryClient,
         source_repo: &str,
         target: &RegistryClient,
@@ -204,12 +197,13 @@ impl SyncEngine {
         let duration = image_start.elapsed();
 
         match result {
-            Ok((status, bytes_transferred)) => ImageResult {
+            Ok((status, bytes_transferred, blob_stats)) => ImageResult {
                 image_id,
                 source: source_ref,
                 target: target_ref,
                 status,
                 bytes_transferred,
+                blob_stats,
                 duration,
             },
             Err(err) => {
@@ -219,10 +213,11 @@ impl SyncEngine {
                     source: source_ref,
                     target: target_ref,
                     status: ImageStatus::Failed {
-                        error: err,
+                        error: err.to_string(),
                         retries: self.retry.max_retries,
                     },
                     bytes_transferred: 0,
+                    blob_stats: BlobTransferStats::default(),
                     duration,
                 }
             }
@@ -232,7 +227,7 @@ impl SyncEngine {
     /// Inner implementation of image sync that returns Result for ergonomic error handling.
     #[allow(clippy::too_many_arguments)]
     async fn sync_image_inner(
-        &self,
+        &mut self,
         source: &RegistryClient,
         source_repo: &str,
         target: &RegistryClient,
@@ -240,11 +235,16 @@ impl SyncEngine {
         target_repo: &str,
         source_tag: &str,
         target_tag: &str,
-    ) -> Result<(ImageStatus, u64), String> {
+    ) -> Result<(ImageStatus, u64, BlobTransferStats), crate::Error> {
         // Step 1: Pull source manifest.
-        let pull = self
-            .manifest_pull_with_retry(source, source_repo, source_tag)
-            .await?;
+        let pull = with_retry(&self.retry, "manifest pull", || {
+            source.manifest_pull(source_repo, source_tag)
+        })
+        .await
+        .map_err(|e| crate::Error::Manifest {
+            reference: source_tag.to_owned(),
+            source: e,
+        })?;
 
         // Step 2: HEAD target manifest — skip if digest matches.
         match target.manifest_head(target_repo, target_tag).await {
@@ -262,6 +262,7 @@ impl SyncEngine {
                         reason: SkipReason::DigestMatch,
                     },
                     0,
+                    BlobTransferStats::default(),
                 ));
             }
             Ok(_) => {} // manifest missing or digest differs — proceed
@@ -276,10 +277,12 @@ impl SyncEngine {
         }
 
         // Step 3/4: Handle based on manifest kind.
+        let mut blob_stats = BlobTransferStats::default();
+
         let bytes_transferred = match &pull.manifest {
             ManifestKind::Image(image_manifest) => {
                 let blobs = collect_image_blobs(image_manifest);
-                let bytes = self
+                let (bytes, stats) = self
                     .transfer_blobs(
                         source,
                         source_repo,
@@ -289,16 +292,17 @@ impl SyncEngine {
                         &blobs,
                     )
                     .await?;
+                blob_stats = stats;
 
                 // Push manifest by tag.
-                self.manifest_push_with_retry(
-                    target,
-                    target_repo,
-                    target_tag,
-                    &pull.media_type,
-                    &pull.raw_bytes,
-                )
-                .await?;
+                with_retry(&self.retry, "manifest push", || {
+                    target.manifest_push(target_repo, target_tag, &pull.media_type, &pull.raw_bytes)
+                })
+                .await
+                .map_err(|e| crate::Error::Manifest {
+                    reference: target_tag.to_owned(),
+                    source: e,
+                })?;
 
                 bytes
             }
@@ -308,13 +312,18 @@ impl SyncEngine {
                 // For each child descriptor, pull child manifest, transfer blobs, push child.
                 for child_desc in &index.manifests {
                     let child_digest_str = child_desc.digest.to_string();
-                    let child_pull = self
-                        .manifest_pull_with_retry(source, source_repo, &child_digest_str)
-                        .await?;
+                    let child_pull = with_retry(&self.retry, "manifest pull", || {
+                        source.manifest_pull(source_repo, &child_digest_str)
+                    })
+                    .await
+                    .map_err(|e| crate::Error::Manifest {
+                        reference: child_digest_str.clone(),
+                        source: e,
+                    })?;
 
                     if let ManifestKind::Image(child_image) = &child_pull.manifest {
                         let blobs = collect_image_blobs(child_image);
-                        let bytes = self
+                        let (bytes, child_stats) = self
                             .transfer_blobs(
                                 source,
                                 source_repo,
@@ -325,28 +334,36 @@ impl SyncEngine {
                             )
                             .await?;
                         total_bytes = total_bytes.saturating_add(bytes);
+                        blob_stats.transferred += child_stats.transferred;
+                        blob_stats.skipped += child_stats.skipped;
+                        blob_stats.mounted += child_stats.mounted;
                     }
 
                     // Push child manifest to target by digest.
-                    self.manifest_push_with_retry(
-                        target,
-                        target_repo,
-                        &child_digest_str,
-                        &child_pull.media_type,
-                        &child_pull.raw_bytes,
-                    )
-                    .await?;
+                    with_retry(&self.retry, "manifest push", || {
+                        target.manifest_push(
+                            target_repo,
+                            &child_digest_str,
+                            &child_pull.media_type,
+                            &child_pull.raw_bytes,
+                        )
+                    })
+                    .await
+                    .map_err(|e| crate::Error::Manifest {
+                        reference: child_digest_str.clone(),
+                        source: e,
+                    })?;
                 }
 
                 // Push the index by tag.
-                self.manifest_push_with_retry(
-                    target,
-                    target_repo,
-                    target_tag,
-                    &pull.media_type,
-                    &pull.raw_bytes,
-                )
-                .await?;
+                with_retry(&self.retry, "manifest push", || {
+                    target.manifest_push(target_repo, target_tag, &pull.media_type, &pull.raw_bytes)
+                })
+                .await
+                .map_err(|e| crate::Error::Manifest {
+                    reference: target_tag.to_owned(),
+                    source: e,
+                })?;
 
                 total_bytes
             }
@@ -357,40 +374,37 @@ impl SyncEngine {
             target_repo, source_tag, target_tag, bytes_transferred, "image synced"
         );
 
-        Ok((ImageStatus::Synced, bytes_transferred))
+        Ok((ImageStatus::Synced, bytes_transferred, blob_stats))
     }
 
     /// Transfer blobs from source to target, using dedup and cross-repo mount.
     ///
     /// For each digest: checks the dedup map, does a HEAD check at the target,
     /// attempts a cross-repo mount, and falls back to pull+push. Returns the
-    /// total bytes transferred.
+    /// total bytes transferred and per-call blob statistics.
     async fn transfer_blobs(
-        &self,
+        &mut self,
         source: &RegistryClient,
         source_repo: &str,
         target: &RegistryClient,
         target_name: &str,
         target_repo: &str,
         digests: &[Digest],
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, BlobTransferStats), crate::Error> {
         let mut total_bytes = 0u64;
+        let mut stats = BlobTransferStats::default();
 
         for digest in digests {
             // Check dedup map — skip if already handled.
-            {
-                let dedup = self.dedup.lock().expect("dedup lock poisoned");
-                if let Some(status) = dedup.status(target_name, digest) {
-                    use crate::plan::BlobStatus;
-                    match status {
-                        BlobStatus::ExistsAtTarget
-                        | BlobStatus::Completed
-                        | BlobStatus::InProgress => {
-                            debug!(%digest, status = ?status, "blob already handled, skipping");
-                            continue;
-                        }
-                        BlobStatus::Unknown | BlobStatus::Failed(_) => {}
+            if let Some(status) = self.dedup.status(target_name, digest) {
+                use crate::plan::BlobStatus;
+                match status {
+                    BlobStatus::ExistsAtTarget | BlobStatus::Completed | BlobStatus::InProgress => {
+                        debug!(%digest, status = ?status, "blob already handled, skipping");
+                        stats.skipped += 1;
+                        continue;
                     }
+                    BlobStatus::Unknown | BlobStatus::Failed(_) => {}
                 }
             }
 
@@ -398,8 +412,8 @@ impl SyncEngine {
             match target.blob_exists(target_repo, digest).await {
                 Ok(Some(_size)) => {
                     debug!(%digest, "blob exists at target, skipping");
-                    let mut dedup = self.dedup.lock().expect("dedup lock poisoned");
-                    dedup.set_exists(target_name, digest, target_repo);
+                    self.dedup.set_exists(target_name, digest, target_repo);
+                    stats.skipped += 1;
                     continue;
                 }
                 Ok(None) => {} // not found, need to transfer
@@ -409,26 +423,21 @@ impl SyncEngine {
             }
 
             // Mark in-progress.
-            {
-                let mut dedup = self.dedup.lock().expect("dedup lock poisoned");
-                dedup.set_in_progress(target_name, digest);
-            }
+            self.dedup.set_in_progress(target_name, digest);
 
             // Try cross-repo mount.
-            let mount_source = {
-                let dedup = self.dedup.lock().expect("dedup lock poisoned");
-                dedup
-                    .mount_source(target_name, digest, target_repo)
-                    .map(|s| s.to_owned())
-            };
+            let mount_source = self
+                .dedup
+                .mount_source(target_name, digest, target_repo)
+                .map(|s| s.to_owned());
 
             if let Some(from_repo) = mount_source {
-                debug!(%digest, from_repo, "attempting cross-repo mount");
+                debug!(%digest, %from_repo, "attempting cross-repo mount");
                 match target.blob_mount(target_repo, digest, &from_repo).await {
                     Ok(MountResult::Mounted) => {
-                        debug!(%digest, "blob mounted from {from_repo}");
-                        let mut dedup = self.dedup.lock().expect("dedup lock poisoned");
-                        dedup.set_completed(target_name, digest, target_repo);
+                        debug!(%digest, %from_repo, "blob mounted");
+                        self.dedup.set_completed(target_name, digest, target_repo);
+                        stats.mounted += 1;
                         continue;
                     }
                     Ok(MountResult::FallbackUpload { .. }) => {
@@ -441,165 +450,83 @@ impl SyncEngine {
             }
 
             // Pull from source with retry.
-            let data = match self.pull_blob_with_retry(source, source_repo, digest).await {
+            let data = match with_retry(&self.retry, "blob pull", || {
+                source.blob_pull_all(source_repo, digest)
+            })
+            .await
+            {
                 Ok(data) => data,
                 Err(e) => {
-                    let mut dedup = self.dedup.lock().expect("dedup lock poisoned");
-                    dedup.set_failed(target_name, digest, e.clone());
-                    return Err(e);
+                    let err = crate::Error::BlobPull {
+                        digest: digest.to_string(),
+                        source: e,
+                    };
+                    self.dedup.set_failed(target_name, digest, err.to_string());
+                    return Err(err);
                 }
             };
             let blob_size = data.len() as u64;
 
             // Push to target with retry.
-            if let Err(e) = self.push_blob_with_retry(target, target_repo, &data).await {
-                let mut dedup = self.dedup.lock().expect("dedup lock poisoned");
-                dedup.set_failed(target_name, digest, e.clone());
-                return Err(e);
+            if let Err(e) = with_retry(&self.retry, "blob push", || {
+                target.blob_push(target_repo, &data)
+            })
+            .await
+            {
+                let err = crate::Error::BlobPush {
+                    digest: digest.to_string(),
+                    source: e,
+                };
+                self.dedup.set_failed(target_name, digest, err.to_string());
+                return Err(err);
             }
 
             total_bytes = total_bytes.saturating_add(blob_size);
+            stats.transferred += 1;
 
             // Mark completed.
-            let mut dedup = self.dedup.lock().expect("dedup lock poisoned");
-            dedup.set_completed(target_name, digest, target_repo);
+            self.dedup.set_completed(target_name, digest, target_repo);
         }
 
-        Ok(total_bytes)
+        Ok((total_bytes, stats))
     }
+}
 
-    /// Pull a blob with retry logic for transient errors.
-    async fn pull_blob_with_retry(
-        &self,
-        source: &RegistryClient,
-        source_repo: &str,
-        digest: &Digest,
-    ) -> Result<Vec<u8>, String> {
-        let mut attempt = 0;
-        loop {
-            match source.blob_pull_all(source_repo, digest).await {
-                Ok(data) => return Ok(data),
-                Err(e) => {
-                    if let Some(status) = e.status_code() {
-                        if retry::should_retry(status, attempt, self.retry.max_retries) {
-                            let backoff = self.retry.backoff_for(attempt);
-                            warn!(
-                                %digest,
-                                attempt,
-                                status = %status,
-                                backoff_ms = backoff.as_millis(),
-                                "retrying blob pull"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            attempt += 1;
-                            continue;
-                        }
+/// Retry an async operation with exponential backoff on transient HTTP errors.
+///
+/// Calls `f()` in a loop. If the result is `Err` with a retryable HTTP status
+/// (408, 429, 5xx), waits with exponential backoff and tries again up to
+/// `config.max_retries` times. Returns the first `Ok` or the final `Err`.
+async fn with_retry<T, F, Fut>(
+    config: &RetryConfig,
+    operation: &str,
+    f: F,
+) -> Result<T, ocync_distribution::Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, ocync_distribution::Error>>,
+{
+    let mut attempt = 0;
+    loop {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if let Some(status) = e.status_code() {
+                    if retry::should_retry(status, attempt, config.max_retries) {
+                        let backoff = config.backoff_for(attempt);
+                        warn!(
+                            operation,
+                            attempt,
+                            status = %status,
+                            backoff_ms = backoff.as_millis(),
+                            "retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
                     }
-                    return Err(format!("failed to pull blob {digest}: {e}"));
                 }
-            }
-        }
-    }
-
-    /// Push a blob with retry logic for transient errors.
-    async fn push_blob_with_retry(
-        &self,
-        target: &RegistryClient,
-        target_repo: &str,
-        data: &[u8],
-    ) -> Result<Digest, String> {
-        let mut attempt = 0;
-        loop {
-            match target.blob_push(target_repo, data).await {
-                Ok(digest) => return Ok(digest),
-                Err(e) => {
-                    if let Some(status) = e.status_code() {
-                        if retry::should_retry(status, attempt, self.retry.max_retries) {
-                            let backoff = self.retry.backoff_for(attempt);
-                            warn!(
-                                attempt,
-                                status = %status,
-                                backoff_ms = backoff.as_millis(),
-                                "retrying blob push"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            attempt += 1;
-                            continue;
-                        }
-                    }
-                    return Err(format!("failed to push blob: {e}"));
-                }
-            }
-        }
-    }
-
-    /// Pull a manifest with retry logic for transient errors.
-    async fn manifest_pull_with_retry(
-        &self,
-        client: &RegistryClient,
-        repo: &str,
-        reference: &str,
-    ) -> Result<ocync_distribution::ManifestPull, String> {
-        let mut attempt = 0;
-        loop {
-            match client.manifest_pull(repo, reference).await {
-                Ok(pull) => return Ok(pull),
-                Err(e) => {
-                    if let Some(status) = e.status_code() {
-                        if retry::should_retry(status, attempt, self.retry.max_retries) {
-                            let backoff = self.retry.backoff_for(attempt);
-                            warn!(
-                                reference,
-                                attempt,
-                                status = %status,
-                                backoff_ms = backoff.as_millis(),
-                                "retrying manifest pull"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            attempt += 1;
-                            continue;
-                        }
-                    }
-                    return Err(format!("failed to pull manifest {reference}: {e}"));
-                }
-            }
-        }
-    }
-
-    /// Push a manifest with retry logic for transient errors.
-    async fn manifest_push_with_retry(
-        &self,
-        client: &RegistryClient,
-        repo: &str,
-        reference: &str,
-        media_type: &ocync_distribution::MediaType,
-        raw_bytes: &[u8],
-    ) -> Result<Digest, String> {
-        let mut attempt = 0;
-        loop {
-            match client
-                .manifest_push(repo, reference, media_type, raw_bytes)
-                .await
-            {
-                Ok(digest) => return Ok(digest),
-                Err(e) => {
-                    if let Some(status) = e.status_code() {
-                        if retry::should_retry(status, attempt, self.retry.max_retries) {
-                            let backoff = self.retry.backoff_for(attempt);
-                            warn!(
-                                reference,
-                                attempt,
-                                status = %status,
-                                backoff_ms = backoff.as_millis(),
-                                "retrying manifest push"
-                            );
-                            tokio::time::sleep(backoff).await;
-                            attempt += 1;
-                            continue;
-                        }
-                    }
-                    return Err(format!("failed to push manifest {reference}: {e}"));
-                }
+                return Err(e);
             }
         }
     }
@@ -621,6 +548,9 @@ fn compute_stats(images: &[ImageResult]) -> SyncStats {
                 stats.images_failed += 1;
             }
         }
+        stats.blobs_transferred += image.blob_stats.transferred;
+        stats.blobs_skipped += image.blob_stats.skipped;
+        stats.blobs_mounted += image.blob_stats.mounted;
     }
     stats
 }
@@ -700,6 +630,7 @@ mod tests {
             target: "target/repo:tag".into(),
             status,
             bytes_transferred: bytes,
+            blob_stats: BlobTransferStats::default(),
             duration: std::time::Duration::from_millis(100),
         }
     }

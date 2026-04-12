@@ -1364,10 +1364,13 @@ dependencies = [
  "reqwest",
  "semver",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
