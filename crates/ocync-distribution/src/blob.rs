@@ -159,10 +159,8 @@ impl RegistryClient {
     /// 1. POST `/v2/{repository}/blobs/uploads/` to initiate the upload.
     /// 2. Accumulate stream chunks into `chunk_size` buffers, issuing PATCH
     ///    requests with `Content-Range` headers for each buffer.
-    /// 3. PUT to finalize with `?digest=` query param.
-    ///
-    /// If the computed digest does not match `expected_digest`, the upload is
-    /// deleted and [`Error::DigestMismatch`] is returned.
+    /// 3. PUT to finalize with `?digest=` query param — the registry verifies
+    ///    the uploaded content matches the digest.
     ///
     /// **GAR fallback**: Google Artifact Registry does not support chunked
     /// uploads, so hosts ending in `-docker.pkg.dev` buffer the entire stream
@@ -213,7 +211,6 @@ impl RegistryClient {
         let upload_url = extract_location(&resp, &self.base_url)?;
 
         // Step 2: Stream chunks, issuing PATCH for each chunk_size buffer.
-        let mut hasher = Sha256::new();
         let mut buffer = Vec::with_capacity(self.chunk_size);
         let mut current_url = upload_url;
         let mut offset: u64 = 0;
@@ -221,7 +218,6 @@ impl RegistryClient {
         futures_util::pin_mut!(stream);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            hasher.update(&chunk);
             buffer.extend_from_slice(&chunk);
 
             if buffer.len() >= self.chunk_size {
@@ -246,24 +242,8 @@ impl RegistryClient {
                 .await?;
         }
 
-        // Verify digest before finalizing.
-        let hash = hasher.finalize();
-        let actual_digest = Digest::from_sha256(hash);
-        if actual_digest != *expected_digest {
-            // DELETE the upload to clean up.
-            let _ = self
-                .send_with_retry(&scopes, "blob push stream delete", |headers| {
-                    self.http.delete(&current_url).headers(headers)
-                })
-                .await;
-            return Err(Error::DigestMismatch {
-                expected: expected_digest.to_string(),
-                actual: actual_digest.to_string(),
-            });
-        }
-
-        // Step 3: PUT to finalize.
-        let digest_str = actual_digest.to_string();
+        // Step 3: PUT to finalize — the registry verifies the digest.
+        let digest_str = expected_digest.to_string();
         let resp = self
             .send_with_retry(&scopes, "blob push stream finalize", |headers| {
                 self.http
@@ -284,7 +264,7 @@ impl RegistryClient {
             return Err(Error::RegistryError { status, message });
         }
 
-        Ok(actual_digest)
+        Ok(expected_digest.clone())
     }
 
     /// Send a PATCH chunk for a chunked upload and return the next upload URL.
@@ -335,7 +315,7 @@ impl RegistryClient {
     async fn blob_push_stream_gar_fallback(
         &self,
         repository: &str,
-        expected_digest: &Digest,
+        _expected_digest: &Digest,
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     ) -> Result<Digest, Error> {
         warn!(
@@ -350,15 +330,7 @@ impl RegistryClient {
             body.extend_from_slice(&chunk);
         }
 
-        let digest = self.blob_push(repository, &body).await?;
-        if digest != *expected_digest {
-            return Err(Error::DigestMismatch {
-                expected: expected_digest.to_string(),
-                actual: digest.to_string(),
-            });
-        }
-
-        Ok(digest)
+        self.blob_push(repository, &body).await
     }
 
     /// Delete an in-progress blob upload.

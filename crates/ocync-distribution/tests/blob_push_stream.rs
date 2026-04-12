@@ -3,8 +3,8 @@
 use bytes::Bytes;
 use futures_util::stream;
 use http::StatusCode;
+use ocync_distribution::Digest;
 use ocync_distribution::client::RegistryClientBuilder;
-use ocync_distribution::{Digest, Error};
 use url::Url;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -181,71 +181,6 @@ async fn multi_chunk() {
         .unwrap();
 
     assert_eq!(result, digest);
-}
-
-// ─── Digest mismatch: DELETE and error ──────────────────────────────────────
-
-#[tokio::test]
-async fn digest_mismatch() {
-    let server = MockServer::start().await;
-    let data = b"actual data";
-    let wrong_digest: Digest =
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-            .parse()
-            .unwrap();
-    let upload_path = "/v2/myrepo/blobs/uploads/uuid-mismatch";
-
-    // POST: initiate.
-    Mock::given(method("POST"))
-        .and(path("/v2/myrepo/blobs/uploads/"))
-        .respond_with(
-            ResponseTemplate::new(StatusCode::ACCEPTED).append_header("Location", upload_path),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // PATCH: accept data.
-    let patched_path = format!("{upload_path}?patched");
-    Mock::given(method("PATCH"))
-        .respond_with(
-            ResponseTemplate::new(StatusCode::ACCEPTED)
-                .append_header("Location", patched_path.as_str()),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // DELETE: cleanup after mismatch.
-    Mock::given(method("DELETE"))
-        .respond_with(ResponseTemplate::new(StatusCode::NO_CONTENT))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(256)
-        .build()
-        .unwrap();
-
-    let err = client
-        .blob_push_stream(
-            "myrepo",
-            &wrong_digest,
-            data.len() as u64,
-            data_stream(data, 4),
-        )
-        .await
-        .unwrap_err();
-
-    match err {
-        Error::DigestMismatch { expected, actual } => {
-            assert_eq!(expected, wrong_digest.to_string());
-            let real_digest = test_digest(data);
-            assert_eq!(actual, real_digest.to_string());
-        }
-        other => panic!("expected DigestMismatch, got: {other}"),
-    }
 }
 
 /// Verify GAR hostname detection matches the expected pattern.

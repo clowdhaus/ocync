@@ -6,10 +6,10 @@ use std::time::Instant;
 
 use std::time::Duration;
 
+use ocync_distribution::RegistryClient;
 use ocync_distribution::blob::MountResult;
 use ocync_distribution::manifest::ManifestPull;
-use ocync_distribution::spec::{ImageManifest, ManifestKind};
-use ocync_distribution::{Digest, RegistryClient};
+use ocync_distribution::spec::{Descriptor, ImageManifest, ManifestKind};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -94,12 +94,12 @@ struct Endpoint<'a> {
     name: &'a str,
 }
 
-/// Collect all blob digests with their declared sizes from an image manifest.
-fn collect_image_blobs(manifest: &ImageManifest) -> Vec<(Digest, u64)> {
+/// Collect all blob descriptors (config + layers) from an image manifest.
+fn collect_image_blobs(manifest: &ImageManifest) -> Vec<&Descriptor> {
     let mut blobs = Vec::with_capacity(1 + manifest.layers.len());
-    blobs.push((manifest.config.digest.clone(), manifest.config.size));
+    blobs.push(&manifest.config);
     for layer in &manifest.layers {
-        blobs.push((layer.digest.clone(), layer.size));
+        blobs.push(layer);
     }
     blobs
 }
@@ -111,15 +111,9 @@ fn collect_image_blobs(manifest: &ImageManifest) -> Vec<(Digest, u64)> {
 struct SourceData {
     /// The top-level manifest (image or index).
     pull: ManifestPull,
-    /// For index manifests: pre-pulled child image manifests with their blob lists.
+    /// For index manifests: pre-pulled child manifests.
     /// Empty for single-image manifests (blobs are derived from `pull.manifest`).
-    children: Vec<ChildData>,
-}
-
-/// A pre-pulled child manifest within an index.
-struct ChildData {
-    pull: ManifestPull,
-    blobs: Vec<(Digest, u64)>,
+    children: Vec<ManifestPull>,
 }
 
 /// Per-target result of a fan-out blob transfer phase.
@@ -301,17 +295,16 @@ impl SyncEngine {
             return;
         }
 
-        // Collect all blob digests (with sizes) from the source data.
-        let owned_blobs;
-        let all_blobs: Vec<(&Digest, u64)> = match &source_data.pull.manifest {
-            ManifestKind::Image(m) => {
-                owned_blobs = collect_image_blobs(m);
-                owned_blobs.iter().map(|(d, s)| (d, *s)).collect()
-            }
+        // Collect all blob descriptors from the source data.
+        let all_blobs: Vec<&Descriptor> = match &source_data.pull.manifest {
+            ManifestKind::Image(m) => collect_image_blobs(m),
             ManifestKind::Index(_) => source_data
                 .children
                 .iter()
-                .flat_map(|c| c.blobs.iter().map(|(d, s)| (d, *s)))
+                .flat_map(|c| match &c.manifest {
+                    ManifestKind::Image(m) => collect_image_blobs(m),
+                    ManifestKind::Index(_) => Vec::new(),
+                })
                 .collect(),
         };
 
@@ -425,12 +418,8 @@ impl SyncEngine {
                     })?;
 
                     match &child_pull.manifest {
-                        ManifestKind::Image(child_image) => {
-                            let blobs = collect_image_blobs(child_image);
-                            children.push(ChildData {
-                                pull: child_pull,
-                                blobs,
-                            });
+                        ManifestKind::Image(_) => {
+                            children.push(child_pull);
                         }
                         ManifestKind::Index(_) => {
                             return Err(crate::Error::Manifest {
@@ -458,13 +447,13 @@ impl SyncEngine {
     ) -> Result<(), crate::Error> {
         // For index manifests, push each child by digest first.
         for child in &source_data.children {
-            let child_digest_str = child.pull.digest.to_string();
+            let child_digest_str = child.digest.to_string();
             with_retry(&self.retry, "manifest push", || {
                 target.client.manifest_push(
                     target.repo,
                     &child_digest_str,
-                    &child.pull.media_type,
-                    &child.pull.raw_bytes,
+                    &child.media_type,
+                    &child.raw_bytes,
                 )
             })
             .await
@@ -502,14 +491,16 @@ impl SyncEngine {
         &mut self,
         source: &Endpoint<'_>,
         targets: &[&Endpoint<'_>],
-        blobs: &[(&Digest, u64)],
+        blobs: &[&Descriptor],
     ) -> Vec<BlobTransferResult> {
         let mut results: Vec<BlobTransferResult> = targets
             .iter()
             .map(|_| BlobTransferResult::default())
             .collect();
 
-        for &(digest, size) in blobs {
+        for blob in blobs {
+            let digest = &blob.digest;
+            let size = blob.size;
             // Determine which targets need this blob pulled+pushed.
             let mut needs_pull: Vec<usize> = Vec::new();
 
@@ -675,6 +666,7 @@ fn compute_stats(images: &[ImageResult]) -> SyncStats {
 
 #[cfg(test)]
 mod tests {
+    use ocync_distribution::Digest;
     use ocync_distribution::spec::{Descriptor, MediaType};
 
     use super::*;
@@ -727,9 +719,12 @@ mod tests {
 
         let blobs = collect_image_blobs(&manifest);
         assert_eq!(blobs.len(), 3);
-        assert_eq!(blobs[0], (config_digest, 50));
-        assert_eq!(blobs[1], (layer1_digest, 200));
-        assert_eq!(blobs[2], (layer2_digest, 300));
+        assert_eq!(blobs[0].digest, config_digest);
+        assert_eq!(blobs[0].size, 50);
+        assert_eq!(blobs[1].digest, layer1_digest);
+        assert_eq!(blobs[1].size, 200);
+        assert_eq!(blobs[2].digest, layer2_digest);
+        assert_eq!(blobs[2].size, 300);
     }
 
     #[test]
@@ -753,7 +748,8 @@ mod tests {
 
         let blobs = collect_image_blobs(&manifest);
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0], (config_digest, 42));
+        assert_eq!(blobs[0].digest, config_digest);
+        assert_eq!(blobs[0].size, 42);
     }
 
     fn make_image_result(status: ImageStatus, bytes: u64) -> ImageResult {
