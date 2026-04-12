@@ -72,38 +72,33 @@ pub enum Error {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// The registry returned an unexpected HTTP status.
+    /// The registry returned a non-success HTTP status.
     #[error("registry returned {status}: {message}")]
     RegistryError {
         /// The HTTP status code.
         status: http::StatusCode,
-        /// The response body.
+        /// Human-readable context (typically registry/repository and response body).
         message: String,
     },
-
-    /// The registry returned 401 Unauthorized.
-    #[error("registry returned 401 Unauthorized for {registry}")]
-    Unauthorized {
-        /// The registry hostname.
-        registry: String,
-    },
-
-    /// The registry returned 403 Forbidden.
-    #[error("registry returned 403 Forbidden for {registry}/{repository}")]
-    Forbidden {
-        /// The registry hostname.
-        registry: String,
-        /// The repository that was denied.
-        repository: String,
-    },
-
-    /// The requested resource was not found.
-    #[error("not found: {0}")]
-    NotFound(String),
 
     /// Catch-all for errors without a dedicated variant.
     #[error("{0}")]
     Other(String),
+}
+
+impl Error {
+    /// Extract the HTTP status code from this error, if applicable.
+    pub fn status_code(&self) -> Option<http::StatusCode> {
+        match self {
+            Self::RegistryError { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// Whether this error represents a 404 Not Found response.
+    pub fn is_not_found(&self) -> bool {
+        self.status_code() == Some(http::StatusCode::NOT_FOUND)
+    }
 }
 
 #[cfg(test)]
@@ -159,5 +154,50 @@ mod tests {
     fn is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Error>();
+    }
+
+    #[test]
+    fn status_code_from_registry_error() {
+        let err = Error::RegistryError {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            message: "rate limited".into(),
+        };
+        assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn status_code_none_for_non_registry_errors() {
+        let err = Error::Other("something".into());
+        assert_eq!(err.status_code(), None);
+
+        let err = Error::InvalidReference {
+            input: "bad".into(),
+            reason: "reason".into(),
+        };
+        assert_eq!(err.status_code(), None);
+
+        let err = Error::AuthFailed {
+            registry: "example.com".into(),
+            reason: "bad creds".into(),
+        };
+        assert_eq!(err.status_code(), None);
+    }
+
+    #[test]
+    fn is_not_found() {
+        let err = Error::RegistryError {
+            status: http::StatusCode::NOT_FOUND,
+            message: "missing".into(),
+        };
+        assert!(err.is_not_found());
+
+        let err = Error::RegistryError {
+            status: http::StatusCode::UNAUTHORIZED,
+            message: "denied".into(),
+        };
+        assert!(!err.is_not_found());
+
+        let err = Error::Other("unrelated".into());
+        assert!(!err.is_not_found());
     }
 }

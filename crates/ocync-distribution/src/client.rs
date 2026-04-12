@@ -247,23 +247,15 @@ async fn classify_response(
         return Ok(resp);
     }
 
-    let registry = base_url.host_str().unwrap_or("unknown").to_owned();
+    let registry = base_url.host_str().unwrap_or("unknown");
+    let body = resp.text().await.unwrap_or_default();
+    let message = if body.is_empty() {
+        format!("{registry}/{repository}")
+    } else {
+        format!("{registry}/{repository}: {body}")
+    };
 
-    match status {
-        StatusCode::UNAUTHORIZED => Err(Error::Unauthorized { registry }),
-        StatusCode::FORBIDDEN => Err(Error::Forbidden {
-            registry,
-            repository: repository.to_owned(),
-        }),
-        StatusCode::NOT_FOUND => {
-            let message = resp.text().await.unwrap_or_default();
-            Err(Error::NotFound(message))
-        }
-        _ => {
-            let message = resp.text().await.unwrap_or_default();
-            Err(Error::RegistryError { status, message })
-        }
-    }
+    Err(Error::RegistryError { status, message })
 }
 
 /// Construct a URL for the `/v2/` endpoint.

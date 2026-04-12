@@ -65,43 +65,36 @@ impl fmt::Display for MediaType {
     }
 }
 
+/// Look up a known media type from its wire-format string.
+fn known_media_type(s: &str) -> Option<MediaType> {
+    Some(match s {
+        "application/vnd.oci.image.manifest.v1+json" => MediaType::OciManifest,
+        "application/vnd.oci.image.index.v1+json" => MediaType::OciIndex,
+        "application/vnd.oci.image.config.v1+json" => MediaType::OciConfig,
+        "application/vnd.oci.image.layer.v1.tar+gzip" => MediaType::OciLayerGzip,
+        "application/vnd.oci.image.layer.v1.tar+zstd" => MediaType::OciLayerZstd,
+        "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip" => {
+            MediaType::OciLayerNondistributableGzip
+        }
+        "application/vnd.docker.distribution.manifest.v2+json" => MediaType::DockerManifestV2,
+        "application/vnd.docker.distribution.manifest.list.v2+json" => {
+            MediaType::DockerManifestList
+        }
+        "application/vnd.docker.container.image.v1+json" => MediaType::DockerConfig,
+        "application/vnd.docker.image.rootfs.diff.tar.gzip" => MediaType::DockerLayerGzip,
+        _ => return None,
+    })
+}
+
 impl From<&str> for MediaType {
     fn from(s: &str) -> Self {
-        match s {
-            "application/vnd.oci.image.manifest.v1+json" => Self::OciManifest,
-            "application/vnd.oci.image.index.v1+json" => Self::OciIndex,
-            "application/vnd.oci.image.config.v1+json" => Self::OciConfig,
-            "application/vnd.oci.image.layer.v1.tar+gzip" => Self::OciLayerGzip,
-            "application/vnd.oci.image.layer.v1.tar+zstd" => Self::OciLayerZstd,
-            "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip" => {
-                Self::OciLayerNondistributableGzip
-            }
-            "application/vnd.docker.distribution.manifest.v2+json" => Self::DockerManifestV2,
-            "application/vnd.docker.distribution.manifest.list.v2+json" => Self::DockerManifestList,
-            "application/vnd.docker.container.image.v1+json" => Self::DockerConfig,
-            "application/vnd.docker.image.rootfs.diff.tar.gzip" => Self::DockerLayerGzip,
-            other => Self::Other(other.to_owned()),
-        }
+        known_media_type(s).unwrap_or_else(|| Self::Other(s.to_owned()))
     }
 }
 
 impl From<String> for MediaType {
     fn from(s: String) -> Self {
-        match s.as_str() {
-            "application/vnd.oci.image.manifest.v1+json" => Self::OciManifest,
-            "application/vnd.oci.image.index.v1+json" => Self::OciIndex,
-            "application/vnd.oci.image.config.v1+json" => Self::OciConfig,
-            "application/vnd.oci.image.layer.v1.tar+gzip" => Self::OciLayerGzip,
-            "application/vnd.oci.image.layer.v1.tar+zstd" => Self::OciLayerZstd,
-            "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip" => {
-                Self::OciLayerNondistributableGzip
-            }
-            "application/vnd.docker.distribution.manifest.v2+json" => Self::DockerManifestV2,
-            "application/vnd.docker.distribution.manifest.list.v2+json" => Self::DockerManifestList,
-            "application/vnd.docker.container.image.v1+json" => Self::DockerConfig,
-            "application/vnd.docker.image.rootfs.diff.tar.gzip" => Self::DockerLayerGzip,
-            _ => Self::Other(s),
-        }
+        known_media_type(&s).unwrap_or(Self::Other(s))
     }
 }
 

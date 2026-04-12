@@ -25,9 +25,15 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
         .map_err(|e| ConfigError::Parse(format!("failed to parse {}: {e}", path.display())))?;
 
     // Structural validation.
+    let has_default_tags = config.defaults.as_ref().is_some_and(|d| d.tags.is_some());
     for mapping in &config.mappings {
-        validate_mapping(mapping)?;
+        validate_mapping(mapping, has_default_tags)?;
         if let Some(ref tags) = mapping.tags {
+            validate_tags(tags)?;
+        }
+    }
+    if let Some(ref defaults) = config.defaults {
+        if let Some(ref tags) = defaults.tags {
             validate_tags(tags)?;
         }
     }
@@ -331,12 +337,17 @@ pub(crate) fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-// TODO(defaults): When defaults merging is implemented, allow mappings to omit
-// `tags` and inherit from `defaults.tags`. This validation must become context-aware.
-pub(crate) fn validate_mapping(mapping: &MappingConfig) -> Result<(), ConfigError> {
-    if mapping.tags.is_none() {
+/// Validate a mapping's tags block, falling back to defaults when present.
+///
+/// A mapping must have its own `tags` block OR inherit from `defaults.tags`.
+/// If neither is present, this returns a validation error.
+pub(crate) fn validate_mapping(
+    mapping: &MappingConfig,
+    has_default_tags: bool,
+) -> Result<(), ConfigError> {
+    if mapping.tags.is_none() && !has_default_tags {
         return Err(ConfigError::Validation(format!(
-            "mapping '{}' is missing a tags block",
+            "mapping '{}' is missing a tags block (and no defaults.tags is set)",
             mapping.from,
         )));
     }
@@ -345,7 +356,7 @@ pub(crate) fn validate_mapping(mapping: &MappingConfig) -> Result<(), ConfigErro
 
 /// Resolve a `TargetsValue` into a list of registry names, producing clear
 /// errors that distinguish unknown groups from unknown registries.
-fn resolve_target_names(
+pub(crate) fn resolve_target_names(
     targets: &TargetsValue,
     config: &Config,
     known: &std::collections::HashSet<&str>,
@@ -706,7 +717,7 @@ mappings:
     }
 
     #[test]
-    fn missing_tags_block() {
+    fn missing_tags_block_no_defaults() {
         let mapping = MappingConfig {
             from: "nginx".to_string(),
             to: None,
@@ -714,8 +725,20 @@ mappings:
             targets: None,
             tags: None,
         };
-        let err = validate_mapping(&mapping).unwrap_err();
+        let err = validate_mapping(&mapping, false).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn missing_tags_block_with_defaults() {
+        let mapping = MappingConfig {
+            from: "nginx".to_string(),
+            to: None,
+            source: None,
+            targets: None,
+            tags: None,
+        };
+        validate_mapping(&mapping, true).unwrap();
     }
 
     #[test]

@@ -32,20 +32,8 @@ pub(crate) struct BlobInfo {
     pub repos: BTreeSet<String>,
 }
 
-/// Result of attempting to claim a blob for transfer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaimResult {
-    /// Successfully claimed — caller should proceed with transfer.
-    Claimed,
-    /// Claim denied — the blob is already in the given state.
-    Occupied(BlobStatus),
-}
-
 /// Per-registry index of tracked blobs.
 type BlobIndex = HashMap<Digest, BlobInfo>;
-
-// TODO: Replace outer `String` key with a `RegistryHost` newtype when the sync
-// engine is built — prevents confusing hostnames with repository names or refs.
 
 /// Process-global deduplication map keyed by target registry, then by digest.
 ///
@@ -82,22 +70,6 @@ impl BlobDedupMap {
         self.inner.get(target)?.get(digest).map(|info| &info.status)
     }
 
-    /// Atomically check blob status and claim it for transfer if unclaimed.
-    ///
-    /// Returns [`ClaimResult::Claimed`] and sets status to [`BlobStatus::InProgress`]
-    /// only if the blob was previously [`BlobStatus::Unknown`]. All other states
-    /// return a descriptive result without modifying the map.
-    pub fn try_claim(&mut self, target: &str, digest: &Digest) -> ClaimResult {
-        let entry = self.entry_mut(target, digest);
-        match &entry.status {
-            BlobStatus::Unknown => {
-                entry.status = BlobStatus::InProgress;
-                ClaimResult::Claimed
-            }
-            other => ClaimResult::Occupied(other.clone()),
-        }
-    }
-
     /// Mark a blob as existing at the target in the given repo.
     pub fn set_exists(&mut self, target: &str, digest: &Digest, repo: &str) {
         let entry = self.entry_mut(target, digest);
@@ -115,9 +87,13 @@ impl BlobDedupMap {
     }
 
     /// Mark a blob as in-progress at the target.
+    ///
+    /// `Completed → InProgress` is expected when re-processing a blob for a
+    /// different repo at the same target (cross-repo mount fallback). Only
+    /// `Failed → InProgress` is warned since it may indicate a logic error.
     pub fn set_in_progress(&mut self, target: &str, digest: &Digest) {
         let entry = self.entry_mut(target, digest);
-        if matches!(entry.status, BlobStatus::Completed | BlobStatus::Failed(_)) {
+        if matches!(entry.status, BlobStatus::Failed(_)) {
             warn!(
                 target,
                 %digest,
@@ -190,23 +166,6 @@ impl Default for BlobDedupMap {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Transfer dependency ordering — variants are declared in transfer order.
-///
-/// `Ord` uses declaration order: blobs first (manifests reference them),
-/// then platform manifests, then multi-platform indexes, then referrers
-/// (which point back at the artifact they annotate).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TransferKind {
-    /// Layer / config blob.
-    Blob,
-    /// Platform-specific manifest.
-    PlatformManifest,
-    /// Multi-platform index / manifest list.
-    Index,
-    /// OCI referrer (signatures, SBOMs, attestations).
-    Referrer,
 }
 
 #[cfg(test)]
@@ -298,13 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn transfer_kind_ordering() {
-        assert!(TransferKind::Blob < TransferKind::PlatformManifest);
-        assert!(TransferKind::PlatformManifest < TransferKind::Index);
-        assert!(TransferKind::Index < TransferKind::Referrer);
-    }
-
-    #[test]
     fn status_transitions() {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
@@ -325,65 +277,6 @@ mod tests {
         assert_eq!(
             map.status("reg.io", &d),
             Some(&BlobStatus::Failed("connection refused".into()))
-        );
-    }
-
-    // -- try_claim tests --
-
-    #[test]
-    fn try_claim_unknown_becomes_in_progress() {
-        let mut map = BlobDedupMap::new();
-        let d = test_digest();
-
-        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::Claimed);
-        assert_eq!(map.status("reg.io", &d), Some(&BlobStatus::InProgress));
-    }
-
-    #[test]
-    fn try_claim_in_progress() {
-        let mut map = BlobDedupMap::new();
-        let d = test_digest();
-
-        map.set_in_progress("reg.io", &d);
-        assert_eq!(
-            map.try_claim("reg.io", &d),
-            ClaimResult::Occupied(BlobStatus::InProgress)
-        );
-    }
-
-    #[test]
-    fn try_claim_completed() {
-        let mut map = BlobDedupMap::new();
-        let d = test_digest();
-
-        map.set_completed("reg.io", &d, "library/alpine");
-        assert_eq!(
-            map.try_claim("reg.io", &d),
-            ClaimResult::Occupied(BlobStatus::Completed)
-        );
-    }
-
-    #[test]
-    fn try_claim_exists_at_target() {
-        let mut map = BlobDedupMap::new();
-        let d = test_digest();
-
-        map.set_exists("reg.io", &d, "library/alpine");
-        assert_eq!(
-            map.try_claim("reg.io", &d),
-            ClaimResult::Occupied(BlobStatus::ExistsAtTarget)
-        );
-    }
-
-    #[test]
-    fn try_claim_failed() {
-        let mut map = BlobDedupMap::new();
-        let d = test_digest();
-
-        map.set_failed("reg.io", &d, "connection refused".into());
-        assert_eq!(
-            map.try_claim("reg.io", &d),
-            ClaimResult::Occupied(BlobStatus::Failed("connection refused".into()))
         );
     }
 }

@@ -4,12 +4,14 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Cooperative shutdown signal using an atomic flag.
+/// Cooperative shutdown signal using an atomic flag and async notification.
 ///
-/// Components check `is_triggered()` at safe points to exit gracefully.
+/// Components can poll `is_triggered()` at safe points, or `await`
+/// [`notified()`](Self::notified) for instant notification without polling.
 #[derive(Clone)]
 pub(crate) struct ShutdownSignal {
     triggered: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl ShutdownSignal {
@@ -17,17 +19,31 @@ impl ShutdownSignal {
     pub(crate) fn new() -> Self {
         Self {
             triggered: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Set the shutdown flag. All clones will observe the change.
+    /// Set the shutdown flag and wake all waiters. All clones will observe the change.
     pub(crate) fn trigger(&self) {
         self.triggered.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     /// Check whether shutdown has been requested.
     pub(crate) fn is_triggered(&self) -> bool {
         self.triggered.load(Ordering::Acquire)
+    }
+
+    /// Wait until shutdown is triggered. Returns immediately if already triggered.
+    ///
+    /// Registers the `Notify` listener before checking the flag to avoid a
+    /// TOCTOU race where `trigger()` fires between the check and the await.
+    pub(crate) async fn notified(&self) {
+        let future = self.notify.notified();
+        if self.is_triggered() {
+            return;
+        }
+        future.await;
     }
 }
 
@@ -134,5 +150,35 @@ mod tests {
         signal.trigger();
         let debug = format!("{signal:?}");
         assert!(debug.contains("triggered: true"));
+    }
+
+    #[tokio::test]
+    async fn notified_returns_immediately_when_already_triggered() {
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        // Should return immediately, not hang.
+        signal.notified().await;
+        assert!(signal.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn notified_wakes_on_trigger() {
+        let signal = ShutdownSignal::new();
+        let signal_clone = signal.clone();
+
+        let handle = tokio::spawn(async move {
+            signal_clone.notified().await;
+            true
+        });
+
+        // Small delay to let the spawned task start waiting.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        signal.trigger();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("timed out waiting for notified()")
+            .expect("task panicked");
+        assert!(result);
     }
 }

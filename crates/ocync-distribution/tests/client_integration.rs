@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use http::StatusCode;
 use ocync_distribution::Error;
 use ocync_distribution::auth::{AuthProvider, Scope, Token};
 use ocync_distribution::client::RegistryClientBuilder;
@@ -153,7 +154,8 @@ async fn get_double_401_returns_unauthorized() {
         .unwrap();
 
     let result = client.get("repo", "manifests/latest", None).await;
-    assert!(matches!(result, Err(Error::Unauthorized { .. })));
+    let err = result.unwrap_err();
+    assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -195,7 +197,8 @@ async fn get_403_returns_forbidden() {
         .unwrap();
 
     let result = client.get("private/repo", "manifests/latest", None).await;
-    assert!(matches!(result, Err(Error::Forbidden { .. })));
+    let err = result.unwrap_err();
+    assert_eq!(err.status_code(), Some(StatusCode::FORBIDDEN));
 }
 
 #[tokio::test]
@@ -215,7 +218,7 @@ async fn get_404_returns_not_found() {
         .unwrap();
 
     let result = client.get("repo", "manifests/nonexistent", None).await;
-    assert!(matches!(result, Err(Error::NotFound(_))));
+    assert!(result.unwrap_err().is_not_found());
 }
 
 #[tokio::test]
@@ -235,10 +238,8 @@ async fn get_500_returns_registry_error() {
         .unwrap();
 
     let result = client.get("repo", "manifests/latest", None).await;
-    assert!(matches!(
-        result,
-        Err(Error::RegistryError { status, .. }) if status == http::StatusCode::INTERNAL_SERVER_ERROR
-    ));
+    let err = result.unwrap_err();
+    assert_eq!(err.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
 }
 
 #[tokio::test]
@@ -355,5 +356,6 @@ async fn head_double_401_returns_unauthorized() {
         .unwrap();
 
     let result = client.head("repo", "manifests/latest").await;
-    assert!(matches!(result, Err(Error::Unauthorized { .. })));
+    let err = result.unwrap_err();
+    assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED));
 }
