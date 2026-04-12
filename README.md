@@ -4,11 +4,11 @@ OCI registry sync tool — copies container images between registries.
 
 ## Features
 
-- **Library-first** — `ocync-distribution` is a standalone OCI Distribution client; `ocync-sync` will provide sync orchestration
+- **Library-first** — `ocync-distribution` is a standalone OCI Distribution client; `ocync-sync` provides sync orchestration
 - **Pure OCI Distribution API** — no skopeo, no Docker daemon, direct HTTPS
 - **Additive sync only** — never deletes; registries handle lifecycle
 - **ECR-first** with broad registry support (GCR, ACR, GHCR, Docker Hub, Chainguard)
-- **FIPS 140-3** by default via aws-lc-rs (NIST Certificate #4816)
+- **FIPS 140-3 ready** via aws-lc-rs (NIST Certificate #4816)
 - **Two-phase sync** — resolve all manifests, deduplicate blobs globally, then transfer
 - **Cross-repo blob mounting** — zero data transfer for shared layers
 - **Tag filtering** — glob, semver ranges, exclude patterns, sort + latest-N
