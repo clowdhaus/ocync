@@ -102,6 +102,9 @@ pub(crate) struct CopyArgs {
 pub(crate) struct TagsArgs {
     /// Repository to list tags from (e.g. `docker.io/library/nginx`).
     pub(crate) repository: Reference,
+    /// Config file path for registry auth (optional).
+    #[arg(short, long)]
+    pub(crate) config: Option<PathBuf>,
     /// Filter tags by glob pattern (repeatable).
     #[arg(long)]
     pub(crate) glob: Vec<String>,
@@ -180,6 +183,12 @@ pub(crate) struct WatchArgs {
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     cli::setup_logging(&cli);
+
+    // Install signal handlers for graceful shutdown logging. The signal is not
+    // yet propagated to commands — sync/watch will need a clone passed down
+    // once they are implemented.
+    let shutdown = cli::shutdown::ShutdownSignal::new();
+    cli::shutdown::install_signal_handlers(shutdown);
 
     let result = match cli.command {
         Commands::Sync(args) => cli::commands::synchronize::run(&args).await,

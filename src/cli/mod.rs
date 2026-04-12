@@ -2,9 +2,7 @@
 
 pub(crate) mod commands;
 pub(crate) mod config;
-#[allow(dead_code)]
 pub(crate) mod output;
-#[allow(dead_code)]
 pub(crate) mod shutdown;
 
 use ocync_distribution::RegistryClient;
@@ -75,6 +73,15 @@ pub(crate) enum CliError {
 // Shared auth provider builder
 // ---------------------------------------------------------------------------
 
+/// Strip scheme and trailing slashes from a registry URL to get a bare hostname.
+///
+/// Used to normalize URLs for comparison across config values and parsed references.
+pub(crate) fn bare_hostname(s: &str) -> &str {
+    s.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+}
+
 /// Build a [`RegistryClient`] for the given hostname, using the appropriate
 /// auth provider based on explicit `auth_type` or hostname auto-detection.
 pub(crate) async fn build_registry_client(
@@ -90,14 +97,19 @@ pub(crate) async fn build_registry_client(
     let url = Url::parse(&base_url)
         .map_err(|e| CliError::Input(format!("invalid registry URL '{base_url}': {e}")))?;
 
-    let bare_host = hostname
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
+    let bare_host = bare_hostname(hostname);
 
     let provider_kind = match auth_type {
         Some(AuthType::Ecr) => Some(ProviderKind::Ecr),
-        Some(AuthType::Anonymous | AuthType::DockerConfig) => None,
-        Some(_) => None, // GCR/ACR/GHCR not yet implemented
+        Some(AuthType::Anonymous) => None,
+        Some(unsupported) => {
+            tracing::warn!(
+                auth_type = ?unsupported,
+                registry = bare_host,
+                "auth type not yet implemented, falling back to anonymous auth"
+            );
+            None
+        }
         None => detect_provider_kind(bare_host),
     };
 
@@ -229,5 +241,39 @@ mod tests {
         assert_ne!(ExitCode::Success, ExitCode::Failure);
         assert_ne!(ExitCode::Failure, ExitCode::Error);
         assert_ne!(ExitCode::Success, ExitCode::Error);
+    }
+
+    #[test]
+    fn bare_hostname_strips_https() {
+        assert_eq!(
+            bare_hostname("https://registry.example.com"),
+            "registry.example.com"
+        );
+    }
+
+    #[test]
+    fn bare_hostname_strips_http() {
+        assert_eq!(bare_hostname("http://localhost:5000"), "localhost:5000");
+    }
+
+    #[test]
+    fn bare_hostname_strips_trailing_slash() {
+        assert_eq!(
+            bare_hostname("https://registry.example.com/"),
+            "registry.example.com"
+        );
+    }
+
+    #[test]
+    fn bare_hostname_noop_for_bare_host() {
+        assert_eq!(
+            bare_hostname("registry.example.com"),
+            "registry.example.com"
+        );
+    }
+
+    #[test]
+    fn bare_hostname_preserves_port() {
+        assert_eq!(bare_hostname("localhost:5000"), "localhost:5000");
     }
 }

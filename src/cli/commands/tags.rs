@@ -3,13 +3,26 @@
 use ocync_sync::filter::FilterConfig;
 
 use crate::TagsArgs;
-use crate::cli::{CliError, ExitCode, build_registry_client};
+use crate::cli::config::load_config;
+use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
 pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     let registry = args.repository.registry();
     let repository = args.repository.repository();
 
-    let client = build_registry_client(registry, None).await?;
+    // Resolve auth_type from config if provided, otherwise use anonymous.
+    let auth_type = if let Some(ref config_path) = args.config {
+        let config = load_config(config_path)?;
+        config
+            .registries
+            .values()
+            .find(|r| bare_hostname(&r.url) == registry)
+            .and_then(|r| r.auth_type.clone())
+    } else {
+        None
+    };
+
+    let client = build_registry_client(registry, auth_type.as_ref()).await?;
 
     let all_tags = client.list_tags(repository).await?;
 

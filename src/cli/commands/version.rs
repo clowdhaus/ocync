@@ -14,3 +14,13 @@ pub(crate) fn run() -> ExitCode {
 
     ExitCode::Success
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_returns_success() {
+        assert_eq!(run(), ExitCode::Success);
+    }
+}
