@@ -592,7 +592,7 @@ async fn sync_empty_mappings() {
 }
 
 #[tokio::test]
-async fn sync_blob_push_failure() {
+async fn sync_blob_transfer_failure() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 

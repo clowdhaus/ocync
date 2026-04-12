@@ -132,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn display_blob_push_error() {
+    fn display_blob_transfer_error() {
         let err = Error::BlobTransfer {
             digest: "sha256:def".into(),
             source: ocync_distribution::Error::Other("timeout".into()),
