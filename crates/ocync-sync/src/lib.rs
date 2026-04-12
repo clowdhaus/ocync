@@ -114,10 +114,10 @@ pub struct SyncStats {
     pub layers_unique_refs: u64,
     /// Layers satisfied via cross-repo mount.
     pub layers_mounted: u64,
-    /// Total bytes transferred.
+    /// Total bytes transferred over the network.
     pub bytes_transferred: u64,
-    /// Total logical size of all images.
-    pub total_image_size: u64,
+    /// Total logical size of all images (before dedup/skip).
+    pub bytes_total: u64,
 }
 
 #[cfg(test)]
@@ -205,6 +205,6 @@ mod tests {
         assert_eq!(stats.layers_unique_refs, 0);
         assert_eq!(stats.layers_mounted, 0);
         assert_eq!(stats.bytes_transferred, 0);
-        assert_eq!(stats.total_image_size, 0);
+        assert_eq!(stats.bytes_total, 0);
     }
 }

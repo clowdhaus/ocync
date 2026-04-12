@@ -33,21 +33,24 @@ pub struct BlobInfo {
 
 /// Result of attempting to claim a blob for transfer.
 ///
-/// Used by the sync engine to atomically check-then-set blob status,
-/// avoiding TOCTOU races when multiple tasks check the same blob.
+/// Non-[`Claimed`](ClaimResult::Claimed) variants mirror [`BlobStatus`] — they
+/// report the state that prevented the claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimResult {
     /// Successfully claimed — caller should proceed with transfer.
     Claimed,
     /// Another task is already transferring this blob.
-    AlreadyInProgress,
+    InProgress,
     /// Blob was already transferred successfully.
-    AlreadyCompleted,
+    Completed,
     /// Blob already exists at the target.
-    AlreadyExists,
+    ExistsAtTarget,
     /// A previous transfer attempt failed.
-    PreviouslyFailed(String),
+    Failed(String),
 }
+
+/// Per-registry index of tracked blobs.
+type BlobIndex = HashMap<Digest, BlobInfo>;
 
 /// Process-global deduplication map keyed by target registry, then by digest.
 ///
@@ -56,7 +59,7 @@ pub enum ClaimResult {
 /// allocations on read-path lookups.
 #[derive(Debug)]
 pub struct BlobDedupMap {
-    inner: HashMap<String, HashMap<Digest, BlobInfo>>,
+    inner: HashMap<String, BlobIndex>,
 }
 
 impl BlobDedupMap {
@@ -92,10 +95,10 @@ impl BlobDedupMap {
                 entry.status = BlobStatus::InProgress;
                 ClaimResult::Claimed
             }
-            BlobStatus::InProgress => ClaimResult::AlreadyInProgress,
-            BlobStatus::Completed => ClaimResult::AlreadyCompleted,
-            BlobStatus::ExistsAtTarget => ClaimResult::AlreadyExists,
-            BlobStatus::Failed(err) => ClaimResult::PreviouslyFailed(err.clone()),
+            BlobStatus::InProgress => ClaimResult::InProgress,
+            BlobStatus::Completed => ClaimResult::Completed,
+            BlobStatus::ExistsAtTarget => ClaimResult::ExistsAtTarget,
+            BlobStatus::Failed(err) => ClaimResult::Failed(err.clone()),
         }
     }
 
@@ -330,41 +333,41 @@ mod tests {
     }
 
     #[test]
-    fn try_claim_already_in_progress() {
+    fn try_claim_in_progress() {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
         map.set_in_progress("reg.io", &d);
-        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::AlreadyInProgress);
+        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::InProgress);
     }
 
     #[test]
-    fn try_claim_already_completed() {
+    fn try_claim_completed() {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
         map.set_completed("reg.io", &d, "library/alpine");
-        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::AlreadyCompleted);
+        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::Completed);
     }
 
     #[test]
-    fn try_claim_already_exists() {
+    fn try_claim_exists_at_target() {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
         map.set_exists("reg.io", &d, "library/alpine");
-        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::AlreadyExists);
+        assert_eq!(map.try_claim("reg.io", &d), ClaimResult::ExistsAtTarget);
     }
 
     #[test]
-    fn try_claim_previously_failed() {
+    fn try_claim_failed() {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
         map.set_failed("reg.io", &d, "connection refused".into());
         assert_eq!(
             map.try_claim("reg.io", &d),
-            ClaimResult::PreviouslyFailed("connection refused".into())
+            ClaimResult::Failed("connection refused".into())
         );
     }
 }
