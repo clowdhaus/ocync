@@ -1,4 +1,5 @@
-// Config types define the YAML schema; dead_code is expected until CLI integration.
+//! Configuration file schema types and YAML deserialization.
+
 #![allow(dead_code)]
 
 use std::collections::HashMap;
