@@ -76,6 +76,11 @@ Never trust the implementer's self-report alone.
 - Regenerate `Cargo.lock` during rebase conflicts (`git checkout --theirs Cargo.lock && cargo generate-lockfile`), never manually resolve
 - Clean stale worktrees before switching to branches from past sessions
 
+## Plans and specs
+
+- **Design spec**: `docs/specs/2026-04-10-ocync-design.md` — full design document (1,752 lines)
+- **Implementation plans**: `docs/superpowers/plans/` (gitignored) — current v1 implementation plan is `2026-04-12-ocync-v1-implementation.md`
+
 ## Commands
 
 ```bash
