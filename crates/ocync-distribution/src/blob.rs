@@ -1,9 +1,9 @@
 //! Blob operations — existence checks, pull, push, mount, and upload management.
 
 use bytes::Bytes;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use http::StatusCode;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, LOCATION};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LOCATION};
 
 use crate::auth::Scope;
 use crate::client::{RegistryClient, build_url};
@@ -136,23 +136,8 @@ impl RegistryClient {
             return Err(Error::RegistryError { status, message });
         }
 
-        // Extract the upload URL from the Location header.
-        let upload_url = resp
-            .headers()
-            .get(LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| Error::Other("missing Location header in upload response".into()))?
-            .to_owned();
-
-        // Resolve relative Location URLs against the base URL.
-        let put_url = if upload_url.starts_with("http://") || upload_url.starts_with("https://") {
-            upload_url
-        } else {
-            self.base_url
-                .join(&upload_url)
-                .map_err(|e| Error::Other(format!("failed to resolve upload URL: {e}")))?
-                .to_string()
-        };
+        // Extract and resolve the upload URL from the Location header.
+        let put_url = extract_location(&resp, &self.base_url)?;
 
         // Step 2: PUT the data with digest query param.
         let digest_str = digest.to_string();
@@ -180,6 +165,194 @@ impl RegistryClient {
         Ok(digest)
     }
 
+    /// Push a blob to the given repository using a chunked streaming upload.
+    ///
+    /// 1. POST `/v2/{repository}/blobs/uploads/` to initiate the upload.
+    /// 2. Accumulate stream chunks into `chunk_size` buffers, issuing PATCH
+    ///    requests with `Content-Range` headers for each buffer.
+    /// 3. PUT to finalize with `?digest=` query param.
+    ///
+    /// If the computed digest does not match `expected_digest`, the upload is
+    /// deleted and [`Error::DigestMismatch`] is returned.
+    ///
+    /// **GAR fallback**: Google Artifact Registry does not support chunked
+    /// uploads, so hosts ending in `-docker.pkg.dev` buffer the entire stream
+    /// and delegate to [`blob_push`](Self::blob_push).
+    pub async fn blob_push_stream(
+        &self,
+        repository: &str,
+        expected_digest: &Digest,
+        _content_length: u64,
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    ) -> Result<Digest, Error> {
+        // GAR fallback: buffer entire stream and use monolithic push.
+        if self
+            .base_url
+            .host_str()
+            .is_some_and(|h| h.ends_with("-docker.pkg.dev"))
+        {
+            return self
+                .blob_push_stream_gar_fallback(repository, expected_digest, stream)
+                .await;
+        }
+
+        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
+        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
+        let scopes = [Scope::pull_push(repository)];
+
+        // Step 1: Initiate upload with POST.
+        let resp = self
+            .send_with_retry(&scopes, "blob push stream initiate", |headers| {
+                self.http.post(url.clone()).headers(headers)
+            })
+            .await?;
+
+        let status = resp.status();
+        if status != StatusCode::ACCEPTED {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(Error::RegistryError { status, message });
+        }
+
+        let upload_url = extract_location(&resp, &self.base_url)?;
+
+        // Step 2: Stream chunks, issuing PATCH for each chunk_size buffer.
+        let mut hasher = Sha256::new();
+        let mut buffer = Vec::with_capacity(self.chunk_size);
+        let mut current_url = upload_url;
+        let mut offset: u64 = 0;
+
+        futures_util::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+            buffer.extend_from_slice(&chunk);
+
+            if buffer.len() >= self.chunk_size {
+                let range_start = offset;
+                let range_end = offset + buffer.len() as u64 - 1;
+                offset += buffer.len() as u64;
+
+                let patch_data =
+                    std::mem::replace(&mut buffer, Vec::with_capacity(self.chunk_size));
+                current_url = self
+                    .send_patch_chunk(&scopes, &current_url, range_start, range_end, patch_data)
+                    .await?;
+            }
+        }
+
+        // Flush any remaining data in the buffer.
+        if !buffer.is_empty() {
+            let range_start = offset;
+            let range_end = offset + buffer.len() as u64 - 1;
+            current_url = self
+                .send_patch_chunk(&scopes, &current_url, range_start, range_end, buffer)
+                .await?;
+        }
+
+        // Verify digest before finalizing.
+        let hash = hasher.finalize();
+        let actual_digest = Digest::from_sha256(hash);
+        if actual_digest != *expected_digest {
+            // DELETE the upload to clean up.
+            let _ = self
+                .send_with_retry(&scopes, "blob push stream delete", |headers| {
+                    self.http.delete(&current_url).headers(headers)
+                })
+                .await;
+            return Err(Error::DigestMismatch {
+                expected: expected_digest.to_string(),
+                actual: actual_digest.to_string(),
+            });
+        }
+
+        // Step 3: PUT to finalize.
+        let digest_str = actual_digest.to_string();
+        let resp = self
+            .send_with_retry(&scopes, "blob push stream finalize", |headers| {
+                self.http
+                    .put(&current_url)
+                    .headers(headers)
+                    .query(&[("digest", &digest_str)])
+                    .header(CONTENT_LENGTH, "0")
+                    .header(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    )
+            })
+            .await?;
+
+        let status = resp.status();
+        if status != StatusCode::CREATED {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(Error::RegistryError { status, message });
+        }
+
+        Ok(actual_digest)
+    }
+
+    /// Send a PATCH chunk for a chunked upload and return the next upload URL.
+    async fn send_patch_chunk(
+        &self,
+        scopes: &[Scope],
+        upload_url: &str,
+        range_start: u64,
+        range_end: u64,
+        data: Vec<u8>,
+    ) -> Result<String, Error> {
+        let content_range = HeaderValue::from_str(&format!("{range_start}-{range_end}"))
+            .map_err(|e| Error::Other(format!("failed to build Content-Range header: {e}")))?;
+        let data_len = data.len();
+        let url = upload_url.to_owned();
+
+        let resp = self
+            .send_with_retry(scopes, "blob push stream patch", |headers| {
+                self.http
+                    .patch(&url)
+                    .headers(headers)
+                    .header(CONTENT_RANGE, content_range.clone())
+                    .header(CONTENT_LENGTH, data_len.to_string())
+                    .header(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    )
+                    .body(data.clone())
+            })
+            .await?;
+
+        let status = resp.status();
+        if status != StatusCode::ACCEPTED {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(Error::RegistryError { status, message });
+        }
+
+        extract_location(&resp, &self.base_url)
+    }
+
+    /// GAR fallback: buffer the entire stream and delegate to monolithic push.
+    async fn blob_push_stream_gar_fallback(
+        &self,
+        repository: &str,
+        expected_digest: &Digest,
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    ) -> Result<Digest, Error> {
+        let mut body = Vec::new();
+        futures_util::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            body.extend_from_slice(&chunk);
+        }
+
+        let digest = self.blob_push(repository, &body).await?;
+        if digest != *expected_digest {
+            return Err(Error::DigestMismatch {
+                expected: expected_digest.to_string(),
+                actual: digest.to_string(),
+            });
+        }
+
+        Ok(digest)
+    }
+
     /// Delete an in-progress blob upload.
     ///
     /// Issues a DELETE to the given upload URL.
@@ -199,6 +372,24 @@ impl RegistryClient {
         }
 
         Ok(())
+    }
+}
+
+/// Extract and resolve the Location header from an upload response.
+fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<String, Error> {
+    let raw = resp
+        .headers()
+        .get(LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Error::Other("missing Location header in upload response".into()))?;
+
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        Ok(raw.to_owned())
+    } else {
+        base_url
+            .join(raw)
+            .map(|u| u.to_string())
+            .map_err(|e| Error::Other(format!("failed to resolve upload URL: {e}")))
     }
 }
 
@@ -238,5 +429,129 @@ mod tests {
             blob_path(&digest),
             "blobs/sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn extract_location_absolute() {
+        let resp = http::Response::builder()
+            .header("Location", "https://registry.example.com/upload/uuid-1")
+            .body("")
+            .unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        let base = url::Url::parse("https://registry.example.com").unwrap();
+        let result = extract_location(&reqwest_resp, &base).unwrap();
+        assert_eq!(result, "https://registry.example.com/upload/uuid-1");
+    }
+
+    #[test]
+    fn extract_location_relative() {
+        let resp = http::Response::builder()
+            .header("Location", "/v2/repo/blobs/uploads/uuid-1")
+            .body("")
+            .unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        let base = url::Url::parse("https://registry.example.com").unwrap();
+        let result = extract_location(&reqwest_resp, &base).unwrap();
+        assert_eq!(
+            result,
+            "https://registry.example.com/v2/repo/blobs/uploads/uuid-1"
+        );
+    }
+
+    #[test]
+    fn extract_location_missing() {
+        let resp = http::Response::builder().body("").unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        let base = url::Url::parse("https://registry.example.com").unwrap();
+        let result = extract_location(&reqwest_resp, &base);
+        assert!(result.is_err());
+    }
+
+    /// Build a `RegistryClient` with a GAR hostname resolving to a local port.
+    fn build_gar_client(port: u16) -> RegistryClient {
+        let base_url = url::Url::parse(&format!("http://us-docker.pkg.dev:{port}")).unwrap();
+        let http = reqwest::Client::builder()
+            .resolve(
+                "us-docker.pkg.dev",
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            )
+            .build()
+            .unwrap();
+
+        RegistryClient {
+            base_url,
+            http,
+            auth: None,
+            semaphore: tokio::sync::Semaphore::new(8),
+            chunk_size: 4,
+        }
+    }
+
+    fn test_digest(data: &[u8]) -> Digest {
+        Digest::from_sha256(Sha256::digest(data))
+    }
+
+    fn data_stream(
+        data: &[u8],
+        chunk_size: usize,
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static {
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = data
+            .chunks(chunk_size)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        futures_util::stream::iter(chunks)
+    }
+
+    #[tokio::test]
+    async fn blob_push_stream_gar_uses_monolithic_upload() {
+        let server = wiremock::MockServer::start().await;
+        let data = b"gar blob content";
+        let digest = test_digest(data);
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        // POST: initiate monolithic upload.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v2/my-project/my-repo/blobs/uploads/",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/my-project/my-repo/blobs/uploads/gar-uuid"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PUT: monolithic upload with full body.
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::query_param(
+                "digest",
+                digest.to_string(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PATCH: must NOT be called for GAR.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = build_gar_client(port);
+
+        let result = client
+            .blob_push_stream(
+                "my-project/my-repo",
+                &digest,
+                data.len() as u64,
+                data_stream(data, 4),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, digest);
     }
 }
