@@ -1,5 +1,6 @@
 //! Error types for sync operations.
 
+use ocync_distribution::Digest;
 use thiserror::Error;
 
 /// Errors returned by sync operations.
@@ -49,7 +50,7 @@ pub enum Error {
     #[error("blob transfer failed for {digest}: {source}")]
     BlobTransfer {
         /// The digest of the blob that could not be transferred.
-        digest: String,
+        digest: Digest,
         /// The underlying distribution error.
         source: ocync_distribution::Error,
     },
@@ -133,13 +134,17 @@ mod tests {
 
     #[test]
     fn display_blob_transfer_error() {
+        let digest: Digest =
+            "sha256:def0000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap();
         let err = Error::BlobTransfer {
-            digest: "sha256:def".into(),
+            digest: digest.clone(),
             source: ocync_distribution::Error::Other("timeout".into()),
         };
         let msg = err.to_string();
         assert!(msg.contains("blob transfer"));
-        assert!(msg.contains("sha256:def"));
+        assert!(msg.contains(&digest.to_string()));
     }
 
     #[test]

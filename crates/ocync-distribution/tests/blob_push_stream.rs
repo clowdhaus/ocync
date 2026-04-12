@@ -6,7 +6,7 @@ use http::StatusCode;
 use ocync_distribution::Digest;
 use ocync_distribution::client::RegistryClientBuilder;
 use url::Url;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 /// Compute the SHA-256 digest for test data.
@@ -78,6 +78,8 @@ async fn happy_path() {
     Mock::given(method("PATCH"))
         .and(path(upload_path))
         .and(ContentRangeMatcher::new("0-11"))
+        .and(header("content-type", "application/octet-stream"))
+        .and(header("content-length", "12"))
         .respond_with(
             ResponseTemplate::new(StatusCode::ACCEPTED)
                 .append_header("Location", patch_next.as_str()),
@@ -86,9 +88,11 @@ async fn happy_path() {
         .mount(&server)
         .await;
 
-    // PUT: finalize with digest query param.
+    // PUT: finalize with digest query param, Content-Length: 0.
     Mock::given(method("PUT"))
         .and(query_param("digest", digest.to_string()))
+        .and(header("content-type", "application/octet-stream"))
+        .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(StatusCode::CREATED))
         .expect(1)
         .mount(&server)
@@ -100,7 +104,7 @@ async fn happy_path() {
         .unwrap();
 
     let result = client
-        .blob_push_stream("myrepo", &digest, data.len() as u64, data_stream(data, 4))
+        .blob_push_stream("myrepo", &digest, data_stream(data, 4))
         .await
         .unwrap();
 
@@ -176,11 +180,309 @@ async fn multi_chunk() {
         .unwrap();
 
     let result = client
-        .blob_push_stream("repo", &digest, data.len() as u64, data_stream(data, 2))
+        .blob_push_stream("repo", &digest, data_stream(data, 2))
         .await
         .unwrap();
 
     assert_eq!(result, digest);
+}
+
+// ─── Exact chunk boundary: data_len == chunk_size, no remainder flush ────────
+
+#[tokio::test]
+async fn exact_chunk_boundary() {
+    let server = MockServer::start().await;
+    let data = b"abcd"; // 4 bytes == chunk_size
+    let digest = test_digest(data);
+    let upload_path = "/v2/repo/blobs/uploads/uuid-1";
+
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(StatusCode::ACCEPTED).append_header("Location", upload_path),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Single PATCH: bytes 0-3, no remainder flush.
+    Mock::given(method("PATCH"))
+        .and(ContentRangeMatcher::new("0-3"))
+        .respond_with(
+            ResponseTemplate::new(StatusCode::ACCEPTED)
+                .append_header("Location", "/v2/repo/blobs/uploads/uuid-2"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(query_param("digest", digest.to_string()))
+        .respond_with(ResponseTemplate::new(StatusCode::CREATED))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .chunk_size(4)
+        .build()
+        .unwrap();
+
+    let result = client
+        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .await
+        .unwrap();
+
+    assert_eq!(result, digest);
+}
+
+// ─── Empty stream: zero-byte blob, POST + PUT only, no PATCH ────────────────
+
+#[tokio::test]
+async fn empty_stream() {
+    let server = MockServer::start().await;
+    let data = b"";
+    let digest = test_digest(data);
+
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(StatusCode::ACCEPTED)
+                .append_header("Location", "/v2/repo/blobs/uploads/uuid-1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // PATCH must NOT be called for empty data.
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(query_param("digest", digest.to_string()))
+        .respond_with(ResponseTemplate::new(StatusCode::CREATED))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .chunk_size(64)
+        .build()
+        .unwrap();
+
+    let result = client
+        .blob_push_stream("repo", &digest, data_stream(data, 1))
+        .await
+        .unwrap();
+
+    assert_eq!(result, digest);
+}
+
+// ─── Error: POST initiation returns 403 ─────────────────────────────────────
+
+#[tokio::test]
+async fn post_initiation_rejected() {
+    let server = MockServer::start().await;
+    let data = b"some data";
+    let digest = test_digest(data);
+
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .chunk_size(64)
+        .build()
+        .unwrap();
+
+    let err = client
+        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("403") || msg.contains("forbidden"),
+        "expected 403 error: {msg}"
+    );
+}
+
+// ─── Error: PATCH chunk fails mid-upload ────────────────────────────────────
+
+#[tokio::test]
+async fn patch_chunk_failure() {
+    let server = MockServer::start().await;
+    let data = b"abcdefgh"; // 8 bytes, chunk_size=4 → 2 PATCHes
+    let digest = test_digest(data);
+    let upload_path = "/v2/repo/blobs/uploads/uuid-1";
+
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(StatusCode::ACCEPTED).append_header("Location", upload_path),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // First PATCH succeeds.
+    Mock::given(method("PATCH"))
+        .and(ContentRangeMatcher::new("0-3"))
+        .respond_with(
+            ResponseTemplate::new(StatusCode::ACCEPTED)
+                .append_header("Location", "/v2/repo/blobs/uploads/uuid-2"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Second PATCH returns 500.
+    Mock::given(method("PATCH"))
+        .and(ContentRangeMatcher::new("4-7"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .chunk_size(4)
+        .build()
+        .unwrap();
+
+    let err = client
+        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(msg.contains("500"), "expected 500 error: {msg}");
+}
+
+// ─── Error: PUT finalize rejected by registry ───────────────────────────────
+
+#[tokio::test]
+async fn put_finalize_rejected() {
+    let server = MockServer::start().await;
+    let data = b"payload";
+    let digest = test_digest(data);
+    let upload_path = "/v2/repo/blobs/uploads/uuid-1";
+
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(StatusCode::ACCEPTED).append_header("Location", upload_path),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .respond_with(
+            ResponseTemplate::new(StatusCode::ACCEPTED)
+                .append_header("Location", "/v2/repo/blobs/uploads/uuid-2"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // PUT: registry rejects the finalization (e.g., digest mismatch).
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("digest invalid"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .chunk_size(64)
+        .build()
+        .unwrap();
+
+    let err = client
+        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(msg.contains("400"), "expected 400 error: {msg}");
+}
+
+// ─── Error: source stream yields an error ───────────────────────────────────
+
+#[tokio::test]
+async fn stream_error_propagates() {
+    let server = MockServer::start().await;
+    let data = b"test";
+    let digest = test_digest(data);
+    let upload_path = "/v2/repo/blobs/uploads/uuid-1";
+
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(StatusCode::ACCEPTED).append_header("Location", upload_path),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Build a stream that yields one chunk then an error.
+    let error_stream = stream::iter(vec![
+        Ok(Bytes::from_static(b"ok")),
+        Err(reqwest::Client::new()
+            .get("http://[::0]:1") // unreachable address
+            .send()
+            .await
+            .unwrap_err()),
+    ]);
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .chunk_size(64)
+        .build()
+        .unwrap();
+
+    let result = client.blob_push_stream("repo", &digest, error_stream).await;
+
+    assert!(result.is_err(), "stream error should propagate");
+}
+
+// ─── Error: POST returns 200 instead of expected 202 ────────────────────────
+
+#[tokio::test]
+async fn post_returns_200_is_rejected() {
+    let server = MockServer::start().await;
+    let data = b"data";
+    let digest = test_digest(data);
+
+    // POST returns 200 OK instead of 202 Accepted — some registries do this.
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(200).append_header("Location", "/v2/repo/blobs/uploads/uuid-1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .chunk_size(64)
+        .build()
+        .unwrap();
+
+    let err = client
+        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .await
+        .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("200"),
+        "should reject 200 as unexpected status: {msg}"
+    );
 }
 
 /// Verify GAR hostname detection matches the expected pattern.

@@ -169,7 +169,6 @@ impl RegistryClient {
         &self,
         repository: &str,
         expected_digest: &Digest,
-        content_length: u64,
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     ) -> Result<Digest, Error> {
         // GAR fallback: buffer entire stream and use monolithic push.
@@ -186,7 +185,6 @@ impl RegistryClient {
         debug!(
             repository,
             %expected_digest,
-            content_length,
             chunk_size = self.chunk_size,
             "starting chunked blob upload"
         );
@@ -225,10 +223,10 @@ impl RegistryClient {
                 let range_end = offset + buffer.len() as u64 - 1;
                 offset += buffer.len() as u64;
 
-                let patch_data =
+                let patch_chunk =
                     std::mem::replace(&mut buffer, Vec::with_capacity(self.chunk_size));
                 current_url = self
-                    .send_patch_chunk(&scopes, &current_url, range_start, range_end, patch_data)
+                    .send_patch_chunk(&scopes, &current_url, range_start, range_end, patch_chunk)
                     .await?;
             }
         }
@@ -274,15 +272,15 @@ impl RegistryClient {
         upload_url: &str,
         range_start: u64,
         range_end: u64,
-        data: Vec<u8>,
+        chunk: Vec<u8>,
     ) -> Result<String, Error> {
         let content_range = HeaderValue::from_str(&format!("{range_start}-{range_end}"))
             .map_err(|e| Error::Other(format!("failed to build Content-Range header: {e}")))?;
-        let data_len = data.len();
+        let chunk_len = chunk.len();
         let url = upload_url.to_owned();
         // Convert to Bytes so .clone() in the retry closure is a cheap
         // reference-count increment instead of a full memcpy per chunk.
-        let data = Bytes::from(data);
+        let chunk = Bytes::from(chunk);
 
         let resp = self
             .send_with_retry(scopes, "blob push stream patch", |headers| {
@@ -290,12 +288,12 @@ impl RegistryClient {
                     .patch(&url)
                     .headers(headers)
                     .header(CONTENT_RANGE, content_range.clone())
-                    .header(CONTENT_LENGTH, data_len.to_string())
+                    .header(CONTENT_LENGTH, chunk_len.to_string())
                     .header(
                         CONTENT_TYPE,
                         HeaderValue::from_static("application/octet-stream"),
                     )
-                    .body(data.clone())
+                    .body(chunk.clone())
             })
             .await?;
 
@@ -312,10 +310,12 @@ impl RegistryClient {
     ///
     /// Google Artifact Registry does not support chunked uploads, so the
     /// entire stream is buffered in memory and sent as a monolithic upload.
+    /// The digest returned by the monolithic push is verified against the
+    /// caller's expected digest to catch data corruption.
     async fn blob_push_stream_gar_fallback(
         &self,
         repository: &str,
-        _expected_digest: &Digest,
+        expected_digest: &Digest,
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     ) -> Result<Digest, Error> {
         warn!(
@@ -330,7 +330,15 @@ impl RegistryClient {
             body.extend_from_slice(&chunk);
         }
 
-        self.blob_push(repository, &body).await
+        let actual_digest = self.blob_push(repository, &body).await?;
+
+        if &actual_digest != expected_digest {
+            return Err(Error::Other(format!(
+                "GAR fallback digest mismatch: expected {expected_digest}, got {actual_digest}"
+            )));
+        }
+
+        Ok(actual_digest)
     }
 
     /// Delete an in-progress blob upload.
@@ -447,6 +455,24 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn extract_location_preserves_query_params() {
+        let resp = http::Response::builder()
+            .header(
+                "Location",
+                "/v2/repo/blobs/uploads/uuid-1?_state=token123&foo=bar",
+            )
+            .body("")
+            .unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        let base = url::Url::parse("https://registry.example.com").unwrap();
+        let result = extract_location(&reqwest_resp, &base).unwrap();
+        assert_eq!(
+            result,
+            "https://registry.example.com/v2/repo/blobs/uploads/uuid-1?_state=token123&foo=bar"
+        );
+    }
+
     /// Build a `RegistryClient` with a GAR hostname resolving to a local port.
     fn build_gar_client(port: u16) -> RegistryClient {
         let base_url = url::Url::parse(&format!("http://us-docker.pkg.dev:{port}")).unwrap();
@@ -523,12 +549,7 @@ mod tests {
         let client = build_gar_client(port);
 
         let result = client
-            .blob_push_stream(
-                "my-project/my-repo",
-                &digest,
-                data.len() as u64,
-                data_stream(data, 4),
-            )
+            .blob_push_stream("my-project/my-repo", &digest, data_stream(data, 4))
             .await
             .unwrap();
 

@@ -116,9 +116,9 @@ struct SourceData {
     children: Vec<ManifestPull>,
 }
 
-/// Per-target result of a fan-out blob transfer phase.
+/// Per-target outcome of the blob transfer phase.
 #[derive(Default)]
-struct BlobTransferResult {
+struct TargetBlobOutcome {
     bytes_transferred: u64,
     stats: BlobTransferStats,
     /// `Some` if a target-specific push failed. Other targets are unaffected.
@@ -312,7 +312,7 @@ impl SyncEngine {
         let active_targets: Vec<&Endpoint<'_>> = active.iter().map(|&(i, _)| &targets[i]).collect();
 
         let blob_results = self
-            .transfer_blobs_fanout(source, &active_targets, &all_blobs)
+            .transfer_blobs(source, &active_targets, &all_blobs)
             .await;
 
         // Phase 3: Push manifests to targets whose blobs all succeeded.
@@ -481,21 +481,21 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Fan-out blob transfer: stream each blob from source to each target.
+    /// Transfer blobs from source to each target that needs them.
     ///
     /// For each blob, checks dedup/HEAD/mount per target. If any target
     /// needs a pull, streams from source directly to that target (one stream
     /// per target since streams are consumed). Transfer failures are per-target
-    /// (recorded in the returned results, other targets continue).
-    async fn transfer_blobs_fanout(
+    /// (recorded in the returned outcomes, other targets continue).
+    async fn transfer_blobs(
         &mut self,
         source: &Endpoint<'_>,
         targets: &[&Endpoint<'_>],
         blobs: &[&Descriptor],
-    ) -> Vec<BlobTransferResult> {
-        let mut results: Vec<BlobTransferResult> = targets
+    ) -> Vec<TargetBlobOutcome> {
+        let mut results: Vec<TargetBlobOutcome> = targets
             .iter()
-            .map(|_| BlobTransferResult::default())
+            .map(|_| TargetBlobOutcome::default())
             .collect();
 
         for blob in blobs {
@@ -573,7 +573,7 @@ impl SyncEngine {
                     let stream = source.client.blob_pull(source.repo, digest).await?;
                     target
                         .client
-                        .blob_push_stream(target.repo, digest, size, stream)
+                        .blob_push_stream(target.repo, digest, stream)
                         .await
                 })
                 .await;
@@ -586,7 +586,7 @@ impl SyncEngine {
                     }
                     Err(e) => {
                         let err = crate::Error::BlobTransfer {
-                            digest: digest.to_string(),
+                            digest: digest.clone(),
                             source: e,
                         };
                         self.dedup.set_failed(target.name, digest, err.to_string());
