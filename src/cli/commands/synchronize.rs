@@ -1,8 +1,9 @@
 //! The `sync` subcommand — runs all mappings from config.
 
 use crate::SyncArgs;
+use crate::cli::{CliError, ExitCode};
 
-pub(crate) async fn run(_args: &SyncArgs) -> i32 {
-    eprintln!("sync: not yet implemented");
-    1
+pub(crate) async fn run(_args: &SyncArgs) -> Result<ExitCode, CliError> {
+    eprintln!("sync: not yet implemented (requires sync engine)");
+    Ok(ExitCode::Failure)
 }

@@ -100,17 +100,17 @@ pub(crate) struct CopyArgs {
 /// Arguments for the `tags` subcommand.
 #[derive(Debug, clap::Args)]
 pub(crate) struct TagsArgs {
-    /// Repository to list tags from.
-    pub(crate) repository: String,
-    /// Filter tags by glob pattern.
+    /// Repository to list tags from (e.g. `docker.io/library/nginx`).
+    pub(crate) repository: Reference,
+    /// Filter tags by glob pattern (repeatable).
     #[arg(long)]
-    pub(crate) glob: Option<String>,
+    pub(crate) glob: Vec<String>,
     /// Filter tags by semver range.
     #[arg(long)]
     pub(crate) semver: Option<String>,
-    /// Exclude tags matching pattern.
+    /// Exclude tags matching pattern (repeatable).
     #[arg(long)]
-    pub(crate) exclude: Option<String>,
+    pub(crate) exclude: Vec<String>,
     /// Sort order for results.
     #[arg(long, value_enum)]
     pub(crate) sort: Option<TagSortOrder>,
@@ -177,14 +177,11 @@ pub(crate) struct WatchArgs {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     cli::setup_logging(&cli);
 
-    let shutdown = cli::shutdown::ShutdownSignal::new();
-    cli::shutdown::install_signal_handlers(shutdown.clone());
-
-    let exit_code = match cli.command {
+    let result = match cli.command {
         Commands::Sync(args) => cli::commands::synchronize::run(&args).await,
         Commands::Copy(args) => cli::commands::copy::run(&args).await,
         Commands::Tags(args) => cli::commands::tags::run(&args).await,
@@ -194,10 +191,16 @@ async fn main() {
         Commands::Validate(args) => cli::commands::validate::run(&args),
         Commands::Expand(args) => cli::commands::expand::run(&args),
         Commands::Watch(args) => cli::commands::watch::run(&args).await,
-        Commands::Version => cli::commands::version::run(),
+        Commands::Version => Ok(cli::commands::version::run()),
     };
 
-    std::process::exit(exit_code);
+    match result {
+        Ok(code) => code.into(),
+        Err(err) => {
+            eprintln!("error: {err}");
+            cli::ExitCode::Error.into()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +256,22 @@ mod tests {
     fn parse_tags() {
         let cli = Cli::parse_from(["ocync", "tags", "docker.io/nginx"]);
         assert!(matches!(cli.command, Commands::Tags(_)));
+    }
+
+    #[test]
+    fn parse_tags_multiple_globs() {
+        let cli = Cli::parse_from([
+            "ocync",
+            "tags",
+            "docker.io/nginx",
+            "--glob",
+            "v1.*",
+            "--glob",
+            "v2.*",
+        ]);
+        if let Commands::Tags(args) = cli.command {
+            assert_eq!(args.glob.len(), 2);
+        }
     }
 
     #[test]

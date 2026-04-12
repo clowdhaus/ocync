@@ -1,74 +1,34 @@
 //! The `tags` subcommand — lists and filters tags from a repository.
 
-use ocync_distribution::auth::anonymous::AnonymousAuth;
-use ocync_distribution::{Reference, RegistryClient};
 use ocync_sync::filter::FilterConfig;
-use url::Url;
 
 use crate::TagsArgs;
+use crate::cli::{CliError, ExitCode, build_registry_client};
 
-pub(crate) async fn run(args: &TagsArgs) -> i32 {
-    let reference: Reference = match args.repository.parse() {
-        Ok(r) => r,
-        Err(err) => {
-            eprintln!("error: invalid repository reference: {err}");
-            return 2;
-        }
-    };
+pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
+    let registry = args.repository.registry();
+    let repository = args.repository.repository();
 
-    let registry = reference.registry();
-    let repository = reference.repository();
+    let client = build_registry_client(registry, None).await?;
 
-    let base_url = format!("https://{registry}");
-    let url = match Url::parse(&base_url) {
-        Ok(u) => u,
-        Err(err) => {
-            eprintln!("error: invalid registry URL '{base_url}': {err}");
-            return 2;
-        }
-    };
+    let all_tags = client.list_tags(repository).await?;
 
-    let http = reqwest::Client::new();
-    let auth = AnonymousAuth::new(registry, http);
-    let client = match RegistryClient::builder(url).auth(auth).build() {
-        Ok(c) => c,
-        Err(err) => {
-            eprintln!("error: failed to build registry client: {err}");
-            return 2;
-        }
-    };
-
-    let all_tags = match client.list_tags(repository).await {
-        Ok(t) => t,
-        Err(err) => {
-            eprintln!("error: failed to list tags for {registry}/{repository}: {err}");
-            return 1;
-        }
-    };
-
-    // Build filter from CLI flags.
     let filter = FilterConfig {
-        glob: args.glob.iter().cloned().collect(),
+        glob: args.glob.clone(),
         semver: args.semver.clone(),
         semver_prerelease: None,
-        exclude: args.exclude.iter().cloned().collect(),
+        exclude: args.exclude.clone(),
         sort: args.sort.map(|s| s.into()),
         latest: args.latest,
         min_tags: None,
     };
 
     let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-    let filtered = match filter.apply(&tag_refs) {
-        Ok(f) => f,
-        Err(err) => {
-            eprintln!("error: tag filter failed: {err}");
-            return 2;
-        }
-    };
+    let filtered = filter.apply(&tag_refs)?;
 
     for tag in &filtered {
         println!("{tag}");
     }
 
-    0
+    Ok(ExitCode::Success)
 }

@@ -1,6 +1,8 @@
 //! The `version` subcommand — shows version and build information.
 
-pub(crate) fn run() -> i32 {
+use crate::cli::ExitCode;
+
+pub(crate) fn run() -> ExitCode {
     let version = env!("CARGO_PKG_VERSION");
     println!("ocync {version}");
 
@@ -10,5 +12,5 @@ pub(crate) fn run() -> i32 {
     // check whether the FIPS module was initialized.
     println!("FIPS 140-3: compiled=no");
 
-    0
+    ExitCode::Success
 }

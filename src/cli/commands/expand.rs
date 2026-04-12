@@ -1,25 +1,11 @@
 //! The `expand` subcommand — shows resolved config with env var expansion.
 
 use crate::ExpandArgs;
-use crate::cli::config::{expand_config, load_config};
+use crate::cli::config::expand_config_for_display;
+use crate::cli::{CliError, ExitCode};
 
-pub(crate) fn run(args: &ExpandArgs) -> i32 {
-    let config = match load_config(&args.config) {
-        Ok(c) => c,
-        Err(err) => {
-            eprintln!("error: {err}");
-            return 2;
-        }
-    };
-
-    match expand_config(&config, args.show_secrets) {
-        Ok(yaml) => {
-            print!("{yaml}");
-            0
-        }
-        Err(err) => {
-            eprintln!("error: {err}");
-            2
-        }
-    }
+pub(crate) fn run(args: &ExpandArgs) -> Result<ExitCode, CliError> {
+    let yaml = expand_config_for_display(&args.config, args.show_secrets)?;
+    print!("{yaml}");
+    Ok(ExitCode::Success)
 }
