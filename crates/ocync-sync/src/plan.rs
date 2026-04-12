@@ -52,6 +52,9 @@ pub enum ClaimResult {
 /// Per-registry index of tracked blobs.
 type BlobIndex = HashMap<Digest, BlobInfo>;
 
+// TODO: Replace outer `String` key with a `RegistryHost` newtype when the sync
+// engine is built — prevents confusing hostnames with repository names or refs.
+
 /// Process-global deduplication map keyed by target registry, then by digest.
 ///
 /// Tracks which blobs have already been transferred or exist at a target so
