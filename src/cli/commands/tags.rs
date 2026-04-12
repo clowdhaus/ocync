@@ -28,7 +28,7 @@ pub(crate) async fn run(args: &TagsArgs) -> i32 {
         }
     };
 
-    let http = ocync_distribution::reqwest::Client::new();
+    let http = reqwest::Client::new();
     let auth = AnonymousAuth::new(registry, http);
     let client = match RegistryClient::builder(url).auth(auth).build() {
         Ok(c) => c,

@@ -1319,6 +1319,7 @@ dependencies = [
  "clap",
  "ocync-distribution",
  "ocync-sync",
+ "reqwest",
  "serde",
  "serde_yaml_ng",
  "thiserror",

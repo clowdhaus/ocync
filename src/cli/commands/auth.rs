@@ -84,7 +84,7 @@ async fn check_registry(name: &str, reg: &RegistryConfig) -> bool {
             }
         }
         _ => {
-            let http = ocync_distribution::reqwest::Client::new();
+            let http = reqwest::Client::new();
             let auth = AnonymousAuth::new(hostname, http);
             RegistryClient::builder(url).auth(auth).build()
         }

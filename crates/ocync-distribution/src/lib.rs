@@ -30,7 +30,3 @@ pub use error::Error;
 pub use manifest::{ManifestHead, ManifestPull};
 pub use reference::Reference;
 pub use spec::{Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, Platform};
-
-/// Re-export `reqwest::Client` so downstream crates can construct auth providers
-/// without taking a direct dependency on reqwest.
-pub use reqwest;
