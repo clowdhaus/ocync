@@ -106,6 +106,19 @@ pub enum Error {
     Other(String),
 }
 
+impl Error {
+    /// Extract the HTTP status code from this error, if applicable.
+    pub fn status_code(&self) -> Option<http::StatusCode> {
+        match self {
+            Self::Unauthorized { .. } => Some(http::StatusCode::UNAUTHORIZED),
+            Self::Forbidden { .. } => Some(http::StatusCode::FORBIDDEN),
+            Self::NotFound(_) => Some(http::StatusCode::NOT_FOUND),
+            Self::RegistryError { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +172,55 @@ mod tests {
     fn is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Error>();
+    }
+
+    #[test]
+    fn status_code_unauthorized() {
+        let err = Error::Unauthorized {
+            registry: "example.com".into(),
+        };
+        assert_eq!(err.status_code(), Some(http::StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn status_code_forbidden() {
+        let err = Error::Forbidden {
+            registry: "example.com".into(),
+            repository: "repo".into(),
+        };
+        assert_eq!(err.status_code(), Some(http::StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn status_code_not_found() {
+        let err = Error::NotFound("something".into());
+        assert_eq!(err.status_code(), Some(http::StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn status_code_registry_error() {
+        let err = Error::RegistryError {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            message: "rate limited".into(),
+        };
+        assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn status_code_none_for_other_variants() {
+        let err = Error::Other("something".into());
+        assert_eq!(err.status_code(), None);
+
+        let err = Error::InvalidReference {
+            input: "bad".into(),
+            reason: "reason".into(),
+        };
+        assert_eq!(err.status_code(), None);
+
+        let err = Error::AuthFailed {
+            registry: "example.com".into(),
+            reason: "bad creds".into(),
+        };
+        assert_eq!(err.status_code(), None);
     }
 }
