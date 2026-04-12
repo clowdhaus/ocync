@@ -318,34 +318,9 @@ impl SyncEngine {
         // Phase 2: Fan-out blob transfer — pull each blob once, push to all active targets.
         let active_targets: Vec<&Endpoint<'_>> = active.iter().map(|&(i, _)| &targets[i]).collect();
 
-        let blob_results = match self
+        let blob_results = self
             .transfer_blobs_fanout(source, &active_targets, &all_blobs)
-            .await
-        {
-            Ok(results) => results,
-            Err(err) => {
-                // Source blob pull failed — all active targets fail.
-                let error_str = err.to_string();
-                for &(i, start) in &active {
-                    let target = &targets[i];
-                    let result = ImageResult {
-                        image_id: Uuid::now_v7(),
-                        source: format!("{}:{source_tag}", source.repo),
-                        target: format!("{}:{target_tag}", target.repo),
-                        status: ImageStatus::Failed {
-                            error: error_str.clone(),
-                            retries: self.retry.max_retries,
-                        },
-                        bytes_transferred: 0,
-                        blob_stats: BlobTransferStats::default(),
-                        duration: start.elapsed(),
-                    };
-                    progress.image_completed(&result);
-                    images.push(result);
-                }
-                return;
-            }
-        };
+            .await;
 
         // Phase 3: Push manifests to targets whose blobs all succeeded.
         for (br, &(i, start)) in blob_results.into_iter().zip(active.iter()) {
@@ -528,7 +503,7 @@ impl SyncEngine {
         source: &Endpoint<'_>,
         targets: &[&Endpoint<'_>],
         blobs: &[(&Digest, u64)],
-    ) -> Result<Vec<BlobTransferResult>, crate::Error> {
+    ) -> Vec<BlobTransferResult> {
         let mut results: Vec<BlobTransferResult> = targets
             .iter()
             .map(|_| BlobTransferResult::default())
@@ -619,7 +594,7 @@ impl SyncEngine {
                         self.dedup.set_completed(target.name, digest, target.repo);
                     }
                     Err(e) => {
-                        let err = crate::Error::BlobPush {
+                        let err = crate::Error::BlobTransfer {
                             digest: digest.to_string(),
                             source: e,
                         };
@@ -631,7 +606,7 @@ impl SyncEngine {
             }
         }
 
-        Ok(results)
+        results
     }
 }
 

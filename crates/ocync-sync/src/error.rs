@@ -47,8 +47,8 @@ pub enum Error {
 
     /// A blob transfer failed during sync.
     #[error("blob transfer failed for {digest}: {source}")]
-    BlobPush {
-        /// The digest of the blob that could not be pushed.
+    BlobTransfer {
+        /// The digest of the blob that could not be transferred.
         digest: String,
         /// The underlying distribution error.
         source: ocync_distribution::Error,
@@ -59,7 +59,9 @@ impl Error {
     /// Extract the HTTP status code from the underlying distribution error, if any.
     pub fn status_code(&self) -> Option<http::StatusCode> {
         match self {
-            Self::Manifest { source, .. } | Self::BlobPush { source, .. } => source.status_code(),
+            Self::Manifest { source, .. } | Self::BlobTransfer { source, .. } => {
+                source.status_code()
+            }
             _ => None,
         }
     }
@@ -131,7 +133,7 @@ mod tests {
 
     #[test]
     fn display_blob_push_error() {
-        let err = Error::BlobPush {
+        let err = Error::BlobTransfer {
             digest: "sha256:def".into(),
             source: ocync_distribution::Error::Other("timeout".into()),
         };
