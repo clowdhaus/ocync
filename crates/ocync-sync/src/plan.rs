@@ -180,17 +180,21 @@ impl Default for BlobDedupMap {
     }
 }
 
-/// Transfer ordering — lower variants are transferred first.
+/// Transfer dependency ordering — variants are declared in transfer order.
+///
+/// `Ord` uses declaration order: blobs first (manifests reference them),
+/// then platform manifests, then multi-platform indexes, then referrers
+/// (which point back at the artifact they annotate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TransferKind {
     /// Layer / config blob.
-    Blob = 0,
+    Blob,
     /// Platform-specific manifest.
-    PlatformManifest = 1,
+    PlatformManifest,
     /// Multi-platform index / manifest list.
-    Index = 2,
+    Index,
     /// OCI referrer (signatures, SBOMs, attestations).
-    Referrer = 3,
+    Referrer,
 }
 
 #[cfg(test)]
