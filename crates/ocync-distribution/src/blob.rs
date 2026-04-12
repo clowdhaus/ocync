@@ -59,11 +59,7 @@ impl RegistryClient {
     /// Issues a GET request to `/v2/{repository}/blobs/{digest}` and returns
     /// the full response body as a `Vec<u8>`. For large blobs, prefer
     /// [`blob_pull`](Self::blob_pull) which returns a streaming response.
-    pub async fn blob_pull_all(
-        &self,
-        repository: &str,
-        digest: &Digest,
-    ) -> Result<Vec<u8>, Error> {
+    pub async fn blob_pull_all(&self, repository: &str, digest: &Digest) -> Result<Vec<u8>, Error> {
         let path = blob_path(digest);
         let resp = self.get(repository, &path, None).await?;
         let bytes = resp.bytes().await?;
