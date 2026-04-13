@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -168,39 +169,132 @@ impl fmt::Display for Platform {
 }
 
 impl Platform {
-    /// Returns `true` if this platform matches the given filter string.
+    /// Returns `true` if this platform matches the given filter.
     ///
-    /// The filter must be `"os/arch"` or `"os/arch/variant"`. Comparison is
-    /// case-insensitive. An empty filter never matches. When the filter
-    /// specifies only `os/arch`, the platform's `variant` field is ignored —
-    /// any variant (or none) will match.
-    pub fn matches(&self, filter: &str) -> bool {
-        if filter.is_empty() {
+    /// Comparison is case-insensitive. When the filter specifies only `os/arch`,
+    /// the platform's `variant` field is ignored — any variant (or none) will
+    /// match.
+    pub fn matches(&self, filter: &PlatformFilter) -> bool {
+        if !self.os.eq_ignore_ascii_case(&filter.os)
+            || !self.architecture.eq_ignore_ascii_case(&filter.arch)
+        {
             return false;
         }
-        let mut parts = filter.splitn(3, '/');
-        let Some(filter_os) = parts.next() else {
-            return false;
-        };
-        let Some(filter_arch) = parts.next() else {
-            return false;
-        };
-        let filter_variant = parts.next();
 
-        if !self.os.eq_ignore_ascii_case(filter_os) {
-            return false;
+        match (&filter.variant, &self.variant) {
+            (Some(fv), Some(pv)) => pv.eq_ignore_ascii_case(fv),
+            (Some(_), None) => false,
+            (None, _) => true,
         }
-        if !self.architecture.eq_ignore_ascii_case(filter_arch) {
-            return false;
+    }
+}
+
+/// A parsed platform filter for matching against [`Platform`] values.
+///
+/// Constructed from strings like `"linux/amd64"` or `"linux/arm64/v8"` via
+/// [`FromStr`]. Parsing validates the format upfront so matching is a simple
+/// field comparison with no runtime splitting.
+#[derive(Debug, Clone)]
+pub struct PlatformFilter {
+    /// Operating system (e.g. `linux`, `windows`).
+    os: String,
+    /// CPU architecture (e.g. `amd64`, `arm64`).
+    arch: String,
+    /// Optional CPU variant (e.g. `v8`).
+    variant: Option<String>,
+}
+
+impl FromStr for PlatformFilter {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.splitn(3, '/');
+        let (Some(os), Some(arch)) = (parts.next(), parts.next()) else {
+            return Err(Error::InvalidPlatformFilter {
+                input: s.into(),
+                reason: "expected 'os/arch' or 'os/arch/variant'".into(),
+            });
+        };
+
+        if os.is_empty() || arch.is_empty() {
+            return Err(Error::InvalidPlatformFilter {
+                input: s.into(),
+                reason: "os and arch must be non-empty".into(),
+            });
         }
-        if let Some(fv) = filter_variant {
-            match &self.variant {
-                Some(pv) => pv.eq_ignore_ascii_case(fv),
-                None => false,
+
+        let variant = parts.next().map(|v| {
+            if v.is_empty() {
+                Err(Error::InvalidPlatformFilter {
+                    input: s.into(),
+                    reason: "variant must be non-empty when specified".into(),
+                })
+            } else {
+                Ok(v.to_owned())
             }
-        } else {
-            true
+        });
+
+        Ok(Self {
+            os: os.to_owned(),
+            arch: arch.to_owned(),
+            variant: variant.transpose()?,
+        })
+    }
+}
+
+impl fmt::Display for PlatformFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.os, self.arch)?;
+        if let Some(ref v) = self.variant {
+            write!(f, "/{v}")?;
         }
+        Ok(())
+    }
+}
+
+/// An OCI repository name (e.g. `library/nginx`, `mirror/nginx`).
+///
+/// Wraps a raw string to distinguish repository names from tag names,
+/// registry hostnames, and other string-typed values. Implements
+/// [`Deref<Target=str>`] for transparent borrowing in functions that
+/// accept `&str`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RepositoryName(String);
+
+impl RepositoryName {
+    /// Create a new repository name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// Return the name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for RepositoryName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RepositoryName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for RepositoryName {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for RepositoryName {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
     }
 }
 
@@ -553,25 +647,25 @@ mod tests {
         }
     }
 
+    /// Helper to parse a filter string, panicking on invalid input.
+    fn filter(s: &str) -> PlatformFilter {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn platform_matches_os_arch() {
-        assert!(linux_amd64().matches("linux/amd64"));
+        assert!(linux_amd64().matches(&filter("linux/amd64")));
     }
 
     #[test]
     fn platform_matches_os_arch_variant() {
-        assert!(linux_arm64_v8().matches("linux/arm64/v8"));
+        assert!(linux_arm64_v8().matches(&filter("linux/arm64/v8")));
     }
 
     #[test]
     fn platform_matches_case_insensitive() {
-        assert!(linux_amd64().matches("Linux/AMD64"));
-        assert!(linux_arm64_v8().matches("LINUX/ARM64/V8"));
-    }
-
-    #[test]
-    fn platform_matches_empty_filter_returns_false() {
-        assert!(!linux_amd64().matches(""));
+        assert!(linux_amd64().matches(&filter("Linux/AMD64")));
+        assert!(linux_arm64_v8().matches(&filter("LINUX/ARM64/V8")));
     }
 
     #[test]
@@ -584,29 +678,108 @@ mod tests {
             os_version: None,
             os_features: None,
         };
-        assert!(!p.matches("linux/arm/v7"));
+        assert!(!p.matches(&filter("linux/arm/v7")));
     }
 
     #[test]
     fn platform_matches_filter_variant_no_platform_variant_returns_false() {
         // filter requires a specific variant but platform has none
-        assert!(!linux_amd64().matches("linux/amd64/v1"));
+        assert!(!linux_amd64().matches(&filter("linux/amd64/v1")));
     }
 
     #[test]
     fn platform_matches_os_arch_ignores_platform_variant() {
         // os/arch filter matches regardless of what variant the platform has
-        assert!(linux_arm64_v8().matches("linux/arm64"));
+        assert!(linux_arm64_v8().matches(&filter("linux/arm64")));
     }
 
     #[test]
     fn platform_matches_wrong_os_returns_false() {
-        assert!(!linux_amd64().matches("windows/amd64"));
+        assert!(!linux_amd64().matches(&filter("windows/amd64")));
     }
 
     #[test]
     fn platform_matches_wrong_arch_returns_false() {
-        assert!(!linux_amd64().matches("linux/arm64"));
+        assert!(!linux_amd64().matches(&filter("linux/arm64")));
+    }
+
+    // --- PlatformFilter parsing tests ---
+
+    #[test]
+    fn platform_filter_parse_os_arch() {
+        let f: PlatformFilter = "linux/amd64".parse().unwrap();
+        assert_eq!(f.to_string(), "linux/amd64");
+    }
+
+    #[test]
+    fn platform_filter_parse_os_arch_variant() {
+        let f: PlatformFilter = "linux/arm64/v8".parse().unwrap();
+        assert_eq!(f.to_string(), "linux/arm64/v8");
+    }
+
+    #[test]
+    fn platform_filter_parse_empty_fails() {
+        let err = "".parse::<PlatformFilter>().unwrap_err();
+        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
+        let Error::InvalidPlatformFilter { input, reason } = &err else {
+            panic!("expected InvalidPlatformFilter, got {err:?}");
+        };
+        assert_eq!(input, "");
+        assert!(reason.contains("os/arch"), "reason: {reason}");
+    }
+
+    #[test]
+    fn platform_filter_parse_os_only_fails() {
+        let err = "linux".parse::<PlatformFilter>().unwrap_err();
+        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
+        let Error::InvalidPlatformFilter { input, reason } = &err else {
+            panic!("expected InvalidPlatformFilter, got {err:?}");
+        };
+        assert_eq!(input, "linux");
+        assert!(reason.contains("os/arch"), "reason: {reason}");
+    }
+
+    #[test]
+    fn platform_filter_parse_empty_os_fails() {
+        let err = "/amd64".parse::<PlatformFilter>().unwrap_err();
+        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
+        let Error::InvalidPlatformFilter { input, reason } = &err else {
+            panic!("expected InvalidPlatformFilter, got {err:?}");
+        };
+        assert_eq!(input, "/amd64");
+        assert!(reason.contains("non-empty"), "reason: {reason}");
+    }
+
+    #[test]
+    fn platform_filter_parse_empty_arch_fails() {
+        let err = "linux/".parse::<PlatformFilter>().unwrap_err();
+        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
+        let Error::InvalidPlatformFilter { input, reason } = &err else {
+            panic!("expected InvalidPlatformFilter, got {err:?}");
+        };
+        assert_eq!(input, "linux/");
+        assert!(reason.contains("non-empty"), "reason: {reason}");
+    }
+
+    #[test]
+    fn platform_filter_parse_empty_variant_fails() {
+        let err = "linux/amd64/".parse::<PlatformFilter>().unwrap_err();
+        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
+        let Error::InvalidPlatformFilter { input, reason } = &err else {
+            panic!("expected InvalidPlatformFilter, got {err:?}");
+        };
+        assert_eq!(input, "linux/amd64/");
+        assert!(
+            reason.contains("variant") && reason.contains("non-empty"),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn platform_filter_display_roundtrip() {
+        let input = "linux/arm64/v8";
+        let f: PlatformFilter = input.parse().unwrap();
+        assert_eq!(f.to_string(), input);
     }
 
     #[test]

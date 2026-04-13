@@ -7,6 +7,7 @@ use url::Url;
 use crate::aimd::{AimdController, RegistryAction};
 use crate::auth::{AuthProvider, Scope};
 use crate::error::Error;
+use crate::spec::RepositoryName;
 
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
@@ -135,13 +136,13 @@ impl RegistryClient {
     /// throttle on 429 so the AIMD window adapts.
     pub async fn get(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         path: &str,
         accept: Option<&str>,
         op: RegistryAction,
     ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
-        let scopes = [Scope::pull(repository)];
+        let scopes = [Scope::pull(repository.as_str())];
 
         let resp = self
             .send_with_aimd(op, &scopes, "GET", |mut headers| {
@@ -162,12 +163,12 @@ impl RegistryClient {
     /// Same AIMD and retry logic as [`get`](Self::get).
     pub async fn head(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         path: &str,
         op: RegistryAction,
     ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
-        let scopes = [Scope::pull(repository)];
+        let scopes = [Scope::pull(repository.as_str())];
 
         let resp = self
             .send_with_aimd(op, &scopes, "HEAD", |headers| {
@@ -443,9 +444,10 @@ mod tests {
             .mount(&server)
             .await;
 
+        let repo = RepositoryName::new("repo");
         let _ = client
             .get(
-                "repo",
+                &repo,
                 "manifests/latest",
                 None,
                 RegistryAction::ManifestRead,
@@ -465,7 +467,7 @@ mod tests {
 
         let result = client
             .get(
-                "repo",
+                &repo,
                 "manifests/latest",
                 None,
                 RegistryAction::ManifestRead,

@@ -23,6 +23,15 @@ pub enum Error {
         reason: String,
     },
 
+    /// A platform filter string could not be parsed.
+    #[error("invalid platform filter '{input}': {reason}")]
+    InvalidPlatformFilter {
+        /// The raw filter string that failed to parse.
+        input: String,
+        /// Why the filter is invalid.
+        reason: String,
+    },
+
     /// The manifest media type is not recognized.
     #[error("unsupported manifest media type: {media_type}")]
     UnsupportedMediaType {

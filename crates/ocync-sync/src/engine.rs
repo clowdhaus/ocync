@@ -19,6 +19,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -34,7 +35,9 @@ use ocync_distribution::RegistryClient;
 use ocync_distribution::blob::MountResult;
 use ocync_distribution::manifest::ManifestPull;
 use ocync_distribution::sha256::Sha256;
-use ocync_distribution::spec::{Descriptor, ImageIndex, ImageManifest, ManifestKind};
+use ocync_distribution::spec::{
+    Descriptor, ImageIndex, ImageManifest, ManifestKind, PlatformFilter, RepositoryName,
+};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -44,6 +47,55 @@ use crate::retry::{self, RetryConfig};
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
 use crate::{BlobTransferStats, ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats};
+
+/// An image reference within a single registry (repository name + tag).
+///
+/// Bundles the two fields that always travel together in discovery and
+/// transfer operations. The [`Display`] impl formats as `repo:tag`.
+///
+/// This is **not** a full OCI reference (which includes the registry hostname).
+/// The registry is tracked separately via the associated [`RegistryClient`].
+#[derive(Debug, Clone)]
+struct ImageRef {
+    /// Repository path (e.g. `library/nginx`).
+    repo: RepositoryName,
+    /// Tag name (e.g. `latest`, `1.25`).
+    tag: String,
+}
+
+impl fmt::Display for ImageRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.repo, self.tag)
+    }
+}
+
+/// A registry identifier used as the blob deduplication key.
+///
+/// Wraps the config-defined name (e.g. `us-ecr`) or bare hostname for
+/// ad-hoc commands. Must be unique per mapping -- it is used as the outer
+/// key in the blob dedup map.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RegistryName(String);
+
+impl RegistryName {
+    /// Create a new registry name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl std::ops::Deref for RegistryName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RegistryName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// A fully resolved mapping ready for the sync engine.
 ///
@@ -55,9 +107,9 @@ pub struct ResolvedMapping {
     /// Client for the source registry.
     pub source_client: Arc<RegistryClient>,
     /// Repository path at the source (e.g. `library/nginx`).
-    pub source_repo: String,
+    pub source_repo: RepositoryName,
     /// Repository path at the target (e.g. `mirror/nginx`).
-    pub target_repo: String,
+    pub target_repo: RepositoryName,
     /// Target registries to sync to.
     pub targets: Vec<TargetEntry>,
     /// Tag pairs to sync (already filtered).
@@ -65,10 +117,10 @@ pub struct ResolvedMapping {
     /// Optional platform filter list (e.g., `["linux/amd64"]`).
     ///
     /// When `Some`, index manifests are filtered to only include descriptors
-    /// whose platform matches one of the filter strings (using
+    /// whose platform matches one of the filters (using
     /// [`Platform::matches()`]). Child manifests and blobs for non-matching
     /// platforms are never pulled from the source.
-    pub platforms: Option<Vec<String>>,
+    pub platforms: Option<Vec<PlatformFilter>>,
     /// When `true`, skip syncing when the target already has any manifest for
     /// the tag, regardless of digest comparison.
     ///
@@ -87,7 +139,7 @@ pub struct TargetEntry {
     ///
     /// Must be unique per mapping. Typically the config-defined registry name
     /// (e.g. `us-ecr`) or the bare hostname for ad-hoc commands.
-    pub name: String,
+    pub name: RegistryName,
     /// Client for this target registry.
     pub client: Arc<RegistryClient>,
     /// Optional batch blob checker for this target (ECR batch API).
@@ -107,8 +159,8 @@ impl Clone for TargetEntry {
     }
 }
 
-impl std::fmt::Debug for TargetEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for TargetEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TargetEntry")
             .field("name", &self.name)
             .field("client", &self.client)
@@ -186,17 +238,13 @@ struct TransferTask {
     /// Source client for pulling blobs.
     source_client: Arc<RegistryClient>,
     /// Target registry name (dedup key).
-    target_name: String,
+    target_name: RegistryName,
     /// Target client for pushing.
     target_client: Arc<RegistryClient>,
-    /// Target repository path.
-    target_repo: String,
-    /// Source repository path.
-    source_repo: String,
-    /// Source tag (for display/logging).
-    source_tag: String,
-    /// Target tag (for pushing manifests).
-    target_tag: String,
+    /// Source image reference (repo + tag, for display/logging and blob pulls).
+    source: ImageRef,
+    /// Target image reference (repo + tag, for pushing manifests and blobs).
+    target: ImageRef,
     /// Optional batch blob checker for pre-populating the cache.
     batch_checker: Option<Rc<dyn BatchBlobChecker>>,
 }
@@ -321,30 +369,23 @@ impl SyncEngine {
         // Seed discovery with all (mapping, tag) pairs.
         for mapping in &mappings {
             for tag_pair in &mapping.tags {
-                let source_client = Arc::clone(&mapping.source_client);
-                let source_repo = mapping.source_repo.clone();
-                let target_repo = mapping.target_repo.clone();
-                let source_tag = tag_pair.source.clone();
-                let target_tag = tag_pair.target.clone();
-                let retry = self.retry.clone();
-                let targets = mapping.targets.clone();
-                let platforms = mapping.platforms.clone();
-                let skip_existing = mapping.skip_existing;
+                let params = DiscoveryParams {
+                    source_client: Arc::clone(&mapping.source_client),
+                    source: ImageRef {
+                        repo: mapping.source_repo.clone(),
+                        tag: tag_pair.source.clone(),
+                    },
+                    target: ImageRef {
+                        repo: mapping.target_repo.clone(),
+                        tag: tag_pair.target.clone(),
+                    },
+                    targets: mapping.targets.clone(),
+                    retry: self.retry.clone(),
+                    platforms: mapping.platforms.clone(),
+                    skip_existing: mapping.skip_existing,
+                };
 
-                discovery_futures.push(async move {
-                    discover_tag(DiscoveryParams {
-                        source_client,
-                        source_repo: &source_repo,
-                        target_repo: &target_repo,
-                        source_tag: &source_tag,
-                        target_tag: &target_tag,
-                        targets: &targets,
-                        retry: &retry,
-                        platforms: platforms.as_deref(),
-                        skip_existing,
-                    })
-                    .await
-                });
+                discovery_futures.push(async move { discover_tag(params).await });
             }
         }
 
@@ -366,11 +407,8 @@ impl SyncEngine {
                     };
 
                     let staging_ref = Rc::clone(&staging);
-                    let source_display = format!(
-                        "{}:{} -> {}",
-                        item.source_repo, item.source_tag, item.target_name
-                    );
-                    let target_display = format!("{}:{}", item.target_repo, item.target_tag);
+                    let source_display = format!("{} -> {}", item.source, item.target_name);
+                    let target_display = item.target.to_string();
 
                     execution_futures.push(Box::pin(async move {
                         let _permit = sem.acquire().await.unwrap();
@@ -462,16 +500,17 @@ impl SyncEngine {
 
 /// Parameters for [`discover_tag`], bundled to keep the argument count under
 /// clippy's limit while preserving readability.
-struct DiscoveryParams<'a> {
+///
+/// Owns all data so it can be moved directly into the async discovery future
+/// without intermediate borrows.
+struct DiscoveryParams {
     source_client: Arc<RegistryClient>,
-    source_repo: &'a str,
-    target_repo: &'a str,
-    source_tag: &'a str,
-    target_tag: &'a str,
-    targets: &'a [TargetEntry],
-    retry: &'a RetryConfig,
+    source: ImageRef,
+    target: ImageRef,
+    targets: Vec<TargetEntry>,
+    retry: RetryConfig,
     /// Optional platform filter list (e.g., `["linux/amd64"]`).
-    platforms: Option<&'a [String]>,
+    platforms: Option<Vec<PlatformFilter>>,
     /// When `true`, skip syncing when the target already has any manifest.
     skip_existing: bool,
 }
@@ -486,61 +525,65 @@ struct DiscoveryParams<'a> {
 ///
 /// When `skip_existing` is `true`, targets that return any manifest HEAD response
 /// (regardless of digest) are skipped without further comparison.
-async fn discover_tag(params: DiscoveryParams<'_>) -> DiscoveryOutcome {
+async fn discover_tag(params: DiscoveryParams) -> DiscoveryOutcome {
     let DiscoveryParams {
         source_client,
-        source_repo,
-        target_repo,
-        source_tag,
-        target_tag,
+        source,
+        target,
         targets,
         retry,
         platforms,
         skip_existing,
     } = params;
     // Pull source manifest (shared across all targets for this tag).
-    let source_data =
-        match pull_source_manifest(&source_client, source_repo, source_tag, retry, platforms).await
-        {
-            Ok(data) => Rc::new(data),
-            Err(err) => {
-                let error_str = err.to_string();
-                warn!(
-                    source_repo = %source_repo,
-                    tag = %source_tag,
-                    error = %error_str,
-                    "source pull failed, skipping all targets"
-                );
-                let fail_results: Vec<ImageResult> = targets
-                    .iter()
-                    .map(|target| ImageResult {
-                        image_id: Uuid::now_v7(),
-                        source: format!("{source_repo}:{source_tag}"),
-                        target: format!("{target_repo} ({}):{target_tag}", target.name),
-                        status: ImageStatus::Failed {
-                            error: error_str.clone(),
-                            retries: retry.max_retries,
-                        },
-                        bytes_transferred: 0,
-                        blob_stats: BlobTransferStats::default(),
-                        duration: Duration::ZERO,
-                    })
-                    .collect();
-                return DiscoveryOutcome::Failed(fail_results);
-            }
-        };
+    let source_data = match pull_source_manifest(
+        &source_client,
+        &source.repo,
+        &source.tag,
+        &retry,
+        platforms.as_deref(),
+    )
+    .await
+    {
+        Ok(data) => Rc::new(data),
+        Err(err) => {
+            let error_str = err.to_string();
+            warn!(
+                source_repo = %source.repo,
+                source_tag = %source.tag,
+                error = %error_str,
+                "source pull failed, skipping all targets"
+            );
+            let fail_results: Vec<ImageResult> = targets
+                .iter()
+                .map(|t| ImageResult {
+                    image_id: Uuid::now_v7(),
+                    source: source.to_string(),
+                    target: format!("{} ({}):{}", target.repo, t.name, target.tag),
+                    status: ImageStatus::Failed {
+                        error: error_str.clone(),
+                        retries: retry.max_retries,
+                    },
+                    bytes_transferred: 0,
+                    blob_stats: BlobTransferStats::default(),
+                    duration: Duration::ZERO,
+                })
+                .collect();
+            return DiscoveryOutcome::Failed(fail_results);
+        }
+    };
 
     let source_digest = &source_data.pull.digest;
 
     // HEAD-check all targets concurrently.
     let mut head_checks = FuturesUnordered::new();
 
-    for target in targets {
-        let client = Arc::clone(&target.client);
-        let repo = target_repo.to_owned();
-        let tag = target_tag.to_owned();
-        let name = target.name.clone();
-        let checker = target.batch_checker.clone();
+    for entry in &targets {
+        let client = Arc::clone(&entry.client);
+        let repo = target.repo.clone();
+        let tag = target.tag.clone();
+        let name = entry.name.clone();
+        let checker = entry.batch_checker.clone();
 
         head_checks.push(async move {
             let result = client.manifest_head(&repo, &tag).await;
@@ -555,16 +598,16 @@ async fn discover_tag(params: DiscoveryParams<'_>) -> DiscoveryOutcome {
         match result {
             Ok(Some(_)) if skip_existing => {
                 info!(
-                    source_repo = %source_repo,
-                    target_repo = %target_repo,
-                    tag = %source_tag,
+                    source_repo = %source.repo,
+                    source_tag = %source.tag,
+                    target_repo = %target.repo,
                     "skipping -- target manifest exists (skip_existing)"
                 );
                 tracing::debug!(target: "ocync::metrics", "skip_existing");
                 skipped_results.push(ImageResult {
                     image_id: Uuid::now_v7(),
-                    source: format!("{source_repo}:{source_tag}"),
-                    target: format!("{target_repo}:{target_tag}"),
+                    source: source.to_string(),
+                    target: target.to_string(),
                     status: ImageStatus::Skipped {
                         reason: SkipReason::SkipExisting,
                     },
@@ -575,17 +618,17 @@ async fn discover_tag(params: DiscoveryParams<'_>) -> DiscoveryOutcome {
             }
             Ok(Some(head)) if head.digest == *source_digest => {
                 info!(
-                    source_repo = %source_repo,
-                    target_repo = %target_repo,
-                    tag = %source_tag,
+                    source_repo = %source.repo,
+                    source_tag = %source.tag,
+                    target_repo = %target.repo,
                     digest = %source_digest,
                     "skipping -- digest matches at target"
                 );
                 tracing::debug!(target: "ocync::metrics", "unchanged_skip");
                 skipped_results.push(ImageResult {
                     image_id: Uuid::now_v7(),
-                    source: format!("{source_repo}:{source_tag}"),
-                    target: format!("{target_repo}:{target_tag}"),
+                    source: source.to_string(),
+                    target: target.to_string(),
                     status: ImageStatus::Skipped {
                         reason: SkipReason::DigestMatch,
                     },
@@ -594,35 +637,22 @@ async fn discover_tag(params: DiscoveryParams<'_>) -> DiscoveryOutcome {
                     duration: Duration::ZERO,
                 });
             }
-            Ok(_) => {
+            other => {
+                if let Err(e) = &other {
+                    warn!(
+                        target_repo = %target.repo,
+                        target_tag = %target.tag,
+                        error = %e,
+                        "target manifest HEAD failed, proceeding with sync"
+                    );
+                }
                 active_items.push(TransferTask {
                     source_data: Rc::clone(&source_data),
                     source_client: Arc::clone(&source_client),
                     target_name,
                     target_client,
-                    target_repo: target_repo.to_owned(),
-                    source_repo: source_repo.to_owned(),
-                    source_tag: source_tag.to_owned(),
-                    target_tag: target_tag.to_owned(),
-                    batch_checker,
-                });
-            }
-            Err(e) => {
-                warn!(
-                    target_repo = %target_repo,
-                    target_tag = %target_tag,
-                    error = %e,
-                    "target manifest HEAD failed, proceeding with sync"
-                );
-                active_items.push(TransferTask {
-                    source_data: Rc::clone(&source_data),
-                    source_client: Arc::clone(&source_client),
-                    target_name,
-                    target_client,
-                    target_repo: target_repo.to_owned(),
-                    source_repo: source_repo.to_owned(),
-                    source_tag: source_tag.to_owned(),
-                    target_tag: target_tag.to_owned(),
+                    source: source.clone(),
+                    target: target.clone(),
                     batch_checker,
                 });
             }
@@ -654,10 +684,10 @@ async fn execute_item(
         staging,
         retry,
         source_client: &item.source_client,
-        source_repo: &item.source_repo,
+        source_repo: &item.source.repo,
         target_client: &item.target_client,
         target_name: &item.target_name,
-        target_repo: &item.target_repo,
+        target_repo: &item.target.repo,
         batch_checker: item.batch_checker.as_ref(),
     };
     let outcome = transfer_image_blobs(&ctx, &item.source_data, freq_counts).await;
@@ -666,8 +696,8 @@ async fn execute_item(
         warn!(target_name = %item.target_name, error = %err, "blob transfer failed");
         return ImageResult {
             image_id: Uuid::now_v7(),
-            source: format!("{}:{}", item.source_repo, item.source_tag),
-            target: format!("{}:{}", item.target_repo, item.target_tag),
+            source: item.source.to_string(),
+            target: item.target.to_string(),
             status: ImageStatus::Failed {
                 error: err.to_string(),
                 retries: retry.max_retries,
@@ -682,25 +712,25 @@ async fn execute_item(
     match push_manifests(
         retry,
         &item.target_client,
-        &item.target_repo,
-        &item.target_tag,
+        &item.target.repo,
+        &item.target.tag,
         &item.source_data,
     )
     .await
     {
         Ok(()) => {
             info!(
-                source_repo = %item.source_repo,
-                target_repo = %item.target_repo,
-                source_tag = %item.source_tag,
-                target_tag = %item.target_tag,
+                source_repo = %item.source.repo,
+                source_tag = %item.source.tag,
+                target_repo = %item.target.repo,
+                target_tag = %item.target.tag,
                 bytes = outcome.bytes_transferred,
                 "image synced"
             );
             ImageResult {
                 image_id: Uuid::now_v7(),
-                source: format!("{}:{}", item.source_repo, item.source_tag),
-                target: format!("{}:{}", item.target_repo, item.target_tag),
+                source: item.source.to_string(),
+                target: item.target.to_string(),
                 status: ImageStatus::Synced,
                 bytes_transferred: outcome.bytes_transferred,
                 blob_stats: outcome.stats,
@@ -711,8 +741,8 @@ async fn execute_item(
             warn!(target_name = %item.target_name, error = %err, "manifest push failed");
             ImageResult {
                 image_id: Uuid::now_v7(),
-                source: format!("{}:{}", item.source_repo, item.source_tag),
-                target: format!("{}:{}", item.target_repo, item.target_tag),
+                source: item.source.to_string(),
+                target: item.target.to_string(),
                 status: ImageStatus::Failed {
                     error: err.to_string(),
                     retries: retry.max_retries,
@@ -736,10 +766,10 @@ async fn execute_item(
 /// re-serialized to reflect only the kept descriptors.
 async fn pull_source_manifest(
     client: &RegistryClient,
-    repo: &str,
+    repo: &RepositoryName,
     tag: &str,
     retry: &RetryConfig,
-    platforms: Option<&[String]>,
+    platforms: Option<&[PlatformFilter]>,
 ) -> Result<PulledManifest, crate::Error> {
     let pull = with_retry(retry, "manifest pull", || client.manifest_pull(repo, tag))
         .await
@@ -869,10 +899,10 @@ struct TransferContext<'a> {
     staging: &'a Rc<BlobStage>,
     retry: &'a RetryConfig,
     source_client: &'a RegistryClient,
-    source_repo: &'a str,
+    source_repo: &'a RepositoryName,
     target_client: &'a RegistryClient,
-    target_name: &'a str,
-    target_repo: &'a str,
+    target_name: &'a RegistryName,
+    target_repo: &'a RepositoryName,
     /// Optional batch blob checker for pre-populating the cache.
     batch_checker: Option<&'a Rc<dyn BatchBlobChecker>>,
 }
@@ -961,11 +991,11 @@ async fn transfer_image_blobs(
         let mount_source = {
             let c = ctx.cache.borrow();
             c.blob_mount_source(ctx.target_name, digest, ctx.target_repo)
-                .map(|s| s.to_owned())
+                .cloned()
         };
 
         if let Some(from_repo) = mount_source {
-            debug!(%digest, %from_repo, target = ctx.target_name, "attempting mount");
+            debug!(%digest, %from_repo, target = %ctx.target_name, "attempting mount");
             match ctx
                 .target_client
                 .blob_mount(ctx.target_repo, digest, &from_repo)
@@ -982,7 +1012,7 @@ async fn transfer_image_blobs(
                     continue;
                 }
                 Ok(MountResult::FallbackUpload { .. }) | Err(_) => {
-                    debug!(%digest, target = ctx.target_name, "mount failed, falling back to HEAD+push");
+                    debug!(%digest, target = %ctx.target_name, "mount failed, falling back to HEAD+push");
                     // Invalidate the stale mount source entry.
                     ctx.cache
                         .borrow_mut()
@@ -1011,7 +1041,7 @@ async fn transfer_image_blobs(
             Err(e) => {
                 debug!(
                     %digest,
-                    target = ctx.target_name,
+                    target = %ctx.target_name,
                     error = %e,
                     "blob HEAD failed, proceeding with push"
                 );
@@ -1129,7 +1159,7 @@ async fn transfer_image_blobs(
 async fn push_manifests(
     retry: &RetryConfig,
     target_client: &RegistryClient,
-    target_repo: &str,
+    target_repo: &RepositoryName,
     target_tag: &str,
     source_data: &PulledManifest,
 ) -> Result<(), crate::Error> {

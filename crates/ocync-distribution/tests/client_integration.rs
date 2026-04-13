@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use http::StatusCode;
 use ocync_distribution::Error;
+use ocync_distribution::RepositoryName;
 use ocync_distribution::auth::{AuthProvider, Scope, Token};
 use ocync_distribution::client::RegistryClientBuilder;
 use url::Url;
@@ -99,9 +100,10 @@ async fn get_success_no_retry() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("library/nginx");
     let resp = client
         .get(
-            "library/nginx",
+            &repo,
             "manifests/latest",
             None,
             ocync_distribution::aimd::RegistryAction::ManifestRead,
@@ -135,9 +137,10 @@ async fn get_401_triggers_invalidate_and_retry() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("library/nginx");
     let resp = client
         .get(
-            "library/nginx",
+            &repo,
             "manifests/latest",
             None,
             ocync_distribution::aimd::RegistryAction::ManifestRead,
@@ -163,9 +166,10 @@ async fn get_double_401_returns_unauthorized() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
         .get(
-            "repo",
+            &repo,
             "manifests/latest",
             None,
             ocync_distribution::aimd::RegistryAction::ManifestRead,
@@ -193,9 +197,10 @@ async fn get_401_retry_only_happens_once() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
         .get(
-            "repo",
+            &repo,
             "manifests/latest",
             None,
             ocync_distribution::aimd::RegistryAction::ManifestRead,
@@ -220,9 +225,10 @@ async fn get_403_returns_forbidden() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("private/repo");
     let result = client
         .get(
-            "private/repo",
+            &repo,
             "manifests/latest",
             None,
             ocync_distribution::aimd::RegistryAction::ManifestRead,
@@ -248,9 +254,10 @@ async fn get_404_returns_not_found() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
         .get(
-            "repo",
+            &repo,
             "manifests/nonexistent",
             None,
             ocync_distribution::aimd::RegistryAction::ManifestRead,
@@ -275,9 +282,10 @@ async fn get_500_returns_registry_error() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
         .get(
-            "repo",
+            &repo,
             "manifests/latest",
             None,
             ocync_distribution::aimd::RegistryAction::ManifestRead,
@@ -301,9 +309,10 @@ async fn no_auth_provider_sends_no_header() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let resp = client
         .get(
-            "repo",
+            &repo,
             "manifests/latest",
             None,
             ocync_distribution::aimd::RegistryAction::ManifestRead,
@@ -388,9 +397,10 @@ async fn head_401_triggers_retry() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let resp = client
         .head(
-            "repo",
+            &repo,
             "manifests/latest",
             ocync_distribution::aimd::RegistryAction::ManifestHead,
         )
@@ -415,9 +425,10 @@ async fn head_double_401_returns_unauthorized() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
         .head(
-            "repo",
+            &repo,
             "manifests/latest",
             ocync_distribution::aimd::RegistryAction::ManifestHead,
         )

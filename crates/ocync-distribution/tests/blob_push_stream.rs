@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use http::StatusCode;
 use ocync_distribution::Digest;
+use ocync_distribution::RepositoryName;
 use ocync_distribution::client::RegistryClientBuilder;
 use url::Url;
 use wiremock::matchers::{header, method, path, query_param};
@@ -103,8 +104,9 @@ async fn happy_path() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("myrepo");
     let result = client
-        .blob_push_stream("myrepo", &digest, None, data_stream(data, 4))
+        .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap();
 
@@ -179,8 +181,9 @@ async fn multi_chunk() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
-        .blob_push_stream("repo", &digest, None, data_stream(data, 2))
+        .blob_push_stream(&repo, &digest, None, data_stream(data, 2))
         .await
         .unwrap();
 
@@ -228,8 +231,9 @@ async fn exact_chunk_boundary() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
-        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
+        .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap();
 
@@ -273,8 +277,9 @@ async fn empty_stream() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
-        .blob_push_stream("repo", &digest, None, data_stream(data, 1))
+        .blob_push_stream(&repo, &digest, None, data_stream(data, 1))
         .await
         .unwrap();
 
@@ -301,8 +306,9 @@ async fn post_initiation_rejected() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let err = client
-        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
+        .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -355,8 +361,9 @@ async fn patch_chunk_failure() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let err = client
-        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
+        .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -403,8 +410,9 @@ async fn put_finalize_rejected() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let err = client
-        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
+        .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -445,8 +453,9 @@ async fn stream_error_propagates() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
-        .blob_push_stream("repo", &digest, None, error_stream)
+        .blob_push_stream(&repo, &digest, None, error_stream)
         .await;
 
     assert!(result.is_err(), "stream error should propagate");
@@ -475,8 +484,9 @@ async fn post_returns_200_is_rejected() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let err = client
-        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
+        .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -528,9 +538,10 @@ async fn small_blob_uses_monolithic_upload() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
         .blob_push_stream(
-            "repo",
+            &repo,
             &digest,
             Some(data.len() as u64),
             data_stream(data, 4),
@@ -577,8 +588,9 @@ async fn unknown_size_skips_monolithic_threshold() {
         .build()
         .unwrap();
 
+    let repo = RepositoryName::new("repo");
     let result = client
-        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
+        .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap();
 

@@ -7,13 +7,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ocync_distribution::RegistryClient;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
+use ocync_distribution::{RegistryClient, RepositoryName};
 use ocync_sync::SyncReport;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{
-    DEFAULT_MAX_CONCURRENT_TRANSFERS, ResolvedMapping, SyncEngine, TagPair, TargetEntry,
+    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryName, ResolvedMapping, SyncEngine, TagPair,
+    TargetEntry,
 };
 use ocync_sync::filter::FilterConfig;
 use ocync_sync::progress::NullProgress;
@@ -289,7 +290,7 @@ async fn resolve_mapping(
             })?;
             let batch_checker = batch_checkers.get(&name).cloned();
             Ok(TargetEntry {
-                name,
+                name: RegistryName::new(name),
                 client,
                 batch_checker,
             })
@@ -297,7 +298,8 @@ async fn resolve_mapping(
         .collect::<Result<Vec<_>, CliError>>()?;
 
     // --- Fetch and filter tags ---
-    let all_tags = source_client.list_tags(&mapping.from).await?;
+    let source_repo_path = RepositoryName::new(&mapping.from);
+    let all_tags = source_client.list_tags(&source_repo_path).await?;
 
     let tags_config = mapping
         .tags
@@ -320,10 +322,17 @@ async fn resolve_mapping(
     let target_repo = mapping.to.as_deref().unwrap_or(&mapping.from).to_owned();
 
     // --- Resolve platforms and skip_existing (mapping overrides defaults) ---
-    let platforms = mapping
+    let platform_strs = mapping
         .platforms
         .clone()
         .or_else(|| config.defaults.as_ref().and_then(|d| d.platforms.clone()));
+    let platforms = platform_strs
+        .map(|strs| {
+            strs.iter()
+                .map(|s| s.parse())
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
 
     let skip_existing = mapping
         .skip_existing
@@ -332,8 +341,8 @@ async fn resolve_mapping(
 
     Ok(Some(ResolvedMapping {
         source_client,
-        source_repo: mapping.from.clone(),
-        target_repo,
+        source_repo: mapping.from.clone().into(),
+        target_repo: target_repo.into(),
         targets,
         tags: filtered.into_iter().map(TagPair::same).collect(),
         platforms,
@@ -375,7 +384,7 @@ fn print_dry_run(mappings: &[ResolvedMapping]) {
     }
 
     for mapping in mappings {
-        let target_names: Vec<&str> = mapping.targets.iter().map(|t| t.name.as_str()).collect();
+        let target_names: Vec<&str> = mapping.targets.iter().map(|t| &*t.name).collect();
         println!(
             "dry-run: {} -> {} ({} tag(s)) => [{}]",
             mapping.source_repo,

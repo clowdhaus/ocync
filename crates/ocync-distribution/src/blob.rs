@@ -13,6 +13,7 @@ use crate::client::{RegistryClient, build_url};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
+use crate::spec::RepositoryName;
 
 /// Blobs at or below this size are uploaded monolithically (POST + PUT) to
 /// save the extra round-trip cost of chunked upload negotiation.
@@ -80,7 +81,7 @@ impl RegistryClient {
     /// Returns `Some(size)` if the blob exists, `None` if not found.
     pub async fn blob_exists(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         digest: &Digest,
     ) -> Result<Option<u64>, Error> {
         let path = blob_path(digest);
@@ -105,7 +106,7 @@ impl RegistryClient {
     /// a byte stream for the response body.
     pub async fn blob_pull(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         digest: &Digest,
     ) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>> + 'static, Error> {
         let path = blob_path(digest);
@@ -122,14 +123,17 @@ impl RegistryClient {
     /// falls back to a regular upload URL.
     pub async fn blob_mount(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         digest: &Digest,
-        from_repo: &str,
+        from_repo: &RepositoryName,
     ) -> Result<MountResult, Error> {
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
-        let scopes = [Scope::pull_push(repository), Scope::pull(from_repo)];
+        let scopes = [
+            Scope::pull_push(repository.as_str()),
+            Scope::pull(from_repo.as_str()),
+        ];
         let digest_str = digest.to_string();
-        let from = from_repo.to_owned();
+        let from = from_repo.to_string();
 
         let resp = self
             .send_with_aimd(
@@ -154,12 +158,16 @@ impl RegistryClient {
     /// 2. PUT the entire data with the computed digest.
     ///
     /// Returns the digest of the uploaded blob.
-    pub async fn blob_push(&self, repository: &str, data: &[u8]) -> Result<Digest, Error> {
+    pub async fn blob_push(
+        &self,
+        repository: &RepositoryName,
+        data: &[u8],
+    ) -> Result<Digest, Error> {
         let hash = Sha256::digest(data);
         let digest = Digest::from_sha256(hash);
 
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
-        let scopes = [Scope::pull_push(repository)];
+        let scopes = [Scope::pull_push(repository.as_str())];
 
         let resp = self
             .send_with_aimd(
@@ -214,7 +222,7 @@ impl RegistryClient {
     /// and delegate to [`blob_push`](Self::blob_push).
     pub async fn blob_push_stream<E>(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         expected_digest: &Digest,
         known_size: Option<u64>,
         stream: impl Stream<Item = Result<Bytes, E>>,
@@ -229,7 +237,7 @@ impl RegistryClient {
         // Monolithic threshold: small blobs skip chunked upload entirely.
         if known_size.is_some_and(|s| s <= MONOLITHIC_THRESHOLD) {
             debug!(
-                repository,
+                repository = repository.as_str(),
                 %expected_digest,
                 size = known_size.unwrap(),
                 "blob below monolithic threshold, using POST+PUT upload"
@@ -266,14 +274,14 @@ impl RegistryClient {
         }
 
         debug!(
-            repository,
+            repository = repository.as_str(),
             %expected_digest,
             chunk_size = self.chunk_size,
             "starting chunked blob upload"
         );
 
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
-        let scopes = [Scope::pull_push(repository)];
+        let scopes = [Scope::pull_push(repository.as_str())];
 
         let resp = self
             .send_with_aimd(
@@ -385,12 +393,12 @@ impl RegistryClient {
     /// caller's expected digest to catch data corruption.
     async fn blob_push_stream_gar_fallback(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         expected_digest: &Digest,
         stream: impl Stream<Item = Result<Bytes, Error>>,
     ) -> Result<Digest, Error> {
         warn!(
-            repository,
+            repository = repository.as_str(),
             host = self.base_url.host_str().unwrap_or("unknown"),
             "GAR does not support chunked uploads; buffering entire blob in memory"
         );
@@ -414,18 +422,18 @@ impl RegistryClient {
     /// PATCH with no `Content-Range` header, followed by a PUT to finalize.
     async fn blob_push_stream_ghcr(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         expected_digest: &Digest,
         known_size: Option<u64>,
         stream: impl Stream<Item = Result<Bytes, Error>>,
     ) -> Result<Digest, Error> {
         warn!(
-            repository,
+            repository = repository.as_str(),
             "GHCR multi-PATCH chunked upload is broken; buffering blob for single-PATCH upload"
         );
 
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
-        let scopes = [Scope::pull_push(repository)];
+        let scopes = [Scope::pull_push(repository.as_str())];
 
         // Initiate upload.
         let resp = self
@@ -690,8 +698,9 @@ mod tests {
 
         let client = build_gar_client(port);
 
+        let repo = RepositoryName::new("my-project/my-repo");
         let result = client
-            .blob_push_stream("my-project/my-repo", &digest, None, data_stream(data, 4))
+            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
             .await
             .unwrap();
 
@@ -747,8 +756,9 @@ mod tests {
 
         // Pass None so the monolithic threshold does not intercept the call;
         // we are verifying the GHCR-specific single-PATCH path directly.
+        let repo = RepositoryName::new("my-org/my-image");
         let result = client
-            .blob_push_stream("my-org/my-image", &digest, None, data_stream(data, 4))
+            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
             .await
             .unwrap();
 
@@ -797,8 +807,9 @@ mod tests {
         let client = build_ghcr_client(port);
 
         // No known_size — GHCR path still taken based on hostname alone.
+        let repo = RepositoryName::new("repo");
         let result = client
-            .blob_push_stream("repo", &digest, None, data_stream(data, 4))
+            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
             .await
             .unwrap();
 

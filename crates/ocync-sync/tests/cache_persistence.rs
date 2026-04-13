@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use ocync_distribution::Digest;
+use ocync_distribution::spec::RepositoryName;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::plan::BlobStatus;
 
@@ -77,8 +78,8 @@ fn round_trip_mount_source_survives() {
 
     let loaded = TransferStateCache::load(&path, long_ttl());
     assert_eq!(
-        loaded.blob_mount_source("reg.io", &digest_a(), "repo/b"),
-        Some("repo/a")
+        loaded.blob_mount_source("reg.io", &digest_a(), &RepositoryName::from("repo/b")),
+        Some(&RepositoryName::from("repo/a"))
     );
 }
 
