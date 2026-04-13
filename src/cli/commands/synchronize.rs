@@ -26,6 +26,7 @@ use crate::SyncArgs;
 use crate::cli::config::{
     AuthType, Config, GlobOrList, MappingConfig, TagsConfig, load_config, resolve_target_names,
 };
+use crate::cli::output::format_bytes;
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
 /// Default cache TTL: 12 hours.
@@ -431,26 +432,6 @@ fn print_summary(report: &SyncReport) {
     );
 }
 
-/// Format a byte count as a human-readable string using SI decimal prefixes.
-///
-/// Matches the same SI convention as [`parse_size`] (1 KB = 1,000 bytes) so
-/// that parsed and displayed values round-trip consistently.
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1_000;
-    const MB: u64 = 1_000_000;
-    const GB: u64 = 1_000_000_000;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,33 +471,6 @@ mod tests {
         assert_eq!(parse_duration("invalid"), None);
         assert_eq!(parse_duration(""), None);
         assert_eq!(parse_duration("12hours"), None);
-    }
-
-    #[test]
-    fn format_bytes_zero() {
-        assert_eq!(format_bytes(0), "0 B");
-    }
-
-    #[test]
-    fn format_bytes_bytes() {
-        assert_eq!(format_bytes(512), "512 B");
-    }
-
-    #[test]
-    fn format_bytes_kb() {
-        assert_eq!(format_bytes(1_000), "1.0 KB");
-        assert_eq!(format_bytes(1_500), "1.5 KB");
-    }
-
-    #[test]
-    fn format_bytes_mb() {
-        assert_eq!(format_bytes(1_000_000), "1.0 MB");
-        assert_eq!(format_bytes(5_500_000), "5.5 MB");
-    }
-
-    #[test]
-    fn format_bytes_gb() {
-        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
     }
 
     #[test]
