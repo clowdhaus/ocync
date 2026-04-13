@@ -28,6 +28,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use ocync_distribution::BatchBlobChecker;
 use ocync_distribution::Digest;
 use ocync_distribution::RegistryClient;
 use ocync_distribution::blob::MountResult;
@@ -67,7 +68,6 @@ pub struct ResolvedMapping {
 /// `name` must be unique across targets within a [`ResolvedMapping`] -- it is
 /// used as the key in the blob deduplication map to track which blobs have
 /// already been transferred to each target.
-#[derive(Debug)]
 pub struct TargetEntry {
     /// Registry identifier used as the blob dedup key.
     ///
@@ -76,6 +76,31 @@ pub struct TargetEntry {
     pub name: String,
     /// Client for this target registry.
     pub client: Arc<RegistryClient>,
+    /// Optional batch blob checker for this target (ECR batch API).
+    ///
+    /// When present, [`transfer_image_blobs`] pre-populates the cache via
+    /// a single batch call instead of per-blob HEAD checks.
+    pub batch_checker: Option<Rc<dyn BatchBlobChecker>>,
+}
+
+impl Clone for TargetEntry {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            client: Arc::clone(&self.client),
+            batch_checker: self.batch_checker.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TargetEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TargetEntry")
+            .field("name", &self.name)
+            .field("client", &self.client)
+            .field("batch_checker", &self.batch_checker.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 /// A source/target tag pair for syncing.
@@ -158,6 +183,8 @@ struct TransferTask {
     source_tag: String,
     /// Target tag (for pushing manifests).
     target_tag: String,
+    /// Optional batch blob checker for pre-populating the cache.
+    batch_checker: Option<Rc<dyn BatchBlobChecker>>,
 }
 
 /// Discovery outcome for one (mapping, tag) pair.
@@ -286,11 +313,7 @@ impl SyncEngine {
                 let source_tag = tag_pair.source.clone();
                 let target_tag = tag_pair.target.clone();
                 let retry = self.retry.clone();
-                let targets: Vec<(String, Arc<RegistryClient>)> = mapping
-                    .targets
-                    .iter()
-                    .map(|te| (te.name.clone(), Arc::clone(&te.client)))
-                    .collect();
+                let targets = mapping.targets.clone();
 
                 discovery_futures.push(async move {
                     discover_tag(
@@ -429,7 +452,7 @@ async fn discover_tag(
     target_repo: &str,
     source_tag: &str,
     target_tag: &str,
-    targets: &[(String, Arc<RegistryClient>)],
+    targets: &[TargetEntry],
     retry: &RetryConfig,
 ) -> DiscoveryOutcome {
     // Pull source manifest (shared across all targets for this tag).
@@ -446,10 +469,10 @@ async fn discover_tag(
                 );
                 let fail_results: Vec<ImageResult> = targets
                     .iter()
-                    .map(|(target_name, _)| ImageResult {
+                    .map(|target| ImageResult {
                         image_id: Uuid::now_v7(),
                         source: format!("{source_repo}:{source_tag}"),
-                        target: format!("{target_repo} ({target_name}):{target_tag}"),
+                        target: format!("{target_repo} ({}):{target_tag}", target.name),
                         status: ImageStatus::Failed {
                             error: error_str.clone(),
                             retries: retry.max_retries,
@@ -468,22 +491,23 @@ async fn discover_tag(
     // HEAD-check all targets concurrently.
     let mut head_checks = FuturesUnordered::new();
 
-    for (target_name, target_client) in targets {
-        let client = Arc::clone(target_client);
+    for target in targets {
+        let client = Arc::clone(&target.client);
         let repo = target_repo.to_owned();
         let tag = target_tag.to_owned();
-        let name = target_name.clone();
+        let name = target.name.clone();
+        let checker = target.batch_checker.clone();
 
         head_checks.push(async move {
             let result = client.manifest_head(&repo, &tag).await;
-            (name, client, result)
+            (name, client, checker, result)
         });
     }
 
     let mut active_items = Vec::new();
     let mut skipped_results = Vec::new();
 
-    while let Some((target_name, target_client, result)) = head_checks.next().await {
+    while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
             Ok(Some(head)) if head.digest == *source_digest => {
                 info!(
@@ -516,6 +540,7 @@ async fn discover_tag(
                     source_repo: source_repo.to_owned(),
                     source_tag: source_tag.to_owned(),
                     target_tag: target_tag.to_owned(),
+                    batch_checker,
                 });
             }
             Err(e) => {
@@ -534,6 +559,7 @@ async fn discover_tag(
                     source_repo: source_repo.to_owned(),
                     source_tag: source_tag.to_owned(),
                     target_tag: target_tag.to_owned(),
+                    batch_checker,
                 });
             }
         }
@@ -568,6 +594,7 @@ async fn execute_item(
         target_client: &item.target_client,
         target_name: &item.target_name,
         target_repo: &item.target_repo,
+        batch_checker: item.batch_checker.as_ref(),
     };
     let outcome = transfer_image_blobs(&ctx, &item.source_data, freq_counts).await;
 
@@ -716,6 +743,8 @@ struct TransferContext<'a> {
     target_client: &'a RegistryClient,
     target_name: &'a str,
     target_repo: &'a str,
+    /// Optional batch blob checker for pre-populating the cache.
+    batch_checker: Option<&'a Rc<dyn BatchBlobChecker>>,
 }
 
 /// Transfer all blobs for a single image to one target.
@@ -739,6 +768,44 @@ async fn transfer_image_blobs(
         let fb = freq_counts.get(&b.digest).copied().unwrap_or(0);
         fb.cmp(&fa)
     });
+
+    // Batch existence check: when a batch checker is available, check all
+    // blobs upfront in a single API call and pre-populate the cache. The
+    // per-blob loop then hits cache at Step 1 for existing blobs (skipping
+    // the per-blob HEAD at Step 3 entirely).
+    if let Some(checker) = ctx.batch_checker {
+        let all_digests: Vec<Digest> = blobs.iter().map(|b| b.digest.clone()).collect();
+        match checker
+            .check_blob_existence(ctx.target_repo, &all_digests)
+            .await
+        {
+            Ok(existing) => {
+                let existing_count = existing.len();
+                for digest in &existing {
+                    ctx.cache.borrow_mut().set_blob_exists(
+                        ctx.target_name,
+                        digest.clone(),
+                        ctx.target_repo.to_owned(),
+                    );
+                }
+                debug!(
+                    target_name = %ctx.target_name,
+                    repo = %ctx.target_repo,
+                    total = all_digests.len(),
+                    existing = existing_count,
+                    "batch check pre-populated cache"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target_name = %ctx.target_name,
+                    error = %e,
+                    "batch check failed, falling back to per-blob HEAD"
+                );
+                // Graceful degradation: continue with per-blob HEAD checks.
+            }
+        }
+    }
 
     let mut outcome = TargetBlobOutcome::default();
 

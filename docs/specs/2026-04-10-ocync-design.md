@@ -161,25 +161,24 @@ cargo tree -e features | grep ring        # must be empty (unless explicitly all
 
 ## Sync Model
 
-### Two-Phase Sync (Plan-First)
+### Pipelined Sync (Discovery + Execution Overlap)
 
-The sync engine operates in two distinct phases to maximize deduplication:
+The sync engine uses a pipelined architecture where discovery and execution overlap via `tokio::select!` over two `FuturesUnordered` pools with a `VecDeque` pending queue between them. This eliminates the latency cost of an upfront planning phase — execution begins as soon as the first image is discovered.
 
-**Phase 1 — Plan**: Resolve ALL manifests from ALL mappings, collect all blob digests, deduplicate globally. No writes occur during planning.
+**Discovery pool**: Concurrent futures that pull source manifests (once per tag) and HEAD-check each target manifest. Index manifests are fully resolved (all children pulled) before leaving discovery. Source data is shared across targets for the same tag via `Rc<PulledManifest>`.
 
-1. For each mapping, resolve source tags through the filter pipeline
-2. For each surviving tag, fetch the source manifest
-3. For image indexes, resolve all platform manifests recursively
-4. Collect every blob digest (layers + configs) across all mappings into a global set
-5. HEAD-check each unique digest against each target registry (parallelized)
-6. Build a global transfer plan: which unique blobs need uploading, which can be mounted, which already exist
+**Pending queue**: Discovery completions produce `TransferTask` entries that queue here. The engine promotes pending items to execution when the global semaphore has capacity.
 
-**Phase 2 — Execute**: Transfer unique blobs, push manifests in DAG order.
+**Execution pool**: Each `(tag, target)` pair becomes an independent future. Within each future, blobs are processed in frequency-descending order (most-shared blobs first for maximum cross-image cache benefit):
 
-1. Transfer blobs (deduplicated — each unique blob uploaded at most once per target registry)
-2. Push platform manifests (only after all their blobs exist)
-3. Push image indexes (only after all referenced platform manifests exist)
-4. Sync referrers/artifacts (only after subject manifests exist)
+1. **Cache check** — persistent `TransferStateCache` (survives across runs) records blob status per target
+2. **Cross-repo mount** — if blob exists at same target in a different repo, attempt mount
+3. **HEAD check** — verify blob existence at target (progressive cache population, not upfront batch)
+4. **Pull + push** — stream from source, push to target (or read from disk staging for multi-target)
+
+After all blobs complete for a `(tag, target)`: push manifests (children first for indexes, then top-level by tag).
+
+**Pipeline `select!` discipline**: Uses `biased;` (prefer execution completions to free permits) and emptiness guards on every branch. Shutdown and drain deadline branches use guard conditions — never `std::future::pending()` inside async blocks.
 
 **Stats report**: actual unique layers transferred vs total layer references across all images. Example: "12 unique layers transferred (referenced 89 times across 50 images)".
 
@@ -231,26 +230,32 @@ For each filtered tag:
 ### Push Ordering (DAG)
 
 Images are pushed in strict dependency order to avoid registry rejection:
-1. **Blobs** (layers + config) — deduplicated across all concurrent syncs via global plan
+1. **Blobs** (layers + config) — deduplicated via persistent cache and progressive population
 2. **Platform-specific manifests** — only after ALL their blobs exist at target
 3. **Image indexes** (manifest lists) — only after ALL referenced manifests exist
 4. **Referrers** (signatures, SBOMs) — only after their subject manifest exists
 
-### Blob Deduplication (Process-Global)
+### Blob Deduplication (Persistent Cache)
 
-The plan phase builds a process-global dedup map. During execution:
+The engine maintains a `TransferStateCache` wrapping a `BlobDedupMap` that persists across sync runs. The cache uses a binary format (postcard + CRC32 integrity check) and supports TTL-based expiry. On startup, a warm cache from a previous run can skip HEAD checks entirely for known blobs.
 
 ```
-blob_state: Map<(TargetRegistry, Digest), BlobStatus>
+blob_state: Map<(TargetName, Digest), BlobInfo>
+
+BlobInfo:
+  status: BlobStatus
+  known_repos: BTreeSet<String>   — repos at this target known to have the blob
 
 BlobStatus:
-  ExistsAtTarget    — HEAD returned 200, skip
-  InProgress(wait)  — another task is uploading, await completion
-  Completed         — upload finished by another task, skip
-  Failed(error)     — upload failed, don't retry
+  ExistsAtTarget    — HEAD returned 200 (or warm cache hit), skip
+  InProgress        — another future is uploading, skip (plan-phase eliminated races)
+  Completed         — upload finished by another future, skip
+  Failed            — upload failed, eligible for retry on next run
 ```
 
-Before any blob operation: check the map first. This guarantees each unique blob is transferred at most once per target registry per sync run, regardless of how many images reference it.
+Only `ExistsAtTarget` and `Completed` states are persisted — transient states (`InProgress`, `Failed`) are stripped before serialization. Cache population is progressive: HEAD checks happen inline during execution rather than in an upfront batch, and results immediately benefit subsequent images sharing the same blob.
+
+**Lazy invalidation**: when a mount or push fails for a cached blob, the entry is invalidated and the operation falls back to a fresh pull+push. This handles target-side staleness (lifecycle policies, manual deletion).
 
 ### Cross-Repo Blob Mount `from` Logic
 
@@ -263,7 +268,7 @@ BlobInfo:
   repos: Set<String>   — repository paths known to have this blob
 ```
 
-When mounting a blob into a new repository, any repo from the `repos` set can serve as the `from` parameter. The engine picks one arbitrarily (first found).
+When mounting a blob into a new repository, any repo from the `repos` set can serve as the `from` parameter. The engine picks the alphabetically first repo (deterministic via `BTreeSet` iteration).
 
 On mount response:
 - **201 Created**: mounted successfully, add the new repo to the `repos` set
@@ -277,18 +282,29 @@ On mount response:
 
 **Same-account ECR optimization**: When multiple targets are in the same ECR account, push to the first target, then cross-repo mount to the others (zero additional data transfer).
 
-**Memory ceiling**: `chunk_size * max_concurrent * num_active_upload_streams`. With defaults (4MB chunks, 10 concurrent, 3 targets): ~120MB peak. For ML image workloads with 32MB chunks: ~960MB peak. Document this formula in operator guidance.
+**Memory ceiling (streaming)**: `chunk_size * max_concurrent * num_active_upload_streams`. With defaults (8MB chunks, 50 concurrent, 3 targets): bounded by semaphore capacity. When disk staging is enabled for multi-target, blobs are pulled once to `{cache_dir}/blobs/{algorithm}/{hex_digest}` and read by each target push, adding disk I/O but reducing source API calls.
 
-### Streaming Transfer (No Local Disk)
+### Streaming Transfer (With Optional Disk Staging)
 
-Blobs are piped directly from source to target:
+**Single-target mode** (default): blobs are piped directly from source to target with no local disk usage:
 ```
 source registry GET → [bytes stream] → target registry PATCH/PUT
                          ↓
                    SHA-256 computed on-the-fly for verification
 ```
 
-No temporary files. No local disk usage. Memory usage bounded by chunk size per active upload stream.
+Memory usage bounded by chunk size per active upload stream.
+
+**Multi-target mode** (when `global.cache_dir` is set and multiple targets exist): blobs are pulled once to a content-addressable disk staging area, then read by each target push:
+```
+source registry GET → [bytes stream] → {cache_dir}/blobs/{algo}/{hex} (atomic write)
+                                              ↓
+                              target 1 push ← read from disk
+                              target 2 push ← read from disk
+                              target N push ← read from disk
+```
+
+Staging uses atomic write protocol (tmp file → fsync → rename → dir fsync) for crash safety. Orphaned tmp files from crashes are cleaned up on startup. Eviction by total staging size keeps disk usage bounded (`global.staging_size_limit`). Staging is automatically disabled for single-target deployments (`BlobStage::disabled()` — zero overhead).
 
 ### Layer Recompression (gzip → zstd)
 
@@ -739,13 +755,23 @@ Some older registries don't support the OCI referrers API. They may use the "tag
 2. If 404, try tag fallback (`GET /v2/{repo}/manifests/sha256-{digest}`)
 3. If neither works, log INFO and continue (artifacts not available)
 
-### Concurrency
+### Concurrency (Three-Level Hierarchy)
 
-- All mappings run concurrently (subject to global and per-registry concurrency caps)
-- Per-registry rate limiting (token bucket, configurable)
-- Per-registry concurrency cap (configurable, default: 10)
-- Global concurrent transfer cap (configurable, default: 50)
-- Adaptive backoff on 429 responses (separate from rate limiter)
+Concurrency is three independent layers:
+
+1. **Global image semaphore** (engine-level): `max_concurrent_transfers` (default 50) caps in-flight `(tag, target)` pairs. Each image sync future acquires a permit before starting execution.
+
+2. **Per-registry aggregate semaphore** (client-level): `max_concurrent` per registry (default 50) caps total HTTP requests to one host. Prevents overwhelming any single registry.
+
+3. **Per-(registry, action) AIMD windows** (client-level): Adaptive concurrency using AIMD (Additive Increase, Multiplicative Decrease) with TCP Reno-style congestion epochs. Each window tracks a floating-point limit that increases fractionally on success (`+1/window`) and halves on 429 (`/2`). A 100ms congestion epoch prevents multiple 429s from the same burst from collapsing the window.
+
+   Registry-specific window granularity via `RegistryAction` enum (9 OCI operations):
+   - **ECR**: 9 independent windows (each API action has different TPS limits)
+   - **Docker Hub**: 3 windows (HEAD unmetered, manifest-read separate, others shared)
+   - **GAR**: 1 shared window (per-project quota)
+   - **Others**: 5 coarse windows (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST)
+
+Every HTTP request acquires permits from levels 2 and 3. Level 1 is engine-level only. When an AIMD window shrinks, the per-action `Arc<Semaphore>` is replaced (not shrunk by forgetting one permit) — Tokio has no `remove_permits` API.
 
 ---
 
@@ -776,7 +802,10 @@ log_format: json                       # json | text (default: auto-detect)
 log_level: default                     # default | quiet | verbose | debug | trace
 
 global:
-  max_concurrent_transfers: 50         # default: 50
+  max_concurrent_transfers: 50         # default: 50, caps in-flight (tag, target) pairs
+  cache_dir: /var/cache/ocync          # persistent cache + blob staging directory
+  cache_ttl: 12h                       # warm cache TTL ("0" disables expiry)
+  staging_size_limit: 2GB              # disk staging eviction threshold (SI prefixes)
 
 registries:
   chainguard:
@@ -1641,28 +1670,17 @@ At the end of each sync run, all metrics are pushed to the Pushgateway. OTLP exp
 
 ### Behavior
 
-Default timeout: 25s (configurable via `watch.shutdown_timeout`). This is chosen to fit within Kubernetes' default 30s `terminationGracePeriodSeconds` with 5s of margin.
+Default drain deadline: 25s (configurable via `SyncEngine::with_drain_deadline()`). This is chosen to fit within Kubernetes' default 30s `terminationGracePeriodSeconds` with 5s of margin.
 
 On receiving SIGTERM or SIGINT:
 
-1. **Stop new work** — no new images start syncing
-2. **Let in-flight complete** — active uploads continue their current chunk
-3. **Finalize if within timeout** — if the current upload can complete within the remaining shutdown time, let it finish (PUT finalize with digest)
-4. **Abandon if not** — if timeout would be exceeded, abandon the upload session
-5. **Clean up orphaned uploads** — DELETE any upload sessions that were abandoned (best-effort, 5s timeout per DELETE request)
-6. **Exit 0** — SIGTERM/SIGINT is a clean shutdown, not an error
+1. **Stop promoting new work** — pending items in the `VecDeque` are not promoted to execution
+2. **Stop discovery** — discovery futures are no longer polled
+3. **Drain in-flight execution** — active execution futures continue until completion or drain deadline
+4. **Persist cache** — `TransferStateCache` is persisted to disk after the pipeline loop exits, preserving progress for the next run
+5. **Abandon if deadline exceeded** — if drain deadline fires while execution futures remain, they are abandoned and logged
 
-### Async Cancellation Safety
-
-The engine tracks active upload session UUIDs (from the `Location` header returned by `POST /v2/{repo}/blobs/uploads/`). On shutdown:
-
-```
-For each active_upload in upload_sessions:
-    DELETE /v2/{repo}/blobs/uploads/{uuid}    # best-effort, 5s timeout
-    Log at DEBUG: "cleaned up orphaned upload {uuid}"
-```
-
-This prevents orphaned upload sessions from consuming registry storage quotas. The cleanup is best-effort — if a DELETE fails or times out, it is logged and skipped.
+The `select!` drain deadline branch guards on `!execution_futures.is_empty()` so the engine exits immediately when all work completes rather than waiting for the full deadline.
 
 ---
 

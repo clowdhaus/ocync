@@ -37,6 +37,7 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
         targets: vec![TargetEntry {
             name: bare_hostname(args.destination.registry()).to_owned(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],
     };
