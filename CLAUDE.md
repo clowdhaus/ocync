@@ -88,6 +88,10 @@ New optimization layers must:
 - **Testing**: see Testing standards section below
 - **Classifiers**: response classifier functions that don't use `self` should be free functions
 - **Formatting**: no special symbols (`§`, etc.) in docs or code — use plain text references; prefer heading hierarchy over excessive bold
+- **Best-effort I/O**: when an I/O result is intentionally not propagated (e.g., directory fsync after a successful atomic rename), log with `tracing::warn!` including path and error — never `let _ = io_op()`. Silent drops mask production issues.
+- **SAFETY comments**: `// SAFETY:` is reserved for explaining why `unsafe` code is sound. For logic correctness assertions (e.g., "guard ensures Option is Some"), use plain comments.
+- **Cleanup loop resilience**: loops that delete multiple files (cleanup, eviction, tmp removal) must log and continue on individual failures, never abort the whole operation with `?`. One stuck file should not prevent cleaning up the rest.
+- **Configurable timeouts**: hardcoded timeout values (drain deadlines, retry caps, etc.) should be configurable via builder methods with sensible defaults. Document the default in the builder method's doc comment, not just in the code that uses it.
 
 ## Testing standards
 
@@ -114,6 +118,14 @@ If a code path is fully wired end-to-end, it needs an integration test that exer
 ### Test concurrent properties at real concurrency
 
 At least some tests must run with `max_concurrent > 1` and multiple tags/targets executing simultaneously. Assert that dedup, caching, and AIMD still work under contention. If concurrent tests are flaky, that is a signal of a real race — investigate, don't serialize.
+
+### Test configurable behavior at boundary values
+
+Tests for configurable parameters (timeouts, concurrency caps, thresholds) must use values that **differentiate** the custom setting from the default. A drain deadline test where blob delays exceed both the custom 2s and default 25s proves nothing about the custom deadline — both would abandon. Use delays **between** the custom and default values so the test only passes if the custom value is actually used.
+
+### Assert aggregate and per-image stats together
+
+Engine integration tests must assert both per-image stats (`report.images[N].blob_stats`) and aggregate stats (`report.stats`). The aggregation path in `compute_stats` has its own logic — a bug there would be missed by per-image assertions alone.
 
 ### wiremock for all network code
 
