@@ -131,8 +131,8 @@ pub(crate) async fn run(
 
     match report.exit_code() {
         0 => Ok(ExitCode::Success),
-        1 => Ok(ExitCode::Failure),
-        _ => Ok(ExitCode::Error),
+        1 => Ok(ExitCode::PartialFailure),
+        _ => Ok(ExitCode::Failure),
     }
 }
 

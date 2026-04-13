@@ -19,28 +19,38 @@ use crate::{Cli, LogFormat};
 // Exit codes (grep/POSIX convention)
 // ---------------------------------------------------------------------------
 
-/// Process exit codes following the grep/POSIX convention.
+/// Process exit codes for CI/CD differentiation.
 ///
-/// - `Success` (0): operation completed successfully
-/// - `Failure` (1): operation completed but with a negative result
-///   (auth check failed, no tags matched, sync had partial errors)
-/// - `Error` (2): program error (bad config, invalid arguments, internal bug)
+/// - `Success` (0): all images synced or skipped
+/// - `PartialFailure` (1): some images failed, some succeeded
+/// - `Failure` (2): all images failed, or unclassified error
+/// - `ConfigError` (3): invalid configuration file
+/// - `AuthError` (4): authentication or authorization failure
+///
+/// Codes 3-4 are more specific than 2 (not more severe). CI scripts
+/// can branch: `>= 3` means the fix is in config/credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExitCode {
-    /// Operation completed successfully.
+    /// All images synced or skipped successfully.
     Success,
-    /// Operational failure (partial failure, check failed, no results).
+    /// Some images failed, some succeeded or were skipped.
+    PartialFailure,
+    /// All images failed, or unclassified program error.
     Failure,
-    /// Program error (bad config, bad arguments, internal error).
-    Error,
+    /// Invalid configuration file (parse, validation, env vars).
+    ConfigError,
+    /// Authentication or authorization failure.
+    AuthError,
 }
 
 impl From<ExitCode> for std::process::ExitCode {
     fn from(code: ExitCode) -> Self {
         match code {
             ExitCode::Success => Self::from(0),
-            ExitCode::Failure => Self::from(1),
-            ExitCode::Error => Self::from(2),
+            ExitCode::PartialFailure => Self::from(1),
+            ExitCode::Failure => Self::from(2),
+            ExitCode::ConfigError => Self::from(3),
+            ExitCode::AuthError => Self::from(4),
         }
     }
 }
@@ -67,6 +77,17 @@ pub(crate) enum CliError {
     /// Invalid user input.
     #[error("{0}")]
     Input(String),
+}
+
+impl CliError {
+    /// Map this error to the appropriate process exit code.
+    pub(crate) fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Config(_) => ExitCode::ConfigError,
+            Self::Registry(e) if e.is_auth_error() => ExitCode::AuthError,
+            _ => ExitCode::Failure,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +229,7 @@ fn detect_log_format() -> Option<LogFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http;
 
     #[test]
     fn verbosity_quiet_is_error() {
@@ -244,11 +266,65 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_equality() {
-        // ExitCode enum variants are distinct.
-        assert_ne!(ExitCode::Success, ExitCode::Failure);
-        assert_ne!(ExitCode::Failure, ExitCode::Error);
-        assert_ne!(ExitCode::Success, ExitCode::Error);
+    fn exit_code_all_variants_distinct() {
+        assert_ne!(ExitCode::Success, ExitCode::PartialFailure);
+        assert_ne!(ExitCode::PartialFailure, ExitCode::Failure);
+        assert_ne!(ExitCode::Failure, ExitCode::ConfigError);
+        assert_ne!(ExitCode::ConfigError, ExitCode::AuthError);
+    }
+
+    #[test]
+    fn cli_error_exit_code_config() {
+        let err = CliError::Config(config::ConfigError::Parse("bad".into()));
+        assert_eq!(err.exit_code(), ExitCode::ConfigError);
+    }
+
+    #[test]
+    fn cli_error_exit_code_auth_failed() {
+        let err = CliError::Registry(ocync_distribution::Error::AuthFailed {
+            registry: "example.com".into(),
+            reason: "denied".into(),
+        });
+        assert_eq!(err.exit_code(), ExitCode::AuthError);
+    }
+
+    #[test]
+    fn cli_error_exit_code_registry_401() {
+        let err = CliError::Registry(ocync_distribution::Error::RegistryError {
+            status: http::StatusCode::UNAUTHORIZED,
+            message: "no".into(),
+        });
+        assert_eq!(err.exit_code(), ExitCode::AuthError);
+    }
+
+    #[test]
+    fn cli_error_exit_code_registry_403() {
+        let err = CliError::Registry(ocync_distribution::Error::RegistryError {
+            status: http::StatusCode::FORBIDDEN,
+            message: "denied".into(),
+        });
+        assert_eq!(err.exit_code(), ExitCode::AuthError);
+    }
+
+    #[test]
+    fn cli_error_exit_code_registry_500() {
+        let err = CliError::Registry(ocync_distribution::Error::RegistryError {
+            status: http::StatusCode::INTERNAL_SERVER_ERROR,
+            message: "broke".into(),
+        });
+        assert_eq!(err.exit_code(), ExitCode::Failure);
+    }
+
+    #[test]
+    fn cli_error_exit_code_input() {
+        let err = CliError::Input("bad url".into());
+        assert_eq!(err.exit_code(), ExitCode::Failure);
+    }
+
+    #[test]
+    fn cli_error_exit_code_filter() {
+        let err = CliError::Filter(ocync_sync::Error::LatestWithoutSort);
+        assert_eq!(err.exit_code(), ExitCode::Failure);
     }
 
     #[test]

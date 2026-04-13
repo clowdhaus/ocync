@@ -302,7 +302,7 @@ async fn main() -> std::process::ExitCode {
         Ok(code) => code.into(),
         Err(err) => {
             eprintln!("error: {err}");
-            cli::ExitCode::Error.into()
+            err.exit_code().into()
         }
     }
 }
