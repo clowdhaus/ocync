@@ -46,7 +46,7 @@ use crate::cache::TransferStateCache;
 use crate::retry::{self, RetryConfig};
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
-use crate::{BlobTransferStats, ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats};
+use crate::{BlobTransferStats, ErrorKind, ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats};
 
 /// An image reference within a single registry (repository name + tag).
 ///
@@ -561,6 +561,7 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryOutcome {
                     source: source.to_string(),
                     target: format!("{} ({}):{}", target.repo, t.name, target.tag),
                     status: ImageStatus::Failed {
+                        kind: ErrorKind::ManifestPull,
                         error: error_str.clone(),
                         retries: retry.max_retries,
                     },
@@ -699,6 +700,7 @@ async fn execute_item(
             source: item.source.to_string(),
             target: item.target.to_string(),
             status: ImageStatus::Failed {
+                kind: ErrorKind::BlobTransfer,
                 error: err.to_string(),
                 retries: retry.max_retries,
             },
@@ -744,6 +746,7 @@ async fn execute_item(
                 source: item.source.to_string(),
                 target: item.target.to_string(),
                 status: ImageStatus::Failed {
+                    kind: ErrorKind::ManifestPush,
                     error: err.to_string(),
                     retries: retry.max_retries,
                 },
@@ -1394,6 +1397,7 @@ mod tests {
             ),
             make_image_result(
                 ImageStatus::Failed {
+                    kind: ErrorKind::BlobTransfer,
                     error: "timeout".into(),
                     retries: 3,
                 },

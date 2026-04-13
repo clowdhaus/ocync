@@ -79,7 +79,7 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
             ImageStatus::Skipped { reason } => {
                 println!("Skipped {src_display} -> {dst_display} (reason: {reason})");
             }
-            ImageStatus::Failed { error, retries } => {
+            ImageStatus::Failed { error, retries, .. } => {
                 eprintln!("Failed {src_display} -> {dst_display}: {error} (retries: {retries})");
             }
         }
