@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::auth::detect::{ProviderKind, detect_provider_kind};
+
 /// Default congestion epoch — prevents multiple halvings from the same burst.
 const DEFAULT_EPOCH: Duration = Duration::from_millis(100);
 
@@ -120,8 +122,34 @@ pub enum RegistryAction {
 /// Different registries have different rate-limit granularities. Use
 /// [`window_key_for_registry`] to obtain the correct key for a given host and
 /// operation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowKey(u8);
+
+// -- ECR window keys: independent TPS limit per action (9 windows) --
+const ECR_MANIFEST_HEAD: u8 = 0;
+const ECR_MANIFEST_READ: u8 = 1;
+const ECR_MANIFEST_WRITE: u8 = 2;
+const ECR_BLOB_HEAD: u8 = 3;
+const ECR_BLOB_READ: u8 = 4;
+const ECR_BLOB_UPLOAD_INIT: u8 = 5;
+const ECR_BLOB_UPLOAD_CHUNK: u8 = 6;
+const ECR_BLOB_UPLOAD_COMPLETE: u8 = 7;
+const ECR_TAG_LIST: u8 = 8;
+
+// -- Docker Hub window keys: HEADs free, manifest reads quota'd, rest shared --
+const DOCKER_HUB_HEADS: u8 = 10;
+const DOCKER_HUB_MANIFEST_READ: u8 = 11;
+const DOCKER_HUB_OTHER: u8 = 12;
+
+// -- GAR window key: single shared project quota --
+const GAR_SHARED: u8 = 20;
+
+// -- Unknown registry window keys: coarse grouping --
+const UNKNOWN_HEADS: u8 = 30;
+const UNKNOWN_READS: u8 = 31;
+const UNKNOWN_UPLOADS: u8 = 32;
+const UNKNOWN_MANIFEST_WRITE: u8 = 33;
+const UNKNOWN_TAG_LIST: u8 = 34;
 
 /// Map a registry host and action to an AIMD window key.
 ///
@@ -134,43 +162,49 @@ pub struct WindowKey(u8);
 /// - **Unknown**: coarse grouping — HEADs share, reads share, uploads share,
 ///   manifest writes and tag listing get their own windows.
 pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey {
-    if host.contains(".dkr.ecr.") || host.contains(".ecr-fips.") {
-        // ECR: independent TPS limit per action
-        let discriminant = match action {
-            RegistryAction::ManifestHead => 0,
-            RegistryAction::ManifestRead => 1,
-            RegistryAction::ManifestWrite => 2,
-            RegistryAction::BlobHead => 3,
-            RegistryAction::BlobRead => 4,
-            RegistryAction::BlobUploadInit => 5,
-            RegistryAction::BlobUploadChunk => 6,
-            RegistryAction::BlobUploadComplete => 7,
-            RegistryAction::TagList => 8,
-        };
-        WindowKey(discriminant)
-    } else if host.contains("docker.io") {
-        // Docker Hub: HEADs are free, manifest reads quota'd, rest shared
-        let discriminant = match action {
-            RegistryAction::ManifestHead | RegistryAction::BlobHead => 10,
-            RegistryAction::ManifestRead => 11,
-            _ => 12,
-        };
-        WindowKey(discriminant)
-    } else if host.ends_with("-docker.pkg.dev") {
-        // GAR: single shared project quota
-        WindowKey(20)
-    } else {
-        // Unknown registry: coarse grouping
-        let discriminant = match action {
-            RegistryAction::ManifestHead | RegistryAction::BlobHead => 30,
-            RegistryAction::ManifestRead | RegistryAction::BlobRead => 31,
-            RegistryAction::BlobUploadInit
-            | RegistryAction::BlobUploadChunk
-            | RegistryAction::BlobUploadComplete => 32,
-            RegistryAction::ManifestWrite => 33,
-            RegistryAction::TagList => 34,
-        };
-        WindowKey(discriminant)
+    match detect_provider_kind(host) {
+        Some(ProviderKind::Ecr) => {
+            // ECR: independent TPS limit per action
+            let key = match action {
+                RegistryAction::ManifestHead => ECR_MANIFEST_HEAD,
+                RegistryAction::ManifestRead => ECR_MANIFEST_READ,
+                RegistryAction::ManifestWrite => ECR_MANIFEST_WRITE,
+                RegistryAction::BlobHead => ECR_BLOB_HEAD,
+                RegistryAction::BlobRead => ECR_BLOB_READ,
+                RegistryAction::BlobUploadInit => ECR_BLOB_UPLOAD_INIT,
+                RegistryAction::BlobUploadChunk => ECR_BLOB_UPLOAD_CHUNK,
+                RegistryAction::BlobUploadComplete => ECR_BLOB_UPLOAD_COMPLETE,
+                RegistryAction::TagList => ECR_TAG_LIST,
+            };
+            WindowKey(key)
+        }
+        Some(ProviderKind::DockerHub) => {
+            // Docker Hub: HEADs are free, manifest reads quota'd, rest shared
+            let key = match action {
+                RegistryAction::ManifestHead | RegistryAction::BlobHead => DOCKER_HUB_HEADS,
+                RegistryAction::ManifestRead => DOCKER_HUB_MANIFEST_READ,
+                _ => DOCKER_HUB_OTHER,
+            };
+            WindowKey(key)
+        }
+        Some(ProviderKind::Gar) => {
+            // GAR: single shared project quota
+            WindowKey(GAR_SHARED)
+        }
+        _ => {
+            // All other registries (GHCR, ACR, Chainguard, ECR Public,
+            // GCR, unknown): coarse grouping
+            let key = match action {
+                RegistryAction::ManifestHead | RegistryAction::BlobHead => UNKNOWN_HEADS,
+                RegistryAction::ManifestRead | RegistryAction::BlobRead => UNKNOWN_READS,
+                RegistryAction::BlobUploadInit
+                | RegistryAction::BlobUploadChunk
+                | RegistryAction::BlobUploadComplete => UNKNOWN_UPLOADS,
+                RegistryAction::ManifestWrite => UNKNOWN_MANIFEST_WRITE,
+                RegistryAction::TagList => UNKNOWN_TAG_LIST,
+            };
+            WindowKey(key)
+        }
     }
 }
 
@@ -235,7 +269,7 @@ impl AimdController {
         // Ensure the window entry exists, then read its semaphore.
         let action_semaphore = {
             let mut map = self.windows.lock().expect("aimd lock poisoned");
-            let state = map.entry(key.clone()).or_insert_with(|| {
+            let state = map.entry(key).or_insert_with(|| {
                 let initial = DEFAULT_INITIAL_WINDOW.min(self.max_concurrent as f64);
                 let window = AimdWindow::new(initial, self.max_concurrent);
                 let limit = window.limit();

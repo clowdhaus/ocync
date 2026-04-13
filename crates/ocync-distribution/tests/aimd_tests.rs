@@ -17,7 +17,7 @@ use ocync_distribution::aimd::{
 
 #[test]
 fn ecr_every_action_gets_distinct_key() {
-    let host = "123456789.dkr.ecr.us-east-1.amazonaws.com";
+    let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
     let actions = [
         RegistryAction::ManifestHead,
         RegistryAction::ManifestRead,
@@ -43,7 +43,7 @@ fn ecr_every_action_gets_distinct_key() {
 
 #[test]
 fn ecr_fips_every_action_gets_distinct_key() {
-    let host = "123456789.ecr-fips.us-gov-west-1.amazonaws.com";
+    let host = "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com";
     let actions = [
         RegistryAction::ManifestHead,
         RegistryAction::ManifestRead,
@@ -195,7 +195,7 @@ async fn controller_acquire_success_increases_limit() {
 
 #[tokio::test]
 async fn controller_acquire_throttle_decreases_limit() {
-    let ctrl = AimdController::new("123456789.dkr.ecr.us-east-1.amazonaws.com", 64);
+    let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 64);
 
     // Warm up the window so it has room to decrease.
     for _ in 0..20 {
@@ -249,7 +249,7 @@ async fn controller_drop_without_report_treated_as_success() {
 
 #[tokio::test]
 async fn controller_throttle_with_outstanding_permits() {
-    let ctrl = AimdController::new("123456789.dkr.ecr.us-east-1.amazonaws.com", 64);
+    let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 64);
     let op = RegistryAction::BlobUploadChunk;
 
     // Warm up window so there's room to shrink.
@@ -298,7 +298,7 @@ async fn controller_throttle_with_outstanding_permits() {
 
 #[tokio::test]
 async fn controller_multiple_throttles_across_epochs() {
-    let ctrl = AimdController::new("123456789.dkr.ecr.us-east-1.amazonaws.com", 64);
+    let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 64);
     let op = RegistryAction::BlobUploadChunk;
 
     // Warm up to grow the window.

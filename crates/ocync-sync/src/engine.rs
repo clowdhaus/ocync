@@ -164,13 +164,11 @@ struct TransferTask {
 enum DiscoveryOutcome {
     /// All targets match; nothing to do. Contains one `ImageResult` per target.
     Skip(Vec<ImageResult>),
-    /// Some targets need sync. Contains active items and blob digests for
-    /// frequency tracking.
+    /// Some targets need sync. Blob digests for frequency tracking are
+    /// extracted from the shared source data in the first item.
     Active {
         /// One per target that needs sync.
         items: Vec<TransferTask>,
-        /// All blob digests from this tag's source data (for frequency tracking).
-        blobs: Vec<Digest>,
         /// Results for targets that were skipped (digest match).
         skipped: Vec<ImageResult>,
     },
@@ -380,9 +378,13 @@ impl SyncEngine {
                             }
                             results.extend(skip_results);
                         }
-                        DiscoveryOutcome::Active { items, blobs, skipped } => {
-                            for digest in &blobs {
-                                freq_map.record(digest);
+                        DiscoveryOutcome::Active { items, skipped } => {
+                            // Record blob frequencies from the shared source data.
+                            // All items share the same Rc<PulledManifest> (pulled once per tag).
+                            if let Some(first) = items.first() {
+                                for blob in blobs_from_manifest(&first.source_data) {
+                                    freq_map.record(&blob.digest);
+                                }
                             }
                             for r in &skipped {
                                 progress.image_completed(r);
@@ -541,15 +543,8 @@ async fn discover_tag(
         return DiscoveryOutcome::Skip(skipped_results);
     }
 
-    // Collect blob digests for frequency tracking.
-    let blobs: Vec<Digest> = blobs_from_manifest(&source_data)
-        .iter()
-        .map(|d| d.digest.clone())
-        .collect();
-
     DiscoveryOutcome::Active {
         items: active_items,
-        blobs,
         skipped: skipped_results,
     }
 }
@@ -986,16 +981,13 @@ fn file_read_stream(
     file: std::fs::File,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
     const CHUNK_SIZE: usize = 256 * 1024;
-    futures_util::stream::unfold(file, |mut file| async move {
+    let buf = vec![0u8; CHUNK_SIZE];
+    futures_util::stream::unfold((file, buf), |(mut file, mut buf)| async move {
         use std::io::Read;
-        let mut buf = vec![0u8; CHUNK_SIZE];
         match file.read(&mut buf) {
             Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                Some((Ok(Bytes::from(buf)), file))
-            }
-            Err(e) => Some((Err(e), file)),
+            Ok(n) => Some((Ok(Bytes::copy_from_slice(&buf[..n])), (file, buf))),
+            Err(e) => Some((Err(e), (file, buf))),
         }
     })
 }

@@ -56,7 +56,7 @@ without a config file.
 
 Examples:
   ocync copy docker.io/library/nginx:1.27 ghcr.io/myorg/nginx:1.27
-  ocync copy 123456789.dkr.ecr.us-east-1.amazonaws.com/app:v2 ghcr.io/myorg/app:v2";
+  ocync copy 123456789012.dkr.ecr.us-east-1.amazonaws.com/app:v2 ghcr.io/myorg/app:v2";
 
 const TAGS_LONG_ABOUT: &str = "\
 List, filter, and sort repository tags

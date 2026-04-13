@@ -12,6 +12,9 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
 
+/// HTTP `Authorization` header scheme prefix for bearer tokens.
+const BEARER_PREFIX: &str = "Bearer";
+
 /// Builder for [`RegistryClient`].
 pub struct RegistryClientBuilder {
     url: Url,
@@ -138,11 +141,10 @@ impl RegistryClient {
         op: RegistryAction,
     ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
-        let permit = self.aimd.acquire(op).await;
         let scopes = [Scope::pull(repository)];
 
-        let result = self
-            .send_with_retry(&scopes, "GET", |mut headers| {
+        let resp = self
+            .send_with_aimd(op, &scopes, "GET", |mut headers| {
                 if let Some(accept) = accept {
                     if let Ok(val) = HeaderValue::from_str(accept) {
                         headers.insert(ACCEPT, val);
@@ -150,10 +152,9 @@ impl RegistryClient {
                 }
                 self.http.get(url.clone()).headers(headers)
             })
-            .await;
+            .await?;
 
-        report_permit(permit, &result);
-        classify_response(result?, &self.base_url, repository).await
+        classify_response(resp, &self.base_url, repository).await
     }
 
     /// Perform an authenticated HEAD request.
@@ -166,17 +167,33 @@ impl RegistryClient {
         op: RegistryAction,
     ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
-        let permit = self.aimd.acquire(op).await;
         let scopes = [Scope::pull(repository)];
 
-        let result = self
-            .send_with_retry(&scopes, "HEAD", |headers| {
+        let resp = self
+            .send_with_aimd(op, &scopes, "HEAD", |headers| {
                 self.http.head(url.clone()).headers(headers)
             })
-            .await;
+            .await?;
 
+        classify_response(resp, &self.base_url, repository).await
+    }
+
+    /// Send a request with AIMD permit tracking and 401 retry.
+    ///
+    /// Combines permit acquisition, the authenticated retry loop, and AIMD
+    /// feedback reporting into a single call. Callers no longer need to
+    /// manually acquire/report permits.
+    pub(crate) async fn send_with_aimd(
+        &self,
+        action: RegistryAction,
+        scopes: &[Scope],
+        context: &str,
+        build_request: impl Fn(HeaderMap) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, Error> {
+        let permit = self.aimd.acquire(action).await;
+        let result = self.send_with_retry(scopes, context, build_request).await;
         report_permit(permit, &result);
-        classify_response(result?, &self.base_url, repository).await
+        result
     }
 
     /// Send a request with 401 retry and token invalidation.
@@ -185,7 +202,7 @@ impl RegistryClient {
     /// sends it, and if a 401 is returned, invalidates the cached token and
     /// retries once. Does NOT acquire an AIMD permit — callers manage their
     /// own permits.
-    pub(crate) async fn send_with_retry(
+    async fn send_with_retry(
         &self,
         scopes: &[Scope],
         context: &str,
@@ -208,21 +225,21 @@ impl RegistryClient {
     ///
     /// Call this before retrying a request after a 401 response so the auth
     /// provider fetches a fresh token instead of returning the stale one.
-    pub(crate) async fn invalidate_auth(&self) {
+    async fn invalidate_auth(&self) {
         if let Some(ref auth) = self.auth {
             auth.invalidate().await;
         }
     }
 
     /// Build auth headers for a request.
-    pub(crate) async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
+    async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
         let mut headers = HeaderMap::new();
 
         if let Some(ref auth) = self.auth {
             let token = auth.get_token(scopes).await?;
             let value = token.value();
             if !value.is_empty() {
-                let header_value = HeaderValue::from_str(&format!("Bearer {value}"))
+                let header_value = HeaderValue::from_str(&format!("{BEARER_PREFIX} {value}"))
                     .map_err(|e| Error::Other(format!("invalid auth header: {e}")))?;
                 headers.insert(AUTHORIZATION, header_value);
             }
@@ -237,10 +254,7 @@ impl RegistryClient {
 /// Calls [`AimdPermit::throttled`] on 429, [`AimdPermit::success`] otherwise.
 /// Transport errors (no response at all) are treated as success by the permit's
 /// drop impl, so we only need to handle the `Ok` case explicitly.
-pub(crate) fn report_permit(
-    permit: crate::aimd::AimdPermit<'_>,
-    result: &Result<reqwest::Response, Error>,
-) {
+fn report_permit(permit: crate::aimd::AimdPermit<'_>, result: &Result<reqwest::Response, Error>) {
     match result {
         Ok(resp) if resp.status() == StatusCode::TOO_MANY_REQUESTS => permit.throttled(),
         _ => permit.success(),
