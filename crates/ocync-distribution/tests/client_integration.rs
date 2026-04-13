@@ -100,7 +100,12 @@ async fn get_success_no_retry() {
         .unwrap();
 
     let resp = client
-        .get("library/nginx", "manifests/latest", None)
+        .get(
+            "library/nginx",
+            "manifests/latest",
+            None,
+            ocync_distribution::aimd::RegistryAction::ManifestRead,
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -131,7 +136,12 @@ async fn get_401_triggers_invalidate_and_retry() {
         .unwrap();
 
     let resp = client
-        .get("library/nginx", "manifests/latest", None)
+        .get(
+            "library/nginx",
+            "manifests/latest",
+            None,
+            ocync_distribution::aimd::RegistryAction::ManifestRead,
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -153,7 +163,14 @@ async fn get_double_401_returns_unauthorized() {
         .build()
         .unwrap();
 
-    let result = client.get("repo", "manifests/latest", None).await;
+    let result = client
+        .get(
+            "repo",
+            "manifests/latest",
+            None,
+            ocync_distribution::aimd::RegistryAction::ManifestRead,
+        )
+        .await;
     let err = result.unwrap_err();
     assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED));
 }
@@ -176,7 +193,14 @@ async fn get_401_retry_only_happens_once() {
         .build()
         .unwrap();
 
-    let result = client.get("repo", "manifests/latest", None).await;
+    let result = client
+        .get(
+            "repo",
+            "manifests/latest",
+            None,
+            ocync_distribution::aimd::RegistryAction::ManifestRead,
+        )
+        .await;
     assert!(result.is_err());
 }
 
@@ -196,7 +220,14 @@ async fn get_403_returns_forbidden() {
         .build()
         .unwrap();
 
-    let result = client.get("private/repo", "manifests/latest", None).await;
+    let result = client
+        .get(
+            "private/repo",
+            "manifests/latest",
+            None,
+            ocync_distribution::aimd::RegistryAction::ManifestRead,
+        )
+        .await;
     let err = result.unwrap_err();
     assert_eq!(err.status_code(), Some(StatusCode::FORBIDDEN));
 }
@@ -217,7 +248,14 @@ async fn get_404_returns_not_found() {
         .build()
         .unwrap();
 
-    let result = client.get("repo", "manifests/nonexistent", None).await;
+    let result = client
+        .get(
+            "repo",
+            "manifests/nonexistent",
+            None,
+            ocync_distribution::aimd::RegistryAction::ManifestRead,
+        )
+        .await;
     assert!(result.unwrap_err().is_not_found());
 }
 
@@ -237,7 +275,14 @@ async fn get_500_returns_registry_error() {
         .build()
         .unwrap();
 
-    let result = client.get("repo", "manifests/latest", None).await;
+    let result = client
+        .get(
+            "repo",
+            "manifests/latest",
+            None,
+            ocync_distribution::aimd::RegistryAction::ManifestRead,
+        )
+        .await;
     let err = result.unwrap_err();
     assert_eq!(err.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
 }
@@ -256,7 +301,15 @@ async fn no_auth_provider_sends_no_header() {
         .build()
         .unwrap();
 
-    let resp = client.get("repo", "manifests/latest", None).await.unwrap();
+    let resp = client
+        .get(
+            "repo",
+            "manifests/latest",
+            None,
+            ocync_distribution::aimd::RegistryAction::ManifestRead,
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 }
 
@@ -335,7 +388,14 @@ async fn head_401_triggers_retry() {
         .build()
         .unwrap();
 
-    let resp = client.head("repo", "manifests/latest").await.unwrap();
+    let resp = client
+        .head(
+            "repo",
+            "manifests/latest",
+            ocync_distribution::aimd::RegistryAction::ManifestHead,
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 }
 
@@ -355,7 +415,13 @@ async fn head_double_401_returns_unauthorized() {
         .build()
         .unwrap();
 
-    let result = client.head("repo", "manifests/latest").await;
+    let result = client
+        .head(
+            "repo",
+            "manifests/latest",
+            ocync_distribution::aimd::RegistryAction::ManifestHead,
+        )
+        .await;
     let err = result.unwrap_err();
     assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED));
 }

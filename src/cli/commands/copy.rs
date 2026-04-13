@@ -1,11 +1,17 @@
-//! The `copy` subcommand — copies a single image between registries.
+//! The `copy` subcommand -- copies a single image between registries.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ocync_sync::ImageStatus;
-use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
+use ocync_sync::cache::TransferStateCache;
+use ocync_sync::engine::{
+    DEFAULT_MAX_CONCURRENT_TRANSFERS, ResolvedMapping, SyncEngine, TagPair, TargetEntry,
+};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
+use ocync_sync::staging::BlobStage;
 
 use crate::CopyArgs;
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
@@ -19,9 +25,10 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
     let dst_tag = args.destination.tag().unwrap_or(src_tag);
 
     let source_client =
-        Arc::new(build_registry_client(bare_hostname(args.source.registry()), None).await?);
-    let target_client =
-        Arc::new(build_registry_client(bare_hostname(args.destination.registry()), None).await?);
+        Arc::new(build_registry_client(bare_hostname(args.source.registry()), None, None).await?);
+    let target_client = Arc::new(
+        build_registry_client(bare_hostname(args.destination.registry()), None, None).await?,
+    );
 
     let mapping = ResolvedMapping {
         source_client,
@@ -34,9 +41,14 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
         tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],
     };
 
-    let mut engine = SyncEngine::new(RetryConfig::default());
+    let engine = SyncEngine::new(RetryConfig::default(), DEFAULT_MAX_CONCURRENT_TRANSFERS);
+    let cache = Rc::new(RefCell::new(TransferStateCache::new()));
+    // Single-target copy: staging is not needed.
+    let staging = BlobStage::disabled();
     let progress = NullProgress;
-    let report = engine.run(vec![mapping], &progress).await;
+    let report = engine
+        .run(vec![mapping], cache, staging, &progress, None)
+        .await;
 
     let src_display = format!(
         "{}/{}:{}",

@@ -1,11 +1,11 @@
 //! OCI distribution client library — types, authentication, and registry operations.
 
+/// AIMD concurrency controller — adaptive rate limiting via 429 feedback.
+pub mod aimd;
 /// Authentication providers and token management.
 pub mod auth;
 /// Blob operations (upload, download, existence checks, mounting).
 pub mod blob;
-/// Catalog listing with pagination.
-pub mod catalog;
 /// OCI registry HTTP client.
 pub mod client;
 /// OCI content-addressable digest type.

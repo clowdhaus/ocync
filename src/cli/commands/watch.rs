@@ -20,7 +20,7 @@ pub(crate) async fn run(args: &WatchArgs, shutdown: ShutdownSignal) -> Result<Ex
             json: args.json,
         };
 
-        match synchronize::run(&sync_args).await {
+        match synchronize::run(&sync_args, Some(&shutdown)).await {
             Ok(code) => {
                 tracing::info!(exit_code = ?code, "sync cycle complete");
             }
