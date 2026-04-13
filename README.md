@@ -57,7 +57,7 @@ $ ocync sync -c sync.yaml
   14 blobs (7 deduplicated, 7 mounted), 89 MB transferred [5.2s]
 ```
 
-> **Note:** The output format shown above is aspirational and represents the intended design. The current CLI output may differ.
+*Output format is under active development and may differ from what is shown above.*
 
 ## How it works
 
@@ -89,13 +89,13 @@ registries:
     url: cgr.dev
   ecr-east:
     url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
-    auth_type: ecr
+    auth_type: ecr # auto-detected from hostname when omitted
   ecr-west:
     url: 123456789012.dkr.ecr.us-west-2.amazonaws.com
     auth_type: ecr
 
 target_groups:
-  prod:
+  prod: # logical name for a set of target registries
     - ecr-east
     - ecr-west
 
@@ -106,17 +106,17 @@ defaults:
     - linux/amd64
     - linux/arm64
   tags:
-    semver: ">=1.0"
+    semver: ">=1.0" # matches any semver tag >= 1.0
     sort: semver
-    latest: 10
+    latest: 10 # keep only the 10 most recent after filtering
 
 mappings:
-  - from: chainguard/nginx
-    to: nginx
+  - from: chainguard/nginx # source repository path
+    to: nginx # target repository path (same across all targets)
   - from: chainguard/python
     to: python
     tags:
-      glob: "*-slim"
+      glob: "*-slim" # override default tag filter for this mapping
 ```
 
 - **Registries** — named registry definitions with optional auth type (auto-detected from hostname when omitted)
