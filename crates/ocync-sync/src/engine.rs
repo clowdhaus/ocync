@@ -790,21 +790,20 @@ async fn transfer_image_blobs(
             .check_blob_existence(ctx.target_repo, &all_digests)
             .await
         {
-            Ok(existence) => {
-                for (digest, exists) in &existence {
-                    if *exists {
-                        ctx.cache.borrow_mut().set_blob_exists(
-                            ctx.target_name,
-                            digest.clone(),
-                            ctx.target_repo.to_owned(),
-                        );
-                    }
+            Ok(existing) => {
+                let existing_count = existing.len();
+                for digest in &existing {
+                    ctx.cache.borrow_mut().set_blob_exists(
+                        ctx.target_name,
+                        digest.clone(),
+                        ctx.target_repo.to_owned(),
+                    );
                 }
                 debug!(
                     target_name = %ctx.target_name,
                     repo = %ctx.target_repo,
                     total = all_digests.len(),
-                    existing = existence.values().filter(|v| **v).count(),
+                    existing = existing_count,
                     "batch check pre-populated cache"
                 );
             }

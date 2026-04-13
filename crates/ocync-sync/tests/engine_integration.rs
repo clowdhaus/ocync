@@ -1,7 +1,7 @@
 //! Integration tests for `SyncEngine` using mock HTTP servers.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -207,21 +207,21 @@ async fn mount_manifest_head_matching(server: &MockServer, repo: &str, tag: &str
 
 /// Mock implementation of [`BatchBlobChecker`] for testing the batch pre-population path.
 ///
-/// Returns pre-configured existence responses and tracks call count to verify
-/// exactly one batch call is made per image.
+/// Returns a pre-configured set of existing digests and tracks call count to
+/// verify exactly one batch call is made per image.
 struct MockBatchChecker {
-    /// Pre-configured responses: digest -> exists.
-    responses: RefCell<HashMap<Digest, bool>>,
+    /// Set of digests that the mock reports as existing at the target.
+    existing: RefCell<HashSet<Digest>>,
     /// Tracks how many times `check_blob_existence` was called.
     call_count: Arc<AtomicUsize>,
 }
 
 impl MockBatchChecker {
-    fn new(responses: HashMap<Digest, bool>) -> (Self, Arc<AtomicUsize>) {
+    fn new(existing: HashSet<Digest>) -> (Self, Arc<AtomicUsize>) {
         let count = Arc::new(AtomicUsize::new(0));
         (
             Self {
-                responses: RefCell::new(responses),
+                existing: RefCell::new(existing),
                 call_count: Arc::clone(&count),
             },
             count,
@@ -233,12 +233,13 @@ impl BatchBlobChecker for MockBatchChecker {
     fn check_blob_existence<'a>(
         &'a self,
         _repo: &'a str,
-        _digests: &'a [Digest],
-    ) -> Pin<Box<dyn Future<Output = Result<HashMap<Digest, bool>, ocync_distribution::Error>> + 'a>>
+        digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
     {
         Box::pin(async {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(self.responses.borrow().clone())
+            let all = self.existing.borrow();
+            Ok(digests.iter().filter(|d| all.contains(d)).cloned().collect())
         })
     }
 }
@@ -3690,10 +3691,8 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
     mount_manifest_push(&target_server, "repo", "v1").await;
 
     // Batch checker: both blobs exist.
-    let mut responses = HashMap::new();
-    responses.insert(config_desc.digest.clone(), true);
-    responses.insert(layer_desc.digest.clone(), true);
-    let (checker, batch_call_count) = MockBatchChecker::new(responses);
+    let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
+    let (checker, batch_call_count) = MockBatchChecker::new(existing);
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -3812,12 +3811,9 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
         .await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    // Batch checker: config exists, layer1 missing, layer2 exists.
-    let mut responses = HashMap::new();
-    responses.insert(config_desc.digest.clone(), true);
-    responses.insert(layer1_desc.digest.clone(), false);
-    responses.insert(layer2_desc.digest.clone(), true);
-    let (checker, batch_call_count) = MockBatchChecker::new(responses);
+    // Batch checker: config and layer2 exist, layer1 missing.
+    let existing = HashSet::from([config_desc.digest.clone(), layer2_desc.digest.clone()]);
+    let (checker, batch_call_count) = MockBatchChecker::new(existing);
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);

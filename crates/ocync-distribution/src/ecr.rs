@@ -10,7 +10,7 @@
 //! `SdkConfig`, and the SDK will route requests to FIPS endpoints
 //! automatically.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -27,7 +27,7 @@ use crate::error::Error;
 const MAX_DIGESTS_PER_BATCH: usize = 100;
 
 /// Boxed future returned by [`BatchBlobChecker::check_blob_existence`].
-type CheckFuture<'a> = Pin<Box<dyn Future<Output = Result<HashMap<Digest, bool>, Error>> + 'a>>;
+type CheckFuture<'a> = Pin<Box<dyn Future<Output = Result<HashSet<Digest>, Error>> + 'a>>;
 
 /// Async trait for batch blob existence checking.
 ///
@@ -38,9 +38,9 @@ type CheckFuture<'a> = Pin<Box<dyn Future<Output = Result<HashMap<Digest, bool>,
 pub trait BatchBlobChecker {
     /// Check which blobs exist in the given repository.
     ///
-    /// Returns a map from each input digest to `true` (exists) or `false`
-    /// (missing). Digests that the API reports as failures are mapped to
-    /// `false`.
+    /// Returns the set of input digests that exist at the target. Digests
+    /// absent from the returned set are missing and need transfer. Digests
+    /// that the API reports as failures are treated as missing.
     fn check_blob_existence<'a>(&'a self, repo: &'a str, digests: &'a [Digest]) -> CheckFuture<'a>;
 }
 
@@ -132,19 +132,19 @@ impl EcrBatchApi for AwsEcrBatchApi {
 /// Provides bulk blob existence checking via `BatchCheckLayerAvailability`,
 /// splitting large batches into chunks of 100 (the ECR API limit per call).
 ///
-/// Construct via [`EcrBatchChecker::new`] with an already-loaded
+/// Construct via [`BatchChecker::new`] with an already-loaded
 /// [`aws_config::SdkConfig`]. FIPS support is handled at the config level.
-pub struct EcrBatchChecker {
+pub struct BatchChecker {
     api: Box<dyn EcrBatchApi>,
 }
 
-impl std::fmt::Debug for EcrBatchChecker {
+impl std::fmt::Debug for BatchChecker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EcrBatchChecker").finish_non_exhaustive()
+        f.debug_struct("BatchChecker").finish_non_exhaustive()
     }
 }
 
-impl EcrBatchChecker {
+impl BatchChecker {
     /// Create a new batch checker from an AWS SDK config.
     ///
     /// The `registry_id` is the 12-digit AWS account ID that owns the ECR
@@ -171,23 +171,44 @@ impl EcrBatchChecker {
         &self,
         repo: &str,
         digests: &[Digest],
-    ) -> Result<HashMap<Digest, bool>, Error> {
-        let mut result = HashMap::with_capacity(digests.len());
+    ) -> Result<HashSet<Digest>, Error> {
+        let mut existing = HashSet::with_capacity(digests.len());
 
         for chunk in digests.chunks(MAX_DIGESTS_PER_BATCH) {
             let digest_strings: Vec<String> = chunk.iter().map(|d| d.to_string()).collect();
-            let response = self
+            let response = match self
                 .api
                 .batch_check_layer_availability(repo, &digest_strings)
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        repo = %repo,
+                        completed = existing.len(),
+                        remaining = digests.len() - existing.len(),
+                        error = %e,
+                        "batch check failed mid-batch, returning partial results"
+                    );
+                    // Total failure (no results yet): propagate error so the
+                    // engine logs the fallback warning.
+                    if existing.is_empty() {
+                        return Err(e);
+                    }
+                    // Partial success: return what we have. Unchecked digests
+                    // are absent from the set and will be handled by per-blob
+                    // HEAD in the engine's transfer loop.
+                    break;
+                }
+            };
 
-            // Build a lookup from digest string to availability.
-            let mut availability: HashMap<&str, bool> =
-                HashMap::with_capacity(response.layers.len() + response.failures.len());
-
-            for (digest_str, available) in &response.layers {
-                availability.insert(digest_str.as_str(), *available);
-            }
+            // Collect digest strings that the API reports as available.
+            let available: HashSet<&str> = response
+                .layers
+                .iter()
+                .filter(|(_, available)| *available)
+                .map(|(digest_str, _)| digest_str.as_str())
+                .collect();
 
             for digest_str in &response.failures {
                 warn!(
@@ -195,25 +216,22 @@ impl EcrBatchChecker {
                     digest = %digest_str,
                     "ECR batch check reported failure for layer"
                 );
-                availability.insert(digest_str.as_str(), false);
             }
 
-            // Map back to Digest keys. Digests not in the response are
-            // treated as unavailable (defensive against partial responses).
+            // Map back to Digest keys. Only available blobs enter the set.
+            // Absent, unavailable, and failed digests are all treated as missing.
             for digest in chunk {
-                let exists = availability
-                    .get(digest.to_string().as_str())
-                    .copied()
-                    .unwrap_or(false);
-                result.insert(digest.clone(), exists);
+                if available.contains(digest.to_string().as_str()) {
+                    existing.insert(digest.clone());
+                }
             }
         }
 
-        Ok(result)
+        Ok(existing)
     }
 }
 
-impl BatchBlobChecker for EcrBatchChecker {
+impl BatchBlobChecker for BatchChecker {
     fn check_blob_existence<'a>(&'a self, repo: &'a str, digests: &'a [Digest]) -> CheckFuture<'a> {
         Box::pin(self.check_batched(repo, digests))
     }
@@ -294,7 +312,7 @@ mod tests {
 
         let counts = CallCounts::default();
         let mock = MockEcrBatchApi::new(counts.clone()).with_check_responses(vec![Ok(response)]);
-        let checker = EcrBatchChecker::with_api(mock);
+        let checker = BatchChecker::with_api(mock);
 
         let result = checker
             .check_blob_existence("my-repo", &[d1.clone(), d2.clone()])
@@ -302,8 +320,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[&d1], true);
-        assert_eq!(result[&d2], true);
+        assert!(result.contains(&d1));
+        assert!(result.contains(&d2));
         assert_eq!(counts.check.load(Ordering::Relaxed), 1);
     }
 
@@ -320,17 +338,18 @@ mod tests {
 
         let counts = CallCounts::default();
         let mock = MockEcrBatchApi::new(counts.clone()).with_check_responses(vec![Ok(response)]);
-        let checker = EcrBatchChecker::with_api(mock);
+        let checker = BatchChecker::with_api(mock);
 
         let result = checker
             .check_blob_existence("my-repo", &[d1.clone(), d2.clone(), d3.clone()])
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[&d1], true);
-        assert_eq!(result[&d2], false);
-        assert_eq!(result[&d3], false);
+        // Only d1 is available; d2 (unavailable) and d3 (failure) are absent.
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&d1));
+        assert!(!result.contains(&d2));
+        assert!(!result.contains(&d3));
     }
 
     #[tokio::test]
@@ -358,7 +377,7 @@ mod tests {
 
         let counts = CallCounts::default();
         let mock = MockEcrBatchApi::new(counts.clone()).with_check_responses(responses);
-        let checker = EcrBatchChecker::with_api(mock);
+        let checker = BatchChecker::with_api(mock);
 
         let result = checker
             .check_blob_existence("my-repo", &digests)
@@ -367,7 +386,7 @@ mod tests {
 
         assert_eq!(result.len(), 250);
         for d in &digests {
-            assert_eq!(result[d], true);
+            assert!(result.contains(d));
         }
 
         // Verify exactly 3 API calls were made.
@@ -382,7 +401,7 @@ mod tests {
     async fn check_empty_digests() {
         let counts = CallCounts::default();
         let mock = MockEcrBatchApi::new(counts.clone());
-        let checker = EcrBatchChecker::with_api(mock);
+        let checker = BatchChecker::with_api(mock);
 
         let result = checker.check_blob_existence("my-repo", &[]).await.unwrap();
 
@@ -395,7 +414,7 @@ mod tests {
         let counts = CallCounts::default();
         let mock = MockEcrBatchApi::new(counts)
             .with_check_responses(vec![Err(Error::Other("throttled".into()))]);
-        let checker = EcrBatchChecker::with_api(mock);
+        let checker = BatchChecker::with_api(mock);
 
         let result = checker
             .check_blob_existence("my-repo", &[test_digest(1)])
@@ -418,15 +437,15 @@ mod tests {
 
         let counts = CallCounts::default();
         let mock = MockEcrBatchApi::new(counts).with_check_responses(vec![Ok(response)]);
-        let checker = EcrBatchChecker::with_api(mock);
+        let checker = BatchChecker::with_api(mock);
 
         let result = checker
             .check_blob_existence("my-repo", &[d1.clone(), d2.clone()])
             .await
             .unwrap();
 
-        assert_eq!(result[&d1], true);
-        assert_eq!(result[&d2], false);
+        assert!(result.contains(&d1));
+        assert!(!result.contains(&d2));
     }
 
     // --- Trait object compatibility ---

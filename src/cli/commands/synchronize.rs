@@ -10,7 +10,7 @@ use std::time::Duration;
 use ocync_distribution::RegistryClient;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::auth::ecr::ecr_region;
-use ocync_distribution::ecr::{BatchBlobChecker, EcrBatchChecker};
+use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
 use ocync_sync::SyncReport;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{
@@ -205,7 +205,7 @@ async fn build_clients(config: &Config) -> Result<HashMap<String, Arc<RegistryCl
 
 /// Build batch blob checkers for ECR registries.
 ///
-/// Automatically creates an [`EcrBatchChecker`] for every registry detected
+/// Automatically creates an [`BatchChecker`] for every registry detected
 /// as ECR (via explicit `auth_type: ecr` or hostname auto-detection). No
 /// user configuration is needed — if we know it's ECR, we use the batch API.
 async fn build_batch_checkers(
@@ -237,7 +237,7 @@ async fn build_batch_checkers(
             .load()
             .await;
 
-        let checker = EcrBatchChecker::new(&sdk_config, registry_id);
+        let checker = BatchChecker::new(&sdk_config, registry_id);
         checkers.insert(name.clone(), Rc::new(checker));
     }
 

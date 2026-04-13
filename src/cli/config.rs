@@ -408,7 +408,6 @@ fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), Config
             )));
         }
     }
-
     Ok(())
 }
 
