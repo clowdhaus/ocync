@@ -33,7 +33,8 @@ use ocync_distribution::Digest;
 use ocync_distribution::RegistryClient;
 use ocync_distribution::blob::MountResult;
 use ocync_distribution::manifest::ManifestPull;
-use ocync_distribution::spec::{Descriptor, ImageManifest, ManifestKind};
+use ocync_distribution::sha256::Sha256;
+use ocync_distribution::spec::{Descriptor, ImageIndex, ImageManifest, ManifestKind};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -61,6 +62,19 @@ pub struct ResolvedMapping {
     pub targets: Vec<TargetEntry>,
     /// Tag pairs to sync (already filtered).
     pub tags: Vec<TagPair>,
+    /// Optional platform filter list (e.g., `["linux/amd64"]`).
+    ///
+    /// When `Some`, index manifests are filtered to only include descriptors
+    /// whose platform matches one of the filter strings (using
+    /// [`Platform::matches()`]). Child manifests and blobs for non-matching
+    /// platforms are never pulled from the source.
+    pub platforms: Option<Vec<String>>,
+    /// When `true`, skip syncing when the target already has any manifest for
+    /// the tag, regardless of digest comparison.
+    ///
+    /// This avoids the overhead of full digest comparison when the user only
+    /// cares that *some* version exists at the target.
+    pub skip_existing: bool,
 }
 
 /// A single target registry entry.
@@ -314,17 +328,21 @@ impl SyncEngine {
                 let target_tag = tag_pair.target.clone();
                 let retry = self.retry.clone();
                 let targets = mapping.targets.clone();
+                let platforms = mapping.platforms.clone();
+                let skip_existing = mapping.skip_existing;
 
                 discovery_futures.push(async move {
-                    discover_tag(
+                    discover_tag(DiscoveryParams {
                         source_client,
-                        &source_repo,
-                        &target_repo,
-                        &source_tag,
-                        &target_tag,
-                        &targets,
-                        &retry,
-                    )
+                        source_repo: &source_repo,
+                        target_repo: &target_repo,
+                        source_tag: &source_tag,
+                        target_tag: &target_tag,
+                        targets: &targets,
+                        retry: &retry,
+                        platforms: platforms.as_deref(),
+                        skip_existing,
+                    })
                     .await
                 });
             }
@@ -442,22 +460,48 @@ impl SyncEngine {
     }
 }
 
+/// Parameters for [`discover_tag`], bundled to keep the argument count under
+/// clippy's limit while preserving readability.
+struct DiscoveryParams<'a> {
+    source_client: Arc<RegistryClient>,
+    source_repo: &'a str,
+    target_repo: &'a str,
+    source_tag: &'a str,
+    target_tag: &'a str,
+    targets: &'a [TargetEntry],
+    retry: &'a RetryConfig,
+    /// Optional platform filter list (e.g., `["linux/amd64"]`).
+    platforms: Option<&'a [String]>,
+    /// When `true`, skip syncing when the target already has any manifest.
+    skip_existing: bool,
+}
+
 /// Discover a single (mapping, tag) pair: pull source manifest, HEAD-check targets.
 ///
 /// Returns a `DiscoveryOutcome` indicating whether all targets can be skipped,
 /// some need sync, or the source pull failed.
-async fn discover_tag(
-    source_client: Arc<RegistryClient>,
-    source_repo: &str,
-    target_repo: &str,
-    source_tag: &str,
-    target_tag: &str,
-    targets: &[TargetEntry],
-    retry: &RetryConfig,
-) -> DiscoveryOutcome {
+///
+/// When `platforms` is `Some`, index manifests are filtered to only include
+/// descriptors matching the given platform filters before pulling children.
+///
+/// When `skip_existing` is `true`, targets that return any manifest HEAD response
+/// (regardless of digest) are skipped without further comparison.
+async fn discover_tag(params: DiscoveryParams<'_>) -> DiscoveryOutcome {
+    let DiscoveryParams {
+        source_client,
+        source_repo,
+        target_repo,
+        source_tag,
+        target_tag,
+        targets,
+        retry,
+        platforms,
+        skip_existing,
+    } = params;
     // Pull source manifest (shared across all targets for this tag).
     let source_data =
-        match pull_source_manifest(&source_client, source_repo, source_tag, retry).await {
+        match pull_source_manifest(&source_client, source_repo, source_tag, retry, platforms).await
+        {
             Ok(data) => Rc::new(data),
             Err(err) => {
                 let error_str = err.to_string();
@@ -509,6 +553,26 @@ async fn discover_tag(
 
     while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
+            Ok(Some(_)) if skip_existing => {
+                info!(
+                    source_repo = %source_repo,
+                    target_repo = %target_repo,
+                    tag = %source_tag,
+                    "skipping -- target manifest exists (skip_existing)"
+                );
+                tracing::debug!(target: "ocync::metrics", "skip_existing");
+                skipped_results.push(ImageResult {
+                    image_id: Uuid::now_v7(),
+                    source: format!("{source_repo}:{source_tag}"),
+                    target: format!("{target_repo}:{target_tag}"),
+                    status: ImageStatus::Skipped {
+                        reason: SkipReason::SkipExisting,
+                    },
+                    bytes_transferred: 0,
+                    blob_stats: BlobTransferStats::default(),
+                    duration: Duration::ZERO,
+                });
+            }
             Ok(Some(head)) if head.digest == *source_digest => {
                 info!(
                     source_repo = %source_repo,
@@ -665,11 +729,17 @@ async fn execute_item(
 ///
 /// For image manifests, returns just the manifest. For index manifests,
 /// also pulls all child manifests.
+///
+/// When `platforms` is `Some`, index manifests are filtered to only include
+/// descriptors whose platform matches one of the filter strings. Only
+/// matching child manifests are pulled, and the index's `raw_bytes` are
+/// re-serialized to reflect only the kept descriptors.
 async fn pull_source_manifest(
     client: &RegistryClient,
     repo: &str,
     tag: &str,
     retry: &RetryConfig,
+    platforms: Option<&[String]>,
 ) -> Result<PulledManifest, crate::Error> {
     let pull = with_retry(retry, "manifest pull", || client.manifest_pull(repo, tag))
         .await
@@ -681,8 +751,35 @@ async fn pull_source_manifest(
     let children = match &pull.manifest {
         ManifestKind::Image(_) => Vec::new(),
         ManifestKind::Index(index) => {
-            let mut children = Vec::with_capacity(index.manifests.len());
-            for child_desc in &index.manifests {
+            // When platform filters are active, only pull children for matching platforms.
+            let descriptors: Vec<&Descriptor> = if let Some(filters) = platforms {
+                let total = index.manifests.len();
+                let kept: Vec<&Descriptor> = index
+                    .manifests
+                    .iter()
+                    .filter(|desc| {
+                        desc.platform
+                            .as_ref()
+                            .is_some_and(|p| filters.iter().any(|f| p.matches(f)))
+                    })
+                    .collect();
+
+                info!(
+                    repo = %repo,
+                    tag = %tag,
+                    kept = kept.len(),
+                    total = total,
+                    "filtered index: {}/{} platforms",
+                    kept.len(),
+                    total,
+                );
+                kept
+            } else {
+                index.manifests.iter().collect()
+            };
+
+            let mut children = Vec::with_capacity(descriptors.len());
+            for child_desc in &descriptors {
                 let child_digest_str = child_desc.digest.to_string();
                 let child_pull = with_retry(retry, "manifest pull", || {
                     client.manifest_pull(repo, &child_digest_str)
@@ -707,6 +804,39 @@ async fn pull_source_manifest(
                     }
                 }
             }
+
+            // When platform filtering is active, rebuild the index manifest with
+            // only the matching descriptors. The raw_bytes and digest must be
+            // recomputed so targets receive the filtered index.
+            if platforms.is_some() && descriptors.len() != index.manifests.len() {
+                let filtered_index = ImageIndex {
+                    schema_version: index.schema_version,
+                    media_type: index.media_type.clone(),
+                    manifests: descriptors.into_iter().cloned().collect(),
+                    subject: index.subject.clone(),
+                    artifact_type: index.artifact_type.clone(),
+                    annotations: index.annotations.clone(),
+                };
+                let new_bytes =
+                    serde_json::to_vec(&filtered_index).map_err(|e| crate::Error::Manifest {
+                        reference: tag.to_owned(),
+                        source: ocync_distribution::Error::Other(format!(
+                            "failed to serialize filtered index: {e}"
+                        )),
+                    })?;
+                let new_digest = Digest::from_sha256(Sha256::digest(&new_bytes));
+                let filtered_pull = ManifestPull {
+                    manifest: ManifestKind::Index(Box::new(filtered_index)),
+                    raw_bytes: new_bytes,
+                    media_type: pull.media_type,
+                    digest: new_digest,
+                };
+                return Ok(PulledManifest {
+                    pull: filtered_pull,
+                    children,
+                });
+            }
+
             children
         }
     };

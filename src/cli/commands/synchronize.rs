@@ -325,6 +325,8 @@ async fn resolve_mapping(
         target_repo,
         targets,
         tags: filtered.into_iter().map(TagPair::same).collect(),
+        platforms: None,
+        skip_existing: false,
     }))
 }
 
