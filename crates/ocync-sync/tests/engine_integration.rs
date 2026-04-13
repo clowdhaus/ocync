@@ -4126,15 +4126,44 @@ async fn sync_batch_checker_empty_result_transfers_all() {
     };
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
-    // Source: manifest + both blobs.
+    // Source: manifest + both blobs with expect(1) to verify pull-once.
     mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(config_data.to_vec())
+                .insert_header("content-length", config_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(layer_data.to_vec())
+                .insert_header("content-length", layer_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
 
-    // Target: manifest HEAD 404, blob HEAD 404 (nothing exists), blob push, manifest push.
+    // Target: manifest HEAD 404, blob HEAD expect(1) per blob (fallback from
+    // empty batch result), blob push, manifest push.
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
@@ -4335,9 +4364,27 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
     };
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
-    // Source: serve manifest for both tags (same manifest content).
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_source_manifest(&source_server, "repo", "v2", &manifest_bytes).await;
+    // Source: serve manifest for both tags with expect(1) per tag.
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/manifests/v2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
 
     // Target: both tags need sync (HEAD 404), both can be pushed.
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
