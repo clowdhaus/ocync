@@ -36,7 +36,7 @@ Before marking work complete, mechanically verify:
 The sync engine uses a **pipelined pull-once, fan-out** pattern for 1:N mappings. Discovery and execution overlap via `tokio::select!` over two `FuturesUnordered` pools with a `VecDeque` pending queue between them. The plan phase is eliminated — progressive cache population replaces upfront batch HEAD checks.
 
 1. Discovery: pull source manifest once per tag (`PulledManifest`), HEAD-check each target, produce `TransferTask` entries
-2. Execution: for each (tag, target): cache check → mount/HEAD → pull+push blobs → push manifests
+2. Execution: for each (tag, target): optional batch existence check (ECR `BatchBlobChecker`, pre-populates cache) → per-blob: cache check → mount/HEAD → pull+push → push manifests
 
 Source-side work (manifest pulls) must NEVER be repeated per target. Blobs are inherently target-specific (dedup/mount decisions depend on target state). Index manifests are fully resolved (all children pulled) during discovery before entering execution.
 
@@ -94,7 +94,7 @@ New optimization layers must:
 - **Best-effort I/O**: when an I/O result is intentionally not propagated (e.g., directory fsync after a successful atomic rename), log with `tracing::warn!` including path and error — never `let _ = io_op()`. Silent drops mask production issues.
 - **SAFETY comments**: `// SAFETY:` is reserved for explaining why `unsafe` code is sound. For logic correctness assertions (e.g., "guard ensures Option is Some"), use plain comments.
 - **Cleanup loop resilience**: loops that delete multiple files (cleanup, eviction, tmp removal) must log and continue on individual failures, never abort the whole operation with `?`. One stuck file should not prevent cleaning up the rest.
-- **Configurable timeouts**: hardcoded timeout values (drain deadlines, retry caps, etc.) should be configurable via builder methods with sensible defaults. Document the default in the builder method's doc comment, not just in the code that uses it.
+- **Configurable timeouts**: hardcoded timeout values (drain deadlines, retry caps, etc.) must be configurable via builder methods with sensible defaults. Document the default in the builder method's doc comment, not just in the code that uses it.
 - **Registry module centralization**: all utilities for a specific registry provider (hostname parsing, SDK config loading, batch operations) live in one module (e.g., `ecr.rs`). Auth implementations import shared helpers from the provider module, not the other way around. Never scatter provider-specific code across auth, batch, and CLI layers.
 - **Constructor encapsulation**: public constructors must not leak internal dependencies into caller signatures. If a struct needs an AWS SDK config internally, accept a hostname string and build the config inside — don't force callers to import `aws-config`. This keeps dependency boundaries clean: library crates own their deps, CLI crates just pass domain values.
 - **Avoid tuple type aliases for struct-like data**: when a tuple alias mirrors an existing struct's fields, add `Clone` to the struct instead. Tuples add destructuring noise at every use site and diverge from the struct over time. Cheap clones (`Arc`, `Rc`, `String`) make struct Clone zero-cost.
@@ -129,6 +129,7 @@ Unit-test leaves (AIMD math, staging filesystem, cache serialization). Integrati
 - Client → auth invalidation → retry sequence
 - Cache hit → target HEAD re-verification → stale entry eviction
 - Index manifest → child manifest pull failure → image-level failure propagation
+- Batch checker failure → per-blob HEAD fallback → correct transfer completion
 
 If a code path is fully wired end-to-end, it needs an integration test that exercises it end-to-end. Unit tests on the leaf types are necessary but not sufficient.
 
@@ -200,7 +201,7 @@ Never trust the implementer's self-report alone.
 
 - **Design spec**: `docs/specs/2026-04-10-ocync-design.md` — full design document
 - **Transfer optimization design**: `docs/specs/2026-04-12-transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse
-- **Implementation plan**: `docs/superpowers/plans/` (gitignored) — remaining v1 work is `2026-04-12-remaining-v1-implementation.md` (PRs #15-#20: ECR batch, platform filtering, output/logging, auth providers, progress/health/metrics, FIPS/packaging)
+- **Implementation plan**: `docs/superpowers/plans/` (gitignored) — remaining v1 work is `2026-04-12-remaining-v1-implementation.md` (ECR batch done; remaining: platform filtering, output/logging, auth providers, progress/health/metrics, FIPS/packaging)
 
 ## Commands
 

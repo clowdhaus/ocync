@@ -216,9 +216,13 @@ async fn mount_manifest_head_matching(server: &MockServer, repo: &str, tag: &str
 
 /// Mock implementation of [`BatchBlobChecker`] for testing the batch pre-population path.
 ///
-/// Returns a pre-configured set of existing digests and tracks call count to
-/// verify exactly one batch call is made per image.
+/// Returns a pre-configured set of existing digests, filtered by input.
+/// Verifies the caller passes the expected repository name (per mock
+/// contract fidelity — a bug where the engine passes the wrong repo
+/// would be invisible without this check).
 struct MockBatchChecker {
+    /// Expected repository name — panics if the caller passes a different repo.
+    expected_repo: String,
     /// Set of digests that the mock reports as existing at the target.
     existing: HashSet<Digest>,
     /// Tracks how many times `check_blob_existence` was called.
@@ -226,10 +230,11 @@ struct MockBatchChecker {
 }
 
 impl MockBatchChecker {
-    fn new(existing: HashSet<Digest>) -> (Self, Arc<AtomicUsize>) {
+    fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Arc<AtomicUsize>) {
         let count = Arc::new(AtomicUsize::new(0));
         (
             Self {
+                expected_repo: expected_repo.to_owned(),
                 existing,
                 call_count: Arc::clone(&count),
             },
@@ -241,10 +246,14 @@ impl MockBatchChecker {
 impl BatchBlobChecker for MockBatchChecker {
     fn check_blob_existence<'a>(
         &'a self,
-        _repo: &'a str,
+        repo: &'a str,
         digests: &'a [Digest],
     ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
     {
+        assert_eq!(
+            repo, self.expected_repo,
+            "mock: batch checker called with wrong repo"
+        );
         Box::pin(async {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             Ok(digests
@@ -257,16 +266,21 @@ impl BatchBlobChecker for MockBatchChecker {
 }
 
 /// Mock batch checker that always returns an error (for testing fallback path).
+///
+/// Verifies the caller passes the expected repository name.
 struct FailingBatchChecker {
+    /// Expected repository name.
+    expected_repo: String,
     /// Tracks how many times `check_blob_existence` was called.
     call_count: Arc<AtomicUsize>,
 }
 
 impl FailingBatchChecker {
-    fn new() -> (Self, Arc<AtomicUsize>) {
+    fn new(expected_repo: &str) -> (Self, Arc<AtomicUsize>) {
         let count = Arc::new(AtomicUsize::new(0));
         (
             Self {
+                expected_repo: expected_repo.to_owned(),
                 call_count: Arc::clone(&count),
             },
             count,
@@ -277,10 +291,14 @@ impl FailingBatchChecker {
 impl BatchBlobChecker for FailingBatchChecker {
     fn check_blob_existence<'a>(
         &'a self,
-        _repo: &'a str,
+        repo: &'a str,
         _digests: &'a [Digest],
     ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
     {
+        assert_eq!(
+            repo, self.expected_repo,
+            "mock: failing batch checker called with wrong repo"
+        );
         Box::pin(async {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             Err(ocync_distribution::Error::Other(
@@ -3571,7 +3589,7 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
 
     // Batch checker: both blobs exist.
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
-    let (checker, batch_call_count) = MockBatchChecker::new(existing);
+    let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -3692,7 +3710,7 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
 
     // Batch checker: config and layer2 exist, layer1 missing.
     let existing = HashSet::from([config_desc.digest.clone(), layer2_desc.digest.clone()]);
-    let (checker, batch_call_count) = MockBatchChecker::new(existing);
+    let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -3885,7 +3903,7 @@ async fn sync_batch_checker_failure_falls_back_to_per_blob_head() {
     mount_manifest_push(&target_server, "repo", "v1").await;
 
     // Batch checker that always fails.
-    let (checker, batch_call_count) = FailingBatchChecker::new();
+    let (checker, batch_call_count) = FailingBatchChecker::new("repo");
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -4014,10 +4032,10 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
 
     // Batch checkers with different responses per target.
     let existing_a = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
-    let (checker_a, count_a) = MockBatchChecker::new(existing_a);
+    let (checker_a, count_a) = MockBatchChecker::new("repo", existing_a);
 
     let existing_b = HashSet::from([config_desc.digest.clone()]);
-    let (checker_b, count_b) = MockBatchChecker::new(existing_b);
+    let (checker_b, count_b) = MockBatchChecker::new("repo", existing_b);
 
     let source_client = mock_client(&source_server);
 
@@ -4168,7 +4186,7 @@ async fn sync_batch_checker_empty_result_transfers_all() {
     mount_manifest_push(&target_server, "repo", "v1").await;
 
     // Batch checker: empty set -- nothing exists at target.
-    let (checker, batch_call_count) = MockBatchChecker::new(HashSet::new());
+    let (checker, batch_call_count) = MockBatchChecker::new("repo", HashSet::new());
 
     let mapping = ResolvedMapping {
         source_client: mock_client(&source_server),
@@ -4283,7 +4301,7 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
 
     // Batch checker for target A only.
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
-    let (checker, batch_call_count) = MockBatchChecker::new(existing);
+    let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
     let mapping = ResolvedMapping {
         source_client: mock_client(&source_server),
@@ -4407,7 +4425,7 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
 
     // Batch checker: both blobs exist. Shared Rc across tags.
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
-    let (checker, batch_call_count) = MockBatchChecker::new(existing);
+    let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
     let mapping = ResolvedMapping {
         source_client: mock_client(&source_server),
@@ -4453,4 +4471,313 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
     assert_eq!(report.stats.blobs_skipped, 4); // 2 per tag
     assert_eq!(report.stats.blobs_transferred, 0);
     assert_eq!(report.stats.bytes_transferred, 0);
+}
+
+/// Batch checker with an index manifest (multi-platform image).
+///
+/// Verifies the batch check works when blobs come from multiple child manifests
+/// (the primary use case: Chainguard multi-arch → ECR). The batch checker reports
+/// all 4 blobs (2 configs + 2 layers across amd64/arm64) as existing. No source
+/// blob pulls or target blob HEADs should occur.
+#[tokio::test]
+async fn sync_batch_checker_index_manifest_all_exist() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // Build two child image manifests (amd64 and arm64).
+    let amd64_config_data = b"amd64-config-batch";
+    let amd64_layer_data = b"amd64-layer-batch";
+    let amd64_config_desc = blob_descriptor(amd64_config_data, MediaType::OciConfig);
+    let amd64_layer_desc = blob_descriptor(amd64_layer_data, MediaType::OciLayerGzip);
+    let amd64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: amd64_config_desc.clone(),
+        layers: vec![amd64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (amd64_bytes, amd64_digest) = serialize_manifest(&amd64_manifest);
+
+    let arm64_config_data = b"arm64-config-batch";
+    let arm64_layer_data = b"arm64-layer-batch";
+    let arm64_config_desc = blob_descriptor(arm64_config_data, MediaType::OciConfig);
+    let arm64_layer_desc = blob_descriptor(arm64_layer_data, MediaType::OciLayerGzip);
+    let arm64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: arm64_config_desc.clone(),
+        layers: vec![arm64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (arm64_bytes, arm64_digest) = serialize_manifest(&arm64_manifest);
+
+    // Build the index manifest referencing both children.
+    let index = ImageIndex {
+        schema_version: 2,
+        media_type: None,
+        manifests: vec![
+            test_descriptor(amd64_digest.clone(), MediaType::OciManifest),
+            test_descriptor(arm64_digest.clone(), MediaType::OciManifest),
+        ],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let index_bytes = serde_json::to_vec(&index).unwrap();
+
+    // Source: serve the index by tag and children by digest.
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(index_bytes)
+                .insert_header("content-type", MediaType::OciIndex.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Source: NO blob endpoints — batch reports all exist, no pulls needed.
+
+    // Target: manifest HEAD 404, blob HEAD expect(0) for all 4 blobs.
+    mount_manifest_head_not_found(&target_server, "repo", "latest").await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", amd64_config_desc.digest)))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", amd64_layer_desc.digest)))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", arm64_config_desc.digest)))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", arm64_layer_desc.digest)))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+
+    // Accept child manifest pushes (by digest) and index push (by tag).
+    // Use expect(1) to verify exactly 3 manifest pushes occur.
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    // Batch checker: all 4 blobs exist.
+    let existing = HashSet::from([
+        amd64_config_desc.digest.clone(),
+        amd64_layer_desc.digest.clone(),
+        arm64_config_desc.digest.clone(),
+        arm64_layer_desc.digest.clone(),
+    ]);
+    let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: mock_client(&target_server),
+            batch_checker: Some(Rc::new(checker)),
+        }],
+        tags: vec![TagPair::same("latest")],
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Exactly 1 batch call for the index image.
+    assert_eq!(
+        batch_call_count.load(Ordering::Relaxed),
+        1,
+        "batch checker must be called exactly once for index manifest"
+    );
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // All 4 blobs skipped (2 per child manifest).
+    assert_eq!(report.images[0].blob_stats.skipped, 4);
+    assert_eq!(report.images[0].blob_stats.transferred, 0);
+    assert_eq!(report.images[0].bytes_transferred, 0);
+    // Aggregate stats.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.blobs_skipped, 4);
+    assert_eq!(report.stats.blobs_transferred, 0);
+    assert_eq!(report.stats.bytes_transferred, 0);
+    // wiremock expect(0) on all blob HEADs and expect(1) on source index manifest
+    // verify the batch path was used exclusively (enforced on MockServer drop).
+}
+
+/// Batch checker with a pre-warmed cache: cache already knows some blobs exist.
+///
+/// The cache has blob A at the target repo (direct match, Step 1 cache hit).
+/// The batch checker also reports blob A as existing (redundant). Blob B is
+/// reported by batch as existing but not in the cache. This verifies:
+/// 1. Cache entries from prior syncs still work alongside batch checking.
+/// 2. Batch pre-population correctly adds entries for blobs the cache didn't know.
+/// 3. No HEAD checks or transfers occur for any blob.
+#[tokio::test]
+async fn sync_batch_checker_with_prewarmed_cache() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-warm";
+    let layer_data = b"layer-warm";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: serve manifest only (no blob endpoints needed).
+    // expect(1) verifies the manifest is pulled exactly once.
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Target: manifest HEAD 404, blob HEAD expect(0), manifest PUT expect(1).
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    // Pre-warm cache: config blob already known at the target repo.
+    // Layer blob is NOT in the cache — only batch reports it.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        c.set_blob_exists("target", config_desc.digest.clone(), "repo".into());
+    }
+
+    // Batch checker: both blobs exist (config is redundant with cache).
+    let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
+    let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: mock_client(&target_server),
+            batch_checker: Some(Rc::new(checker)),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Batch was called even though some blobs were in the cache.
+    assert_eq!(
+        batch_call_count.load(Ordering::Relaxed),
+        1,
+        "batch checker must be called even with pre-warmed cache"
+    );
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // Both blobs skipped: config from cache (Step 1), layer from batch
+    // pre-population (also Step 1 cache hit after batch populates it).
+    assert_eq!(report.images[0].blob_stats.skipped, 2);
+    assert_eq!(report.images[0].blob_stats.transferred, 0);
+    assert_eq!(report.images[0].bytes_transferred, 0);
+    // Aggregate stats.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.blobs_skipped, 2);
+    assert_eq!(report.stats.blobs_transferred, 0);
+    assert_eq!(report.stats.bytes_transferred, 0);
+    // wiremock expect(0) on blob HEADs verifies no fallback path was used.
 }
