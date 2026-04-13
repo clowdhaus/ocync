@@ -36,7 +36,7 @@ Before marking work complete, mechanically verify:
 The sync engine uses a **pipelined pull-once, fan-out** pattern for 1:N mappings. Discovery and execution overlap via `tokio::select!` over two `FuturesUnordered` pools with a `VecDeque` pending queue between them. The plan phase is eliminated — progressive cache population replaces upfront batch HEAD checks.
 
 1. Discovery: pull source manifest once per tag (`PulledManifest`), HEAD-check each target, produce `TransferTask` entries
-2. Execution: for each (tag, target): cache check → mount/HEAD → pull+push blobs → push manifests
+2. Execution: for each (tag, target): optional batch existence check (ECR `BatchBlobChecker`, pre-populates cache) → per-blob: cache check → mount/HEAD → pull+push → push manifests
 
 Source-side work (manifest pulls) must NEVER be repeated per target. Blobs are inherently target-specific (dedup/mount decisions depend on target state). Index manifests are fully resolved (all children pulled) during discovery before entering execution.
 
@@ -94,7 +94,10 @@ New optimization layers must:
 - **Best-effort I/O**: when an I/O result is intentionally not propagated (e.g., directory fsync after a successful atomic rename), log with `tracing::warn!` including path and error — never `let _ = io_op()`. Silent drops mask production issues.
 - **SAFETY comments**: `// SAFETY:` is reserved for explaining why `unsafe` code is sound. For logic correctness assertions (e.g., "guard ensures Option is Some"), use plain comments.
 - **Cleanup loop resilience**: loops that delete multiple files (cleanup, eviction, tmp removal) must log and continue on individual failures, never abort the whole operation with `?`. One stuck file should not prevent cleaning up the rest.
-- **Configurable timeouts**: hardcoded timeout values (drain deadlines, retry caps, etc.) should be configurable via builder methods with sensible defaults. Document the default in the builder method's doc comment, not just in the code that uses it.
+- **Configurable timeouts**: hardcoded timeout values (drain deadlines, retry caps, etc.) must be configurable via builder methods with sensible defaults. Document the default in the builder method's doc comment, not just in the code that uses it.
+- **Registry module centralization**: all utilities for a specific registry provider (hostname parsing, SDK config loading, batch operations) live in one module (e.g., `ecr.rs`). Auth implementations import shared helpers from the provider module, not the other way around. Never scatter provider-specific code across auth, batch, and CLI layers.
+- **Constructor encapsulation**: public constructors must not leak internal dependencies into caller signatures. If a struct needs an AWS SDK config internally, accept a hostname string and build the config inside — don't force callers to import `aws-config`. This keeps dependency boundaries clean: library crates own their deps, CLI crates just pass domain values.
+- **Avoid tuple type aliases for struct-like data**: when a tuple alias mirrors an existing struct's fields, add `Clone` to the struct instead. Tuples add destructuring noise at every use site and diverge from the struct over time. Cheap clones (`Arc`, `Rc`, `String`) make struct Clone zero-cost.
 
 ## Testing standards
 
@@ -106,6 +109,17 @@ Tests must verify **behavior under failure and concurrency**, not just happy-pat
 
 Every multi-target engine test must use wiremock `.expect(N)` on source endpoints to verify the pull-once fan-out invariant. A test that passes when the source manifest is pulled 3 times instead of 1 does not protect the architecture. Assert exact byte counts, blob counts, and request counts — never `> 0` or `status == Synced` alone.
 
+### Verify optimizations take the designed path
+
+A correct outcome does not prove the optimization worked. Images can sync successfully via the slow path (per-blob HEAD, redundant pulls, no mounts) and still report `Synced`. Tests for optimization features must prove the **intended fast path was taken**, not just that the end state is correct:
+
+- When a batch API replaces per-blob HEAD: assert `.expect(0)` on the HEAD endpoint AND `.expect(1)` on the batch endpoint. The test must **fail** if the slow path is used.
+- When cache pre-population skips transfers: assert `blob_stats.skipped == N` for the exact count of blobs the batch check reported as existing. If `skipped == 0` and `transferred == total`, the optimization was wired but never activated.
+- When cross-repo mount succeeds: assert `blob_stats.mounted == N` and `.expect(0)` on the pull endpoint for that blob.
+- When auto-create triggers: assert `.expect(1)` on the create endpoint AND that the manifest push was retried after creation, not just that the image eventually synced.
+
+The pattern: assert the **negative** (the slow path was NOT taken) alongside the **positive** (the fast path produced correct results). An optimization that silently falls back to the slow path on every call is a bug, not a feature — and only negative assertions catch it.
+
 ### Test the bridges between layers
 
 Unit-test leaves (AIMD math, staging filesystem, cache serialization). Integration-test the top (engine end-to-end). But also test the **bridges** between layers — these are where real bugs live:
@@ -115,6 +129,7 @@ Unit-test leaves (AIMD math, staging filesystem, cache serialization). Integrati
 - Client → auth invalidation → retry sequence
 - Cache hit → target HEAD re-verification → stale entry eviction
 - Index manifest → child manifest pull failure → image-level failure propagation
+- Batch checker failure → per-blob HEAD fallback → correct transfer completion
 
 If a code path is fully wired end-to-end, it needs an integration test that exercises it end-to-end. Unit tests on the leaf types are necessary but not sufficient.
 
@@ -129,6 +144,30 @@ Tests for configurable parameters (timeouts, concurrency caps, thresholds) must 
 ### Assert aggregate and per-image stats together
 
 Engine integration tests must assert both per-image stats (`report.images[N].blob_stats`) and aggregate stats (`report.stats`). The aggregation path in `compute_stats` has its own logic — a bug there would be missed by per-image assertions alone.
+
+### Test helpers for struct defaults
+
+When adding a new field to a widely-used struct (especially one constructed in many tests), immediately add a test helper function with the default value. This prevents N boilerplate additions across existing tests and keeps the diff focused on new behavior. The helper should accept only the fields that vary between tests; default fields go inside the helper.
+
+### Mock contract fidelity
+
+Test mocks (trait implementations, not just wiremock) must honor the same input/output contract as the real implementation. A mock that ignores its input parameters (`_digests`, `_repo`) can't catch wiring bugs where the caller passes wrong values:
+- If the real implementation filters by input, the mock must filter the same way
+- If the real implementation returns only requested items, the mock must not return unrequested items
+- Use named parameters (not `_`-prefixed) in mock impls that use the parameter, to signal the mock respects the contract
+- A mock that returns a static response regardless of input is testing that the caller handles the response, not that the caller sends the right request
+
+### Batched operation resilience
+
+Multi-batch operations (chunked API calls, paginated requests) must handle mid-batch failures gracefully:
+- Preserve results from successful batches before the failure (partial success)
+- Propagate the error only if no results were obtained (total failure on first batch)
+- Let the caller decide what to do with the unchecked remainder (fall back to per-item checks, retry, etc.)
+- Test both total failure (first batch fails) and partial failure (Nth batch fails with N>1) — they exercise different code paths
+
+### Fan-out feature testing
+
+For 1:N fan-out features (e.g., sync to multiple targets), at least one test must exercise N>1 with **different state per target**. A feature tested only at N=1 doesn't verify target independence — shared state bugs, cross-target contamination, and per-target stat tracking only surface at N>=2. Each target should have its own mock server and its own assertions.
 
 ### wiremock for all network code
 
@@ -160,9 +199,9 @@ Never trust the implementer's self-report alone.
 
 ## Plans and specs
 
-- **Design spec**: `docs/specs/2026-04-10-ocync-design.md` — full design document (1,752 lines)
-- **Transfer optimization design**: `docs/specs/2026-04-12-transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse (under review)
-- **Implementation plans**: `docs/superpowers/plans/` (gitignored) — current v1 implementation plan is `2026-04-12-ocync-v1-implementation.md`
+- **Design spec**: `docs/specs/2026-04-10-ocync-design.md` — full design document
+- **Transfer optimization design**: `docs/specs/2026-04-12-transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse
+- **Implementation plan**: `docs/superpowers/plans/` (gitignored) — remaining v1 work is `2026-04-12-remaining-v1-implementation.md` (ECR batch done; remaining: platform filtering, output/logging, auth providers, progress/health/metrics, FIPS/packaging)
 
 ## Commands
 

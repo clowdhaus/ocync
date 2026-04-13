@@ -10,6 +10,8 @@ pub mod blob;
 pub mod client;
 /// OCI content-addressable digest type.
 pub mod digest;
+/// AWS ECR batch operations — bulk blob existence checks.
+pub mod ecr;
 /// Error types for OCI distribution operations.
 pub mod error;
 /// Manifest operations (pull, push, head, referrers).
@@ -26,6 +28,7 @@ pub mod tags;
 pub use blob::MountResult;
 pub use client::{RegistryClient, RegistryClientBuilder};
 pub use digest::Digest;
+pub use ecr::BatchBlobChecker;
 pub use error::Error;
 pub use manifest::{ManifestHead, ManifestPull};
 pub use reference::Reference;

@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ocync_distribution::RegistryClient;
+use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
+use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
 use ocync_sync::SyncReport;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{
@@ -21,7 +23,7 @@ use ocync_sync::staging::BlobStage;
 
 use crate::SyncArgs;
 use crate::cli::config::{
-    Config, GlobOrList, MappingConfig, TagsConfig, load_config, resolve_target_names,
+    AuthType, Config, GlobOrList, MappingConfig, TagsConfig, load_config, resolve_target_names,
 };
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
@@ -39,10 +41,11 @@ pub(crate) async fn run(
     let config = load_config(&args.config)?;
 
     let clients = build_clients(&config).await?;
+    let batch_checkers = build_batch_checkers(&config).await?;
 
     let mut mappings = Vec::new();
     for mapping in &config.mappings {
-        match resolve_mapping(mapping, &config, &clients).await {
+        match resolve_mapping(mapping, &config, &clients, &batch_checkers).await {
             Ok(Some(resolved)) => mappings.push(resolved),
             Ok(None) => {} // no tags after filtering, logged inside
             Err(err) => return Err(err),
@@ -199,6 +202,34 @@ async fn build_clients(config: &Config) -> Result<HashMap<String, Arc<RegistryCl
     Ok(clients)
 }
 
+/// Build batch blob checkers for ECR registries.
+///
+/// Automatically creates a [`BatchChecker`] for every registry detected
+/// as ECR (via explicit `auth_type: ecr` or hostname auto-detection). No
+/// user configuration is needed — if we know it's ECR, we use the batch API.
+async fn build_batch_checkers(
+    config: &Config,
+) -> Result<HashMap<String, Rc<dyn BatchBlobChecker>>, CliError> {
+    let mut checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
+
+    for (name, reg) in &config.registries {
+        let hostname = bare_hostname(&reg.url);
+        let is_ecr = reg.auth_type.as_ref().is_some_and(|a| *a == AuthType::Ecr)
+            || detect_provider_kind(hostname) == Some(ProviderKind::Ecr);
+
+        if !is_ecr {
+            continue;
+        }
+
+        let checker = BatchChecker::from_hostname(hostname)
+            .await
+            .map_err(|e| CliError::Input(format!("ECR batch checker for '{name}': {e}")))?;
+        checkers.insert(name.clone(), Rc::new(checker));
+    }
+
+    Ok(checkers)
+}
+
 /// Resolve a single mapping config into a `ResolvedMapping`, or `None` if no
 /// tags survive filtering.
 ///
@@ -208,6 +239,7 @@ async fn resolve_mapping(
     mapping: &MappingConfig,
     config: &Config,
     clients: &HashMap<String, Arc<RegistryClient>>,
+    batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
 ) -> Result<Option<ResolvedMapping>, CliError> {
     // --- Source registry ---
     let source_name = mapping
@@ -255,7 +287,12 @@ async fn resolve_mapping(
                     mapping.from, name,
                 ))
             })?;
-            Ok(TargetEntry { name, client })
+            let batch_checker = batch_checkers.get(&name).cloned();
+            Ok(TargetEntry {
+                name,
+                client,
+                batch_checker,
+            })
         })
         .collect::<Result<Vec<_>, CliError>>()?;
 
