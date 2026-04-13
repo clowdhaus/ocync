@@ -50,7 +50,6 @@ workspace = true
 
 [dependencies]
 anstyle = { version = "1", default-features = false }
-aws-config.workspace = true
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "color"] }
 ocync-distribution.workspace = true
 ocync-sync.workspace = true

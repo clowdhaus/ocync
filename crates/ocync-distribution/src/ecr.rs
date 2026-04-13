@@ -14,11 +14,57 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
+use aws_config::BehaviorVersion;
 use aws_sdk_ecr::types::LayerAvailability;
 use tracing::warn;
 
 use crate::digest::Digest;
 use crate::error::Error;
+
+/// Extract the AWS region from an ECR hostname.
+///
+/// Handles both standard (`<account>.dkr.ecr[-fips].<region>.<domain>`)
+/// and dual-stack (`<account>.dkr-ecr[-fips].<region>.<domain>`) formats
+/// across all AWS partitions.
+fn ecr_region(hostname: &str) -> Option<&str> {
+    let parts: Vec<&str> = hostname.split('.').collect();
+    if parts.len() < 5 {
+        return None;
+    }
+
+    for (i, part) in parts.iter().enumerate() {
+        if matches!(*part, "ecr" | "ecr-fips" | "dkr-ecr" | "dkr-ecr-fips") {
+            return parts.get(i + 1).copied();
+        }
+    }
+
+    None
+}
+
+/// Extract the 12-digit registry ID from an ECR hostname.
+///
+/// The registry ID is the first segment of the hostname (before `.dkr`).
+fn ecr_registry_id(hostname: &str) -> Option<&str> {
+    hostname.split('.').next()
+}
+
+/// Load an AWS SDK config for the given ECR hostname.
+///
+/// Extracts the region from the hostname and configures the SDK with it.
+/// FIPS endpoint support is handled at the SDK level: set
+/// `AWS_USE_FIPS_ENDPOINT=true` before calling this function.
+pub(crate) async fn load_sdk_config(hostname: &str) -> Result<aws_config::SdkConfig, Error> {
+    let region = ecr_region(hostname).ok_or_else(|| {
+        Error::Other(format!(
+            "cannot extract AWS region from ECR hostname '{hostname}'"
+        ))
+    })?;
+
+    Ok(aws_config::defaults(BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_owned()))
+        .load()
+        .await)
+}
 
 /// Maximum number of layer digests per `BatchCheckLayerAvailability` API call.
 ///
@@ -46,8 +92,8 @@ pub trait BatchBlobChecker {
 
 /// Abstraction over ECR batch API calls for testability.
 ///
-/// Wraps `BatchCheckLayerAvailability` and `CreateRepository` so tests can
-/// inject mock responses without an SDK client.
+/// Wraps `BatchCheckLayerAvailability` so tests can inject mock responses
+/// without an SDK client.
 trait EcrBatchApi {
     /// Call `BatchCheckLayerAvailability` for a single batch (up to 100 digests).
     fn batch_check_layer_availability(
@@ -132,8 +178,9 @@ impl EcrBatchApi for AwsEcrBatchApi {
 /// Provides bulk blob existence checking via `BatchCheckLayerAvailability`,
 /// splitting large batches into chunks of 100 (the ECR API limit per call).
 ///
-/// Construct via [`BatchChecker::new`] with an already-loaded
-/// [`aws_config::SdkConfig`]. FIPS support is handled at the config level.
+/// Construct via [`BatchChecker::from_hostname`] with an ECR hostname.
+/// FIPS support is handled at the SDK config level: set
+/// `AWS_USE_FIPS_ENDPOINT=true` before loading.
 pub struct BatchChecker {
     api: Box<dyn EcrBatchApi>,
 }
@@ -145,19 +192,21 @@ impl std::fmt::Debug for BatchChecker {
 }
 
 impl BatchChecker {
-    /// Create a new batch checker from an AWS SDK config.
+    /// Create a batch checker from an ECR hostname.
     ///
-    /// The `registry_id` is the 12-digit AWS account ID that owns the ECR
-    /// registry. Pass `None` to use the default registry for the caller's
-    /// account.
-    pub fn new(config: &aws_config::SdkConfig, registry_id: Option<String>) -> Self {
-        let client = aws_sdk_ecr::Client::new(config);
-        Self {
+    /// Extracts the AWS region and 12-digit registry ID from the hostname,
+    /// then builds an SDK config and ECR client internally. Returns an error
+    /// if the region cannot be determined from the hostname.
+    pub async fn from_hostname(hostname: &str) -> Result<Self, Error> {
+        let sdk_config = load_sdk_config(hostname).await?;
+        let registry_id = ecr_registry_id(hostname).map(|s| s.to_owned());
+        let client = aws_sdk_ecr::Client::new(&sdk_config);
+        Ok(Self {
             api: Box::new(AwsEcrBatchApi {
                 client,
                 registry_id,
             }),
-        }
+        })
     }
 
     /// Create an ECR batch checker with an injected API implementation.
@@ -246,6 +295,84 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+
+    // --- ecr_region tests ---
+
+    #[test]
+    fn region_standard() {
+        let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
+        assert_eq!(ecr_region(host), Some("us-east-1"));
+    }
+
+    #[test]
+    fn region_fips() {
+        let host = "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com";
+        assert_eq!(ecr_region(host), Some("us-gov-west-1"));
+    }
+
+    #[test]
+    fn region_dual_stack() {
+        let host = "123456789012.dkr-ecr.us-east-1.amazonaws.com";
+        assert_eq!(ecr_region(host), Some("us-east-1"));
+    }
+
+    #[test]
+    fn region_dual_stack_fips() {
+        let host = "123456789012.dkr-ecr-fips.us-gov-west-1.amazonaws.com";
+        assert_eq!(ecr_region(host), Some("us-gov-west-1"));
+    }
+
+    #[test]
+    fn region_china() {
+        let host = "123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn";
+        assert_eq!(ecr_region(host), Some("cn-north-1"));
+    }
+
+    #[test]
+    fn region_iso() {
+        let host = "123456789012.dkr.ecr.us-iso-east-1.c2s.ic.gov";
+        assert_eq!(ecr_region(host), Some("us-iso-east-1"));
+    }
+
+    #[test]
+    fn region_isob() {
+        let host = "123456789012.dkr.ecr.us-isob-east-1.sc2s.sgov.gov";
+        assert_eq!(ecr_region(host), Some("us-isob-east-1"));
+    }
+
+    #[test]
+    fn region_eu_sovereign() {
+        let host = "123456789012.dkr.ecr.eusc-de-east-1.amazonaws.eu";
+        assert_eq!(ecr_region(host), Some("eusc-de-east-1"));
+    }
+
+    #[test]
+    fn region_invalid_host() {
+        assert_eq!(ecr_region("ghcr.io"), None);
+        assert_eq!(ecr_region(""), None);
+    }
+
+    // --- ecr_registry_id tests ---
+
+    #[test]
+    fn registry_id_standard() {
+        assert_eq!(
+            ecr_registry_id("123456789012.dkr.ecr.us-east-1.amazonaws.com"),
+            Some("123456789012")
+        );
+    }
+
+    #[test]
+    fn registry_id_empty() {
+        assert_eq!(ecr_registry_id(""), Some(""));
+    }
+
+    #[test]
+    fn registry_id_dotless_hostname() {
+        assert_eq!(ecr_registry_id("localhost"), Some("localhost"));
+    }
+
+    // --- BatchBlobChecker tests ---
 
     /// Generate a valid test digest with a unique hex portion.
     fn test_digest(n: u8) -> Digest {
@@ -425,6 +552,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_all_unavailable_returns_empty() {
+        let d1 = test_digest(1);
+        let d2 = test_digest(2);
+
+        // API responds with entries but none are available.
+        let response = BatchCheckResponse {
+            layers: vec![(d1.to_string(), false), (d2.to_string(), false)],
+            failures: vec![],
+        };
+
+        let counts = CallCounts::default();
+        let mock = MockEcrBatchApi::new(counts).with_check_responses(vec![Ok(response)]);
+        let checker = BatchChecker::with_api(mock);
+
+        let result = checker
+            .check_blob_existence("my-repo", &[d1, d2])
+            .await
+            .unwrap();
+
+        assert!(result.is_empty(), "no blobs should be reported as existing");
+    }
+
+    #[tokio::test]
     async fn check_digest_missing_from_response_treated_as_unavailable() {
         let d1 = test_digest(1);
         let d2 = test_digest(2);
@@ -446,6 +596,58 @@ mod tests {
 
         assert!(result.contains(&d1));
         assert!(!result.contains(&d2));
+    }
+
+    #[tokio::test]
+    async fn check_partial_batch_failure_preserves_results() {
+        // 150 digests → 2 batches (100 + 50).
+        // Batch 1 succeeds (all available), batch 2 fails.
+        // Result should contain the 100 successful results.
+        let digests: Vec<Digest> = (0..150u16)
+            .map(|n| {
+                let hex = format!("{:0>64x}", n);
+                format!("sha256:{hex}").parse().unwrap()
+            })
+            .collect();
+
+        let batch1_response = BatchCheckResponse {
+            layers: digests[..100]
+                .iter()
+                .map(|d| (d.to_string(), true))
+                .collect(),
+            failures: vec![],
+        };
+
+        let counts = CallCounts::default();
+        let mock = MockEcrBatchApi::new(counts.clone()).with_check_responses(vec![
+            Ok(batch1_response),
+            Err(Error::Other("throttled on batch 2".into())),
+        ]);
+        let checker = BatchChecker::with_api(mock);
+
+        let result = checker
+            .check_blob_existence("my-repo", &digests)
+            .await
+            .unwrap();
+
+        // First 100 digests should be present (all available in batch 1).
+        assert_eq!(
+            result.len(),
+            100,
+            "partial results from successful batch must be preserved"
+        );
+        for d in &digests[..100] {
+            assert!(result.contains(d));
+        }
+        // Remaining 50 not in the result (batch 2 failed, never checked).
+        for d in &digests[100..] {
+            assert!(
+                !result.contains(d),
+                "unchecked digests from failed batch must not appear"
+            );
+        }
+        // 2 API calls were made (first succeeded, second failed).
+        assert_eq!(counts.check.load(Ordering::Relaxed), 2);
     }
 
     // --- Trait object compatibility ---

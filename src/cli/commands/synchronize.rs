@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use ocync_distribution::RegistryClient;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
-use ocync_distribution::auth::ecr::ecr_region;
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
 use ocync_sync::SyncReport;
 use ocync_sync::cache::TransferStateCache;
@@ -205,7 +204,7 @@ async fn build_clients(config: &Config) -> Result<HashMap<String, Arc<RegistryCl
 
 /// Build batch blob checkers for ECR registries.
 ///
-/// Automatically creates an [`BatchChecker`] for every registry detected
+/// Automatically creates a [`BatchChecker`] for every registry detected
 /// as ECR (via explicit `auth_type: ecr` or hostname auto-detection). No
 /// user configuration is needed — if we know it's ECR, we use the batch API.
 async fn build_batch_checkers(
@@ -222,22 +221,9 @@ async fn build_batch_checkers(
             continue;
         }
 
-        let region = ecr_region(hostname).ok_or_else(|| {
-            CliError::Input(format!(
-                "ECR batch checker for '{name}': cannot extract region from '{hostname}'"
-            ))
-        })?;
-
-        // Extract the 12-digit registry ID from the hostname (the first
-        // segment before `.dkr`).
-        let registry_id = hostname.split('.').next().map(|s| s.to_owned());
-
-        let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_owned()))
-            .load()
-            .await;
-
-        let checker = BatchChecker::new(&sdk_config, registry_id);
+        let checker = BatchChecker::from_hostname(hostname)
+            .await
+            .map_err(|e| CliError::Input(format!("ECR batch checker for '{name}': {e}")))?;
         checkers.insert(name.clone(), Rc::new(checker));
     }
 

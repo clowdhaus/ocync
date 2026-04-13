@@ -4,7 +4,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
-use aws_config::BehaviorVersion;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::sync::RwLock;
@@ -133,26 +132,6 @@ pub(crate) fn decode_ecr_token(encoded: &str, registry: &str) -> Result<String, 
     Ok(password.to_owned())
 }
 
-/// Extract the AWS region from an ECR hostname.
-///
-/// Handles both standard (`<account>.dkr.ecr[-fips].<region>.<domain>`)
-/// and dual-stack (`<account>.dkr-ecr[-fips].<region>.<domain>`) formats
-/// across all AWS partitions.
-pub fn ecr_region(hostname: &str) -> Option<&str> {
-    let parts: Vec<&str> = hostname.split('.').collect();
-    if parts.len() < 5 {
-        return None;
-    }
-
-    for (i, part) in parts.iter().enumerate() {
-        if matches!(*part, "ecr" | "ecr-fips" | "dkr-ecr" | "dkr-ecr-fips") {
-            return parts.get(i + 1).copied();
-        }
-    }
-
-    None
-}
-
 /// AWS ECR authentication provider.
 ///
 /// Uses the AWS SDK to obtain authorization tokens via `GetAuthorizationToken`.
@@ -190,15 +169,13 @@ impl EcrAuth {
     /// an error if the region cannot be extracted from the hostname.
     pub async fn new(hostname: impl Into<String>) -> Result<Self, Error> {
         let hostname = hostname.into();
-        let region = ecr_region(&hostname).ok_or_else(|| Error::AuthFailed {
-            registry: hostname.clone(),
-            reason: "unable to extract AWS region from ECR hostname".into(),
-        })?;
-
-        let config = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_owned()))
-            .load()
-            .await;
+        let config =
+            crate::ecr::load_sdk_config(&hostname)
+                .await
+                .map_err(|e| Error::AuthFailed {
+                    registry: hostname.clone(),
+                    reason: format!("failed to load AWS SDK config: {e}"),
+                })?;
 
         let ecr_client = aws_sdk_ecr::Client::new(&config);
         let registry = hostname.clone();
@@ -393,62 +370,6 @@ mod tests {
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
         let err = decode_ecr_token("!!!", host).unwrap_err().to_string();
         assert!(err.contains(host));
-    }
-
-    // --- ecr_region tests ---
-
-    #[test]
-    fn region_standard() {
-        let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        assert_eq!(ecr_region(host), Some("us-east-1"));
-    }
-
-    #[test]
-    fn region_fips() {
-        let host = "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com";
-        assert_eq!(ecr_region(host), Some("us-gov-west-1"));
-    }
-
-    #[test]
-    fn region_dual_stack() {
-        let host = "123456789012.dkr-ecr.us-east-1.amazonaws.com";
-        assert_eq!(ecr_region(host), Some("us-east-1"));
-    }
-
-    #[test]
-    fn region_dual_stack_fips() {
-        let host = "123456789012.dkr-ecr-fips.us-gov-west-1.amazonaws.com";
-        assert_eq!(ecr_region(host), Some("us-gov-west-1"));
-    }
-
-    #[test]
-    fn region_china() {
-        let host = "123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn";
-        assert_eq!(ecr_region(host), Some("cn-north-1"));
-    }
-
-    #[test]
-    fn region_iso() {
-        let host = "123456789012.dkr.ecr.us-iso-east-1.c2s.ic.gov";
-        assert_eq!(ecr_region(host), Some("us-iso-east-1"));
-    }
-
-    #[test]
-    fn region_isob() {
-        let host = "123456789012.dkr.ecr.us-isob-east-1.sc2s.sgov.gov";
-        assert_eq!(ecr_region(host), Some("us-isob-east-1"));
-    }
-
-    #[test]
-    fn region_eu_sovereign() {
-        let host = "123456789012.dkr.ecr.eusc-de-east-1.amazonaws.eu";
-        assert_eq!(ecr_region(host), Some("eusc-de-east-1"));
-    }
-
-    #[test]
-    fn region_invalid_host() {
-        assert_eq!(ecr_region("ghcr.io"), None);
-        assert_eq!(ecr_region(""), None);
     }
 
     // --- EcrAuth async tests ---

@@ -1410,7 +1410,6 @@ name = "ocync"
 version = "0.1.0"
 dependencies = [
  "anstyle",
- "aws-config",
  "clap",
  "ocync-distribution",
  "ocync-sync",

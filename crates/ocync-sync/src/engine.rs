@@ -83,6 +83,16 @@ pub struct TargetEntry {
     pub batch_checker: Option<Rc<dyn BatchBlobChecker>>,
 }
 
+impl Clone for TargetEntry {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            client: Arc::clone(&self.client),
+            batch_checker: self.batch_checker.clone(),
+        }
+    }
+}
+
 impl std::fmt::Debug for TargetEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TargetEntry")
@@ -220,17 +230,6 @@ impl BlobFrequencyMap {
     }
 }
 
-/// Flattened target info tuple passed into [`discover_tag`].
-///
-/// Contains the target name (dedup key), client, and optional batch checker.
-/// Extracted from [`TargetEntry`] so that discovery futures can own their data
-/// without referencing the original `ResolvedMapping`.
-type DiscoveryTarget = (
-    String,
-    Arc<RegistryClient>,
-    Option<Rc<dyn BatchBlobChecker>>,
-);
-
 /// Default cap for concurrent image transfers (Level 1: global image semaphore).
 pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 50;
 
@@ -314,17 +313,7 @@ impl SyncEngine {
                 let source_tag = tag_pair.source.clone();
                 let target_tag = tag_pair.target.clone();
                 let retry = self.retry.clone();
-                let targets: Vec<DiscoveryTarget> = mapping
-                    .targets
-                    .iter()
-                    .map(|te| {
-                        (
-                            te.name.clone(),
-                            Arc::clone(&te.client),
-                            te.batch_checker.clone(),
-                        )
-                    })
-                    .collect();
+                let targets = mapping.targets.clone();
 
                 discovery_futures.push(async move {
                     discover_tag(
@@ -463,7 +452,7 @@ async fn discover_tag(
     target_repo: &str,
     source_tag: &str,
     target_tag: &str,
-    targets: &[DiscoveryTarget],
+    targets: &[TargetEntry],
     retry: &RetryConfig,
 ) -> DiscoveryOutcome {
     // Pull source manifest (shared across all targets for this tag).
@@ -480,10 +469,10 @@ async fn discover_tag(
                 );
                 let fail_results: Vec<ImageResult> = targets
                     .iter()
-                    .map(|(target_name, _, _)| ImageResult {
+                    .map(|target| ImageResult {
                         image_id: Uuid::now_v7(),
                         source: format!("{source_repo}:{source_tag}"),
-                        target: format!("{target_repo} ({target_name}):{target_tag}"),
+                        target: format!("{target_repo} ({}):{target_tag}", target.name),
                         status: ImageStatus::Failed {
                             error: error_str.clone(),
                             retries: retry.max_retries,
@@ -502,12 +491,12 @@ async fn discover_tag(
     // HEAD-check all targets concurrently.
     let mut head_checks = FuturesUnordered::new();
 
-    for (target_name, target_client, batch_checker) in targets {
-        let client = Arc::clone(target_client);
+    for target in targets {
+        let client = Arc::clone(&target.client);
         let repo = target_repo.to_owned();
         let tag = target_tag.to_owned();
-        let name = target_name.clone();
-        let checker = batch_checker.clone();
+        let name = target.name.clone();
+        let checker = target.batch_checker.clone();
 
         head_checks.push(async move {
             let result = client.manifest_head(&repo, &tag).await;

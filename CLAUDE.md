@@ -141,6 +141,26 @@ Tests for configurable parameters (timeouts, concurrency caps, thresholds) must 
 
 Engine integration tests must assert both per-image stats (`report.images[N].blob_stats`) and aggregate stats (`report.stats`). The aggregation path in `compute_stats` has its own logic — a bug there would be missed by per-image assertions alone.
 
+### Mock contract fidelity
+
+Test mocks (trait implementations, not just wiremock) must honor the same input/output contract as the real implementation. A mock that ignores its input parameters (`_digests`, `_repo`) can't catch wiring bugs where the caller passes wrong values:
+- If the real implementation filters by input, the mock must filter the same way
+- If the real implementation returns only requested items, the mock must not return unrequested items
+- Use named parameters (not `_`-prefixed) in mock impls that use the parameter, to signal the mock respects the contract
+- A mock that returns a static response regardless of input is testing that the caller handles the response, not that the caller sends the right request
+
+### Batched operation resilience
+
+Multi-batch operations (chunked API calls, paginated requests) must handle mid-batch failures gracefully:
+- Preserve results from successful batches before the failure (partial success)
+- Propagate the error only if no results were obtained (total failure on first batch)
+- Let the caller decide what to do with the unchecked remainder (fall back to per-item checks, retry, etc.)
+- Test both total failure (first batch fails) and partial failure (Nth batch fails with N>1) — they exercise different code paths
+
+### Fan-out feature testing
+
+For 1:N fan-out features (e.g., sync to multiple targets), at least one test must exercise N>1 with **different state per target**. A feature tested only at N=1 doesn't verify target independence — shared state bugs, cross-target contamination, and per-target stat tracking only surface at N>=2. Each target should have its own mock server and its own assertions.
+
 ### wiremock for all network code
 
 Network code requires `wiremock` tests verifying actual HTTP request sequences, not just unit tests on types. Tests must cover:
