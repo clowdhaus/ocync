@@ -317,4 +317,18 @@ mod tests {
             serde_json::Value::String("blob_transfer".into()),
         );
     }
+
+    #[test]
+    fn image_status_failed_json_includes_kind() {
+        let status = ImageStatus::Failed {
+            kind: ErrorKind::ManifestPull,
+            error: "timeout".into(),
+            retries: 3,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["kind"], "manifest_pull");
+        assert_eq!(json["error"], "timeout");
+        assert_eq!(json["retries"], 3);
+    }
 }

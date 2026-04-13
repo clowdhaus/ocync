@@ -299,6 +299,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verbosity_1_prints_skip_existing() {
+        let (progress, stderr, _stdout) = test_progress(1);
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::SkipExisting,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert!(output.contains("skipped"), "should print skipped");
+        assert!(
+            output.contains("skip existing"),
+            "should contain skip existing reason"
+        );
+    }
+
     // -- run_completed tests --
 
     #[test]
@@ -401,21 +419,13 @@ mod tests {
         ));
 
         let output = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert_eq!(
-            output.matches("synced").count(),
-            2,
-            "should have 2 synced lines"
-        );
-        assert_eq!(
-            output.matches("skipped").count(),
-            1,
-            "should have 1 skipped line"
-        );
-        assert_eq!(
-            output.matches("FAILED").count(),
-            1,
-            "should have 1 FAILED line"
-        );
+        let lines: Vec<&str> = output.lines().collect();
+        let synced_lines = lines.iter().filter(|l| l.starts_with("synced  ")).count();
+        let skipped_lines = lines.iter().filter(|l| l.starts_with("skipped ")).count();
+        let failed_lines = lines.iter().filter(|l| l.starts_with("FAILED  ")).count();
+        assert_eq!(synced_lines, 2, "should have 2 synced lines");
+        assert_eq!(skipped_lines, 1, "should have 1 skipped line");
+        assert_eq!(failed_lines, 1, "should have 1 FAILED line");
     }
 
     #[test]
