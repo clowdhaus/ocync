@@ -2,13 +2,13 @@
 
 use http::StatusCode;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
-use tokio::sync::Semaphore;
 use url::Url;
 
+use crate::aimd::{AimdController, RegistryAction};
 use crate::auth::{AuthProvider, Scope};
 use crate::error::Error;
 
-const DEFAULT_MAX_CONCURRENT: usize = 8;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
 
@@ -38,7 +38,7 @@ impl RegistryClientBuilder {
         Self {
             url,
             auth: None,
-            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            max_concurrent: DEFAULT_MAX_CONCURRENT_REQUESTS,
             chunk_size: DEFAULT_CHUNK_SIZE,
         }
     }
@@ -46,12 +46,6 @@ impl RegistryClientBuilder {
     /// Set the authentication provider.
     pub fn auth(mut self, auth: impl AuthProvider + 'static) -> Self {
         self.auth = Some(Box::new(auth));
-        self
-    }
-
-    /// Set the authentication provider from a boxed trait object.
-    pub fn auth_boxed(mut self, auth: Box<dyn AuthProvider>) -> Self {
-        self.auth = Some(auth);
         self
     }
 
@@ -73,11 +67,15 @@ impl RegistryClientBuilder {
             .user_agent(USER_AGENT_VALUE)
             .build()?;
 
+        let aimd = AimdController::new(
+            self.url.host_str().unwrap_or("unknown"),
+            self.max_concurrent,
+        );
         Ok(RegistryClient {
             base_url: self.url,
             http,
             auth: self.auth,
-            semaphore: Semaphore::new(self.max_concurrent),
+            aimd,
             chunk_size: self.chunk_size,
         })
     }
@@ -86,12 +84,12 @@ impl RegistryClientBuilder {
 /// HTTP client for a single OCI registry.
 ///
 /// Each `RegistryClient` targets one registry host and owns its auth provider
-/// and concurrency semaphore. Construct via [`RegistryClientBuilder`].
+/// and AIMD concurrency controller. Construct via [`RegistryClientBuilder`].
 pub struct RegistryClient {
     pub(crate) base_url: Url,
     pub(crate) http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
-    pub(crate) semaphore: Semaphore,
+    pub(crate) aimd: AimdController,
     pub(crate) chunk_size: usize,
 }
 
@@ -108,16 +106,6 @@ impl RegistryClient {
     /// Create a builder for this client.
     pub fn builder(url: Url) -> RegistryClientBuilder {
         RegistryClientBuilder::new(url)
-    }
-
-    /// The base URL of this registry.
-    pub fn base_url(&self) -> &Url {
-        &self.base_url
-    }
-
-    /// The configured chunk size for blob uploads.
-    pub fn chunk_size(&self) -> usize {
-        self.chunk_size
     }
 
     /// Ping the registry's `/v2/` endpoint.
@@ -139,19 +127,21 @@ impl RegistryClient {
 
     /// Perform an authenticated GET request.
     ///
-    /// Acquires a semaphore permit, attaches auth headers, and retries once
-    /// on 401 (invalidating the cached token first).
+    /// Acquires an AIMD permit for the given operation, attaches auth headers,
+    /// and retries once on 401 (invalidating the cached token first). Reports
+    /// throttle on 429 so the AIMD window adapts.
     pub async fn get(
         &self,
         repository: &str,
         path: &str,
         accept: Option<&str>,
+        op: RegistryAction,
     ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
+        let permit = self.aimd.acquire(op).await;
         let scopes = [Scope::pull(repository)];
 
-        let resp = self
+        let result = self
             .send_with_retry(&scopes, "GET", |mut headers| {
                 if let Some(accept) = accept {
                     if let Ok(val) = HeaderValue::from_str(accept) {
@@ -160,33 +150,40 @@ impl RegistryClient {
                 }
                 self.http.get(url.clone()).headers(headers)
             })
-            .await?;
+            .await;
 
-        classify_response(resp, &self.base_url, repository).await
+        report_permit(permit, &result);
+        classify_response(result?, &self.base_url, repository).await
     }
 
     /// Perform an authenticated HEAD request.
     ///
-    /// Same retry logic as [`get`](Self::get).
-    pub async fn head(&self, repository: &str, path: &str) -> Result<reqwest::Response, Error> {
+    /// Same AIMD and retry logic as [`get`](Self::get).
+    pub async fn head(
+        &self,
+        repository: &str,
+        path: &str,
+        op: RegistryAction,
+    ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
+        let permit = self.aimd.acquire(op).await;
         let scopes = [Scope::pull(repository)];
 
-        let resp = self
+        let result = self
             .send_with_retry(&scopes, "HEAD", |headers| {
                 self.http.head(url.clone()).headers(headers)
             })
-            .await?;
+            .await;
 
-        classify_response(resp, &self.base_url, repository).await
+        report_permit(permit, &result);
+        classify_response(result?, &self.base_url, repository).await
     }
 
     /// Send a request with 401 retry and token invalidation.
     ///
     /// Builds the request via `build_request` (called with fresh auth headers),
     /// sends it, and if a 401 is returned, invalidates the cached token and
-    /// retries once. Does NOT acquire a semaphore permit — callers manage their
+    /// retries once. Does NOT acquire an AIMD permit — callers manage their
     /// own permits.
     pub(crate) async fn send_with_retry(
         &self,
@@ -232,6 +229,21 @@ impl RegistryClient {
         }
 
         Ok(headers)
+    }
+}
+
+/// Report AIMD permit outcome based on the HTTP response.
+///
+/// Calls [`AimdPermit::throttled`] on 429, [`AimdPermit::success`] otherwise.
+/// Transport errors (no response at all) are treated as success by the permit's
+/// drop impl, so we only need to handle the `Ok` case explicitly.
+pub(crate) fn report_permit(
+    permit: crate::aimd::AimdPermit<'_>,
+    result: &Result<reqwest::Response, Error>,
+) {
+    match result {
+        Ok(resp) if resp.status() == StatusCode::TOO_MANY_REQUESTS => permit.throttled(),
+        _ => permit.success(),
     }
 }
 
@@ -339,8 +351,8 @@ mod tests {
     #[test]
     fn builder_defaults() {
         let client = RegistryClient::builder(test_base_url()).build().unwrap();
-        assert_eq!(client.base_url().as_str(), "https://registry-1.docker.io/");
-        assert_eq!(client.chunk_size(), DEFAULT_CHUNK_SIZE);
+        assert_eq!(client.base_url.as_str(), "https://registry-1.docker.io/");
+        assert_eq!(client.chunk_size, DEFAULT_CHUNK_SIZE);
         assert!(client.auth.is_none());
     }
 
@@ -350,7 +362,7 @@ mod tests {
             .chunk_size(4 * 1024 * 1024)
             .build()
             .unwrap();
-        assert_eq!(client.chunk_size(), 4 * 1024 * 1024);
+        assert_eq!(client.chunk_size, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -359,7 +371,10 @@ mod tests {
             .max_concurrent(4)
             .build()
             .unwrap();
-        assert_eq!(client.semaphore.available_permits(), 4);
+        // The AIMD controller initialises per-action windows lazily, so verify
+        // via the window_limit accessor (which returns the default initial value
+        // capped at max_concurrent before any requests are made).
+        assert_eq!(client.aimd.window_limit(RegistryAction::BlobRead), 4);
     }
 
     #[test]

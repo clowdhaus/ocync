@@ -3,13 +3,12 @@
 use std::collections::{BTreeSet, HashMap};
 
 use ocync_distribution::Digest;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 /// Status of a blob at the target registry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobStatus {
-    /// Not yet checked.
-    Unknown,
     /// Already exists at target.
     ExistsAtTarget,
     /// Transfer currently in flight.
@@ -21,7 +20,7 @@ pub enum BlobStatus {
 }
 
 /// Metadata for a tracked blob.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct BlobInfo {
     /// Current transfer status.
     pub status: BlobStatus,
@@ -40,38 +39,41 @@ type BlobIndex = HashMap<Digest, BlobInfo>;
 /// Tracks which blobs have already been transferred or exist at a target so
 /// we never push the same layer twice. Uses a two-level map to avoid
 /// allocations on read-path lookups.
-#[derive(Debug)]
-pub struct BlobDedupMap {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct BlobDedupMap {
     inner: HashMap<String, BlobIndex>,
 }
 
 impl BlobDedupMap {
     /// Create an empty deduplication map.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: HashMap::new(),
         }
     }
 
     /// Get or create the `BlobInfo` entry for the given target and digest.
+    ///
+    /// New entries start as `InProgress` — callers always overwrite the status
+    /// immediately, so the initial value is never observed.
     fn entry_mut(&mut self, target: &str, digest: &Digest) -> &mut BlobInfo {
         self.inner
             .entry(target.to_owned())
             .or_default()
             .entry(digest.clone())
             .or_insert_with(|| BlobInfo {
-                status: BlobStatus::Unknown,
+                status: BlobStatus::InProgress,
                 repos: BTreeSet::new(),
             })
     }
 
     /// Get the current status for a blob at the given target.
-    pub fn status(&self, target: &str, digest: &Digest) -> Option<&BlobStatus> {
+    pub(crate) fn status(&self, target: &str, digest: &Digest) -> Option<&BlobStatus> {
         self.inner.get(target)?.get(digest).map(|info| &info.status)
     }
 
     /// Mark a blob as existing at the target in the given repo.
-    pub fn set_exists(&mut self, target: &str, digest: &Digest, repo: &str) {
+    pub(crate) fn set_exists(&mut self, target: &str, digest: &Digest, repo: &str) {
         let entry = self.entry_mut(target, digest);
         if matches!(entry.status, BlobStatus::Completed | BlobStatus::Failed(_)) {
             warn!(
@@ -91,7 +93,7 @@ impl BlobDedupMap {
     /// `Completed → InProgress` is expected when re-processing a blob for a
     /// different repo at the same target (cross-repo mount fallback). Only
     /// `Failed → InProgress` is warned since it may indicate a logic error.
-    pub fn set_in_progress(&mut self, target: &str, digest: &Digest) {
+    pub(crate) fn set_in_progress(&mut self, target: &str, digest: &Digest) {
         let entry = self.entry_mut(target, digest);
         if matches!(entry.status, BlobStatus::Failed(_)) {
             warn!(
@@ -106,7 +108,7 @@ impl BlobDedupMap {
     }
 
     /// Mark a blob as completed at the target in the given repo.
-    pub fn set_completed(&mut self, target: &str, digest: &Digest, repo: &str) {
+    pub(crate) fn set_completed(&mut self, target: &str, digest: &Digest, repo: &str) {
         let entry = self.entry_mut(target, digest);
         if matches!(entry.status, BlobStatus::Failed(_)) {
             warn!(
@@ -122,7 +124,7 @@ impl BlobDedupMap {
     }
 
     /// Mark a blob as failed at the target.
-    pub fn set_failed(&mut self, target: &str, digest: &Digest, error: String) {
+    pub(crate) fn set_failed(&mut self, target: &str, digest: &Digest, error: String) {
         let entry = self.entry_mut(target, digest);
         if matches!(
             entry.status,
@@ -140,7 +142,7 @@ impl BlobDedupMap {
     }
 
     /// Return the set of known repos for a blob at a target.
-    pub fn known_repos(&self, target: &str, digest: &Digest) -> Option<&BTreeSet<String>> {
+    pub(crate) fn known_repos(&self, target: &str, digest: &Digest) -> Option<&BTreeSet<String>> {
         self.inner.get(target)?.get(digest).map(|info| &info.repos)
     }
 
@@ -148,7 +150,7 @@ impl BlobDedupMap {
     /// `target_repo`, suitable as a cross-repo mount source.
     ///
     /// Returns the alphabetically first candidate (deterministic via `BTreeSet`).
-    pub fn mount_source<'a>(
+    pub(crate) fn mount_source<'a>(
         &'a self,
         target: &str,
         digest: &Digest,
@@ -159,6 +161,59 @@ impl BlobDedupMap {
             .iter()
             .find(|r| r.as_str() != target_repo)
             .map(|r| r.as_str())
+    }
+
+    /// Remove the entry for the given blob at the target.
+    ///
+    /// Used for lazy invalidation when a mount or push fails so the next sync
+    /// attempt re-evaluates the blob's state rather than trusting stale data.
+    pub(crate) fn invalidate(&mut self, target: &str, digest: &Digest) {
+        if let Some(index) = self.inner.get_mut(target) {
+            index.remove(digest);
+        }
+    }
+
+    /// Return a copy of this map containing only entries whose status is
+    /// [`BlobStatus::ExistsAtTarget`] or [`BlobStatus::Completed`].
+    ///
+    /// Transient states (`InProgress`, `Failed`) are excluded so
+    /// only stable, verified results are written to the on-disk cache.
+    pub(crate) fn filter_persistable(&self) -> BlobDedupMap {
+        let inner = self
+            .inner
+            .iter()
+            .filter_map(|(target, index)| {
+                let filtered: HashMap<Digest, BlobInfo> = index
+                    .iter()
+                    .filter(|(_, info)| {
+                        matches!(
+                            info.status,
+                            BlobStatus::ExistsAtTarget | BlobStatus::Completed
+                        )
+                    })
+                    .map(|(digest, info)| {
+                        (
+                            digest.clone(),
+                            BlobInfo {
+                                status: info.status.clone(),
+                                repos: info.repos.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some((target.clone(), filtered))
+                }
+            })
+            .collect();
+        BlobDedupMap { inner }
+    }
+
+    /// Returns `true` if the map contains no entries.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.values().all(|index| index.is_empty())
     }
 }
 

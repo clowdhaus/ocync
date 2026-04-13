@@ -1,15 +1,19 @@
 //! Integration tests for `SyncEngine` using mock HTTP servers.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType};
 use ocync_distribution::{Digest, RegistryClientBuilder};
+use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
+use ocync_sync::staging::BlobStage;
 use ocync_sync::{ImageStatus, SkipReason};
 use url::Url;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -40,6 +44,10 @@ fn fast_retry() -> RetryConfig {
         max_backoff: std::time::Duration::from_millis(10),
         backoff_multiplier: 2,
     }
+}
+
+fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
+    Rc::new(RefCell::new(TransferStateCache::new()))
 }
 
 /// Serialize an `ImageManifest` to JSON bytes and compute its digest.
@@ -263,8 +271,16 @@ async fn sync_happy_path() {
         tags: vec![TagPair::same("latest")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -306,8 +322,16 @@ async fn sync_skip_on_digest_match() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(
@@ -355,8 +379,16 @@ async fn sync_blob_exists_at_target_skips_transfer() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -393,8 +425,16 @@ async fn sync_manifest_pull_failure() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(
@@ -463,8 +503,16 @@ async fn sync_blob_transfer_retries_on_source_500() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -521,8 +569,17 @@ async fn sync_dedup_across_tags() {
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    // Use max_concurrent=1 to ensure sequential execution so dedup works across tags.
+    let engine = SyncEngine::new(fast_retry(), 1);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 2);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -588,8 +645,16 @@ async fn sync_multiple_targets() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 2);
     assert_eq!(report.stats.images_synced, 2);
@@ -642,8 +707,16 @@ async fn sync_retag() {
         tags: vec![TagPair::retag("latest", "stable")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -651,8 +724,16 @@ async fn sync_retag() {
 
 #[tokio::test]
 async fn sync_empty_mappings() {
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert!(report.images.is_empty());
     assert_eq!(report.stats.images_synced, 0);
@@ -695,8 +776,16 @@ async fn sync_blob_transfer_failure() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(
@@ -844,8 +933,16 @@ async fn sync_index_manifest_multi_platform() {
         tags: vec![TagPair::same("latest")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -901,8 +998,16 @@ async fn sync_head_different_digest_proceeds_with_sync() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -926,8 +1031,16 @@ async fn sync_empty_tags_produces_no_images() {
         tags: vec![],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert!(report.images.is_empty());
     assert_eq!(report.stats.images_synced, 0);
@@ -982,8 +1095,16 @@ async fn sync_manifest_push_failure() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(
@@ -1045,8 +1166,16 @@ async fn sync_retry_exhaustion_returns_final_error() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(
@@ -1142,8 +1271,18 @@ async fn sync_cross_repo_mount_success() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping_a, mapping_b], &NullProgress).await;
+    // Use max_concurrent=1 to ensure mapping_a completes before mapping_b starts,
+    // so that repo-a's blobs are in the dedup map for cross-repo mount.
+    let engine = SyncEngine::new(fast_retry(), 1);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 2);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -1255,8 +1394,18 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping_a, mapping_b], &NullProgress).await;
+    // Use max_concurrent=1 to ensure mapping_a completes first so mapping_b
+    // has mount sources available in the dedup map.
+    let engine = SyncEngine::new(fast_retry(), 1);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 2);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -1371,8 +1520,18 @@ async fn sync_cross_repo_mount_failure_falls_back() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping_a, mapping_b], &NullProgress).await;
+    // Use max_concurrent=1 to ensure mapping_a completes first so mapping_b
+    // has mount sources available in the dedup map.
+    let engine = SyncEngine::new(fast_retry(), 1);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 2);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -1442,23 +1601,505 @@ async fn sync_multi_target_partial_blob_failure_isolates_targets() {
         tags: vec![TagPair::same("v1")],
     };
 
-    let mut engine = SyncEngine::new(fast_retry());
-    let report = engine.run(vec![mapping], &NullProgress).await;
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 2);
-    // Target A succeeds despite target B's failure.
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Synced),
-        "target A should succeed: {:?}",
-        report.images[0].status
-    );
-    assert_eq!(report.images[0].blob_stats.transferred, 2);
-    // Target B fails.
-    assert!(
-        matches!(report.images[1].status, ImageStatus::Failed { .. }),
-        "target B should fail: {:?}",
-        report.images[1].status
-    );
+    // With concurrent execution, results may arrive in any order.
+    // Find results by status rather than assuming index order.
+    let synced = report
+        .images
+        .iter()
+        .filter(|r| matches!(r.status, ImageStatus::Synced))
+        .count();
+    let failed = report
+        .images
+        .iter()
+        .filter(|r| matches!(r.status, ImageStatus::Failed { .. }))
+        .count();
+    assert_eq!(synced, 1, "one target should succeed");
+    assert_eq!(failed, 1, "one target should fail");
+    // Verify the successful target transferred blobs.
+    let synced_result = report
+        .images
+        .iter()
+        .find(|r| matches!(r.status, ImageStatus::Synced))
+        .unwrap();
+    assert_eq!(synced_result.blob_stats.transferred, 2);
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.images_failed, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: progressive cache population, cross-repo mount, monolithic upload,
+// lazy invalidation, and cache persistence round-trip.
+// ---------------------------------------------------------------------------
+
+/// Two images sharing one base layer and one unique layer each.
+///
+/// After the first image syncs, the base layer is recorded as completed at
+/// `(target, repo)`. When the second image processes the base layer, the
+/// engine hits `blob_known_at_repo` → skips the HEAD check entirely.
+/// Total blob pushes: base + layer_a + layer_b = 3, not 4.
+#[tokio::test]
+async fn sync_progressive_cache_skips_shared_blob_head_check() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let base_data = b"base-layer-data";
+    let layer_a_data = b"layer-a-data";
+    let layer_b_data = b"layer-b-data";
+    let config_a_data = b"config-a";
+    let config_b_data = b"config-b";
+
+    let base_desc = blob_descriptor(base_data, MediaType::OciLayerGzip);
+    let layer_a_desc = blob_descriptor(layer_a_data, MediaType::OciLayerGzip);
+    let layer_b_desc = blob_descriptor(layer_b_data, MediaType::OciLayerGzip);
+    let config_a_desc = blob_descriptor(config_a_data, MediaType::OciConfig);
+    let config_b_desc = blob_descriptor(config_b_data, MediaType::OciConfig);
+
+    let manifest_a = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_a_desc.clone(),
+        layers: vec![base_desc.clone(), layer_a_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let manifest_b = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_b_desc.clone(),
+        layers: vec![base_desc.clone(), layer_b_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_a_bytes, _) = serialize_manifest(&manifest_a);
+    let (manifest_b_bytes, _) = serialize_manifest(&manifest_b);
+
+    // Source: serve both manifests and all blobs.
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_a_bytes).await;
+    mount_source_manifest(&source_server, "repo", "v2", &manifest_b_bytes).await;
+    mount_blob_pull(&source_server, "repo", &base_desc.digest, base_data).await;
+    mount_blob_pull(&source_server, "repo", &layer_a_desc.digest, layer_a_data).await;
+    mount_blob_pull(&source_server, "repo", &layer_b_desc.digest, layer_b_data).await;
+    mount_blob_pull(&source_server, "repo", &config_a_desc.digest, config_a_data).await;
+    mount_blob_pull(&source_server, "repo", &config_b_desc.digest, config_b_data).await;
+
+    // Target: manifest HEAD 404 for both tags.
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_manifest_head_not_found(&target_server, "repo", "v2").await;
+
+    // v1 blobs: all missing at target — base, config_a, layer_a each need HEAD + push.
+    mount_blob_not_found(&target_server, "repo", &base_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &config_a_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_a_desc.digest).await;
+
+    // v2 blobs: base was already completed by v1 — no HEAD issued.
+    // config_b and layer_b are new so HEAD + push needed.
+    mount_blob_not_found(&target_server, "repo", &config_b_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_b_desc.digest).await;
+
+    // The push endpoint accepts any upload (3 pushes for v1: base + config_a + layer_a;
+    // 2 pushes for v2: config_b + layer_b; base is skipped entirely for v2).
+    mount_blob_push(&target_server, "repo").await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+    mount_manifest_push(&target_server, "repo", "v2").await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: mock_client(&target_server),
+        }],
+        tags: vec![TagPair::same("v1"), TagPair::same("v2")],
+    };
+
+    // Sequential execution ensures v1 completes and populates the cache before v2 starts.
+    let engine = SyncEngine::new(fast_retry(), 1);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 2);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert!(matches!(report.images[1].status, ImageStatus::Synced));
+
+    // v1: 3 blobs transferred (base + config_a + layer_a).
+    assert_eq!(report.images[0].blob_stats.transferred, 3);
+    assert_eq!(report.images[0].blob_stats.skipped, 0);
+
+    // v2: base is a cache hit (skipped), config_b + layer_b transferred.
+    assert_eq!(report.images[1].blob_stats.transferred, 2);
+    assert_eq!(report.images[1].blob_stats.skipped, 1);
+
+    // Total: 5 transferred across both images, 1 skipped (the shared base for v2).
+    assert_eq!(report.stats.blobs_transferred, 5);
+    assert_eq!(report.stats.blobs_skipped, 1);
+}
+
+/// A pre-warmed cache records a blob as completed at repo-a. When the engine
+/// processes the same blob for repo-b on the same target, it finds a mount
+/// source in the cache and issues a cross-repo mount POST (201 → Mounted).
+#[tokio::test]
+async fn sync_warm_cache_triggers_cross_repo_mount() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-data";
+    let layer_data = b"layer-data";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: serve manifest (blobs will be mounted, not pulled).
+    mount_source_manifest(&source_server, "repo-b", "v1", &manifest_bytes).await;
+
+    // Target: manifest HEAD 404, mount POST returns 201 (Mounted) for both blobs.
+    mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-b/blobs/uploads/"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo-b", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    // Pre-warm the cache: blobs already exist at repo-a on the target.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        let target = "target";
+        c.set_blob_completed(target, config_desc.digest.clone(), "repo-a".into());
+        c.set_blob_completed(target, layer_desc.digest.clone(), "repo-a".into());
+    }
+
+    let mapping = ResolvedMapping {
+        source_client,
+        source_repo: "repo-b".into(),
+        target_repo: "repo-b".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client,
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // Both blobs mounted from repo-a; none pulled or skipped by HEAD.
+    assert_eq!(report.images[0].blob_stats.mounted, 2);
+    assert_eq!(report.images[0].blob_stats.transferred, 0);
+    assert_eq!(report.images[0].blob_stats.skipped, 0);
+    assert_eq!(report.stats.blobs_mounted, 2);
+    assert_eq!(report.stats.blobs_transferred, 0);
+}
+
+/// Small blobs (below the 1 MiB monolithic threshold) use POST+PUT with no
+/// PATCH. The mock expects exactly 1 POST and 1 PUT per blob, and 0 PATCHes.
+#[tokio::test]
+async fn sync_small_blob_uses_monolithic_upload() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // Both blobs are well below the 1 MiB monolithic threshold.
+    let config_data = b"small-config";
+    let layer_data = b"small-layer";
+
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+
+    // Monolithic upload: POST initiates, PUT finalizes — no PATCH.
+    // Use .expect() to assert exact counts per HTTP method.
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202).insert_header("location", "/v2/repo/blobs/uploads/mono-id"),
+        )
+        .expect(2) // one POST per blob
+        .mount(&target_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/blobs/uploads/mono-id"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(2) // one PUT per blob
+        .mount(&target_server)
+        .await;
+
+    // No PATCH mock registered — any PATCH would cause a wiremock 404 and fail the test.
+
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: mock_client(&target_server),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+}
+
+/// A stale cache entry records a blob as completed at `other-repo`. The engine
+/// finds a mount source, issues a mount POST, which returns a non-201/non-202
+/// status (treated as an error). The engine invalidates the cache entry and
+/// falls back to HEAD check + full push, which succeeds.
+#[tokio::test]
+async fn sync_lazy_invalidation_on_mount_failure() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-payload";
+    let layer_data = b"layer-payload";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+
+    // Mount POSTs carry a `mount` query parameter; match on it to distinguish
+    // them from regular upload initiations.  Both mount attempts return 404
+    // (non-retryable error) so the engine invalidates the stale cache entry
+    // and falls back to HEAD check + full push.
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .and(query_param("mount", config_desc.digest.to_string()))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .mount(&target_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .and(query_param("mount", layer_desc.digest.to_string()))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .mount(&target_server)
+        .await;
+
+    // After invalidation the engine falls back to HEAD check (returns 404 = absent).
+    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+
+    // Fallback push: the blobs are small so the engine takes the monolithic
+    // path (POST → 202, then PUT → 201; no PATCH).
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/repo/blobs/uploads/fallback-id"),
+        )
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/blobs/uploads/fallback-id"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    // Stale cache: blobs appear completed at other-repo, so the engine will
+    // find a mount source and try a mount before falling back.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        c.set_blob_completed("target", config_desc.digest.clone(), "other-repo".into());
+        c.set_blob_completed("target", layer_desc.digest.clone(), "other-repo".into());
+    }
+
+    let mapping = ResolvedMapping {
+        source_client,
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client,
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // After failed mounts, fallback push transferred both blobs.
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+    assert_eq!(report.images[0].blob_stats.mounted, 0);
+}
+
+/// Run a sync, persist the resulting cache to disk, reload it, and verify
+/// the blob entries recorded during the sync are present in the loaded cache.
+#[tokio::test]
+async fn sync_cache_persist_and_load_round_trip() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"persist-config";
+    let layer_data = b"persist-layer";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "repo").await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target-reg".into(),
+            client: mock_client(&target_server),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let cache = empty_cache();
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            Rc::clone(&cache),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.blobs_transferred, 2);
+
+    // Persist the in-memory cache to a temp file.
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let cache_path = tmp_dir.path().join("sync_cache.bin");
+    cache.borrow().persist(&cache_path).unwrap();
+
+    // Load the cache back and verify both blobs are recorded as completed.
+    let loaded = TransferStateCache::load(&cache_path, std::time::Duration::from_secs(3600));
+
+    assert!(
+        loaded.blob_known_at_repo("target-reg", &config_desc.digest, "repo"),
+        "config blob should be recorded as completed at repo"
+    );
+    assert!(
+        loaded.blob_known_at_repo("target-reg", &layer_desc.digest, "repo"),
+        "layer blob should be recorded as completed at repo"
+    );
+    assert!(
+        !loaded.blob_known_at_repo("target-reg", &config_desc.digest, "other-repo"),
+        "blob should not appear at an unrelated repo"
+    );
 }

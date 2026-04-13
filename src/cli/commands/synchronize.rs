@@ -1,14 +1,23 @@
 //! The `sync` subcommand -- runs all mappings from config.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ocync_distribution::RegistryClient;
 use ocync_sync::SyncReport;
-use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
+use ocync_sync::cache::TransferStateCache;
+use ocync_sync::engine::{
+    DEFAULT_MAX_CONCURRENT_TRANSFERS, ResolvedMapping, SyncEngine, TagPair, TargetEntry,
+};
 use ocync_sync::filter::FilterConfig;
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
+use ocync_sync::shutdown::ShutdownSignal;
+use ocync_sync::staging::BlobStage;
 
 use crate::SyncArgs;
 use crate::cli::config::{
@@ -16,8 +25,17 @@ use crate::cli::config::{
 };
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
+/// Default cache TTL: 12 hours.
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
+
 /// Run the sync command: load config, resolve mappings, and execute.
-pub(crate) async fn run(args: &SyncArgs) -> Result<ExitCode, CliError> {
+///
+/// The `shutdown` signal, if provided, will be forwarded to the engine for
+/// graceful drain on SIGINT/SIGTERM.
+pub(crate) async fn run(
+    args: &SyncArgs,
+    shutdown: Option<&ShutdownSignal>,
+) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
 
     let clients = build_clients(&config).await?;
@@ -36,9 +54,75 @@ pub(crate) async fn run(args: &SyncArgs) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::Success);
     }
 
-    let mut engine = SyncEngine::new(RetryConfig::default());
+    // Resolve cache directory: explicit config > default next to config file.
+    let cache_dir = config
+        .global
+        .as_ref()
+        .and_then(|g| g.cache_dir.as_deref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            args.config
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(".ocync/cache")
+        });
+
+    // Parse cache TTL from config (default 12h).
+    // The config validator ensures only valid duration strings reach here.
+    let cache_ttl = config
+        .global
+        .as_ref()
+        .and_then(|g| g.cache_ttl.as_deref())
+        .and_then(parse_duration)
+        .unwrap_or(DEFAULT_CACHE_TTL);
+
+    let cache_path = cache_dir.join("transfer_state.bin");
+    let cache = Rc::new(RefCell::new(TransferStateCache::load(
+        &cache_path,
+        cache_ttl,
+    )));
+
+    // Enable disk staging only when at least one mapping has multiple targets.
+    let has_multi_target = mappings.iter().any(|m| m.targets.len() > 1);
+    let staging = if has_multi_target {
+        let stage = BlobStage::new(cache_dir.join("blobs"));
+        if let Err(e) = stage.cleanup_tmp_files() {
+            tracing::warn!(error = %e, "failed to clean staging tmp files");
+        }
+        // Evict stale blobs from previous runs before starting new work.
+        // Between sync cycles, all leftover blobs have zero future references
+        // so empty ref_counts is correct — eviction just limits residual disk usage.
+        if let Some(limit) = config
+            .global
+            .as_ref()
+            .and_then(|g| g.staging_size_limit.as_deref())
+            .and_then(parse_size)
+        {
+            if let Err(e) = stage.evict(limit, &HashMap::new()) {
+                tracing::warn!(error = %e, "failed to evict staged blobs");
+            }
+        }
+        stage
+    } else {
+        BlobStage::disabled()
+    };
+
+    let max_concurrent = config
+        .global
+        .as_ref()
+        .map_or(DEFAULT_MAX_CONCURRENT_TRANSFERS, |g| {
+            g.max_concurrent_transfers
+        });
+    let engine = SyncEngine::new(RetryConfig::default(), max_concurrent);
     let progress = NullProgress;
-    let report = engine.run(mappings, &progress).await;
+    let report = engine
+        .run(mappings, cache.clone(), staging, &progress, shutdown)
+        .await;
+
+    // Persist cache after the run.
+    if let Err(e) = cache.borrow().persist(&cache_path) {
+        tracing::error!(error = %e, "failed to persist transfer state cache");
+    }
 
     write_output(&report, args.json)?;
 
@@ -49,12 +133,69 @@ pub(crate) async fn run(args: &SyncArgs) -> Result<ExitCode, CliError> {
     }
 }
 
+/// Parse a human-readable duration string into a [`Duration`].
+///
+/// Accepts:
+/// - `"0"` — [`Duration::ZERO`]
+/// - `"<N>s"` — N seconds
+/// - `"<N>m"` — N minutes
+/// - `"<N>h"` — N hours
+/// - `"<N>d"` — N days
+/// - `"<N>"` (no suffix) — N seconds
+///
+/// Returns `None` for unrecognised strings — callers must decide how to
+/// handle invalid input rather than silently receiving a default.
+fn parse_duration(s: &str) -> Option<Duration> {
+    if s == "0" {
+        return Some(Duration::ZERO);
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let last = &s[s.len() - 1..];
+    let (digits, multiplier) = match last {
+        "s" => (&s[..s.len() - 1], 1u64),
+        "m" => (&s[..s.len() - 1], 60),
+        "h" => (&s[..s.len() - 1], 3600),
+        "d" => (&s[..s.len() - 1], 86400),
+        _ if s.chars().all(|c| c.is_ascii_digit()) => (s, 1),
+        _ => return None,
+    };
+    digits
+        .parse::<u64>()
+        .ok()
+        .map(|n| Duration::from_secs(n * multiplier))
+}
+
+/// Parse a human-readable size string into bytes.
+///
+/// Accepts `"0"`, `"<N>B"`, `"<N>KB"`, `"<N>MB"`, `"<N>GB"`, `"<N>TB"`.
+/// Returns `None` for unrecognised strings.
+fn parse_size(s: &str) -> Option<u64> {
+    if s == "0" {
+        return Some(0);
+    }
+    for (suffix, multiplier) in &[
+        ("TB", 1_000_000_000_000u64),
+        ("GB", 1_000_000_000),
+        ("MB", 1_000_000),
+        ("KB", 1_000),
+        ("B", 1),
+    ] {
+        if let Some(digits) = s.strip_suffix(suffix) {
+            return digits.parse::<u64>().ok().map(|n| n * multiplier);
+        }
+    }
+    None
+}
+
 /// Build a `RegistryClient` for each named registry in config, keyed by name.
 async fn build_clients(config: &Config) -> Result<HashMap<String, Arc<RegistryClient>>, CliError> {
     let mut clients = HashMap::with_capacity(config.registries.len());
     for (name, reg) in &config.registries {
         let hostname = bare_hostname(&reg.url);
-        let client = build_registry_client(hostname, reg.auth_type.as_ref()).await?;
+        let client =
+            build_registry_client(hostname, reg.auth_type.as_ref(), reg.max_concurrent).await?;
         clients.insert(name.clone(), Arc::new(client));
     }
     Ok(clients)
@@ -233,11 +374,14 @@ fn print_summary(report: &SyncReport) {
     );
 }
 
-/// Format a byte count as a human-readable string.
+/// Format a byte count as a human-readable string using SI decimal prefixes.
+///
+/// Matches the same SI convention as [`parse_size`] (1 KB = 1,000 bytes) so
+/// that parsed and displayed values round-trip consistently.
 fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
+    const KB: u64 = 1_000;
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000_000_000;
 
     if bytes >= GB {
         format!("{:.1} GB", bytes as f64 / GB as f64)
@@ -255,6 +399,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_duration_zero() {
+        assert_eq!(parse_duration("0"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parse_duration_seconds_suffix() {
+        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn parse_duration_minutes_suffix() {
+        assert_eq!(parse_duration("30m"), Some(Duration::from_secs(30 * 60)));
+    }
+
+    #[test]
+    fn parse_duration_hours_suffix() {
+        assert_eq!(parse_duration("12h"), Some(Duration::from_secs(12 * 3600)));
+    }
+
+    #[test]
+    fn parse_duration_days_suffix() {
+        assert_eq!(parse_duration("7d"), Some(Duration::from_secs(7 * 86400)));
+    }
+
+    #[test]
+    fn parse_duration_no_suffix_treated_as_seconds() {
+        assert_eq!(parse_duration("60"), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn parse_duration_invalid_returns_none() {
+        assert_eq!(parse_duration("invalid"), None);
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("12hours"), None);
+    }
+
+    #[test]
     fn format_bytes_zero() {
         assert_eq!(format_bytes(0), "0 B");
     }
@@ -266,19 +447,19 @@ mod tests {
 
     #[test]
     fn format_bytes_kb() {
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1_000), "1.0 KB");
+        assert_eq!(format_bytes(1_500), "1.5 KB");
     }
 
     #[test]
     fn format_bytes_mb() {
-        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
-        assert_eq!(format_bytes(5 * 1024 * 1024 + 512 * 1024), "5.5 MB");
+        assert_eq!(format_bytes(1_000_000), "1.0 MB");
+        assert_eq!(format_bytes(5_500_000), "5.5 MB");
     }
 
     #[test]
     fn format_bytes_gb() {
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
     }
 
     #[test]
@@ -360,5 +541,44 @@ mod tests {
     fn glob_or_list_to_vec_list() {
         let g = GlobOrList::List(vec!["a".into(), "b".into()]);
         assert_eq!(glob_or_list_to_vec(Some(&g)), vec!["a", "b"]);
+    }
+
+    // -- parse_size -----------------------------------------------------------
+
+    #[test]
+    fn parse_size_zero() {
+        assert_eq!(parse_size("0"), Some(0));
+    }
+
+    #[test]
+    fn parse_size_bytes() {
+        assert_eq!(parse_size("512B"), Some(512));
+    }
+
+    #[test]
+    fn parse_size_kilobytes() {
+        assert_eq!(parse_size("500KB"), Some(500_000));
+    }
+
+    #[test]
+    fn parse_size_megabytes() {
+        assert_eq!(parse_size("500MB"), Some(500_000_000));
+    }
+
+    #[test]
+    fn parse_size_gigabytes() {
+        assert_eq!(parse_size("2GB"), Some(2_000_000_000));
+    }
+
+    #[test]
+    fn parse_size_terabytes() {
+        assert_eq!(parse_size("1TB"), Some(1_000_000_000_000));
+    }
+
+    #[test]
+    fn parse_size_invalid_returns_none() {
+        assert_eq!(parse_size("2gigabytes"), None);
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("abc"), None);
     }
 }

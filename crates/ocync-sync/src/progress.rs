@@ -3,7 +3,11 @@
 use crate::{ImageResult, SyncReport};
 
 /// Reports progress during a sync run.
-pub trait ProgressReporter: Send + Sync {
+///
+/// No `Send + Sync` bound: the engine runs on a single-threaded tokio runtime
+/// with `Rc<RefCell<>>` for shared state, so progress reporters can use non-Send
+/// types like `Rc`.
+pub trait ProgressReporter {
     /// Called when an image transfer begins.
     fn image_started(&self, source: &str, target: &str);
     /// Called when an individual image transfer completes.
@@ -30,13 +34,6 @@ mod tests {
 
     use super::*;
     use crate::{ImageStatus, SyncStats};
-
-    fn _assert_send_sync<T: Send + Sync>() {}
-
-    #[test]
-    fn null_progress_is_send_sync() {
-        _assert_send_sync::<NullProgress>();
-    }
 
     #[test]
     fn null_progress_methods_do_not_panic() {

@@ -33,14 +33,44 @@ Before marking work complete, mechanically verify:
 
 ## Engine architecture
 
-The sync engine uses a **pull-once, fan-out** pattern for 1:N mappings:
+The sync engine uses a **pipelined pull-once, fan-out** pattern for 1:N mappings. Discovery and execution overlap via `tokio::select!` over two `FuturesUnordered` pools with a `VecDeque` pending queue between them. The plan phase is eliminated — progressive cache population replaces upfront batch HEAD checks.
 
-1. Pull source manifest once per tag (including child manifests for indexes)
-2. For each target: HEAD check, transfer blobs, push manifests
+1. Discovery: pull source manifest once per tag (`PulledManifest`), HEAD-check each target, produce `TransferTask` entries
+2. Execution: for each (tag, target): cache check → mount/HEAD → pull+push blobs → push manifests
 
-Source-side work (manifest pulls) must NEVER be repeated per target. The loop structure must be `tag → pull_source → for target → push_to_target`, never `tag → for target → (pull + push)`. Blobs are inherently target-specific (dedup/mount decisions depend on target state) so blob pulls may repeat across targets, but manifest pulls are pure source-side work that is identical across all targets.
+Source-side work (manifest pulls) must NEVER be repeated per target. Blobs are inherently target-specific (dedup/mount decisions depend on target state). Index manifests are fully resolved (all children pulled) during discovery before entering execution.
+
+### Pipeline select! loop discipline
+
+The pipeline `select!` must use `biased;` (prefer execution completions to free permits) and emptiness guards (`if !pool.is_empty()`) on every branch. Optional branches (shutdown signal, drain deadline) must use guard conditions (`if shutdown.is_some()`) — never `match` with `std::future::pending()` inside the async block, as this creates a permanently-pending future that prevents the `else` arm from firing when both pools drain.
 
 OCI blobs are repo-scoped: a blob pushed to `registry/repo-a` is NOT accessible from `registry/repo-b` without a cross-repo mount or separate push. The blob dedup map must check `known_repos` for the current repo before skipping — never skip based on status alone.
+
+### Cache staleness discipline
+
+Any persistent cache that skips verification must analyze staleness on **both** source and target sides. Source-side staleness (image changed between syncs) is a missed optimization. Target-side staleness (image deleted/overwritten at target by lifecycle policy, manual push, or GC) is a **correctness bug** — the tool thinks it synced but the target has wrong/missing content. Every cache-skip path must have a verification or reconciliation mechanism for both sides.
+
+### Rate limit controller granularity
+
+Rate limit handling (AIMD, token buckets, etc.) must match the **actual API action granularity** of the target registry. ECR rate limits vary 5x within the same logical category (e.g., InitiateLayerUpload at 100 TPS vs UploadLayerPart at 500 TPS are both "blob write" but need independent windows). A 429 on one action must not throttle a different action with a higher limit. The controller key must be (registry, specific_api_action), not (registry, coarse_category).
+
+### AIMD congestion epoch
+
+AIMD window decreases must use a congestion epoch (100ms). Multiple 429s within the same epoch are a single congestion event — halve the window once, not once per 429. Without this, N simultaneous 429s collapse the window from 50 to 1. Recovery from 1 takes ~1,200 successes (~60 seconds). This is TCP Reno's core correctness property.
+
+When the window shrinks, the per-action `Arc<Semaphore>` must be **replaced** (not shrunk by forgetting one permit). Tokio has no `remove_permits` API, so forgetting one permit only reduces the count by 1 regardless of the window delta. Outstanding `OwnedSemaphorePermit`s hold their own `Arc` reference and drain naturally. The `Drop` impl must mirror the `success()` path — if `on_success()` can grow the limit, Drop must also call `add_permits()`.
+
+### Three-level concurrency control
+
+Concurrency is three independent layers: (1) global image semaphore (`max_concurrent_transfers`, default 50) caps in-flight `(tag, target)` pairs, (2) per-registry aggregate semaphore (`max_concurrent`, default 50) caps total HTTP requests to one host, (3) per-(registry, action) AIMD windows adapt independently within the aggregate ceiling. Every request acquires permits from levels 2 and 3. Level 1 is engine-level, levels 2-3 are client-level.
+
+### Optimization acceptance criteria
+
+New optimization layers must:
+1. **Quantify** wall-clock benefit for the primary use case (Chainguard → multi-region ECR) with concrete numbers
+2. **Prove** the common case pays zero overhead (single-target, steady-state sync)
+3. **Degrade gracefully** when assumptions break (stale cache, partial data, rate-limited source)
+4. **Specify failure interaction** with other optimizations (see failure interaction matrix in design specs)
 
 ## Code standards
 
@@ -53,9 +83,11 @@ OCI blobs are repo-scoped: a blob pushed to `registry/repo-a` is NOT accessible 
 - **Security**: manual `Debug` impls use `&"[REDACTED]"` for secrets; tracing HTTP crate caps via `add_directive()` after `EnvFilter`, never in base filter string
 - **Auth**: expose both `get_token()` and `invalidate()`; never hand-roll 401 retry — use shared `invalidate_auth()` + retry helpers; use API-provided expiry over constants
 - **Process control**: return `ExitCode` via `Termination` trait, never call `process::exit()`
-- **Config parsing**: env var expansion on raw YAML before serde deserialization, not round-trip after
+- **Config parsing**: env var expansion on raw YAML before serde deserialization, not round-trip after; parse functions return `Option`/`Result`, never silently fall back to defaults; validators and parsers must accept the same inputs
+- **Units**: parse and display functions for byte sizes use SI decimal prefixes (1 KB = 1,000) consistently; never mix SI parsing with binary display
 - **Testing**: network code requires `wiremock` tests verifying actual HTTP request sequences, not just unit tests on types
 - **Classifiers**: response classifier functions that don't use `self` should be free functions
+- **Formatting**: no special symbols (`§`, etc.) in docs or code — use plain text references; prefer heading hierarchy over excessive bold
 
 ## Review protocol
 
@@ -79,6 +111,7 @@ Never trust the implementer's self-report alone.
 ## Plans and specs
 
 - **Design spec**: `docs/specs/2026-04-10-ocync-design.md` — full design document (1,752 lines)
+- **Transfer optimization design**: `docs/specs/2026-04-12-transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse (under review)
 - **Implementation plans**: `docs/superpowers/plans/` (gitignored) — current v1 implementation plan is `2026-04-12-ocync-v1-implementation.md`
 
 ## Commands

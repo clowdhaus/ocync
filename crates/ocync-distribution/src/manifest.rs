@@ -3,8 +3,9 @@
 use http::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
 
+use crate::aimd::RegistryAction;
 use crate::auth::Scope;
-use crate::client::{RegistryClient, build_url};
+use crate::client::{RegistryClient, build_url, report_permit};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
@@ -65,7 +66,10 @@ impl RegistryClient {
         reference: &str,
     ) -> Result<Option<ManifestHead>, Error> {
         let path = manifest_path(reference);
-        match self.head(repository, &path).await {
+        match self
+            .head(repository, &path, RegistryAction::ManifestHead)
+            .await
+        {
             Ok(resp) => {
                 let headers = resp.headers();
 
@@ -113,7 +117,14 @@ impl RegistryClient {
     ) -> Result<ManifestPull, Error> {
         let path = manifest_path(reference);
         let accept = manifest_accept_header();
-        let resp = self.get(repository, &path, Some(&accept)).await?;
+        let resp = self
+            .get(
+                repository,
+                &path,
+                Some(&accept),
+                RegistryAction::ManifestRead,
+            )
+            .await?;
 
         let media_type: MediaType = resp
             .headers()
@@ -152,13 +163,13 @@ impl RegistryClient {
         let digest = Digest::from_sha256(hash);
 
         let url = build_url(&self.base_url, repository, &manifest_path(reference))?;
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
+        let permit = self.aimd.acquire(RegistryAction::ManifestWrite).await;
         let scopes = [Scope::pull_push(repository)];
 
         let content_type = HeaderValue::from_str(media_type.as_str())
             .map_err(|e| Error::Other(format!("invalid media type header value: {e}")))?;
 
-        let resp = self
+        let result = self
             .send_with_retry(&scopes, "manifest push", |headers| {
                 self.http
                     .put(url.clone())
@@ -167,7 +178,10 @@ impl RegistryClient {
                     .header(CONTENT_LENGTH, raw_bytes.len().to_string())
                     .body(raw_bytes.to_vec())
             })
-            .await?;
+            .await;
+
+        report_permit(permit, &result);
+        let resp = result?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -198,19 +212,20 @@ impl RegistryClient {
             url.query_pairs_mut().append_pair("artifactType", at);
         }
 
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
+        let permit = self.aimd.acquire(RegistryAction::ManifestRead).await;
         let scopes = [Scope::pull(repository)];
 
-        let resp = self
+        let result = self
             .send_with_retry(&scopes, "referrers", |mut headers| {
                 if let Ok(val) = HeaderValue::from_str(accept) {
                     headers.insert(reqwest::header::ACCEPT, val);
                 }
                 self.http.get(url.clone()).headers(headers)
             })
-            .await?;
+            .await;
 
-        classify_referrers_response(resp).await
+        report_permit(permit, &result);
+        classify_referrers_response(result?).await
     }
 }
 
