@@ -286,10 +286,16 @@ async fn main() -> std::process::ExitCode {
     let shutdown = cli::shutdown::ShutdownSignal::new();
     cli::shutdown::install_signal_handlers(shutdown.clone());
 
+    let json_mode = match &cli.command {
+        Commands::Sync(args) => args.json,
+        Commands::Watch(args) => args.json,
+        _ => false,
+    };
+
     let progress: Box<dyn ocync_sync::progress::ProgressReporter> = if cli.quiet {
         Box::new(NullProgress)
     } else {
-        Box::new(cli::progress::TextProgress::new(cli.verbose))
+        Box::new(cli::progress::TextProgress::new(cli.verbose, json_mode))
     };
 
     let result = match cli.command {

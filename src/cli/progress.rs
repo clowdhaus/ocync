@@ -18,6 +18,8 @@ use crate::cli::output::{format_bytes, format_duration};
 /// single-threaded tokio runtime.
 pub(crate) struct TextProgress {
     verbosity: u8,
+    /// When true, suppress the stdout summary (JSON output owns stdout).
+    json: bool,
     stderr: RefCell<Box<dyn Write>>,
     stdout: RefCell<Box<dyn Write>>,
 }
@@ -26,15 +28,20 @@ impl std::fmt::Debug for TextProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TextProgress")
             .field("verbosity", &self.verbosity)
+            .field("json", &self.json)
             .finish_non_exhaustive()
     }
 }
 
 impl TextProgress {
     /// Create a new text progress reporter writing to real stderr/stdout.
-    pub(crate) fn new(verbosity: u8) -> Self {
+    ///
+    /// When `json` is true, the run summary is suppressed on stdout (JSON
+    /// output owns stdout). Per-image status lines still go to stderr.
+    pub(crate) fn new(verbosity: u8, json: bool) -> Self {
         Self {
             verbosity,
+            json,
             stderr: RefCell::new(Box::new(io::stderr())),
             stdout: RefCell::new(Box::new(io::stdout())),
         }
@@ -42,9 +49,15 @@ impl TextProgress {
 
     /// Create a text progress reporter with custom writers (for testing).
     #[cfg(test)]
-    fn with_writers(verbosity: u8, stderr: Box<dyn Write>, stdout: Box<dyn Write>) -> Self {
+    fn with_writers(
+        verbosity: u8,
+        json: bool,
+        stderr: Box<dyn Write>,
+        stdout: Box<dyn Write>,
+    ) -> Self {
         Self {
             verbosity,
+            json,
             stderr: RefCell::new(stderr),
             stdout: RefCell::new(stdout),
         }
@@ -59,51 +72,63 @@ impl ProgressReporter for TextProgress {
     fn image_completed(&self, result: &ImageResult) {
         match &result.status {
             ImageStatus::Failed { kind, error, .. } => {
-                let _ = writeln!(
+                if let Err(e) = writeln!(
                     self.stderr.borrow_mut(),
                     "FAILED  {} -> {}  ({kind}: {error})",
                     result.source,
                     result.target,
-                );
+                ) {
+                    tracing::warn!(error = %e, "failed to write progress to stderr");
+                }
             }
             ImageStatus::Synced if self.verbosity >= 1 => {
-                let _ = writeln!(
+                if let Err(e) = writeln!(
                     self.stderr.borrow_mut(),
                     "synced  {} -> {}  ({}, {})",
                     result.source,
                     result.target,
                     format_bytes(result.bytes_transferred),
                     format_duration(result.duration),
-                );
+                ) {
+                    tracing::warn!(error = %e, "failed to write progress to stderr");
+                }
             }
             ImageStatus::Skipped { reason } if self.verbosity >= 1 => {
-                let _ = writeln!(
+                if let Err(e) = writeln!(
                     self.stderr.borrow_mut(),
                     "skipped {} -> {}  ({reason})",
                     result.source,
                     result.target,
-                );
+                ) {
+                    tracing::warn!(error = %e, "failed to write progress to stderr");
+                }
             }
             _ => {}
         }
     }
 
     fn run_completed(&self, report: &SyncReport) {
+        if self.json {
+            return;
+        }
         if report.images.is_empty() {
             return;
         }
         let s = &report.stats;
-        let _ = writeln!(
+        if let Err(e) = writeln!(
             self.stdout.borrow_mut(),
-            "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} mounted | {} in {}",
+            "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {}",
             s.images_synced,
             s.images_skipped,
             s.images_failed,
             s.blobs_transferred,
+            s.blobs_skipped,
             s.blobs_mounted,
             format_bytes(s.bytes_transferred),
             format_duration(report.duration),
-        );
+        ) {
+            tracing::warn!(error = %e, "failed to write progress summary to stdout");
+        }
     }
 }
 
@@ -130,11 +155,19 @@ mod tests {
     }
 
     fn test_progress(verbosity: u8) -> (TextProgress, Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>) {
+        test_progress_with_json(verbosity, false)
+    }
+
+    fn test_progress_with_json(
+        verbosity: u8,
+        json: bool,
+    ) -> (TextProgress, Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>) {
         let stderr_buf = Rc::new(RefCell::new(Vec::new()));
         let stdout_buf = Rc::new(RefCell::new(Vec::new()));
 
         let progress = TextProgress::with_writers(
             verbosity,
+            json,
             Box::new(RcWriter(Rc::clone(&stderr_buf))),
             Box::new(RcWriter(Rc::clone(&stdout_buf))),
         );
@@ -285,6 +318,14 @@ mod tests {
         );
         assert!(output.contains("1 failed"), "should contain failed count");
         assert!(
+            output.contains("12 transferred"),
+            "should contain blobs transferred count"
+        );
+        assert!(
+            output.contains("0 skipped, 34 mounted"),
+            "should contain blobs_skipped and blobs_mounted in order"
+        );
+        assert!(
             output.contains("432.0 MB"),
             "should contain formatted bytes"
         );
@@ -302,5 +343,41 @@ mod tests {
         progress.run_completed(&report);
         let output = stdout.borrow();
         assert!(output.is_empty(), "empty report should produce no summary");
+    }
+
+    // -- json mode tests --
+
+    #[test]
+    fn run_completed_suppressed_in_json_mode() {
+        let (progress, _stderr, stdout) = test_progress_with_json(0, true);
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        assert!(
+            stdout.borrow().is_empty(),
+            "json mode should suppress summary on stdout"
+        );
+    }
+
+    #[test]
+    fn json_mode_still_prints_failures_to_stderr() {
+        let (progress, stderr, stdout) = test_progress_with_json(0, true);
+        let result = make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::ManifestPush,
+                error: "timeout".into(),
+                retries: 2,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        let stderr_text = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert!(
+            stderr_text.contains("FAILED"),
+            "json mode should still print failures to stderr"
+        );
+        assert!(
+            stdout.borrow().is_empty(),
+            "json mode should not write to stdout on image_completed"
+        );
     }
 }
