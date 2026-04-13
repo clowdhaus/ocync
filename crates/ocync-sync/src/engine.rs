@@ -46,7 +46,9 @@ use crate::cache::TransferStateCache;
 use crate::retry::{self, RetryConfig};
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
-use crate::{BlobTransferStats, ErrorKind, ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats};
+use crate::{
+    BlobTransferStats, ErrorKind, ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats,
+};
 
 /// An image reference within a single registry (repository name + tag).
 ///

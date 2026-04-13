@@ -42,11 +42,7 @@ impl TextProgress {
 
     /// Create a text progress reporter with custom writers (for testing).
     #[cfg(test)]
-    fn with_writers(
-        verbosity: u8,
-        stderr: Box<dyn Write>,
-        stdout: Box<dyn Write>,
-    ) -> Self {
+    fn with_writers(verbosity: u8, stderr: Box<dyn Write>, stdout: Box<dyn Write>) -> Self {
         Self {
             verbosity,
             stderr: RefCell::new(stderr),
@@ -190,9 +186,18 @@ mod tests {
         );
         progress.image_completed(&result);
         let output = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(output.contains("FAILED"), "should print FAILED, got: {output}");
-        assert!(output.contains("manifest push"), "should contain error kind");
-        assert!(output.contains("connection refused"), "should contain error message");
+        assert!(
+            output.contains("FAILED"),
+            "should print FAILED, got: {output}"
+        );
+        assert!(
+            output.contains("manifest push"),
+            "should contain error kind"
+        );
+        assert!(
+            output.contains("connection refused"),
+            "should contain error message"
+        );
     }
 
     #[test]
@@ -201,7 +206,10 @@ mod tests {
         let result = make_result(ImageStatus::Synced, 187_000_000);
         progress.image_completed(&result);
         let output = stderr.borrow();
-        assert!(output.is_empty(), "verbosity 0 should not print synced images");
+        assert!(
+            output.is_empty(),
+            "verbosity 0 should not print synced images"
+        );
     }
 
     #[test]
@@ -215,7 +223,10 @@ mod tests {
         );
         progress.image_completed(&result);
         let output = stderr.borrow();
-        assert!(output.is_empty(), "verbosity 0 should not print skipped images");
+        assert!(
+            output.is_empty(),
+            "verbosity 0 should not print skipped images"
+        );
     }
 
     #[test]
@@ -224,8 +235,14 @@ mod tests {
         let result = make_result(ImageStatus::Synced, 187_000_000);
         progress.image_completed(&result);
         let output = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(output.contains("synced"), "should print synced, got: {output}");
-        assert!(output.contains("187.0 MB"), "should contain formatted bytes");
+        assert!(
+            output.contains("synced"),
+            "should print synced, got: {output}"
+        );
+        assert!(
+            output.contains("187.0 MB"),
+            "should contain formatted bytes"
+        );
     }
 
     #[test]
@@ -239,8 +256,14 @@ mod tests {
         );
         progress.image_completed(&result);
         let output = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(output.contains("skipped"), "should print skipped, got: {output}");
-        assert!(output.contains("digest match"), "should contain skip reason");
+        assert!(
+            output.contains("skipped"),
+            "should print skipped, got: {output}"
+        );
+        assert!(
+            output.contains("digest match"),
+            "should contain skip reason"
+        );
     }
 
     // -- run_completed tests --
@@ -251,11 +274,20 @@ mod tests {
         let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
         progress.run_completed(&report);
         let output = String::from_utf8(stdout.borrow().clone()).unwrap();
-        assert!(output.contains("sync complete:"), "should print summary, got: {output}");
+        assert!(
+            output.contains("sync complete:"),
+            "should print summary, got: {output}"
+        );
         assert!(output.contains("3 synced"), "should contain synced count");
-        assert!(output.contains("47 skipped"), "should contain skipped count");
+        assert!(
+            output.contains("47 skipped"),
+            "should contain skipped count"
+        );
         assert!(output.contains("1 failed"), "should contain failed count");
-        assert!(output.contains("432.0 MB"), "should contain formatted bytes");
+        assert!(
+            output.contains("432.0 MB"),
+            "should contain formatted bytes"
+        );
     }
 
     #[test]

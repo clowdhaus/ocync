@@ -25,8 +25,6 @@ use crate::SyncArgs;
 use crate::cli::config::{
     AuthType, Config, GlobOrList, MappingConfig, TagsConfig, load_config, resolve_target_names,
 };
-use crate::cli::output::format_bytes;
-use crate::cli::progress::TextProgress;
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
 /// Default cache TTL: 12 hours.
@@ -38,6 +36,7 @@ const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
 /// graceful drain on SIGINT/SIGTERM.
 pub(crate) async fn run(
     args: &SyncArgs,
+    progress: &dyn ocync_sync::progress::ProgressReporter,
     shutdown: Option<&ShutdownSignal>,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
@@ -117,9 +116,8 @@ pub(crate) async fn run(
             g.max_concurrent_transfers
         });
     let engine = SyncEngine::new(RetryConfig::default(), max_concurrent);
-    let progress = TextProgress::new(0);
     let report = engine
-        .run(mappings, cache.clone(), staging, &progress, shutdown)
+        .run(mappings, cache.clone(), staging, progress, shutdown)
         .await;
 
     // Persist cache after the run.
@@ -403,33 +401,15 @@ fn print_dry_run(mappings: &[ResolvedMapping]) {
     }
 }
 
-/// Write sync output in the requested format.
+/// Write sync output as JSON when `--json` is passed.
 fn write_output(report: &SyncReport, json: bool) -> Result<(), CliError> {
     if json {
         let json = serde_json::to_string_pretty(report)
             .map_err(|e| CliError::Input(format!("failed to serialize report: {e}")))?;
         println!("{json}");
-    } else {
-        print_summary(report);
     }
 
     Ok(())
-}
-
-/// Print a human-readable summary of the sync report.
-fn print_summary(report: &SyncReport) {
-    let s = &report.stats;
-    println!(
-        "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {:.1}s",
-        s.images_synced,
-        s.images_skipped,
-        s.images_failed,
-        s.blobs_transferred,
-        s.blobs_skipped,
-        s.blobs_mounted,
-        format_bytes(s.bytes_transferred),
-        report.duration.as_secs_f64(),
-    );
 }
 
 #[cfg(test)]

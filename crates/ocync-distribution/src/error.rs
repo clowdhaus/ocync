@@ -101,8 +101,7 @@ impl Error {
         match self {
             Self::AuthFailed { .. } => true,
             Self::RegistryError { status, .. } => {
-                *status == http::StatusCode::UNAUTHORIZED
-                    || *status == http::StatusCode::FORBIDDEN
+                *status == http::StatusCode::UNAUTHORIZED || *status == http::StatusCode::FORBIDDEN
             }
             _ => false,
         }

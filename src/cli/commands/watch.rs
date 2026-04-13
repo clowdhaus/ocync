@@ -9,7 +9,11 @@ use crate::{SyncArgs, WatchArgs};
 
 /// Run the watch command: loop forever, running sync then waiting for the
 /// configured interval or a shutdown signal.
-pub(crate) async fn run(args: &WatchArgs, shutdown: ShutdownSignal) -> Result<ExitCode, CliError> {
+pub(crate) async fn run(
+    args: &WatchArgs,
+    progress: &dyn ocync_sync::progress::ProgressReporter,
+    shutdown: ShutdownSignal,
+) -> Result<ExitCode, CliError> {
     let interval = Duration::from_secs(args.interval);
     tracing::info!(interval_secs = args.interval, "starting watch mode");
 
@@ -20,7 +24,7 @@ pub(crate) async fn run(args: &WatchArgs, shutdown: ShutdownSignal) -> Result<Ex
             json: args.json,
         };
 
-        match synchronize::run(&sync_args, Some(&shutdown)).await {
+        match synchronize::run(&sync_args, progress, Some(&shutdown)).await {
             Ok(code) => {
                 tracing::info!(exit_code = ?code, "sync cycle complete");
             }
