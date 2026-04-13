@@ -95,7 +95,7 @@ New optimization layers must:
 - **SAFETY comments**: `// SAFETY:` is reserved for explaining why `unsafe` code is sound. For logic correctness assertions (e.g., "guard ensures Option is Some"), use plain comments.
 - **Cleanup loop resilience**: loops that delete multiple files (cleanup, eviction, tmp removal) must log and continue on individual failures, never abort the whole operation with `?`. One stuck file should not prevent cleaning up the rest.
 - **Configurable timeouts**: hardcoded timeout values (drain deadlines, retry caps, etc.) must be configurable via builder methods with sensible defaults. Document the default in the builder method's doc comment, not just in the code that uses it.
-- **Registry module centralization**: all utilities for a specific registry provider (hostname parsing, SDK config loading, batch operations) live in one module (e.g., `ecr.rs`). Auth implementations import shared helpers from the provider module, not the other way around. Never scatter provider-specific code across auth, batch, and CLI layers.
+- **Registry module centralization**: all utilities for a specific registry provider (hostname parsing, SDK config loading, batch operations) live in one module (e.g., `ecr.rs`). Auth implementations import shared helpers from the provider module, not the other way around. Never scatter provider-specific code across auth, batch, and CLI layers. After centralizing, audit `pub use` re-exports in `lib.rs` — consumers may import via the submodule path, leaving the top-level re-export dead.
 - **Constructor encapsulation**: public constructors must not leak internal dependencies into caller signatures. If a struct needs an AWS SDK config internally, accept a hostname string and build the config inside — don't force callers to import `aws-config`. This keeps dependency boundaries clean: library crates own their deps, CLI crates just pass domain values.
 - **Avoid tuple type aliases for struct-like data**: when a tuple alias mirrors an existing struct's fields, add `Clone` to the struct instead. Tuples add destructuring noise at every use site and diverge from the struct over time. Cheap clones (`Arc`, `Rc`, `String`) make struct Clone zero-cost.
 
@@ -107,7 +107,7 @@ Tests must verify **behavior under failure and concurrency**, not just happy-pat
 
 ### Assert request counts, not just results
 
-Every multi-target engine test must use wiremock `.expect(N)` on source endpoints to verify the pull-once fan-out invariant. A test that passes when the source manifest is pulled 3 times instead of 1 does not protect the architecture. Assert exact byte counts, blob counts, and request counts — never `> 0` or `status == Synced` alone.
+Every multi-target engine test must use wiremock `.expect(N)` on source endpoints to verify the pull-once fan-out invariant. A test that passes when the source manifest is pulled 3 times instead of 1 does not protect the architecture. Assert exact byte counts, blob counts, and request counts — never `> 0` or `status == Synced` alone. This applies to ALL endpoints in the test, not just source manifests — child manifest GETs, target manifest PUTs, blob pushes, and blob pulls each need `.expect(N)` when the count is architecturally significant. Helper functions like `mount_blob_pull` and `mount_manifest_push` don't set expectations; use inline `Mock::given()...expect(N)` for any endpoint where the count matters.
 
 ### Verify optimizations take the designed path
 
@@ -119,6 +119,8 @@ A correct outcome does not prove the optimization worked. Images can sync succes
 - When auto-create triggers: assert `.expect(1)` on the create endpoint AND that the manifest push was retried after creation, not just that the image eventually synced.
 
 The pattern: assert the **negative** (the slow path was NOT taken) alongside the **positive** (the fast path produced correct results). An optimization that silently falls back to the slow path on every call is a bug, not a feature — and only negative assertions catch it.
+
+Optimization tests must cover both single-image manifests and index manifests (multi-platform). The blob collection path differs: single images have `config + layers`, index manifests flatten across children. An optimization tested only with single images may silently fail for the index path — and multi-arch ECR sync is the primary use case.
 
 ### Test the bridges between layers
 
@@ -156,6 +158,8 @@ Test mocks (trait implementations, not just wiremock) must honor the same input/
 - If the real implementation returns only requested items, the mock must not return unrequested items
 - Use named parameters (not `_`-prefixed) in mock impls that use the parameter, to signal the mock respects the contract
 - A mock that returns a static response regardless of input is testing that the caller handles the response, not that the caller sends the right request
+- **Context parameters need `assert_eq!`**: store expected values (repo name, registry ID) in the mock struct and assert they match on every call. A `_repo` parameter in a mock hides bugs where the engine passes the source repo instead of the target repo — a silent correctness failure. Only `_`-prefix parameters in always-error mocks where input genuinely doesn't matter
+- Cross-check mock expected values against test setup: every `MockFoo::new("repo", ...)` must match the test's `ResolvedMapping.target_repo`
 
 ### Batched operation resilience
 
