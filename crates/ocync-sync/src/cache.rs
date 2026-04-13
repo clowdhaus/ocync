@@ -153,10 +153,18 @@ impl TransferStateCache {
 
         std::fs::rename(&tmp_path, path)?;
 
-        // fsync parent directory so the rename is durable
+        // Best-effort directory fsync — the rename succeeded, so the data is
+        // reachable; only crash-before-journal-flush can lose it.
         if let Some(parent) = path.parent() {
-            let dir = std::fs::File::open(parent)?;
-            let _ = dir.sync_all();
+            if let Ok(dir) = std::fs::File::open(parent) {
+                if let Err(e) = dir.sync_all() {
+                    warn!(
+                        path = %parent.display(),
+                        error = %e,
+                        "directory fsync failed after cache rename"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -229,7 +237,9 @@ impl TransferStateCache {
             .as_secs();
 
         let age = now_secs.saturating_sub(header.written_at);
-        if Duration::from_secs(age) >= max_age {
+        // Duration::ZERO means "never expire" (TTL disabled); any positive
+        // duration is a real expiry threshold.
+        if !max_age.is_zero() && Duration::from_secs(age) >= max_age {
             info!(
                 path = %path.display(),
                 age_secs = age,

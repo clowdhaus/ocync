@@ -15,7 +15,7 @@ aws-config = { version = "1", default-features = false, features = ["behavior-ve
 aws-lc-rs.workspace = true
 aws-sdk-ecr = { version = "1", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
-bytes = { version = "1", default-features = false }
+bytes.workspace = true
 futures-util = { version = "0.3", default-features = false }
 http.workspace = true
 hex.workspace = true

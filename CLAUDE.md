@@ -42,7 +42,7 @@ Source-side work (manifest pulls) must NEVER be repeated per target. Blobs are i
 
 ### Pipeline select! loop discipline
 
-The pipeline `select!` must use `biased;` (prefer execution completions to free permits) and emptiness guards (`if !pool.is_empty()`) on every branch. Optional branches (shutdown signal, drain deadline) must use guard conditions (`if shutdown.is_some()`) — never `match` with `std::future::pending()` inside the async block, as this creates a permanently-pending future that prevents the `else` arm from firing when both pools drain.
+The pipeline `select!` must use `biased;` (prefer execution completions to free permits) and emptiness guards (`if !pool.is_empty()`) on every branch. Optional branches (shutdown signal, drain deadline) must use guard conditions (`if shutdown.is_some()`) — never `match` with `std::future::pending()` inside the async block, as this creates a permanently-pending future that prevents the `else` arm from firing when both pools drain. The drain deadline branch must also guard on `!execution_futures.is_empty()` so the engine exits immediately when all work completes rather than waiting for the full deadline.
 
 OCI blobs are repo-scoped: a blob pushed to `registry/repo-a` is NOT accessible from `registry/repo-b` without a cross-repo mount or separate push. The blob dedup map must check `known_repos` for the current repo before skipping — never skip based on status alone.
 
@@ -79,15 +79,50 @@ New optimization layers must:
 - **Docs**: every `.rs` file gets a `//!` module doc comment; all `pub` items get `///` doc comments
 - **Errors**: invalid user config must return `Result` errors, never silently degrade; users can't distinguish "nothing matched" from "config broken"
 - **Types**: prefer enums/newtypes over `String`/`u16` for domain concepts (media types, artifact types, status codes)
-- **Dependencies**: `default-features = false` on everything; justify every new dep; prefer hand-written code under ~100 lines over a crate; use `regex-lite` for ASCII patterns
+- **Dependencies**: `default-features = false` on everything; justify every new dep; prefer hand-written code under ~100 lines over a crate; use `regex-lite` for ASCII patterns; all shared deps must use `[workspace.dependencies]` — never add direct version references to crate-level Cargo.toml when the dep exists elsewhere in the workspace
 - **Security**: manual `Debug` impls use `&"[REDACTED]"` for secrets; tracing HTTP crate caps via `add_directive()` after `EnvFilter`, never in base filter string
 - **Auth**: expose both `get_token()` and `invalidate()`; never hand-roll 401 retry — use shared `invalidate_auth()` + retry helpers; use API-provided expiry over constants
 - **Process control**: return `ExitCode` via `Termination` trait, never call `process::exit()`
 - **Config parsing**: env var expansion on raw YAML before serde deserialization, not round-trip after; parse functions return `Option`/`Result`, never silently fall back to defaults; validators and parsers must accept the same inputs
 - **Units**: parse and display functions for byte sizes use SI decimal prefixes (1 KB = 1,000) consistently; never mix SI parsing with binary display
-- **Testing**: network code requires `wiremock` tests verifying actual HTTP request sequences, not just unit tests on types
+- **Testing**: see Testing standards section below
 - **Classifiers**: response classifier functions that don't use `self` should be free functions
 - **Formatting**: no special symbols (`§`, etc.) in docs or code — use plain text references; prefer heading hierarchy over excessive bold
+
+## Testing standards
+
+### Test what can break, not what works
+
+Tests must verify **behavior under failure and concurrency**, not just happy-path output. A test suite where everything passes with `max_concurrent=1` and no error injection is testing a `for` loop, not a concurrent pipeline. Per scope discipline above: if you cannot write a test that exercises a code path, that code path does not belong in the PR.
+
+### Assert request counts, not just results
+
+Every multi-target engine test must use wiremock `.expect(N)` on source endpoints to verify the pull-once fan-out invariant. A test that passes when the source manifest is pulled 3 times instead of 1 does not protect the architecture. Assert exact byte counts, blob counts, and request counts — never `> 0` or `status == Synced` alone.
+
+### Test the bridges between layers
+
+Unit-test leaves (AIMD math, staging filesystem, cache serialization). Integration-test the top (engine end-to-end). But also test the **bridges** between layers — these are where real bugs live:
+- HTTP 429 response → AIMD permit throttling → window shrinkage
+- Engine → staging pull-once-push-N-from-disk path
+- Engine → shutdown drain state machine
+- Client → auth invalidation → retry sequence
+- Cache hit → target HEAD re-verification → stale entry eviction
+- Index manifest → child manifest pull failure → image-level failure propagation
+
+If a code path is fully wired end-to-end, it needs an integration test that exercises it end-to-end. Unit tests on the leaf types are necessary but not sufficient.
+
+### Test concurrent properties at real concurrency
+
+At least some tests must run with `max_concurrent > 1` and multiple tags/targets executing simultaneously. Assert that dedup, caching, and AIMD still work under contention. If concurrent tests are flaky, that is a signal of a real race — investigate, don't serialize.
+
+### wiremock for all network code
+
+Network code requires `wiremock` tests verifying actual HTTP request sequences, not just unit tests on types. Tests must cover:
+- Error paths by status code (401, 403, 404, 429, 500), not just success
+- HTTP header assertions (Content-Type, Content-Range, Authorization format)
+- Edge cases: empty streams, exact chunk boundaries, Location header chaining
+- Stream error propagation (error mid-transfer, not just at start/end)
+- Auth sequences: scope params, token rotation, 401 retry with invalidation
 
 ## Review protocol
 

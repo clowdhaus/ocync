@@ -117,10 +117,27 @@ fn expired_cache_returns_empty() {
     cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
     cache.persist(&path).unwrap();
 
-    // Duration::ZERO means any file is immediately expired.
-    let loaded = TransferStateCache::load(&path, Duration::ZERO);
+    // The cache stores timestamps at second granularity, so we need
+    // the file to be at least 1 second old to exceed a 1-second TTL.
+    std::thread::sleep(Duration::from_millis(1100));
+    let loaded = TransferStateCache::load(&path, Duration::from_secs(1));
     assert!(loaded.is_empty());
     assert_eq!(loaded.blob_status("reg.io", &digest_a()), None);
+}
+
+#[test]
+fn zero_ttl_means_never_expire() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.bin");
+
+    let mut cache = TransferStateCache::new();
+    cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
+    cache.persist(&path).unwrap();
+
+    // Duration::ZERO disables TTL — the cache never expires by age.
+    let loaded = TransferStateCache::load(&path, Duration::ZERO);
+    assert!(!loaded.is_empty());
+    assert!(loaded.blob_status("reg.io", &digest_a()).is_some());
 }
 
 // ---------------------------------------------------------------------------

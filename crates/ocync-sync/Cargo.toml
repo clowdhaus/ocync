@@ -11,6 +11,7 @@ description = "OCI registry sync orchestration"
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 crc32fast = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false }
 globset = { version = "0.4", default-features = false }
@@ -28,6 +29,6 @@ uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
 [dev-dependencies]
 serde_json.workspace = true
 tempfile = { version = "3", default-features = false }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 url.workspace = true
 wiremock = "0.6"

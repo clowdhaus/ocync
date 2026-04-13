@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use ocync_distribution::Digest;
@@ -207,6 +208,9 @@ impl BlobFrequencyMap {
 /// Default cap for concurrent image transfers (Level 1: global image semaphore).
 pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 50;
 
+/// Default shutdown drain deadline in seconds.
+const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 25;
+
 /// Sync engine -- orchestrates concurrent image transfers across registries.
 ///
 /// Uses a pipelined architecture where discovery and execution overlap via
@@ -216,6 +220,7 @@ pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 50;
 pub struct SyncEngine {
     retry: RetryConfig,
     max_concurrent: usize,
+    drain_deadline: Duration,
 }
 
 impl SyncEngine {
@@ -227,7 +232,15 @@ impl SyncEngine {
         Self {
             retry,
             max_concurrent,
+            drain_deadline: Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
         }
+    }
+
+    /// Set the maximum time to wait for in-flight transfers to complete after
+    /// a shutdown signal is received. Defaults to 25 seconds.
+    pub fn with_drain_deadline(mut self, deadline: Duration) -> Self {
+        self.drain_deadline = deadline;
+        self
     }
 
     /// Run the sync engine across all resolved mappings.
@@ -240,8 +253,9 @@ impl SyncEngine {
     /// [`BlobStage::disabled`] for single-target deployments to pay zero overhead.
     ///
     /// If `shutdown` is `Some`, the engine will stop accepting new work when the
-    /// signal fires, drain in-flight transfers up to a 25-second deadline, then
-    /// return. Pass `None` to run to completion without shutdown handling.
+    /// signal fires, drain in-flight transfers up to the configured drain deadline
+    /// (default: 25s, configurable via [`with_drain_deadline`](Self::with_drain_deadline)),
+    /// then return. Pass `None` to run to completion without shutdown handling.
     pub async fn run(
         &self,
         mappings: Vec<ResolvedMapping>,
@@ -334,12 +348,12 @@ impl SyncEngine {
                     results.push(result);
                 }
                 _ = async {
-                    // SAFETY: guard ensures shutdown.is_some(), unwrap is safe.
+                    // Guard above ensures shutdown.is_some(); unwrap cannot panic.
                     shutdown.unwrap().notified().await
                 }, if shutdown.is_some() && !shutting_down => {
                     shutting_down = true;
                     drain_deadline = Some(
-                        tokio::time::Instant::now() + Duration::from_secs(25),
+                        tokio::time::Instant::now() + self.drain_deadline,
                     );
                     tracing::info!(
                         in_flight = execution_futures.len(),
@@ -347,9 +361,9 @@ impl SyncEngine {
                     );
                 }
                 _ = async {
-                    // SAFETY: guard ensures drain_deadline.is_some(), unwrap is safe.
+                    // Guard above ensures drain_deadline.is_some(); unwrap cannot panic.
                     tokio::time::sleep_until(drain_deadline.unwrap()).await
-                }, if drain_deadline.is_some() => {
+                }, if drain_deadline.is_some() && !execution_futures.is_empty() => {
                     tracing::warn!(
                         remaining = execution_futures.len(),
                         "drain deadline reached, abandoning in-flight transfers"
@@ -723,6 +737,8 @@ async fn transfer_image_blobs(
     let mut blobs: Vec<&Descriptor> = blobs_from_manifest(source_data);
 
     // Sort by descending frequency (most-shared first for maximum cache benefit).
+    // Rust's sort_by is stable, so blobs with equal frequency preserve their
+    // original manifest order (config first, then layers).
     blobs.sort_by(|a, b| {
         let fa = freq_counts.get(&a.digest).copied().unwrap_or(0);
         let fb = freq_counts.get(&b.digest).copied().unwrap_or(0);
@@ -820,63 +836,63 @@ async fn transfer_image_blobs(
             .set_blob_in_progress(ctx.target_name, digest.clone());
 
         let transfer_result: Result<(), crate::Error> = if ctx.staging.is_enabled() {
-            if ctx.staging.exists(digest) {
-                // Blob already staged from a previous target: push from disk.
-                match ctx.staging.read(digest) {
-                    Ok(data) => with_retry(ctx.retry, "blob push (staged)", || {
-                        ctx.target_client.blob_push(ctx.target_repo, &data)
-                    })
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| crate::Error::BlobTransfer {
-                        digest: digest.clone(),
-                        source: e,
-                    }),
-                    Err(e) => Err(crate::Error::BlobTransfer {
-                        digest: digest.clone(),
-                        source: ocync_distribution::Error::Other(format!(
-                            "staging read failed: {e}"
-                        )),
-                    }),
-                }
-            } else {
-                // Pull from source, write to staging, then push to target.
-                let pull_result = with_retry(ctx.retry, "blob pull (to stage)", || async {
+            if !ctx.staging.exists(digest) {
+                // Pull from source, stream to staging file chunk-by-chunk.
+                // This avoids buffering the entire blob in memory during pull.
+                if let Err(e) = with_retry(ctx.retry, "blob pull (to stage)", || async {
+                    let mut writer = ctx.staging.begin_write(digest).map_err(|e| {
+                        ocync_distribution::Error::Other(format!("staging create: {e}"))
+                    })?;
                     let stream = ctx.source_client.blob_pull(ctx.source_repo, digest).await?;
-                    let mut buf = Vec::new();
                     futures_util::pin_mut!(stream);
-                    use futures_util::StreamExt as _;
                     while let Some(chunk) = stream.next().await {
                         let chunk =
                             chunk.map_err(|e| ocync_distribution::Error::Other(e.to_string()))?;
-                        buf.extend_from_slice(&chunk);
+                        writer.write_chunk(&chunk).map_err(|e| {
+                            ocync_distribution::Error::Other(format!("staging write: {e}"))
+                        })?;
                     }
-                    Ok::<Vec<u8>, ocync_distribution::Error>(buf)
+                    writer.finish().map_err(|e| {
+                        ocync_distribution::Error::Other(format!("staging finalize: {e}"))
+                    })?;
+                    Ok::<(), ocync_distribution::Error>(())
                 })
-                .await;
-
-                match pull_result {
-                    Ok(data) => {
-                        // Write to staging (best-effort: if it fails, skip caching).
-                        if let Err(e) = ctx.staging.write(digest, &data) {
-                            debug!(%digest, error = %e, "failed to write blob to staging, continuing");
-                        }
-                        with_retry(ctx.retry, "blob push (via stage)", || {
-                            ctx.target_client.blob_push(ctx.target_repo, &data)
-                        })
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| crate::Error::BlobTransfer {
-                            digest: digest.clone(),
-                            source: e,
-                        })
-                    }
-                    Err(e) => Err(crate::Error::BlobTransfer {
+                .await
+                {
+                    let err = crate::Error::BlobTransfer {
                         digest: digest.clone(),
                         source: e,
-                    }),
+                    };
+                    ctx.cache.borrow_mut().set_blob_failed(
+                        ctx.target_name,
+                        digest.clone(),
+                        err.to_string(),
+                    );
+                    outcome.error = Some(err);
+                    return outcome;
                 }
             }
+
+            // Push from staged file, streaming from disk.
+            with_retry(ctx.retry, "blob push (staged)", || async {
+                let file = ctx
+                    .staging
+                    .open_read(digest)
+                    .map_err(|e| ocync_distribution::Error::Other(format!("staging read: {e}")))?;
+                let file_size = file.metadata().map(|m| m.len()).ok();
+                let stream = file_read_stream(file).map(|r| {
+                    r.map_err(|e| ocync_distribution::Error::Other(format!("staging read: {e}")))
+                });
+                ctx.target_client
+                    .blob_push_stream(ctx.target_repo, digest, file_size, stream)
+                    .await
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::Error::BlobTransfer {
+                digest: digest.clone(),
+                source: e,
+            })
         } else {
             with_retry(ctx.retry, "blob transfer", || async {
                 let stream = ctx.source_client.blob_pull(ctx.source_repo, digest).await?;
@@ -959,6 +975,29 @@ async fn push_manifests(
     })?;
 
     Ok(())
+}
+
+/// Read a file in 256 KB chunks, yielding a stream of `Bytes`.
+///
+/// Uses synchronous `std::fs::Read` internally. On a single-threaded tokio
+/// runtime, each individual read call blocks for microseconds (local disk),
+/// which is negligible compared to network RTT.
+fn file_read_stream(
+    file: std::fs::File,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+    const CHUNK_SIZE: usize = 256 * 1024;
+    futures_util::stream::unfold(file, |mut file| async move {
+        use std::io::Read;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        match file.read(&mut buf) {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(Bytes::from(buf)), file))
+            }
+            Err(e) => Some((Err(e), file)),
+        }
+    })
 }
 
 /// Retry an async operation with exponential backoff on transient HTTP errors.

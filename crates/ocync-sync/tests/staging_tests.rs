@@ -1,8 +1,8 @@
 //! Integration tests for [`BlobStage`].
 //!
-//! Covers the round-trip, crash recovery, eviction, and disabled-mode paths.
+//! Covers the round-trip, crash recovery, eviction, streaming write/read, and
+//! disabled-mode paths.
 
-use std::collections::HashMap;
 use std::io;
 
 use ocync_sync::staging::BlobStage;
@@ -60,6 +60,52 @@ fn write_creates_parent_dirs() {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming write via StagedWriter
+// ---------------------------------------------------------------------------
+
+#[test]
+fn begin_write_and_finish_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = BlobStage::new(dir.path().to_path_buf());
+
+    let mut writer = stage.begin_write(&digest_a()).unwrap();
+    writer.write_chunk(b"hello ").unwrap();
+    writer.write_chunk(b"world").unwrap();
+    writer.finish().unwrap();
+
+    assert!(stage.exists(&digest_a()));
+    let data = stage.read(&digest_a()).unwrap();
+    assert_eq!(data, b"hello world");
+}
+
+#[test]
+fn open_read_returns_file_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = BlobStage::new(dir.path().to_path_buf());
+
+    stage.write(&digest_a(), b"read me").unwrap();
+
+    let mut file = stage.open_read(&digest_a()).unwrap();
+    let mut buf = Vec::new();
+    io::Read::read_to_end(&mut file, &mut buf).unwrap();
+    assert_eq!(buf, b"read me");
+}
+
+#[test]
+fn begin_write_on_disabled_returns_unsupported() {
+    let stage = BlobStage::disabled();
+    let err = stage.begin_write(&digest_a()).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+}
+
+#[test]
+fn open_read_on_disabled_returns_unsupported() {
+    let stage = BlobStage::disabled();
+    let err = stage.open_read(&digest_a()).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+}
+
+// ---------------------------------------------------------------------------
 // Crash recovery: cleanup_tmp_files
 // ---------------------------------------------------------------------------
 
@@ -99,7 +145,7 @@ fn cleanup_tmp_files_is_noop_when_dir_missing() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn evict_keeps_high_ref_removes_low_ref() {
+fn evict_removes_smallest_files_first() {
     let dir = tempfile::tempdir().unwrap();
     let stage = BlobStage::new(dir.path().to_path_buf());
 
@@ -113,19 +159,17 @@ fn evict_keeps_high_ref_removes_low_ref() {
     stage.write(&digest_c(), &large).unwrap();
 
     // Total = 60 bytes. Limit to 40 bytes, so 20+ bytes must be evicted.
-    // Ref counts: A=0 (evicted first), B=1, C=5 (kept last).
-    let mut ref_counts = HashMap::new();
-    ref_counts.insert(digest_b(), 1_usize);
-    ref_counts.insert(digest_c(), 5_usize);
+    // Sorted by ascending size: A(10), B(20), C(30).
+    stage.evict(40).unwrap();
 
-    stage.evict(40, &ref_counts).unwrap();
-
-    // digest_a has no ref count (treated as 0) — evicted first.
-    assert!(!stage.exists(&digest_a()), "low-ref blob must be evicted");
-    // After evicting A (10 bytes), total = 50 — still over 40.
-    // Next evict B (20 bytes), total = 30 — now under 40. C is kept.
-    assert!(!stage.exists(&digest_b()), "mid-ref blob must be evicted");
-    assert!(stage.exists(&digest_c()), "high-ref blob must be kept");
+    // A (10 bytes) evicted first. Total = 50 — still over 40.
+    assert!(!stage.exists(&digest_a()), "smallest blob must be evicted");
+    // B (20 bytes) evicted next. Total = 30 — now under 40. C is kept.
+    assert!(
+        !stage.exists(&digest_b()),
+        "second-smallest blob must be evicted"
+    );
+    assert!(stage.exists(&digest_c()), "largest blob must be kept");
 }
 
 #[test]
@@ -135,8 +179,7 @@ fn evict_noop_when_under_threshold() {
 
     stage.write(&digest_a(), b"small").unwrap();
 
-    let ref_counts = HashMap::new();
-    stage.evict(1_000_000, &ref_counts).unwrap();
+    stage.evict(1_000_000).unwrap();
 
     // Nothing should be evicted.
     assert!(stage.exists(&digest_a()));
@@ -147,7 +190,7 @@ fn evict_noop_when_blobs_dir_missing() {
     let dir = tempfile::tempdir().unwrap();
     let stage = BlobStage::new(dir.path().to_path_buf());
     // No writes; blobs/ dir doesn't exist.
-    stage.evict(0, &HashMap::new()).unwrap();
+    stage.evict(0).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -196,5 +239,5 @@ fn disabled_cleanup_tmp_files_is_noop() {
 #[test]
 fn disabled_evict_is_noop() {
     let stage = BlobStage::disabled();
-    stage.evict(0, &HashMap::new()).unwrap();
+    stage.evict(0).unwrap();
 }

@@ -90,15 +90,13 @@ pub(crate) async fn run(
             tracing::warn!(error = %e, "failed to clean staging tmp files");
         }
         // Evict stale blobs from previous runs before starting new work.
-        // Between sync cycles, all leftover blobs have zero future references
-        // so empty ref_counts is correct — eviction just limits residual disk usage.
         if let Some(limit) = config
             .global
             .as_ref()
             .and_then(|g| g.staging_size_limit.as_deref())
             .and_then(parse_size)
         {
-            if let Err(e) = stage.evict(limit, &HashMap::new()) {
+            if let Err(e) = stage.evict(limit) {
                 tracing::warn!(error = %e, "failed to evict staged blobs");
             }
         }

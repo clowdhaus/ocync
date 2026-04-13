@@ -187,13 +187,20 @@ impl RegistryClient {
     /// **GAR fallback**: Google Artifact Registry does not support chunked
     /// uploads, so hosts ending in `-docker.pkg.dev` buffer the entire stream
     /// and delegate to [`blob_push`](Self::blob_push).
-    pub async fn blob_push_stream(
+    pub async fn blob_push_stream<E>(
         &self,
         repository: &str,
         expected_digest: &Digest,
         known_size: Option<u64>,
-        stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
-    ) -> Result<Digest, Error> {
+        stream: impl Stream<Item = Result<Bytes, E>>,
+    ) -> Result<Digest, Error>
+    where
+        E: Into<Error>,
+    {
+        // Map stream errors to our Error type at the boundary so all
+        // internal code works uniformly with `Result<Bytes, Error>`.
+        let stream = stream.map(|r| r.map_err(Into::into));
+
         // Monolithic threshold: small blobs skip chunked upload entirely.
         if known_size.is_some_and(|s| s <= MONOLITHIC_THRESHOLD) {
             debug!(
@@ -381,7 +388,7 @@ impl RegistryClient {
         &self,
         repository: &str,
         expected_digest: &Digest,
-        stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+        stream: impl Stream<Item = Result<Bytes, Error>>,
     ) -> Result<Digest, Error> {
         warn!(
             repository,
@@ -422,7 +429,7 @@ impl RegistryClient {
         repository: &str,
         expected_digest: &Digest,
         known_size: Option<u64>,
-        stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+        stream: impl Stream<Item = Result<Bytes, Error>>,
     ) -> Result<Digest, Error> {
         warn!(
             repository,

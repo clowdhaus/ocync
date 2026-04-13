@@ -285,10 +285,37 @@ pub(crate) fn build_url(base: &Url, repository: &str, path: &str) -> Result<Url,
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+    use crate::auth::Token;
 
     fn test_base_url() -> Url {
         Url::parse("https://registry-1.docker.io").unwrap()
+    }
+
+    /// Minimal auth provider for tests that always returns a fixed token.
+    struct StubAuth;
+
+    impl AuthProvider for StubAuth {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn get_token(
+            &self,
+            _scopes: &[Scope],
+        ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
+            Box::pin(async { Ok(Token::new("stub-token".to_owned())) })
+        }
+
+        fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
     }
 
     #[test]
@@ -380,5 +407,69 @@ mod tests {
     #[test]
     fn user_agent_value() {
         assert!(USER_AGENT_VALUE.starts_with("ocync/"));
+    }
+
+    #[tokio::test]
+    async fn get_429_shrinks_aimd_window() {
+        let server = MockServer::start().await;
+        let base_url = Url::parse(&server.uri()).unwrap();
+
+        let client = RegistryClient::builder(base_url)
+            .auth(StubAuth)
+            .max_concurrent(50)
+            .build()
+            .unwrap();
+
+        // Seed the AIMD window for ManifestRead with a success so the window
+        // has a known starting value we can compare against after the 429.
+        Mock::given(method("GET"))
+            .and(path("/v2/repo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _ = client
+            .get(
+                "repo",
+                "manifests/latest",
+                None,
+                RegistryAction::ManifestRead,
+            )
+            .await;
+
+        let limit_before = client.aimd.window_limit(RegistryAction::ManifestRead);
+
+        // Reset the mock to return 429 on the next request.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/repo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client
+            .get(
+                "repo",
+                "manifests/latest",
+                None,
+                RegistryAction::ManifestRead,
+            )
+            .await;
+
+        // The 429 response is classified as a RegistryError after report_permit
+        // has already called permit.throttled().
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().status_code(),
+            Some(StatusCode::TOO_MANY_REQUESTS),
+        );
+
+        let limit_after = client.aimd.window_limit(RegistryAction::ManifestRead);
+        assert!(
+            limit_after < limit_before,
+            "AIMD window should shrink after 429: before={limit_before}, after={limit_after}",
+        );
     }
 }

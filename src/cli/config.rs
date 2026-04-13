@@ -122,8 +122,8 @@ pub(crate) struct GlobalConfig {
 
     /// Warm cache TTL as a human-readable duration (e.g. "12h", "30m").
     ///
-    /// `0` disables TTL-based expiry (lazy invalidation only). Defaults to
-    /// `"12h"` when not specified.
+    /// `"0"` disables TTL-based expiry (cache never expires by age; lazy
+    /// invalidation only). Defaults to `"12h"` when not specified.
     pub cache_ttl: Option<String>,
 
     /// Disk staging size limit as a human-readable size (e.g. "2GB", "500MB").
