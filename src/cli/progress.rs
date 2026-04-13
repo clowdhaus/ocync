@@ -345,6 +345,104 @@ mod tests {
         assert!(output.is_empty(), "empty report should produce no summary");
     }
 
+    #[test]
+    fn stream_separation_failed_stderr_summary_stdout() {
+        let (progress, stderr, stdout) = test_progress(0);
+        let failed = make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::ManifestPull,
+                error: "timeout".into(),
+                retries: 2,
+            },
+            0,
+        );
+        progress.image_completed(&failed);
+
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+
+        let stderr_text = String::from_utf8(stderr.borrow().clone()).unwrap();
+        let stdout_text = String::from_utf8(stdout.borrow().clone()).unwrap();
+
+        assert!(stderr_text.contains("FAILED"), "FAILED should be on stderr");
+        assert!(
+            !stdout_text.contains("FAILED"),
+            "FAILED should NOT be on stdout"
+        );
+        assert!(
+            stdout_text.contains("sync complete:"),
+            "summary should be on stdout"
+        );
+        assert!(
+            !stderr_text.contains("sync complete:"),
+            "summary should NOT be on stderr"
+        );
+    }
+
+    #[test]
+    fn multiple_images_mixed_status() {
+        let (progress, stderr, _stdout) = test_progress(1);
+
+        progress.image_completed(&make_result(ImageStatus::Synced, 100_000_000));
+        progress.image_completed(&make_result(ImageStatus::Synced, 200_000_000));
+        progress.image_completed(&make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            },
+            0,
+        ));
+        progress.image_completed(&make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::BlobTransfer,
+                error: "connection lost".into(),
+                retries: 1,
+            },
+            0,
+        ));
+
+        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert_eq!(
+            output.matches("synced").count(),
+            2,
+            "should have 2 synced lines"
+        );
+        assert_eq!(
+            output.matches("skipped").count(),
+            1,
+            "should have 1 skipped line"
+        );
+        assert_eq!(
+            output.matches("FAILED").count(),
+            1,
+            "should have 1 FAILED line"
+        );
+    }
+
+    #[test]
+    fn run_completed_exact_format() {
+        let (progress, _stderr, stdout) = test_progress(0);
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 3,
+                images_skipped: 47,
+                images_failed: 1,
+                blobs_transferred: 12,
+                blobs_skipped: 5,
+                blobs_mounted: 34,
+                bytes_transferred: 432_000_000,
+            },
+            duration: Duration::from_secs(47),
+        };
+        progress.run_completed(&report);
+        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
+        assert_eq!(
+            output,
+            "sync complete: 3 synced, 47 skipped, 1 failed | blobs: 12 transferred, 5 skipped, 34 mounted | 432.0 MB in 47s\n"
+        );
+    }
+
     // -- json mode tests --
 
     #[test]

@@ -301,4 +301,20 @@ mod tests {
         assert_eq!(stats.skipped, 0);
         assert_eq!(stats.mounted, 0);
     }
+
+    #[test]
+    fn error_kind_json_serialization() {
+        assert_eq!(
+            serde_json::to_value(ErrorKind::ManifestPull).unwrap(),
+            serde_json::Value::String("manifest_pull".into()),
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorKind::ManifestPush).unwrap(),
+            serde_json::Value::String("manifest_push".into()),
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorKind::BlobTransfer).unwrap(),
+            serde_json::Value::String("blob_transfer".into()),
+        );
+    }
 }
