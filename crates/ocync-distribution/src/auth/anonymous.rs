@@ -6,11 +6,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use http::header::WWW_AUTHENTICATE;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use super::{AuthProvider, Scope, Token};
 use crate::error::Error;
+
+/// The `Bearer` auth scheme prefix used in `WWW-Authenticate` challenges.
+const BEARER_SCHEME: &str = "bearer";
 
 /// Anonymous auth provider that performs the Docker token-exchange flow.
 ///
@@ -123,7 +127,7 @@ impl AnonymousAuth {
 
         let www_auth = resp
             .headers()
-            .get("www-authenticate")
+            .get(WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| Error::AuthFailed {
                 registry: self.base_url.clone(),
@@ -194,16 +198,18 @@ impl WwwAuthenticate {
         let header = header.trim();
 
         // Must start with "Bearer " (case-insensitive).
-        if header.len() < 7
-            || !header[..6].eq_ignore_ascii_case("bearer")
-            || header.as_bytes()[6] != b' '
+        let scheme_len = BEARER_SCHEME.len();
+        let prefix_len = scheme_len + 1; // "bearer" + space
+        if header.len() < prefix_len
+            || !header[..scheme_len].eq_ignore_ascii_case(BEARER_SCHEME)
+            || header.as_bytes()[scheme_len] != b' '
         {
             return Err(format!(
                 "unsupported WWW-Authenticate scheme (expected Bearer): {header}"
             ));
         }
 
-        let params = &header[7..];
+        let params = &header[prefix_len..];
         let mut realm = None;
         let mut service = None;
 

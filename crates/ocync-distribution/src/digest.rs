@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 
+/// SHA-256 algorithm name as used in OCI digest strings.
+const SHA256_ALGO: &str = "sha256";
+
 /// OCI content-addressable digest in `algorithm:hex` format (e.g. `sha256:abcd...`).
 #[derive(Debug, Clone, Eq)]
 pub struct Digest {
@@ -21,8 +24,11 @@ impl Digest {
     /// Build a digest from a 32-byte SHA-256 hash.
     pub fn from_sha256(bytes: [u8; 32]) -> Self {
         let hex = hex::encode(bytes);
-        let raw = format!("sha256:{hex}");
-        Self { raw, algo_len: 6 }
+        let raw = format!("{SHA256_ALGO}:{hex}");
+        Self {
+            raw,
+            algo_len: SHA256_ALGO.len(),
+        }
     }
 
     /// The algorithm portion (e.g. `sha256`).
@@ -70,7 +76,7 @@ impl FromStr for Digest {
         }
 
         // SHA-256 must be exactly 64 hex chars
-        if algorithm == "sha256" && hex_part.len() != 64 {
+        if algorithm == SHA256_ALGO && hex_part.len() != 64 {
             return Err(Error::InvalidDigest {
                 digest: s.into(),
                 reason: format!("sha256 hex must be 64 characters, got {}", hex_part.len()),

@@ -84,9 +84,13 @@ pub(crate) fn bare_hostname(s: &str) -> &str {
 
 /// Build a [`RegistryClient`] for the given hostname, using the appropriate
 /// auth provider based on explicit `auth_type` or hostname auto-detection.
+///
+/// When `max_concurrent` is `Some`, the per-registry aggregate concurrency
+/// cap is set to that value; otherwise the client default applies.
 pub(crate) async fn build_registry_client(
     hostname: &str,
     auth_type: Option<&AuthType>,
+    max_concurrent: Option<usize>,
 ) -> Result<RegistryClient, CliError> {
     let base_url = if hostname.starts_with("http://") || hostname.starts_with("https://") {
         hostname.to_string()
@@ -113,7 +117,7 @@ pub(crate) async fn build_registry_client(
         None => detect_provider_kind(bare_host),
     };
 
-    let builder = match provider_kind {
+    let mut builder = match provider_kind {
         Some(ProviderKind::Ecr | ProviderKind::EcrPublic) => {
             let auth = EcrAuth::new(bare_host)
                 .await
@@ -126,6 +130,10 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
     };
+
+    if let Some(n) = max_concurrent {
+        builder = builder.max_concurrent(n);
+    }
 
     builder
         .build()

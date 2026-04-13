@@ -6,11 +6,20 @@ use http::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LOCATION};
 use tracing::{debug, warn};
 
+use crate::aimd::RegistryAction;
 use crate::auth::Scope;
+use crate::auth::detect::{ProviderKind, detect_provider_kind};
 use crate::client::{RegistryClient, build_url};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
+
+/// Blobs at or below this size are uploaded monolithically (POST + PUT) to
+/// save the extra round-trip cost of chunked upload negotiation.
+const MONOLITHIC_THRESHOLD: u64 = 1024 * 1024;
+
+/// Content type for raw blob data in OCI upload requests.
+const OCTET_STREAM: &str = "application/octet-stream";
 
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
@@ -29,6 +38,41 @@ fn blob_path(digest: &Digest) -> String {
     format!("blobs/{digest}")
 }
 
+/// Check an HTTP response status, returning an error with the response body
+/// if the status does not match `expected`.
+async fn expect_status(
+    resp: reqwest::Response,
+    expected: StatusCode,
+) -> Result<reqwest::Response, Error> {
+    let status = resp.status();
+    if status == expected {
+        Ok(resp)
+    } else {
+        let message = resp.text().await.unwrap_or_default();
+        Err(Error::RegistryError { status, message })
+    }
+}
+
+/// Buffer an entire byte stream into a `Vec<u8>`.
+///
+/// When `capacity_hint` is `Some(n)`, the buffer is pre-allocated to `n` bytes
+/// to avoid reallocations. Used by fallback upload paths (GAR, GHCR, monolithic
+/// threshold) that cannot stream chunks to the registry.
+async fn buffer_stream(
+    stream: impl Stream<Item = Result<Bytes, Error>>,
+    capacity_hint: Option<u64>,
+) -> Result<Vec<u8>, Error> {
+    let mut body = match capacity_hint {
+        Some(s) => Vec::with_capacity(s as usize),
+        None => Vec::new(),
+    };
+    futures_util::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk?);
+    }
+    Ok(body)
+}
+
 impl RegistryClient {
     /// Check whether a blob exists in the given repository.
     ///
@@ -40,7 +84,7 @@ impl RegistryClient {
         digest: &Digest,
     ) -> Result<Option<u64>, Error> {
         let path = blob_path(digest);
-        match self.head(repository, &path).await {
+        match self.head(repository, &path, RegistryAction::BlobHead).await {
             Ok(resp) => {
                 let size = resp
                     .headers()
@@ -65,7 +109,9 @@ impl RegistryClient {
         digest: &Digest,
     ) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>> + 'static, Error> {
         let path = blob_path(digest);
-        let resp = self.get(repository, &path, None).await?;
+        let resp = self
+            .get(repository, &path, None, RegistryAction::BlobRead)
+            .await?;
         Ok(resp.bytes_stream())
     }
 
@@ -81,18 +127,22 @@ impl RegistryClient {
         from_repo: &str,
     ) -> Result<MountResult, Error> {
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
         let scopes = [Scope::pull_push(repository), Scope::pull(from_repo)];
         let digest_str = digest.to_string();
         let from = from_repo.to_owned();
 
         let resp = self
-            .send_with_retry(&scopes, "blob mount", |headers| {
-                self.http
-                    .post(url.clone())
-                    .headers(headers)
-                    .query(&[("mount", &digest_str), ("from", &from)])
-            })
+            .send_with_aimd(
+                RegistryAction::BlobUploadInit,
+                &scopes,
+                "blob mount",
+                |headers| {
+                    self.http
+                        .post(url.clone())
+                        .headers(headers)
+                        .query(&[("mount", &digest_str), ("from", &from)])
+                },
+            )
             .await?;
 
         classify_mount_response(resp).await
@@ -109,47 +159,37 @@ impl RegistryClient {
         let digest = Digest::from_sha256(hash);
 
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
         let scopes = [Scope::pull_push(repository)];
 
-        // Step 1: Initiate upload with POST.
         let resp = self
-            .send_with_retry(&scopes, "blob push initiate", |headers| {
-                self.http.post(url.clone()).headers(headers)
-            })
+            .send_with_aimd(
+                RegistryAction::BlobUploadInit,
+                &scopes,
+                "blob push initiate",
+                |headers| self.http.post(url.clone()).headers(headers),
+            )
             .await?;
-
-        let status = resp.status();
-        if status != StatusCode::ACCEPTED {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(Error::RegistryError { status, message });
-        }
-
-        // Extract and resolve the upload URL from the Location header.
+        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
         let put_url = extract_location(&resp, &self.base_url)?;
 
-        // Step 2: PUT the data with digest query param.
         let digest_str = digest.to_string();
         let resp = self
-            .send_with_retry(&scopes, "blob push upload", |headers| {
-                self.http
-                    .put(&put_url)
-                    .headers(headers)
-                    .query(&[("digest", &digest_str)])
-                    .header(CONTENT_LENGTH, data.len().to_string())
-                    .header(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("application/octet-stream"),
-                    )
-                    .body(data.to_vec())
-            })
+            .send_with_aimd(
+                RegistryAction::BlobUploadComplete,
+                &scopes,
+                "blob push upload",
+                |headers| {
+                    self.http
+                        .put(&put_url)
+                        .headers(headers)
+                        .query(&[("digest", &digest_str)])
+                        .header(CONTENT_LENGTH, data.len().to_string())
+                        .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
+                        .body(data.to_vec())
+                },
+            )
             .await?;
-
-        let status = resp.status();
-        if status != StatusCode::CREATED {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(Error::RegistryError { status, message });
-        }
+        expect_status(resp, StatusCode::CREATED).await?;
 
         Ok(digest)
     }
@@ -162,21 +202,64 @@ impl RegistryClient {
     /// 3. PUT to finalize with `?digest=` query param — the registry verifies
     ///    the uploaded content matches the digest.
     ///
+    /// When `known_size` is `Some(n)` and `n <= 1 MiB`, the stream is buffered
+    /// and sent as a monolithic upload, saving one HTTP round-trip.
+    ///
+    /// **GHCR fallback**: GitHub Container Registry's multi-PATCH chunked
+    /// upload is broken — each PATCH overwrites all previous chunks. Blobs
+    /// pushed to `ghcr.io` use a single PATCH with no `Content-Range` header.
+    ///
     /// **GAR fallback**: Google Artifact Registry does not support chunked
     /// uploads, so hosts ending in `-docker.pkg.dev` buffer the entire stream
     /// and delegate to [`blob_push`](Self::blob_push).
-    pub async fn blob_push_stream(
+    pub async fn blob_push_stream<E>(
         &self,
         repository: &str,
         expected_digest: &Digest,
-        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-    ) -> Result<Digest, Error> {
+        known_size: Option<u64>,
+        stream: impl Stream<Item = Result<Bytes, E>>,
+    ) -> Result<Digest, Error>
+    where
+        E: Into<Error>,
+    {
+        // Map stream errors to our Error type at the boundary so all
+        // internal code works uniformly with `Result<Bytes, Error>`.
+        let stream = stream.map(|r| r.map_err(Into::into));
+
+        // Monolithic threshold: small blobs skip chunked upload entirely.
+        if known_size.is_some_and(|s| s <= MONOLITHIC_THRESHOLD) {
+            debug!(
+                repository,
+                %expected_digest,
+                size = known_size.unwrap(),
+                "blob below monolithic threshold, using POST+PUT upload"
+            );
+            let body = buffer_stream(stream, known_size).await?;
+            let actual_digest = self.blob_push(repository, &body).await?;
+            if &actual_digest != expected_digest {
+                return Err(Error::Other(format!(
+                    "monolithic upload digest mismatch: expected {expected_digest}, got {actual_digest}"
+                )));
+            }
+            return Ok(actual_digest);
+        }
+
+        // Registry-specific upload fallbacks, detected via the canonical
+        // provider detection (handles case-insensitivity, ports, trailing dots).
+        let provider = self.base_url.host_str().and_then(detect_provider_kind);
+
+        // GHCR fallback: single PATCH (no Content-Range) to avoid the
+        // multi-PATCH corruption bug.
+        if provider == Some(ProviderKind::Ghcr) {
+            return self
+                .blob_push_stream_ghcr(repository, expected_digest, known_size, stream)
+                .await;
+        }
+
         // GAR fallback: buffer entire stream and use monolithic push.
-        if self
-            .base_url
-            .host_str()
-            .is_some_and(|h| h.ends_with("-docker.pkg.dev"))
-        {
+        // GAR (Artifact Registry) does not support chunked uploads; legacy
+        // gcr.io hosts support it fine, so only Gar triggers this path.
+        if provider == Some(ProviderKind::Gar) {
             return self
                 .blob_push_stream_gar_fallback(repository, expected_digest, stream)
                 .await;
@@ -190,25 +273,20 @@ impl RegistryClient {
         );
 
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
         let scopes = [Scope::pull_push(repository)];
 
-        // Step 1: Initiate upload with POST.
         let resp = self
-            .send_with_retry(&scopes, "blob push stream initiate", |headers| {
-                self.http.post(url.clone()).headers(headers)
-            })
+            .send_with_aimd(
+                RegistryAction::BlobUploadInit,
+                &scopes,
+                "blob push stream initiate",
+                |headers| self.http.post(url.clone()).headers(headers),
+            )
             .await?;
-
-        let status = resp.status();
-        if status != StatusCode::ACCEPTED {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(Error::RegistryError { status, message });
-        }
-
+        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
         let upload_url = extract_location(&resp, &self.base_url)?;
 
-        // Step 2: Stream chunks, issuing PATCH for each chunk_size buffer.
+        // Stream chunks, issuing PATCH for each chunk_size buffer.
         let mut buffer = Vec::with_capacity(self.chunk_size);
         let mut current_url = upload_url;
         let mut offset: u64 = 0;
@@ -240,27 +318,24 @@ impl RegistryClient {
                 .await?;
         }
 
-        // Step 3: PUT to finalize — the registry verifies the digest.
+        // PUT to finalize — the registry verifies the digest.
         let digest_str = expected_digest.to_string();
         let resp = self
-            .send_with_retry(&scopes, "blob push stream finalize", |headers| {
-                self.http
-                    .put(&current_url)
-                    .headers(headers)
-                    .query(&[("digest", &digest_str)])
-                    .header(CONTENT_LENGTH, "0")
-                    .header(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("application/octet-stream"),
-                    )
-            })
+            .send_with_aimd(
+                RegistryAction::BlobUploadComplete,
+                &scopes,
+                "blob push stream finalize",
+                |headers| {
+                    self.http
+                        .put(&current_url)
+                        .headers(headers)
+                        .query(&[("digest", &digest_str)])
+                        .header(CONTENT_LENGTH, "0")
+                        .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
+                },
+            )
             .await?;
-
-        let status = resp.status();
-        if status != StatusCode::CREATED {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(Error::RegistryError { status, message });
-        }
+        expect_status(resp, StatusCode::CREATED).await?;
 
         Ok(expected_digest.clone())
     }
@@ -283,26 +358,22 @@ impl RegistryClient {
         let chunk = Bytes::from(chunk);
 
         let resp = self
-            .send_with_retry(scopes, "blob push stream patch", |headers| {
-                self.http
-                    .patch(&url)
-                    .headers(headers)
-                    .header(CONTENT_RANGE, content_range.clone())
-                    .header(CONTENT_LENGTH, chunk_len.to_string())
-                    .header(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("application/octet-stream"),
-                    )
-                    .body(chunk.clone())
-            })
+            .send_with_aimd(
+                RegistryAction::BlobUploadChunk,
+                scopes,
+                "blob push stream patch",
+                |headers| {
+                    self.http
+                        .patch(&url)
+                        .headers(headers)
+                        .header(CONTENT_RANGE, content_range.clone())
+                        .header(CONTENT_LENGTH, chunk_len.to_string())
+                        .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
+                        .body(chunk.clone())
+                },
+            )
             .await?;
-
-        let status = resp.status();
-        if status != StatusCode::ACCEPTED {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(Error::RegistryError { status, message });
-        }
-
+        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
         extract_location(&resp, &self.base_url)
     }
 
@@ -316,20 +387,14 @@ impl RegistryClient {
         &self,
         repository: &str,
         expected_digest: &Digest,
-        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        stream: impl Stream<Item = Result<Bytes, Error>>,
     ) -> Result<Digest, Error> {
         warn!(
             repository,
             host = self.base_url.host_str().unwrap_or("unknown"),
             "GAR does not support chunked uploads; buffering entire blob in memory"
         );
-        let mut body = Vec::new();
-        futures_util::pin_mut!(stream);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            body.extend_from_slice(&chunk);
-        }
-
+        let body = buffer_stream(stream, None).await?;
         let actual_digest = self.blob_push(repository, &body).await?;
 
         if &actual_digest != expected_digest {
@@ -341,25 +406,82 @@ impl RegistryClient {
         Ok(actual_digest)
     }
 
-    /// Delete an in-progress blob upload.
+    /// GHCR fallback: single PATCH upload to avoid multi-PATCH corruption.
     ///
-    /// Issues a DELETE to the given upload URL.
-    pub async fn blob_upload_delete(&self, upload_url: &str) -> Result<(), Error> {
-        let _permit = self.semaphore.acquire().await.expect("semaphore closed");
+    /// GitHub Container Registry's chunked upload is broken: each PATCH
+    /// request overwrites all previous chunks, so only the last chunk is
+    /// stored. This fallback buffers the entire stream and sends a single
+    /// PATCH with no `Content-Range` header, followed by a PUT to finalize.
+    async fn blob_push_stream_ghcr(
+        &self,
+        repository: &str,
+        expected_digest: &Digest,
+        known_size: Option<u64>,
+        stream: impl Stream<Item = Result<Bytes, Error>>,
+    ) -> Result<Digest, Error> {
+        warn!(
+            repository,
+            "GHCR multi-PATCH chunked upload is broken; buffering blob for single-PATCH upload"
+        );
 
+        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
+        let scopes = [Scope::pull_push(repository)];
+
+        // Initiate upload.
         let resp = self
-            .send_with_retry(&[], "upload delete", |headers| {
-                self.http.delete(upload_url).headers(headers)
-            })
+            .send_with_aimd(
+                RegistryAction::BlobUploadInit,
+                &scopes,
+                "blob push ghcr initiate",
+                |headers| self.http.post(url.clone()).headers(headers),
+            )
             .await?;
+        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
+        let upload_url = extract_location(&resp, &self.base_url)?;
 
-        let status = resp.status();
-        if status != StatusCode::NO_CONTENT && status != StatusCode::ACCEPTED {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(Error::RegistryError { status, message });
-        }
+        // Buffer entire stream.
+        let body = Bytes::from(buffer_stream(stream, known_size).await?);
+        let body_len = body.len();
 
-        Ok(())
+        // Single PATCH — no Content-Range header.
+        let resp = self
+            .send_with_aimd(
+                RegistryAction::BlobUploadChunk,
+                &scopes,
+                "blob push ghcr patch",
+                |headers| {
+                    self.http
+                        .patch(&upload_url)
+                        .headers(headers)
+                        .header(CONTENT_LENGTH, body_len.to_string())
+                        .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
+                        .body(body.clone())
+                },
+            )
+            .await?;
+        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
+        let finalize_url = extract_location(&resp, &self.base_url)?;
+
+        // PUT to finalize with digest query param.
+        let digest_str = expected_digest.to_string();
+        let resp = self
+            .send_with_aimd(
+                RegistryAction::BlobUploadComplete,
+                &scopes,
+                "blob push ghcr finalize",
+                |headers| {
+                    self.http
+                        .put(&finalize_url)
+                        .headers(headers)
+                        .query(&[("digest", &digest_str)])
+                        .header(CONTENT_LENGTH, "0")
+                        .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
+                },
+            )
+            .await?;
+        expect_status(resp, StatusCode::CREATED).await?;
+
+        Ok(expected_digest.clone())
     }
 }
 
@@ -473,6 +595,26 @@ mod tests {
         );
     }
 
+    /// Build a `RegistryClient` with a GHCR hostname resolving to a local port.
+    fn build_ghcr_client(port: u16) -> RegistryClient {
+        let base_url = url::Url::parse(&format!("http://ghcr.io:{port}")).unwrap();
+        let http = reqwest::Client::builder()
+            .resolve(
+                "ghcr.io",
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            )
+            .build()
+            .unwrap();
+
+        RegistryClient {
+            base_url,
+            http,
+            auth: None,
+            aimd: crate::aimd::AimdController::new("ghcr.io", 8),
+            chunk_size: 4,
+        }
+    }
+
     /// Build a `RegistryClient` with a GAR hostname resolving to a local port.
     fn build_gar_client(port: u16) -> RegistryClient {
         let base_url = url::Url::parse(&format!("http://us-docker.pkg.dev:{port}")).unwrap();
@@ -488,7 +630,7 @@ mod tests {
             base_url,
             http,
             auth: None,
-            semaphore: tokio::sync::Semaphore::new(8),
+            aimd: crate::aimd::AimdController::new("us-docker.pkg.dev", 8),
             chunk_size: 4,
         }
     }
@@ -500,7 +642,7 @@ mod tests {
     fn data_stream(
         data: &[u8],
         chunk_size: usize,
-    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static {
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
         let chunks: Vec<Result<Bytes, reqwest::Error>> = data
             .chunks(chunk_size)
             .map(|c| Ok(Bytes::copy_from_slice(c)))
@@ -549,7 +691,114 @@ mod tests {
         let client = build_gar_client(port);
 
         let result = client
-            .blob_push_stream("my-project/my-repo", &digest, data_stream(data, 4))
+            .blob_push_stream("my-project/my-repo", &digest, None, data_stream(data, 4))
+            .await
+            .unwrap();
+
+        assert_eq!(result, digest);
+    }
+
+    /// GHCR: single PATCH with Content-Length, no Content-Range.
+    #[tokio::test]
+    async fn blob_push_stream_ghcr_uses_single_patch() {
+        let server = wiremock::MockServer::start().await;
+        let data = b"ghcr blob content";
+        let digest = test_digest(data);
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        // POST: initiate upload.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/v2/my-org/my-image/blobs/uploads/",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/my-org/my-image/blobs/uploads/ghcr-uuid"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PATCH: single PATCH with Content-Length.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path(
+                "/v2/my-org/my-image/blobs/uploads/ghcr-uuid",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(202).append_header(
+                "Location",
+                "/v2/my-org/my-image/blobs/uploads/ghcr-uuid?after-patch",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PUT: finalize with digest query param.
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::query_param(
+                "digest",
+                digest.to_string(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_ghcr_client(port);
+
+        // Pass None so the monolithic threshold does not intercept the call;
+        // we are verifying the GHCR-specific single-PATCH path directly.
+        let result = client
+            .blob_push_stream("my-org/my-image", &digest, None, data_stream(data, 4))
+            .await
+            .unwrap();
+
+        assert_eq!(result, digest);
+    }
+
+    /// GHCR: exactly one PATCH regardless of blob size vs `chunk_size`.
+    #[tokio::test]
+    async fn blob_push_stream_ghcr_single_patch_large_blob() {
+        let server = wiremock::MockServer::start().await;
+        // 16 bytes >> chunk_size=4; only one PATCH must be issued.
+        let data = b"abcdefghijklmnop";
+        let digest = test_digest(data);
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/repo/blobs/uploads/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/repo/blobs/uploads/ghcr-id"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // One PATCH with the full 16-byte body.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/repo/blobs/uploads/ghcr-id?done"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::query_param(
+                "digest",
+                digest.to_string(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_ghcr_client(port);
+
+        // No known_size — GHCR path still taken based on hostname alone.
+        let result = client
+            .blob_push_stream("repo", &digest, None, data_stream(data, 4))
             .await
             .unwrap();
 

@@ -10,6 +10,7 @@ repository = "https://github.com/clowdhaus/ocync"
 
 [workspace.dependencies]
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+bytes = { version = "1", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 http = { version = "1", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
@@ -55,7 +56,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml = { package = "serde_yaml_ng", version = "0.10", default-features = false }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { workspace = true, features = ["rt", "macros", "signal"] }
 reqwest.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "json", "fmt"] }

@@ -19,7 +19,7 @@ fn test_digest(data: &[u8]) -> Digest {
 fn data_stream(
     data: &[u8],
     chunk_size: usize,
-) -> impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static {
+) -> impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> {
     let chunks: Vec<Result<Bytes, reqwest::Error>> = data
         .chunks(chunk_size)
         .map(|c| Ok(Bytes::copy_from_slice(c)))
@@ -104,7 +104,7 @@ async fn happy_path() {
         .unwrap();
 
     let result = client
-        .blob_push_stream("myrepo", &digest, data_stream(data, 4))
+        .blob_push_stream("myrepo", &digest, None, data_stream(data, 4))
         .await
         .unwrap();
 
@@ -180,7 +180,7 @@ async fn multi_chunk() {
         .unwrap();
 
     let result = client
-        .blob_push_stream("repo", &digest, data_stream(data, 2))
+        .blob_push_stream("repo", &digest, None, data_stream(data, 2))
         .await
         .unwrap();
 
@@ -229,7 +229,7 @@ async fn exact_chunk_boundary() {
         .unwrap();
 
     let result = client
-        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
         .await
         .unwrap();
 
@@ -274,7 +274,7 @@ async fn empty_stream() {
         .unwrap();
 
     let result = client
-        .blob_push_stream("repo", &digest, data_stream(data, 1))
+        .blob_push_stream("repo", &digest, None, data_stream(data, 1))
         .await
         .unwrap();
 
@@ -302,7 +302,7 @@ async fn post_initiation_rejected() {
         .unwrap();
 
     let err = client
-        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -356,7 +356,7 @@ async fn patch_chunk_failure() {
         .unwrap();
 
     let err = client
-        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -404,7 +404,7 @@ async fn put_finalize_rejected() {
         .unwrap();
 
     let err = client
-        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -445,7 +445,9 @@ async fn stream_error_propagates() {
         .build()
         .unwrap();
 
-    let result = client.blob_push_stream("repo", &digest, error_stream).await;
+    let result = client
+        .blob_push_stream("repo", &digest, None, error_stream)
+        .await;
 
     assert!(result.is_err(), "stream error should propagate");
 }
@@ -474,7 +476,7 @@ async fn post_returns_200_is_rejected() {
         .unwrap();
 
     let err = client
-        .blob_push_stream("repo", &digest, data_stream(data, 4))
+        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -483,6 +485,104 @@ async fn post_returns_200_is_rejected() {
         msg.contains("200"),
         "should reject 200 as unexpected status: {msg}"
     );
+}
+
+// ─── Monolithic threshold: small blobs use POST+PUT ──────────────────────────
+
+/// Blobs at or below 1 MiB use monolithic POST+PUT upload (no PATCH).
+#[tokio::test]
+async fn small_blob_uses_monolithic_upload() {
+    let server = MockServer::start().await;
+    // 10 bytes — well under the 1 MiB threshold.
+    let data = b"small blob";
+    let digest = test_digest(data);
+
+    // POST: initiate monolithic upload.
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .append_header("Location", "/v2/repo/blobs/uploads/mono-uuid"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // PUT: monolithic upload with digest query param.
+    Mock::given(method("PUT"))
+        .and(query_param("digest", digest.to_string()))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // PATCH: must NOT be called for small blobs.
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .chunk_size(4)
+        .build()
+        .unwrap();
+
+    let result = client
+        .blob_push_stream(
+            "repo",
+            &digest,
+            Some(data.len() as u64),
+            data_stream(data, 4),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result, digest);
+}
+
+/// Blobs with no `known_size` are not subject to the monolithic threshold.
+#[tokio::test]
+async fn unknown_size_skips_monolithic_threshold() {
+    let server = MockServer::start().await;
+    let data = b"no size known";
+    let digest = test_digest(data);
+    let upload_path = "/v2/repo/blobs/uploads/uuid-1";
+
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(ResponseTemplate::new(202).append_header("Location", upload_path))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // PATCH must be called (chunked path taken).
+    Mock::given(method("PATCH"))
+        .respond_with(
+            ResponseTemplate::new(202).append_header("Location", "/v2/repo/blobs/uploads/uuid-2"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(query_param("digest", digest.to_string()))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .chunk_size(64)
+        .build()
+        .unwrap();
+
+    let result = client
+        .blob_push_stream("repo", &digest, None, data_stream(data, 4))
+        .await
+        .unwrap();
+
+    assert_eq!(result, digest);
 }
 
 /// Verify GAR hostname detection matches the expected pattern.

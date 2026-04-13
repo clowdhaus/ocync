@@ -25,6 +25,12 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
         .map_err(|e| ConfigError::Parse(format!("failed to parse {}: {e}", path.display())))?;
 
     // Structural validation.
+    if let Some(ref global) = config.global {
+        validate_global(global)?;
+    }
+    for (name, registry) in &config.registries {
+        validate_registry(name, registry)?;
+    }
     let has_default_tags = config.defaults.as_ref().is_some_and(|d| d.tags.is_some());
     for mapping in &config.mappings {
         validate_mapping(mapping, has_default_tags)?;
@@ -82,6 +88,10 @@ pub(crate) enum ConfigError {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Config {
+    /// Global engine settings applied across all syncs.
+    #[serde(default)]
+    pub global: Option<GlobalConfig>,
+
     #[serde(default)]
     pub registries: HashMap<String, RegistryConfig>,
 
@@ -92,6 +102,50 @@ pub(crate) struct Config {
     pub defaults: Option<DefaultsConfig>,
 
     pub mappings: Vec<MappingConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Global config
+// ---------------------------------------------------------------------------
+
+/// Global engine settings that apply across all sync operations.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct GlobalConfig {
+    /// Maximum concurrent image syncs (default: 50).
+    #[serde(default = "default_max_concurrent_transfers")]
+    pub max_concurrent_transfers: usize,
+
+    /// Cache directory for persistent cache and blob staging.
+    ///
+    /// Defaults to a directory next to the config file when not specified.
+    pub cache_dir: Option<String>,
+
+    /// Warm cache TTL as a human-readable duration (e.g. "12h", "30m").
+    ///
+    /// `"0"` disables TTL-based expiry (cache never expires by age; lazy
+    /// invalidation only). Defaults to `"12h"` when not specified.
+    pub cache_ttl: Option<String>,
+
+    /// Disk staging size limit as a human-readable size (e.g. "2GB", "500MB").
+    ///
+    /// Uses SI decimal prefixes: 1 GB = 1,000,000,000 bytes.
+    /// `0` disables disk staging. When absent, no eviction is performed.
+    pub staging_size_limit: Option<String>,
+}
+
+fn default_max_concurrent_transfers() -> usize {
+    50
+}
+
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_transfers: default_max_concurrent_transfers(),
+            cache_dir: None,
+            cache_ttl: None,
+            staging_size_limit: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -127,14 +181,12 @@ pub(crate) struct RegistryConfig {
     #[serde(default)]
     pub auth_type: Option<AuthType>,
 
-    #[serde(default)]
-    pub ecr: Option<EcrConfig>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct EcrConfig {
-    #[serde(default)]
-    pub auto_create: bool,
+    /// Per-registry aggregate concurrency cap (default: 50).
+    ///
+    /// Limits the total number of simultaneous in-flight HTTP requests to this
+    /// registry across all action types. This is independent of the global
+    /// `max_concurrent_transfers` (which caps image-level parallelism).
+    pub max_concurrent: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +375,80 @@ pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
+/// Validate the global config section.
+fn validate_global(global: &GlobalConfig) -> Result<(), ConfigError> {
+    if global.max_concurrent_transfers < 1 {
+        return Err(ConfigError::Validation(
+            "global.max_concurrent_transfers must be >= 1".to_string(),
+        ));
+    }
+    if let Some(ref ttl) = global.cache_ttl {
+        if !is_valid_duration(ttl) {
+            return Err(ConfigError::Validation(format!(
+                "global.cache_ttl '{ttl}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")"
+            )));
+        }
+    }
+    if let Some(ref size) = global.staging_size_limit {
+        if !is_valid_size(size) {
+            return Err(ConfigError::Validation(format!(
+                "global.staging_size_limit '{size}' is not a valid size (e.g. \"2GB\", \"500MB\", \"0\")"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate per-registry settings.
+fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), ConfigError> {
+    if let Some(max) = registry.max_concurrent {
+        if max < 1 {
+            return Err(ConfigError::Validation(format!(
+                "registries.{name}.max_concurrent must be >= 1"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Check whether a string is a valid human-readable duration.
+///
+/// Accepts an unsigned integer optionally followed by a unit suffix:
+/// `s` (seconds), `m` (minutes), `h` (hours), `d` (days). A bare
+/// integer with no suffix is treated as seconds. `"0"` means disabled.
+fn is_valid_duration(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    // Bare integer (including "0") — treated as seconds.
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    let (digits, suffix) = s.split_at(s.len() - 1);
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    matches!(suffix, "s" | "m" | "h" | "d")
+}
+
+/// Check whether a string is a valid human-readable byte size.
+///
+/// Accepts an unsigned integer optionally followed by a unit suffix:
+/// `B`, `KB`, `MB`, `GB`, `TB`. A bare `0` is accepted to mean
+/// "disabled".
+fn is_valid_size(s: &str) -> bool {
+    if s == "0" {
+        return true;
+    }
+    for suffix in &["TB", "GB", "MB", "KB", "B"] {
+        if let Some(digits) = s.strip_suffix(suffix) {
+            return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    false
+}
+
+fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
     if tags.latest.is_some() && tags.sort.is_none() {
         return Err(ConfigError::Validation(
             "tags.latest requires tags.sort to be set".to_string(),
@@ -341,10 +466,7 @@ pub(crate) fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
 ///
 /// A mapping must have its own `tags` block OR inherit from `defaults.tags`.
 /// If neither is present, this returns a validation error.
-pub(crate) fn validate_mapping(
-    mapping: &MappingConfig,
-    has_default_tags: bool,
-) -> Result<(), ConfigError> {
+fn validate_mapping(mapping: &MappingConfig, has_default_tags: bool) -> Result<(), ConfigError> {
     if mapping.tags.is_none() && !has_default_tags {
         return Err(ConfigError::Validation(format!(
             "mapping '{}' is missing a tags block (and no defaults.tags is set)",
@@ -378,7 +500,7 @@ pub(crate) fn resolve_target_names(
     }
 }
 
-pub(crate) fn validate_references(config: &Config) -> Result<(), ConfigError> {
+fn validate_references(config: &Config) -> Result<(), ConfigError> {
     let known: std::collections::HashSet<&str> =
         config.registries.keys().map(String::as_str).collect();
 
@@ -459,8 +581,6 @@ registries:
   my-ecr:
     url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
     auth_type: ecr
-    ecr:
-      auto_create: true
 mappings:
   - from: nginx
     tags:
@@ -469,7 +589,6 @@ mappings:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let reg = &config.registries["my-ecr"];
         assert_eq!(reg.auth_type, Some(AuthType::Ecr));
-        assert!(reg.ecr.as_ref().unwrap().auto_create);
     }
 
     #[test]
@@ -869,5 +988,187 @@ mappings:
             }
             other => panic!("wrong error: {other}"),
         }
+    }
+
+    // -- GlobalConfig -------------------------------------------------------
+
+    #[test]
+    fn deserialize_global_all_fields() {
+        let yaml = r#"
+global:
+  max_concurrent_transfers: 20
+  cache_dir: /tmp/ocync-cache
+  cache_ttl: 6h
+  staging_size_limit: 1GB
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let global = config.global.as_ref().unwrap();
+        assert_eq!(global.max_concurrent_transfers, 20);
+        assert_eq!(global.cache_dir.as_deref(), Some("/tmp/ocync-cache"));
+        assert_eq!(global.cache_ttl.as_deref(), Some("6h"));
+        assert_eq!(global.staging_size_limit.as_deref(), Some("1GB"));
+    }
+
+    #[test]
+    fn global_defaults_when_section_absent() {
+        let yaml = r#"
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.global.is_none());
+        // When global is absent consumers should use the field defaults.
+        let global = GlobalConfig::default();
+        assert_eq!(
+            global.max_concurrent_transfers,
+            default_max_concurrent_transfers()
+        );
+        assert!(global.cache_dir.is_none());
+        assert!(global.cache_ttl.is_none());
+        assert!(global.staging_size_limit.is_none());
+    }
+
+    #[test]
+    fn global_max_concurrent_transfers_default_when_section_present() {
+        let yaml = r#"
+global:
+  cache_dir: /tmp
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let global = config.global.as_ref().unwrap();
+        assert_eq!(global.max_concurrent_transfers, 50);
+    }
+
+    #[test]
+    fn global_max_concurrent_transfers_zero_is_invalid() {
+        let global = GlobalConfig {
+            max_concurrent_transfers: 0,
+            ..Default::default()
+        };
+        let err = validate_global(&global).unwrap_err();
+        match err {
+            ConfigError::Validation(msg) => assert!(msg.contains("max_concurrent_transfers")),
+            other => panic!("wrong error: {other}"),
+        }
+    }
+
+    #[test]
+    fn global_invalid_cache_ttl() {
+        let global = GlobalConfig {
+            cache_ttl: Some("not-a-duration".to_string()),
+            ..Default::default()
+        };
+        let err = validate_global(&global).unwrap_err();
+        match err {
+            ConfigError::Validation(msg) => assert!(msg.contains("cache_ttl")),
+            other => panic!("wrong error: {other}"),
+        }
+    }
+
+    #[test]
+    fn global_valid_cache_ttl_forms() {
+        for ttl in &["0", "60", "1s", "30m", "12h", "7d"] {
+            let global = GlobalConfig {
+                cache_ttl: Some((*ttl).to_string()),
+                ..Default::default()
+            };
+            validate_global(&global).unwrap_or_else(|e| panic!("expected valid ttl '{ttl}': {e}"));
+        }
+    }
+
+    #[test]
+    fn global_invalid_staging_size_limit() {
+        let global = GlobalConfig {
+            staging_size_limit: Some("2gigabytes".to_string()),
+            ..Default::default()
+        };
+        let err = validate_global(&global).unwrap_err();
+        match err {
+            ConfigError::Validation(msg) => assert!(msg.contains("staging_size_limit")),
+            other => panic!("wrong error: {other}"),
+        }
+    }
+
+    #[test]
+    fn global_valid_staging_size_limit_forms() {
+        for size in &["0", "512B", "500KB", "500MB", "2GB", "1TB"] {
+            let global = GlobalConfig {
+                staging_size_limit: Some((*size).to_string()),
+                ..Default::default()
+            };
+            validate_global(&global)
+                .unwrap_or_else(|e| panic!("expected valid size '{size}': {e}"));
+        }
+    }
+
+    // -- Per-registry fields ------------------------------------------------
+
+    #[test]
+    fn deserialize_registry_max_concurrent() {
+        let yaml = r#"
+registries:
+  chainguard:
+    url: cgr.dev
+    max_concurrent: 10
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let reg = &config.registries["chainguard"];
+        assert_eq!(reg.max_concurrent, Some(10));
+    }
+
+    #[test]
+    fn registry_max_concurrent_defaults_none() {
+        let yaml = r#"
+registries:
+  hub:
+    url: registry-1.docker.io
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.registries["hub"].max_concurrent.is_none());
+    }
+
+    #[test]
+    fn registry_max_concurrent_zero_is_invalid() {
+        let registry = RegistryConfig {
+            url: "example.com".to_string(),
+            auth_type: None,
+            max_concurrent: Some(0),
+        };
+        let err = validate_registry("example", &registry).unwrap_err();
+        match err {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("example"));
+                assert!(msg.contains("max_concurrent"));
+            }
+            other => panic!("wrong error: {other}"),
+        }
+    }
+
+    #[test]
+    fn registry_max_concurrent_valid_passes() {
+        let registry = RegistryConfig {
+            url: "example.com".to_string(),
+            auth_type: None,
+            max_concurrent: Some(25),
+        };
+        validate_registry("example", &registry).unwrap();
     }
 }

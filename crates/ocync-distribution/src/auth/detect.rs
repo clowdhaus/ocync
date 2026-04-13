@@ -19,8 +19,10 @@ pub enum ProviderKind {
     Ecr,
     /// AWS ECR Public Gallery.
     EcrPublic,
-    /// Google Container Registry (gcr.io and regional mirrors) or Artifact Registry.
+    /// Google Container Registry (gcr.io and regional mirrors).
     Gcr,
+    /// Google Artifact Registry (*-docker.pkg.dev).
+    Gar,
     /// Azure Container Registry.
     Acr,
     /// GitHub Container Registry.
@@ -85,7 +87,7 @@ pub fn detect_provider_kind(hostname: &str) -> Option<ProviderKind> {
         "docker.io" | "index.docker.io" | "registry-1.docker.io" => Some(ProviderKind::DockerHub),
         _ if hostname == "gcr.io" || hostname.ends_with(".gcr.io") => Some(ProviderKind::Gcr),
         _ if ECR_RE.is_match(hostname) => Some(ProviderKind::Ecr),
-        _ if GAR_RE.is_match(hostname) => Some(ProviderKind::Gcr),
+        _ if GAR_RE.is_match(hostname) => Some(ProviderKind::Gar),
         _ if ACR_RE.is_match(hostname) => Some(ProviderKind::Acr),
         _ => None,
     }
@@ -220,7 +222,7 @@ mod tests {
     fn detect_gar_us_central() {
         assert_eq!(
             detect_provider_kind("us-central1-docker.pkg.dev"),
-            Some(ProviderKind::Gcr)
+            Some(ProviderKind::Gar)
         );
     }
 
@@ -228,7 +230,7 @@ mod tests {
     fn detect_gar_europe() {
         assert_eq!(
             detect_provider_kind("europe-docker.pkg.dev"),
-            Some(ProviderKind::Gcr)
+            Some(ProviderKind::Gar)
         );
     }
 
@@ -236,7 +238,7 @@ mod tests {
     fn detect_gar_asia() {
         assert_eq!(
             detect_provider_kind("asia-docker.pkg.dev"),
-            Some(ProviderKind::Gcr)
+            Some(ProviderKind::Gar)
         );
     }
 
@@ -372,7 +374,7 @@ mod tests {
     fn detect_case_insensitive_gar() {
         assert_eq!(
             detect_provider_kind("US-Central1-Docker.PKG.DEV"),
-            Some(ProviderKind::Gcr)
+            Some(ProviderKind::Gar)
         );
     }
 

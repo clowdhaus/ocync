@@ -1,5 +1,7 @@
 //! OCI registry sync orchestration — tag filtering, transfer planning, and execution.
 
+/// Persistent transfer state cache wrapping [`plan::BlobDedupMap`].
+pub mod cache;
 /// Error types for sync operations.
 pub mod error;
 
@@ -12,14 +14,20 @@ pub mod progress;
 /// Retry configuration and backoff logic.
 pub mod retry;
 
-/// Sync engine — two-phase orchestration of image transfers.
+/// Sync engine -- pipelined concurrent orchestration of image transfers.
 pub mod engine;
+/// Cooperative shutdown signal for the sync engine.
+pub mod shutdown;
+/// Content-addressable disk staging for multi-target blob reuse.
+pub mod staging;
 
 use std::time::Duration;
 
-pub use error::Error;
 use serde::Serialize;
 use uuid::Uuid;
+
+pub use error::Error;
+pub use shutdown::ShutdownSignal;
 
 /// Result of a complete sync run. The engine never "fails" as a whole.
 #[derive(Debug, Serialize)]
@@ -109,18 +117,12 @@ pub enum ImageStatus {
 pub enum SkipReason {
     /// Source and target digests already match.
     DigestMatch,
-    /// Configuration says to skip existing images.
-    SkipExisting,
-    /// Tag is immutable and already exists at target.
-    ImmutableTag,
 }
 
 impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DigestMatch => f.write_str("digest match"),
-            Self::SkipExisting => f.write_str("skip existing"),
-            Self::ImmutableTag => f.write_str("immutable tag"),
         }
     }
 }
@@ -235,8 +237,6 @@ mod tests {
     #[test]
     fn skip_reason_display() {
         assert_eq!(SkipReason::DigestMatch.to_string(), "digest match");
-        assert_eq!(SkipReason::SkipExisting.to_string(), "skip existing");
-        assert_eq!(SkipReason::ImmutableTag.to_string(), "immutable tag");
     }
 
     #[test]

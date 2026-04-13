@@ -23,15 +23,6 @@ pub enum Error {
         reason: String,
     },
 
-    /// A fetched digest did not match the expected value.
-    #[error("digest mismatch: expected {expected}, got {actual}")]
-    DigestMismatch {
-        /// The digest that was expected.
-        expected: String,
-        /// The digest that was computed.
-        actual: String,
-    },
-
     /// The manifest media type is not recognized.
     #[error("unsupported manifest media type: {media_type}")]
     UnsupportedMediaType {
@@ -50,13 +41,6 @@ pub enum Error {
         registry: String,
         /// Why authentication failed.
         reason: String,
-    },
-
-    /// No credentials were found for the target registry.
-    #[error("no credentials found for registry '{registry}'")]
-    NoCredentials {
-        /// The registry hostname.
-        registry: String,
     },
 
     /// An external credential helper process failed.
@@ -123,17 +107,6 @@ mod tests {
         };
         assert!(err.to_string().contains("bad"));
         assert!(err.to_string().contains("missing colon"));
-    }
-
-    #[test]
-    fn display_digest_mismatch() {
-        let err = Error::DigestMismatch {
-            expected: "sha256:aaa".into(),
-            actual: "sha256:bbb".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("sha256:aaa"));
-        assert!(msg.contains("sha256:bbb"));
     }
 
     #[test]

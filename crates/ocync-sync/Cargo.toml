@@ -11,20 +11,24 @@ description = "OCI registry sync orchestration"
 workspace = true
 
 [dependencies]
+bytes.workspace = true
+crc32fast = { version = "1", default-features = false }
+futures-util = { version = "0.3", default-features = false }
 globset = { version = "0.4", default-features = false }
 http.workspace = true
 ocync-distribution.workspace = true
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+reqwest.workspace = true
 semver = { version = "1", default-features = false, features = ["std"] }
 serde.workspace = true
 thiserror.workspace = true
-futures-util = { version = "0.3", default-features = false }
-reqwest.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
 tracing.workspace = true
 uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
 
 [dev-dependencies]
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = { version = "3", default-features = false }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 url.workspace = true
 wiremock = "0.6"

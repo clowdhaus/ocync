@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 
+use crate::aimd::RegistryAction;
 use crate::client::RegistryClient;
 use crate::error::Error;
 
@@ -57,7 +58,9 @@ impl RegistryClient {
         let mut path = "tags/list".to_owned();
 
         loop {
-            let resp = self.get(repository, &path, None).await?;
+            let resp = self
+                .get(repository, &path, None, RegistryAction::TagList)
+                .await?;
 
             // Check for Link header before consuming the body.
             let next_url = resp

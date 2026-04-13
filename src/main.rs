@@ -56,7 +56,7 @@ without a config file.
 
 Examples:
   ocync copy docker.io/library/nginx:1.27 ghcr.io/myorg/nginx:1.27
-  ocync copy 123456789.dkr.ecr.us-east-1.amazonaws.com/app:v2 ghcr.io/myorg/app:v2";
+  ocync copy 123456789012.dkr.ecr.us-east-1.amazonaws.com/app:v2 ghcr.io/myorg/app:v2";
 
 const TAGS_LONG_ABOUT: &str = "\
 List, filter, and sort repository tags
@@ -276,7 +276,7 @@ pub(crate) struct WatchArgs {
     pub(crate) json: bool,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     cli::setup_logging(&cli);
@@ -286,7 +286,7 @@ async fn main() -> std::process::ExitCode {
     cli::shutdown::install_signal_handlers(shutdown.clone());
 
     let result = match cli.command {
-        Commands::Sync(args) => cli::commands::synchronize::run(&args).await,
+        Commands::Sync(args) => cli::commands::synchronize::run(&args, Some(&shutdown)).await,
         Commands::Copy(args) => cli::commands::copy::run(&args).await,
         Commands::Tags(args) => cli::commands::tags::run(&args).await,
         Commands::Auth { action } => match action {
