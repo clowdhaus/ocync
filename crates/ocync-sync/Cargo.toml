@@ -25,7 +25,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
 tracing.workspace = true
-uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = { version = "3", default-features = false }

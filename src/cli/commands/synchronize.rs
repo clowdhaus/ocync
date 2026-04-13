@@ -17,7 +17,6 @@ use ocync_sync::engine::{
     TargetEntry,
 };
 use ocync_sync::filter::FilterConfig;
-use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
@@ -27,6 +26,7 @@ use crate::cli::config::{
     AuthType, Config, GlobOrList, MappingConfig, TagsConfig, load_config, resolve_target_names,
 };
 use crate::cli::output::format_bytes;
+use crate::cli::progress::TextProgress;
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
 /// Default cache TTL: 12 hours.
@@ -117,7 +117,7 @@ pub(crate) async fn run(
             g.max_concurrent_transfers
         });
     let engine = SyncEngine::new(RetryConfig::default(), max_concurrent);
-    let progress = NullProgress;
+    let progress = TextProgress::new(0);
     let report = engine
         .run(mappings, cache.clone(), staging, &progress, shutdown)
         .await;

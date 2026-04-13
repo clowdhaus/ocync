@@ -1,0 +1,274 @@
+//! Verbosity-aware text progress reporter.
+
+use std::cell::RefCell;
+use std::io::{self, Write};
+
+use ocync_sync::progress::ProgressReporter;
+use ocync_sync::{ImageResult, ImageStatus, SyncReport};
+
+use crate::cli::output::{format_bytes, format_duration};
+
+/// Text progress reporter with configurable verbosity.
+///
+/// Per-image status lines go to stderr (alongside tracing logs).
+/// The run summary goes to stdout (pipeable, parseable).
+///
+/// Uses [`RefCell`] for interior mutability because the
+/// [`ProgressReporter`] trait takes `&self` and the engine runs on a
+/// single-threaded tokio runtime.
+pub(crate) struct TextProgress {
+    verbosity: u8,
+    stderr: RefCell<Box<dyn Write>>,
+    stdout: RefCell<Box<dyn Write>>,
+}
+
+impl std::fmt::Debug for TextProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextProgress")
+            .field("verbosity", &self.verbosity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TextProgress {
+    /// Create a new text progress reporter writing to real stderr/stdout.
+    pub(crate) fn new(verbosity: u8) -> Self {
+        Self {
+            verbosity,
+            stderr: RefCell::new(Box::new(io::stderr())),
+            stdout: RefCell::new(Box::new(io::stdout())),
+        }
+    }
+
+    /// Create a text progress reporter with custom writers (for testing).
+    #[cfg(test)]
+    fn with_writers(
+        verbosity: u8,
+        stderr: Box<dyn Write>,
+        stdout: Box<dyn Write>,
+    ) -> Self {
+        Self {
+            verbosity,
+            stderr: RefCell::new(stderr),
+            stdout: RefCell::new(stdout),
+        }
+    }
+}
+
+impl ProgressReporter for TextProgress {
+    fn image_started(&self, _source: &str, _target: &str) {
+        // No-op: tracing handles debug-level start events.
+    }
+
+    fn image_completed(&self, result: &ImageResult) {
+        match &result.status {
+            ImageStatus::Failed { kind, error, .. } => {
+                let _ = writeln!(
+                    self.stderr.borrow_mut(),
+                    "FAILED  {} -> {}  ({kind}: {error})",
+                    result.source,
+                    result.target,
+                );
+            }
+            ImageStatus::Synced if self.verbosity >= 1 => {
+                let _ = writeln!(
+                    self.stderr.borrow_mut(),
+                    "synced  {} -> {}  ({}, {})",
+                    result.source,
+                    result.target,
+                    format_bytes(result.bytes_transferred),
+                    format_duration(result.duration),
+                );
+            }
+            ImageStatus::Skipped { reason } if self.verbosity >= 1 => {
+                let _ = writeln!(
+                    self.stderr.borrow_mut(),
+                    "skipped {} -> {}  ({reason})",
+                    result.source,
+                    result.target,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn run_completed(&self, report: &SyncReport) {
+        if report.images.is_empty() {
+            return;
+        }
+        let s = &report.stats;
+        let _ = writeln!(
+            self.stdout.borrow_mut(),
+            "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} mounted | {} in {}",
+            s.images_synced,
+            s.images_skipped,
+            s.images_failed,
+            s.blobs_transferred,
+            s.blobs_mounted,
+            format_bytes(s.bytes_transferred),
+            format_duration(report.duration),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use ocync_sync::{BlobTransferStats, ErrorKind, SkipReason, SyncStats};
+    use uuid::Uuid;
+
+    use super::*;
+
+    /// Adapter that writes into a shared `Rc<RefCell<Vec<u8>>>`.
+    struct RcWriter(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for RcWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.borrow_mut().flush()
+        }
+    }
+
+    fn test_progress(verbosity: u8) -> (TextProgress, Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>) {
+        let stderr_buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
+
+        let progress = TextProgress::with_writers(
+            verbosity,
+            Box::new(RcWriter(Rc::clone(&stderr_buf))),
+            Box::new(RcWriter(Rc::clone(&stdout_buf))),
+        );
+
+        (progress, stderr_buf, stdout_buf)
+    }
+
+    fn make_result(status: ImageStatus, bytes: u64) -> ImageResult {
+        ImageResult {
+            image_id: Uuid::now_v7(),
+            source: "source/repo:v1".into(),
+            target: "target/repo:v1".into(),
+            status,
+            bytes_transferred: bytes,
+            blob_stats: BlobTransferStats::default(),
+            duration: Duration::from_secs(14),
+        }
+    }
+
+    fn make_report(images: Vec<ImageResult>) -> SyncReport {
+        SyncReport {
+            run_id: Uuid::now_v7(),
+            images,
+            stats: SyncStats {
+                images_synced: 3,
+                images_skipped: 47,
+                images_failed: 1,
+                blobs_transferred: 12,
+                blobs_skipped: 0,
+                blobs_mounted: 34,
+                bytes_transferred: 432_000_000,
+            },
+            duration: Duration::from_secs(47),
+        }
+    }
+
+    // -- image_completed tests --
+
+    #[test]
+    fn verbosity_0_prints_failed() {
+        let (progress, stderr, _stdout) = test_progress(0);
+        let result = make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::ManifestPush,
+                error: "connection refused".into(),
+                retries: 3,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert!(output.contains("FAILED"), "should print FAILED, got: {output}");
+        assert!(output.contains("manifest push"), "should contain error kind");
+        assert!(output.contains("connection refused"), "should contain error message");
+    }
+
+    #[test]
+    fn verbosity_0_silent_on_synced() {
+        let (progress, stderr, _stdout) = test_progress(0);
+        let result = make_result(ImageStatus::Synced, 187_000_000);
+        progress.image_completed(&result);
+        let output = stderr.borrow();
+        assert!(output.is_empty(), "verbosity 0 should not print synced images");
+    }
+
+    #[test]
+    fn verbosity_0_silent_on_skipped() {
+        let (progress, stderr, _stdout) = test_progress(0);
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        let output = stderr.borrow();
+        assert!(output.is_empty(), "verbosity 0 should not print skipped images");
+    }
+
+    #[test]
+    fn verbosity_1_prints_synced() {
+        let (progress, stderr, _stdout) = test_progress(1);
+        let result = make_result(ImageStatus::Synced, 187_000_000);
+        progress.image_completed(&result);
+        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert!(output.contains("synced"), "should print synced, got: {output}");
+        assert!(output.contains("187.0 MB"), "should contain formatted bytes");
+    }
+
+    #[test]
+    fn verbosity_1_prints_skipped() {
+        let (progress, stderr, _stdout) = test_progress(1);
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert!(output.contains("skipped"), "should print skipped, got: {output}");
+        assert!(output.contains("digest match"), "should contain skip reason");
+    }
+
+    // -- run_completed tests --
+
+    #[test]
+    fn run_completed_prints_summary() {
+        let (progress, _stderr, stdout) = test_progress(0);
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
+        assert!(output.contains("sync complete:"), "should print summary, got: {output}");
+        assert!(output.contains("3 synced"), "should contain synced count");
+        assert!(output.contains("47 skipped"), "should contain skipped count");
+        assert!(output.contains("1 failed"), "should contain failed count");
+        assert!(output.contains("432.0 MB"), "should contain formatted bytes");
+    }
+
+    #[test]
+    fn run_completed_empty_report_no_output() {
+        let (progress, _stderr, stdout) = test_progress(0);
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![],
+            stats: SyncStats::default(),
+            duration: Duration::ZERO,
+        };
+        progress.run_completed(&report);
+        let output = stdout.borrow();
+        assert!(output.is_empty(), "empty report should produce no summary");
+    }
+}
