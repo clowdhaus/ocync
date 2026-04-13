@@ -319,14 +319,25 @@ async fn resolve_mapping(
     // --- Target repo ---
     let target_repo = mapping.to.as_deref().unwrap_or(&mapping.from).to_owned();
 
+    // --- Resolve platforms and skip_existing (mapping overrides defaults) ---
+    let platforms = mapping
+        .platforms
+        .clone()
+        .or_else(|| config.defaults.as_ref().and_then(|d| d.platforms.clone()));
+
+    let skip_existing = mapping
+        .skip_existing
+        .or_else(|| config.defaults.as_ref().and_then(|d| d.skip_existing))
+        .unwrap_or(false);
+
     Ok(Some(ResolvedMapping {
         source_client,
         source_repo: mapping.from.clone(),
         target_repo,
         targets,
         tags: filtered.into_iter().map(TagPair::same).collect(),
-        platforms: None,
-        skip_existing: false,
+        platforms,
+        skip_existing,
     }))
 }
 

@@ -119,9 +119,6 @@ pub enum SkipReason {
     DigestMatch,
     /// `skip_existing` is enabled and the target already has a manifest for this tag.
     SkipExisting,
-    /// ECR returned HTTP 400 `ImageTagAlreadyExistsException`, meaning immutable tagging is
-    /// enabled and the tag already exists at the target.
-    ImmutableTag,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -129,7 +126,6 @@ impl std::fmt::Display for SkipReason {
         match self {
             Self::DigestMatch => f.write_str("digest match"),
             Self::SkipExisting => f.write_str("skip existing"),
-            Self::ImmutableTag => f.write_str("immutable tag"),
         }
     }
 }
@@ -249,11 +245,6 @@ mod tests {
     #[test]
     fn skip_reason_display_skip_existing() {
         assert_eq!(SkipReason::SkipExisting.to_string(), "skip existing");
-    }
-
-    #[test]
-    fn skip_reason_display_immutable_tag() {
-        assert_eq!(SkipReason::ImmutableTag.to_string(), "immutable tag");
     }
 
     #[test]

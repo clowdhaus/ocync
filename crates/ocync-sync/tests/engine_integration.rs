@@ -64,28 +64,6 @@ fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>) -> 
     }
 }
 
-/// Build a [`ResolvedMapping`] with default `platforms` and `skip_existing`.
-///
-/// Avoids boilerplate in the majority of tests that don't exercise platform
-/// filtering or skip-existing behavior.
-fn resolved_mapping(
-    source_client: Arc<ocync_distribution::RegistryClient>,
-    source_repo: &str,
-    target_repo: &str,
-    targets: Vec<TargetEntry>,
-    tags: Vec<TagPair>,
-) -> ResolvedMapping {
-    ResolvedMapping {
-        source_client,
-        source_repo: source_repo.into(),
-        target_repo: target_repo.into(),
-        targets,
-        tags,
-        platforms: None,
-        skip_existing: false,
-    }
-}
-
 /// Serialize an `ImageManifest` to JSON bytes and compute its digest.
 fn serialize_manifest(manifest: &ImageManifest) -> (Vec<u8>, Digest) {
     let bytes = serde_json::to_vec(manifest).unwrap();
@@ -5336,4 +5314,403 @@ async fn sync_skip_existing_false_syncs_on_different_digest() {
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.blobs_transferred, 2);
     assert_eq!(report.stats.bytes_transferred, expected_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-target independence tests
+// ---------------------------------------------------------------------------
+
+/// With two targets and `skip_existing = true`, each target is evaluated
+/// independently:
+/// - Target A has an existing manifest (different digest) → skipped
+/// - Target B has no manifest → synced
+///
+/// Verifies that the source manifest is pulled exactly once (pull-once
+/// fan-out invariant), that target A receives no blob or manifest pushes,
+/// and that per-target and aggregate stats are correct.
+#[tokio::test]
+async fn sync_skip_existing_multi_target_independent() {
+    let source_server = MockServer::start().await;
+    let target_a = MockServer::start().await;
+    let target_b = MockServer::start().await;
+
+    let config_data = b"config-skip-multi";
+    let layer_data = b"layer-skip-multi";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _manifest_digest) = serialize_manifest(&manifest);
+
+    // Source: manifest pulled exactly once (pull-once fan-out invariant).
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Source blobs: only target B needs them; expect(1) each since only one
+    // target actually transfers.
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(config_data.to_vec())
+                .insert_header("content-length", config_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(layer_data.to_vec())
+                .insert_header("content-length", layer_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Target A: HEAD returns 200 with a different digest -- skip_existing
+    // means the engine skips without comparing digests.  No blob or manifest
+    // push endpoints are mounted; an unexpected request would fail the mock.
+    let different_digest = test_digest("d1ff");
+    Mock::given(method("HEAD"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", different_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_a)
+        .await;
+
+    // Target B: HEAD returns 404 -- engine must sync.
+    mount_manifest_head_not_found(&target_b, "repo", "latest").await;
+    mount_blob_not_found(&target_b, "repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_b, "repo", &layer_desc.digest).await;
+    mount_blob_push(&target_b, "repo").await;
+    mount_manifest_push(&target_b, "repo", "latest").await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![
+            target_entry("target-a", mock_client(&target_a)),
+            target_entry("target-b", mock_client(&target_b)),
+        ],
+        tags: vec![TagPair::same("latest")],
+        platforms: None,
+        skip_existing: true,
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Exactly 2 image results (1 tag x 2 targets).
+    assert_eq!(report.images.len(), 2);
+
+    // Find results by status since target and source strings are identical.
+    let result_a = report
+        .images
+        .iter()
+        .find(|r| {
+            matches!(
+                r.status,
+                ImageStatus::Skipped {
+                    reason: SkipReason::SkipExisting,
+                }
+            )
+        })
+        .expect("target-a result (SkipExisting) not found");
+
+    let result_b = report
+        .images
+        .iter()
+        .find(|r| matches!(r.status, ImageStatus::Synced))
+        .expect("target-b result (Synced) not found");
+
+    // Target A: skipped, zero bytes, zero blob transfers.
+    assert_eq!(result_a.bytes_transferred, 0);
+    assert_eq!(result_a.blob_stats.transferred, 0);
+    assert_eq!(result_a.blob_stats.skipped, 0);
+
+    // Target B: synced, both blobs transferred.
+    assert_eq!(result_b.blob_stats.transferred, 2);
+    assert_eq!(result_b.blob_stats.skipped, 0);
+    let expected_bytes = (config_data.len() + layer_data.len()) as u64;
+    assert_eq!(result_b.bytes_transferred, expected_bytes);
+
+    // Aggregate stats.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.blobs_transferred, 2);
+    assert_eq!(report.stats.bytes_transferred, expected_bytes);
+    // wiremock expect(N) assertions verify pull-once and no target-A pushes.
+}
+
+/// With two targets, an index manifest containing linux/amd64 and linux/arm64,
+/// and a platform filter for linux/amd64 only:
+/// - Source index is pulled exactly once
+/// - Only the amd64 child manifest is pulled (arm64 filtered out)
+/// - Both targets receive amd64 blobs and manifest pushes
+/// - Neither target receives arm64 blobs or manifest pushes
+///
+/// Source blobs are pulled once per target (staging disabled), so each blob
+/// GET has `.expect(2)`.
+#[tokio::test]
+async fn sync_platform_filter_multi_target() {
+    let source_server = MockServer::start().await;
+    let target_a = MockServer::start().await;
+    let target_b = MockServer::start().await;
+
+    // --- Build two child image manifests: linux/amd64 and linux/arm64 ---
+
+    let amd64_config_data = b"amd64-config-multi";
+    let amd64_layer_data = b"amd64-layer-multi";
+    let amd64_config_desc = blob_descriptor(amd64_config_data, MediaType::OciConfig);
+    let amd64_layer_desc = blob_descriptor(amd64_layer_data, MediaType::OciLayerGzip);
+    let amd64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: amd64_config_desc.clone(),
+        layers: vec![amd64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (amd64_bytes, amd64_digest) = serialize_manifest(&amd64_manifest);
+
+    let arm64_config_data = b"arm64-config-multi";
+    let arm64_layer_data = b"arm64-layer-multi";
+    let arm64_config_desc = blob_descriptor(arm64_config_data, MediaType::OciConfig);
+    let arm64_layer_desc = blob_descriptor(arm64_layer_data, MediaType::OciLayerGzip);
+    let arm64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: arm64_config_desc.clone(),
+        layers: vec![arm64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (arm64_bytes, arm64_digest) = serialize_manifest(&arm64_manifest);
+
+    // --- Build index with platform-annotated descriptors ---
+
+    let index = ImageIndex {
+        schema_version: 2,
+        media_type: None,
+        manifests: vec![
+            Descriptor {
+                media_type: MediaType::OciManifest,
+                digest: amd64_digest.clone(),
+                size: amd64_bytes.len() as u64,
+                platform: Some(Platform {
+                    architecture: "amd64".into(),
+                    os: "linux".into(),
+                    variant: None,
+                    os_version: None,
+                    os_features: None,
+                }),
+                artifact_type: None,
+                annotations: None,
+            },
+            Descriptor {
+                media_type: MediaType::OciManifest,
+                digest: arm64_digest.clone(),
+                size: arm64_bytes.len() as u64,
+                platform: Some(Platform {
+                    architecture: "arm64".into(),
+                    os: "linux".into(),
+                    variant: None,
+                    os_version: None,
+                    os_features: None,
+                }),
+                artifact_type: None,
+                annotations: None,
+            },
+        ],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let index_bytes = serde_json::to_vec(&index).unwrap();
+
+    // --- Source: serve index by tag, children by digest ---
+
+    // Index pulled exactly once (pull-once fan-out invariant).
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(index_bytes.clone())
+                .insert_header("content-type", MediaType::OciIndex.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // amd64 child: expect exactly 1 pull (platform matches; pulled once
+    // during discovery and cached for both targets).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // arm64 child: expect 0 pulls (filtered out).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // amd64 blobs: each pulled once per target (staging disabled → 2 pulls total).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", amd64_config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_config_data.to_vec())
+                .insert_header("content-length", amd64_config_data.len().to_string()),
+        )
+        .expect(2)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", amd64_layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_layer_data.to_vec())
+                .insert_header("content-length", amd64_layer_data.len().to_string()),
+        )
+        .expect(2)
+        .mount(&source_server)
+        .await;
+
+    // arm64 blobs: expect 0 pulls (filtered out).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", arm64_config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_config_data.to_vec())
+                .insert_header("content-length", arm64_config_data.len().to_string()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", arm64_layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_layer_data.to_vec())
+                .insert_header("content-length", arm64_layer_data.len().to_string()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // --- Both targets: no existing manifest, no blobs, accept pushes ---
+
+    for target in [&target_a, &target_b] {
+        // HEAD check for index tag.
+        mount_manifest_head_not_found(target, "repo", "latest").await;
+        // Blob checks and pushes for amd64 only.
+        mount_blob_not_found(target, "repo", &amd64_config_desc.digest).await;
+        mount_blob_not_found(target, "repo", &amd64_layer_desc.digest).await;
+        mount_blob_push(target, "repo").await;
+        // Accept amd64 child manifest push (by digest).
+        mount_manifest_push(target, "repo", &amd64_digest.to_string()).await;
+        // Accept filtered index push (by tag).
+        mount_manifest_push(target, "repo", "latest").await;
+        // arm64 manifest pushes must NOT arrive -- no mock mounted for them.
+    }
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![
+            target_entry("target-a", mock_client(&target_a)),
+            target_entry("target-b", mock_client(&target_b)),
+        ],
+        tags: vec![TagPair::same("latest")],
+        platforms: Some(vec!["linux/amd64".to_string()]),
+        skip_existing: false,
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // 2 image results (1 tag x 2 targets).
+    assert_eq!(report.images.len(), 2);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "both targets must be Synced"
+    );
+
+    // Each target transfers 2 blobs (amd64 config + layer).
+    let expected_blob_bytes = (amd64_config_data.len() + amd64_layer_data.len()) as u64;
+    for result in &report.images {
+        assert_eq!(
+            result.blob_stats.transferred, 2,
+            "each target must transfer exactly 2 amd64 blobs"
+        );
+        assert_eq!(result.blob_stats.skipped, 0);
+        assert_eq!(result.bytes_transferred, expected_blob_bytes);
+    }
+
+    // Aggregate stats: 2 synced images, 4 blob transfers (2 per target).
+    assert_eq!(report.stats.images_synced, 2);
+    assert_eq!(report.stats.blobs_transferred, 4);
+    assert_eq!(report.stats.bytes_transferred, expected_blob_bytes * 2);
+    // wiremock expect(N) assertions verify platform filtering and pull-once
+    // on index and amd64 child manifests.
 }
