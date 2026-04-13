@@ -21,13 +21,13 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 reqwest.workspace = true
 semver = { version = "1", default-features = false, features = ["std"] }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
 tracing.workspace = true
 uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile = { version = "3", default-features = false }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 url.workspace = true

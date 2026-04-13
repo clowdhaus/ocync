@@ -40,6 +40,8 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
             batch_checker: None,
         }],
         tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(RetryConfig::default(), DEFAULT_MAX_CONCURRENT_TRANSFERS);

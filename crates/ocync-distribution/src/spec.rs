@@ -167,6 +167,43 @@ impl fmt::Display for Platform {
     }
 }
 
+impl Platform {
+    /// Returns `true` if this platform matches the given filter string.
+    ///
+    /// The filter must be `"os/arch"` or `"os/arch/variant"`. Comparison is
+    /// case-insensitive. An empty filter never matches. When the filter
+    /// specifies only `os/arch`, the platform's `variant` field is ignored —
+    /// any variant (or none) will match.
+    pub fn matches(&self, filter: &str) -> bool {
+        if filter.is_empty() {
+            return false;
+        }
+        let mut parts = filter.splitn(3, '/');
+        let Some(filter_os) = parts.next() else {
+            return false;
+        };
+        let Some(filter_arch) = parts.next() else {
+            return false;
+        };
+        let filter_variant = parts.next();
+
+        if !self.os.eq_ignore_ascii_case(filter_os) {
+            return false;
+        }
+        if !self.architecture.eq_ignore_ascii_case(filter_arch) {
+            return false;
+        }
+        if let Some(fv) = filter_variant {
+            match &self.variant {
+                Some(pv) => pv.eq_ignore_ascii_case(fv),
+                None => false,
+            }
+        } else {
+            true
+        }
+    }
+}
+
 /// OCI image manifest (single-platform).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -492,6 +529,84 @@ mod tests {
         let m = ManifestKind::from_json(&MediaType::OciIndex, &bytes).unwrap();
         let digests = m.referenced_digests();
         assert_eq!(digests.len(), 2);
+    }
+
+    // -- Platform::matches tests --
+
+    fn linux_amd64() -> Platform {
+        Platform {
+            architecture: "amd64".into(),
+            os: "linux".into(),
+            variant: None,
+            os_version: None,
+            os_features: None,
+        }
+    }
+
+    fn linux_arm64_v8() -> Platform {
+        Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            variant: Some("v8".into()),
+            os_version: None,
+            os_features: None,
+        }
+    }
+
+    #[test]
+    fn platform_matches_os_arch() {
+        assert!(linux_amd64().matches("linux/amd64"));
+    }
+
+    #[test]
+    fn platform_matches_os_arch_variant() {
+        assert!(linux_arm64_v8().matches("linux/arm64/v8"));
+    }
+
+    #[test]
+    fn platform_matches_case_insensitive() {
+        assert!(linux_amd64().matches("Linux/AMD64"));
+        assert!(linux_arm64_v8().matches("LINUX/ARM64/V8"));
+    }
+
+    #[test]
+    fn platform_matches_empty_filter_returns_false() {
+        assert!(!linux_amd64().matches(""));
+    }
+
+    #[test]
+    fn platform_matches_variant_mismatch_returns_false() {
+        // filter specifies v7 but platform has v8
+        let p = Platform {
+            architecture: "arm".into(),
+            os: "linux".into(),
+            variant: Some("v8".into()),
+            os_version: None,
+            os_features: None,
+        };
+        assert!(!p.matches("linux/arm/v7"));
+    }
+
+    #[test]
+    fn platform_matches_filter_variant_no_platform_variant_returns_false() {
+        // filter requires a specific variant but platform has none
+        assert!(!linux_amd64().matches("linux/amd64/v1"));
+    }
+
+    #[test]
+    fn platform_matches_os_arch_ignores_platform_variant() {
+        // os/arch filter matches regardless of what variant the platform has
+        assert!(linux_arm64_v8().matches("linux/arm64"));
+    }
+
+    #[test]
+    fn platform_matches_wrong_os_returns_false() {
+        assert!(!linux_amd64().matches("windows/amd64"));
+    }
+
+    #[test]
+    fn platform_matches_wrong_arch_returns_false() {
+        assert!(!linux_amd64().matches("linux/arm64"));
     }
 
     #[test]

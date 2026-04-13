@@ -42,6 +42,9 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
         if let Some(ref tags) = defaults.tags {
             validate_tags(tags)?;
         }
+        if let Some(ref platforms) = defaults.platforms {
+            validate_platforms("defaults", platforms)?;
+        }
     }
     validate_references(&config)?;
 
@@ -203,6 +206,18 @@ pub(crate) struct DefaultsConfig {
 
     #[serde(default)]
     pub tags: Option<TagsConfig>,
+
+    /// Platform filter applied to all mappings unless overridden.
+    ///
+    /// Each entry must be `os/arch` or `os/arch/variant` (e.g. `linux/amd64`,
+    /// `linux/arm/v7`).
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
+
+    /// When `true`, mappings that already exist at the target are skipped
+    /// without re-syncing.
+    #[serde(default)]
+    pub skip_existing: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +239,18 @@ pub(crate) struct MappingConfig {
 
     #[serde(default)]
     pub tags: Option<TagsConfig>,
+
+    /// Platform filter for this mapping, overriding any value in `defaults`.
+    ///
+    /// Each entry must be `os/arch` or `os/arch/variant` (e.g. `linux/amd64`,
+    /// `linux/arm/v7`).
+    #[serde(default)]
+    pub platforms: Option<Vec<String>>,
+
+    /// When `true`, this mapping is skipped if the image already exists at the
+    /// target, overriding any value in `defaults`.
+    #[serde(default)]
+    pub skip_existing: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -466,12 +493,38 @@ fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
 ///
 /// A mapping must have its own `tags` block OR inherit from `defaults.tags`.
 /// If neither is present, this returns a validation error.
+///
+/// Platform strings are also validated: each entry must be `os/arch` or
+/// `os/arch/variant`.
 fn validate_mapping(mapping: &MappingConfig, has_default_tags: bool) -> Result<(), ConfigError> {
     if mapping.tags.is_none() && !has_default_tags {
         return Err(ConfigError::Validation(format!(
             "mapping '{}' is missing a tags block (and no defaults.tags is set)",
             mapping.from,
         )));
+    }
+    if let Some(ref platforms) = mapping.platforms {
+        validate_platforms(&mapping.from, platforms)?;
+    }
+    Ok(())
+}
+
+/// Validate that every platform string has the form `os/arch` or
+/// `os/arch/variant`.
+fn validate_platforms(mapping_from: &str, platforms: &[String]) -> Result<(), ConfigError> {
+    if platforms.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "mapping '{mapping_from}': platforms list must not be empty",
+        )));
+    }
+    for platform in platforms {
+        let parts: Vec<&str> = platform.splitn(3, '/').collect();
+        if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
+            return Err(ConfigError::Validation(format!(
+                "mapping '{mapping_from}': invalid platform '{platform}' \
+                 (expected os/arch or os/arch/variant)",
+            )));
+        }
     }
     Ok(())
 }
@@ -843,6 +896,8 @@ mappings:
             source: None,
             targets: None,
             tags: None,
+            platforms: None,
+            skip_existing: None,
         };
         let err = validate_mapping(&mapping, false).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
@@ -856,8 +911,134 @@ mappings:
             source: None,
             targets: None,
             tags: None,
+            platforms: None,
+            skip_existing: None,
         };
         validate_mapping(&mapping, true).unwrap();
+    }
+
+    #[test]
+    fn invalid_platform_format_rejected() {
+        let mapping = MappingConfig {
+            from: "nginx".to_string(),
+            to: None,
+            source: None,
+            targets: None,
+            tags: Some(TagsConfig {
+                glob: Some(GlobOrList::Single("*".to_string())),
+                ..Default::default()
+            }),
+            platforms: Some(vec!["linux-amd64".to_string()]),
+            skip_existing: None,
+        };
+        let err = validate_mapping(&mapping, false).unwrap_err();
+        match err {
+            ConfigError::Validation(msg) => assert!(msg.contains("linux-amd64")),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_platform_formats_accepted() {
+        for platform in &[
+            "linux/amd64",
+            "linux/arm64",
+            "linux/arm/v7",
+            "windows/amd64",
+        ] {
+            let mapping = MappingConfig {
+                from: "nginx".to_string(),
+                to: None,
+                source: None,
+                targets: None,
+                tags: Some(TagsConfig {
+                    glob: Some(GlobOrList::Single("*".to_string())),
+                    ..Default::default()
+                }),
+                platforms: Some(vec![platform.to_string()]),
+                skip_existing: None,
+            };
+            validate_mapping(&mapping, false)
+                .unwrap_or_else(|e| panic!("expected valid platform '{platform}': {e}"));
+        }
+    }
+
+    #[test]
+    fn empty_platform_parts_rejected() {
+        for bad in &["/", "/amd64", "linux/", "//", "linux//v8"] {
+            let err = validate_platforms("test", &[bad.to_string()]).unwrap_err();
+            match err {
+                ConfigError::Validation(msg) => {
+                    assert!(msg.contains(bad), "expected '{bad}' in: {msg}")
+                }
+                other => panic!("expected Validation for '{bad}', got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_platforms_list_rejected() {
+        let err = validate_platforms("test", &[]).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn deserialize_mapping_with_new_fields() {
+        let yaml = r#"
+mappings:
+  - from: library/nginx
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    skip_existing: true
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let m = &config.mappings[0];
+        assert_eq!(
+            m.platforms,
+            Some(vec!["linux/amd64".to_string(), "linux/arm64".to_string()])
+        );
+        assert_eq!(m.skip_existing, Some(true));
+    }
+
+    #[test]
+    fn deserialize_defaults_with_new_fields() {
+        let yaml = r#"
+defaults:
+  platforms:
+    - linux/amd64
+  skip_existing: false
+mappings:
+  - from: library/nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let d = config.defaults.as_ref().unwrap();
+        assert_eq!(d.platforms, Some(vec!["linux/amd64".to_string()]));
+        assert_eq!(d.skip_existing, Some(false));
+    }
+
+    #[test]
+    fn invalid_platform_in_defaults_rejected() {
+        let yaml = r#"
+defaults:
+  platforms:
+    - linux-amd64
+mappings:
+  - from: library/nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let defaults = config.defaults.as_ref().unwrap();
+        let err = validate_platforms("defaults", defaults.platforms.as_ref().unwrap()).unwrap_err();
+        match err {
+            ConfigError::Validation(msg) => assert!(msg.contains("linux-amd64")),
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ocync_distribution::spec::{Descriptor, ImageIndex, ImageManifest, MediaType};
+use ocync_distribution::spec::{Descriptor, ImageIndex, ImageManifest, MediaType, Platform};
 use ocync_distribution::{BatchBlobChecker, Digest, RegistryClientBuilder};
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
@@ -374,6 +374,8 @@ async fn sync_happy_path() {
         target_repo: "mirror/nginx".into(),
         targets: vec![target_entry("target-reg", target_client)],
         tags: vec![TagPair::same("latest")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -428,6 +430,8 @@ async fn sync_skip_on_digest_match() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -482,6 +486,8 @@ async fn sync_blob_exists_at_target_skips_transfer() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -525,6 +531,8 @@ async fn sync_manifest_pull_failure() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -600,6 +608,8 @@ async fn sync_blob_transfer_retries_on_source_500() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -663,6 +673,8 @@ async fn sync_dedup_across_tags() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Use max_concurrent=1 to ensure sequential execution so dedup works across tags.
@@ -743,6 +755,8 @@ async fn sync_multiple_targets() {
             target_entry("target-b", mock_client(&target_b)),
         ],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -812,6 +826,8 @@ async fn sync_retag() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::retag("latest", "stable")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -878,6 +894,8 @@ async fn sync_blob_transfer_failure() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -1032,6 +1050,8 @@ async fn sync_index_manifest_multi_platform() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("latest")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -1101,6 +1121,8 @@ async fn sync_head_different_digest_proceeds_with_sync() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -1131,6 +1153,8 @@ async fn sync_empty_tags_produces_no_images() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -1192,6 +1216,8 @@ async fn sync_manifest_push_failure() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -1260,6 +1286,8 @@ async fn sync_retry_exhaustion_returns_final_error() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -1350,6 +1378,8 @@ async fn sync_cross_repo_mount_success() {
         target_repo: "repo-a".into(),
         targets: vec![target_entry("target", target_client.clone())],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Second mapping: repo-b should mount from repo-a.
@@ -1359,6 +1389,8 @@ async fn sync_cross_repo_mount_success() {
         target_repo: "repo-b".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Use max_concurrent=1 to ensure mapping_a completes before mapping_b starts,
@@ -1468,6 +1500,8 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
         target_repo: "repo-a".into(),
         targets: vec![target_entry("target", target_client.clone())],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let mapping_b = ResolvedMapping {
@@ -1476,6 +1510,8 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
         target_repo: "repo-b".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Use max_concurrent=1 to ensure mapping_a completes first so mapping_b
@@ -1588,6 +1624,8 @@ async fn sync_cross_repo_mount_failure_falls_back() {
         target_repo: "repo-a".into(),
         targets: vec![target_entry("target", target_client.clone())],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let mapping_b = ResolvedMapping {
@@ -1596,6 +1634,8 @@ async fn sync_cross_repo_mount_failure_falls_back() {
         target_repo: "repo-b".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Use max_concurrent=1 to ensure mapping_a completes first so mapping_b
@@ -1671,6 +1711,8 @@ async fn sync_multi_target_partial_blob_failure_isolates_targets() {
             target_entry("target-b", mock_client(&target_b)),
         ],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -1794,6 +1836,8 @@ async fn sync_progressive_cache_skips_shared_blob_head_check() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Sequential execution ensures v1 completes and populates the cache before v2 starts.
@@ -1878,6 +1922,8 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         target_repo: "repo-b".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -1962,6 +2008,8 @@ async fn sync_small_blob_uses_monolithic_upload() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -2066,6 +2114,8 @@ async fn sync_lazy_invalidation_on_mount_failure() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -2123,6 +2173,8 @@ async fn sync_cache_persist_and_load_round_trip() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target-reg", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let cache = empty_cache();
@@ -2209,6 +2261,8 @@ async fn sync_shutdown_stops_new_work() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let shutdown = ShutdownSignal::new();
@@ -2287,6 +2341,8 @@ async fn sync_shutdown_drains_in_flight() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let shutdown = ShutdownSignal::new();
@@ -2379,6 +2435,8 @@ async fn sync_dedup_across_tags_concurrent() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Use higher concurrency — both tags can execute simultaneously.
@@ -2469,6 +2527,8 @@ async fn sync_cross_repo_mount_concurrent() {
         target_repo: "repo-a".into(),
         targets: vec![target_entry("target", Arc::clone(&target_client))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
     let mapping_b = ResolvedMapping {
         source_client,
@@ -2476,6 +2536,8 @@ async fn sync_cross_repo_mount_concurrent() {
         target_repo: "repo-b".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // max_concurrent=10: both mappings can execute concurrently.
@@ -2568,6 +2630,8 @@ async fn sync_nested_index_manifest_returns_error() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -2668,6 +2732,8 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -2799,6 +2865,8 @@ async fn sync_index_manifest_child_pull_failure() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("latest")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -2889,6 +2957,8 @@ async fn sync_partial_blob_failure_stops_remaining() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Use max_concurrent=1 to ensure sequential blob processing (config first).
@@ -2991,6 +3061,8 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Real concurrency — NOT 1.
@@ -3120,6 +3192,8 @@ async fn sync_staging_pulls_once_pushes_twice() {
             target_entry("target-b", mock_client(&target_b)),
         ],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     // Use max_concurrent=1 so target-a completes and stages blobs before
@@ -3204,6 +3278,8 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let shutdown = ShutdownSignal::new();
@@ -3304,6 +3380,8 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let shutdown = ShutdownSignal::new();
@@ -3416,6 +3494,8 @@ async fn sync_staging_writes_blobs_to_disk() {
             target_entry("target-b", mock_client(&target_b)),
         ],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 1);
@@ -3510,6 +3590,8 @@ async fn sync_warm_cache_skips_blob_head_check() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -3604,6 +3686,8 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
             batch_checker: Some(Rc::new(checker)),
         }],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -3725,6 +3809,8 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
             batch_checker: Some(Rc::new(checker)),
         }],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -3827,6 +3913,8 @@ async fn sync_no_batch_checker_falls_back_to_per_blob_head() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", target_client)],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -3918,6 +4006,8 @@ async fn sync_batch_checker_failure_falls_back_to_per_blob_head() {
             batch_checker: Some(Rc::new(checker)),
         }],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -4056,6 +4146,8 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
             },
         ],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -4198,6 +4290,8 @@ async fn sync_batch_checker_empty_result_transfers_all() {
             batch_checker: Some(Rc::new(checker)),
         }],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -4316,6 +4410,8 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
             target_entry("target-b", mock_client(&target_b_server)),
         ],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -4437,6 +4533,8 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
             batch_checker: Some(Rc::new(checker)),
         }],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -4630,6 +4728,8 @@ async fn sync_batch_checker_index_manifest_all_exist() {
             batch_checker: Some(Rc::new(checker)),
         }],
         tags: vec![TagPair::same("latest")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -4748,6 +4848,8 @@ async fn sync_batch_checker_with_prewarmed_cache() {
             batch_checker: Some(Rc::new(checker)),
         }],
         tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
     };
 
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -4780,4 +4882,835 @@ async fn sync_batch_checker_with_prewarmed_cache() {
     assert_eq!(report.stats.blobs_transferred, 0);
     assert_eq!(report.stats.bytes_transferred, 0);
     // wiremock expect(0) on blob HEADs verifies no fallback path was used.
+}
+
+// ---------------------------------------------------------------------------
+// Platform filtering tests
+// ---------------------------------------------------------------------------
+
+/// Platform filtering: only the matching platform's child manifest and blobs
+/// are pulled from source and pushed to target. Non-matching platforms are
+/// never touched.
+#[tokio::test]
+async fn sync_index_manifest_platform_filter() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // --- Build three child image manifests (linux/amd64, linux/arm64, windows/amd64) ---
+
+    let amd64_config_data = b"amd64-config";
+    let amd64_layer_data = b"amd64-layer";
+    let amd64_config_desc = blob_descriptor(amd64_config_data, MediaType::OciConfig);
+    let amd64_layer_desc = blob_descriptor(amd64_layer_data, MediaType::OciLayerGzip);
+    let amd64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: amd64_config_desc.clone(),
+        layers: vec![amd64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (amd64_bytes, amd64_digest) = serialize_manifest(&amd64_manifest);
+
+    let arm64_config_data = b"arm64-config";
+    let arm64_layer_data = b"arm64-layer";
+    let arm64_config_desc = blob_descriptor(arm64_config_data, MediaType::OciConfig);
+    let arm64_layer_desc = blob_descriptor(arm64_layer_data, MediaType::OciLayerGzip);
+    let arm64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: arm64_config_desc.clone(),
+        layers: vec![arm64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (arm64_bytes, arm64_digest) = serialize_manifest(&arm64_manifest);
+
+    let win_config_data = b"win-config";
+    let win_layer_data = b"win-layer";
+    let win_config_desc = blob_descriptor(win_config_data, MediaType::OciConfig);
+    let win_layer_desc = blob_descriptor(win_layer_data, MediaType::OciLayerGzip);
+    let win_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: win_config_desc.clone(),
+        layers: vec![win_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (win_bytes, win_digest) = serialize_manifest(&win_manifest);
+
+    // --- Build index with platform-annotated descriptors ---
+
+    let index = ImageIndex {
+        schema_version: 2,
+        media_type: None,
+        manifests: vec![
+            Descriptor {
+                media_type: MediaType::OciManifest,
+                digest: amd64_digest.clone(),
+                size: amd64_bytes.len() as u64,
+                platform: Some(Platform {
+                    architecture: "amd64".into(),
+                    os: "linux".into(),
+                    variant: None,
+                    os_version: None,
+                    os_features: None,
+                }),
+                artifact_type: None,
+                annotations: None,
+            },
+            Descriptor {
+                media_type: MediaType::OciManifest,
+                digest: arm64_digest.clone(),
+                size: arm64_bytes.len() as u64,
+                platform: Some(Platform {
+                    architecture: "arm64".into(),
+                    os: "linux".into(),
+                    variant: None,
+                    os_version: None,
+                    os_features: None,
+                }),
+                artifact_type: None,
+                annotations: None,
+            },
+            Descriptor {
+                media_type: MediaType::OciManifest,
+                digest: win_digest.clone(),
+                size: win_bytes.len() as u64,
+                platform: Some(Platform {
+                    architecture: "amd64".into(),
+                    os: "windows".into(),
+                    variant: None,
+                    os_version: None,
+                    os_features: None,
+                }),
+                artifact_type: None,
+                annotations: None,
+            },
+        ],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let index_bytes = serde_json::to_vec(&index).unwrap();
+
+    // --- Source: serve index by tag, children by digest ---
+
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(index_bytes.clone())
+                .insert_header("content-type", MediaType::OciIndex.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // amd64 child: expect exactly 1 pull (matching platform).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // arm64 child: expect 0 pulls (filtered out).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // windows child: expect 0 pulls (filtered out).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{win_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(win_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // Source blobs: amd64 blobs expect 1 pull each, others expect 0.
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", amd64_config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_config_data.to_vec())
+                .insert_header("content-length", amd64_config_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", amd64_layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_layer_data.to_vec())
+                .insert_header("content-length", amd64_layer_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", arm64_config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_config_data.to_vec())
+                .insert_header("content-length", arm64_config_data.len().to_string()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", arm64_layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_layer_data.to_vec())
+                .insert_header("content-length", arm64_layer_data.len().to_string()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", win_config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(win_config_data.to_vec())
+                .insert_header("content-length", win_config_data.len().to_string()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", win_layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(win_layer_data.to_vec())
+                .insert_header("content-length", win_layer_data.len().to_string()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // --- Target: no existing manifest, no blobs, accept all pushes ---
+
+    mount_manifest_head_not_found(&target_server, "repo", "latest").await;
+    mount_blob_not_found(&target_server, "repo", &amd64_config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &amd64_layer_desc.digest).await;
+    mount_blob_push(&target_server, "repo").await;
+
+    // Accept amd64 child manifest push (by digest).
+    mount_manifest_push(&target_server, "repo", &amd64_digest.to_string()).await;
+
+    // Accept filtered index push (by tag).
+    mount_manifest_push(&target_server, "repo", "latest").await;
+
+    // arm64 and windows manifest pushes should NOT happen -- wiremock will
+    // fail verification if unexpected requests arrive (no mock mounted).
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![target_entry("target", mock_client(&target_server))],
+        tags: vec![TagPair::same("latest")],
+        platforms: Some(vec!["linux/amd64".to_string()]),
+        skip_existing: false,
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // Only 2 blobs transferred: amd64 config + amd64 layer.
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+    assert_eq!(report.images[0].blob_stats.skipped, 0);
+    let expected_bytes = (amd64_config_data.len() + amd64_layer_data.len()) as u64;
+    assert_eq!(report.images[0].bytes_transferred, expected_bytes);
+    // Aggregate stats.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.blobs_transferred, 2);
+    assert_eq!(report.stats.bytes_transferred, expected_bytes);
+    // wiremock .expect(N) assertions verify the platform filtering path.
+}
+
+// ---------------------------------------------------------------------------
+// skip_existing tests
+// ---------------------------------------------------------------------------
+
+/// When `skip_existing` is true, a target HEAD returning any manifest (even
+/// with a different digest) causes the image to be skipped.
+#[tokio::test]
+async fn sync_skip_existing_skips_without_digest_comparison() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-data";
+    let layer_data = b"layer-data";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _manifest_digest) = serialize_manifest(&manifest);
+
+    // Source: serve manifest (will be pulled during discovery).
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+
+    // Target: HEAD returns 200 with a DIFFERENT digest -- normally would sync.
+    let stale_digest = test_digest("d1ff");
+    mount_manifest_head_matching(&target_server, "repo", "v1", &stale_digest).await;
+
+    // No blob endpoints needed -- skip_existing should prevent any blob work.
+    // If the engine incorrectly proceeds to sync, it will fail on missing
+    // blob endpoints.
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![target_entry("target", mock_client(&target_server))],
+        tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: true,
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(
+            report.images[0].status,
+            ImageStatus::Skipped {
+                reason: SkipReason::SkipExisting,
+            }
+        ),
+        "expected SkipExisting, got {:?}",
+        report.images[0].status
+    );
+    assert_eq!(report.images[0].bytes_transferred, 0);
+    assert_eq!(report.images[0].blob_stats.transferred, 0);
+    assert_eq!(report.images[0].blob_stats.skipped, 0);
+    // Aggregate stats.
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.images_synced, 0);
+    assert_eq!(report.stats.blobs_transferred, 0);
+}
+
+/// When `skip_existing` is false (default), a target HEAD returning a different
+/// digest triggers a full sync.
+#[tokio::test]
+async fn sync_skip_existing_false_syncs_on_different_digest() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-data";
+    let layer_data = b"layer-data";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _manifest_digest) = serialize_manifest(&manifest);
+
+    // Source: serve manifest and blobs.
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+
+    // Target: HEAD returns 200 with a DIFFERENT digest -- should proceed to sync.
+    let stale_digest = test_digest("d1ff");
+    mount_manifest_head_matching(&target_server, "repo", "v1", &stale_digest).await;
+    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "repo").await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![target_entry("target", mock_client(&target_server))],
+        tags: vec![TagPair::same("v1")],
+        platforms: None,
+        skip_existing: false,
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(report.images[0].status, ImageStatus::Synced),
+        "expected Synced, got {:?}",
+        report.images[0].status
+    );
+    // Both blobs transferred.
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+    assert_eq!(report.images[0].blob_stats.skipped, 0);
+    let expected_bytes = (config_data.len() + layer_data.len()) as u64;
+    assert_eq!(report.images[0].bytes_transferred, expected_bytes);
+    // Aggregate stats.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.blobs_transferred, 2);
+    assert_eq!(report.stats.bytes_transferred, expected_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-target independence tests
+// ---------------------------------------------------------------------------
+
+/// With two targets and `skip_existing = true`, each target is evaluated
+/// independently:
+/// - Target A has an existing manifest (different digest) → skipped
+/// - Target B has no manifest → synced
+///
+/// Verifies that the source manifest is pulled exactly once (pull-once
+/// fan-out invariant), that target A receives no blob or manifest pushes,
+/// and that per-target and aggregate stats are correct.
+#[tokio::test]
+async fn sync_skip_existing_multi_target_independent() {
+    let source_server = MockServer::start().await;
+    let target_a = MockServer::start().await;
+    let target_b = MockServer::start().await;
+
+    let config_data = b"config-skip-multi";
+    let layer_data = b"layer-skip-multi";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _manifest_digest) = serialize_manifest(&manifest);
+
+    // Source: manifest pulled exactly once (pull-once fan-out invariant).
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Source blobs: only target B needs them; expect(1) each since only one
+    // target actually transfers.
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(config_data.to_vec())
+                .insert_header("content-length", config_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(layer_data.to_vec())
+                .insert_header("content-length", layer_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Target A: HEAD returns 200 with a different digest -- skip_existing
+    // means the engine skips without comparing digests.  No blob or manifest
+    // push endpoints are mounted; an unexpected request would fail the mock.
+    let different_digest = test_digest("d1ff");
+    Mock::given(method("HEAD"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", different_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_a)
+        .await;
+
+    // Target B: HEAD returns 404 -- engine must sync.
+    mount_manifest_head_not_found(&target_b, "repo", "latest").await;
+    mount_blob_not_found(&target_b, "repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_b, "repo", &layer_desc.digest).await;
+    mount_blob_push(&target_b, "repo").await;
+    mount_manifest_push(&target_b, "repo", "latest").await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![
+            target_entry("target-a", mock_client(&target_a)),
+            target_entry("target-b", mock_client(&target_b)),
+        ],
+        tags: vec![TagPair::same("latest")],
+        platforms: None,
+        skip_existing: true,
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Exactly 2 image results (1 tag x 2 targets).
+    assert_eq!(report.images.len(), 2);
+
+    // Find results by status since target and source strings are identical.
+    let result_a = report
+        .images
+        .iter()
+        .find(|r| {
+            matches!(
+                r.status,
+                ImageStatus::Skipped {
+                    reason: SkipReason::SkipExisting,
+                }
+            )
+        })
+        .expect("target-a result (SkipExisting) not found");
+
+    let result_b = report
+        .images
+        .iter()
+        .find(|r| matches!(r.status, ImageStatus::Synced))
+        .expect("target-b result (Synced) not found");
+
+    // Target A: skipped, zero bytes, zero blob transfers.
+    assert_eq!(result_a.bytes_transferred, 0);
+    assert_eq!(result_a.blob_stats.transferred, 0);
+    assert_eq!(result_a.blob_stats.skipped, 0);
+
+    // Target B: synced, both blobs transferred.
+    assert_eq!(result_b.blob_stats.transferred, 2);
+    assert_eq!(result_b.blob_stats.skipped, 0);
+    let expected_bytes = (config_data.len() + layer_data.len()) as u64;
+    assert_eq!(result_b.bytes_transferred, expected_bytes);
+
+    // Aggregate stats.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.blobs_transferred, 2);
+    assert_eq!(report.stats.bytes_transferred, expected_bytes);
+    // wiremock expect(N) assertions verify pull-once and no target-A pushes.
+}
+
+/// With two targets, an index manifest containing linux/amd64 and linux/arm64,
+/// and a platform filter for linux/amd64 only:
+/// - Source index is pulled exactly once
+/// - Only the amd64 child manifest is pulled (arm64 filtered out)
+/// - Both targets receive amd64 blobs and manifest pushes
+/// - Neither target receives arm64 blobs or manifest pushes
+///
+/// Source blobs are pulled once per target (staging disabled), so each blob
+/// GET has `.expect(2)`.
+#[tokio::test]
+async fn sync_platform_filter_multi_target() {
+    let source_server = MockServer::start().await;
+    let target_a = MockServer::start().await;
+    let target_b = MockServer::start().await;
+
+    // --- Build two child image manifests: linux/amd64 and linux/arm64 ---
+
+    let amd64_config_data = b"amd64-config-multi";
+    let amd64_layer_data = b"amd64-layer-multi";
+    let amd64_config_desc = blob_descriptor(amd64_config_data, MediaType::OciConfig);
+    let amd64_layer_desc = blob_descriptor(amd64_layer_data, MediaType::OciLayerGzip);
+    let amd64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: amd64_config_desc.clone(),
+        layers: vec![amd64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (amd64_bytes, amd64_digest) = serialize_manifest(&amd64_manifest);
+
+    let arm64_config_data = b"arm64-config-multi";
+    let arm64_layer_data = b"arm64-layer-multi";
+    let arm64_config_desc = blob_descriptor(arm64_config_data, MediaType::OciConfig);
+    let arm64_layer_desc = blob_descriptor(arm64_layer_data, MediaType::OciLayerGzip);
+    let arm64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: arm64_config_desc.clone(),
+        layers: vec![arm64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (arm64_bytes, arm64_digest) = serialize_manifest(&arm64_manifest);
+
+    // --- Build index with platform-annotated descriptors ---
+
+    let index = ImageIndex {
+        schema_version: 2,
+        media_type: None,
+        manifests: vec![
+            Descriptor {
+                media_type: MediaType::OciManifest,
+                digest: amd64_digest.clone(),
+                size: amd64_bytes.len() as u64,
+                platform: Some(Platform {
+                    architecture: "amd64".into(),
+                    os: "linux".into(),
+                    variant: None,
+                    os_version: None,
+                    os_features: None,
+                }),
+                artifact_type: None,
+                annotations: None,
+            },
+            Descriptor {
+                media_type: MediaType::OciManifest,
+                digest: arm64_digest.clone(),
+                size: arm64_bytes.len() as u64,
+                platform: Some(Platform {
+                    architecture: "arm64".into(),
+                    os: "linux".into(),
+                    variant: None,
+                    os_version: None,
+                    os_features: None,
+                }),
+                artifact_type: None,
+                annotations: None,
+            },
+        ],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let index_bytes = serde_json::to_vec(&index).unwrap();
+
+    // --- Source: serve index by tag, children by digest ---
+
+    // Index pulled exactly once (pull-once fan-out invariant).
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(index_bytes.clone())
+                .insert_header("content-type", MediaType::OciIndex.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // amd64 child: expect exactly 1 pull (platform matches; pulled once
+    // during discovery and cached for both targets).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // arm64 child: expect 0 pulls (filtered out).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // amd64 blobs: each pulled once per target (staging disabled → 2 pulls total).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", amd64_config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_config_data.to_vec())
+                .insert_header("content-length", amd64_config_data.len().to_string()),
+        )
+        .expect(2)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", amd64_layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_layer_data.to_vec())
+                .insert_header("content-length", amd64_layer_data.len().to_string()),
+        )
+        .expect(2)
+        .mount(&source_server)
+        .await;
+
+    // arm64 blobs: expect 0 pulls (filtered out).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", arm64_config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_config_data.to_vec())
+                .insert_header("content-length", arm64_config_data.len().to_string()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", arm64_layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_layer_data.to_vec())
+                .insert_header("content-length", arm64_layer_data.len().to_string()),
+        )
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // --- Both targets: no existing manifest, no blobs, accept pushes ---
+
+    for target in [&target_a, &target_b] {
+        // HEAD check for index tag.
+        mount_manifest_head_not_found(target, "repo", "latest").await;
+        // Blob checks and pushes for amd64 only.
+        mount_blob_not_found(target, "repo", &amd64_config_desc.digest).await;
+        mount_blob_not_found(target, "repo", &amd64_layer_desc.digest).await;
+        mount_blob_push(target, "repo").await;
+        // Accept amd64 child manifest push (by digest).
+        mount_manifest_push(target, "repo", &amd64_digest.to_string()).await;
+        // Accept filtered index push (by tag).
+        mount_manifest_push(target, "repo", "latest").await;
+        // arm64 manifest pushes must NOT arrive -- no mock mounted for them.
+    }
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![
+            target_entry("target-a", mock_client(&target_a)),
+            target_entry("target-b", mock_client(&target_b)),
+        ],
+        tags: vec![TagPair::same("latest")],
+        platforms: Some(vec!["linux/amd64".to_string()]),
+        skip_existing: false,
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // 2 image results (1 tag x 2 targets).
+    assert_eq!(report.images.len(), 2);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "both targets must be Synced"
+    );
+
+    // Each target transfers 2 blobs (amd64 config + layer).
+    let expected_blob_bytes = (amd64_config_data.len() + amd64_layer_data.len()) as u64;
+    for result in &report.images {
+        assert_eq!(
+            result.blob_stats.transferred, 2,
+            "each target must transfer exactly 2 amd64 blobs"
+        );
+        assert_eq!(result.blob_stats.skipped, 0);
+        assert_eq!(result.bytes_transferred, expected_blob_bytes);
+    }
+
+    // Aggregate stats: 2 synced images, 4 blob transfers (2 per target).
+    assert_eq!(report.stats.images_synced, 2);
+    assert_eq!(report.stats.blobs_transferred, 4);
+    assert_eq!(report.stats.bytes_transferred, expected_blob_bytes * 2);
+    // wiremock expect(N) assertions verify platform filtering and pull-once
+    // on index and amd64 child manifests.
 }
