@@ -106,6 +106,17 @@ Tests must verify **behavior under failure and concurrency**, not just happy-pat
 
 Every multi-target engine test must use wiremock `.expect(N)` on source endpoints to verify the pull-once fan-out invariant. A test that passes when the source manifest is pulled 3 times instead of 1 does not protect the architecture. Assert exact byte counts, blob counts, and request counts — never `> 0` or `status == Synced` alone.
 
+### Verify optimizations take the designed path
+
+A correct outcome does not prove the optimization worked. Images can sync successfully via the slow path (per-blob HEAD, redundant pulls, no mounts) and still report `Synced`. Tests for optimization features must prove the **intended fast path was taken**, not just that the end state is correct:
+
+- When a batch API replaces per-blob HEAD: assert `.expect(0)` on the HEAD endpoint AND `.expect(1)` on the batch endpoint. The test must **fail** if the slow path is used.
+- When cache pre-population skips transfers: assert `blob_stats.skipped == N` for the exact count of blobs the batch check reported as existing. If `skipped == 0` and `transferred == total`, the optimization was wired but never activated.
+- When cross-repo mount succeeds: assert `blob_stats.mounted == N` and `.expect(0)` on the pull endpoint for that blob.
+- When auto-create triggers: assert `.expect(1)` on the create endpoint AND that the manifest push was retried after creation, not just that the image eventually synced.
+
+The pattern: assert the **negative** (the slow path was NOT taken) alongside the **positive** (the fast path produced correct results). An optimization that silently falls back to the slow path on every call is a bug, not a feature — and only negative assertions catch it.
+
 ### Test the bridges between layers
 
 Unit-test leaves (AIMD math, staging filesystem, cache serialization). Integration-test the top (engine end-to-end). But also test the **bridges** between layers — these are where real bugs live:
@@ -160,9 +171,9 @@ Never trust the implementer's self-report alone.
 
 ## Plans and specs
 
-- **Design spec**: `docs/specs/2026-04-10-ocync-design.md` — full design document (1,752 lines)
-- **Transfer optimization design**: `docs/specs/2026-04-12-transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse (under review)
-- **Implementation plans**: `docs/superpowers/plans/` (gitignored) — current v1 implementation plan is `2026-04-12-ocync-v1-implementation.md`
+- **Design spec**: `docs/specs/2026-04-10-ocync-design.md` — full design document
+- **Transfer optimization design**: `docs/specs/2026-04-12-transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse
+- **Implementation plan**: `docs/superpowers/plans/` (gitignored) — remaining v1 work is `2026-04-12-remaining-v1-implementation.md` (PRs #15-#20: ECR batch, platform filtering, output/logging, auth providers, progress/health/metrics, FIPS/packaging)
 
 ## Commands
 

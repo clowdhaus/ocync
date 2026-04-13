@@ -138,7 +138,7 @@ pub(crate) fn decode_ecr_token(encoded: &str, registry: &str) -> Result<String, 
 /// Handles both standard (`<account>.dkr.ecr[-fips].<region>.<domain>`)
 /// and dual-stack (`<account>.dkr-ecr[-fips].<region>.<domain>`) formats
 /// across all AWS partitions.
-pub(crate) fn ecr_region(hostname: &str) -> Option<&str> {
+pub fn ecr_region(hostname: &str) -> Option<&str> {
     let parts: Vec<&str> = hostname.split('.').collect();
     if parts.len() < 5 {
         return None;

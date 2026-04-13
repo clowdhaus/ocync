@@ -11,7 +11,7 @@ description = "OCI Distribution client library"
 workspace = true
 
 [dependencies]
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "rt-tokio", "rustls", "sso"] }
+aws-config.workspace = true
 aws-lc-rs.workspace = true
 aws-sdk-ecr = { version = "1", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }

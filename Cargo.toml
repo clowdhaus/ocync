@@ -9,6 +9,7 @@ license = "Apache-2.0"
 repository = "https://github.com/clowdhaus/ocync"
 
 [workspace.dependencies]
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "rt-tokio", "rustls", "sso"] }
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
 bytes = { version = "1", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
@@ -49,6 +50,7 @@ workspace = true
 
 [dependencies]
 anstyle = { version = "1", default-features = false }
+aws-config.workspace = true
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "color"] }
 ocync-distribution.workspace = true
 ocync-sync.workspace = true

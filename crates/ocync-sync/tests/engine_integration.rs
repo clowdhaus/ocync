@@ -1,11 +1,15 @@
 //! Integration tests for `SyncEngine` using mock HTTP servers.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ocync_distribution::spec::{Descriptor, ImageIndex, ImageManifest, MediaType};
-use ocync_distribution::{Digest, RegistryClientBuilder};
+use ocync_distribution::{BatchBlobChecker, Digest, RegistryClientBuilder};
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
@@ -201,6 +205,44 @@ async fn mount_manifest_head_matching(server: &MockServer, repo: &str, tag: &str
         .await;
 }
 
+/// Mock implementation of [`BatchBlobChecker`] for testing the batch pre-population path.
+///
+/// Returns pre-configured existence responses and tracks call count to verify
+/// exactly one batch call is made per image.
+struct MockBatchChecker {
+    /// Pre-configured responses: digest -> exists.
+    responses: RefCell<HashMap<Digest, bool>>,
+    /// Tracks how many times `check_blob_existence` was called.
+    call_count: Arc<AtomicUsize>,
+}
+
+impl MockBatchChecker {
+    fn new(responses: HashMap<Digest, bool>) -> (Self, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                responses: RefCell::new(responses),
+                call_count: Arc::clone(&count),
+            },
+            count,
+        )
+    }
+}
+
+impl BatchBlobChecker for MockBatchChecker {
+    fn check_blob_existence<'a>(
+        &'a self,
+        _repo: &'a str,
+        _digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<HashMap<Digest, bool>, ocync_distribution::Error>> + 'a>>
+    {
+        Box::pin(async {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            Ok(self.responses.borrow().clone())
+        })
+    }
+}
+
 /// Mount mock for manifest push (PUT) returning 201.
 async fn mount_manifest_push(server: &MockServer, repo: &str, reference: &str) {
     Mock::given(method("PUT"))
@@ -268,6 +310,7 @@ async fn sync_happy_path() {
         targets: vec![TargetEntry {
             name: "target-reg".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("latest")],
     };
@@ -325,6 +368,7 @@ async fn sync_skip_on_digest_match() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -382,6 +426,7 @@ async fn sync_blob_exists_at_target_skips_transfer() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -428,6 +473,7 @@ async fn sync_manifest_pull_failure() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -506,6 +552,7 @@ async fn sync_blob_transfer_retries_on_source_500() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -572,6 +619,7 @@ async fn sync_dedup_across_tags() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
     };
@@ -653,10 +701,12 @@ async fn sync_multiple_targets() {
             TargetEntry {
                 name: "target-a".into(),
                 client: mock_client(&target_a),
+                batch_checker: None,
             },
             TargetEntry {
                 name: "target-b".into(),
                 client: mock_client(&target_b),
+                batch_checker: None,
             },
         ],
         tags: vec![TagPair::same("v1")],
@@ -730,6 +780,7 @@ async fn sync_retag() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::retag("latest", "stable")],
     };
@@ -799,6 +850,7 @@ async fn sync_blob_transfer_failure() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -956,6 +1008,7 @@ async fn sync_index_manifest_multi_platform() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("latest")],
     };
@@ -1028,6 +1081,7 @@ async fn sync_head_different_digest_proceeds_with_sync() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1061,6 +1115,7 @@ async fn sync_empty_tags_produces_no_images() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![],
     };
@@ -1125,6 +1180,7 @@ async fn sync_manifest_push_failure() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1196,6 +1252,7 @@ async fn sync_retry_exhaustion_returns_final_error() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1289,6 +1346,7 @@ async fn sync_cross_repo_mount_success() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client.clone(),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1301,6 +1359,7 @@ async fn sync_cross_repo_mount_success() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1413,6 +1472,7 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client.clone(),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1424,6 +1484,7 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1539,6 +1600,7 @@ async fn sync_cross_repo_mount_failure_falls_back() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client.clone(),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1550,6 +1612,7 @@ async fn sync_cross_repo_mount_failure_falls_back() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1626,10 +1689,12 @@ async fn sync_multi_target_partial_blob_failure_isolates_targets() {
             TargetEntry {
                 name: "target-a".into(),
                 client: mock_client(&target_a),
+                batch_checker: None,
             },
             TargetEntry {
                 name: "target-b".into(),
                 client: mock_client(&target_b),
+                batch_checker: None,
             },
         ],
         tags: vec![TagPair::same("v1")],
@@ -1757,6 +1822,7 @@ async fn sync_progressive_cache_skips_shared_blob_head_check() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
     };
@@ -1844,6 +1910,7 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -1931,6 +1998,7 @@ async fn sync_small_blob_uses_monolithic_upload() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -2038,6 +2106,7 @@ async fn sync_lazy_invalidation_on_mount_failure() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -2098,6 +2167,7 @@ async fn sync_cache_persist_and_load_round_trip() {
         targets: vec![TargetEntry {
             name: "target-reg".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -2187,6 +2257,7 @@ async fn sync_shutdown_stops_new_work() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
     };
@@ -2268,6 +2339,7 @@ async fn sync_shutdown_drains_in_flight() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -2363,6 +2435,7 @@ async fn sync_dedup_across_tags_concurrent() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
     };
@@ -2456,6 +2529,7 @@ async fn sync_cross_repo_mount_concurrent() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: Arc::clone(&target_client),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -2466,6 +2540,7 @@ async fn sync_cross_repo_mount_concurrent() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: target_client,
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -2561,6 +2636,7 @@ async fn sync_nested_index_manifest_returns_error() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -2664,6 +2740,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -2798,6 +2875,7 @@ async fn sync_index_manifest_child_pull_failure() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("latest")],
     };
@@ -2891,6 +2969,7 @@ async fn sync_partial_blob_failure_stops_remaining() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -2996,6 +3075,7 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1"), TagPair::same("v2")],
     };
@@ -3126,10 +3206,12 @@ async fn sync_staging_pulls_once_pushes_twice() {
             TargetEntry {
                 name: "target-a".into(),
                 client: mock_client(&target_a),
+                batch_checker: None,
             },
             TargetEntry {
                 name: "target-b".into(),
                 client: mock_client(&target_b),
+                batch_checker: None,
             },
         ],
         tags: vec![TagPair::same("v1")],
@@ -3218,6 +3300,7 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -3321,6 +3404,7 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -3434,10 +3518,12 @@ async fn sync_staging_writes_blobs_to_disk() {
             TargetEntry {
                 name: "target-a".into(),
                 client: mock_client(&target_a),
+                batch_checker: None,
             },
             TargetEntry {
                 name: "target-b".into(),
                 client: mock_client(&target_b),
+                batch_checker: None,
             },
         ],
         tags: vec![TagPair::same("v1")],
@@ -3536,6 +3622,7 @@ async fn sync_warm_cache_skips_blob_head_check() {
         targets: vec![TargetEntry {
             name: "target".into(),
             client: mock_client(&target_server),
+            batch_checker: None,
         }],
         tags: vec![TagPair::same("v1")],
     };
@@ -3562,4 +3649,319 @@ async fn sync_warm_cache_skips_blob_head_check() {
     assert_eq!(report.stats.blobs_skipped, 2);
     assert_eq!(report.stats.blobs_transferred, 0);
     assert_eq!(report.stats.bytes_transferred, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Batch blob checker tests
+// ---------------------------------------------------------------------------
+
+/// Batch checker reports all blobs exist -- per-blob HEAD is bypassed entirely.
+///
+/// The test has NO wiremock mock for blob HEAD endpoints. If the engine falls
+/// through to per-blob HEAD (Step 3), wiremock returns 404, the engine would
+/// attempt a pull+push for the blob, and the test would fail because no blob
+/// pull/push endpoints are mocked either.
+#[tokio::test]
+async fn sync_batch_checker_all_blobs_exist_skips_head() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-batch";
+    let layer_data = b"layer-batch";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: serve manifest only (no blob endpoints -- they shouldn't be needed).
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+
+    // Target: manifest HEAD 404 (image needs sync), manifest PUT (for pushing).
+    // NO blob HEAD, NO blob push endpoints.
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    // Batch checker: both blobs exist.
+    let mut responses = HashMap::new();
+    responses.insert(config_desc.digest.clone(), true);
+    responses.insert(layer_desc.digest.clone(), true);
+    let (checker, batch_call_count) = MockBatchChecker::new(responses);
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = ResolvedMapping {
+        source_client,
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client,
+            batch_checker: Some(Rc::new(checker)),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Exactly 1 batch call was made.
+    assert_eq!(
+        batch_call_count.load(Ordering::Relaxed),
+        1,
+        "batch checker must be called exactly once"
+    );
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // Both blobs skipped via batch-populated cache (Step 1 cache hit).
+    assert_eq!(report.images[0].blob_stats.skipped, 2);
+    assert_eq!(report.images[0].blob_stats.transferred, 0);
+    assert_eq!(report.images[0].bytes_transferred, 0);
+    // Aggregate stats.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.blobs_skipped, 2);
+    assert_eq!(report.stats.blobs_transferred, 0);
+    assert_eq!(report.stats.bytes_transferred, 0);
+}
+
+/// Batch checker reports some blobs missing -- only missing blobs are transferred.
+///
+/// Config and layer2 exist (batch reports true), layer1 is missing (batch reports
+/// false). Only layer1 should be pulled from source and pushed to target.
+/// No blob HEAD endpoints are mocked -- the batch check handles all existence
+/// decisions.
+#[tokio::test]
+async fn sync_batch_checker_partial_existence_transfers_missing() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-partial";
+    let layer1_data = b"layer1-missing";
+    let layer2_data = b"layer2-exists";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer1_desc = blob_descriptor(layer1_data, MediaType::OciLayerGzip);
+    let layer2_desc = blob_descriptor(layer2_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer1_desc.clone(), layer2_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: serve manifest and the missing blob (layer1).
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    // Only layer1 should be pulled -- use expect(1) to verify.
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", layer1_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(layer1_data.to_vec())
+                .insert_header("content-length", layer1_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Target: manifest HEAD 404, blob push for layer1, manifest PUT.
+    // NO blob HEAD mocked (batch check handles existence).
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+
+    // Blob push endpoints for layer1.
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/repo/blobs/uploads/upload-id"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v2/repo/blobs/uploads/upload-id"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/repo/blobs/uploads/upload-id"),
+        )
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/blobs/uploads/upload-id"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    // Batch checker: config exists, layer1 missing, layer2 exists.
+    let mut responses = HashMap::new();
+    responses.insert(config_desc.digest.clone(), true);
+    responses.insert(layer1_desc.digest.clone(), false);
+    responses.insert(layer2_desc.digest.clone(), true);
+    let (checker, batch_call_count) = MockBatchChecker::new(responses);
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = ResolvedMapping {
+        source_client,
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client,
+            batch_checker: Some(Rc::new(checker)),
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Exactly 1 batch call.
+    assert_eq!(
+        batch_call_count.load(Ordering::Relaxed),
+        1,
+        "batch checker must be called exactly once"
+    );
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // 2 blobs skipped (config + layer2), 1 transferred (layer1).
+    assert_eq!(report.images[0].blob_stats.skipped, 2);
+    assert_eq!(report.images[0].blob_stats.transferred, 1);
+    assert_eq!(
+        report.images[0].bytes_transferred,
+        layer1_data.len() as u64,
+        "only layer1 bytes should be transferred"
+    );
+    // Aggregate stats.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.blobs_skipped, 2);
+    assert_eq!(report.stats.blobs_transferred, 1);
+    assert_eq!(report.stats.bytes_transferred, layer1_data.len() as u64);
+    // wiremock expect(1) assertions on source pull and target push verify
+    // exactly 1 blob was pulled and 1 was pushed (enforced on MockServer drop).
+}
+
+/// Without a batch checker, per-blob HEAD is used for existence checks.
+///
+/// Same image setup as the batch tests, but `batch_checker: None`. All 3 blobs
+/// are checked via HEAD (returning 200 = exists) and skipped. This proves the
+/// fallback path works and hasn't regressed.
+#[tokio::test]
+async fn sync_no_batch_checker_falls_back_to_per_blob_head() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-head";
+    let layer1_data = b"layer1-head";
+    let layer2_data = b"layer2-head";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer1_desc = blob_descriptor(layer1_data, MediaType::OciLayerGzip);
+    let layer2_desc = blob_descriptor(layer2_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer1_desc.clone(), layer2_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: serve manifest only (no blobs needed -- all exist at target).
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+
+    // Target: manifest HEAD 404, all 3 blobs return 200 on HEAD, manifest PUT.
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+
+    // Blob HEAD: use expect(1) per blob to verify exactly 1 HEAD per blob.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", layer1_desc.digest)))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{}", layer2_desc.digest)))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = ResolvedMapping {
+        source_client,
+        source_repo: "repo".into(),
+        target_repo: "repo".into(),
+        targets: vec![TargetEntry {
+            name: "target".into(),
+            client: target_client,
+            batch_checker: None, // No batch checker -- per-blob HEAD fallback.
+        }],
+        tags: vec![TagPair::same("v1")],
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // All 3 blobs skipped via per-blob HEAD (Step 3).
+    assert_eq!(report.images[0].blob_stats.skipped, 3);
+    assert_eq!(report.images[0].blob_stats.transferred, 0);
+    assert_eq!(report.images[0].bytes_transferred, 0);
+    // Aggregate stats.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.blobs_skipped, 3);
+    assert_eq!(report.stats.blobs_transferred, 0);
+    assert_eq!(report.stats.bytes_transferred, 0);
+    // wiremock expect(1) per blob HEAD verifies exactly 3 HEAD requests were made
+    // (enforced on MockServer drop).
 }
