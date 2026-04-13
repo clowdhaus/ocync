@@ -286,14 +286,17 @@ async fn main() -> std::process::ExitCode {
     let shutdown = cli::shutdown::ShutdownSignal::new();
     cli::shutdown::install_signal_handlers(shutdown.clone());
 
-    let json_mode = match &cli.command {
+    // Suppress the text summary on stdout when JSON owns stdout or when
+    // the summary is redundant (single-image copy).
+    let suppress_summary = match &cli.command {
         Commands::Sync(args) => args.json,
         Commands::Watch(args) => args.json,
+        Commands::Copy(_) => true,
         _ => false,
     };
 
     let effective_verbosity = match &cli.command {
-        // Copy always shows per-image output — users expect to see what was copied
+        // Copy always shows per-image output — users expect to see what was copied.
         Commands::Copy(_) => cli.verbose.max(1),
         _ => cli.verbose,
     };
@@ -303,7 +306,7 @@ async fn main() -> std::process::ExitCode {
     } else {
         Box::new(cli::progress::TextProgress::new(
             effective_verbosity,
-            json_mode,
+            suppress_summary,
         ))
     };
 

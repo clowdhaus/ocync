@@ -18,8 +18,10 @@ use crate::cli::output::{format_bytes, format_duration};
 /// single-threaded tokio runtime.
 pub(crate) struct TextProgress {
     verbosity: u8,
-    /// When true, suppress the stdout summary (JSON output owns stdout).
-    json: bool,
+    /// When true, suppress the stdout summary line. Used when JSON output
+    /// owns stdout (`--json`) or when the summary is redundant (e.g., `copy`
+    /// with a single image where the per-image line says everything).
+    suppress_summary: bool,
     stderr: RefCell<Box<dyn Write>>,
     stdout: RefCell<Box<dyn Write>>,
 }
@@ -28,7 +30,7 @@ impl std::fmt::Debug for TextProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TextProgress")
             .field("verbosity", &self.verbosity)
-            .field("json", &self.json)
+            .field("suppress_summary", &self.suppress_summary)
             .finish_non_exhaustive()
     }
 }
@@ -36,12 +38,13 @@ impl std::fmt::Debug for TextProgress {
 impl TextProgress {
     /// Create a new text progress reporter writing to real stderr/stdout.
     ///
-    /// When `json` is true, the run summary is suppressed on stdout (JSON
-    /// output owns stdout). Per-image status lines still go to stderr.
-    pub(crate) fn new(verbosity: u8, json: bool) -> Self {
+    /// When `suppress_summary` is true, the run summary is suppressed on
+    /// stdout. Per-image status lines still go to stderr. Used when JSON
+    /// output owns stdout or when the summary is redundant (single-image copy).
+    pub(crate) fn new(verbosity: u8, suppress_summary: bool) -> Self {
         Self {
             verbosity,
-            json,
+            suppress_summary,
             stderr: RefCell::new(Box::new(io::stderr())),
             stdout: RefCell::new(Box::new(io::stdout())),
         }
@@ -51,13 +54,13 @@ impl TextProgress {
     #[cfg(test)]
     fn with_writers(
         verbosity: u8,
-        json: bool,
+        suppress_summary: bool,
         stderr: Box<dyn Write>,
         stdout: Box<dyn Write>,
     ) -> Self {
         Self {
             verbosity,
-            json,
+            suppress_summary,
             stderr: RefCell::new(stderr),
             stdout: RefCell::new(stdout),
         }
@@ -108,7 +111,7 @@ impl ProgressReporter for TextProgress {
     }
 
     fn run_completed(&self, report: &SyncReport) {
-        if self.json {
+        if self.suppress_summary {
             return;
         }
         if report.images.is_empty() {
@@ -155,19 +158,19 @@ mod tests {
     }
 
     fn test_progress(verbosity: u8) -> (TextProgress, Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>) {
-        test_progress_with_json(verbosity, false)
+        test_progress_with_suppress(verbosity, false)
     }
 
-    fn test_progress_with_json(
+    fn test_progress_with_suppress(
         verbosity: u8,
-        json: bool,
+        suppress_summary: bool,
     ) -> (TextProgress, Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>) {
         let stderr_buf = Rc::new(RefCell::new(Vec::new()));
         let stdout_buf = Rc::new(RefCell::new(Vec::new()));
 
         let progress = TextProgress::with_writers(
             verbosity,
-            json,
+            suppress_summary,
             Box::new(RcWriter(Rc::clone(&stderr_buf))),
             Box::new(RcWriter(Rc::clone(&stdout_buf))),
         );
@@ -453,22 +456,22 @@ mod tests {
         );
     }
 
-    // -- json mode tests --
+    // -- suppress_summary tests --
 
     #[test]
-    fn run_completed_suppressed_in_json_mode() {
-        let (progress, _stderr, stdout) = test_progress_with_json(0, true);
+    fn run_completed_suppressed_when_flag_set() {
+        let (progress, _stderr, stdout) = test_progress_with_suppress(0, true);
         let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
         progress.run_completed(&report);
         assert!(
             stdout.borrow().is_empty(),
-            "json mode should suppress summary on stdout"
+            "suppress_summary should suppress summary on stdout"
         );
     }
 
     #[test]
-    fn json_mode_still_prints_failures_to_stderr() {
-        let (progress, stderr, stdout) = test_progress_with_json(0, true);
+    fn suppress_summary_still_prints_failures_to_stderr() {
+        let (progress, stderr, stdout) = test_progress_with_suppress(0, true);
         let result = make_result(
             ImageStatus::Failed {
                 kind: ErrorKind::ManifestPush,
@@ -481,11 +484,11 @@ mod tests {
         let stderr_text = String::from_utf8(stderr.borrow().clone()).unwrap();
         assert!(
             stderr_text.contains("FAILED"),
-            "json mode should still print failures to stderr"
+            "suppress_summary should still print failures to stderr"
         );
         assert!(
             stdout.borrow().is_empty(),
-            "json mode should not write to stdout on image_completed"
+            "suppress_summary should not write to stdout on image_completed"
         );
     }
 }
