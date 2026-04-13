@@ -92,6 +92,21 @@ impl Error {
     pub fn is_not_found(&self) -> bool {
         self.status_code() == Some(http::StatusCode::NOT_FOUND)
     }
+
+    /// Whether this error represents an authentication or authorization failure.
+    ///
+    /// Returns `true` for [`AuthFailed`](Self::AuthFailed) errors and registry
+    /// responses with HTTP 401 Unauthorized or 403 Forbidden status codes.
+    pub fn is_auth_error(&self) -> bool {
+        match self {
+            Self::AuthFailed { .. } => true,
+            Self::RegistryError { status, .. } => {
+                *status == http::StatusCode::UNAUTHORIZED
+                    || *status == http::StatusCode::FORBIDDEN
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +196,47 @@ mod tests {
 
         let err = Error::Other("unrelated".into());
         assert!(!err.is_not_found());
+    }
+
+    #[test]
+    fn is_auth_error_auth_failed() {
+        let err = Error::AuthFailed {
+            registry: "example.com".into(),
+            reason: "bad creds".into(),
+        };
+        assert!(err.is_auth_error());
+    }
+
+    #[test]
+    fn is_auth_error_unauthorized() {
+        let err = Error::RegistryError {
+            status: http::StatusCode::UNAUTHORIZED,
+            message: "denied".into(),
+        };
+        assert!(err.is_auth_error());
+    }
+
+    #[test]
+    fn is_auth_error_forbidden() {
+        let err = Error::RegistryError {
+            status: http::StatusCode::FORBIDDEN,
+            message: "no access".into(),
+        };
+        assert!(err.is_auth_error());
+    }
+
+    #[test]
+    fn is_auth_error_server_error() {
+        let err = Error::RegistryError {
+            status: http::StatusCode::INTERNAL_SERVER_ERROR,
+            message: "broke".into(),
+        };
+        assert!(!err.is_auth_error());
+    }
+
+    #[test]
+    fn is_auth_error_other() {
+        let err = Error::Other("something".into());
+        assert!(!err.is_auth_error());
     }
 }
