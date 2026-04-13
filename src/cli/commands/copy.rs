@@ -7,7 +7,8 @@ use std::sync::Arc;
 use ocync_sync::ImageStatus;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{
-    DEFAULT_MAX_CONCURRENT_TRANSFERS, ResolvedMapping, SyncEngine, TagPair, TargetEntry,
+    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryName, ResolvedMapping, SyncEngine, TagPair,
+    TargetEntry,
 };
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
@@ -32,10 +33,10 @@ pub(crate) async fn run(args: &CopyArgs) -> Result<ExitCode, CliError> {
 
     let mapping = ResolvedMapping {
         source_client,
-        source_repo: args.source.repository().to_owned(),
-        target_repo: args.destination.repository().to_owned(),
+        source_repo: args.source.repository().into(),
+        target_repo: args.destination.repository().into(),
         targets: vec![TargetEntry {
-            name: bare_hostname(args.destination.registry()).to_owned(),
+            name: RegistryName::new(bare_hostname(args.destination.registry())),
             client: target_client,
             batch_checker: None,
         }],

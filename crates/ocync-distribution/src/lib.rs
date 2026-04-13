@@ -32,4 +32,7 @@ pub use ecr::BatchBlobChecker;
 pub use error::Error;
 pub use manifest::{ManifestHead, ManifestPull};
 pub use reference::Reference;
-pub use spec::{Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, Platform};
+pub use spec::{
+    Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, Platform, PlatformFilter,
+    RepositoryName,
+};

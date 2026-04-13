@@ -5,6 +5,7 @@ use serde::Deserialize;
 use crate::aimd::RegistryAction;
 use crate::client::RegistryClient;
 use crate::error::Error;
+use crate::spec::RepositoryName;
 
 /// Response body from the tag listing API.
 #[derive(Debug, Clone, Deserialize)]
@@ -53,7 +54,7 @@ impl RegistryClient {
     /// List all tags in a repository, automatically following pagination.
     ///
     /// Returns a complete list of tags by following `Link: rel="next"` headers.
-    pub async fn list_tags(&self, repository: &str) -> Result<Vec<String>, Error> {
+    pub async fn list_tags(&self, repository: &RepositoryName) -> Result<Vec<String>, Error> {
         let mut all_tags = Vec::new();
         let mut path = "tags/list".to_owned();
 

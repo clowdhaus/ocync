@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use ocync_distribution::Digest;
+use ocync_distribution::spec::RepositoryName;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -28,7 +29,7 @@ pub(crate) struct BlobInfo {
     ///
     /// `BTreeSet` guarantees deterministic iteration order, which makes
     /// [`BlobDedupMap::mount_source`] return a consistent result.
-    pub repos: BTreeSet<String>,
+    pub repos: BTreeSet<RepositoryName>,
 }
 
 /// Per-registry index of tracked blobs.
@@ -73,7 +74,7 @@ impl BlobDedupMap {
     }
 
     /// Mark a blob as existing at the target in the given repo.
-    pub(crate) fn set_exists(&mut self, target: &str, digest: &Digest, repo: &str) {
+    pub(crate) fn set_exists(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
         let entry = self.entry_mut(target, digest);
         if matches!(entry.status, BlobStatus::Completed | BlobStatus::Failed(_)) {
             warn!(
@@ -85,7 +86,7 @@ impl BlobDedupMap {
             );
         }
         entry.status = BlobStatus::ExistsAtTarget;
-        entry.repos.insert(repo.to_owned());
+        entry.repos.insert(repo.clone());
     }
 
     /// Mark a blob as in-progress at the target.
@@ -108,7 +109,7 @@ impl BlobDedupMap {
     }
 
     /// Mark a blob as completed at the target in the given repo.
-    pub(crate) fn set_completed(&mut self, target: &str, digest: &Digest, repo: &str) {
+    pub(crate) fn set_completed(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
         let entry = self.entry_mut(target, digest);
         if matches!(entry.status, BlobStatus::Failed(_)) {
             warn!(
@@ -120,7 +121,7 @@ impl BlobDedupMap {
             );
         }
         entry.status = BlobStatus::Completed;
-        entry.repos.insert(repo.to_owned());
+        entry.repos.insert(repo.clone());
     }
 
     /// Mark a blob as failed at the target.
@@ -142,7 +143,11 @@ impl BlobDedupMap {
     }
 
     /// Return the set of known repos for a blob at a target.
-    pub(crate) fn known_repos(&self, target: &str, digest: &Digest) -> Option<&BTreeSet<String>> {
+    pub(crate) fn known_repos(
+        &self,
+        target: &str,
+        digest: &Digest,
+    ) -> Option<&BTreeSet<RepositoryName>> {
         self.inner.get(target)?.get(digest).map(|info| &info.repos)
     }
 
@@ -154,13 +159,10 @@ impl BlobDedupMap {
         &'a self,
         target: &str,
         digest: &Digest,
-        target_repo: &str,
-    ) -> Option<&'a str> {
+        target_repo: &RepositoryName,
+    ) -> Option<&'a RepositoryName> {
         let info = self.inner.get(target)?.get(digest)?;
-        info.repos
-            .iter()
-            .find(|r| r.as_str() != target_repo)
-            .map(|r| r.as_str())
+        info.repos.iter().find(|r| *r != target_repo)
     }
 
     /// Remove the entry for the given blob at the target.
@@ -233,13 +235,17 @@ mod tests {
             .unwrap()
     }
 
+    fn repo(name: &str) -> RepositoryName {
+        RepositoryName::new(name)
+    }
+
     #[test]
     fn insert_and_check_status() {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
         assert!(map.status("reg.io", &d).is_none());
-        map.set_exists("reg.io", &d, "library/alpine");
+        map.set_exists("reg.io", &d, &repo("library/alpine"));
         assert_eq!(map.status("reg.io", &d), Some(&BlobStatus::ExistsAtTarget));
     }
 
@@ -248,12 +254,12 @@ mod tests {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
-        map.set_completed("reg.io", &d, "library/alpine");
-        map.set_completed("reg.io", &d, "library/nginx");
+        map.set_completed("reg.io", &d, &repo("library/alpine"));
+        map.set_completed("reg.io", &d, &repo("library/nginx"));
 
         let repos = map.known_repos("reg.io", &d).unwrap();
-        assert!(repos.contains("library/alpine"));
-        assert!(repos.contains("library/nginx"));
+        assert!(repos.contains(&repo("library/alpine")));
+        assert!(repos.contains(&repo("library/nginx")));
         assert_eq!(repos.len(), 2);
     }
 
@@ -262,11 +268,11 @@ mod tests {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
-        map.set_completed("reg.io", &d, "library/alpine");
-        map.set_completed("reg.io", &d, "library/nginx");
+        map.set_completed("reg.io", &d, &repo("library/alpine"));
+        map.set_completed("reg.io", &d, &repo("library/nginx"));
 
-        let source = map.mount_source("reg.io", &d, "library/nginx");
-        assert_eq!(source, Some("library/alpine"));
+        let source = map.mount_source("reg.io", &d, &repo("library/nginx"));
+        assert_eq!(source, Some(&repo("library/alpine")));
     }
 
     #[test]
@@ -274,9 +280,9 @@ mod tests {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
-        map.set_completed("reg.io", &d, "library/alpine");
+        map.set_completed("reg.io", &d, &repo("library/alpine"));
 
-        let source = map.mount_source("reg.io", &d, "library/alpine");
+        let source = map.mount_source("reg.io", &d, &repo("library/alpine"));
         assert!(source.is_none());
     }
 
@@ -286,16 +292,16 @@ mod tests {
         let d = test_digest();
 
         // Insert in non-alphabetical order to verify BTreeSet ordering
-        map.set_completed("reg.io", &d, "library/redis");
-        map.set_completed("reg.io", &d, "library/nginx");
-        map.set_completed("reg.io", &d, "library/alpine");
+        map.set_completed("reg.io", &d, &repo("library/redis"));
+        map.set_completed("reg.io", &d, &repo("library/nginx"));
+        map.set_completed("reg.io", &d, &repo("library/alpine"));
 
         // BTreeSet iterates alphabetically: alpine, nginx, redis
-        let source = map.mount_source("reg.io", &d, "library/redis");
-        assert_eq!(source, Some("library/alpine"));
+        let source = map.mount_source("reg.io", &d, &repo("library/redis"));
+        assert_eq!(source, Some(&repo("library/alpine")));
 
-        let source = map.mount_source("reg.io", &d, "library/alpine");
-        assert_eq!(source, Some("library/nginx"));
+        let source = map.mount_source("reg.io", &d, &repo("library/alpine"));
+        assert_eq!(source, Some(&repo("library/nginx")));
     }
 
     #[test]
@@ -303,7 +309,7 @@ mod tests {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
-        map.set_completed("reg-a.io", &d, "library/alpine");
+        map.set_completed("reg-a.io", &d, &repo("library/alpine"));
         map.set_in_progress("reg-b.io", &d);
 
         assert_eq!(map.status("reg-a.io", &d), Some(&BlobStatus::Completed));
@@ -319,7 +325,7 @@ mod tests {
         map.set_in_progress("reg.io", &d);
         assert_eq!(map.status("reg.io", &d), Some(&BlobStatus::InProgress));
 
-        map.set_completed("reg.io", &d, "library/alpine");
+        map.set_completed("reg.io", &d, &repo("library/alpine"));
         assert_eq!(map.status("reg.io", &d), Some(&BlobStatus::Completed));
     }
 

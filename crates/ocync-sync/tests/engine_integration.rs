@@ -8,10 +8,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ocync_distribution::spec::{Descriptor, ImageIndex, ImageManifest, MediaType, Platform};
+use ocync_distribution::spec::{
+    Descriptor, ImageIndex, ImageManifest, MediaType, Platform, PlatformFilter, RepositoryName,
+};
 use ocync_distribution::{BatchBlobChecker, Digest, RegistryClientBuilder};
 use ocync_sync::cache::TransferStateCache;
-use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
+use ocync_sync::engine::{RegistryName, ResolvedMapping, SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
@@ -58,7 +60,7 @@ fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
 /// Shorthand for a [`TargetEntry`] without a batch checker.
 fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>) -> TargetEntry {
     TargetEntry {
-        name: name.into(),
+        name: RegistryName::new(name),
         client,
         batch_checker: None,
     }
@@ -246,12 +248,13 @@ impl MockBatchChecker {
 impl BatchBlobChecker for MockBatchChecker {
     fn check_blob_existence<'a>(
         &'a self,
-        repo: &'a str,
+        repo: &'a RepositoryName,
         digests: &'a [Digest],
     ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
     {
         assert_eq!(
-            repo, self.expected_repo,
+            repo.as_str(),
+            self.expected_repo,
             "mock: batch checker called with wrong repo"
         );
         Box::pin(async {
@@ -291,12 +294,13 @@ impl FailingBatchChecker {
 impl BatchBlobChecker for FailingBatchChecker {
     fn check_blob_existence<'a>(
         &'a self,
-        repo: &'a str,
+        repo: &'a RepositoryName,
         _digests: &'a [Digest],
     ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
     {
         assert_eq!(
-            repo, self.expected_repo,
+            repo.as_str(),
+            self.expected_repo,
             "mock: failing batch checker called with wrong repo"
         );
         Box::pin(async {
@@ -2200,15 +2204,27 @@ async fn sync_cache_persist_and_load_round_trip() {
     let loaded = TransferStateCache::load(&cache_path, std::time::Duration::from_secs(3600));
 
     assert!(
-        loaded.blob_known_at_repo("target-reg", &config_desc.digest, "repo"),
+        loaded.blob_known_at_repo(
+            "target-reg",
+            &config_desc.digest,
+            &RepositoryName::from("repo")
+        ),
         "config blob should be recorded as completed at repo"
     );
     assert!(
-        loaded.blob_known_at_repo("target-reg", &layer_desc.digest, "repo"),
+        loaded.blob_known_at_repo(
+            "target-reg",
+            &layer_desc.digest,
+            &RepositoryName::from("repo")
+        ),
         "layer blob should be recorded as completed at repo"
     );
     assert!(
-        !loaded.blob_known_at_repo("target-reg", &config_desc.digest, "other-repo"),
+        !loaded.blob_known_at_repo(
+            "target-reg",
+            &config_desc.digest,
+            &RepositoryName::from("other-repo")
+        ),
         "blob should not appear at an unrelated repo"
     );
 }
@@ -2753,19 +2769,27 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
     // Verify: stale mount source is gone, blobs are now recorded at "repo".
     let c = cache.borrow();
     assert!(
-        !c.blob_known_at_repo("target", &config_desc.digest, "stale-repo"),
+        !c.blob_known_at_repo(
+            "target",
+            &config_desc.digest,
+            &RepositoryName::from("stale-repo")
+        ),
         "stale cache entry for config at stale-repo should be invalidated"
     );
     assert!(
-        !c.blob_known_at_repo("target", &layer_desc.digest, "stale-repo"),
+        !c.blob_known_at_repo(
+            "target",
+            &layer_desc.digest,
+            &RepositoryName::from("stale-repo")
+        ),
         "stale cache entry for layer at stale-repo should be invalidated"
     );
     assert!(
-        c.blob_known_at_repo("target", &config_desc.digest, "repo"),
+        c.blob_known_at_repo("target", &config_desc.digest, &RepositoryName::from("repo")),
         "config blob should be recorded as completed at repo after fallback push"
     );
     assert!(
-        c.blob_known_at_repo("target", &layer_desc.digest, "repo"),
+        c.blob_known_at_repo("target", &layer_desc.digest, &RepositoryName::from("repo")),
         "layer blob should be recorded as completed at repo after fallback push"
     );
 }
@@ -3649,39 +3673,41 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
     // Source: serve manifest only (no blob endpoints -- they shouldn't be needed).
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    // Use different repo names to ensure the engine passes target_repo (not
+    // source_repo) to the batch checker.
+    mount_source_manifest(&source_server, "src/nginx", "v1", &manifest_bytes).await;
 
     // Target: manifest HEAD 404 (image needs sync), manifest PUT (for pushing).
     // Blob HEAD endpoints: expect(0) -- batch pre-population must prevent all
     // per-blob HEAD checks. This is the explicit negative assertion per CLAUDE.md.
-    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_manifest_head_not_found(&target_server, "tgt/nginx", "v1").await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/tgt/nginx/blobs/{}", config_desc.digest)))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!("/v2/tgt/nginx/blobs/{}", layer_desc.digest)))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
         .await;
-    mount_manifest_push(&target_server, "repo", "v1").await;
+    mount_manifest_push(&target_server, "tgt/nginx", "v1").await;
 
-    // Batch checker: both blobs exist.
+    // Batch checker: both blobs exist. Expected repo is target repo, not source.
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
-    let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
+    let (checker, batch_call_count) = MockBatchChecker::new("tgt/nginx", existing);
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
     let mapping = ResolvedMapping {
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
+        source_repo: "src/nginx".into(),
+        target_repo: "tgt/nginx".into(),
         targets: vec![TargetEntry {
-            name: "target".into(),
+            name: RegistryName::new("target"),
             client: target_client,
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -3804,7 +3830,7 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
         source_repo: "repo".into(),
         target_repo: "repo".into(),
         targets: vec![TargetEntry {
-            name: "target".into(),
+            name: RegistryName::new("target"),
             client: target_client,
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -4001,7 +4027,7 @@ async fn sync_batch_checker_failure_falls_back_to_per_blob_head() {
         source_repo: "repo".into(),
         target_repo: "repo".into(),
         targets: vec![TargetEntry {
-            name: "target".into(),
+            name: RegistryName::new("target"),
             client: target_client,
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -4135,12 +4161,12 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
         target_repo: "repo".into(),
         targets: vec![
             TargetEntry {
-                name: "target-a".into(),
+                name: RegistryName::new("target-a"),
                 client: mock_client(&target_a_server),
                 batch_checker: Some(Rc::new(checker_a)),
             },
             TargetEntry {
-                name: "target-b".into(),
+                name: RegistryName::new("target-b"),
                 client: mock_client(&target_b_server),
                 batch_checker: Some(Rc::new(checker_b)),
             },
@@ -4285,7 +4311,7 @@ async fn sync_batch_checker_empty_result_transfers_all() {
         source_repo: "repo".into(),
         target_repo: "repo".into(),
         targets: vec![TargetEntry {
-            name: "target".into(),
+            name: RegistryName::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -4403,7 +4429,7 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
         target_repo: "repo".into(),
         targets: vec![
             TargetEntry {
-                name: "target-a".into(),
+                name: RegistryName::new("target-a"),
                 client: mock_client(&target_a_server),
                 batch_checker: Some(Rc::new(checker)),
             },
@@ -4528,7 +4554,7 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
         source_repo: "repo".into(),
         target_repo: "repo".into(),
         targets: vec![TargetEntry {
-            name: "target".into(),
+            name: RegistryName::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -4723,7 +4749,7 @@ async fn sync_batch_checker_index_manifest_all_exist() {
         source_repo: "repo".into(),
         target_repo: "repo".into(),
         targets: vec![TargetEntry {
-            name: "target".into(),
+            name: RegistryName::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -4843,7 +4869,7 @@ async fn sync_batch_checker_with_prewarmed_cache() {
         source_repo: "repo".into(),
         target_repo: "repo".into(),
         targets: vec![TargetEntry {
-            name: "target".into(),
+            name: RegistryName::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -5136,7 +5162,7 @@ async fn sync_index_manifest_platform_filter() {
         target_repo: "repo".into(),
         targets: vec![target_entry("target", mock_client(&target_server))],
         tags: vec![TagPair::same("latest")],
-        platforms: Some(vec!["linux/amd64".to_string()]),
+        platforms: Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]),
         skip_existing: false,
     };
 
@@ -5671,7 +5697,7 @@ async fn sync_platform_filter_multi_target() {
             target_entry("target-b", mock_client(&target_b)),
         ],
         tags: vec![TagPair::same("latest")],
-        platforms: Some(vec!["linux/amd64".to_string()]),
+        platforms: Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]),
         skip_existing: false,
     };
 

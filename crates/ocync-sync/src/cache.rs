@@ -21,6 +21,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ocync_distribution::Digest;
+use ocync_distribution::spec::RepositoryName;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -78,13 +79,13 @@ impl TransferStateCache {
         &'a self,
         target: &str,
         digest: &Digest,
-        current_repo: &str,
-    ) -> Option<&'a str> {
+        current_repo: &RepositoryName,
+    ) -> Option<&'a RepositoryName> {
         self.dedup.mount_source(target, digest, current_repo)
     }
 
     /// Mark a blob as already existing at the target in the given repo.
-    pub fn set_blob_exists(&mut self, target: &str, digest: Digest, repo: String) {
+    pub fn set_blob_exists(&mut self, target: &str, digest: Digest, repo: RepositoryName) {
         self.dedup.set_exists(target, &digest, &repo);
     }
 
@@ -94,7 +95,7 @@ impl TransferStateCache {
     }
 
     /// Mark a blob as successfully transferred to the given repo at the target.
-    pub fn set_blob_completed(&mut self, target: &str, digest: Digest, repo: String) {
+    pub fn set_blob_completed(&mut self, target: &str, digest: Digest, repo: RepositoryName) {
         self.dedup.set_completed(target, &digest, &repo);
     }
 
@@ -109,7 +110,7 @@ impl TransferStateCache {
     /// `set_blob_completed`) at the given `(target, repo)` pair. This is the
     /// repo-scoped skip check: a blob known at `repo-a` is NOT accessible from
     /// `repo-b` without a mount.
-    pub fn blob_known_at_repo(&self, target: &str, digest: &Digest, repo: &str) -> bool {
+    pub fn blob_known_at_repo(&self, target: &str, digest: &Digest, repo: &RepositoryName) -> bool {
         self.dedup
             .known_repos(target, digest)
             .is_some_and(|repos| repos.contains(repo))
@@ -323,6 +324,10 @@ mod tests {
             .unwrap()
     }
 
+    fn repo(name: &str) -> RepositoryName {
+        RepositoryName::new(name)
+    }
+
     #[test]
     fn new_cache_is_empty() {
         assert!(TransferStateCache::new().is_empty());
@@ -345,8 +350,8 @@ mod tests {
         cache.set_blob_completed("reg.io", digest(), "repo/a".into());
         cache.set_blob_completed("reg.io", digest(), "repo/b".into());
         assert_eq!(
-            cache.blob_mount_source("reg.io", &digest(), "repo/b"),
-            Some("repo/a")
+            cache.blob_mount_source("reg.io", &digest(), &repo("repo/b")),
+            Some(&repo("repo/a"))
         );
     }
 
@@ -354,9 +359,9 @@ mod tests {
     fn blob_known_at_repo_checks_specific_repo() {
         let mut cache = TransferStateCache::new();
         cache.set_blob_completed("reg.io", digest(), "repo/a".into());
-        assert!(cache.blob_known_at_repo("reg.io", &digest(), "repo/a"));
-        assert!(!cache.blob_known_at_repo("reg.io", &digest(), "repo/b"));
-        assert!(!cache.blob_known_at_repo("other.io", &digest(), "repo/a"));
+        assert!(cache.blob_known_at_repo("reg.io", &digest(), &repo("repo/a")));
+        assert!(!cache.blob_known_at_repo("reg.io", &digest(), &repo("repo/b")));
+        assert!(!cache.blob_known_at_repo("other.io", &digest(), &repo("repo/a")));
     }
 
     #[test]
@@ -370,7 +375,7 @@ mod tests {
     #[test]
     fn build_cache_bytes_roundtrip() {
         let mut dedup = BlobDedupMap::new();
-        dedup.set_completed("reg.io", &digest(), "repo/a");
+        dedup.set_completed("reg.io", &digest(), &repo("repo/a"));
         let bytes = build_cache_bytes(&dedup).unwrap();
         // Verify CRC covers the entire payload
         let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);

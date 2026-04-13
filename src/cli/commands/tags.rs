@@ -1,5 +1,6 @@
 //! The `tags` subcommand — lists and filters tags from a repository.
 
+use ocync_distribution::RepositoryName;
 use ocync_sync::filter::FilterConfig;
 
 use crate::TagsArgs;
@@ -24,7 +25,8 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
 
     let client = build_registry_client(registry, auth_type.as_ref(), None).await?;
 
-    let all_tags = client.list_tags(repository).await?;
+    let repo_path = RepositoryName::from(repository);
+    let all_tags = client.list_tags(&repo_path).await?;
 
     let filter = FilterConfig {
         glob: args.glob.clone(),

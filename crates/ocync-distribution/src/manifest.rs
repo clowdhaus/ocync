@@ -9,7 +9,7 @@ use crate::client::{RegistryClient, build_url};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
-use crate::spec::{ImageIndex, ManifestKind, MediaType};
+use crate::spec::{ImageIndex, ManifestKind, MediaType, RepositoryName};
 
 /// OCI-specific header returned by registries to provide the content-addressable
 /// digest of a manifest. Not part of the HTTP standard, so no constant exists in
@@ -67,7 +67,7 @@ impl RegistryClient {
     /// Returns `None` if the manifest is not found (404).
     pub async fn manifest_head(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         reference: &str,
     ) -> Result<Option<ManifestHead>, Error> {
         let path = manifest_path(reference);
@@ -117,7 +117,7 @@ impl RegistryClient {
     /// the manifest, and computes the digest from the raw bytes.
     pub async fn manifest_pull(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         reference: &str,
     ) -> Result<ManifestPull, Error> {
         let path = manifest_path(reference);
@@ -159,7 +159,7 @@ impl RegistryClient {
     /// exactly as provided. Returns the digest computed from those bytes.
     pub async fn manifest_push(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         reference: &str,
         media_type: &MediaType,
         raw_bytes: &[u8],
@@ -168,7 +168,7 @@ impl RegistryClient {
         let digest = Digest::from_sha256(hash);
 
         let url = build_url(&self.base_url, repository, &manifest_path(reference))?;
-        let scopes = [Scope::pull_push(repository)];
+        let scopes = [Scope::pull_push(repository.as_str())];
 
         let content_type = HeaderValue::from_str(media_type.as_str())
             .map_err(|e| Error::Other(format!("invalid media type header value: {e}")))?;
@@ -205,7 +205,7 @@ impl RegistryClient {
     /// e.g. `application/vnd.dev.cosign.simplesigning.v1+json`).
     pub async fn referrers(
         &self,
-        repository: &str,
+        repository: &RepositoryName,
         digest: &Digest,
         artifact_type: Option<&str>,
     ) -> Result<Option<ImageIndex>, Error> {
@@ -218,7 +218,7 @@ impl RegistryClient {
             url.query_pairs_mut().append_pair("artifactType", at);
         }
 
-        let scopes = [Scope::pull(repository)];
+        let scopes = [Scope::pull(repository.as_str())];
 
         let resp = self
             .send_with_aimd(

@@ -20,6 +20,7 @@ use tracing::warn;
 
 use crate::digest::Digest;
 use crate::error::Error;
+use crate::spec::RepositoryName;
 
 /// Extract the AWS region from an ECR hostname.
 ///
@@ -93,7 +94,11 @@ pub trait BatchBlobChecker {
     /// Returns the set of input digests that exist at the target. Digests
     /// absent from the returned set are missing and need transfer. Digests
     /// that the API reports as failures are treated as missing.
-    fn check_blob_existence<'a>(&'a self, repo: &'a str, digests: &'a [Digest]) -> CheckFuture<'a>;
+    fn check_blob_existence<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+    ) -> CheckFuture<'a>;
 }
 
 /// Abstraction over ECR batch API calls for testability.
@@ -224,7 +229,7 @@ impl BatchChecker {
     /// Check blob existence, splitting into batches of 100.
     async fn check_batched(
         &self,
-        repo: &str,
+        repo: &RepositoryName,
         digests: &[Digest],
     ) -> Result<HashSet<Digest>, Error> {
         let mut existing = HashSet::with_capacity(digests.len());
@@ -238,7 +243,7 @@ impl BatchChecker {
 
             let response = match self
                 .api
-                .batch_check_layer_availability(repo, &digest_strings)
+                .batch_check_layer_availability(repo.as_str(), &digest_strings)
                 .await
             {
                 Ok(r) => r,
@@ -293,7 +298,11 @@ impl BatchChecker {
 }
 
 impl BatchBlobChecker for BatchChecker {
-    fn check_blob_existence<'a>(&'a self, repo: &'a str, digests: &'a [Digest]) -> CheckFuture<'a> {
+    fn check_blob_existence<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+    ) -> CheckFuture<'a> {
         Box::pin(self.check_batched(repo, digests))
     }
 }
@@ -498,7 +507,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence("my-repo", &[d1.clone(), d2.clone()])
+            .check_blob_existence(&RepositoryName::new("my-repo"), &[d1.clone(), d2.clone()])
             .await
             .unwrap();
 
@@ -525,7 +534,10 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence("my-repo", &[d1.clone(), d2.clone(), d3.clone()])
+            .check_blob_existence(
+                &RepositoryName::new("my-repo"),
+                &[d1.clone(), d2.clone(), d3.clone()],
+            )
             .await
             .unwrap();
 
@@ -564,7 +576,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence("my-repo", &digests)
+            .check_blob_existence(&RepositoryName::new("my-repo"), &digests)
             .await
             .unwrap();
 
@@ -587,7 +599,10 @@ mod tests {
         let mock = MockEcrBatchApi::new("my-repo", counts.clone());
         let checker = BatchChecker::with_api(mock);
 
-        let result = checker.check_blob_existence("my-repo", &[]).await.unwrap();
+        let result = checker
+            .check_blob_existence(&RepositoryName::new("my-repo"), &[])
+            .await
+            .unwrap();
 
         assert!(result.is_empty());
         assert_eq!(counts.check.load(Ordering::Relaxed), 0);
@@ -601,7 +616,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence("my-repo", &[test_digest(1)])
+            .check_blob_existence(&RepositoryName::new("my-repo"), &[test_digest(1)])
             .await;
 
         assert!(result.is_err());
@@ -624,7 +639,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence("my-repo", &[d1, d2])
+            .check_blob_existence(&RepositoryName::new("my-repo"), &[d1, d2])
             .await
             .unwrap();
 
@@ -647,7 +662,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence("my-repo", &[d1.clone(), d2.clone()])
+            .check_blob_existence(&RepositoryName::new("my-repo"), &[d1.clone(), d2.clone()])
             .await
             .unwrap();
 
@@ -683,7 +698,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence("my-repo", &digests)
+            .check_blob_existence(&RepositoryName::new("my-repo"), &digests)
             .await
             .unwrap();
 
