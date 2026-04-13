@@ -21,7 +21,7 @@ fn digest_b() -> Digest {
     DIGEST_B.parse().unwrap()
 }
 
-/// A large but finite max_age used to mean "never expires during the test".
+/// A large but finite `max_age` used to mean "never expires during the test".
 fn long_ttl() -> Duration {
     Duration::from_secs(86_400 * 365)
 }

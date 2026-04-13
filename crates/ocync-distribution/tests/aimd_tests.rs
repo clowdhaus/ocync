@@ -278,7 +278,7 @@ async fn controller_throttle_with_outstanding_permits() {
     let after_throttle = ctrl.window_limit(op);
     // Window should approximately halve — verify it shrank by more than 1.
     assert!(
-        after_throttle <= (before + 1) / 2,
+        after_throttle <= before.div_ceil(2),
         "throttle should approximately halve the window (before={before}, after={after_throttle})"
     );
 

@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(result, digest);
     }
 
-    /// GHCR: exactly one PATCH regardless of blob size vs chunk_size.
+    /// GHCR: exactly one PATCH regardless of blob size vs `chunk_size`.
     #[tokio::test]
     async fn blob_push_stream_ghcr_single_patch_large_blob() {
         let server = wiremock::MockServer::start().await;

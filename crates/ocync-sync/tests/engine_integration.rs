@@ -1682,7 +1682,7 @@ async fn sync_multi_target_partial_blob_failure_isolates_targets() {
 /// After the first image syncs, the base layer is recorded as completed at
 /// `(target, repo)`. When the second image processes the base layer, the
 /// engine hits `blob_known_at_repo` → skips the HEAD check entirely.
-/// Total blob pushes: base + layer_a + layer_b = 3, not 4.
+/// Total blob pushes: base + `layer_a` + `layer_b` = 3, not 4.
 #[tokio::test]
 async fn sync_progressive_cache_skips_shared_blob_head_check() {
     let source_server = MockServer::start().await;
@@ -1870,7 +1870,7 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
 }
 
 /// Small blobs (below the 1 MiB monolithic threshold) use POST+PUT with no
-/// PATCH. The mock expects exactly 1 POST and 1 PUT per blob, and 0 PATCHes.
+/// PATCH. The mock expects exactly 1 POST and 1 PUT per blob, and 0 PATCH requests.
 #[tokio::test]
 async fn sync_small_blob_uses_monolithic_upload() {
     let source_server = MockServer::start().await;
@@ -2306,7 +2306,7 @@ async fn sync_shutdown_drains_in_flight() {
 // ---------------------------------------------------------------------------
 
 /// Verify that cross-tag dedup works correctly even with concurrent execution
-/// (max_concurrent > 1). Results may arrive in any order, but shared blobs
+/// (`max_concurrent` > 1). Results may arrive in any order, but shared blobs
 /// must still be deduplicated globally.
 #[tokio::test]
 async fn sync_dedup_across_tags_concurrent() {
@@ -2401,7 +2401,7 @@ async fn sync_dedup_across_tags_concurrent() {
 }
 
 /// Verify two cross-repo mappings both succeed with concurrent execution.
-/// With max_concurrent>1, both may execute simultaneously. The test verifies
+/// With `max_concurrent` > 1, both may execute simultaneously. The test verifies
 /// correctness (both complete) without prescribing mount vs push paths.
 #[tokio::test]
 async fn sync_cross_repo_mount_concurrent() {
@@ -2824,7 +2824,7 @@ async fn sync_index_manifest_child_pull_failure() {
 }
 
 /// Blob 1 (config) push succeeds. Blob 2 (layer) push POST returns 403.
-/// Verify image fails, bytes_transferred reflects only the first blob,
+/// Verify image fails, `bytes_transferred` reflects only the first blob,
 /// and manifest is NOT pushed.
 #[tokio::test]
 async fn sync_partial_blob_failure_stops_remaining() {

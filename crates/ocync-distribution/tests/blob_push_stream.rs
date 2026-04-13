@@ -541,7 +541,7 @@ async fn small_blob_uses_monolithic_upload() {
     assert_eq!(result, digest);
 }
 
-/// Blobs with no known_size are not subject to the monolithic threshold.
+/// Blobs with no `known_size` are not subject to the monolithic threshold.
 #[tokio::test]
 async fn unknown_size_skips_monolithic_threshold() {
     let server = MockServer::start().await;

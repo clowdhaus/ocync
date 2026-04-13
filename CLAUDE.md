@@ -87,6 +87,9 @@ New optimization layers must:
 - **Units**: parse and display functions for byte sizes use SI decimal prefixes (1 KB = 1,000) consistently; never mix SI parsing with binary display
 - **Testing**: see Testing standards section below
 - **Classifiers**: response classifier functions that don't use `self` should be free functions
+- **Registry detection**: use `detect_provider_kind()` and `ProviderKind` enum for registry-specific behavior (GHCR fallback, GAR fallback, ECR rate limits) — never match on raw hostname strings; the canonical detector handles case-insensitivity, ports, and trailing dots
+- **Ceremony consolidation**: when a multi-step protocol pattern (acquire permit → send → report → check status) repeats more than twice, extract a helper immediately; the helper becomes the single point where the protocol is correct, and callers become declarative
+- **Visibility after consolidation**: after wrapping internal methods behind a new helper, audit whether the original methods still have external callers; tighten `pub(crate)` to private when the helper is the only remaining caller
 - **Formatting**: no special symbols (`§`, etc.) in docs or code — use plain text references; prefer heading hierarchy over excessive bold
 - **Best-effort I/O**: when an I/O result is intentionally not propagated (e.g., directory fsync after a successful atomic rename), log with `tracing::warn!` including path and error — never `let _ = io_op()`. Silent drops mask production issues.
 - **SAFETY comments**: `// SAFETY:` is reserved for explaining why `unsafe` code is sound. For logic correctness assertions (e.g., "guard ensures Option is Some"), use plain comments.
