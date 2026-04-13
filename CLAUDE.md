@@ -95,6 +95,9 @@ New optimization layers must:
 - **SAFETY comments**: `// SAFETY:` is reserved for explaining why `unsafe` code is sound. For logic correctness assertions (e.g., "guard ensures Option is Some"), use plain comments.
 - **Cleanup loop resilience**: loops that delete multiple files (cleanup, eviction, tmp removal) must log and continue on individual failures, never abort the whole operation with `?`. One stuck file should not prevent cleaning up the rest.
 - **Configurable timeouts**: hardcoded timeout values (drain deadlines, retry caps, etc.) should be configurable via builder methods with sensible defaults. Document the default in the builder method's doc comment, not just in the code that uses it.
+- **Registry module centralization**: all utilities for a specific registry provider (hostname parsing, SDK config loading, batch operations) live in one module (e.g., `ecr.rs`). Auth implementations import shared helpers from the provider module, not the other way around. Never scatter provider-specific code across auth, batch, and CLI layers.
+- **Constructor encapsulation**: public constructors must not leak internal dependencies into caller signatures. If a struct needs an AWS SDK config internally, accept a hostname string and build the config inside — don't force callers to import `aws-config`. This keeps dependency boundaries clean: library crates own their deps, CLI crates just pass domain values.
+- **Avoid tuple type aliases for struct-like data**: when a tuple alias mirrors an existing struct's fields, add `Clone` to the struct instead. Tuples add destructuring noise at every use site and diverge from the struct over time. Cheap clones (`Arc`, `Rc`, `String`) make struct Clone zero-cost.
 
 ## Testing standards
 
@@ -140,6 +143,10 @@ Tests for configurable parameters (timeouts, concurrency caps, thresholds) must 
 ### Assert aggregate and per-image stats together
 
 Engine integration tests must assert both per-image stats (`report.images[N].blob_stats`) and aggregate stats (`report.stats`). The aggregation path in `compute_stats` has its own logic — a bug there would be missed by per-image assertions alone.
+
+### Test helpers for struct defaults
+
+When adding a new field to a widely-used struct (especially one constructed in many tests), immediately add a test helper function with the default value. This prevents N boilerplate additions across existing tests and keeps the diff focused on new behavior. The helper should accept only the fields that vary between tests; default fields go inside the helper.
 
 ### Mock contract fidelity
 
