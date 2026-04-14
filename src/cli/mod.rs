@@ -162,8 +162,23 @@ pub(crate) async fn build_registry_client(
             let auth = StaticTokenAuth::new(tok);
             RegistryClient::builder(url).auth(auth)
         }
-        Some(AuthType::DockerConfig | AuthType::Ghcr | AuthType::Gcr | AuthType::Acr) => {
-            // User explicitly requested docker config auth — error if config can't load.
+        Some(AuthType::Ghcr | AuthType::Gcr | AuthType::Acr) => {
+            // These registries will eventually have native providers (OAuth2, GITHUB_TOKEN).
+            // For now, resolve credentials from docker config — covers PATs and helper-stored creds.
+            tracing::debug!(
+                registry = bare_host,
+                auth_type = ?auth_type,
+                "using docker config credential resolution for registry provider"
+            );
+            let docker_config = DockerConfig::load_default().map_err(|e| {
+                CliError::Input(format!(
+                    "failed to load docker config for '{bare_host}': {e}"
+                ))
+            })?;
+            let auth = DockerConfigAuth::new(bare_host, &docker_config, http)?;
+            RegistryClient::builder(url).auth(auth)
+        }
+        Some(AuthType::DockerConfig) => {
             let docker_config = DockerConfig::load_default().map_err(|e| {
                 CliError::Input(format!(
                     "failed to load docker config for '{bare_host}': {e}"
@@ -177,7 +192,10 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
         None => {
-            // Auto-detect: ECR by hostname, otherwise anonymous.
+            // Interim credential resolution: ECR by hostname, docker config for
+            // everything else, anonymous as final fallback. Native providers for
+            // GCR/ACR/GHCR will be inserted between ECR and docker config when
+            // implemented.
             if let Some(ProviderKind::Ecr | ProviderKind::EcrPublic) =
                 detect_provider_kind(bare_host)
             {
@@ -186,8 +204,27 @@ pub(crate) async fn build_registry_client(
                 })?;
                 RegistryClient::builder(url).auth(auth)
             } else {
-                let auth = AnonymousAuth::new(bare_host, http);
-                RegistryClient::builder(url).auth(auth)
+                // Try docker config — falls back to anonymous exchange if no creds found.
+                match DockerConfig::load_default() {
+                    Ok(config) => {
+                        let auth =
+                            DockerConfigAuth::new(bare_host, &config, http).map_err(|e| {
+                                CliError::Input(format!(
+                                    "docker config credential resolution for '{bare_host}': {e}"
+                                ))
+                            })?;
+                        RegistryClient::builder(url).auth(auth)
+                    }
+                    Err(_) => {
+                        // No docker config file — use anonymous.
+                        tracing::debug!(
+                            registry = bare_host,
+                            "no docker config found, using anonymous auth"
+                        );
+                        let auth = AnonymousAuth::new(bare_host, http);
+                        RegistryClient::builder(url).auth(auth)
+                    }
+                }
             }
         }
     };
