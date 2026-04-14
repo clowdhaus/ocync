@@ -6693,3 +6693,392 @@ async fn discovery_zero_platform_match_returns_error() {
         1
     );
 }
+
+/// Cache hit + `skip_existing`: source HEAD matches the cached snapshot, but
+/// the target returns a manifest with a DIFFERENT digest. Because `skip_existing`
+/// is true, the target is skipped with `SkipExisting` (not `DigestMatch`).
+/// No source GET is mounted -- if the engine incorrectly falls through, wiremock
+/// will return 404 on the GET and the test will fail.
+#[tokio::test]
+async fn discovery_skip_existing_with_cache_hit() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let manifest_digest = test_digest("aabb");
+    let different_target_digest = test_digest("d1ff");
+
+    // Source: only HEAD (no GET mounted).
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+
+    // Target: HEAD returns 200 with a DIFFERENT digest.
+    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &different_target_digest).await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mut mapping = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+    mapping.skip_existing = true;
+
+    // Pre-populate cache: source digest matches what HEAD will return.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        c.set_source_snapshot(
+            "source.test.io:443",
+            &"src/repo".into(),
+            "v1",
+            ocync_sync::cache::SourceSnapshot {
+                source_digest: manifest_digest.clone(),
+                filtered_digest: manifest_digest.clone(),
+                platform_filter_key: String::new(),
+            },
+        );
+    }
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Image must be skipped with SkipExisting (not DigestMatch).
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(
+            report.images[0].status,
+            ImageStatus::Skipped {
+                reason: SkipReason::SkipExisting,
+            }
+        ),
+        "expected SkipExisting, got {:?}",
+        report.images[0].status
+    );
+    assert_eq!(report.images[0].bytes_transferred, 0);
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.images_synced, 0);
+
+    // Discovery counters: cache hit path (source HEAD matched cache).
+    assert_eq!(report.stats.discovery_cache_hits, 1);
+    assert_eq!(report.stats.discovery_cache_misses, 0);
+    assert_eq!(report.stats.discovery_head_failures, 0);
+    assert_eq!(report.stats.discovery_target_stale, 0);
+    // Sum invariant.
+    assert_eq!(
+        report.stats.discovery_cache_hits + report.stats.discovery_cache_misses,
+        1,
+        "sum invariant"
+    );
+}
+
+/// Cache miss + `skip_existing`: no cache entry exists, so the engine must do
+/// a full source manifest pull (GET). Target HEAD returns 200 (different digest).
+/// Because `skip_existing` is true, the image is skipped with `SkipExisting`.
+/// Source GET must fire (cache miss forces full pull).
+#[tokio::test]
+async fn discovery_skip_existing_with_cache_miss() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-skip-miss";
+    let layer_data = b"layer-skip-miss";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
+    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
+
+    // Source: HEAD + GET both needed (no cache).
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+    // Source GET: expect exactly 1 (proves cache miss triggered full pull).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Target: HEAD returns 200 with a DIFFERENT digest.
+    let different_target_digest = test_digest("d1ff");
+    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &different_target_digest).await;
+
+    // No blob or manifest push endpoints needed -- skip_existing should prevent
+    // any blob work. If the engine incorrectly proceeds, it will fail on missing
+    // endpoints.
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mut mapping = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+    mapping.skip_existing = true;
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Image must be skipped with SkipExisting.
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(
+            report.images[0].status,
+            ImageStatus::Skipped {
+                reason: SkipReason::SkipExisting,
+            }
+        ),
+        "expected SkipExisting, got {:?}",
+        report.images[0].status
+    );
+    assert_eq!(report.images[0].bytes_transferred, 0);
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.images_synced, 0);
+
+    // Discovery counters: cache miss (no prior cache entry).
+    assert_eq!(report.stats.discovery_cache_hits, 0);
+    assert_eq!(report.stats.discovery_cache_misses, 1);
+    assert_eq!(report.stats.discovery_head_failures, 0);
+    assert_eq!(report.stats.discovery_target_stale, 0);
+    // Sum invariant.
+    assert_eq!(
+        report.stats.discovery_cache_hits + report.stats.discovery_cache_misses,
+        1,
+        "sum invariant"
+    );
+    // wiremock .expect(1) on source GET verifies the full pull happened.
+}
+
+/// Multi-target fan-out with cache: source HEAD matches cache, Target A matches
+/// `filtered_digest` (DigestMatch skip), Target B returns 404 (stale). The engine
+/// must do a full source pull for Target B only. Discovery path is `TargetStale`.
+#[tokio::test]
+async fn discovery_mixed_fanout_one_match_one_stale() {
+    let source_server = MockServer::start().await;
+    let target_a_server = MockServer::start().await;
+    let target_b_server = MockServer::start().await;
+
+    // Build a real image with blobs (using blob_descriptor for correct sizes).
+    let config_data = b"config-fanout";
+    let layer_data = b"layer-fanout";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
+
+    // Source: HEAD + GET.
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
+
+    // Target A: HEAD matches filtered_digest -> will be skipped (DigestMatch).
+    mount_manifest_head_matching(&target_a_server, "tgt/repo", "v1", &manifest_digest).await;
+
+    // Target B: HEAD 404 -> needs sync.
+    mount_manifest_head_not_found(&target_b_server, "tgt/repo", "v1").await;
+    mount_blob_not_found(&target_b_server, "tgt/repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_b_server, "tgt/repo", &layer_desc.digest).await;
+    mount_blob_push(&target_b_server, "tgt/repo").await;
+    mount_manifest_push(&target_b_server, "tgt/repo", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_a_client = mock_client(&target_a_server);
+    let target_b_client = mock_client(&target_b_server);
+
+    let mapping = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![
+            target_entry("target-a", target_a_client),
+            target_entry("target-b", target_b_client),
+        ],
+        vec![TagPair::same("v1".to_owned())],
+    );
+
+    // Pre-populate cache so source HEAD matches.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        c.set_source_snapshot(
+            "source.test.io:443",
+            &"src/repo".into(),
+            "v1",
+            ocync_sync::cache::SourceSnapshot {
+                source_digest: manifest_digest.clone(),
+                filtered_digest: manifest_digest.clone(),
+                platform_filter_key: String::new(),
+            },
+        );
+    }
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Two image results: one skipped (Target A), one synced (Target B).
+    assert_eq!(report.images.len(), 2);
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.images_synced, 1);
+
+    // Identify results by status.
+    let skipped = report
+        .images
+        .iter()
+        .find(|r| {
+            matches!(
+                r.status,
+                ImageStatus::Skipped {
+                    reason: SkipReason::DigestMatch,
+                }
+            )
+        })
+        .expect("Target A should be skipped with DigestMatch");
+    assert_eq!(skipped.bytes_transferred, 0);
+    assert_eq!(skipped.blob_stats.transferred, 0);
+
+    let synced = report
+        .images
+        .iter()
+        .find(|r| matches!(r.status, ImageStatus::Synced))
+        .expect("Target B should be Synced");
+    assert_eq!(synced.blob_stats.transferred, 2);
+    let expected_bytes = (config_data.len() + layer_data.len()) as u64;
+    assert_eq!(synced.bytes_transferred, expected_bytes);
+
+    // Discovery counters: TargetStale path (cache matched source, but target B mismatched).
+    assert_eq!(report.stats.discovery_cache_hits, 0);
+    assert_eq!(report.stats.discovery_cache_misses, 1);
+    assert_eq!(report.stats.discovery_head_failures, 0);
+    assert_eq!(report.stats.discovery_target_stale, 1);
+    // Sum invariant.
+    assert_eq!(
+        report.stats.discovery_cache_hits + report.stats.discovery_cache_misses,
+        1,
+        "sum invariant"
+    );
+}
+
+/// Retag: source tag `v1.0` mapped to target tag `latest`. Cache is keyed on
+/// source tag. Source HEAD uses `v1.0`, target HEAD uses `latest`. With cache
+/// pre-populated, the engine should take the CacheHit path and skip.
+#[tokio::test]
+async fn discovery_retag_uses_correct_tags() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let manifest_digest = test_digest("aabb");
+
+    // Source: HEAD at /v2/src/repo/manifests/v1.0.
+    mount_source_head(&source_server, "src/repo", "v1.0", &manifest_digest).await;
+
+    // Target: HEAD at /v2/tgt/repo/manifests/latest returns matching digest.
+    mount_manifest_head_matching(&target_server, "tgt/repo", "latest", &manifest_digest).await;
+
+    // No source GET mounted -- cache hit should skip without pulling.
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::retag("v1.0".to_owned(), "latest".to_owned())],
+    );
+
+    // Pre-populate cache keyed on source tag "v1.0".
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        c.set_source_snapshot(
+            "source.test.io:443",
+            &"src/repo".into(),
+            "v1.0",
+            ocync_sync::cache::SourceSnapshot {
+                source_digest: manifest_digest.clone(),
+                filtered_digest: manifest_digest.clone(),
+                platform_filter_key: String::new(),
+            },
+        );
+    }
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Image must be skipped (DigestMatch) via the cache hit path.
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(
+            report.images[0].status,
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            }
+        ),
+        "expected DigestMatch skip, got {:?}",
+        report.images[0].status
+    );
+    assert_eq!(report.images[0].bytes_transferred, 0);
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.images_synced, 0);
+
+    // Discovery counters: cache hit path.
+    assert_eq!(report.stats.discovery_cache_hits, 1);
+    assert_eq!(report.stats.discovery_cache_misses, 0);
+    assert_eq!(report.stats.discovery_head_failures, 0);
+    assert_eq!(report.stats.discovery_target_stale, 0);
+    // Sum invariant.
+    assert_eq!(
+        report.stats.discovery_cache_hits + report.stats.discovery_cache_misses,
+        1,
+        "sum invariant"
+    );
+}
