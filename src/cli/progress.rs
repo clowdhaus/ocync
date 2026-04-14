@@ -158,14 +158,16 @@ mod tests {
         }
     }
 
-    fn test_progress(verbosity: u8) -> (TextProgress, Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>) {
+    type Buf = Rc<RefCell<Vec<u8>>>;
+
+    fn test_progress(verbosity: u8) -> (TextProgress, Buf, Buf) {
         test_progress_with_suppress(verbosity, false)
     }
 
     fn test_progress_with_suppress(
         verbosity: u8,
         suppress_summary: bool,
-    ) -> (TextProgress, Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>) {
+    ) -> (TextProgress, Buf, Buf) {
         let stderr_buf = Rc::new(RefCell::new(Vec::new()));
         let stdout_buf = Rc::new(RefCell::new(Vec::new()));
 

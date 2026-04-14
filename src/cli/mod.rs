@@ -230,7 +230,6 @@ fn detect_log_format() -> Option<LogFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http;
 
     #[test]
     fn verbosity_quiet_is_error() {
