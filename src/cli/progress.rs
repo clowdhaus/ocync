@@ -204,6 +204,7 @@ mod tests {
                 blobs_skipped: 0,
                 blobs_mounted: 34,
                 bytes_transferred: 432_000_000,
+                ..SyncStats::default()
             },
             duration: Duration::from_secs(47),
         }
@@ -465,6 +466,7 @@ mod tests {
                 blobs_skipped: 5,
                 blobs_mounted: 34,
                 bytes_transferred: 432_000_000,
+                ..SyncStats::default()
             },
             duration: Duration::from_secs(47),
         };
