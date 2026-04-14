@@ -10,7 +10,7 @@ use ocync_distribution::RepositoryName;
 use ocync_distribution::auth::{AuthProvider, Scope, Token};
 use ocync_distribution::client::RegistryClientBuilder;
 use url::Url;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A mock auth provider that tracks token requests and invalidation calls.
@@ -437,4 +437,87 @@ async fn head_double_401_returns_unauthorized() {
         .await;
     let err = result.unwrap_err();
     assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED));
+}
+
+#[tokio::test]
+async fn manifest_head_sends_accept_header() {
+    let server = MockServer::start().await;
+
+    // Only respond to HEAD with Accept header present.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/repo/manifests/latest"))
+        .and(header_exists("accept"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header(
+                    "docker-content-digest",
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .insert_header("content-type", "application/vnd.oci.image.index.v1+json")
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .build()
+        .unwrap();
+    let repo = RepositoryName::new("repo");
+
+    let result = client.manifest_head(&repo, "latest").await.unwrap();
+    assert!(result.is_some());
+}
+
+#[tokio::test]
+async fn manifest_head_missing_digest_header_returns_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("HEAD"))
+        .and(path("/v2/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.oci.image.index.v1+json")
+                .insert_header("content-length", "100"),
+            // No docker-content-digest header.
+        )
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .build()
+        .unwrap();
+    let repo = RepositoryName::new("repo");
+
+    let result = client.manifest_head(&repo, "latest").await;
+    assert!(result.is_err(), "missing digest header should be an error");
+}
+
+#[tokio::test]
+async fn blob_exists_does_not_send_accept_header() {
+    let server = MockServer::start().await;
+
+    // This mock ONLY matches requests WITHOUT an Accept header.
+    // If blob_exists sent Accept, it would not match, and wiremock
+    // would return 404 by default.
+    Mock::given(method("HEAD"))
+        .and(path(
+            "/v2/repo/blobs/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-length", "1024"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .build()
+        .unwrap();
+    let repo = RepositoryName::new("repo");
+    let digest: ocync_distribution::Digest =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+
+    let result = client.blob_exists(&repo, &digest).await.unwrap();
+    assert_eq!(result, Some(1024));
 }
