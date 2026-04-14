@@ -66,6 +66,26 @@ fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>) -> 
     }
 }
 
+/// Construct a `ResolvedMapping` for tests with sensible defaults.
+fn test_mapping(
+    source_client: Arc<ocync_distribution::RegistryClient>,
+    source_repo: &str,
+    target_repo: &str,
+    targets: Vec<TargetEntry>,
+    tags: Vec<TagPair>,
+) -> ResolvedMapping {
+    ResolvedMapping {
+        source_authority: "source.test.io:443".to_string(),
+        source_client,
+        source_repo: source_repo.into(),
+        target_repo: target_repo.into(),
+        targets,
+        tags,
+        platforms: None,
+        skip_existing: false,
+    }
+}
+
 /// Serialize an `ImageManifest` to JSON bytes and compute its digest.
 fn serialize_manifest(manifest: &ImageManifest) -> (Vec<u8>, Digest) {
     let bytes = serde_json::to_vec(manifest).unwrap();
@@ -372,15 +392,13 @@ async fn sync_happy_path() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "library/nginx".into(),
-        target_repo: "mirror/nginx".into(),
-        targets: vec![target_entry("target-reg", target_client)],
-        tags: vec![TagPair::same("latest")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "library/nginx",
+        "mirror/nginx",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("latest")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -428,15 +446,13 @@ async fn sync_skip_on_digest_match() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo",
+        "repo",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -484,15 +500,13 @@ async fn sync_blob_exists_at_target_skips_transfer() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo",
+        "repo",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -529,15 +543,13 @@ async fn sync_manifest_pull_failure() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo",
+        "repo",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -609,15 +621,13 @@ async fn sync_blob_transfer_retries_on_source_500() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo",
+        "repo",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -674,15 +684,13 @@ async fn sync_dedup_across_tags() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1"), TagPair::same("v2")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo",
+        "repo",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1"), TagPair::same("v2")],
+    );
 
     // Use max_concurrent=1 to ensure sequential execution so dedup works across tags.
     let engine = SyncEngine::new(fast_retry(), 1);
@@ -753,18 +761,16 @@ async fn sync_multiple_targets() {
 
     let source_client = mock_client(&source_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![
+        "repo",
+        "repo",
+        vec![
             target_entry("target-a", mock_client(&target_a)),
             target_entry("target-b", mock_client(&target_b)),
         ],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -827,15 +833,13 @@ async fn sync_retag() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::retag("latest", "stable")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo",
+        "repo",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::retag("latest", "stable")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -895,15 +899,13 @@ async fn sync_blob_transfer_failure() {
         .mount(&target_server)
         .await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -1051,15 +1053,13 @@ async fn sync_index_manifest_multi_platform() {
     mount_manifest_push(&target_server, "repo", &arm64_digest.to_string()).await;
     mount_manifest_push(&target_server, "repo", "latest").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("latest")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("latest")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -1122,15 +1122,13 @@ async fn sync_head_different_digest_proceeds_with_sync() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -1154,15 +1152,13 @@ async fn sync_empty_tags_produces_no_images() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -1217,15 +1213,13 @@ async fn sync_manifest_push_failure() {
         .mount(&target_server)
         .await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -1288,15 +1282,13 @@ async fn sync_retry_exhaustion_returns_final_error() {
     mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "repo").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -1380,26 +1372,22 @@ async fn sync_cross_repo_mount_success() {
     let target_client = mock_client(&target_server);
 
     // First mapping: repo-a syncs normally (pull+push).
-    let mapping_a = ResolvedMapping {
-        source_client: source_client.clone(),
-        source_repo: "repo-a".into(),
-        target_repo: "repo-a".into(),
-        targets: vec![target_entry("target", target_client.clone())],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping_a = test_mapping(
+        source_client.clone(),
+        "repo-a",
+        "repo-a",
+        vec![target_entry("target", target_client.clone())],
+        vec![TagPair::same("v1")],
+    );
 
     // Second mapping: repo-b should mount from repo-a.
-    let mapping_b = ResolvedMapping {
+    let mapping_b = test_mapping(
         source_client,
-        source_repo: "repo-b".into(),
-        target_repo: "repo-b".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo-b",
+        "repo-b",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     // Use max_concurrent=1 to ensure mapping_a completes before mapping_b starts,
     // so that repo-a's blobs are in the dedup map for cross-repo mount.
@@ -1502,25 +1490,21 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping_a = ResolvedMapping {
-        source_client: source_client.clone(),
-        source_repo: "repo-a".into(),
-        target_repo: "repo-a".into(),
-        targets: vec![target_entry("target", target_client.clone())],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping_a = test_mapping(
+        source_client.clone(),
+        "repo-a",
+        "repo-a",
+        vec![target_entry("target", target_client.clone())],
+        vec![TagPair::same("v1")],
+    );
 
-    let mapping_b = ResolvedMapping {
+    let mapping_b = test_mapping(
         source_client,
-        source_repo: "repo-b".into(),
-        target_repo: "repo-b".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo-b",
+        "repo-b",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     // Use max_concurrent=1 to ensure mapping_a completes first so mapping_b
     // has mount sources available in the dedup map.
@@ -1626,25 +1610,21 @@ async fn sync_cross_repo_mount_failure_falls_back() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping_a = ResolvedMapping {
-        source_client: source_client.clone(),
-        source_repo: "repo-a".into(),
-        target_repo: "repo-a".into(),
-        targets: vec![target_entry("target", target_client.clone())],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping_a = test_mapping(
+        source_client.clone(),
+        "repo-a",
+        "repo-a",
+        vec![target_entry("target", target_client.clone())],
+        vec![TagPair::same("v1")],
+    );
 
-    let mapping_b = ResolvedMapping {
+    let mapping_b = test_mapping(
         source_client,
-        source_repo: "repo-b".into(),
-        target_repo: "repo-b".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo-b",
+        "repo-b",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     // Use max_concurrent=1 to ensure mapping_a completes first so mapping_b
     // has mount sources available in the dedup map.
@@ -1710,18 +1690,16 @@ async fn sync_multi_target_partial_blob_failure_isolates_targets() {
         .mount(&target_b)
         .await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![
             target_entry("target-a", mock_client(&target_a)),
             target_entry("target-b", mock_client(&target_b)),
         ],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -1838,15 +1816,13 @@ async fn sync_progressive_cache_skips_shared_blob_head_check() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1"), TagPair::same("v2")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1"), TagPair::same("v2")],
+    );
 
     // Sequential execution ensures v1 completes and populates the cache before v2 starts.
     let engine = SyncEngine::new(fast_retry(), 1);
@@ -1924,15 +1900,13 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         c.set_blob_completed(target, layer_desc.digest.clone(), "repo-a".into());
     }
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo-b".into(),
-        target_repo: "repo-b".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo-b",
+        "repo-b",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -2010,15 +1984,13 @@ async fn sync_small_blob_uses_monolithic_upload() {
 
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -2116,15 +2088,13 @@ async fn sync_lazy_invalidation_on_mount_failure() {
         c.set_blob_completed("target", layer_desc.digest.clone(), "other-repo".into());
     }
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo",
+        "repo",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -2175,15 +2145,13 @@ async fn sync_cache_persist_and_load_round_trip() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target-reg", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target-reg", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let cache = empty_cache();
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -2275,15 +2243,13 @@ async fn sync_shutdown_stops_new_work() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1"), TagPair::same("v2")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1"), TagPair::same("v2")],
+    );
 
     let shutdown = ShutdownSignal::new();
     // Trigger shutdown immediately before the engine even starts running.
@@ -2355,15 +2321,13 @@ async fn sync_shutdown_drains_in_flight() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let shutdown = ShutdownSignal::new();
 
@@ -2449,15 +2413,13 @@ async fn sync_dedup_across_tags_concurrent() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1"), TagPair::same("v2")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1"), TagPair::same("v2")],
+    );
 
     // Use higher concurrency — both tags can execute simultaneously.
     let engine = SyncEngine::new(fast_retry(), 10);
@@ -2541,24 +2503,20 @@ async fn sync_cross_repo_mount_concurrent() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping_a = ResolvedMapping {
-        source_client: Arc::clone(&source_client),
-        source_repo: "repo-a".into(),
-        target_repo: "repo-a".into(),
-        targets: vec![target_entry("target", Arc::clone(&target_client))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
-    let mapping_b = ResolvedMapping {
+    let mapping_a = test_mapping(
+        Arc::clone(&source_client),
+        "repo-a",
+        "repo-a",
+        vec![target_entry("target", Arc::clone(&target_client))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_b = test_mapping(
         source_client,
-        source_repo: "repo-b".into(),
-        target_repo: "repo-b".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo-b",
+        "repo-b",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     // max_concurrent=10: both mappings can execute concurrently.
     let engine = SyncEngine::new(fast_retry(), 10);
@@ -2644,15 +2602,13 @@ async fn sync_nested_index_manifest_returns_error() {
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -2746,15 +2702,13 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         c.set_blob_completed("target", layer_desc.digest.clone(), "stale-repo".into());
     }
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -2887,15 +2841,13 @@ async fn sync_index_manifest_child_pull_failure() {
     // Target: manifest HEAD 404.
     mount_manifest_head_not_found(&target_server, "repo", "latest").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("latest")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("latest")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -2979,15 +2931,13 @@ async fn sync_partial_blob_failure_stops_remaining() {
     // No manifest PUT mock — if engine tries to push manifest, wiremock
     // returns 404 and the test fails differently.
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     // Use max_concurrent=1 to ensure sequential blob processing (config first).
     let engine = SyncEngine::new(fast_retry(), 1);
@@ -3086,15 +3036,13 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1"), TagPair::same("v2")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1"), TagPair::same("v2")],
+    );
 
     // Real concurrency — NOT 1.
     let engine = SyncEngine::new(fast_retry(), 50);
@@ -3214,18 +3162,16 @@ async fn sync_staging_pulls_once_pushes_twice() {
     let staging_dir = tempfile::tempdir().unwrap();
     let staging = BlobStage::new(staging_dir.path().to_path_buf());
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![
             target_entry("target-a", mock_client(&target_a)),
             target_entry("target-b", mock_client(&target_b)),
         ],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     // Use max_concurrent=1 so target-a completes and stages blobs before
     // target-b starts (reads from staging instead of pulling from source).
@@ -3303,15 +3249,13 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let shutdown = ShutdownSignal::new();
 
@@ -3405,15 +3349,13 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let shutdown = ShutdownSignal::new();
     let signal = shutdown.clone();
@@ -3516,18 +3458,16 @@ async fn sync_staging_writes_blobs_to_disk() {
     let staging_dir = tempfile::tempdir().unwrap();
     let staging = BlobStage::new(staging_dir.path().to_path_buf());
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![
             target_entry("target-a", mock_client(&target_a)),
             target_entry("target-b", mock_client(&target_b)),
         ],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 1);
     let report = engine
@@ -3615,15 +3555,13 @@ async fn sync_warm_cache_skips_blob_head_check() {
         c.set_blob_completed("target", layer_desc.digest.clone(), "repo".into());
     }
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -3709,19 +3647,17 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "src/nginx".into(),
-        target_repo: "tgt/nginx".into(),
-        targets: vec![TargetEntry {
+        "src/nginx",
+        "tgt/nginx",
+        vec![TargetEntry {
             name: RegistryName::new("target"),
             client: target_client,
             batch_checker: Some(Rc::new(checker)),
         }],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -3832,19 +3768,17 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![TargetEntry {
+        "repo",
+        "repo",
+        vec![TargetEntry {
             name: RegistryName::new("target"),
             client: target_client,
             batch_checker: Some(Rc::new(checker)),
         }],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -3940,15 +3874,13 @@ async fn sync_no_batch_checker_falls_back_to_per_blob_head() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", target_client)],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        "repo",
+        "repo",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -4029,19 +3961,17 @@ async fn sync_batch_checker_failure_falls_back_to_per_blob_head() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![TargetEntry {
+        "repo",
+        "repo",
+        vec![TargetEntry {
             name: RegistryName::new("target"),
             client: target_client,
             batch_checker: Some(Rc::new(checker)),
         }],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -4162,11 +4092,11 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
 
     let source_client = mock_client(&source_server);
 
-    let mapping = ResolvedMapping {
+    let mapping = test_mapping(
         source_client,
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![
+        "repo",
+        "repo",
+        vec![
             TargetEntry {
                 name: RegistryName::new("target-a"),
                 client: mock_client(&target_a_server),
@@ -4178,10 +4108,8 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
                 batch_checker: Some(Rc::new(checker_b)),
             },
         ],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -4313,19 +4241,17 @@ async fn sync_batch_checker_empty_result_transfers_all() {
     // Batch checker: empty set -- nothing exists at target.
     let (checker, batch_call_count) = MockBatchChecker::new("repo", HashSet::new());
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![TargetEntry {
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![TargetEntry {
             name: RegistryName::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -4430,11 +4356,11 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![
             TargetEntry {
                 name: RegistryName::new("target-a"),
                 client: mock_client(&target_a_server),
@@ -4442,10 +4368,8 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
             },
             target_entry("target-b", mock_client(&target_b_server)),
         ],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -4556,19 +4480,17 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![TargetEntry {
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![TargetEntry {
             name: RegistryName::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
-        tags: vec![TagPair::same("v1"), TagPair::same("v2")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1"), TagPair::same("v2")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -4751,19 +4673,17 @@ async fn sync_batch_checker_index_manifest_all_exist() {
     ]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![TargetEntry {
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![TargetEntry {
             name: RegistryName::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
-        tags: vec![TagPair::same("latest")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("latest")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -4871,19 +4791,17 @@ async fn sync_batch_checker_with_prewarmed_cache() {
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![TargetEntry {
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![TargetEntry {
             name: RegistryName::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -5163,15 +5081,14 @@ async fn sync_index_manifest_platform_filter() {
     // arm64 and windows manifest pushes should NOT happen -- wiremock will
     // fail verification if unexpected requests arrive (no mock mounted).
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("latest")],
-        platforms: Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]),
-        skip_existing: false,
-    };
+    let mut mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("latest")],
+    );
+    mapping.platforms = Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]);
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -5235,15 +5152,14 @@ async fn sync_skip_existing_skips_without_digest_comparison() {
     // If the engine incorrectly proceeds to sync, it will fail on missing
     // blob endpoints.
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: true,
-    };
+    let mut mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
+    mapping.skip_existing = true;
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -5311,15 +5227,13 @@ async fn sync_skip_existing_false_syncs_on_different_digest() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -5440,18 +5354,17 @@ async fn sync_skip_existing_multi_target_independent() {
     mount_blob_push(&target_b, "repo").await;
     mount_manifest_push(&target_b, "repo", "latest").await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![
+    let mut mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![
             target_entry("target-a", mock_client(&target_a)),
             target_entry("target-b", mock_client(&target_b)),
         ],
-        tags: vec![TagPair::same("latest")],
-        platforms: None,
-        skip_existing: true,
-    };
+        vec![TagPair::same("latest")],
+    );
+    mapping.skip_existing = true;
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -5695,18 +5608,17 @@ async fn sync_platform_filter_multi_target() {
         // arm64 manifest pushes must NOT arrive -- no mock mounted for them.
     }
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "repo".into(),
-        target_repo: "repo".into(),
-        targets: vec![
+    let mut mapping = test_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![
             target_entry("target-a", mock_client(&target_a)),
             target_entry("target-b", mock_client(&target_b)),
         ],
-        tags: vec![TagPair::same("latest")],
-        platforms: Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]),
-        skip_existing: false,
-    };
+        vec![TagPair::same("latest")],
+    );
+    mapping.platforms = Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]);
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -5863,15 +5775,13 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
         .mount(&target_server)
         .await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "src/nginx".into(),
-        target_repo: "tgt/nginx".into(),
-        targets: vec![target_entry("ecr-target", mock_client(&target_server))],
-        tags: vec![TagPair::same("v1.0")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "src/nginx",
+        "tgt/nginx",
+        vec![target_entry("ecr-target", mock_client(&target_server))],
+        vec![TagPair::same("v1.0")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
@@ -5970,15 +5880,13 @@ async fn sync_non_immutable_400_still_fails() {
         .mount(&target_server)
         .await;
 
-    let mapping = ResolvedMapping {
-        source_client: mock_client(&source_server),
-        source_repo: "src/app".into(),
-        target_repo: "tgt/app".into(),
-        targets: vec![target_entry("target", mock_client(&target_server))],
-        tags: vec![TagPair::same("latest")],
-        platforms: None,
-        skip_existing: false,
-    };
+    let mapping = test_mapping(
+        mock_client(&source_server),
+        "src/app",
+        "tgt/app",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("latest")],
+    );
 
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine

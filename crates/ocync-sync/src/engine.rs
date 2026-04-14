@@ -106,6 +106,8 @@ impl fmt::Display for RegistryName {
 /// resolved values.
 #[derive(Debug)]
 pub struct ResolvedMapping {
+    /// Source registry authority for cache key construction (e.g. `cgr.dev:443`).
+    pub source_authority: String,
     /// Client for the source registry.
     pub source_client: Arc<RegistryClient>,
     /// Repository path at the source (e.g. `library/nginx`).
@@ -310,6 +312,8 @@ pub struct SyncEngine {
     retry: RetryConfig,
     max_concurrent: usize,
     drain_deadline: Duration,
+    /// Timeout for the optimization source HEAD request. Default: 5 seconds.
+    discovery_head_timeout: Duration,
 }
 
 impl SyncEngine {
@@ -322,6 +326,7 @@ impl SyncEngine {
             retry,
             max_concurrent,
             drain_deadline: Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
+            discovery_head_timeout: Duration::from_secs(5),
         }
     }
 
@@ -329,6 +334,15 @@ impl SyncEngine {
     /// a shutdown signal is received. Defaults to 25 seconds.
     pub fn with_drain_deadline(mut self, deadline: Duration) -> Self {
         self.drain_deadline = deadline;
+        self
+    }
+
+    /// Set the timeout for the optimization source HEAD request.
+    ///
+    /// Default: 5 seconds. If the HEAD doesn't complete within this duration,
+    /// the engine falls through to the full source manifest pull.
+    pub fn with_discovery_head_timeout(mut self, timeout: Duration) -> Self {
+        self.discovery_head_timeout = timeout;
         self
     }
 
@@ -373,6 +387,7 @@ impl SyncEngine {
             for tag_pair in &mapping.tags {
                 let params = DiscoveryParams {
                     source_client: Arc::clone(&mapping.source_client),
+                    source_authority: mapping.source_authority.clone(),
                     source: ImageRef {
                         repo: mapping.source_repo.clone(),
                         tag: tag_pair.source.clone(),
@@ -385,6 +400,8 @@ impl SyncEngine {
                     retry: self.retry.clone(),
                     platforms: mapping.platforms.clone(),
                     skip_existing: mapping.skip_existing,
+                    cache: Rc::clone(&cache),
+                    discovery_head_timeout: self.discovery_head_timeout,
                 };
 
                 discovery_futures.push(async move { discover_tag(params).await });
@@ -507,6 +524,7 @@ impl SyncEngine {
 /// without intermediate borrows.
 struct DiscoveryParams {
     source_client: Arc<RegistryClient>,
+    source_authority: String,
     source: ImageRef,
     target: ImageRef,
     targets: Vec<TargetEntry>,
@@ -515,6 +533,8 @@ struct DiscoveryParams {
     platforms: Option<Vec<PlatformFilter>>,
     /// When `true`, skip syncing when the target already has any manifest.
     skip_existing: bool,
+    cache: Rc<RefCell<TransferStateCache>>,
+    discovery_head_timeout: Duration,
 }
 
 /// Discover a single (mapping, tag) pair: pull source manifest, HEAD-check targets.
@@ -530,12 +550,15 @@ struct DiscoveryParams {
 async fn discover_tag(params: DiscoveryParams) -> DiscoveryOutcome {
     let DiscoveryParams {
         source_client,
+        source_authority: _source_authority,
         source,
         target,
         targets,
         retry,
         platforms,
         skip_existing,
+        cache: _cache,
+        discovery_head_timeout: _discovery_head_timeout,
     } = params;
     // Pull source manifest (shared across all targets for this tag).
     let source_data = match pull_source_manifest(

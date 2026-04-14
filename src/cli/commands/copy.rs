@@ -31,7 +31,12 @@ pub(crate) async fn run(
     let target_client =
         Arc::new(build_registry_client(bare_hostname(args.destination.registry()), None).await?);
 
+    let source_authority = source_client
+        .registry_authority()
+        .unwrap_or_else(|_| "unknown:443".to_string());
+
     let mapping = ResolvedMapping {
+        source_authority,
         source_client,
         source_repo: args.source.repository().into(),
         target_repo: args.destination.repository().into(),
