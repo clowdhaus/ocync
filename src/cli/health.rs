@@ -42,6 +42,28 @@ impl HealthState {
     }
 }
 
+/// Route a request path to an HTTP status and body based on health state.
+fn handle_request<'a>(path: &str, state: &HealthState) -> (&'a str, &'a str) {
+    match path {
+        "/healthz" => {
+            if state.is_healthy() {
+                ("200 OK", "ok\n")
+            } else {
+                ("503 Service Unavailable", "sync stale\n")
+            }
+        }
+        _ => ("404 Not Found", "not found\n"),
+    }
+}
+
+/// Format an HTTP/1.1 response with the given status and body.
+fn format_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    )
+}
+
 /// Start the health server on the given port.
 ///
 /// Binds to `0.0.0.0:{port}` and serves `/healthz`. Runs until the
@@ -61,21 +83,8 @@ pub(crate) async fn serve(port: u16, state: Rc<RefCell<HealthState>>) -> io::Res
         let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
         let path = request.split_whitespace().nth(1).unwrap_or("");
 
-        let (status, body) = match path {
-            "/healthz" => {
-                if state.borrow().is_healthy() {
-                    ("200 OK", "ok\n")
-                } else {
-                    ("503 Service Unavailable", "sync stale\n")
-                }
-            }
-            _ => ("404 Not Found", "not found\n"),
-        };
-
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len(),
-        );
+        let (status, body) = handle_request(path, &state.borrow());
+        let response = format_response(status, body);
         if let Err(err) = stream.write_all(response.as_bytes()).await {
             tracing::warn!(error = %err, "failed to write health response");
         }
@@ -86,134 +95,44 @@ pub(crate) async fn serve(port: u16, state: Rc<RefCell<HealthState>>) -> io::Res
 mod tests {
     use super::*;
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::time::Duration;
+    // -- handler unit tests (no TCP, no port) --
 
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpStream;
-
-    /// Helper: start the health server on an OS-assigned port and return the port.
-    async fn start_server(state: Rc<RefCell<HealthState>>) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // Re-implement serve inline so we can use the pre-bound listener
-        // instead of racing on a port.
-        tokio::task::spawn_local(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let mut buf = [0u8; 256];
-                let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                    .await
-                    .unwrap_or(0);
-                let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
-                let path = request.split_whitespace().nth(1).unwrap_or("");
-
-                let (status, body) = match path {
-                    "/healthz" => {
-                        if state.borrow().is_healthy() {
-                            ("200 OK", "ok\n")
-                        } else {
-                            ("503 Service Unavailable", "sync stale\n")
-                        }
-                    }
-                    _ => ("404 Not Found", "not found\n"),
-                };
-
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-
-        port
+    #[test]
+    fn healthz_returns_503_before_first_sync() {
+        let state = HealthState::new(Duration::from_secs(60));
+        let (status, body) = handle_request("/healthz", &state);
+        assert_eq!(status, "503 Service Unavailable");
+        assert_eq!(body, "sync stale\n");
     }
 
-    /// Send a raw HTTP GET and return the full response as a string.
-    async fn http_get(port: u16, path: &str) -> String {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        String::from_utf8(buf).unwrap()
+    #[test]
+    fn healthz_returns_200_after_successful_sync() {
+        let mut state = HealthState::new(Duration::from_secs(60));
+        state.record_success();
+        let (status, body) = handle_request("/healthz", &state);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body, "ok\n");
     }
 
-    #[tokio::test]
-    async fn healthz_returns_503_before_first_sync() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
-                let port = start_server(state).await;
-                let resp = http_get(port, "/healthz").await;
-                assert!(
-                    resp.starts_with("HTTP/1.1 503"),
-                    "expected 503, got: {resp}"
-                );
-                assert!(resp.ends_with("sync stale\n"));
-            })
-            .await;
+    #[test]
+    fn healthz_returns_503_when_stale() {
+        let interval = Duration::from_millis(10);
+        let mut state = HealthState::new(interval);
+        state.last_success = Some(Instant::now() - interval * 3);
+        let (status, body) = handle_request("/healthz", &state);
+        assert_eq!(status, "503 Service Unavailable");
+        assert_eq!(body, "sync stale\n");
     }
 
-    #[tokio::test]
-    async fn healthz_returns_200_after_successful_sync() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
-                state.borrow_mut().record_success();
-                let port = start_server(state).await;
-                let resp = http_get(port, "/healthz").await;
-                assert!(
-                    resp.starts_with("HTTP/1.1 200"),
-                    "expected 200, got: {resp}"
-                );
-                assert!(resp.ends_with("ok\n"));
-            })
-            .await;
+    #[test]
+    fn unknown_path_returns_404() {
+        let state = HealthState::new(Duration::from_secs(60));
+        let (status, body) = handle_request("/foo", &state);
+        assert_eq!(status, "404 Not Found");
+        assert_eq!(body, "not found\n");
     }
 
-    #[tokio::test]
-    async fn healthz_returns_503_when_stale() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let interval = Duration::from_millis(50);
-                let state = Rc::new(RefCell::new(HealthState::new(interval)));
-                // Simulate a success that happened long ago.
-                state.borrow_mut().last_success = Some(Instant::now() - interval * 3);
-                let port = start_server(state).await;
-                let resp = http_get(port, "/healthz").await;
-                assert!(
-                    resp.starts_with("HTTP/1.1 503"),
-                    "expected 503, got: {resp}"
-                );
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn unknown_path_returns_404() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
-                let port = start_server(state).await;
-                let resp = http_get(port, "/foo").await;
-                assert!(
-                    resp.starts_with("HTTP/1.1 404"),
-                    "expected 404, got: {resp}"
-                );
-                assert!(resp.ends_with("not found\n"));
-            })
-            .await;
-    }
+    // -- state logic unit tests --
 
     #[test]
     fn health_state_no_success_is_unhealthy() {
@@ -234,5 +153,16 @@ mod tests {
         let mut state = HealthState::new(interval);
         state.last_success = Some(Instant::now() - interval * 3);
         assert!(!state.is_healthy());
+    }
+
+    // -- response formatting --
+
+    #[test]
+    fn format_response_is_valid_http() {
+        let response = format_response("200 OK", "ok\n");
+        assert_eq!(
+            response,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n"
+        );
     }
 }

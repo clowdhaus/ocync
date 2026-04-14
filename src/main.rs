@@ -277,8 +277,8 @@ pub(crate) struct WatchArgs {
     /// Output sync reports as JSON instead of text summaries.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Port for the health endpoint (default: 9090).
-    #[arg(long, default_value = "9090")]
+    /// Port for the health endpoint (default: 8080).
+    #[arg(long, default_value = "8080")]
     pub(crate) health_port: u16,
 }
 
