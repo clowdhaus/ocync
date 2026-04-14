@@ -10,6 +10,8 @@ pub mod detect;
 pub mod docker;
 /// AWS ECR authentication provider.
 pub mod ecr;
+/// Static bearer token authentication provider.
+pub mod static_token;
 
 pub use detect::{ProviderKind, detect_provider_kind};
 
