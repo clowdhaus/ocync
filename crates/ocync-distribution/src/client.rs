@@ -129,6 +129,22 @@ impl RegistryClient {
         }
     }
 
+    /// Return the registry authority as `host:port` for use as a cache key.
+    ///
+    /// Returns `Err` if the URL has no host (a bug in client construction).
+    /// Does not include the URL scheme — registries at the same host:port
+    /// but different schemes produce the same key, which is acceptable
+    /// because no production registry serves both HTTP and HTTPS on the
+    /// same port.
+    pub fn registry_authority(&self) -> Result<String, Error> {
+        let host = self
+            .base_url
+            .host_str()
+            .ok_or_else(|| Error::Other(format!("registry URL has no host: {}", self.base_url)))?;
+        let port = self.base_url.port_or_known_default().unwrap_or(443);
+        Ok(format!("{host}:{port}"))
+    }
+
     /// Perform an authenticated GET request.
     ///
     /// Acquires an AIMD permit for the given operation, attaches auth headers,
@@ -339,6 +355,32 @@ mod tests {
         fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(async {})
         }
+    }
+
+    #[test]
+    fn registry_authority_https_default_port() {
+        let client = RegistryClient::builder(test_base_url()).build().unwrap();
+        assert_eq!(
+            client.registry_authority().unwrap(),
+            "registry-1.docker.io:443"
+        );
+    }
+
+    #[test]
+    fn registry_authority_explicit_port() {
+        let base = Url::parse("http://localhost:5000").unwrap();
+        let client = RegistryClient::builder(base).build().unwrap();
+        assert_eq!(client.registry_authority().unwrap(), "localhost:5000");
+    }
+
+    #[test]
+    fn registry_authority_http_default_port() {
+        let base = Url::parse("http://registry.example.com").unwrap();
+        let client = RegistryClient::builder(base).build().unwrap();
+        assert_eq!(
+            client.registry_authority().unwrap(),
+            "registry.example.com:80"
+        );
     }
 
     #[test]
