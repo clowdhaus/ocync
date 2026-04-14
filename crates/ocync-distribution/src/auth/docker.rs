@@ -30,25 +30,25 @@ const DOCKER_HUB_ALIASES: &[&str] = &[
 #[serde(default)]
 pub struct DockerConfig {
     /// Static credentials keyed by registry hostname.
-    pub auths: HashMap<String, AuthEntry>,
+    auths: HashMap<String, AuthEntry>,
     /// Credential helpers keyed by registry hostname.
     #[serde(rename = "credHelpers")]
-    pub cred_helpers: HashMap<String, String>,
+    cred_helpers: HashMap<String, String>,
     /// Default credential store (e.g. "desktop", "osxkeychain").
     #[serde(rename = "credsStore")]
-    pub creds_store: Option<String>,
+    creds_store: Option<String>,
 }
 
 /// A single auth entry from the `auths` map.
 #[derive(Deserialize, Default)]
 #[serde(default)]
-pub struct AuthEntry {
+struct AuthEntry {
     /// Base64-encoded `username:password`.
-    pub auth: Option<String>,
+    auth: Option<String>,
     /// Username (when stored separately).
-    pub username: Option<String>,
+    username: Option<String>,
     /// Password (when stored separately).
-    pub password: Option<String>,
+    password: Option<String>,
 }
 
 impl fmt::Debug for AuthEntry {
@@ -70,7 +70,7 @@ impl DockerConfig {
     }
 
     /// Load from a specific file path.
-    pub fn load_from(path: &Path) -> Result<Self, Error> {
+    fn load_from(path: &Path) -> Result<Self, Error> {
         let contents = std::fs::read_to_string(path).map_err(|e| {
             Error::Other(format!(
                 "failed to read docker config at {}: {e}",
@@ -690,11 +690,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_base_url(
-            mock.uri(),
-            reqwest::Client::new(),
-            Some(creds),
-        );
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), Some(creds));
         let token = auth
             .get_token(&[Scope::pull("library/nginx")])
             .await
@@ -726,11 +722,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_base_url(
-            mock.uri(),
-            reqwest::Client::new(),
-            None,
-        );
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), None);
         let token = auth.get_token(&[Scope::pull("public/repo")]).await.unwrap();
         assert_eq!(token.value(), "anon-token");
     }
@@ -759,11 +751,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_base_url(
-            mock.uri(),
-            reqwest::Client::new(),
-            None,
-        );
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), None);
         let t1 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         let t2 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         assert_eq!(t1.value(), "cached");
@@ -795,11 +783,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_base_url(
-            mock.uri(),
-            reqwest::Client::new(),
-            None,
-        );
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), None);
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.invalidate().await;
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();

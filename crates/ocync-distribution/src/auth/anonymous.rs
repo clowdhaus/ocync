@@ -129,7 +129,10 @@ mod tests {
             .await;
 
         let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
-        let token = auth.get_token(&[Scope::pull("library/nginx")]).await.unwrap();
+        let token = auth
+            .get_token(&[Scope::pull("library/nginx")])
+            .await
+            .unwrap();
         assert_eq!(token.value(), "anon-123");
     }
 

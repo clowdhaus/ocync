@@ -319,9 +319,10 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/token"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"token": "anon-tok", "expires_in": 300}),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "anon-tok", "expires_in": 300})),
+            )
             .expect(1)
             .mount(&mock)
             .await;
@@ -349,10 +350,14 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/token"))
-            .and(wiremock::matchers::header("Authorization", "Basic dXNlcjpwYXNz"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"token": "basic-tok"}),
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Basic dXNlcjpwYXNz",
             ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "basic-tok"})),
+            )
             .expect(1)
             .mount(&mock)
             .await;

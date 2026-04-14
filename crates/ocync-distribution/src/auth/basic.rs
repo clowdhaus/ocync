@@ -62,7 +62,8 @@ impl BasicAuth {
     /// Create a new Basic auth provider with an explicit base URL.
     ///
     /// Use this for registries that don't use HTTPS (e.g. `http://localhost:5000`).
-    pub fn with_base_url(
+    #[cfg(test)]
+    fn with_base_url(
         base_url: impl Into<String>,
         http: reqwest::Client,
         credentials: Credentials,
@@ -98,13 +99,9 @@ impl AuthProvider for BasicAuth {
                 }
             }
 
-            let token = exchange_token(
-                &self.http,
-                &self.base_url,
-                &scopes,
-                Some(&self.credentials),
-            )
-            .await?;
+            let token =
+                exchange_token(&self.http, &self.base_url, &scopes, Some(&self.credentials))
+                    .await?;
             cache.insert(key, token.clone());
 
             Ok(token)
@@ -143,12 +140,13 @@ mod tests {
     async fn mount_v2_challenge(server: &MockServer, expect: u64) {
         Mock::given(method("GET"))
             .and(path("/v2/"))
-            .respond_with(
-                ResponseTemplate::new(401).insert_header(
-                    "WWW-Authenticate",
-                    format!(r#"Bearer realm="{}/token",service="test-registry""#, server.uri()),
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="test-registry""#,
+                    server.uri()
                 ),
-            )
+            ))
             .expect(expect)
             .mount(server)
             .await;
@@ -175,7 +173,10 @@ mod tests {
 
         let auth =
             BasicAuth::with_base_url(server.uri(), reqwest::Client::new(), test_credentials());
-        let token = auth.get_token(&[Scope::pull("library/nginx")]).await.unwrap();
+        let token = auth
+            .get_token(&[Scope::pull("library/nginx")])
+            .await
+            .unwrap();
         assert_eq!(token.value(), "tok123");
 
         // Verify query params on the token request.
@@ -189,7 +190,10 @@ mod tests {
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
-        assert_eq!(query_pairs.get("service").map(String::as_str), Some("test-registry"));
+        assert_eq!(
+            query_pairs.get("service").map(String::as_str),
+            Some("test-registry")
+        );
         assert_eq!(
             query_pairs.get("scope").map(String::as_str),
             Some("repository:library/nginx:pull")
