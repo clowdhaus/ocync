@@ -18,6 +18,7 @@ Every PR must be self-contained. Code in the diff must be called, tested, and in
 - No error variants that are never constructed
 - No struct fields that are never read
 - No enum variants for "future use"
+- No speculative derives — every `derive` trait (`Hash`, `Eq`, `Serialize`, etc.) must have a live caller; remove unused derives during pre-commit audit
 - No Cargo feature flags anywhere — single binary, all registries, always; this is a CLI tool, not a library
 - If you can't write a test that exercises a code path in this PR, it doesn't belong in this PR
 
@@ -78,7 +79,7 @@ New optimization layers must:
 - **Imports**: `use` statements, never inline paths; group std > external > crate; direct deps, not re-exports
 - **Docs**: every `.rs` file gets a `//!` module doc comment; all `pub` items get `///` doc comments
 - **Errors**: invalid user config must return `Result` errors, never silently degrade; users can't distinguish "nothing matched" from "config broken"
-- **Types**: prefer enums/newtypes over `String`/`u16` for domain concepts (media types, artifact types, status codes)
+- **Types**: prefer enums/newtypes over `String`/`u16` for domain concepts (media types, artifact types, status codes, repository names, registry identifiers). String newtypes use `Deref<Target=str>` for ergonomic borrowing; rely on implicit deref for `&str` params, use `.as_str()` only for generic bounds (`impl Into<String>`) and tracing fields. Only derive traits with live callers — no speculative `Hash`, `Eq`, or `Serialize` "just in case"
 - **Dependencies**: `default-features = false` on everything; justify every new dep; prefer hand-written code under ~100 lines over a crate; use `regex-lite` for ASCII patterns; all shared deps must use `[workspace.dependencies]` — never add direct version references to crate-level Cargo.toml when the dep exists elsewhere in the workspace
 - **Security**: manual `Debug` impls use `&"[REDACTED]"` for secrets; tracing HTTP crate caps via `add_directive()` after `EnvFilter`, never in base filter string
 - **Auth**: expose both `get_token()` and `invalidate()`; never hand-roll 401 retry — use shared `invalidate_auth()` + retry helpers; use API-provided expiry over constants
@@ -98,6 +99,9 @@ New optimization layers must:
 - **Registry module centralization**: all utilities for a specific registry provider (hostname parsing, SDK config loading, batch operations) live in one module (e.g., `ecr.rs`). Auth implementations import shared helpers from the provider module, not the other way around. Never scatter provider-specific code across auth, batch, and CLI layers. After centralizing, audit `pub use` re-exports in `lib.rs` — consumers may import via the submodule path, leaving the top-level re-export dead.
 - **Constructor encapsulation**: public constructors must not leak internal dependencies into caller signatures. If a struct needs an AWS SDK config internally, accept a hostname string and build the config inside — don't force callers to import `aws-config`. This keeps dependency boundaries clean: library crates own their deps, CLI crates just pass domain values.
 - **Avoid tuple type aliases for struct-like data**: when a tuple alias mirrors an existing struct's fields, add `Clone` to the struct instead. Tuples add destructuring noise at every use site and diverge from the struct over time. Cheap clones (`Arc`, `Rc`, `String`) make struct Clone zero-cost.
+- **stdout contention**: when a component writes to stdout (progress summary, status lines) and the command also has `--json` output on stdout, the component must suppress its stdout writes. Use a behavioral flag (`suppress_summary: bool`), not a format flag (`json: bool`) — the behavior is "don't write to stdout", not "the output is JSON". This applies to any stdout writer that coexists with structured output modes.
+- **Boolean parameters named for behavior**: name boolean constructor/method params for the behavior they control, not the trigger. `suppress_summary` is reusable (JSON mode, single-image copy, future formats); `json` is tied to one trigger and misleads when reused for other purposes.
+- **Trait in library, impl in consumer**: when a library crate defines a trait (e.g., `ProgressReporter`), keep the default/no-op impl (`NullProgress`) in the library but put presentation impls (`TextProgress`) in the consumer (CLI) crate. The library defines the contract; the consumer decides how to present. This prevents formatting code from leaking into library APIs.
 
 ## Testing standards
 
@@ -160,6 +164,7 @@ Test mocks (trait implementations, not just wiremock) must honor the same input/
 - A mock that returns a static response regardless of input is testing that the caller handles the response, not that the caller sends the right request
 - **Context parameters need `assert_eq!`**: store expected values (repo name, registry ID) in the mock struct and assert they match on every call. A `_repo` parameter in a mock hides bugs where the engine passes the source repo instead of the target repo — a silent correctness failure. Only `_`-prefix parameters in always-error mocks where input genuinely doesn't matter
 - Cross-check mock expected values against test setup: every `MockFoo::new("repo", ...)` must match the test's `ResolvedMapping.target_repo`
+- **Non-tautological assertions**: when a mock asserts `assert_eq!(repo, self.expected_repo)`, the test must use different values for source and target (e.g., `source_repo: "src/nginx"`, `target_repo: "tgt/nginx"`) so the assertion actually differentiates. A test where `source_repo == target_repo == "repo"` makes every repo assertion pass regardless of which value the engine passes — the mock check exists but catches nothing
 
 ### Batched operation resilience
 
@@ -172,6 +177,13 @@ Multi-batch operations (chunked API calls, paginated requests) must handle mid-b
 ### Fan-out feature testing
 
 For 1:N fan-out features (e.g., sync to multiple targets), at least one test must exercise N>1 with **different state per target**. A feature tested only at N=1 doesn't verify target independence — shared state bugs, cross-target contamination, and per-target stat tracking only surface at N>=2. Each target should have its own mock server and its own assertions.
+
+### Output format tests use exact assertions
+
+CLI output format tests must use exact string assertions or line-prefix matching, not substring searches. A test that uses `.contains("synced")` passes even if the format is completely wrong — the word just has to appear somewhere. For stable output formats (summary lines, per-image status):
+- At least one test should `assert_eq!` the exact output string
+- Per-line assertions should use `line.starts_with("synced  ")` (with correct padding), not `output.matches("synced").count()`
+- Tests for both stdout and stderr: verify content goes to the correct stream AND does not appear on the wrong stream (cross-stream negative assertions)
 
 ### wiremock for all network code
 
@@ -205,7 +217,7 @@ Never trust the implementer's self-report alone.
 
 - **Design spec**: `docs/specs/2026-04-10-ocync-design.md` — full design document
 - **Transfer optimization design**: `docs/specs/2026-04-12-transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse
-- **Implementation plan**: `docs/superpowers/plans/` (gitignored) — remaining v1 work is `2026-04-12-remaining-v1-implementation.md` (ECR batch done; remaining: platform filtering, output/logging, auth providers, progress/health/metrics, FIPS/packaging)
+- **Implementation plan**: `docs/superpowers/plans/` (gitignored) — remaining v1 work is `2026-04-12-remaining-v1-implementation.md` (remaining: auth providers, progress/health/metrics, FIPS/packaging)
 
 ## Commands
 
