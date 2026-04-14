@@ -10,9 +10,9 @@ use std::process::Command;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 
-use super::anonymous::AnonymousAuth;
-use super::basic::BasicAuth;
+use super::token_exchange::{exchange_token, scope_cache_key};
 use super::{AuthProvider, Credentials, Scope, Token};
 use crate::error::Error;
 
@@ -268,28 +268,27 @@ fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentials, Er
 
 /// Auth provider that resolves credentials from a Docker `config.json`.
 ///
-/// On the first `get_token()` call, resolves credentials for the
-/// configured registry hostname from the provided [`DockerConfig`].
-/// If credentials are found, delegates to [`BasicAuth`]; otherwise
-/// falls back to [`AnonymousAuth`].
+/// Resolves credentials for the configured registry hostname on construction,
+/// then uses the shared token-exchange flow with those credentials (or without,
+/// for anonymous access when no credentials are found). Tokens are cached
+/// per-scope with the same pattern as [`super::basic::BasicAuth`] and
+/// [`super::anonymous::AnonymousAuth`].
 pub struct DockerConfigAuth {
-    /// The registry hostname to look up in the Docker config.
-    registry: String,
-    /// The registry base URL for the underlying auth provider.
+    /// The registry base URL for token exchange.
     base_url: String,
-    /// The loaded Docker config.
-    config: DockerConfig,
-    /// HTTP client shared with the inner auth provider.
+    /// HTTP client for token requests.
     http: reqwest::Client,
-    /// Lazily initialized inner provider.
-    inner: tokio::sync::OnceCell<Box<dyn AuthProvider>>,
+    /// Resolved credentials (None = anonymous).
+    credentials: Option<Credentials>,
+    /// Cached tokens keyed by sorted scope strings.
+    cache: Mutex<HashMap<String, Token>>,
 }
 
 impl fmt::Debug for DockerConfigAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DockerConfigAuth")
-            .field("registry", &self.registry)
             .field("base_url", &self.base_url)
+            .field("has_credentials", &self.credentials.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -297,61 +296,39 @@ impl fmt::Debug for DockerConfigAuth {
 impl DockerConfigAuth {
     /// Create a new Docker config auth provider for the given hostname.
     ///
-    /// Uses HTTPS by default.
-    pub fn new(registry: impl Into<String>, config: DockerConfig, http: reqwest::Client) -> Self {
+    /// Resolves credentials from `config` immediately. Uses HTTPS by default.
+    pub fn new(
+        registry: impl Into<String>,
+        config: &DockerConfig,
+        http: reqwest::Client,
+    ) -> Result<Self, Error> {
         let registry = registry.into();
-        let base_url = format!("https://{registry}");
-        Self {
-            registry,
-            base_url,
-            config,
-            http,
-            inner: tokio::sync::OnceCell::new(),
+        let credentials = resolve_from_docker_config(config, &registry)?;
+        if credentials.is_some() {
+            tracing::debug!(registry = %registry, "docker config: resolved credentials");
+        } else {
+            tracing::debug!(registry = %registry, "docker config: no credentials, using anonymous");
         }
+        Ok(Self {
+            base_url: format!("https://{registry}"),
+            http,
+            credentials,
+            cache: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Create a Docker config auth provider with an explicit base URL (for testing).
     #[cfg(test)]
-    fn with_config_and_base_url(
-        config: DockerConfig,
-        registry: impl Into<String>,
+    fn with_base_url(
         base_url: impl Into<String>,
         http: reqwest::Client,
+        credentials: Option<Credentials>,
     ) -> Self {
         Self {
-            registry: registry.into(),
             base_url: base_url.into(),
-            config,
             http,
-            inner: tokio::sync::OnceCell::new(),
-        }
-    }
-
-    /// Resolve credentials and build the appropriate inner provider.
-    fn resolve_inner(&self) -> Result<Box<dyn AuthProvider>, Error> {
-        let http = self.http.clone();
-        match resolve_from_docker_config(&self.config, &self.registry)? {
-            Some(creds) => {
-                tracing::debug!(
-                    registry = %self.registry,
-                    "docker config: resolved credentials, using basic auth"
-                );
-                Ok(Box::new(BasicAuth::with_base_url(
-                    self.base_url.clone(),
-                    http,
-                    creds,
-                )))
-            }
-            None => {
-                tracing::debug!(
-                    registry = %self.registry,
-                    "docker config: no credentials found, using anonymous auth"
-                );
-                Ok(Box::new(AnonymousAuth::with_base_url(
-                    self.base_url.clone(),
-                    http,
-                )))
-            }
+            credentials,
+            cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -367,19 +344,33 @@ impl AuthProvider for DockerConfigAuth {
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
         let scopes = scopes.to_vec();
         Box::pin(async move {
-            let inner = self
-                .inner
-                .get_or_try_init(|| async { self.resolve_inner() })
-                .await?;
-            inner.get_token(&scopes).await
+            let key = scope_cache_key(&scopes);
+
+            let mut cache = self.cache.lock().await;
+
+            if let Some(token) = cache.get(&key) {
+                if !token.should_refresh() {
+                    return Ok(token.clone());
+                }
+            }
+
+            let token = exchange_token(
+                &self.http,
+                &self.base_url,
+                &scopes,
+                self.credentials.as_ref(),
+            )
+            .await?;
+            cache.insert(key, token.clone());
+
+            Ok(token)
         })
     }
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            if let Some(inner) = self.inner.get() {
-                inner.invalidate().await;
-            }
+            let mut cache = self.cache.lock().await;
+            cache.clear();
         })
     }
 }
@@ -666,25 +657,11 @@ mod tests {
     #[tokio::test]
     async fn docker_config_auth_with_inline_creds() {
         let mock = wiremock::MockServer::start().await;
-
-        let uri = mock.uri();
-        let mock_host = uri.trim_start_matches("http://");
         let encoded = BASE64.encode("testuser:testpass");
-        let config = DockerConfig {
-            auths: {
-                let mut m = HashMap::new();
-                m.insert(
-                    mock_host.to_string(),
-                    AuthEntry {
-                        auth: Some(encoded.clone()),
-                        username: None,
-                        password: None,
-                    },
-                );
-                m
-            },
-            cred_helpers: HashMap::new(),
-            creds_store: None,
+
+        let creds = Credentials::Basic {
+            username: "testuser".into(),
+            password: "testpass".into(),
         };
 
         // /v2/ returns 401 with Bearer challenge.
@@ -692,7 +669,7 @@ mod tests {
             .and(wiremock::matchers::path("/v2/"))
             .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
                 "WWW-Authenticate",
-                format!("Bearer realm=\"{}/token\"", mock.uri()),
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
             ))
             .expect(1)
             .mount(&mock)
@@ -713,11 +690,10 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_config_and_base_url(
-            config,
-            mock_host.to_string(),
+        let auth = DockerConfigAuth::with_base_url(
             mock.uri(),
             reqwest::Client::new(),
+            Some(creds),
         );
         let token = auth
             .get_token(&[Scope::pull("library/nginx")])
@@ -729,16 +705,12 @@ mod tests {
     #[tokio::test]
     async fn docker_config_auth_no_creds_falls_back_to_anonymous() {
         let mock = wiremock::MockServer::start().await;
-        let uri = mock.uri();
-        let mock_host = uri.trim_start_matches("http://");
-
-        let config = DockerConfig::default();
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v2/"))
             .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
                 "WWW-Authenticate",
-                format!("Bearer realm=\"{}/token\"", mock.uri()),
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
             ))
             .expect(1)
             .mount(&mock)
@@ -754,23 +726,142 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_config_and_base_url(
-            config,
-            mock_host.to_string(),
+        let auth = DockerConfigAuth::with_base_url(
             mock.uri(),
             reqwest::Client::new(),
+            None,
         );
         let token = auth.get_token(&[Scope::pull("public/repo")]).await.unwrap();
         assert_eq!(token.value(), "anon-token");
+    }
+
+    #[tokio::test]
+    async fn docker_config_auth_caches_tokens() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "cached", "expires_in": 3600})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let auth = DockerConfigAuth::with_base_url(
+            mock.uri(),
+            reqwest::Client::new(),
+            None,
+        );
+        let t1 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        let t2 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(t1.value(), "cached");
+        assert_eq!(t2.value(), "cached");
+        // expect(1) on both endpoints proves the second call hit cache.
+    }
+
+    #[tokio::test]
+    async fn docker_config_auth_invalidate_clears_cache() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "fresh", "expires_in": 3600})),
+            )
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        let auth = DockerConfigAuth::with_base_url(
+            mock.uri(),
+            reqwest::Client::new(),
+            None,
+        );
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        auth.invalidate().await;
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        // expect(2) proves cache was cleared.
     }
 
     #[test]
     fn docker_config_auth_name() {
         let auth = DockerConfigAuth::new(
             "example.com",
-            DockerConfig::default(),
+            &DockerConfig::default(),
             reqwest::Client::new(),
-        );
+        )
+        .unwrap();
         assert_eq!(auth.name(), "docker-config");
+    }
+
+    #[test]
+    fn docker_config_auth_resolves_from_config() {
+        let config = DockerConfig {
+            auths: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "ghcr.io".to_string(),
+                    AuthEntry {
+                        auth: Some(BASE64.encode("user:pass")),
+                        username: None,
+                        password: None,
+                    },
+                );
+                m
+            },
+            cred_helpers: HashMap::new(),
+            creds_store: None,
+        };
+        let auth = DockerConfigAuth::new("ghcr.io", &config, reqwest::Client::new()).unwrap();
+        // Verify credentials were resolved (has_credentials in Debug output).
+        let debug = format!("{auth:?}");
+        assert!(debug.contains("has_credentials: true"));
+    }
+
+    #[test]
+    fn docker_config_auth_no_match_is_anonymous() {
+        let config = DockerConfig {
+            auths: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "ghcr.io".to_string(),
+                    AuthEntry {
+                        auth: Some(BASE64.encode("user:pass")),
+                        username: None,
+                        password: None,
+                    },
+                );
+                m
+            },
+            cred_helpers: HashMap::new(),
+            creds_store: None,
+        };
+        // quay.io not in config — should resolve as anonymous.
+        let auth = DockerConfigAuth::new("quay.io", &config, reqwest::Client::new()).unwrap();
+        let debug = format!("{auth:?}");
+        assert!(debug.contains("has_credentials: false"));
     }
 }

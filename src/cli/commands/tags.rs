@@ -22,14 +22,7 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
         None
     };
 
-    let client = build_registry_client(
-        registry,
-        reg_config.as_ref().and_then(|r| r.auth_type.as_ref()),
-        None,
-        reg_config.as_ref().and_then(|r| r.credentials.as_ref()),
-        reg_config.as_ref().and_then(|r| r.token.as_deref()),
-    )
-    .await?;
+    let client = build_registry_client(registry, reg_config.as_ref()).await?;
 
     let repo_path = RepositoryName::from(repository);
     let all_tags = client.list_tags(&repo_path).await?;

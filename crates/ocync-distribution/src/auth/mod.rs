@@ -12,6 +12,8 @@ pub mod docker;
 pub mod ecr;
 /// Static bearer token authentication provider.
 pub mod static_token;
+/// Shared Docker v2 token-exchange protocol.
+pub(crate) mod token_exchange;
 
 pub use detect::{ProviderKind, detect_provider_kind};
 

@@ -195,14 +195,7 @@ async fn build_clients(config: &Config) -> Result<HashMap<String, Arc<RegistryCl
     let mut clients = HashMap::with_capacity(config.registries.len());
     for (name, reg) in &config.registries {
         let hostname = bare_hostname(&reg.url);
-        let client = build_registry_client(
-            hostname,
-            reg.auth_type.as_ref(),
-            reg.max_concurrent,
-            reg.credentials.as_ref(),
-            reg.token.as_deref(),
-        )
-        .await?;
+        let client = build_registry_client(hostname, Some(reg)).await?;
         clients.insert(name.clone(), Arc::new(client));
     }
     Ok(clients)
