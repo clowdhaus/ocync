@@ -541,6 +541,20 @@ impl SyncEngine {
             }
         }
 
+        // Prune snapshot entries for tags no longer in the mapping set.
+        // Prevents unbounded cache growth when source tags are deleted.
+        {
+            let live_keys: std::collections::HashSet<String> = mappings
+                .iter()
+                .flat_map(|m| {
+                    m.tags.iter().map(|t| {
+                        crate::cache::snapshot_key(&m.source_authority, &m.source_repo, &t.source)
+                    })
+                })
+                .collect();
+            cache.borrow_mut().prune_snapshots(&live_keys);
+        }
+
         let mut stats = compute_stats(&results);
         stats.discovery_cache_hits = discovery_hits;
         stats.discovery_cache_misses = discovery_misses;
