@@ -435,6 +435,24 @@ mod tests {
     }
 
     #[test]
+    fn verbosity_1_prints_immutable_tag_skip() {
+        let (progress, stderr, _stdout) = test_progress(1);
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::ImmutableTag,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert!(output.starts_with("skipped "), "should print skipped");
+        assert!(
+            output.contains("immutable tag"),
+            "should contain immutable tag reason"
+        );
+    }
+
+    #[test]
     fn run_completed_exact_format() {
         let (progress, _stderr, stdout) = test_progress(0);
         let report = SyncReport {
