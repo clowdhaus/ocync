@@ -269,6 +269,28 @@ enum DiscoveryOutcome {
     Failed(Vec<ImageResult>),
 }
 
+/// Signal from `discover_tag()` indicating which discovery path was taken.
+///
+/// Used by the pipeline loop to accumulate per-path counters for
+/// `SyncStats` observability without polluting `DiscoveryOutcome`.
+enum DiscoveryPath {
+    /// Source HEAD matched cache, no full source pull needed.
+    CacheHit,
+    /// Full source manifest pull was required (cold cache, source changed, config changed).
+    CacheMiss,
+    /// Source HEAD failed (network error, timeout, bad digest).
+    HeadFailure,
+    /// Source cache matched but target HEAD mismatch forced full pull.
+    TargetStale,
+}
+
+/// Wrapper returned by `discover_tag()` to carry both the outcome and the
+/// discovery cache signal.
+struct DiscoveryResult {
+    outcome: DiscoveryOutcome,
+    path: DiscoveryPath,
+}
+
 /// Blob frequency tracker for ordering blobs by popularity.
 ///
 /// Blobs shared across many images should be transferred first so the cache
@@ -381,6 +403,10 @@ impl SyncEngine {
         let mut results: Vec<ImageResult> = Vec::new();
         let mut shutting_down = false;
         let mut drain_deadline: Option<tokio::time::Instant> = None;
+        let mut discovery_hits: u64 = 0;
+        let mut discovery_misses: u64 = 0;
+        let mut discovery_head_failures: u64 = 0;
+        let mut discovery_target_stale: u64 = 0;
 
         // Seed discovery with all (mapping, tag) pairs.
         for mapping in &mappings {
@@ -466,10 +492,23 @@ impl SyncEngine {
                     );
                     break;
                 }
-                Some(outcome) = discovery_futures.next(),
+                Some(result) = discovery_futures.next(),
                     if !shutting_down && !discovery_futures.is_empty() =>
                 {
-                    match outcome {
+                    // Accumulate discovery path counters.
+                    match result.path {
+                        DiscoveryPath::CacheHit => discovery_hits += 1,
+                        DiscoveryPath::CacheMiss => discovery_misses += 1,
+                        DiscoveryPath::HeadFailure => {
+                            discovery_misses += 1;
+                            discovery_head_failures += 1;
+                        }
+                        DiscoveryPath::TargetStale => {
+                            discovery_misses += 1;
+                            discovery_target_stale += 1;
+                        }
+                    }
+                    match result.outcome {
                         DiscoveryOutcome::Skip(skip_results) => {
                             for r in &skip_results {
                                 progress.image_completed(r);
@@ -502,7 +541,11 @@ impl SyncEngine {
             }
         }
 
-        let stats = compute_stats(&results);
+        let mut stats = compute_stats(&results);
+        stats.discovery_cache_hits = discovery_hits;
+        stats.discovery_cache_misses = discovery_misses;
+        stats.discovery_head_failures = discovery_head_failures;
+        stats.discovery_target_stale = discovery_target_stale;
         let duration = run_start.elapsed();
 
         let report = SyncReport {
@@ -537,36 +580,273 @@ struct DiscoveryParams {
     discovery_head_timeout: Duration,
 }
 
-/// Discover a single (mapping, tag) pair: pull source manifest, HEAD-check targets.
+/// Discover a single (mapping, tag) pair: HEAD source, check cache, pull if needed.
 ///
-/// Returns a `DiscoveryOutcome` indicating whether all targets can be skipped,
-/// some need sync, or the source pull failed.
+/// Returns a `DiscoveryResult` carrying both the transfer outcome and a signal
+/// for which discovery path was taken (cache hit, miss, head failure, or stale).
+///
+/// The optimization flow:
+/// 1. HEAD source manifest with a short timeout
+/// 2. If HEAD succeeds, look up the tag digest cache
+/// 3. If cache hit (same source digest + platform key), HEAD-check all targets
+///    against the cached filtered digest
+/// 4. If all targets match, skip entirely (`CacheHit`)
+/// 5. If any target mismatches, full-pull for mismatched targets only (`TargetStale`)
+/// 6. If cache miss or HEAD failed, full-pull all targets (`CacheMiss` / `HeadFailure`)
 ///
 /// When `platforms` is `Some`, index manifests are filtered to only include
 /// descriptors matching the given platform filters before pulling children.
 ///
 /// When `skip_existing` is `true`, targets that return any manifest HEAD response
 /// (regardless of digest) are skipped without further comparison.
-async fn discover_tag(params: DiscoveryParams) -> DiscoveryOutcome {
+async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
     let DiscoveryParams {
         source_client,
-        source_authority: _source_authority,
+        source_authority,
         source,
         target,
         targets,
         retry,
         platforms,
         skip_existing,
-        cache: _cache,
-        discovery_head_timeout: _discovery_head_timeout,
+        cache,
+        discovery_head_timeout,
+    } = params;
+
+    let platform_key = crate::cache::platform_filter_key(platforms.as_deref());
+
+    // --- Step 1: HEAD source manifest with short timeout ---
+    let source_head_digest = match tokio::time::timeout(
+        discovery_head_timeout,
+        source_client.manifest_head(&source.repo, &source.tag),
+    )
+    .await
+    {
+        Ok(Ok(Some(head))) => Some(head.digest),
+        Ok(Ok(None)) => {
+            debug!(
+                repo = %source.repo, tag = %source.tag,
+                "source HEAD 404, falling through to full pull"
+            );
+            None
+        }
+        Ok(Err(e)) => {
+            debug!(
+                repo = %source.repo, tag = %source.tag, error = %e,
+                "source HEAD failed, falling through to full pull"
+            );
+            None
+        }
+        Err(_) => {
+            debug!(
+                repo = %source.repo, tag = %source.tag,
+                "source HEAD timed out, falling through to full pull"
+            );
+            None
+        }
+    };
+
+    // --- Steps 2-5: Cache lookup (only if HEAD succeeded) ---
+    if let Some(ref head_digest) = source_head_digest {
+        // Scoped borrow -- dropped before any .await
+        let cached = {
+            let c = cache.borrow();
+            c.source_snapshot(&source_authority, &source.repo, &source.tag)
+                .cloned()
+        };
+
+        if let Some(snapshot) = cached {
+            if *head_digest == snapshot.source_digest
+                && platform_key == snapshot.platform_filter_key
+            {
+                // Source unchanged, config unchanged. Check targets against
+                // the cached filtered_digest.
+                let compare_digest = snapshot.filtered_digest;
+
+                // HEAD-check all targets concurrently.
+                let mut head_checks = FuturesUnordered::new();
+                for entry in &targets {
+                    let client = Arc::clone(&entry.client);
+                    let repo = target.repo.clone();
+                    let tag = target.tag.clone();
+                    let name = entry.name.clone();
+                    let checker = entry.batch_checker.clone();
+                    head_checks.push(async move {
+                        let result = client.manifest_head(&repo, &tag).await;
+                        (name, client, checker, result)
+                    });
+                }
+
+                let mut skipped_results = Vec::new();
+                let mut mismatched_targets = Vec::new();
+
+                while let Some((target_name, target_client, batch_checker, result)) =
+                    head_checks.next().await
+                {
+                    match result {
+                        Ok(Some(_)) if skip_existing => {
+                            info!(
+                                source_repo = %source.repo,
+                                source_tag = %source.tag,
+                                target_repo = %target.repo,
+                                "skipping -- target manifest exists (skip_existing)"
+                            );
+                            tracing::debug!(target: "ocync::metrics", "skip_existing");
+                            skipped_results.push(ImageResult {
+                                image_id: Uuid::now_v7(),
+                                source: source.to_string(),
+                                target: target.to_string(),
+                                status: ImageStatus::Skipped {
+                                    reason: SkipReason::SkipExisting,
+                                },
+                                bytes_transferred: 0,
+                                blob_stats: BlobTransferStats::default(),
+                                duration: Duration::ZERO,
+                            });
+                        }
+                        Ok(Some(head)) if head.digest == compare_digest => {
+                            info!(
+                                source_repo = %source.repo,
+                                source_tag = %source.tag,
+                                target_repo = %target.repo,
+                                digest = %compare_digest,
+                                "skipping -- digest matches at target (cache hit)"
+                            );
+                            tracing::debug!(target: "ocync::metrics", "unchanged_skip");
+                            skipped_results.push(ImageResult {
+                                image_id: Uuid::now_v7(),
+                                source: source.to_string(),
+                                target: target.to_string(),
+                                status: ImageStatus::Skipped {
+                                    reason: SkipReason::DigestMatch,
+                                },
+                                bytes_transferred: 0,
+                                blob_stats: BlobTransferStats::default(),
+                                duration: Duration::ZERO,
+                            });
+                        }
+                        other => {
+                            if let Err(e) = &other {
+                                warn!(
+                                    target_repo = %target.repo,
+                                    target_tag = %target.tag,
+                                    error = %e,
+                                    "target manifest HEAD failed, proceeding with sync"
+                                );
+                            }
+                            mismatched_targets.push(TargetEntry {
+                                name: target_name,
+                                client: target_client,
+                                batch_checker,
+                            });
+                        }
+                    }
+                }
+
+                if mismatched_targets.is_empty() {
+                    // All targets match -- skip entirely (preserve existing cache entry).
+                    return DiscoveryResult {
+                        outcome: DiscoveryOutcome::Skip(skipped_results),
+                        path: DiscoveryPath::CacheHit,
+                    };
+                }
+
+                // Some targets stale -- need full pull for those targets.
+                let outcome = full_pull_and_build_tasks(FullPullParams {
+                    source_client: &source_client,
+                    source: &source,
+                    target: &target,
+                    targets: &mismatched_targets,
+                    skipped_results,
+                    retry: &retry,
+                    platforms: platforms.as_deref(),
+                    skip_existing,
+                    cache: &cache,
+                    source_authority: &source_authority,
+                    head_digest: Some(head_digest),
+                    platform_key: &platform_key,
+                })
+                .await;
+
+                return DiscoveryResult {
+                    outcome,
+                    path: DiscoveryPath::TargetStale,
+                };
+            }
+            // Cache entry exists but source changed or config changed -- fall through.
+        }
+        // No cache entry -- fall through.
+    }
+
+    // --- Full pull path (cache miss, HEAD failed, or source changed) ---
+    let path = if source_head_digest.is_none() {
+        DiscoveryPath::HeadFailure
+    } else {
+        DiscoveryPath::CacheMiss
+    };
+
+    let outcome = full_pull_and_build_tasks(FullPullParams {
+        source_client: &source_client,
+        source: &source,
+        target: &target,
+        targets: &targets,
+        skipped_results: Vec::new(),
+        retry: &retry,
+        platforms: platforms.as_deref(),
+        skip_existing,
+        cache: &cache,
+        source_authority: &source_authority,
+        head_digest: source_head_digest.as_ref(),
+        platform_key: &platform_key,
+    })
+    .await;
+
+    DiscoveryResult { outcome, path }
+}
+
+/// Parameters for [`full_pull_and_build_tasks`], bundled to keep the argument
+/// count under clippy's limit.
+struct FullPullParams<'a> {
+    source_client: &'a Arc<RegistryClient>,
+    source: &'a ImageRef,
+    target: &'a ImageRef,
+    targets: &'a [TargetEntry],
+    skipped_results: Vec<ImageResult>,
+    retry: &'a RetryConfig,
+    platforms: Option<&'a [PlatformFilter]>,
+    skip_existing: bool,
+    cache: &'a Rc<RefCell<TransferStateCache>>,
+    source_authority: &'a str,
+    head_digest: Option<&'a Digest>,
+    platform_key: &'a str,
+}
+
+/// Full discovery: pull source manifest, HEAD-check targets, build transfer tasks.
+///
+/// Updates the tag digest cache on successful pull. Used by both the cache-miss
+/// path and the target-stale path (where only mismatched targets need tasks).
+async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutcome {
+    let FullPullParams {
+        source_client,
+        source,
+        target,
+        targets,
+        mut skipped_results,
+        retry,
+        platforms,
+        skip_existing,
+        cache,
+        source_authority,
+        head_digest,
+        platform_key,
     } = params;
     // Pull source manifest (shared across all targets for this tag).
     let source_data = match pull_source_manifest(
-        &source_client,
+        source_client,
         &source.repo,
         &source.tag,
-        &retry,
-        platforms.as_deref(),
+        retry,
+        platforms,
     )
     .await
     {
@@ -595,22 +875,32 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryOutcome {
                     duration: Duration::ZERO,
                 })
                 .collect();
+            // Do NOT update cache on pull failure.
             return DiscoveryOutcome::Failed(fail_results);
         }
     };
+
+    // Update cache with fresh source data (regardless of target outcomes).
+    if let Some(hd) = head_digest {
+        let snapshot = crate::cache::SourceSnapshot {
+            source_digest: hd.clone(),
+            filtered_digest: source_data.pull.digest.clone(),
+            platform_filter_key: platform_key.to_string(),
+        };
+        let mut c = cache.borrow_mut();
+        c.set_source_snapshot(source_authority, &source.repo, &source.tag, snapshot);
+    } // borrow dropped before any .await
 
     let source_digest = &source_data.pull.digest;
 
     // HEAD-check all targets concurrently.
     let mut head_checks = FuturesUnordered::new();
-
-    for entry in &targets {
+    for entry in targets {
         let client = Arc::clone(&entry.client);
         let repo = target.repo.clone();
         let tag = target.tag.clone();
         let name = entry.name.clone();
         let checker = entry.batch_checker.clone();
-
         head_checks.push(async move {
             let result = client.manifest_head(&repo, &tag).await;
             (name, client, checker, result)
@@ -618,7 +908,6 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryOutcome {
     }
 
     let mut active_items = Vec::new();
-    let mut skipped_results = Vec::new();
 
     while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
@@ -674,7 +963,7 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryOutcome {
                 }
                 active_items.push(TransferTask {
                     source_data: Rc::clone(&source_data),
-                    source_client: Arc::clone(&source_client),
+                    source_client: Arc::clone(source_client),
                     target_name,
                     target_client,
                     source: source.clone(),
@@ -841,6 +1130,30 @@ async fn pull_source_manifest(
                             .is_some_and(|p| filters.iter().any(|f| p.matches(f)))
                     })
                     .collect();
+
+                if !index.manifests.is_empty() && kept.is_empty() {
+                    let available: Vec<String> = index
+                        .manifests
+                        .iter()
+                        .filter_map(|d| d.platform.as_ref())
+                        .map(|p| {
+                            if let Some(ref v) = p.variant {
+                                format!("{}/{}/{v}", p.os, p.architecture)
+                            } else {
+                                format!("{}/{}", p.os, p.architecture)
+                            }
+                        })
+                        .collect();
+                    let filter_strs: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
+                    return Err(crate::Error::Manifest {
+                        reference: tag.to_owned(),
+                        source: ocync_distribution::Error::Other(format!(
+                            "platform filter [{}] matched no manifests in index (source has: [{}])",
+                            filter_strs.join(", "),
+                            available.join(", "),
+                        )),
+                    });
+                }
 
                 info!(
                     repo = %repo,
