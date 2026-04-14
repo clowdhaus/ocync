@@ -73,15 +73,12 @@ pub(crate) async fn serve(port: u16, state: Rc<RefCell<HealthState>>) -> io::Res
         };
 
         let response = format!(
-            "HTTP/1.1 {status}\r\n\
-             Content-Type: text/plain\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {body}",
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len(),
         );
-        let _ = stream.write_all(response.as_bytes()).await;
+        if let Err(err) = stream.write_all(response.as_bytes()).await {
+            tracing::warn!(error = %err, "failed to write health response");
+        }
     }
 }
 
@@ -127,12 +124,7 @@ mod tests {
                 };
 
                 let response = format!(
-                    "HTTP/1.1 {status}\r\n\
-                     Content-Type: text/plain\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len(),
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
