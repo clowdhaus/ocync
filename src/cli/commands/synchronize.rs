@@ -38,6 +38,7 @@ pub(crate) async fn run(
     args: &SyncArgs,
     progress: &dyn ocync_sync::progress::ProgressReporter,
     shutdown: Option<&ShutdownSignal>,
+    external_cache: Option<Rc<RefCell<TransferStateCache>>>,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
 
@@ -81,10 +82,16 @@ pub(crate) async fn run(
         .unwrap_or(DEFAULT_CACHE_TTL);
 
     let cache_path = cache_dir.join("transfer_state.bin");
-    let cache = Rc::new(RefCell::new(TransferStateCache::load(
-        &cache_path,
-        cache_ttl,
-    )));
+    let (cache, should_persist) = match external_cache {
+        Some(ext) => (ext, false),
+        None => {
+            let loaded = Rc::new(RefCell::new(TransferStateCache::load(
+                &cache_path,
+                cache_ttl,
+            )));
+            (loaded, true)
+        }
+    };
 
     // Enable disk staging only when at least one mapping has multiple targets.
     let has_multi_target = mappings.iter().any(|m| m.targets.len() > 1);
@@ -120,9 +127,11 @@ pub(crate) async fn run(
         .run(mappings, cache.clone(), staging, progress, shutdown)
         .await;
 
-    // Persist cache after the run.
-    if let Err(e) = cache.borrow().persist(&cache_path) {
-        tracing::error!(error = %e, "failed to persist transfer state cache");
+    // Persist only when we own the cache (sync command). Watch mode persists on shutdown.
+    if should_persist {
+        if let Err(e) = cache.borrow().persist(&cache_path) {
+            tracing::error!(error = %e, "failed to persist transfer state cache");
+        }
     }
 
     write_output(&report, args.json)?;

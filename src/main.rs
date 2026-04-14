@@ -317,7 +317,7 @@ async fn main() -> std::process::ExitCode {
 
     let result = match cli.command {
         Commands::Sync(args) => {
-            cli::commands::synchronize::run(&args, &*progress, Some(&shutdown)).await
+            cli::commands::synchronize::run(&args, &*progress, Some(&shutdown), None).await
         }
         Commands::Copy(args) => cli::commands::copy::run(&args, &*progress).await,
         Commands::Tags(args) => cli::commands::tags::run(&args).await,
