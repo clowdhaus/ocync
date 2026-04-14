@@ -4,31 +4,36 @@
 //! cache on startup and skip redundant HEAD checks for blobs already known to
 //! exist at a target.
 //!
-//! # Binary format
+//! # Binary format (v2)
 //!
 //! ```text
 //! [4 bytes: header_len as u32 LE]
 //! [header_len bytes: postcard-serialized CacheHeader]
-//! [remaining bytes before last 4: postcard-serialized BlobDedupMap]
+//! [postcard-serialized BlobDedupMap]
+//! [postcard-serialized SourceSnapshotMap]          ← new in v2
 //! [4 bytes: CRC32 of everything before this]
 //! ```
+//!
+//! v1 files (no snapshot section) are loaded with an empty snapshot map.
 //!
 //! Only [`BlobStatus::ExistsAtTarget`] and [`BlobStatus::Completed`] entries
 //! are written to disk; transient states are stripped before serialization.
 
+use std::collections::HashMap as StdHashMap;
+use std::collections::HashSet as StdHashSet;
 use std::io;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ocync_distribution::Digest;
-use ocync_distribution::spec::RepositoryName;
+use ocync_distribution::spec::{PlatformFilter, RepositoryName};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::plan::{BlobDedupMap, BlobStatus};
 
 /// Cache file format version.
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 /// Header written at the start of every cache file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -39,6 +44,26 @@ struct CacheHeader {
     written_at: u64,
 }
 
+/// Cached source manifest state for the tag digest cache.
+///
+/// Records what was observed at the source (HEAD digest) and what was
+/// produced after platform filtering (filtered digest), enabling
+/// HEAD-before-GET skip logic in `discover_tag()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceSnapshot {
+    /// Source manifest digest as returned by HEAD (unfiltered for multi-arch).
+    pub source_digest: Digest,
+    /// Digest of the filtered manifest intended for targets.
+    pub filtered_digest: Digest,
+    /// Canonical platform filter string active when this entry was written.
+    /// Empty string means no platform filtering. Compared directly for
+    /// config change detection — no hashing needed.
+    pub platform_filter_key: String,
+}
+
+/// Map of `"{authority}\0{repo}\0{tag}"` → [`SourceSnapshot`].
+type SourceSnapshotMap = StdHashMap<String, SourceSnapshot>;
+
 /// Persistent transfer state cache.
 ///
 /// Wraps [`BlobDedupMap`] and adds load/persist operations so that stable blob
@@ -48,22 +73,21 @@ struct CacheHeader {
 ///
 /// `load` never returns an error — a missing, corrupt, or expired file simply
 /// yields an empty cache, and the next sync run will repopulate it.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TransferStateCache {
     dedup: BlobDedupMap,
+    snapshots: SourceSnapshotMap,
 }
 
 impl TransferStateCache {
     /// Create an empty cache.
     pub fn new() -> Self {
-        Self {
-            dedup: BlobDedupMap::new(),
-        }
+        Self::default()
     }
 
     /// Returns `true` if the cache contains no entries.
     pub fn is_empty(&self) -> bool {
-        self.dedup.is_empty()
+        self.dedup.is_empty() && self.snapshots.is_empty()
     }
 
     /// Get the current status for a blob at the given target.
@@ -124,6 +148,41 @@ impl TransferStateCache {
         self.dedup.invalidate(target, digest);
     }
 
+    /// Look up a cached source snapshot.
+    pub fn source_snapshot(
+        &self,
+        authority: &str,
+        repo: &RepositoryName,
+        tag: &str,
+    ) -> Option<&SourceSnapshot> {
+        self.snapshots.get(&snapshot_key(authority, repo, tag))
+    }
+
+    /// Record a source snapshot after a successful source pull.
+    pub fn set_source_snapshot(
+        &mut self,
+        authority: &str,
+        repo: &RepositoryName,
+        tag: &str,
+        snapshot: SourceSnapshot,
+    ) {
+        self.snapshots
+            .insert(snapshot_key(authority, repo, tag), snapshot);
+    }
+
+    /// Remove all source snapshot entries (used on SIGHUP config reload).
+    pub fn clear_snapshots(&mut self) {
+        self.snapshots.clear();
+    }
+
+    /// Remove snapshot entries for tags not in the provided set of live keys.
+    ///
+    /// Each key should be produced by [`snapshot_key`]. Call after each sync
+    /// cycle to prevent unbounded cache growth when source tags are deleted.
+    pub fn prune_snapshots(&mut self, live_keys: &StdHashSet<String>) {
+        self.snapshots.retain(|k, _| live_keys.contains(k));
+    }
+
     /// Atomically write the cache to `path`.
     ///
     /// Only [`BlobStatus::ExistsAtTarget`] and [`BlobStatus::Completed`]
@@ -137,7 +196,7 @@ impl TransferStateCache {
     /// modified if any step before the rename fails.
     pub fn persist(&self, path: &Path) -> Result<(), io::Error> {
         let persistable = self.dedup.filter_persistable();
-        let bytes = build_cache_bytes(&persistable)?;
+        let bytes = build_cache_bytes(&persistable, &self.snapshots)?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -222,7 +281,7 @@ impl TransferStateCache {
                 LoadError::Corrupt
             })?;
 
-        if header.version != CACHE_VERSION {
+        if header.version != 1 && header.version != CACHE_VERSION {
             warn!(
                 path = %path.display(),
                 version = header.version,
@@ -251,18 +310,25 @@ impl TransferStateCache {
         }
 
         let body = &payload[4 + header_len..];
-        let dedup: BlobDedupMap = postcard::from_bytes(body).map_err(|e| {
-            warn!(path = %path.display(), error = %e, "cache body deserialization failed, discarding");
-            LoadError::Corrupt
-        })?;
 
-        Ok(Self { dedup })
-    }
-}
+        // Use take_from_bytes so we can read the optional snapshot section after.
+        let (dedup, remainder): (BlobDedupMap, &[u8]) =
+            postcard::take_from_bytes(body).map_err(|e| {
+                warn!(path = %path.display(), error = %e, "cache body deserialization failed, discarding");
+                LoadError::Corrupt
+            })?;
 
-impl Default for TransferStateCache {
-    fn default() -> Self {
-        Self::new()
+        // v2 has a SourceSnapshotMap after the BlobDedupMap; v1 has nothing.
+        let snapshots: SourceSnapshotMap = if remainder.is_empty() {
+            SourceSnapshotMap::new()
+        } else {
+            postcard::from_bytes(remainder).map_err(|e| {
+                warn!(path = %path.display(), error = %e, "snapshot section deserialization failed, using empty snapshots");
+                LoadError::Corrupt
+            })?
+        };
+
+        Ok(Self { dedup, snapshots })
     }
 }
 
@@ -276,8 +342,12 @@ enum LoadError {
     Expired,
 }
 
-/// Serialize a [`BlobDedupMap`] into the on-disk cache format.
-fn build_cache_bytes(dedup: &BlobDedupMap) -> Result<Vec<u8>, io::Error> {
+/// Serialize a [`BlobDedupMap`] and [`SourceSnapshotMap`] into the on-disk
+/// cache format (v2).
+fn build_cache_bytes(
+    dedup: &BlobDedupMap,
+    snapshots: &SourceSnapshotMap,
+) -> Result<Vec<u8>, io::Error> {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -294,17 +364,46 @@ fn build_cache_bytes(dedup: &BlobDedupMap) -> Result<Vec<u8>, io::Error> {
     let body_bytes =
         postcard::to_allocvec(dedup).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+    let snapshot_bytes = postcard::to_allocvec(snapshots)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
     let header_len = header_bytes.len() as u32;
 
-    let mut buf = Vec::with_capacity(4 + header_bytes.len() + body_bytes.len() + 4);
+    let mut buf =
+        Vec::with_capacity(4 + header_bytes.len() + body_bytes.len() + snapshot_bytes.len() + 4);
     buf.extend_from_slice(&header_len.to_le_bytes());
     buf.extend_from_slice(&header_bytes);
     buf.extend_from_slice(&body_bytes);
+    buf.extend_from_slice(&snapshot_bytes);
 
     let crc = crc32fast::hash(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
 
     Ok(buf)
+}
+
+/// Build the cache key for a source snapshot.
+///
+/// Format: `"{authority}\0{repo}\0{tag}"` — NUL-separated to avoid
+/// ambiguity (repo names contain `/`).
+pub fn snapshot_key(authority: &str, repo: &RepositoryName, tag: &str) -> String {
+    format!("{authority}\0{repo}\0{tag}")
+}
+
+/// Compute the canonical platform filter key for cache comparison.
+///
+/// Sorts platforms alphabetically and joins with comma. Returns empty
+/// string for `None` or empty slice (no platform filtering).
+pub fn platform_filter_key(filters: Option<&[PlatformFilter]>) -> String {
+    let Some(filters) = filters else {
+        return String::new();
+    };
+    if filters.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
+    sorted.sort();
+    sorted.join(",")
 }
 
 #[cfg(test)]
@@ -376,7 +475,8 @@ mod tests {
     fn build_cache_bytes_roundtrip() {
         let mut dedup = BlobDedupMap::new();
         dedup.set_completed("reg.io", &digest(), &repo("repo/a"));
-        let bytes = build_cache_bytes(&dedup).unwrap();
+        let snapshots = SourceSnapshotMap::new();
+        let bytes = build_cache_bytes(&dedup, &snapshots).unwrap();
         // Verify CRC covers the entire payload
         let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);
         let stored = u32::from_le_bytes(crc_bytes.try_into().unwrap());
