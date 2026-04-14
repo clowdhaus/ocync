@@ -74,12 +74,24 @@ pub(crate) async fn serve(port: u16, state: Rc<RefCell<HealthState>>) -> io::Res
     tracing::info!(port, "health server listening");
 
     loop {
-        let (mut stream, _addr) = listener.accept().await?;
+        let (mut stream, _addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(error = %e, "health server accept failed, continuing");
+                continue;
+            }
+        };
 
         // Read the request line to extract the path. We only need the
         // first line — ignore headers and body.
         let mut buf = [0u8; 256];
-        let n = stream.read(&mut buf).await?;
+        let n = match stream.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "health server read failed, continuing");
+                continue;
+            }
+        };
         let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
         let path = request.split_whitespace().nth(1).unwrap_or("");
 
