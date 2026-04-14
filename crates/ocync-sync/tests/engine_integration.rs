@@ -18,7 +18,7 @@ use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
-use ocync_sync::{ImageStatus, SkipReason};
+use ocync_sync::{ErrorKind, ImageStatus, SkipReason};
 use url::Url;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5746,4 +5746,264 @@ async fn sync_platform_filter_multi_target() {
     assert_eq!(report.stats.bytes_transferred, expected_blob_bytes * 2);
     // wiremock expect(N) assertions verify platform filtering and pull-once
     // on index and amd64 child manifests.
+}
+
+/// ECR immutable tag: manifest push returns HTTP 400 with
+/// `ImageTagAlreadyExistsException` → engine produces `Skipped { ImmutableTag }`,
+/// NOT `Failed`. Blobs are transferred before the manifest push, so the image
+/// result should show the blob work that was done.
+#[tokio::test]
+async fn sync_immutable_tag_skips_instead_of_failing() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-immutable";
+    let layer_data = b"layer-immutable";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: serve manifest and blobs normally.
+    Mock::given(method("GET"))
+        .and(path("/v2/src/nginx/manifests/v1.0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src/nginx/blobs/{}", config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(config_data.to_vec())
+                .insert_header("content-length", config_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src/nginx/blobs/{}", layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(layer_data.to_vec())
+                .insert_header("content-length", layer_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Target: manifest HEAD 404, blob HEADs 404, blob push, manifest PUT → 400.
+    // All target endpoints use inline mocks with expect(N) to verify the engine
+    // transferred blobs before attempting the manifest push.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/nginx/manifests/v1.0"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    // Blob HEAD checks — one per blob.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/tgt/nginx/blobs/{}", config_desc.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/tgt/nginx/blobs/{}", layer_desc.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    // Monolithic blob push: POST initiate + PUT finalize — no PATCH for small blobs.
+    Mock::given(method("POST"))
+        .and(path("/v2/tgt/nginx/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/tgt/nginx/blobs/uploads/mono-id"),
+        )
+        .expect(2)
+        .mount(&target_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v2/tgt/nginx/blobs/uploads/mono-id"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(2)
+        .mount(&target_server)
+        .await;
+
+    // No PATCH registered — any PATCH would cause a wiremock 404 and fail the test.
+
+    // Manifest PUT returns ECR immutable tag error (HTTP 400).
+    Mock::given(method("PUT"))
+        .and(path("/v2/tgt/nginx/manifests/v1.0"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(
+                r#"{"errors":[{"code":"TAG_INVALID","message":"ImageTagAlreadyExistsException: The image tag 'v1.0' already exists"}]}"#,
+            ),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "src/nginx".into(),
+        target_repo: "tgt/nginx".into(),
+        targets: vec![target_entry("ecr-target", mock_client(&target_server))],
+        tags: vec![TagPair::same("v1.0")],
+        platforms: None,
+        skip_existing: false,
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Per-image: skipped with ImmutableTag reason, NOT failed.
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(
+            report.images[0].status,
+            ImageStatus::Skipped {
+                reason: SkipReason::ImmutableTag,
+            }
+        ),
+        "expected Skipped/ImmutableTag, got: {:?}",
+        report.images[0].status
+    );
+
+    // Blobs were transferred before the manifest push was attempted.
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+    assert_eq!(
+        report.images[0].bytes_transferred,
+        config_data.len() as u64 + layer_data.len() as u64
+    );
+
+    // Aggregate stats: counted as skipped, NOT failed.
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.images_synced, 0);
+    assert_eq!(report.stats.images_failed, 0);
+    assert_eq!(report.stats.blobs_transferred, 2);
+
+    // Exit code: 0 (skipped is success, not failure).
+    assert_eq!(report.exit_code(), 0);
+    // wiremock expect(N) verifies: 1 source manifest pull, 1 target manifest HEAD,
+    // 1 config blob pull, 1 layer blob pull, 1 manifest PUT (rejected).
+}
+
+/// Non-immutable 400 errors on manifest push still produce `Failed`, not `Skipped`.
+/// This is the negative assertion — ensures only the specific ECR exception triggers
+/// the skip path.
+#[tokio::test]
+async fn sync_non_immutable_400_still_fails() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-400";
+    let layer_data = b"layer-400";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: expect(1) on manifest pull to verify pull-once.
+    Mock::given(method("GET"))
+        .and(path("/v2/src/app/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    mount_blob_pull(&source_server, "src/app", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src/app", &layer_desc.digest, layer_data).await;
+
+    mount_manifest_head_not_found(&target_server, "tgt/app", "latest").await;
+    mount_blob_not_found(&target_server, "tgt/app", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/app", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/app").await;
+
+    // Manifest PUT returns 400 but NOT ImageTagAlreadyExistsException.
+    // 400 is not retryable, so expect exactly 1 attempt.
+    Mock::given(method("PUT"))
+        .and(path("/v2/tgt/app/manifests/latest"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"errors":[{"code":"MANIFEST_INVALID","message":"manifest invalid"}]}"#,
+        ))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    let mapping = ResolvedMapping {
+        source_client: mock_client(&source_server),
+        source_repo: "src/app".into(),
+        target_repo: "tgt/app".into(),
+        targets: vec![target_entry("target", mock_client(&target_server))],
+        tags: vec![TagPair::same("latest")],
+        platforms: None,
+        skip_existing: false,
+    };
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Must be Failed with ManifestPush kind, NOT Skipped.
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(
+            report.images[0].status,
+            ImageStatus::Failed {
+                kind: ErrorKind::ManifestPush,
+                ..
+            }
+        ),
+        "expected Failed/ManifestPush, got: {:?}",
+        report.images[0].status
+    );
+    assert_eq!(report.stats.images_failed, 1);
+    assert_eq!(report.stats.images_skipped, 0);
 }

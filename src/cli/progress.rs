@@ -69,8 +69,7 @@ impl TextProgress {
 
 impl ProgressReporter for TextProgress {
     fn image_started(&self, _source: &str, _target: &str) {
-        // No-op for text output. BarProgress (PR #21) will use this
-        // to create per-image progress bars.
+        // No-op for text output — only progress bar implementations need this.
     }
 
     fn image_completed(&self, result: &ImageResult) {
@@ -432,6 +431,24 @@ mod tests {
         assert_eq!(synced_lines, 2, "should have 2 synced lines");
         assert_eq!(skipped_lines, 1, "should have 1 skipped line");
         assert_eq!(failed_lines, 1, "should have 1 FAILED line");
+    }
+
+    #[test]
+    fn verbosity_1_prints_immutable_tag_skip() {
+        let (progress, stderr, _stdout) = test_progress(1);
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::ImmutableTag,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert!(output.starts_with("skipped "), "should print skipped");
+        assert!(
+            output.contains("immutable tag"),
+            "should contain immutable tag reason"
+        );
     }
 
     #[test]

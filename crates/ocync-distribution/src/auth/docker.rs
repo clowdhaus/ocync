@@ -2,14 +2,18 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 
-use super::Credentials;
+use super::token_exchange;
+use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::error::Error;
 
 /// Docker Hub hostnames that all resolve to the same credential entry.
@@ -26,25 +30,25 @@ const DOCKER_HUB_ALIASES: &[&str] = &[
 #[serde(default)]
 pub struct DockerConfig {
     /// Static credentials keyed by registry hostname.
-    pub auths: HashMap<String, AuthEntry>,
+    auths: HashMap<String, AuthEntry>,
     /// Credential helpers keyed by registry hostname.
     #[serde(rename = "credHelpers")]
-    pub cred_helpers: HashMap<String, String>,
+    cred_helpers: HashMap<String, String>,
     /// Default credential store (e.g. "desktop", "osxkeychain").
     #[serde(rename = "credsStore")]
-    pub creds_store: Option<String>,
+    creds_store: Option<String>,
 }
 
 /// A single auth entry from the `auths` map.
 #[derive(Deserialize, Default)]
 #[serde(default)]
-pub struct AuthEntry {
+struct AuthEntry {
     /// Base64-encoded `username:password`.
-    pub auth: Option<String>,
+    auth: Option<String>,
     /// Username (when stored separately).
-    pub username: Option<String>,
+    username: Option<String>,
     /// Password (when stored separately).
-    pub password: Option<String>,
+    password: Option<String>,
 }
 
 impl fmt::Debug for AuthEntry {
@@ -66,7 +70,7 @@ impl DockerConfig {
     }
 
     /// Load from a specific file path.
-    pub fn load_from(path: &Path) -> Result<Self, Error> {
+    fn load_from(path: &Path) -> Result<Self, Error> {
         let contents = std::fs::read_to_string(path).map_err(|e| {
             Error::Other(format!(
                 "failed to read docker config at {}: {e}",
@@ -260,6 +264,115 @@ fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentials, Er
         username: resp.username,
         password: resp.secret,
     })
+}
+
+/// Auth provider that resolves credentials from a Docker `config.json`.
+///
+/// Resolves credentials for the configured registry hostname on construction,
+/// then uses the shared token-exchange flow with those credentials (or without,
+/// for anonymous access when no credentials are found). Tokens are cached
+/// per-scope with the same pattern as [`super::basic::BasicAuth`] and
+/// [`super::anonymous::AnonymousAuth`].
+pub struct DockerConfigAuth {
+    /// The registry base URL for token exchange.
+    base_url: String,
+    /// HTTP client for token requests.
+    http: reqwest::Client,
+    /// Resolved credentials (None = anonymous).
+    credentials: Option<Credentials>,
+    /// Cached tokens keyed by sorted scope strings.
+    cache: Mutex<HashMap<String, Token>>,
+}
+
+impl fmt::Debug for DockerConfigAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DockerConfigAuth")
+            .field("base_url", &self.base_url)
+            .field("has_credentials", &self.credentials.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DockerConfigAuth {
+    /// Create a new Docker config auth provider for the given hostname.
+    ///
+    /// Resolves credentials from `config` immediately. Uses HTTPS by default.
+    pub fn new(
+        registry: impl Into<String>,
+        config: &DockerConfig,
+        http: reqwest::Client,
+    ) -> Result<Self, Error> {
+        let registry = registry.into();
+        let credentials = resolve_from_docker_config(config, &registry)?;
+        if credentials.is_some() {
+            tracing::debug!(registry = %registry, "docker config: resolved credentials");
+        } else {
+            tracing::debug!(registry = %registry, "docker config: no credentials, using anonymous");
+        }
+        Ok(Self {
+            base_url: format!("https://{registry}"),
+            http,
+            credentials,
+            cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Create a Docker config auth provider with an explicit base URL (for testing).
+    #[cfg(test)]
+    fn with_base_url(
+        base_url: impl Into<String>,
+        http: reqwest::Client,
+        credentials: Option<Credentials>,
+    ) -> Self {
+        Self {
+            base_url: base_url.into(),
+            http,
+            credentials,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl AuthProvider for DockerConfigAuth {
+    fn name(&self) -> &'static str {
+        "docker-config"
+    }
+
+    fn get_token(
+        &self,
+        scopes: &[Scope],
+    ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
+        let scopes = scopes.to_vec();
+        Box::pin(async move {
+            let key = scopes_cache_key(&scopes);
+
+            let mut cache = self.cache.lock().await;
+
+            if let Some(token) = cache.get(&key) {
+                if !token.should_refresh() {
+                    return Ok(token.clone());
+                }
+            }
+
+            let token = token_exchange::exchange(
+                &self.http,
+                &self.base_url,
+                &scopes,
+                self.credentials.as_ref(),
+            )
+            .await?;
+            cache.insert(key, token.clone());
+
+            Ok(token)
+        })
+    }
+
+    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let mut cache = self.cache.lock().await;
+            cache.clear();
+        })
+    }
 }
 
 /// Check if a hostname is a Docker Hub alias.
@@ -537,5 +650,202 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(creds, Credentials::Basic { username, .. } if username == "user"));
+    }
+
+    use crate::auth::Scope;
+
+    #[tokio::test]
+    async fn docker_config_auth_with_inline_creds() {
+        let mock = wiremock::MockServer::start().await;
+        let encoded = BASE64.encode("testuser:testpass");
+
+        let creds = Credentials::Basic {
+            username: "testuser".into(),
+            password: "testpass".into(),
+        };
+
+        // /v2/ returns 401 with Bearer challenge.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Token endpoint expects Basic auth.
+        let expected_basic = format!("Basic {encoded}");
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                expected_basic.as_str(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"token": "docker-config-token", "expires_in": 300}),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), Some(creds));
+        let token = auth
+            .get_token(&[Scope::pull("library/nginx")])
+            .await
+            .unwrap();
+        assert_eq!(token.value(), "docker-config-token");
+    }
+
+    #[tokio::test]
+    async fn docker_config_auth_no_creds_falls_back_to_anonymous() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "anon-token"})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), None);
+        let token = auth.get_token(&[Scope::pull("public/repo")]).await.unwrap();
+        assert_eq!(token.value(), "anon-token");
+    }
+
+    #[tokio::test]
+    async fn docker_config_auth_caches_tokens() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "cached", "expires_in": 3600})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), None);
+        let t1 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        let t2 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(t1.value(), "cached");
+        assert_eq!(t2.value(), "cached");
+        // expect(1) on both endpoints proves the second call hit cache.
+    }
+
+    #[tokio::test]
+    async fn docker_config_auth_invalidate_clears_cache() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "fresh", "expires_in": 3600})),
+            )
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), None);
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        auth.invalidate().await;
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        // expect(2) proves cache was cleared.
+    }
+
+    #[test]
+    fn docker_config_auth_name() {
+        let auth = DockerConfigAuth::new(
+            "example.com",
+            &DockerConfig::default(),
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert_eq!(auth.name(), "docker-config");
+    }
+
+    #[test]
+    fn docker_config_auth_resolves_from_config() {
+        let config = DockerConfig {
+            auths: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "ghcr.io".to_string(),
+                    AuthEntry {
+                        auth: Some(BASE64.encode("user:pass")),
+                        username: None,
+                        password: None,
+                    },
+                );
+                m
+            },
+            cred_helpers: HashMap::new(),
+            creds_store: None,
+        };
+        let auth = DockerConfigAuth::new("ghcr.io", &config, reqwest::Client::new()).unwrap();
+        // Verify credentials were resolved (has_credentials in Debug output).
+        let debug = format!("{auth:?}");
+        assert!(debug.contains("has_credentials: true"));
+    }
+
+    #[test]
+    fn docker_config_auth_no_match_is_anonymous() {
+        let config = DockerConfig {
+            auths: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "ghcr.io".to_string(),
+                    AuthEntry {
+                        auth: Some(BASE64.encode("user:pass")),
+                        username: None,
+                        password: None,
+                    },
+                );
+                m
+            },
+            cred_helpers: HashMap::new(),
+            creds_store: None,
+        };
+        // quay.io not in config — should resolve as anonymous.
+        let auth = DockerConfigAuth::new("quay.io", &config, reqwest::Client::new()).unwrap();
+        let debug = format!("{auth:?}");
+        assert!(debug.contains("has_credentials: false"));
     }
 }

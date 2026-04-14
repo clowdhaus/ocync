@@ -27,10 +27,9 @@ pub(crate) async fn run(
     let dst_tag = args.destination.tag().unwrap_or(src_tag);
 
     let source_client =
-        Arc::new(build_registry_client(bare_hostname(args.source.registry()), None, None).await?);
-    let target_client = Arc::new(
-        build_registry_client(bare_hostname(args.destination.registry()), None, None).await?,
-    );
+        Arc::new(build_registry_client(bare_hostname(args.source.registry()), None).await?);
+    let target_client =
+        Arc::new(build_registry_client(bare_hostname(args.destination.registry()), None).await?);
 
     let mapping = ResolvedMapping {
         source_client,

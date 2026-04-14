@@ -171,13 +171,14 @@ pub(crate) enum AuthType {
     Anonymous,
     /// HTTP basic auth.
     Basic,
-    /// Bearer token.
-    Token,
+    /// Pre-obtained bearer token (PAT, CI token).
+    #[serde(alias = "token")]
+    StaticToken,
     /// Docker config.json credential store.
     DockerConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 pub(crate) struct RegistryConfig {
     pub url: String,
 
@@ -190,6 +191,44 @@ pub(crate) struct RegistryConfig {
     /// registry across all action types. This is independent of the global
     /// `max_concurrent_transfers` (which caps image-level parallelism).
     pub max_concurrent: Option<usize>,
+
+    /// Credentials for Basic auth (`auth_type: basic`).
+    #[serde(default)]
+    pub credentials: Option<BasicCredentials>,
+
+    /// Bearer token for static token auth (`auth_type: static_token`).
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for RegistryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryConfig")
+            .field("url", &self.url)
+            .field("auth_type", &self.auth_type)
+            .field("max_concurrent", &self.max_concurrent)
+            .field("credentials", &self.credentials)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Credentials for HTTP Basic authentication.
+#[derive(Deserialize, Serialize)]
+pub(crate) struct BasicCredentials {
+    /// Username for authentication.
+    pub username: String,
+    /// Password or access token.
+    pub password: String,
+}
+
+impl std::fmt::Debug for BasicCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +474,33 @@ fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), Config
             )));
         }
     }
+
+    if let Some(ref auth_type) = registry.auth_type {
+        match auth_type {
+            AuthType::Basic => {
+                if registry.credentials.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "registries.{name}: auth_type 'basic' requires 'credentials' \
+                         with 'username' and 'password'"
+                    )));
+                }
+            }
+            AuthType::StaticToken => {
+                if registry.token.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "registries.{name}: auth_type 'token' requires a 'token' field"
+                    )));
+                }
+            }
+            AuthType::Ecr
+            | AuthType::Gcr
+            | AuthType::Acr
+            | AuthType::Ghcr
+            | AuthType::Anonymous
+            | AuthType::DockerConfig => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -1332,6 +1398,8 @@ mappings:
             url: "example.com".to_string(),
             auth_type: None,
             max_concurrent: Some(0),
+            credentials: None,
+            token: None,
         };
         let err = validate_registry("example", &registry).unwrap_err();
         match err {
@@ -1349,7 +1417,149 @@ mappings:
             url: "example.com".to_string(),
             auth_type: None,
             max_concurrent: Some(25),
+            credentials: None,
+            token: None,
         };
         validate_registry("example", &registry).unwrap();
+    }
+
+    // -- Auth-type validation -------------------------------------------------
+
+    #[test]
+    fn validate_basic_without_credentials_is_error() {
+        let yaml = r#"
+registries:
+  ghcr:
+    url: ghcr.io
+    auth_type: basic
+mappings:
+  - from: library/nginx
+    source: ghcr
+    targets: [ghcr]
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_registry("ghcr", config.registries.get("ghcr").unwrap());
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err().to_string().contains("credentials"),
+            "error should mention credentials"
+        );
+    }
+
+    #[test]
+    fn validate_basic_with_credentials_is_ok() {
+        let yaml = r#"
+registries:
+  ghcr:
+    url: ghcr.io
+    auth_type: basic
+    credentials:
+      username: myuser
+      password: mypass
+mappings:
+  - from: library/nginx
+    source: ghcr
+    targets: [ghcr]
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = validate_registry("ghcr", config.registries.get("ghcr").unwrap());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_token_without_token_field_is_error() {
+        let yaml = r#"
+registries:
+  quay:
+    url: quay.io
+    auth_type: token
+mappings:
+  - from: library/nginx
+    source: quay
+    targets: [quay]
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_registry("quay", config.registries.get("quay").unwrap());
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err().to_string().contains("token"),
+            "error should mention token"
+        );
+    }
+
+    #[test]
+    fn validate_token_with_token_field_is_ok() {
+        let yaml = r#"
+registries:
+  quay:
+    url: quay.io
+    auth_type: token
+    token: ghp_abc123
+mappings:
+  - from: library/nginx
+    source: quay
+    targets: [quay]
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let result = validate_registry("quay", config.registries.get("quay").unwrap());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn credentials_config_deserializes() {
+        let yaml = r#"
+registries:
+  private:
+    url: registry.example.com
+    auth_type: basic
+    credentials:
+      username: user
+      password: pass
+mappings:
+  - from: myapp
+    source: private
+    targets: [private]
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let reg = config.registries.get("private").unwrap();
+        let creds = reg.credentials.as_ref().unwrap();
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "pass");
+    }
+
+    #[test]
+    fn credentials_debug_redacts_password() {
+        let creds = BasicCredentials {
+            username: "admin".to_string(),
+            password: "super-secret".to_string(),
+        };
+        let debug_output = format!("{creds:?}");
+        assert!(debug_output.contains("admin"));
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("super-secret"));
+    }
+
+    #[test]
+    fn registry_debug_redacts_token() {
+        let registry = RegistryConfig {
+            url: "example.com".to_string(),
+            auth_type: Some(AuthType::StaticToken),
+            max_concurrent: None,
+            credentials: None,
+            token: Some("secret-bearer-token".to_string()),
+        };
+        let debug_output = format!("{registry:?}");
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("secret-bearer-token"));
     }
 }

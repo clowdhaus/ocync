@@ -742,19 +742,39 @@ async fn execute_item(
             }
         }
         Err(err) => {
-            warn!(target_name = %item.target_name, error = %err, "manifest push failed");
-            ImageResult {
-                image_id: Uuid::now_v7(),
-                source: item.source.to_string(),
-                target: item.target.to_string(),
-                status: ImageStatus::Failed {
-                    kind: ErrorKind::ManifestPush,
-                    error: err.to_string(),
-                    retries: retry.max_retries,
-                },
-                bytes_transferred: outcome.bytes_transferred,
-                blob_stats: outcome.stats,
-                duration: start.elapsed(),
+            if is_immutable_tag_error(&err) {
+                info!(
+                    source_repo = %item.source.repo,
+                    target_repo = %item.target.repo,
+                    target_tag = %item.target.tag,
+                    "target tag is immutable, skipping"
+                );
+                ImageResult {
+                    image_id: Uuid::now_v7(),
+                    source: item.source.to_string(),
+                    target: item.target.to_string(),
+                    status: ImageStatus::Skipped {
+                        reason: SkipReason::ImmutableTag,
+                    },
+                    bytes_transferred: outcome.bytes_transferred,
+                    blob_stats: outcome.stats,
+                    duration: start.elapsed(),
+                }
+            } else {
+                warn!(target_name = %item.target_name, error = %err, "manifest push failed");
+                ImageResult {
+                    image_id: Uuid::now_v7(),
+                    source: item.source.to_string(),
+                    target: item.target.to_string(),
+                    status: ImageStatus::Failed {
+                        kind: ErrorKind::ManifestPush,
+                        error: err.to_string(),
+                        retries: retry.max_retries,
+                    },
+                    bytes_transferred: outcome.bytes_transferred,
+                    blob_stats: outcome.stats,
+                    duration: start.elapsed(),
+                }
             }
         }
     }
@@ -1287,6 +1307,22 @@ fn compute_stats(images: &[ImageResult]) -> SyncStats {
     stats
 }
 
+/// Check if a manifest push error is an ECR immutable tag rejection.
+///
+/// ECR returns HTTP 400 with `ImageTagAlreadyExistsException` when a
+/// manifest push targets a tag that already exists on a repository with
+/// immutable tag settings enabled.
+fn is_immutable_tag_error(err: &crate::Error) -> bool {
+    matches!(
+        err,
+        crate::Error::Manifest {
+            source: ocync_distribution::Error::RegistryError { status, message },
+            ..
+        } if *status == http::StatusCode::BAD_REQUEST
+            && message.contains("ImageTagAlreadyExistsException")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use ocync_distribution::Digest;
@@ -1437,5 +1473,57 @@ mod tests {
 
         assert_eq!(freq.count(&d1), 2);
         assert_eq!(freq.count(&d2), 1);
+    }
+
+    #[test]
+    fn immutable_tag_error_detected() {
+        let err = crate::Error::Manifest {
+            reference: "v1.0".into(),
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::BAD_REQUEST,
+                message: "ImageTagAlreadyExistsException: tag already exists".into(),
+            },
+        };
+        assert!(is_immutable_tag_error(&err));
+    }
+
+    #[test]
+    fn non_immutable_400_not_detected() {
+        let err = crate::Error::Manifest {
+            reference: "v1.0".into(),
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::BAD_REQUEST,
+                message: "some other 400 error".into(),
+            },
+        };
+        assert!(!is_immutable_tag_error(&err));
+    }
+
+    #[test]
+    fn non_400_not_detected_as_immutable() {
+        let err = crate::Error::Manifest {
+            reference: "v1.0".into(),
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::INTERNAL_SERVER_ERROR,
+                message: "ImageTagAlreadyExistsException".into(),
+            },
+        };
+        assert!(!is_immutable_tag_error(&err));
+    }
+
+    #[test]
+    fn blob_error_not_detected_as_immutable() {
+        let digest: ocync_distribution::Digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap();
+        let err = crate::Error::BlobTransfer {
+            digest,
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::BAD_REQUEST,
+                message: "ImageTagAlreadyExistsException".into(),
+            },
+        };
+        assert!(!is_immutable_tag_error(&err));
     }
 }
