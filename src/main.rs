@@ -74,11 +74,13 @@ const WATCH_LONG_ABOUT: &str = "\
 Run sync continuously on a recurring schedule
 
 Runs the sync operation in a loop at the configured interval. Handles graceful
-shutdown on SIGINT/SIGTERM.
+shutdown on SIGINT/SIGTERM. Exposes a /healthz endpoint for Kubernetes liveness
+probes.
 
 Examples:
   ocync watch -c config.yaml
-  ocync watch -c config.yaml --interval 60";
+  ocync watch -c config.yaml --interval 60
+  ocync watch -c config.yaml --health-port 8080";
 
 /// Sync OCI container images across registries.
 #[derive(Debug, Parser)]
@@ -275,6 +277,9 @@ pub(crate) struct WatchArgs {
     /// Output sync reports as JSON instead of text summaries.
     #[arg(long)]
     pub(crate) json: bool,
+    /// Port for the health endpoint (default: 9090).
+    #[arg(long, default_value = "9090")]
+    pub(crate) health_port: u16,
 }
 
 #[tokio::main(flavor = "current_thread")]
