@@ -72,7 +72,12 @@ impl RegistryClient {
     ) -> Result<Option<ManifestHead>, Error> {
         let path = manifest_path(reference);
         match self
-            .head(repository, &path, RegistryAction::ManifestHead)
+            .head(
+                repository,
+                &path,
+                Some(&manifest_accept_header()),
+                RegistryAction::ManifestHead,
+            )
             .await
         {
             Ok(resp) => {
