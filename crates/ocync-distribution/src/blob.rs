@@ -85,7 +85,10 @@ impl RegistryClient {
         digest: &Digest,
     ) -> Result<Option<u64>, Error> {
         let path = blob_path(digest);
-        match self.head(repository, &path, RegistryAction::BlobHead).await {
+        match self
+            .head(repository, &path, None, RegistryAction::BlobHead)
+            .await
+        {
             Ok(resp) => {
                 let size = resp
                     .headers()

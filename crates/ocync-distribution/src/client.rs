@@ -160,18 +160,26 @@ impl RegistryClient {
 
     /// Perform an authenticated HEAD request.
     ///
-    /// Same AIMD and retry logic as [`get`](Self::get).
+    /// Same AIMD and retry logic as [`get`](Self::get). Pass `accept` to
+    /// set an `Accept` header, ensuring content negotiation matches what
+    /// [`get`](Self::get) would return for the same resource.
     pub async fn head(
         &self,
         repository: &RepositoryName,
         path: &str,
+        accept: Option<&str>,
         op: RegistryAction,
     ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
         let scopes = [Scope::pull(repository.as_str())];
 
         let resp = self
-            .send_with_aimd(op, &scopes, "HEAD", |headers| {
+            .send_with_aimd(op, &scopes, "HEAD", |mut headers| {
+                if let Some(accept) = accept {
+                    if let Ok(val) = HeaderValue::from_str(accept) {
+                        headers.insert(ACCEPT, val);
+                    }
+                }
                 self.http.head(url.clone()).headers(headers)
             })
             .await?;

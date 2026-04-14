@@ -402,6 +402,7 @@ async fn head_401_triggers_retry() {
         .head(
             &repo,
             "manifests/latest",
+            None,
             ocync_distribution::aimd::RegistryAction::ManifestHead,
         )
         .await
@@ -430,6 +431,7 @@ async fn head_double_401_returns_unauthorized() {
         .head(
             &repo,
             "manifests/latest",
+            None,
             ocync_distribution::aimd::RegistryAction::ManifestHead,
         )
         .await;
