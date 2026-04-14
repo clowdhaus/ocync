@@ -179,6 +179,16 @@ pub struct SyncStats {
     pub blobs_mounted: u64,
     /// Total bytes transferred over the network.
     pub bytes_transferred: u64,
+    /// Tags where the HEAD optimization avoided the full source pull.
+    pub discovery_cache_hits: u64,
+    /// Tags where a full source manifest pull was required.
+    pub discovery_cache_misses: u64,
+    /// Tags where the source HEAD request failed (network, timeout, bad digest).
+    /// Subset of `discovery_cache_misses`.
+    pub discovery_head_failures: u64,
+    /// Tags where source cache matched but target HEAD showed staleness.
+    /// Subset of `discovery_cache_misses`.
+    pub discovery_target_stale: u64,
 }
 
 #[cfg(test)]
