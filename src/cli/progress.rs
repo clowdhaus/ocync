@@ -69,7 +69,8 @@ impl TextProgress {
 
 impl ProgressReporter for TextProgress {
     fn image_started(&self, _source: &str, _target: &str) {
-        // No-op: tracing handles debug-level start events.
+        // No-op for text output. BarProgress (PR #21) will use this
+        // to create per-image progress bars.
     }
 
     fn image_completed(&self, result: &ImageResult) {
