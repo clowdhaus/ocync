@@ -1,8 +1,11 @@
 //! The `watch` subcommand -- daemon mode for periodic sync with graceful shutdown.
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
+
+use ocync_sync::cache::TransferStateCache;
 
 use crate::cli::commands::synchronize;
 use crate::cli::health::HealthState;
@@ -27,6 +30,18 @@ pub(crate) async fn run(
     let local = tokio::task::LocalSet::new();
     let exit_code = local
         .run_until(async {
+            // Load cache from disk once (warm start from prior session).
+            let cache_dir = args
+                .config
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(".ocync/cache");
+            let cache_path = cache_dir.join("transfer_state.bin");
+            let cache = Rc::new(RefCell::new(TransferStateCache::load(
+                &cache_path,
+                Duration::from_secs(12 * 3600),
+            )));
+
             // Spawn the health server as a background local task.
             let health_handle = {
                 let state = Rc::clone(&health_state);
@@ -45,7 +60,14 @@ pub(crate) async fn run(
                     json: args.json,
                 };
 
-                match synchronize::run(&sync_args, progress, Some(&shutdown)).await {
+                match synchronize::run(
+                    &sync_args,
+                    progress,
+                    Some(&shutdown),
+                    Some(Rc::clone(&cache)),
+                )
+                .await
+                {
                     Ok(code) => {
                         tracing::info!(exit_code = ?code, "sync cycle complete");
                         if matches!(code, ExitCode::Success | ExitCode::PartialFailure) {
@@ -66,6 +88,11 @@ pub(crate) async fn run(
                     }
                 }
             };
+
+            // Persist cache on graceful shutdown.
+            if let Err(e) = cache.borrow().persist(&cache_path) {
+                tracing::warn!(error = %e, "failed to persist cache on shutdown");
+            }
 
             health_handle.abort();
             exit_code
