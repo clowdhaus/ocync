@@ -1,6 +1,6 @@
 //! OCI image spec types — manifests, descriptors, and platforms.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -133,7 +133,7 @@ pub struct Descriptor {
 
     /// Arbitrary metadata as key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 /// OCI platform specification.
@@ -321,7 +321,7 @@ pub struct ImageManifest {
 
     /// Arbitrary metadata as key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 /// OCI image index (multi-platform manifest list).
@@ -345,7 +345,7 @@ pub struct ImageIndex {
 
     /// Arbitrary metadata as key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<HashMap<String, String>>,
+    pub annotations: Option<BTreeMap<String, String>>,
 }
 
 /// A parsed manifest — either a single image or a multi-platform index.
