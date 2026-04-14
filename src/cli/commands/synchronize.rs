@@ -337,7 +337,12 @@ async fn resolve_mapping(
         .or_else(|| config.defaults.as_ref().and_then(|d| d.skip_existing))
         .unwrap_or(false);
 
+    let source_authority = source_client
+        .registry_authority()
+        .map_err(|e| CliError::Input(format!("mapping '{}': {e}", mapping.from)))?;
+
     Ok(Some(ResolvedMapping {
+        source_authority,
         source_client,
         source_repo: mapping.from.clone().into(),
         target_repo: target_repo.into(),
