@@ -207,7 +207,7 @@ impl std::fmt::Debug for RegistryConfig {
             .field("auth_type", &self.auth_type)
             .field("max_concurrent", &self.max_concurrent)
             .field("credentials", &self.credentials)
-            .field("token", &self.token.as_ref().map(|_| &"[REDACTED]"))
+            .field("token", &"[REDACTED]")
             .finish()
     }
 }

@@ -479,6 +479,32 @@ mod tests {
         assert_eq!(auth.name(), "basic");
     }
 
+    #[tokio::test]
+    async fn basic_auth_missing_www_authenticate_header() {
+        let server = MockServer::start().await;
+
+        // /v2/ returns 401 without WWW-Authenticate header.
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let creds = Credentials::Basic {
+            username: "u".into(),
+            password: "p".into(),
+        };
+        let auth = BasicAuth::with_base_url(server.uri(), reqwest::Client::new(), creds);
+        let result = auth.get_token(&[Scope::pull("repo")]).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("WWW-Authenticate"),
+            "error should mention missing header, got: {err}"
+        );
+    }
+
     #[test]
     fn basic_auth_debug_redacts_credentials() {
         let auth = BasicAuth::new(

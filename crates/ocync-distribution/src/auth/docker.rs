@@ -279,6 +279,8 @@ pub struct DockerConfigAuth {
     base_url: String,
     /// The loaded Docker config.
     config: DockerConfig,
+    /// HTTP client shared with the inner auth provider.
+    http: reqwest::Client,
     /// Lazily initialized inner provider.
     inner: tokio::sync::OnceCell<Box<dyn AuthProvider>>,
 }
@@ -296,13 +298,14 @@ impl DockerConfigAuth {
     /// Create a new Docker config auth provider for the given hostname.
     ///
     /// Uses HTTPS by default.
-    pub fn new(registry: impl Into<String>, config: DockerConfig) -> Self {
+    pub fn new(registry: impl Into<String>, config: DockerConfig, http: reqwest::Client) -> Self {
         let registry = registry.into();
         let base_url = format!("https://{registry}");
         Self {
             registry,
             base_url,
             config,
+            http,
             inner: tokio::sync::OnceCell::new(),
         }
     }
@@ -313,18 +316,20 @@ impl DockerConfigAuth {
         config: DockerConfig,
         registry: impl Into<String>,
         base_url: impl Into<String>,
+        http: reqwest::Client,
     ) -> Self {
         Self {
             registry: registry.into(),
             base_url: base_url.into(),
             config,
+            http,
             inner: tokio::sync::OnceCell::new(),
         }
     }
 
     /// Resolve credentials and build the appropriate inner provider.
     fn resolve_inner(&self) -> Result<Box<dyn AuthProvider>, Error> {
-        let http = reqwest::Client::new();
+        let http = self.http.clone();
         match resolve_from_docker_config(&self.config, &self.registry)? {
             Some(creds) => {
                 tracing::debug!(
@@ -708,8 +713,12 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth =
-            DockerConfigAuth::with_config_and_base_url(config, mock_host.to_string(), mock.uri());
+        let auth = DockerConfigAuth::with_config_and_base_url(
+            config,
+            mock_host.to_string(),
+            mock.uri(),
+            reqwest::Client::new(),
+        );
         let token = auth
             .get_token(&[Scope::pull("library/nginx")])
             .await
@@ -745,15 +754,23 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth =
-            DockerConfigAuth::with_config_and_base_url(config, mock_host.to_string(), mock.uri());
+        let auth = DockerConfigAuth::with_config_and_base_url(
+            config,
+            mock_host.to_string(),
+            mock.uri(),
+            reqwest::Client::new(),
+        );
         let token = auth.get_token(&[Scope::pull("public/repo")]).await.unwrap();
         assert_eq!(token.value(), "anon-token");
     }
 
     #[test]
     fn docker_config_auth_name() {
-        let auth = DockerConfigAuth::new("example.com", DockerConfig::default());
+        let auth = DockerConfigAuth::new(
+            "example.com",
+            DockerConfig::default(),
+            reqwest::Client::new(),
+        );
         assert_eq!(auth.name(), "docker-config");
     }
 }

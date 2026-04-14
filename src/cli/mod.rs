@@ -171,7 +171,7 @@ pub(crate) async fn build_registry_client(
                 );
                 DockerConfig::default()
             });
-            let auth = DockerConfigAuth::new(bare_host, config);
+            let auth = DockerConfigAuth::new(bare_host, config, http);
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Anonymous) | None => {
