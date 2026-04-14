@@ -20,7 +20,7 @@ use crate::{Cli, LogFormat};
 // Exit codes (grep/POSIX convention)
 // ---------------------------------------------------------------------------
 
-/// Process exit codes for CI/CD differentiation.
+/// Process exit codes following the grep/POSIX convention.
 ///
 /// - `Success` (0): all images synced or skipped
 /// - `PartialFailure` (1): some images failed, some succeeded
@@ -28,7 +28,7 @@ use crate::{Cli, LogFormat};
 /// - `ConfigError` (3): invalid configuration file
 /// - `AuthError` (4): authentication or authorization failure
 ///
-/// Codes 3-4 are more specific than 2 (not more severe). CI scripts
+/// Codes 3-4 are more specific than 2 (not more severe). Callers
 /// can branch: `>= 3` means the fix is in config/credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExitCode {
