@@ -5915,3 +5915,282 @@ async fn sync_non_immutable_400_still_fails() {
     assert_eq!(report.stats.images_failed, 1);
     assert_eq!(report.stats.images_skipped, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Discovery optimization tests
+// ---------------------------------------------------------------------------
+
+/// Mount a source manifest HEAD returning a specific digest.
+async fn mount_source_head(server: &MockServer, repo: &str, tag: &str, digest: &Digest) {
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/{repo}/manifests/{tag}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Cold cache: source HEAD succeeds but no cache entry exists, so full GET is
+/// required. All four discovery counters must reflect exactly one cache miss.
+#[tokio::test]
+async fn discovery_cache_miss_first_run() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-data";
+    let layer_data = b"layer-data";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
+    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
+
+    // Source: HEAD + GET both needed.
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+
+    // Target: HEAD 404 (not synced yet), blob + manifest push endpoints.
+    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
+    mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let cache = empty_cache();
+    let report = engine
+        .run(
+            vec![mapping],
+            cache.clone(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.discovery_cache_hits, 0);
+    assert_eq!(report.stats.discovery_cache_misses, 1);
+    assert_eq!(report.stats.discovery_head_failures, 0);
+    assert_eq!(report.stats.discovery_target_stale, 0);
+
+    // Verify cache was populated after successful sync.
+    let c = cache.borrow();
+    assert!(
+        c.source_snapshot("source.test.io:443", &"src/repo".into(), "v1")
+            .is_some()
+    );
+}
+
+/// Warm cache: source HEAD matches cached snapshot and target HEAD returns the
+/// same digest. The engine must skip with zero source GETs (no GET mounted).
+#[tokio::test]
+async fn discovery_cache_hit_skips_source_get() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let manifest_digest = test_digest("aabb");
+
+    // Source: only HEAD (no GET mounted -- if GET is attempted, wiremock returns 404).
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+
+    // Target: HEAD returns matching digest.
+    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &manifest_digest).await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+
+    // Pre-populate cache.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        c.set_source_snapshot(
+            "source.test.io:443",
+            &"src/repo".into(),
+            "v1",
+            ocync_sync::cache::SourceSnapshot {
+                source_digest: manifest_digest.clone(),
+                filtered_digest: manifest_digest.clone(),
+                platform_filter_key: String::new(),
+            },
+        );
+    }
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.images_synced, 0);
+    assert_eq!(report.stats.discovery_cache_hits, 1);
+    assert_eq!(report.stats.discovery_cache_misses, 0);
+    assert_eq!(report.stats.discovery_head_failures, 0);
+    assert_eq!(report.stats.discovery_target_stale, 0);
+}
+
+/// Source HEAD returns 500. The engine must fall through to a full GET pull and
+/// record the HEAD failure in addition to the cache miss counter.
+#[tokio::test]
+async fn discovery_head_failure_falls_through() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-data";
+    let layer_data = b"layer-data";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
+    let (manifest_bytes, _manifest_digest) = serialize_manifest(&manifest);
+
+    // Source HEAD returns 500.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&source_server)
+        .await;
+
+    // Source GET succeeds.
+    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
+
+    // Target: HEAD 404, push endpoints.
+    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.discovery_cache_hits, 0);
+    assert_eq!(report.stats.discovery_cache_misses, 1);
+    assert_eq!(report.stats.discovery_head_failures, 1);
+    assert_eq!(report.stats.discovery_target_stale, 0);
+}
+
+/// Cache hit on source (HEAD matches snapshot), but target HEAD returns 404
+/// (target was garbage-collected). The engine must fall through to a full pull
+/// and record target staleness.
+#[tokio::test]
+async fn discovery_target_stale_triggers_full_pull() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-data";
+    let layer_data = b"layer-data";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
+    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
+
+    // Source HEAD matches cache.
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+    // Source GET (needed because target is stale).
+    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
+
+    // Target: HEAD returns 404 (target was GC'd / never synced).
+    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+
+    // Pre-populate cache -- source matches but target won't.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        c.set_source_snapshot(
+            "source.test.io:443",
+            &"src/repo".into(),
+            "v1",
+            ocync_sync::cache::SourceSnapshot {
+                source_digest: manifest_digest.clone(),
+                filtered_digest: manifest_digest.clone(),
+                platform_filter_key: String::new(),
+            },
+        );
+    }
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.discovery_cache_hits, 0);
+    assert_eq!(report.stats.discovery_cache_misses, 1);
+    assert_eq!(report.stats.discovery_head_failures, 0);
+    assert_eq!(report.stats.discovery_target_stale, 1);
+}
