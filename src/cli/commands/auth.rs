@@ -37,6 +37,6 @@ pub(crate) async fn run_check(configs: &[PathBuf]) -> Result<ExitCode, CliError>
     if all_ok {
         Ok(ExitCode::Success)
     } else {
-        Ok(ExitCode::Failure)
+        Ok(ExitCode::PartialFailure)
     }
 }

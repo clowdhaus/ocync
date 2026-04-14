@@ -555,6 +555,9 @@ async fn sync_manifest_pull_failure() {
         report.images[0].status,
         ImageStatus::Failed { .. }
     ));
+    if let ImageStatus::Failed { kind, .. } = &report.images[0].status {
+        assert_eq!(kind.to_string(), "manifest pull");
+    }
     assert_eq!(report.stats.images_failed, 1);
     assert_eq!(report.exit_code(), 2);
 }
@@ -1240,7 +1243,8 @@ async fn sync_manifest_push_failure() {
         report.images[0].status,
         ImageStatus::Failed { .. }
     ));
-    if let ImageStatus::Failed { error, .. } = &report.images[0].status {
+    if let ImageStatus::Failed { kind, error, .. } = &report.images[0].status {
+        assert_eq!(kind.to_string(), "manifest push");
         assert!(
             error.contains("manifest"),
             "error should mention manifest: {error}"
@@ -3003,6 +3007,9 @@ async fn sync_partial_blob_failure_stops_remaining() {
         "image should fail when a blob push fails, got: {:?}",
         report.images[0].status
     );
+    if let ImageStatus::Failed { kind, .. } = &report.images[0].status {
+        assert_eq!(kind.to_string(), "blob transfer");
+    }
     assert_eq!(
         report.images[0].bytes_transferred,
         config_data.len() as u64,

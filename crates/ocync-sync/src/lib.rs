@@ -104,6 +104,8 @@ pub enum ImageStatus {
     },
     /// Image transfer failed after exhausting retries.
     Failed {
+        /// What operation failed.
+        kind: ErrorKind,
         /// Error message describing the failure.
         error: String,
         /// Number of retry attempts made.
@@ -126,6 +128,33 @@ impl std::fmt::Display for SkipReason {
         match self {
             Self::DigestMatch => f.write_str("digest match"),
             Self::SkipExisting => f.write_str("skip existing"),
+        }
+    }
+}
+
+/// Classification of the operation that failed during image transfer.
+///
+/// Classifies *what operation* failed, not *why* it failed. The `error`
+/// string on [`ImageStatus::Failed`] carries the cause. This separation
+/// lets output formatters group by operation type while preserving full
+/// error context.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// Source manifest could not be pulled.
+    ManifestPull,
+    /// Target manifest could not be pushed.
+    ManifestPush,
+    /// Blob transfer (pull, push, or mount) failed.
+    BlobTransfer,
+}
+
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ManifestPull => f.write_str("manifest pull"),
+            Self::ManifestPush => f.write_str("manifest push"),
+            Self::BlobTransfer => f.write_str("blob transfer"),
         }
     }
 }
@@ -203,6 +232,7 @@ mod tests {
         let report = make_report(vec![
             ImageStatus::Synced,
             ImageStatus::Failed {
+                kind: ErrorKind::BlobTransfer,
                 error: "timeout".into(),
                 retries: 3,
             },
@@ -214,10 +244,12 @@ mod tests {
     fn exit_code_all_failed() {
         let report = make_report(vec![
             ImageStatus::Failed {
+                kind: ErrorKind::ManifestPull,
                 error: "a".into(),
                 retries: 1,
             },
             ImageStatus::Failed {
+                kind: ErrorKind::ManifestPush,
                 error: "b".into(),
                 retries: 2,
             },
@@ -248,10 +280,55 @@ mod tests {
     }
 
     #[test]
+    fn error_kind_display_manifest_pull() {
+        assert_eq!(ErrorKind::ManifestPull.to_string(), "manifest pull");
+    }
+
+    #[test]
+    fn error_kind_display_manifest_push() {
+        assert_eq!(ErrorKind::ManifestPush.to_string(), "manifest push");
+    }
+
+    #[test]
+    fn error_kind_display_blob_transfer() {
+        assert_eq!(ErrorKind::BlobTransfer.to_string(), "blob transfer");
+    }
+
+    #[test]
     fn blob_transfer_stats_default_is_zeroed() {
         let stats = BlobTransferStats::default();
         assert_eq!(stats.transferred, 0);
         assert_eq!(stats.skipped, 0);
         assert_eq!(stats.mounted, 0);
+    }
+
+    #[test]
+    fn error_kind_json_serialization() {
+        assert_eq!(
+            serde_json::to_value(ErrorKind::ManifestPull).unwrap(),
+            serde_json::Value::String("manifest_pull".into()),
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorKind::ManifestPush).unwrap(),
+            serde_json::Value::String("manifest_push".into()),
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorKind::BlobTransfer).unwrap(),
+            serde_json::Value::String("blob_transfer".into()),
+        );
+    }
+
+    #[test]
+    fn image_status_failed_json_includes_kind() {
+        let status = ImageStatus::Failed {
+            kind: ErrorKind::ManifestPull,
+            error: "timeout".into(),
+            retries: 3,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["kind"], "manifest_pull");
+        assert_eq!(json["error"], "timeout");
+        assert_eq!(json["retries"], 3);
     }
 }

@@ -8,6 +8,7 @@ use anstyle::{Ansi256Color, Color, Style};
 use clap::builder::Styles;
 use clap::{Parser, Subcommand, ValueEnum};
 use ocync_distribution::Reference;
+use ocync_sync::progress::NullProgress;
 
 const PINK: Option<Color> = Some(Color::Ansi256(Ansi256Color(213)));
 const PURPLE: Option<Color> = Some(Color::Ansi256(Ansi256Color(141)));
@@ -285,16 +286,44 @@ async fn main() -> std::process::ExitCode {
     let shutdown = cli::shutdown::ShutdownSignal::new();
     cli::shutdown::install_signal_handlers(shutdown.clone());
 
+    // Suppress the text summary on stdout when JSON owns stdout or when
+    // the summary is redundant (single-image copy).
+    let suppress_summary = match &cli.command {
+        Commands::Sync(args) => args.json,
+        Commands::Watch(args) => args.json,
+        Commands::Copy(_) => true,
+        _ => false,
+    };
+
+    let effective_verbosity = match &cli.command {
+        // Copy always shows per-image output — users expect to see what was copied.
+        Commands::Copy(_) => cli.verbose.max(1),
+        _ => cli.verbose,
+    };
+
+    let progress: Box<dyn ocync_sync::progress::ProgressReporter> = if cli.quiet {
+        Box::new(NullProgress)
+    } else {
+        Box::new(cli::progress::TextProgress::new(
+            effective_verbosity,
+            suppress_summary,
+        ))
+    };
+
     let result = match cli.command {
-        Commands::Sync(args) => cli::commands::synchronize::run(&args, Some(&shutdown)).await,
-        Commands::Copy(args) => cli::commands::copy::run(&args).await,
+        Commands::Sync(args) => {
+            cli::commands::synchronize::run(&args, &*progress, Some(&shutdown)).await
+        }
+        Commands::Copy(args) => cli::commands::copy::run(&args, &*progress).await,
         Commands::Tags(args) => cli::commands::tags::run(&args).await,
         Commands::Auth { action } => match action {
             AuthAction::Check { config } => cli::commands::auth::run_check(&config).await,
         },
         Commands::Validate(args) => cli::commands::validate::run(&args),
         Commands::Expand(args) => cli::commands::expand::run(&args),
-        Commands::Watch(args) => cli::commands::watch::run(&args, shutdown.clone()).await,
+        Commands::Watch(args) => {
+            cli::commands::watch::run(&args, &*progress, shutdown.clone()).await
+        }
         Commands::Version => Ok(cli::commands::version::run()),
     };
 
@@ -302,7 +331,7 @@ async fn main() -> std::process::ExitCode {
         Ok(code) => code.into(),
         Err(err) => {
             eprintln!("error: {err}");
-            cli::ExitCode::Error.into()
+            err.exit_code().into()
         }
     }
 }

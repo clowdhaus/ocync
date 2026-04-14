@@ -1411,6 +1411,7 @@ version = "0.1.0"
 dependencies = [
  "anstyle",
  "clap",
+ "http 1.4.0",
  "ocync-distribution",
  "ocync-sync",
  "reqwest",
@@ -1422,6 +1423,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

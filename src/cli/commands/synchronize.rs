@@ -17,7 +17,6 @@ use ocync_sync::engine::{
     TargetEntry,
 };
 use ocync_sync::filter::FilterConfig;
-use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
@@ -37,6 +36,7 @@ const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
 /// graceful drain on SIGINT/SIGTERM.
 pub(crate) async fn run(
     args: &SyncArgs,
+    progress: &dyn ocync_sync::progress::ProgressReporter,
     shutdown: Option<&ShutdownSignal>,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
@@ -116,9 +116,8 @@ pub(crate) async fn run(
             g.max_concurrent_transfers
         });
     let engine = SyncEngine::new(RetryConfig::default(), max_concurrent);
-    let progress = NullProgress;
     let report = engine
-        .run(mappings, cache.clone(), staging, &progress, shutdown)
+        .run(mappings, cache.clone(), staging, progress, shutdown)
         .await;
 
     // Persist cache after the run.
@@ -130,8 +129,8 @@ pub(crate) async fn run(
 
     match report.exit_code() {
         0 => Ok(ExitCode::Success),
-        1 => Ok(ExitCode::Failure),
-        _ => Ok(ExitCode::Error),
+        1 => Ok(ExitCode::PartialFailure),
+        _ => Ok(ExitCode::Failure),
     }
 }
 
@@ -402,53 +401,15 @@ fn print_dry_run(mappings: &[ResolvedMapping]) {
     }
 }
 
-/// Write sync output in the requested format.
+/// Write sync output as JSON when `--json` is passed.
 fn write_output(report: &SyncReport, json: bool) -> Result<(), CliError> {
     if json {
         let json = serde_json::to_string_pretty(report)
             .map_err(|e| CliError::Input(format!("failed to serialize report: {e}")))?;
         println!("{json}");
-    } else {
-        print_summary(report);
     }
 
     Ok(())
-}
-
-/// Print a human-readable summary of the sync report.
-fn print_summary(report: &SyncReport) {
-    let s = &report.stats;
-    println!(
-        "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {:.1}s",
-        s.images_synced,
-        s.images_skipped,
-        s.images_failed,
-        s.blobs_transferred,
-        s.blobs_skipped,
-        s.blobs_mounted,
-        format_bytes(s.bytes_transferred),
-        report.duration.as_secs_f64(),
-    );
-}
-
-/// Format a byte count as a human-readable string using SI decimal prefixes.
-///
-/// Matches the same SI convention as [`parse_size`] (1 KB = 1,000 bytes) so
-/// that parsed and displayed values round-trip consistently.
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1_000;
-    const MB: u64 = 1_000_000;
-    const GB: u64 = 1_000_000_000;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 #[cfg(test)]
@@ -490,33 +451,6 @@ mod tests {
         assert_eq!(parse_duration("invalid"), None);
         assert_eq!(parse_duration(""), None);
         assert_eq!(parse_duration("12hours"), None);
-    }
-
-    #[test]
-    fn format_bytes_zero() {
-        assert_eq!(format_bytes(0), "0 B");
-    }
-
-    #[test]
-    fn format_bytes_bytes() {
-        assert_eq!(format_bytes(512), "512 B");
-    }
-
-    #[test]
-    fn format_bytes_kb() {
-        assert_eq!(format_bytes(1_000), "1.0 KB");
-        assert_eq!(format_bytes(1_500), "1.5 KB");
-    }
-
-    #[test]
-    fn format_bytes_mb() {
-        assert_eq!(format_bytes(1_000_000), "1.0 MB");
-        assert_eq!(format_bytes(5_500_000), "5.5 MB");
-    }
-
-    #[test]
-    fn format_bytes_gb() {
-        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
     }
 
     #[test]
