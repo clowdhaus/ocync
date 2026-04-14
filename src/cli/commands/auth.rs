@@ -15,7 +15,14 @@ pub(crate) async fn run_check(configs: &[PathBuf]) -> Result<ExitCode, CliError>
 
         for (name, reg) in &config.registries {
             let safe_url = redact_url(&reg.url);
-            match build_registry_client(&reg.url, reg.auth_type.as_ref(), reg.max_concurrent).await
+            match build_registry_client(
+                &reg.url,
+                reg.auth_type.as_ref(),
+                reg.max_concurrent,
+                reg.credentials.as_ref(),
+                reg.token.as_deref(),
+            )
+            .await
             {
                 Ok(client) => match client.ping().await {
                     Ok(()) => {

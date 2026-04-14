@@ -7,9 +7,13 @@ pub(crate) mod progress;
 pub(crate) mod shutdown;
 
 use ocync_distribution::RegistryClient;
+use ocync_distribution::auth::Credentials;
 use ocync_distribution::auth::anonymous::AnonymousAuth;
+use ocync_distribution::auth::basic::BasicAuth;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
+use ocync_distribution::auth::docker::{DockerConfig, DockerConfigAuth};
 use ocync_distribution::auth::ecr::EcrAuth;
+use ocync_distribution::auth::static_token::StaticTokenAuth;
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
 
@@ -109,10 +113,16 @@ pub(crate) fn bare_hostname(s: &str) -> &str {
 ///
 /// When `max_concurrent` is `Some`, the per-registry aggregate concurrency
 /// cap is set to that value; otherwise the client default applies.
+///
+/// The `credentials` and `token` parameters supply auth material for
+/// `Basic` and `Token` auth types respectively. Config validation ensures
+/// these are present when the corresponding `auth_type` is set.
 pub(crate) async fn build_registry_client(
     hostname: &str,
     auth_type: Option<&AuthType>,
     max_concurrent: Option<usize>,
+    credentials: Option<&config::CredentialsConfig>,
+    token: Option<&str>,
 ) -> Result<RegistryClient, CliError> {
     let base_url = if hostname.starts_with("http://") || hostname.starts_with("https://") {
         hostname.to_string()
@@ -124,32 +134,65 @@ pub(crate) async fn build_registry_client(
         .map_err(|e| CliError::Input(format!("invalid registry URL '{base_url}': {e}")))?;
 
     let bare_host = bare_hostname(hostname);
+    let http = reqwest::Client::new();
 
-    let provider_kind = match auth_type {
-        Some(AuthType::Ecr) => Some(ProviderKind::Ecr),
-        Some(AuthType::Anonymous) => None,
-        Some(unsupported) => {
-            tracing::warn!(
-                auth_type = ?unsupported,
-                registry = bare_host,
-                "auth type not yet implemented, falling back to anonymous auth"
-            );
-            None
-        }
-        None => detect_provider_kind(bare_host),
-    };
-
-    let mut builder = match provider_kind {
-        Some(ProviderKind::Ecr | ProviderKind::EcrPublic) => {
+    let mut builder = match auth_type {
+        Some(AuthType::Ecr) => {
             let auth = EcrAuth::new(bare_host)
                 .await
                 .map_err(|e| CliError::Input(format!("ECR auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
         }
-        _ => {
-            let http = reqwest::Client::new();
-            let auth = AnonymousAuth::new(bare_host, http);
+        Some(AuthType::Basic) => {
+            // Config validation ensures credentials are present for Basic auth.
+            let creds = credentials.expect("basic auth requires credentials (validated)");
+            let auth = BasicAuth::new(
+                bare_host,
+                http,
+                Credentials::Basic {
+                    username: creds.username.clone(),
+                    password: creds.password.clone(),
+                },
+            );
             RegistryClient::builder(url).auth(auth)
+        }
+        Some(AuthType::Token) => {
+            // Config validation ensures token is present for Token auth.
+            let tok = token.expect("token auth requires token field (validated)");
+            let auth = StaticTokenAuth::new(tok);
+            RegistryClient::builder(url).auth(auth)
+        }
+        Some(AuthType::DockerConfig | AuthType::Ghcr | AuthType::Gcr | AuthType::Acr) => {
+            let config = DockerConfig::load_default().unwrap_or_else(|e| {
+                tracing::debug!(
+                    registry = bare_host,
+                    error = %e,
+                    "failed to load docker config, using anonymous auth"
+                );
+                DockerConfig::default()
+            });
+            let auth = DockerConfigAuth::new(bare_host, config);
+            RegistryClient::builder(url).auth(auth)
+        }
+        Some(AuthType::Anonymous) | None => {
+            // Explicit anonymous or no auth_type specified.
+            // For None, also try auto-detection for ECR.
+            if auth_type.is_none() {
+                if let Some(ProviderKind::Ecr | ProviderKind::EcrPublic) =
+                    detect_provider_kind(bare_host)
+                {
+                    let auth = EcrAuth::new(bare_host).await.map_err(|e| {
+                        CliError::Input(format!("ECR auth setup for '{bare_host}': {e}"))
+                    })?;
+                    RegistryClient::builder(url).auth(auth)
+                } else {
+                    let auth = AnonymousAuth::new(bare_host, http);
+                    RegistryClient::builder(url).auth(auth)
+                }
+            } else {
+                let auth = AnonymousAuth::new(bare_host, http);
+                RegistryClient::builder(url).auth(auth)
+            }
         }
     };
 
@@ -359,5 +402,33 @@ mod tests {
     #[test]
     fn bare_hostname_preserves_port() {
         assert_eq!(bare_hostname("localhost:5000"), "localhost:5000");
+    }
+
+    #[test]
+    fn all_auth_types_are_handled() {
+        // Exhaustive match ensures no AuthType variant is unhandled.
+        // If a new variant is added, this fails to compile.
+        let variants = [
+            AuthType::Ecr,
+            AuthType::Gcr,
+            AuthType::Acr,
+            AuthType::Ghcr,
+            AuthType::Anonymous,
+            AuthType::Basic,
+            AuthType::Token,
+            AuthType::DockerConfig,
+        ];
+        for variant in &variants {
+            match variant {
+                AuthType::Ecr => {}
+                AuthType::Gcr => {}
+                AuthType::Acr => {}
+                AuthType::Ghcr => {}
+                AuthType::Anonymous => {}
+                AuthType::Basic => {}
+                AuthType::Token => {}
+                AuthType::DockerConfig => {}
+            }
+        }
     }
 }

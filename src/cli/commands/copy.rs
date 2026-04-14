@@ -26,10 +26,25 @@ pub(crate) async fn run(
         .ok_or_else(|| CliError::Input(format!("source '{}' has no tag", args.source)))?;
     let dst_tag = args.destination.tag().unwrap_or(src_tag);
 
-    let source_client =
-        Arc::new(build_registry_client(bare_hostname(args.source.registry()), None, None).await?);
+    let source_client = Arc::new(
+        build_registry_client(
+            bare_hostname(args.source.registry()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?,
+    );
     let target_client = Arc::new(
-        build_registry_client(bare_hostname(args.destination.registry()), None, None).await?,
+        build_registry_client(
+            bare_hostname(args.destination.registry()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?,
     );
 
     let mapping = ResolvedMapping {

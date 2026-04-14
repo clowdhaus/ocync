@@ -11,19 +11,25 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     let registry = args.repository.registry();
     let repository = args.repository.repository();
 
-    // Resolve auth_type from config if provided, otherwise use anonymous.
-    let auth_type = if let Some(ref config_path) = args.config {
+    // Resolve auth settings from config if provided, otherwise use anonymous.
+    let reg_config = if let Some(ref config_path) = args.config {
         let config = load_config(config_path)?;
         config
             .registries
-            .values()
+            .into_values()
             .find(|r| bare_hostname(&r.url) == registry)
-            .and_then(|r| r.auth_type.clone())
     } else {
         None
     };
 
-    let client = build_registry_client(registry, auth_type.as_ref(), None).await?;
+    let client = build_registry_client(
+        registry,
+        reg_config.as_ref().and_then(|r| r.auth_type.as_ref()),
+        None,
+        reg_config.as_ref().and_then(|r| r.credentials.as_ref()),
+        reg_config.as_ref().and_then(|r| r.token.as_deref()),
+    )
+    .await?;
 
     let repo_path = RepositoryName::from(repository);
     let all_tags = client.list_tags(&repo_path).await?;
