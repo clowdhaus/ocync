@@ -2,6 +2,7 @@
 
 pub(crate) mod commands;
 pub(crate) mod config;
+pub(crate) mod health;
 pub(crate) mod output;
 pub(crate) mod progress;
 pub(crate) mod shutdown;

@@ -59,7 +59,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml = { package = "serde_yaml_ng", version = "0.10", default-features = false }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "signal"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "macros", "signal"] }
 reqwest.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "json", "fmt"] }
