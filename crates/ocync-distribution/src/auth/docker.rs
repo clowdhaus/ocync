@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use super::token_exchange::exchange_token;
+use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::error::Error;
 
@@ -354,7 +354,7 @@ impl AuthProvider for DockerConfigAuth {
                 }
             }
 
-            let token = exchange_token(
+            let token = token_exchange::exchange(
                 &self.http,
                 &self.base_url,
                 &scopes,

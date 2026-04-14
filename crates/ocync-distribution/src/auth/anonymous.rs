@@ -7,7 +7,7 @@ use std::pin::Pin;
 
 use tokio::sync::Mutex;
 
-use super::token_exchange::exchange_token;
+use super::token_exchange;
 use super::{AuthProvider, Scope, Token, scopes_cache_key};
 use crate::error::Error;
 
@@ -82,7 +82,7 @@ impl AuthProvider for AnonymousAuth {
                 }
             }
 
-            let token = exchange_token(&self.http, &self.base_url, &scopes, None).await?;
+            let token = token_exchange::exchange(&self.http, &self.base_url, &scopes, None).await?;
             cache.insert(key, token.clone());
 
             Ok(token)

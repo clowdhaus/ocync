@@ -10,7 +10,7 @@ use std::pin::Pin;
 
 use tokio::sync::Mutex;
 
-use super::token_exchange::exchange_token;
+use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::error::Error;
 
@@ -99,9 +99,13 @@ impl AuthProvider for BasicAuth {
                 }
             }
 
-            let token =
-                exchange_token(&self.http, &self.base_url, &scopes, Some(&self.credentials))
-                    .await?;
+            let token = token_exchange::exchange(
+                &self.http,
+                &self.base_url,
+                &scopes,
+                Some(&self.credentials),
+            )
+            .await?;
             cache.insert(key, token.clone());
 
             Ok(token)

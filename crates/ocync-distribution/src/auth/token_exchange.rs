@@ -26,7 +26,7 @@ const BEARER_SCHEME: &str = "bearer";
 /// `Some`, an `Authorization: Basic` header is included on the token request.
 ///
 /// If `/v2/` returns 200 (no auth required), returns an empty token.
-pub(crate) async fn exchange_token(
+pub(crate) async fn exchange(
     http: &reqwest::Client,
     base_url: &str,
     scopes: &[Scope],
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchange_token_anonymous() {
+    async fn exchange_anonymous() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -307,14 +307,14 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let token = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
         assert_eq!(token.value(), "anon-tok");
     }
 
     #[tokio::test]
-    async fn exchange_token_with_credentials() {
+    async fn exchange_with_credentials() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -346,14 +346,14 @@ mod tests {
             password: "pass".into(),
         };
         let http = reqwest::Client::new();
-        let token = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], Some(&creds))
+        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], Some(&creds))
             .await
             .unwrap();
         assert_eq!(token.value(), "basic-tok");
     }
 
     #[tokio::test]
-    async fn exchange_token_no_auth_required() {
+    async fn exchange_no_auth_required() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -364,14 +364,14 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let token = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
         assert_eq!(token.value(), "");
     }
 
     #[tokio::test]
-    async fn exchange_token_missing_www_authenticate() {
+    async fn exchange_missing_www_authenticate() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -382,14 +382,14 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let err = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("WWW-Authenticate"));
     }
 
     #[tokio::test]
-    async fn exchange_token_endpoint_error() {
+    async fn exchange_endpoint_error() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -410,14 +410,14 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let err = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Http(_)));
     }
 
     #[tokio::test]
-    async fn exchange_token_access_token_fallback() {
+    async fn exchange_access_token_fallback() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -442,14 +442,14 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let token = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
         assert_eq!(token.value(), "fallback-tok");
     }
 
     #[tokio::test]
-    async fn exchange_token_no_expiry_produces_permanent_token() {
+    async fn exchange_no_expiry_produces_permanent_token() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -474,7 +474,7 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let token = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
         assert_eq!(token.value(), "perm-tok");
@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchange_token_zero_expiry_treated_as_permanent() {
+    async fn exchange_zero_expiry_treated_as_permanent() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -507,7 +507,7 @@ mod tests {
             .await;
 
         let http = reqwest::Client::new();
-        let token = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
         assert_eq!(token.value(), "zero-tok");
@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchange_token_multi_scope_query_params() {
+    async fn exchange_multi_scope_query_params() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -540,9 +540,7 @@ mod tests {
 
         let http = reqwest::Client::new();
         let scopes = [Scope::pull("repo-a"), Scope::pull_push("repo-b")];
-        let token = exchange_token(&http, &mock.uri(), &scopes, None)
-            .await
-            .unwrap();
+        let token = exchange(&http, &mock.uri(), &scopes, None).await.unwrap();
         assert_eq!(token.value(), "multi-tok");
 
         // Verify both scope params are present in the token request URL.
