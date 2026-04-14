@@ -160,7 +160,10 @@ mod tests {
                 let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
                 let port = start_server(state).await;
                 let resp = http_get(port, "/healthz").await;
-                assert!(resp.starts_with("HTTP/1.1 503"), "expected 503, got: {resp}");
+                assert!(
+                    resp.starts_with("HTTP/1.1 503"),
+                    "expected 503, got: {resp}"
+                );
                 assert!(resp.ends_with("sync stale\n"));
             })
             .await;
@@ -175,7 +178,10 @@ mod tests {
                 state.borrow_mut().record_success();
                 let port = start_server(state).await;
                 let resp = http_get(port, "/healthz").await;
-                assert!(resp.starts_with("HTTP/1.1 200"), "expected 200, got: {resp}");
+                assert!(
+                    resp.starts_with("HTTP/1.1 200"),
+                    "expected 200, got: {resp}"
+                );
                 assert!(resp.ends_with("ok\n"));
             })
             .await;
@@ -192,7 +198,10 @@ mod tests {
                 state.borrow_mut().last_success = Some(Instant::now() - interval * 3);
                 let port = start_server(state).await;
                 let resp = http_get(port, "/healthz").await;
-                assert!(resp.starts_with("HTTP/1.1 503"), "expected 503, got: {resp}");
+                assert!(
+                    resp.starts_with("HTTP/1.1 503"),
+                    "expected 503, got: {resp}"
+                );
             })
             .await;
     }
@@ -205,7 +214,10 @@ mod tests {
                 let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
                 let port = start_server(state).await;
                 let resp = http_get(port, "/foo").await;
-                assert!(resp.starts_with("HTTP/1.1 404"), "expected 404, got: {resp}");
+                assert!(
+                    resp.starts_with("HTTP/1.1 404"),
+                    "expected 404, got: {resp}"
+                );
                 assert!(resp.ends_with("not found\n"));
             })
             .await;
