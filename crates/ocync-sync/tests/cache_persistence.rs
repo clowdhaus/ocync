@@ -430,3 +430,69 @@ fn snapshot_key_nul_separator_prevents_collision() {
     let k2 = snapshot_key("reg.io:443", &repo("lib"), "nginx/v1");
     assert_ne!(k1, k2);
 }
+
+// ---------------------------------------------------------------------------
+// v1 → v2 migration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v1_to_v2_migration_preserves_blob_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.bin");
+
+    // Write a v2 cache with blob data (no snapshots).
+    let mut cache = TransferStateCache::new();
+    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
+    cache.persist(&path).unwrap();
+
+    // Read the raw v2 bytes and reconstruct as v1:
+    // v2 format: [4B header_len][header][blob_dedup][snapshot_map][4B CRC]
+    // v1 format: [4B header_len][header][blob_dedup][4B CRC]
+    //
+    // The snapshot section for an empty map is a single postcard byte (0x00).
+    // Patch the version byte in the header from 2 to 1 and strip the snapshot.
+    let raw = std::fs::read(&path).unwrap();
+
+    // Strip CRC (last 4 bytes).
+    let payload = &raw[..raw.len() - 4];
+
+    // Parse header_len.
+    let header_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+
+    // The header starts at byte 4. In postcard varint encoding, version 2 is
+    // the single byte 0x02 at the start of the header. Patch it to 0x01.
+    assert_eq!(payload[4], 0x02, "expected v2 version byte");
+
+    // Body after the header: blob_dedup + snapshot_map.
+    // The empty snapshot map serializes to a single 0x00 byte (postcard
+    // varint length prefix for an empty HashMap).
+    let body_end = payload.len();
+    assert_eq!(
+        payload[body_end - 1],
+        0x00,
+        "expected empty snapshot map byte"
+    );
+
+    // Rebuild as v1: same header with version=1, same blob_dedup, no snapshot.
+    let mut v1_payload = Vec::new();
+    v1_payload.extend_from_slice(&payload[..4]); // header_len
+    v1_payload.push(0x01); // patched version byte
+    v1_payload.extend_from_slice(&payload[5..4 + header_len]); // rest of header
+    v1_payload.extend_from_slice(&payload[4 + header_len..body_end - 1]); // blob_dedup only
+
+    let crc = crc32fast::hash(&v1_payload);
+    v1_payload.extend_from_slice(&crc.to_le_bytes());
+
+    std::fs::write(&path, &v1_payload).unwrap();
+
+    // Load with v2 reader — should accept v1 and produce intact blob data.
+    let loaded = TransferStateCache::load(&path, Duration::from_secs(3600));
+
+    // Blob dedup data should be intact.
+    assert_eq!(
+        loaded.blob_status("reg.io", &digest_a()),
+        Some(&BlobStatus::Completed),
+    );
+    // Snapshot section should be empty (v1 had none).
+    assert!(loaded.source_snapshot("any", &repo("any"), "any").is_none());
+}
