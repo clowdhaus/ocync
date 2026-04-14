@@ -98,13 +98,6 @@ pub(crate) async fn exchange_token(
     Ok(token)
 }
 
-/// Build a sorted, space-joined cache key from a set of scopes.
-pub(crate) fn scope_cache_key(scopes: &[Scope]) -> String {
-    let mut parts: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
-    parts.sort();
-    parts.join(" ")
-}
-
 /// Build the `Authorization: Basic ...` header value from credentials.
 fn basic_header_value(credentials: &Credentials) -> String {
     let Credentials::Basic { username, password } = credentials;
@@ -278,20 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn scope_cache_key_sorted() {
-        let scopes = vec![Scope::pull("z-repo"), Scope::pull("a-repo")];
-        let key = scope_cache_key(&scopes);
-        assert!(key.starts_with("repository:a-repo"));
-    }
-
-    #[test]
-    fn scope_cache_key_deterministic() {
-        let k1 = scope_cache_key(&[Scope::pull("a"), Scope::pull("b")]);
-        let k2 = scope_cache_key(&[Scope::pull("b"), Scope::pull("a")]);
-        assert_eq!(k1, k2);
-    }
-
-    #[test]
     fn basic_header_value_encodes_correctly() {
         let creds = Credentials::Basic {
             username: "user".into(),
@@ -435,5 +414,151 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Http(_)));
+    }
+
+    #[tokio::test]
+    async fn exchange_token_access_token_fallback() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Response uses access_token field instead of token.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": "fallback-tok"})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let http = reqwest::Client::new();
+        let token = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+            .await
+            .unwrap();
+        assert_eq!(token.value(), "fallback-tok");
+    }
+
+    #[tokio::test]
+    async fn exchange_token_no_expiry_produces_permanent_token() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // No expires_in field — token should be permanent.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "perm-tok"})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let http = reqwest::Client::new();
+        let token = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+            .await
+            .unwrap();
+        assert_eq!(token.value(), "perm-tok");
+        assert!(!token.is_expired());
+        assert!(!token.should_refresh());
+    }
+
+    #[tokio::test]
+    async fn exchange_token_zero_expiry_treated_as_permanent() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "zero-tok", "expires_in": 0})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let http = reqwest::Client::new();
+        let token = exchange_token(&http, &mock.uri(), &[Scope::pull("repo")], None)
+            .await
+            .unwrap();
+        assert_eq!(token.value(), "zero-tok");
+        assert!(!token.is_expired());
+    }
+
+    #[tokio::test]
+    async fn exchange_token_multi_scope_query_params() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token",service="svc""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "multi-tok"})),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let http = reqwest::Client::new();
+        let scopes = [Scope::pull("repo-a"), Scope::pull_push("repo-b")];
+        let token = exchange_token(&http, &mock.uri(), &scopes, None)
+            .await
+            .unwrap();
+        assert_eq!(token.value(), "multi-tok");
+
+        // Verify both scope params are present in the token request URL.
+        let requests = mock.received_requests().await.unwrap();
+        let token_req = requests
+            .iter()
+            .find(|r| r.url.path() == "/token")
+            .expect("token request not found");
+        let scope_params: Vec<String> = token_req
+            .url
+            .query_pairs()
+            .filter(|(k, _)| k == "scope")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(scope_params.len(), 2, "expected 2 scope params");
+        assert!(scope_params.contains(&"repository:repo-a:pull".to_string()));
+        assert!(scope_params.contains(&"repository:repo-b:pull,push".to_string()));
     }
 }

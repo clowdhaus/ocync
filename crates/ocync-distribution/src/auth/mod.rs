@@ -156,6 +156,16 @@ impl Token {
     }
 }
 
+/// Build a sorted, space-joined cache key from a set of scopes.
+///
+/// Used by auth providers to key their token caches. The sort ensures
+/// that the same set of scopes in any order produces the same key.
+pub(crate) fn scopes_cache_key(scopes: &[Scope]) -> String {
+    let mut parts: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+    parts.sort();
+    parts.join(" ")
+}
+
 /// Credentials for authenticating to a registry.
 #[derive(Clone)]
 pub enum Credentials {
@@ -270,6 +280,26 @@ mod tests {
         let token = Token::with_ttl("abc123", Duration::from_secs(1200));
         assert!(!token.is_expired());
         assert!(!token.should_refresh());
+    }
+
+    #[test]
+    fn scopes_cache_key_sorted() {
+        let scopes = vec![Scope::pull("z-repo"), Scope::pull("a-repo")];
+        let key = scopes_cache_key(&scopes);
+        assert!(key.starts_with("repository:a-repo"));
+    }
+
+    #[test]
+    fn scopes_cache_key_deterministic() {
+        let k1 = scopes_cache_key(&[Scope::pull("a"), Scope::pull("b")]);
+        let k2 = scopes_cache_key(&[Scope::pull("b"), Scope::pull("a")]);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn scopes_cache_key_single() {
+        let key = scopes_cache_key(&[Scope::pull("repo")]);
+        assert_eq!(key, "repository:repo:pull");
     }
 
     #[test]

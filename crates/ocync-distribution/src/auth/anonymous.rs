@@ -7,8 +7,8 @@ use std::pin::Pin;
 
 use tokio::sync::Mutex;
 
-use super::token_exchange::{exchange_token, scope_cache_key};
-use super::{AuthProvider, Scope, Token};
+use super::token_exchange::exchange_token;
+use super::{AuthProvider, Scope, Token, scopes_cache_key};
 use crate::error::Error;
 
 /// Anonymous auth provider that performs the Docker token-exchange flow.
@@ -71,7 +71,7 @@ impl AuthProvider for AnonymousAuth {
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
         let scopes = scopes.to_vec();
         Box::pin(async move {
-            let key = scope_cache_key(&scopes);
+            let key = scopes_cache_key(&scopes);
 
             // Hold the mutex for the entire check-then-fetch to prevent thundering herd.
             let mut cache = self.cache.lock().await;

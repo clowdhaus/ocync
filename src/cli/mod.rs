@@ -154,7 +154,7 @@ pub(crate) async fn build_registry_client(
             );
             RegistryClient::builder(url).auth(auth)
         }
-        Some(AuthType::Token) => {
+        Some(AuthType::StaticToken) => {
             // Config validation ensures token is present for Token auth.
             let tok = registry_config
                 .and_then(|r| r.token.as_deref())
@@ -411,7 +411,7 @@ mod tests {
             AuthType::Ghcr,
             AuthType::Anonymous,
             AuthType::Basic,
-            AuthType::Token,
+            AuthType::StaticToken,
             AuthType::DockerConfig,
         ];
         for variant in &variants {
@@ -422,7 +422,7 @@ mod tests {
                 AuthType::Ghcr => {}
                 AuthType::Anonymous => {}
                 AuthType::Basic => {}
-                AuthType::Token => {}
+                AuthType::StaticToken => {}
                 AuthType::DockerConfig => {}
             }
         }

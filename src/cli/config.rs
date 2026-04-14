@@ -171,8 +171,9 @@ pub(crate) enum AuthType {
     Anonymous,
     /// HTTP basic auth.
     Basic,
-    /// Bearer token.
-    Token,
+    /// Pre-obtained bearer token (PAT, CI token).
+    #[serde(alias = "token")]
+    StaticToken,
     /// Docker config.json credential store.
     DockerConfig,
 }
@@ -193,9 +194,9 @@ pub(crate) struct RegistryConfig {
 
     /// Credentials for Basic auth (`auth_type: basic`).
     #[serde(default)]
-    pub credentials: Option<CredentialsConfig>,
+    pub credentials: Option<BasicCredentials>,
 
-    /// Bearer token for Token auth (`auth_type: token`).
+    /// Bearer token for static token auth (`auth_type: static_token`).
     #[serde(default)]
     pub token: Option<String>,
 }
@@ -214,16 +215,16 @@ impl std::fmt::Debug for RegistryConfig {
 
 /// Credentials for HTTP Basic authentication.
 #[derive(Deserialize, Serialize)]
-pub(crate) struct CredentialsConfig {
+pub(crate) struct BasicCredentials {
     /// Username for authentication.
     pub username: String,
     /// Password or access token.
     pub password: String,
 }
 
-impl std::fmt::Debug for CredentialsConfig {
+impl std::fmt::Debug for BasicCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CredentialsConfig")
+        f.debug_struct("BasicCredentials")
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
             .finish()
@@ -484,7 +485,7 @@ fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), Config
                     )));
                 }
             }
-            AuthType::Token => {
+            AuthType::StaticToken => {
                 if registry.token.is_none() {
                     return Err(ConfigError::Validation(format!(
                         "registries.{name}: auth_type 'token' requires a 'token' field"
@@ -1538,7 +1539,7 @@ mappings:
 
     #[test]
     fn credentials_debug_redacts_password() {
-        let creds = CredentialsConfig {
+        let creds = BasicCredentials {
             username: "admin".to_string(),
             password: "super-secret".to_string(),
         };
@@ -1552,7 +1553,7 @@ mappings:
     fn registry_debug_redacts_token() {
         let registry = RegistryConfig {
             url: "example.com".to_string(),
-            auth_type: Some(AuthType::Token),
+            auth_type: Some(AuthType::StaticToken),
             max_concurrent: None,
             credentials: None,
             token: Some("secret-bearer-token".to_string()),

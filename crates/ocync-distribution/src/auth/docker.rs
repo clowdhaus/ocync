@@ -12,8 +12,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use super::token_exchange::{exchange_token, scope_cache_key};
-use super::{AuthProvider, Credentials, Scope, Token};
+use super::token_exchange::exchange_token;
+use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::error::Error;
 
 /// Docker Hub hostnames that all resolve to the same credential entry.
@@ -344,7 +344,7 @@ impl AuthProvider for DockerConfigAuth {
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
         let scopes = scopes.to_vec();
         Box::pin(async move {
-            let key = scope_cache_key(&scopes);
+            let key = scopes_cache_key(&scopes);
 
             let mut cache = self.cache.lock().await;
 

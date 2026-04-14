@@ -10,8 +10,8 @@ use std::pin::Pin;
 
 use tokio::sync::Mutex;
 
-use super::token_exchange::{exchange_token, scope_cache_key};
-use super::{AuthProvider, Credentials, Scope, Token};
+use super::token_exchange::exchange_token;
+use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::error::Error;
 
 /// Auth provider that performs the Docker token-exchange flow with HTTP Basic credentials.
@@ -88,7 +88,7 @@ impl AuthProvider for BasicAuth {
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
         let scopes = scopes.to_vec();
         Box::pin(async move {
-            let key = scope_cache_key(&scopes);
+            let key = scopes_cache_key(&scopes);
 
             // Hold the mutex for the entire check-then-fetch to prevent thundering herd.
             let mut cache = self.cache.lock().await;
@@ -185,7 +185,7 @@ mod tests {
             .iter()
             .find(|r| r.url.path() == "/token")
             .expect("token request not found");
-        let query_pairs: std::collections::HashMap<String, String> = token_req
+        let query_pairs: HashMap<String, String> = token_req
             .url
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
