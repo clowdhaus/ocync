@@ -36,13 +36,14 @@ use ocync_distribution::blob::MountResult;
 use ocync_distribution::manifest::ManifestPull;
 use ocync_distribution::sha256::Sha256;
 use ocync_distribution::spec::{
-    Descriptor, ImageIndex, ImageManifest, ManifestKind, PlatformFilter, RepositoryName,
+    Descriptor, ImageIndex, ImageManifest, ManifestKind, PlatformFilter, RegistryAuthority,
+    RepositoryName,
 };
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::cache::TransferStateCache;
+use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
 use crate::retry::{self, RetryConfig};
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
@@ -76,7 +77,7 @@ impl fmt::Display for ImageRef {
 /// Wraps the config-defined name (e.g. `us-ecr`) or bare hostname for
 /// ad-hoc commands. Must be unique per mapping -- it is used as the outer
 /// key in the blob dedup map.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct RegistryName(String);
 
 impl RegistryName {
@@ -107,7 +108,7 @@ impl fmt::Display for RegistryName {
 #[derive(Debug)]
 pub struct ResolvedMapping {
     /// Source registry authority for cache key construction (e.g. `cgr.dev:443`).
-    pub source_authority: String,
+    pub source_authority: RegistryAuthority,
     /// Client for the source registry.
     pub source_client: Arc<RegistryClient>,
     /// Repository path at the source (e.g. `library/nginx`).
@@ -544,12 +545,12 @@ impl SyncEngine {
         // Prune snapshot entries for tags no longer in the mapping set.
         // Prevents unbounded cache growth when source tags are deleted.
         {
-            let live_keys: std::collections::HashSet<String> = mappings
+            let live_keys: std::collections::HashSet<SnapshotKey> = mappings
                 .iter()
                 .flat_map(|m| {
-                    m.tags.iter().map(|t| {
-                        crate::cache::snapshot_key(&m.source_authority, &m.source_repo, &t.source)
-                    })
+                    m.tags
+                        .iter()
+                        .map(|t| SnapshotKey::new(&m.source_authority, &m.source_repo, &t.source))
                 })
                 .collect();
             cache.borrow_mut().prune_snapshots(&live_keys);
@@ -581,7 +582,7 @@ impl SyncEngine {
 /// without intermediate borrows.
 struct DiscoveryParams {
     source_client: Arc<RegistryClient>,
-    source_authority: String,
+    source_authority: RegistryAuthority,
     source: ImageRef,
     target: ImageRef,
     targets: Vec<TargetEntry>,
@@ -627,7 +628,7 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
         discovery_head_timeout,
     } = params;
 
-    let platform_key = crate::cache::platform_filter_key(platforms.as_deref());
+    let platform_key = PlatformFilterKey::from_filters(platforms.as_deref());
 
     // --- Step 1: HEAD source manifest with short timeout ---
     let source_head_digest = match tokio::time::timeout(
@@ -661,12 +662,12 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
     };
 
     // --- Steps 2-5: Cache lookup (only if HEAD succeeded) ---
+    let snapshot_key = SnapshotKey::new(&source_authority, &source.repo, &source.tag);
     if let Some(ref head_digest) = source_head_digest {
         // Scoped borrow -- dropped before any .await
         let cached = {
             let c = cache.borrow();
-            c.source_snapshot(&source_authority, &source.repo, &source.tag)
-                .cloned()
+            c.source_snapshot(&snapshot_key).cloned()
         };
 
         if let Some(snapshot) = cached {
@@ -776,7 +777,7 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
                     platforms: platforms.as_deref(),
                     skip_existing,
                     cache: &cache,
-                    source_authority: &source_authority,
+                    snapshot_key: &snapshot_key,
                     head_digest: Some(head_digest),
                     platform_key: &platform_key,
                 })
@@ -809,7 +810,7 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
         platforms: platforms.as_deref(),
         skip_existing,
         cache: &cache,
-        source_authority: &source_authority,
+        snapshot_key: &snapshot_key,
         head_digest: source_head_digest.as_ref(),
         platform_key: &platform_key,
     })
@@ -830,9 +831,9 @@ struct FullPullParams<'a> {
     platforms: Option<&'a [PlatformFilter]>,
     skip_existing: bool,
     cache: &'a Rc<RefCell<TransferStateCache>>,
-    source_authority: &'a str,
+    snapshot_key: &'a SnapshotKey,
     head_digest: Option<&'a Digest>,
-    platform_key: &'a str,
+    platform_key: &'a PlatformFilterKey,
 }
 
 /// Full discovery: pull source manifest, HEAD-check targets, build transfer tasks.
@@ -850,7 +851,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
         platforms,
         skip_existing,
         cache,
-        source_authority,
+        snapshot_key,
         head_digest,
         platform_key,
     } = params;
@@ -896,13 +897,14 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
 
     // Update cache with fresh source data (regardless of target outcomes).
     if let Some(hd) = head_digest {
-        let snapshot = crate::cache::SourceSnapshot {
+        let snapshot = SourceSnapshot {
             source_digest: hd.clone(),
             filtered_digest: source_data.pull.digest.clone(),
-            platform_filter_key: platform_key.to_string(),
+            platform_filter_key: platform_key.clone(),
         };
-        let mut c = cache.borrow_mut();
-        c.set_source_snapshot(source_authority, &source.repo, &source.tag, snapshot);
+        cache
+            .borrow_mut()
+            .set_source_snapshot(snapshot_key.clone(), snapshot);
     } // borrow dropped before any .await
 
     let source_digest = &source_data.pull.digest;

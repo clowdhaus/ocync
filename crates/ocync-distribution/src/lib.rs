@@ -34,5 +34,5 @@ pub use manifest::{ManifestHead, ManifestPull};
 pub use reference::Reference;
 pub use spec::{
     Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, Platform, PlatformFilter,
-    RepositoryName,
+    RegistryAuthority, RepositoryName,
 };

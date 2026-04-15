@@ -7,7 +7,7 @@ use url::Url;
 use crate::aimd::{AimdController, RegistryAction};
 use crate::auth::{AuthProvider, Scope};
 use crate::error::Error;
-use crate::spec::RepositoryName;
+use crate::spec::{RegistryAuthority, RepositoryName};
 
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
@@ -132,17 +132,13 @@ impl RegistryClient {
     /// Return the registry authority as `host:port` for use as a cache key.
     ///
     /// Returns `Err` if the URL has no host (a bug in client construction).
-    /// Does not include the URL scheme — registries at the same host:port
-    /// but different schemes produce the same key, which is acceptable
-    /// because no production registry serves both HTTP and HTTPS on the
-    /// same port.
-    pub fn registry_authority(&self) -> Result<String, Error> {
+    pub fn registry_authority(&self) -> Result<RegistryAuthority, Error> {
         let host = self
             .base_url
             .host_str()
             .ok_or_else(|| Error::Other(format!("registry URL has no host: {}", self.base_url)))?;
         let port = self.base_url.port_or_known_default().unwrap_or(443);
-        Ok(format!("{host}:{port}"))
+        Ok(RegistryAuthority::new(format!("{host}:{port}")))
     }
 
     /// Perform an authenticated GET request.
@@ -361,7 +357,7 @@ mod tests {
     fn registry_authority_https_default_port() {
         let client = RegistryClient::builder(test_base_url()).build().unwrap();
         assert_eq!(
-            client.registry_authority().unwrap(),
+            client.registry_authority().unwrap().as_str(),
             "registry-1.docker.io:443"
         );
     }
@@ -370,7 +366,10 @@ mod tests {
     fn registry_authority_explicit_port() {
         let base = Url::parse("http://localhost:5000").unwrap();
         let client = RegistryClient::builder(base).build().unwrap();
-        assert_eq!(client.registry_authority().unwrap(), "localhost:5000");
+        assert_eq!(
+            client.registry_authority().unwrap().as_str(),
+            "localhost:5000"
+        );
     }
 
     #[test]
@@ -378,7 +377,7 @@ mod tests {
         let base = Url::parse("http://registry.example.com").unwrap();
         let client = RegistryClient::builder(base).build().unwrap();
         assert_eq!(
-            client.registry_authority().unwrap(),
+            client.registry_authority().unwrap().as_str(),
             "registry.example.com:80"
         );
     }

@@ -33,7 +33,7 @@ pub(crate) async fn run(
 
     let source_authority = source_client
         .registry_authority()
-        .unwrap_or_else(|_| "unknown:443".to_string());
+        .map_err(|e| CliError::Input(format!("source '{}': {e}", args.source)))?;
 
     let mapping = ResolvedMapping {
         source_authority,

@@ -258,7 +258,7 @@ impl fmt::Display for PlatformFilter {
 /// registry hostnames, and other string-typed values. Implements
 /// [`Deref<Target=str>`] for transparent borrowing in functions that
 /// accept `&str`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RepositoryName(String);
 
 impl RepositoryName {
@@ -295,6 +295,40 @@ impl From<String> for RepositoryName {
 impl From<&str> for RepositoryName {
     fn from(s: &str) -> Self {
         Self(s.to_owned())
+    }
+}
+
+/// Registry authority as `host:port` (e.g. `cgr.dev:443`, `localhost:5000`).
+///
+/// Used as a cache key to identify which registry a manifest was observed at.
+/// Does not include the URL scheme — registries at the same host:port but
+/// different schemes produce the same key, which is acceptable because no
+/// production registry serves both HTTP and HTTPS on the same port.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RegistryAuthority(String);
+
+impl RegistryAuthority {
+    /// Create a new registry authority.
+    pub fn new(authority: impl Into<String>) -> Self {
+        Self(authority.into())
+    }
+
+    /// Return the authority as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for RegistryAuthority {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RegistryAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
