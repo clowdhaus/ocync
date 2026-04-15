@@ -23,6 +23,10 @@ use crate::cli::output::{format_bytes, format_duration};
 /// line only at verbosity >= 1.
 fn format_image_line(result: &ImageResult, verbosity: u8) -> Option<String> {
     match &result.status {
+        ImageStatus::Failed { kind, error, .. } if error.is_empty() => Some(format!(
+            "FAILED  {} -> {}  ({kind})",
+            result.source, result.target,
+        )),
         ImageStatus::Failed { kind, error, .. } => Some(format!(
             "FAILED  {} -> {}  ({kind}: {error})",
             result.source, result.target,
@@ -141,7 +145,7 @@ impl TextProgress {
 /// selection is made in `main.rs`, not here.
 pub(crate) struct TtyProgress {
     multi: MultiProgress,
-    spinners: RefCell<HashMap<String, ProgressBar>>,
+    spinners: RefCell<HashMap<(String, String), ProgressBar>>,
     style: ProgressStyle,
     verbosity: u8,
     suppress_summary: bool,
@@ -180,11 +184,6 @@ impl TtyProgress {
     fn spinner_style() -> ProgressStyle {
         ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("hardcoded template is valid")
     }
-
-    /// Build the map key for an image.
-    fn spinner_key(source: &str, target: &str) -> String {
-        format!("{source} -> {target}")
-    }
 }
 
 impl ProgressReporter for TtyProgress {
@@ -194,11 +193,11 @@ impl ProgressReporter for TtyProgress {
         pb.set_message(format!("syncing {source} -> {target}"));
         self.spinners
             .borrow_mut()
-            .insert(Self::spinner_key(source, target), pb);
+            .insert((source.to_owned(), target.to_owned()), pb);
     }
 
     fn image_completed(&self, result: &ImageResult) {
-        let key = Self::spinner_key(&result.source, &result.target);
+        let key = (result.source.clone(), result.target.clone());
         let mut spinners = self.spinners.borrow_mut();
         let Some(pb) = spinners.remove(&key) else {
             tracing::warn!(
@@ -330,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn image_line_failed_with_empty_error() {
+    fn image_line_failed_with_empty_error_omits_colon() {
         let result = make_result(
             ImageStatus::Failed {
                 kind: ErrorKind::ManifestPull,
@@ -340,7 +339,10 @@ mod tests {
             0,
         );
         let line = format_image_line(&result, 0).unwrap();
-        assert!(line.contains("manifest pull: )"), "got: {line}");
+        assert_eq!(
+            line,
+            "FAILED  source/repo:v1 -> target/repo:v1  (manifest pull)"
+        );
     }
 
     #[test]
@@ -526,6 +528,54 @@ mod tests {
     }
 
     #[test]
+    fn summary_with_only_cache_hits_includes_discovery() {
+        // Distinguishes the `||` from `&&` in the discovery condition:
+        // even when misses == 0, hits > 0 should show the discovery suffix.
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 1,
+                discovery_cache_hits: 5,
+                discovery_cache_misses: 0,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(1),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            output.contains("discovery: 5 cached, 0 pulled"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn summary_with_only_cache_misses_includes_discovery() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 1,
+                discovery_cache_hits: 0,
+                discovery_cache_misses: 3,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(1),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            output.contains("discovery: 0 cached, 3 pulled"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
     fn summary_suppressed_produces_no_output() {
         let buf: Buf = Rc::new(RefCell::new(Vec::new()));
         let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
@@ -570,25 +620,44 @@ mod tests {
     }
 
     #[test]
+    fn text_image_started_is_noop() {
+        let (progress, stderr, stdout) = test_text_progress(1);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        assert!(
+            stderr.borrow().is_empty(),
+            "image_started should not write to stderr"
+        );
+        assert!(
+            stdout.borrow().is_empty(),
+            "image_started should not write to stdout"
+        );
+    }
+
+    #[test]
     fn text_image_completed_writes_to_stderr() {
-        let (progress, stderr, _stdout) = test_text_progress(1);
+        let (progress, stderr, stdout) = test_text_progress(1);
         let result = make_result(ImageStatus::Synced, 187_000_000);
         progress.image_completed(&result);
         let output = String::from_utf8(stderr.borrow().clone()).unwrap();
         assert!(output.starts_with("synced  "), "got: {output}");
+        assert!(
+            stdout.borrow().is_empty(),
+            "per-image output must NOT go to stdout"
+        );
     }
 
     #[test]
     fn text_image_completed_silent_at_v0() {
-        let (progress, stderr, _stdout) = test_text_progress(0);
+        let (progress, stderr, stdout) = test_text_progress(0);
         let result = make_result(ImageStatus::Synced, 187_000_000);
         progress.image_completed(&result);
         assert!(stderr.borrow().is_empty());
+        assert!(stdout.borrow().is_empty());
     }
 
     #[test]
     fn text_failed_always_writes_to_stderr() {
-        let (progress, stderr, _stdout) = test_text_progress(0);
+        let (progress, stderr, stdout) = test_text_progress(0);
         let result = make_result(
             ImageStatus::Failed {
                 kind: ErrorKind::ManifestPush,
@@ -600,6 +669,10 @@ mod tests {
         progress.image_completed(&result);
         let output = String::from_utf8(stderr.borrow().clone()).unwrap();
         assert!(output.starts_with("FAILED  "), "got: {output}");
+        assert!(
+            stdout.borrow().is_empty(),
+            "per-image output must NOT go to stdout"
+        );
     }
 
     #[test]
@@ -700,9 +773,9 @@ mod tests {
         );
     }
 
-    // -- TtyProgress tests (wiring: bar lifecycle and summary output) --
+    // -- TtyProgress tests (wiring: spinner lifecycle and summary output) --
 
-    fn test_bar_progress(verbosity: u8) -> (TtyProgress, Buf) {
+    fn test_tty_progress(verbosity: u8) -> (TtyProgress, Buf) {
         let stdout_buf = Rc::new(RefCell::new(Vec::new()));
         let progress =
             TtyProgress::with_writers(verbosity, false, Box::new(RcWriter(Rc::clone(&stdout_buf))));
@@ -710,31 +783,31 @@ mod tests {
     }
 
     #[test]
-    fn bar_started_creates_entry() {
-        let (progress, _stdout) = test_bar_progress(0);
+    fn tty_started_creates_entry() {
+        let (progress, _stdout) = test_tty_progress(0);
         progress.image_started("source/repo:v1", "target/repo:v1");
         assert_eq!(progress.spinners.borrow().len(), 1);
     }
 
     #[test]
-    fn bar_started_multiple_creates_multiple() {
-        let (progress, _stdout) = test_bar_progress(0);
+    fn tty_started_multiple_creates_multiple() {
+        let (progress, _stdout) = test_tty_progress(0);
         progress.image_started("source/a:v1", "target/a:v1");
         progress.image_started("source/b:v1", "target/b:v1");
         assert_eq!(progress.spinners.borrow().len(), 2);
     }
 
     #[test]
-    fn bar_completed_removes_entry() {
-        let (progress, _stdout) = test_bar_progress(0);
+    fn tty_completed_removes_entry() {
+        let (progress, _stdout) = test_tty_progress(0);
         progress.image_started("source/repo:v1", "target/repo:v1");
         progress.image_completed(&make_result(ImageStatus::Synced, 1024));
         assert!(progress.spinners.borrow().is_empty());
     }
 
     #[test]
-    fn bar_completed_failed_removes_entry() {
-        let (progress, _stdout) = test_bar_progress(0);
+    fn tty_completed_failed_removes_entry() {
+        let (progress, _stdout) = test_tty_progress(0);
         progress.image_started("source/repo:v1", "target/repo:v1");
         progress.image_completed(&make_result(
             ImageStatus::Failed {
@@ -748,16 +821,16 @@ mod tests {
     }
 
     #[test]
-    fn bar_completed_without_started_does_not_panic() {
-        let (progress, _stdout) = test_bar_progress(0);
+    fn tty_completed_without_started_does_not_panic() {
+        let (progress, _stdout) = test_tty_progress(0);
         // No image_started — should warn and return, not panic.
         progress.image_completed(&make_result(ImageStatus::Synced, 1024));
         assert!(progress.spinners.borrow().is_empty());
     }
 
     #[test]
-    fn bar_multiple_images_all_cleaned_up() {
-        let (progress, _stdout) = test_bar_progress(1);
+    fn tty_multiple_images_all_cleaned_up() {
+        let (progress, _stdout) = test_tty_progress(1);
         progress.image_started("source/a:v1", "target/a:v1");
         progress.image_started("source/b:v1", "target/b:v1");
 
@@ -781,7 +854,7 @@ mod tests {
 
     #[test]
     fn tty_run_completed_writes_summary_to_stdout() {
-        let (progress, stdout) = test_bar_progress(0);
+        let (progress, stdout) = test_tty_progress(0);
         let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
         progress.run_completed(&report);
         let output = String::from_utf8(stdout.borrow().clone()).unwrap();
@@ -803,4 +876,47 @@ mod tests {
             "suppress_summary should suppress stdout"
         );
     }
+
+    #[test]
+    fn tty_suppress_summary_still_runs_spinners() {
+        // Spinner lifecycle must work even when summary is suppressed
+        // (e.g., --json mode). Spinners go to stderr, summary to stdout —
+        // suppressing stdout must not interfere with spinner create/remove.
+        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
+        let progress =
+            TtyProgress::with_writers(0, true, Box::new(RcWriter(Rc::clone(&stdout_buf))));
+
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        assert_eq!(progress.spinners.borrow().len(), 1);
+
+        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
+        assert!(progress.spinners.borrow().is_empty());
+
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        assert!(
+            stdout_buf.borrow().is_empty(),
+            "suppress_summary should suppress stdout"
+        );
+    }
+
+    #[test]
+    fn tty_started_same_image_twice_overwrites() {
+        // If image_started is called twice for the same (source, target),
+        // the second spinner replaces the first. The map should still have
+        // exactly one entry, and image_completed should clean it up.
+        let (progress, _stdout) = test_tty_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        assert_eq!(progress.spinners.borrow().len(), 1);
+
+        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
+        assert!(progress.spinners.borrow().is_empty());
+    }
+
+    // Note: spinner message content (the transient "syncing ..." text shown
+    // during in-flight transfers) cannot be asserted because indicatif's
+    // ProgressDrawTarget::hidden() swallows all rendering. The final message
+    // on completion uses format_image_line(), which IS thoroughly tested above.
+    // Only the cosmetic in-flight prefix is untested.
 }
