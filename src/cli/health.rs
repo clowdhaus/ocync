@@ -42,26 +42,45 @@ impl HealthState {
     }
 }
 
-/// Route a request path to an HTTP status and body based on health state.
-fn handle_request<'a>(path: &str, state: &HealthState) -> (&'a str, &'a str) {
-    match path {
-        "/healthz" => {
-            if state.is_healthy() {
-                ("200 OK", "ok\n")
-            } else {
-                ("503 Service Unavailable", "sync stale\n")
-            }
-        }
-        _ => ("404 Not Found", "not found\n"),
+/// HTTP response components from the health handler.
+struct HealthResponse {
+    status: &'static str,
+    body: &'static str,
+}
+
+impl HealthResponse {
+    /// Format as an HTTP/1.1 response string.
+    fn to_http(&self) -> String {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            self.status,
+            self.body.len(),
+            self.body,
+        )
     }
 }
 
-/// Format an HTTP/1.1 response with the given status and body.
-fn format_response(status: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-    )
+/// Route a request path to an HTTP response based on health state.
+fn handle_request(path: &str, state: &HealthState) -> HealthResponse {
+    match path {
+        "/healthz" => {
+            if state.is_healthy() {
+                HealthResponse {
+                    status: "200 OK",
+                    body: "ok\n",
+                }
+            } else {
+                HealthResponse {
+                    status: "503 Service Unavailable",
+                    body: "sync stale\n",
+                }
+            }
+        }
+        _ => HealthResponse {
+            status: "404 Not Found",
+            body: "not found\n",
+        },
+    }
 }
 
 /// Start the health server on the given port.
@@ -95,8 +114,8 @@ pub(crate) async fn serve(port: u16, state: Rc<RefCell<HealthState>>) -> io::Res
         let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
         let path = request.split_whitespace().nth(1).unwrap_or("");
 
-        let (status, body) = handle_request(path, &state.borrow());
-        let response = format_response(status, body);
+        let resp = handle_request(path, &state.borrow());
+        let response = resp.to_http();
         if let Err(err) = stream.write_all(response.as_bytes()).await {
             tracing::warn!(error = %err, "failed to write health response");
         }
@@ -112,18 +131,18 @@ mod tests {
     #[test]
     fn healthz_returns_503_before_first_sync() {
         let state = HealthState::new(Duration::from_secs(60));
-        let (status, body) = handle_request("/healthz", &state);
-        assert_eq!(status, "503 Service Unavailable");
-        assert_eq!(body, "sync stale\n");
+        let resp = handle_request("/healthz", &state);
+        assert_eq!(resp.status, "503 Service Unavailable");
+        assert_eq!(resp.body, "sync stale\n");
     }
 
     #[test]
     fn healthz_returns_200_after_successful_sync() {
         let mut state = HealthState::new(Duration::from_secs(60));
         state.record_success();
-        let (status, body) = handle_request("/healthz", &state);
-        assert_eq!(status, "200 OK");
-        assert_eq!(body, "ok\n");
+        let resp = handle_request("/healthz", &state);
+        assert_eq!(resp.status, "200 OK");
+        assert_eq!(resp.body, "ok\n");
     }
 
     #[test]
@@ -131,17 +150,17 @@ mod tests {
         let interval = Duration::from_millis(10);
         let mut state = HealthState::new(interval);
         state.last_success = Some(Instant::now() - interval * 3);
-        let (status, body) = handle_request("/healthz", &state);
-        assert_eq!(status, "503 Service Unavailable");
-        assert_eq!(body, "sync stale\n");
+        let resp = handle_request("/healthz", &state);
+        assert_eq!(resp.status, "503 Service Unavailable");
+        assert_eq!(resp.body, "sync stale\n");
     }
 
     #[test]
     fn unknown_path_returns_404() {
         let state = HealthState::new(Duration::from_secs(60));
-        let (status, body) = handle_request("/foo", &state);
-        assert_eq!(status, "404 Not Found");
-        assert_eq!(body, "not found\n");
+        let resp = handle_request("/foo", &state);
+        assert_eq!(resp.status, "404 Not Found");
+        assert_eq!(resp.body, "not found\n");
     }
 
     // -- state logic unit tests --
@@ -170,11 +189,38 @@ mod tests {
     // -- response formatting --
 
     #[test]
-    fn format_response_is_valid_http() {
-        let response = format_response("200 OK", "ok\n");
+    fn to_http_200() {
+        let resp = HealthResponse {
+            status: "200 OK",
+            body: "ok\n",
+        };
         assert_eq!(
-            response,
+            resp.to_http(),
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n"
+        );
+    }
+
+    #[test]
+    fn to_http_503() {
+        let resp = HealthResponse {
+            status: "503 Service Unavailable",
+            body: "sync stale\n",
+        };
+        assert_eq!(
+            resp.to_http(),
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nsync stale\n"
+        );
+    }
+
+    #[test]
+    fn to_http_404() {
+        let resp = HealthResponse {
+            status: "404 Not Found",
+            body: "not found\n",
+        };
+        assert_eq!(
+            resp.to_http(),
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nnot found\n"
         );
     }
 }

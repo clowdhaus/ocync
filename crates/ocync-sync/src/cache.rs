@@ -4,36 +4,34 @@
 //! cache on startup and skip redundant HEAD checks for blobs already known to
 //! exist at a target.
 //!
-//! # Binary format (v2)
+//! # Binary format
 //!
 //! ```text
 //! [4 bytes: header_len as u32 LE]
 //! [header_len bytes: postcard-serialized CacheHeader]
 //! [postcard-serialized BlobDedupMap]
-//! [postcard-serialized SourceSnapshotMap]          ← new in v2
+//! [postcard-serialized SourceSnapshotMap]
 //! [4 bytes: CRC32 of everything before this]
 //! ```
-//!
-//! v1 files (no snapshot section) are loaded with an empty snapshot map.
 //!
 //! Only [`BlobStatus::ExistsAtTarget`] and [`BlobStatus::Completed`] entries
 //! are written to disk; transient states are stripped before serialization.
 
-use std::collections::HashMap as StdHashMap;
-use std::collections::HashSet as StdHashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ocync_distribution::Digest;
-use ocync_distribution::spec::{PlatformFilter, RepositoryName};
+use ocync_distribution::spec::{PlatformFilter, RegistryAuthority, RepositoryName};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::plan::{BlobDedupMap, BlobStatus};
 
-/// Cache file format version.
-const CACHE_VERSION: u32 = 2;
+/// Cache file format version. Bump on incompatible layout changes; mismatched
+/// versions are discarded and rebuilt from scratch on the next sync cycle.
+const CACHE_VERSION: u32 = 1;
 
 /// Header written at the start of every cache file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -42,6 +40,71 @@ struct CacheHeader {
     version: u32,
     /// Unix timestamp (seconds since epoch) when the file was written.
     written_at: u64,
+}
+
+/// Composite key identifying a source manifest in the snapshot cache.
+///
+/// Combines registry authority, repository, and tag into a structured key
+/// for the [`SourceSnapshotMap`]. Using a struct instead of an encoded string
+/// eliminates separator ambiguity and gives compile-time key construction
+/// correctness.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SnapshotKey {
+    /// Registry authority (e.g. `cgr.dev:443`).
+    pub authority: RegistryAuthority,
+    /// Repository path (e.g. `chainguard/nginx`).
+    pub repo: RepositoryName,
+    /// Tag name (e.g. `latest`).
+    pub tag: String,
+}
+
+impl SnapshotKey {
+    /// Create a new snapshot key.
+    pub fn new(authority: &RegistryAuthority, repo: &RepositoryName, tag: &str) -> Self {
+        Self {
+            authority: authority.clone(),
+            repo: repo.clone(),
+            tag: tag.to_owned(),
+        }
+    }
+}
+
+/// Canonical representation of the active platform filter set.
+///
+/// Platforms are sorted alphabetically and joined with commas. An empty
+/// `PlatformFilterKey` means no platform filtering is active. Compared by
+/// equality for config change detection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformFilterKey(String);
+
+impl PlatformFilterKey {
+    /// Compute the canonical key from an optional platform filter slice.
+    ///
+    /// Returns an empty key for `None` or empty slice.
+    pub fn from_filters(filters: Option<&[PlatformFilter]>) -> Self {
+        let Some(filters) = filters else {
+            return Self(String::new());
+        };
+        if filters.is_empty() {
+            return Self(String::new());
+        }
+        let mut sorted: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
+        sorted.sort();
+        Self(sorted.join(","))
+    }
+}
+
+impl std::ops::Deref for PlatformFilterKey {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PlatformFilterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Cached source manifest state for the tag digest cache.
@@ -55,14 +118,12 @@ pub struct SourceSnapshot {
     pub source_digest: Digest,
     /// Digest of the filtered manifest intended for targets.
     pub filtered_digest: Digest,
-    /// Canonical platform filter string active when this entry was written.
-    /// Empty string means no platform filtering. Compared directly for
-    /// config change detection — no hashing needed.
-    pub platform_filter_key: String,
+    /// Platform filter active when this entry was written.
+    pub platform_filter_key: PlatformFilterKey,
 }
 
-/// Map of `"{authority}\0{repo}\0{tag}"` → [`SourceSnapshot`].
-type SourceSnapshotMap = StdHashMap<String, SourceSnapshot>;
+/// Map of [`SnapshotKey`] to [`SourceSnapshot`].
+type SourceSnapshotMap = HashMap<SnapshotKey, SourceSnapshot>;
 
 /// Persistent transfer state cache.
 ///
@@ -149,37 +210,20 @@ impl TransferStateCache {
     }
 
     /// Look up a cached source snapshot.
-    pub fn source_snapshot(
-        &self,
-        authority: &str,
-        repo: &RepositoryName,
-        tag: &str,
-    ) -> Option<&SourceSnapshot> {
-        self.snapshots.get(&snapshot_key(authority, repo, tag))
+    pub fn source_snapshot(&self, key: &SnapshotKey) -> Option<&SourceSnapshot> {
+        self.snapshots.get(key)
     }
 
     /// Record a source snapshot after a successful source pull.
-    pub fn set_source_snapshot(
-        &mut self,
-        authority: &str,
-        repo: &RepositoryName,
-        tag: &str,
-        snapshot: SourceSnapshot,
-    ) {
-        self.snapshots
-            .insert(snapshot_key(authority, repo, tag), snapshot);
-    }
-
-    /// Remove all source snapshot entries (used on SIGHUP config reload).
-    pub fn clear_snapshots(&mut self) {
-        self.snapshots.clear();
+    pub fn set_source_snapshot(&mut self, key: SnapshotKey, snapshot: SourceSnapshot) {
+        self.snapshots.insert(key, snapshot);
     }
 
     /// Remove snapshot entries for tags not in the provided set of live keys.
     ///
-    /// Each key should be produced by [`snapshot_key`]. Call after each sync
-    /// cycle to prevent unbounded cache growth when source tags are deleted.
-    pub fn prune_snapshots(&mut self, live_keys: &StdHashSet<String>) {
+    /// Call after each sync cycle to prevent unbounded cache growth when
+    /// source tags are deleted.
+    pub fn prune_snapshots(&mut self, live_keys: &HashSet<SnapshotKey>) {
         self.snapshots.retain(|k, _| live_keys.contains(k));
     }
 
@@ -281,7 +325,7 @@ impl TransferStateCache {
                 LoadError::Corrupt
             })?;
 
-        if header.version != 1 && header.version != CACHE_VERSION {
+        if header.version != CACHE_VERSION {
             warn!(
                 path = %path.display(),
                 version = header.version,
@@ -311,22 +355,16 @@ impl TransferStateCache {
 
         let body = &payload[4 + header_len..];
 
-        // Use take_from_bytes so we can read the optional snapshot section after.
         let (dedup, remainder): (BlobDedupMap, &[u8]) =
             postcard::take_from_bytes(body).map_err(|e| {
                 warn!(path = %path.display(), error = %e, "cache body deserialization failed, discarding");
                 LoadError::Corrupt
             })?;
 
-        // v2 has a SourceSnapshotMap after the BlobDedupMap; v1 has nothing.
-        let snapshots: SourceSnapshotMap = if remainder.is_empty() {
-            SourceSnapshotMap::new()
-        } else {
-            postcard::from_bytes(remainder).map_err(|e| {
-                warn!(path = %path.display(), error = %e, "snapshot section deserialization failed, using empty snapshots");
-                LoadError::Corrupt
-            })?
-        };
+        let snapshots: SourceSnapshotMap = postcard::from_bytes(remainder).map_err(|e| {
+            warn!(path = %path.display(), error = %e, "snapshot section deserialization failed, discarding");
+            LoadError::Corrupt
+        })?;
 
         Ok(Self { dedup, snapshots })
     }
@@ -343,7 +381,7 @@ enum LoadError {
 }
 
 /// Serialize a [`BlobDedupMap`] and [`SourceSnapshotMap`] into the on-disk
-/// cache format (v2).
+/// cache format.
 fn build_cache_bytes(
     dedup: &BlobDedupMap,
     snapshots: &SourceSnapshotMap,
@@ -380,30 +418,6 @@ fn build_cache_bytes(
     buf.extend_from_slice(&crc.to_le_bytes());
 
     Ok(buf)
-}
-
-/// Build the cache key for a source snapshot.
-///
-/// Format: `"{authority}\0{repo}\0{tag}"` — NUL-separated to avoid
-/// ambiguity (repo names contain `/`).
-pub fn snapshot_key(authority: &str, repo: &RepositoryName, tag: &str) -> String {
-    format!("{authority}\0{repo}\0{tag}")
-}
-
-/// Compute the canonical platform filter key for cache comparison.
-///
-/// Sorts platforms alphabetically and joins with comma. Returns empty
-/// string for `None` or empty slice (no platform filtering).
-pub fn platform_filter_key(filters: Option<&[PlatformFilter]>) -> String {
-    let Some(filters) = filters else {
-        return String::new();
-    };
-    if filters.is_empty() {
-        return String::new();
-    }
-    let mut sorted: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
-    sorted.sort();
-    sorted.join(",")
 }
 
 #[cfg(test)]
@@ -475,7 +489,7 @@ mod tests {
     fn build_cache_bytes_roundtrip() {
         let mut dedup = BlobDedupMap::new();
         dedup.set_completed("reg.io", &digest(), &repo("repo/a"));
-        let snapshots = SourceSnapshotMap::new();
+        let snapshots = SourceSnapshotMap::default();
         let bytes = build_cache_bytes(&dedup, &snapshots).unwrap();
         // Verify CRC covers the entire payload
         let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);

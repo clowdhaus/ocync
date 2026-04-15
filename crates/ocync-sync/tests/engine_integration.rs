@@ -9,10 +9,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ocync_distribution::spec::{
-    Descriptor, ImageIndex, ImageManifest, MediaType, Platform, PlatformFilter, RepositoryName,
+    Descriptor, ImageIndex, ImageManifest, MediaType, Platform, PlatformFilter, RegistryAuthority,
+    RepositoryName,
 };
 use ocync_distribution::{BatchBlobChecker, Digest, RegistryClientBuilder};
-use ocync_sync::cache::TransferStateCache;
+use ocync_sync::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
 use ocync_sync::engine::{RegistryName, ResolvedMapping, SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
@@ -57,6 +58,15 @@ fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
     Rc::new(RefCell::new(TransferStateCache::new()))
 }
 
+/// Build a [`SnapshotKey`] for tests using the standard test authority.
+fn test_snap_key(repo: &str, tag: &str) -> SnapshotKey {
+    SnapshotKey::new(
+        &RegistryAuthority::new("source.test.io:443"),
+        &RepositoryName::new(repo),
+        tag,
+    )
+}
+
 /// Shorthand for a [`TargetEntry`] without a batch checker.
 fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>) -> TargetEntry {
     TargetEntry {
@@ -75,7 +85,7 @@ fn test_mapping(
     tags: Vec<TagPair>,
 ) -> ResolvedMapping {
     ResolvedMapping {
-        source_authority: "source.test.io:443".to_string(),
+        source_authority: RegistryAuthority::new("source.test.io:443"),
         source_client,
         source_repo: source_repo.into(),
         target_repo: target_repo.into(),
@@ -5993,7 +6003,7 @@ async fn discovery_cache_miss_first_run() {
     // Verify cache was populated after successful sync.
     let c = cache.borrow();
     assert!(
-        c.source_snapshot("source.test.io:443", &"src/repo".into(), "v1")
+        c.source_snapshot(&test_snap_key("src/repo", "v1"))
             .is_some()
     );
 }
@@ -6029,13 +6039,11 @@ async fn discovery_cache_hit_skips_source_get() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            "source.test.io:443",
-            &"src/repo".into(),
-            "v1",
-            ocync_sync::cache::SourceSnapshot {
+            test_snap_key("src/repo", "v1"),
+            SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
-                platform_filter_key: String::new(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
             },
         );
     }
@@ -6166,13 +6174,11 @@ async fn discovery_target_stale_triggers_full_pull() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            "source.test.io:443",
-            &"src/repo".into(),
-            "v1",
-            ocync_sync::cache::SourceSnapshot {
+            test_snap_key("src/repo", "v1"),
+            SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
-                platform_filter_key: String::new(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
             },
         );
     }
@@ -6240,13 +6246,11 @@ async fn discovery_source_changed_triggers_full_pull() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            "source.test.io:443",
-            &"src/repo".into(),
-            "v1",
-            ocync_sync::cache::SourceSnapshot {
+            test_snap_key("src/repo", "v1"),
+            SourceSnapshot {
                 source_digest: old_digest,
                 filtered_digest: test_digest("beef"),
-                platform_filter_key: String::new(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
             },
         );
     }
@@ -6277,7 +6281,7 @@ async fn discovery_source_changed_triggers_full_pull() {
     // Cache must be updated with the new digest.
     let c = cache.borrow();
     let snapshot = c
-        .source_snapshot("source.test.io:443", &"src/repo".into(), "v1")
+        .source_snapshot(&test_snap_key("src/repo", "v1"))
         .expect("cache should be populated after sync");
     assert_eq!(snapshot.source_digest, manifest_digest);
 }
@@ -6478,13 +6482,11 @@ async fn discovery_head_failure_ignores_valid_cache() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            "source.test.io:443",
-            &"src/repo".into(),
-            "v1",
-            ocync_sync::cache::SourceSnapshot {
+            test_snap_key("src/repo", "v1"),
+            SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
-                platform_filter_key: String::new(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
             },
         );
     }
@@ -6579,7 +6581,7 @@ async fn discovery_pull_failure_does_not_populate_cache() {
     // Cache must NOT have been populated on failure.
     let c = cache.borrow();
     assert!(
-        c.source_snapshot("source.test.io:443", &"src/repo".into(), "v1")
+        c.source_snapshot(&test_snap_key("src/repo", "v1"))
             .is_none(),
         "cache must not be populated after pull failure"
     );
@@ -6730,13 +6732,11 @@ async fn discovery_skip_existing_with_cache_hit() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            "source.test.io:443",
-            &"src/repo".into(),
-            "v1",
-            ocync_sync::cache::SourceSnapshot {
+            test_snap_key("src/repo", "v1"),
+            SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
-                platform_filter_key: String::new(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
             },
         );
     }
@@ -6933,13 +6933,11 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            "source.test.io:443",
-            &"src/repo".into(),
-            "v1",
-            ocync_sync::cache::SourceSnapshot {
+            test_snap_key("src/repo", "v1"),
+            SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
-                platform_filter_key: String::new(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
             },
         );
     }
@@ -7032,13 +7030,11 @@ async fn discovery_retag_uses_correct_tags() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            "source.test.io:443",
-            &"src/repo".into(),
-            "v1.0",
-            ocync_sync::cache::SourceSnapshot {
+            test_snap_key("src/repo", "v1.0"),
+            SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
-                platform_filter_key: String::new(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
             },
         );
     }
@@ -7191,13 +7187,11 @@ async fn discovery_concurrent_mixed_outcomes() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            "source.test.io:443",
-            &"src/repo".into(),
-            "tag-a",
-            ocync_sync::cache::SourceSnapshot {
+            test_snap_key("src/repo", "tag-a"),
+            SourceSnapshot {
                 source_digest: manifest_a_digest.clone(),
                 filtered_digest: manifest_a_digest.clone(),
-                platform_filter_key: String::new(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
             },
         );
     }
@@ -7301,7 +7295,7 @@ async fn discovery_source_change_across_cycles() {
     {
         let c = cache.borrow();
         let snap = c
-            .source_snapshot("source.test.io:443", &"src/repo".into(), "v1")
+            .source_snapshot(&test_snap_key("src/repo", "v1"))
             .expect("cache populated after cycle 1");
         assert_eq!(snap.source_digest, manifest_1_digest);
     }
@@ -7369,7 +7363,7 @@ async fn discovery_source_change_across_cycles() {
     // Cache must be updated to D2.
     let c = cache.borrow();
     let snap = c
-        .source_snapshot("source.test.io:443", &"src/repo".into(), "v1")
+        .source_snapshot(&test_snap_key("src/repo", "v1"))
         .expect("cache updated after cycle 2");
     assert_eq!(snap.source_digest, manifest_2_digest);
 }
