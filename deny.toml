@@ -5,6 +5,11 @@ ignore = [
   # (used only for byte-count formatting in progress bars, which we don't use —
   # our bars are spinners). No security impact, just an unmaintained notice.
   "RUSTSEC-2025-0119",
+  # rustls name constraint vulnerabilities in transitive deps (via reqwest →
+  # hyper-rustls → rustls). Pre-existing on main, not introduced by this PR.
+  # Fix: upgrade rustls when a patched version is available.
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
 ]
 
 [licenses]
