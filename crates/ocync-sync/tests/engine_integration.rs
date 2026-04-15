@@ -7082,3 +7082,398 @@ async fn discovery_retag_uses_correct_tags() {
         "sum invariant"
     );
 }
+
+/// Three tags discovered concurrently with mixed outcomes: tag-a is a cache
+/// hit (pre-populated), tag-b is a cache miss (first run), and tag-c has a
+/// source HEAD failure (500) that falls through to GET. Uses
+/// `max_concurrent = 10` to exercise concurrent discovery.
+#[tokio::test]
+async fn discovery_concurrent_mixed_outcomes() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // --- Image A (for tag-a: cache hit path) ---
+    let config_a = b"config-a";
+    let layer_a = b"layer-a";
+    let config_a_desc = blob_descriptor(config_a, MediaType::OciConfig);
+    let layer_a_desc = blob_descriptor(layer_a, MediaType::OciLayerGzip);
+    let manifest_a = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_a_desc.clone(),
+        layers: vec![layer_a_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (_manifest_a_bytes, manifest_a_digest) = serialize_manifest(&manifest_a);
+
+    // --- Image B (for tag-b: cache miss path) ---
+    let config_b = b"config-b";
+    let layer_b = b"layer-b";
+    let config_b_desc = blob_descriptor(config_b, MediaType::OciConfig);
+    let layer_b_desc = blob_descriptor(layer_b, MediaType::OciLayerGzip);
+    let manifest_b = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_b_desc.clone(),
+        layers: vec![layer_b_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_b_bytes, manifest_b_digest) = serialize_manifest(&manifest_b);
+
+    // --- Image C (for tag-c: HEAD failure path) ---
+    let config_c = b"config-c";
+    let layer_c = b"layer-c";
+    let config_c_desc = blob_descriptor(config_c, MediaType::OciConfig);
+    let layer_c_desc = blob_descriptor(layer_c, MediaType::OciLayerGzip);
+    let manifest_c = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_c_desc.clone(),
+        layers: vec![layer_c_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_c_bytes, manifest_c_digest) = serialize_manifest(&manifest_c);
+
+    // --- Tag A: cache hit (source HEAD matches, target HEAD matches) ---
+    mount_source_head(&source_server, "src/repo", "tag-a", &manifest_a_digest).await;
+    // No source GET for tag-a: cache hit skips it.
+    mount_manifest_head_matching(&target_server, "tgt/repo", "tag-a", &manifest_a_digest).await;
+
+    // --- Tag B: cache miss (no cache entry, full pull + push) ---
+    mount_source_head(&source_server, "src/repo", "tag-b", &manifest_b_digest).await;
+    mount_source_manifest(&source_server, "src/repo", "tag-b", &manifest_b_bytes).await;
+    mount_blob_pull(&source_server, "src/repo", &config_b_desc.digest, config_b).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_b_desc.digest, layer_b).await;
+    mount_manifest_head_not_found(&target_server, "tgt/repo", "tag-b").await;
+    mount_blob_not_found(&target_server, "tgt/repo", &config_b_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_b_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "tag-b").await;
+
+    // --- Tag C: HEAD failure (500 on HEAD, falls through to GET) ---
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/tag-c"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&source_server)
+        .await;
+    mount_source_manifest(&source_server, "src/repo", "tag-c", &manifest_c_bytes).await;
+    mount_blob_pull(&source_server, "src/repo", &config_c_desc.digest, config_c).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_c_desc.digest, layer_c).await;
+    mount_manifest_head_not_found(&target_server, "tgt/repo", "tag-c").await;
+    mount_blob_not_found(&target_server, "tgt/repo", &config_c_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_c_desc.digest).await;
+    // blob_push already mounted for tgt/repo (shared across tags).
+    mount_manifest_push(&target_server, "tgt/repo", "tag-c").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![
+            TagPair::same("tag-a".to_owned()),
+            TagPair::same("tag-b".to_owned()),
+            TagPair::same("tag-c".to_owned()),
+        ],
+    );
+
+    // Pre-populate cache for tag-a only.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        c.set_source_snapshot(
+            "source.test.io:443",
+            &"src/repo".into(),
+            "tag-a",
+            ocync_sync::cache::SourceSnapshot {
+                source_digest: manifest_a_digest.clone(),
+                filtered_digest: manifest_a_digest.clone(),
+                platform_filter_key: String::new(),
+            },
+        );
+    }
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Tag A: skipped (cache hit). Tag B: synced (cache miss). Tag C: synced (HEAD failure).
+    assert_eq!(report.stats.images_skipped, 1, "tag-a should be skipped");
+    assert_eq!(report.stats.images_synced, 2, "tag-b and tag-c should sync");
+    assert_eq!(report.stats.discovery_cache_hits, 1, "tag-a = cache hit");
+    assert_eq!(
+        report.stats.discovery_cache_misses, 2,
+        "tag-b + tag-c = cache misses"
+    );
+    assert_eq!(
+        report.stats.discovery_head_failures, 1,
+        "tag-c = HEAD failure"
+    );
+    assert_eq!(report.stats.discovery_target_stale, 0);
+    assert_eq!(
+        report.stats.discovery_cache_hits + report.stats.discovery_cache_misses,
+        3,
+        "sum invariant: 3 tags"
+    );
+}
+
+/// Source changes between two engine runs sharing the same cache. Cycle 1
+/// syncs digest D1 (cold cache). Between cycles the source image changes to
+/// digest D2. Cycle 2 detects the mismatch (cache has D1, HEAD returns D2)
+/// and performs a full pull of the new content.
+#[tokio::test]
+async fn discovery_source_change_across_cycles() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // --- Cycle 1 image (digest D1) ---
+    let config_1 = b"config-cycle-1";
+    let layer_1 = b"layer-cycle-1";
+    let config_1_desc = blob_descriptor(config_1, MediaType::OciConfig);
+    let layer_1_desc = blob_descriptor(layer_1, MediaType::OciLayerGzip);
+    let manifest_1 = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_1_desc.clone(),
+        layers: vec![layer_1_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_1_bytes, manifest_1_digest) = serialize_manifest(&manifest_1);
+
+    // Mount cycle 1: source HEAD + GET, target 404 + push.
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_1_digest).await;
+    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_1_bytes).await;
+    mount_blob_pull(&source_server, "src/repo", &config_1_desc.digest, config_1).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_1_desc.digest, layer_1).await;
+    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    mount_blob_not_found(&target_server, "tgt/repo", &config_1_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_1_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+
+    let cache = empty_cache();
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_1 = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report_1 = engine
+        .run(
+            vec![mapping_1],
+            cache.clone(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Cycle 1: cold cache, full sync.
+    assert_eq!(report_1.stats.images_synced, 1);
+    assert_eq!(report_1.stats.discovery_cache_misses, 1);
+    assert_eq!(report_1.stats.discovery_cache_hits, 0);
+
+    // Cache should now contain D1.
+    {
+        let c = cache.borrow();
+        let snap = c
+            .source_snapshot("source.test.io:443", &"src/repo".into(), "v1")
+            .expect("cache populated after cycle 1");
+        assert_eq!(snap.source_digest, manifest_1_digest);
+    }
+
+    // --- Between cycles: source image changes to D2 ---
+    source_server.reset().await;
+    target_server.reset().await;
+
+    let config_2 = b"config-cycle-2";
+    let layer_2 = b"layer-cycle-2";
+    let config_2_desc = blob_descriptor(config_2, MediaType::OciConfig);
+    let layer_2_desc = blob_descriptor(layer_2, MediaType::OciLayerGzip);
+    let manifest_2 = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_2_desc.clone(),
+        layers: vec![layer_2_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_2_bytes, manifest_2_digest) = serialize_manifest(&manifest_2);
+
+    // Mount cycle 2: source HEAD returns D2, GET returns the new manifest.
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_2_digest).await;
+    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_2_bytes).await;
+    mount_blob_pull(&source_server, "src/repo", &config_2_desc.digest, config_2).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_2_desc.digest, layer_2).await;
+    // Target: HEAD returns old digest (D1 from cycle 1), so sync is needed.
+    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &manifest_1_digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &config_2_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_2_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+
+    // Build new mapping (consumed by run()).
+    let source_client_2 = mock_client(&source_server);
+    let target_client_2 = mock_client(&target_server);
+
+    let mapping_2 = test_mapping(
+        source_client_2,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client_2)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+
+    let report_2 = engine
+        .run(
+            vec![mapping_2],
+            cache.clone(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Cycle 2: cache has D1, HEAD returns D2 -> cache miss, full pull.
+    assert_eq!(report_2.stats.images_synced, 1);
+    assert_eq!(report_2.stats.discovery_cache_misses, 1);
+    assert_eq!(report_2.stats.discovery_cache_hits, 0);
+    assert_eq!(report_2.stats.discovery_head_failures, 0);
+    assert_eq!(report_2.stats.discovery_target_stale, 0);
+
+    // Cache must be updated to D2.
+    let c = cache.borrow();
+    let snap = c
+        .source_snapshot("source.test.io:443", &"src/repo".into(), "v1")
+        .expect("cache updated after cycle 2");
+    assert_eq!(snap.source_digest, manifest_2_digest);
+}
+
+/// Two-cycle warm cache test: cycle 1 syncs from a cold cache, populating
+/// it. Cycle 2 has the same source digest — the cache hit path fires, no
+/// source GET is issued, and the image is skipped. This is the core
+/// proof that the warm cache works across engine runs.
+#[tokio::test]
+async fn discovery_two_cycle_cache_hit() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-warm";
+    let layer_data = b"layer-warm";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
+
+    // --- Cycle 1: cold cache, full pull ---
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
+    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+
+    let cache = empty_cache();
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_1 = test_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report_1 = engine
+        .run(
+            vec![mapping_1],
+            cache.clone(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Cycle 1: full sync, cache miss.
+    assert_eq!(report_1.stats.images_synced, 1);
+    assert_eq!(report_1.stats.discovery_cache_misses, 1);
+    assert_eq!(report_1.stats.discovery_cache_hits, 0);
+
+    // --- Between cycles: reset mocks, remount only what cycle 2 needs ---
+    source_server.reset().await;
+    target_server.reset().await;
+
+    // Source: HEAD returns same digest. No GET mounted — if the engine
+    // attempts a GET, wiremock returns 404 and the test fails.
+    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+
+    // Target: HEAD returns matching digest (image is already there from cycle 1).
+    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &manifest_digest).await;
+
+    let source_client_2 = mock_client(&source_server);
+    let target_client_2 = mock_client(&target_server);
+
+    let mapping_2 = test_mapping(
+        source_client_2,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client_2)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+
+    let report_2 = engine
+        .run(
+            vec![mapping_2],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Cycle 2: cache hit, image skipped, zero source GETs.
+    assert_eq!(report_2.stats.images_skipped, 1);
+    assert_eq!(report_2.stats.images_synced, 0);
+    assert_eq!(report_2.stats.discovery_cache_hits, 1);
+    assert_eq!(report_2.stats.discovery_cache_misses, 0);
+    assert_eq!(report_2.stats.discovery_head_failures, 0);
+    assert_eq!(report_2.stats.discovery_target_stale, 0);
+}
