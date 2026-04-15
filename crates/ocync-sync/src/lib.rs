@@ -186,8 +186,9 @@ pub struct SyncStats {
     /// Tags where the source HEAD request failed (network, timeout, bad digest).
     /// Subset of `discovery_cache_misses`.
     pub discovery_head_failures: u64,
-    /// Tags where source cache matched but target HEAD showed staleness.
-    /// Subset of `discovery_cache_misses`.
+    /// Tags where the source cache matched but a full pull was still needed
+    /// because a target HEAD showed staleness. Counted toward
+    /// `discovery_cache_misses` for aggregate purposes.
     pub discovery_target_stale: u64,
 }
 

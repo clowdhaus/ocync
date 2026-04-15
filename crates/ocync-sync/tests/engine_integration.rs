@@ -14,7 +14,7 @@ use ocync_distribution::spec::{
 };
 use ocync_distribution::{BatchBlobChecker, Digest, RegistryClientBuilder};
 use ocync_sync::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
-use ocync_sync::engine::{RegistryName, ResolvedMapping, SyncEngine, TagPair, TargetEntry};
+use ocync_sync::engine::{RegistryAlias, ResolvedMapping, SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
@@ -29,7 +29,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ---------------------------------------------------------------------------
 
 /// Build a valid sha256 digest from a short suffix, zero-padded to 64 hex chars.
-fn test_digest(suffix: &str) -> Digest {
+fn make_digest(suffix: &str) -> Digest {
     format!("sha256:{suffix:0>64}").parse().unwrap()
 }
 
@@ -59,7 +59,7 @@ fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
 }
 
 /// Build a [`SnapshotKey`] for tests using the standard test authority.
-fn test_snap_key(repo: &str, tag: &str) -> SnapshotKey {
+fn snap_key(repo: &str, tag: &str) -> SnapshotKey {
     SnapshotKey::new(
         &RegistryAuthority::new("source.test.io:443"),
         &RepositoryName::new(repo),
@@ -70,14 +70,14 @@ fn test_snap_key(repo: &str, tag: &str) -> SnapshotKey {
 /// Shorthand for a [`TargetEntry`] without a batch checker.
 fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>) -> TargetEntry {
     TargetEntry {
-        name: RegistryName::new(name),
+        name: RegistryAlias::new(name),
         client,
         batch_checker: None,
     }
 }
 
 /// Construct a `ResolvedMapping` for tests with sensible defaults.
-fn test_mapping(
+fn resolved_mapping(
     source_client: Arc<ocync_distribution::RegistryClient>,
     source_repo: &str,
     target_repo: &str,
@@ -104,7 +104,7 @@ fn serialize_manifest(manifest: &ImageManifest) -> (Vec<u8>, Digest) {
     (bytes, digest)
 }
 
-fn test_descriptor(digest: Digest, media_type: MediaType) -> Descriptor {
+fn make_descriptor(digest: Digest, media_type: MediaType) -> Descriptor {
     Descriptor {
         media_type,
         digest,
@@ -119,8 +119,8 @@ fn simple_image_manifest(config_digest: &Digest, layer_digest: &Digest) -> Image
     ImageManifest {
         schema_version: 2,
         media_type: None,
-        config: test_descriptor(config_digest.clone(), MediaType::OciConfig),
-        layers: vec![test_descriptor(
+        config: make_descriptor(config_digest.clone(), MediaType::OciConfig),
+        layers: vec![make_descriptor(
             layer_digest.clone(),
             MediaType::OciLayerGzip,
         )],
@@ -402,7 +402,7 @@ async fn sync_happy_path() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "library/nginx",
         "mirror/nginx",
@@ -442,8 +442,8 @@ async fn sync_skip_on_digest_match() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_digest = test_digest("cc");
-    let layer_digest = test_digest("11");
+    let config_digest = make_digest("cc");
+    let layer_digest = make_digest("11");
     let manifest = simple_image_manifest(&config_digest, &layer_digest);
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
 
@@ -456,7 +456,7 @@ async fn sync_skip_on_digest_match() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
@@ -493,8 +493,8 @@ async fn sync_blob_exists_at_target_skips_transfer() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_digest = test_digest("c1");
-    let layer_digest = test_digest("b1");
+    let config_digest = make_digest("c1");
+    let layer_digest = make_digest("b1");
     let manifest = simple_image_manifest(&config_digest, &layer_digest);
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
@@ -510,7 +510,7 @@ async fn sync_blob_exists_at_target_skips_transfer() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
@@ -553,7 +553,7 @@ async fn sync_manifest_pull_failure() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
@@ -631,7 +631,7 @@ async fn sync_blob_transfer_retries_on_source_500() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
@@ -694,7 +694,7 @@ async fn sync_dedup_across_tags() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
@@ -771,7 +771,7 @@ async fn sync_multiple_targets() {
 
     let source_client = mock_client(&source_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
@@ -843,7 +843,7 @@ async fn sync_retag() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
@@ -889,8 +889,8 @@ async fn sync_blob_transfer_failure() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_digest = test_digest("c5");
-    let layer_digest = test_digest("b5");
+    let config_digest = make_digest("c5");
+    let layer_digest = make_digest("b5");
     let manifest = simple_image_manifest(&config_digest, &layer_digest);
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
@@ -909,7 +909,7 @@ async fn sync_blob_transfer_failure() {
         .mount(&target_server)
         .await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -980,8 +980,8 @@ async fn sync_index_manifest_multi_platform() {
         schema_version: 2,
         media_type: None,
         manifests: vec![
-            test_descriptor(amd64_digest.clone(), MediaType::OciManifest),
-            test_descriptor(arm64_digest.clone(), MediaType::OciManifest),
+            make_descriptor(amd64_digest.clone(), MediaType::OciManifest),
+            make_descriptor(arm64_digest.clone(), MediaType::OciManifest),
         ],
         subject: None,
         artifact_type: None,
@@ -1063,7 +1063,7 @@ async fn sync_index_manifest_multi_platform() {
     mount_manifest_push(&target_server, "repo", &arm64_digest.to_string()).await;
     mount_manifest_push(&target_server, "repo", "latest").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -1125,14 +1125,14 @@ async fn sync_head_different_digest_proceeds_with_sync() {
     mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
 
     // Target: manifest HEAD returns a DIFFERENT digest → should proceed.
-    let stale_digest = test_digest("5ca1e");
+    let stale_digest = make_digest("5ca1e");
     mount_manifest_head_matching(&target_server, "repo", "v1", &stale_digest).await;
     mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -1153,8 +1153,15 @@ async fn sync_head_different_digest_proceeds_with_sync() {
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // Per-image stats.
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+    assert_eq!(report.images[0].blob_stats.skipped, 0);
+    let expected_bytes = (config_data.len() + layer_data.len()) as u64;
+    assert_eq!(report.images[0].bytes_transferred, expected_bytes);
+    // Aggregate stats.
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.blobs_transferred, 2);
+    assert_eq!(report.stats.bytes_transferred, expected_bytes);
 }
 
 #[tokio::test]
@@ -1162,7 +1169,7 @@ async fn sync_empty_tags_produces_no_images() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -1223,7 +1230,7 @@ async fn sync_manifest_push_failure() {
         .mount(&target_server)
         .await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -1292,7 +1299,7 @@ async fn sync_retry_exhaustion_returns_final_error() {
     mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "repo").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -1382,7 +1389,7 @@ async fn sync_cross_repo_mount_success() {
     let target_client = mock_client(&target_server);
 
     // First mapping: repo-a syncs normally (pull+push).
-    let mapping_a = test_mapping(
+    let mapping_a = resolved_mapping(
         source_client.clone(),
         "repo-a",
         "repo-a",
@@ -1391,7 +1398,7 @@ async fn sync_cross_repo_mount_success() {
     );
 
     // Second mapping: repo-b should mount from repo-a.
-    let mapping_b = test_mapping(
+    let mapping_b = resolved_mapping(
         source_client,
         "repo-b",
         "repo-b",
@@ -1500,7 +1507,7 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping_a = test_mapping(
+    let mapping_a = resolved_mapping(
         source_client.clone(),
         "repo-a",
         "repo-a",
@@ -1508,7 +1515,7 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
         vec![TagPair::same("v1")],
     );
 
-    let mapping_b = test_mapping(
+    let mapping_b = resolved_mapping(
         source_client,
         "repo-b",
         "repo-b",
@@ -1620,7 +1627,7 @@ async fn sync_cross_repo_mount_failure_falls_back() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping_a = test_mapping(
+    let mapping_a = resolved_mapping(
         source_client.clone(),
         "repo-a",
         "repo-a",
@@ -1628,7 +1635,7 @@ async fn sync_cross_repo_mount_failure_falls_back() {
         vec![TagPair::same("v1")],
     );
 
-    let mapping_b = test_mapping(
+    let mapping_b = resolved_mapping(
         source_client,
         "repo-b",
         "repo-b",
@@ -1700,7 +1707,7 @@ async fn sync_multi_target_partial_blob_failure_isolates_targets() {
         .mount(&target_b)
         .await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -1826,7 +1833,7 @@ async fn sync_progressive_cache_skips_shared_blob_head_check() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -1910,7 +1917,7 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         c.set_blob_completed(target, layer_desc.digest.clone(), "repo-a".into());
     }
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo-b",
         "repo-b",
@@ -1994,7 +2001,7 @@ async fn sync_small_blob_uses_monolithic_upload() {
 
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -2098,7 +2105,7 @@ async fn sync_lazy_invalidation_on_mount_failure() {
         c.set_blob_completed("target", layer_desc.digest.clone(), "other-repo".into());
     }
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
@@ -2155,7 +2162,7 @@ async fn sync_cache_persist_and_load_round_trip() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -2253,7 +2260,7 @@ async fn sync_shutdown_stops_new_work() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -2331,7 +2338,7 @@ async fn sync_shutdown_drains_in_flight() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -2423,7 +2430,7 @@ async fn sync_dedup_across_tags_concurrent() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -2513,14 +2520,14 @@ async fn sync_cross_repo_mount_concurrent() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping_a = test_mapping(
+    let mapping_a = resolved_mapping(
         Arc::clone(&source_client),
         "repo-a",
         "repo-a",
         vec![target_entry("target", Arc::clone(&target_client))],
         vec![TagPair::same("v1")],
     );
-    let mapping_b = test_mapping(
+    let mapping_b = resolved_mapping(
         source_client,
         "repo-b",
         "repo-b",
@@ -2612,7 +2619,7 @@ async fn sync_nested_index_manifest_returns_error() {
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -2712,7 +2719,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         c.set_blob_completed("target", layer_desc.digest.clone(), "stale-repo".into());
     }
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -2811,8 +2818,8 @@ async fn sync_index_manifest_child_pull_failure() {
         schema_version: 2,
         media_type: None,
         manifests: vec![
-            test_descriptor(amd64_digest.clone(), MediaType::OciManifest),
-            test_descriptor(arm64_digest.clone(), MediaType::OciManifest),
+            make_descriptor(amd64_digest.clone(), MediaType::OciManifest),
+            make_descriptor(arm64_digest.clone(), MediaType::OciManifest),
         ],
         subject: None,
         artifact_type: None,
@@ -2851,7 +2858,7 @@ async fn sync_index_manifest_child_pull_failure() {
     // Target: manifest HEAD 404.
     mount_manifest_head_not_found(&target_server, "repo", "latest").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -2941,7 +2948,7 @@ async fn sync_partial_blob_failure_stops_remaining() {
     // No manifest PUT mock — if engine tries to push manifest, wiremock
     // returns 404 and the test fails differently.
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -3046,7 +3053,7 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -3172,7 +3179,7 @@ async fn sync_staging_pulls_once_pushes_twice() {
     let staging_dir = tempfile::tempdir().unwrap();
     let staging = BlobStage::new(staging_dir.path().to_path_buf());
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -3259,7 +3266,7 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -3359,7 +3366,7 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -3468,7 +3475,7 @@ async fn sync_staging_writes_blobs_to_disk() {
     let staging_dir = tempfile::tempdir().unwrap();
     let staging = BlobStage::new(staging_dir.path().to_path_buf());
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -3565,7 +3572,7 @@ async fn sync_warm_cache_skips_blob_head_check() {
         c.set_blob_completed("target", layer_desc.digest.clone(), "repo".into());
     }
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -3657,12 +3664,12 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/nginx",
         "tgt/nginx",
         vec![TargetEntry {
-            name: RegistryName::new("target"),
+            name: RegistryAlias::new("target"),
             client: target_client,
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -3778,12 +3785,12 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
         vec![TargetEntry {
-            name: RegistryName::new("target"),
+            name: RegistryAlias::new("target"),
             client: target_client,
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -3884,7 +3891,7 @@ async fn sync_no_batch_checker_falls_back_to_per_blob_head() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
@@ -3971,12 +3978,12 @@ async fn sync_batch_checker_failure_falls_back_to_per_blob_head() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
         vec![TargetEntry {
-            name: RegistryName::new("target"),
+            name: RegistryAlias::new("target"),
             client: target_client,
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -4102,18 +4109,18 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
 
     let source_client = mock_client(&source_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "repo",
         "repo",
         vec![
             TargetEntry {
-                name: RegistryName::new("target-a"),
+                name: RegistryAlias::new("target-a"),
                 client: mock_client(&target_a_server),
                 batch_checker: Some(Rc::new(checker_a)),
             },
             TargetEntry {
-                name: RegistryName::new("target-b"),
+                name: RegistryAlias::new("target-b"),
                 client: mock_client(&target_b_server),
                 batch_checker: Some(Rc::new(checker_b)),
             },
@@ -4251,12 +4258,12 @@ async fn sync_batch_checker_empty_result_transfers_all() {
     // Batch checker: empty set -- nothing exists at target.
     let (checker, batch_call_count) = MockBatchChecker::new("repo", HashSet::new());
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
         vec![TargetEntry {
-            name: RegistryName::new("target"),
+            name: RegistryAlias::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -4366,13 +4373,13 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
         vec![
             TargetEntry {
-                name: RegistryName::new("target-a"),
+                name: RegistryAlias::new("target-a"),
                 client: mock_client(&target_a_server),
                 batch_checker: Some(Rc::new(checker)),
             },
@@ -4490,12 +4497,12 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
         vec![TargetEntry {
-            name: RegistryName::new("target"),
+            name: RegistryAlias::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -4583,8 +4590,8 @@ async fn sync_batch_checker_index_manifest_all_exist() {
         schema_version: 2,
         media_type: None,
         manifests: vec![
-            test_descriptor(amd64_digest.clone(), MediaType::OciManifest),
-            test_descriptor(arm64_digest.clone(), MediaType::OciManifest),
+            make_descriptor(amd64_digest.clone(), MediaType::OciManifest),
+            make_descriptor(arm64_digest.clone(), MediaType::OciManifest),
         ],
         subject: None,
         artifact_type: None,
@@ -4683,12 +4690,12 @@ async fn sync_batch_checker_index_manifest_all_exist() {
     ]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
         vec![TargetEntry {
-            name: RegistryName::new("target"),
+            name: RegistryAlias::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -4801,12 +4808,12 @@ async fn sync_batch_checker_with_prewarmed_cache() {
     let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
         vec![TargetEntry {
-            name: RegistryName::new("target"),
+            name: RegistryAlias::new("target"),
             client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
         }],
@@ -5091,7 +5098,7 @@ async fn sync_index_manifest_platform_filter() {
     // arm64 and windows manifest pushes should NOT happen -- wiremock will
     // fail verification if unexpected requests arrive (no mock mounted).
 
-    let mut mapping = test_mapping(
+    let mut mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -5155,14 +5162,14 @@ async fn sync_skip_existing_skips_without_digest_comparison() {
     mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
 
     // Target: HEAD returns 200 with a DIFFERENT digest -- normally would sync.
-    let stale_digest = test_digest("d1ff");
+    let stale_digest = make_digest("d1ff");
     mount_manifest_head_matching(&target_server, "repo", "v1", &stale_digest).await;
 
     // No blob endpoints needed -- skip_existing should prevent any blob work.
     // If the engine incorrectly proceeds to sync, it will fail on missing
     // blob endpoints.
 
-    let mut mapping = test_mapping(
+    let mut mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -5200,77 +5207,6 @@ async fn sync_skip_existing_skips_without_digest_comparison() {
     assert_eq!(report.stats.images_skipped, 1);
     assert_eq!(report.stats.images_synced, 0);
     assert_eq!(report.stats.blobs_transferred, 0);
-}
-
-/// When `skip_existing` is false (default), a target HEAD returning a different
-/// digest triggers a full sync.
-#[tokio::test]
-async fn sync_skip_existing_false_syncs_on_different_digest() {
-    let source_server = MockServer::start().await;
-    let target_server = MockServer::start().await;
-
-    let config_data = b"config-data";
-    let layer_data = b"layer-data";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _manifest_digest) = serialize_manifest(&manifest);
-
-    // Source: serve manifest and blobs.
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
-
-    // Target: HEAD returns 200 with a DIFFERENT digest -- should proceed to sync.
-    let stale_digest = test_digest("d1ff");
-    mount_manifest_head_matching(&target_server, "repo", "v1", &stale_digest).await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1").await;
-
-    let mapping = test_mapping(
-        mock_client(&source_server),
-        "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
-        vec![TagPair::same("v1")],
-    );
-
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
-
-    assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Synced),
-        "expected Synced, got {:?}",
-        report.images[0].status
-    );
-    // Both blobs transferred.
-    assert_eq!(report.images[0].blob_stats.transferred, 2);
-    assert_eq!(report.images[0].blob_stats.skipped, 0);
-    let expected_bytes = (config_data.len() + layer_data.len()) as u64;
-    assert_eq!(report.images[0].bytes_transferred, expected_bytes);
-    // Aggregate stats.
-    assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(report.stats.blobs_transferred, 2);
-    assert_eq!(report.stats.bytes_transferred, expected_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -5344,7 +5280,7 @@ async fn sync_skip_existing_multi_target_independent() {
     // Target A: HEAD returns 200 with a different digest -- skip_existing
     // means the engine skips without comparing digests.  No blob or manifest
     // push endpoints are mounted; an unexpected request would fail the mock.
-    let different_digest = test_digest("d1ff");
+    let different_digest = make_digest("d1ff");
     Mock::given(method("HEAD"))
         .and(path("/v2/repo/manifests/latest"))
         .respond_with(
@@ -5364,7 +5300,7 @@ async fn sync_skip_existing_multi_target_independent() {
     mount_blob_push(&target_b, "repo").await;
     mount_manifest_push(&target_b, "repo", "latest").await;
 
-    let mut mapping = test_mapping(
+    let mut mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -5618,7 +5554,7 @@ async fn sync_platform_filter_multi_target() {
         // arm64 manifest pushes must NOT arrive -- no mock mounted for them.
     }
 
-    let mut mapping = test_mapping(
+    let mut mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
@@ -5785,7 +5721,7 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
         .mount(&target_server)
         .await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "src/nginx",
         "tgt/nginx",
@@ -5890,7 +5826,7 @@ async fn sync_non_immutable_400_still_fails() {
         .mount(&target_server)
         .await;
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         mock_client(&source_server),
         "src/app",
         "tgt/app",
@@ -5930,20 +5866,6 @@ async fn sync_non_immutable_400_still_fails() {
 // Discovery optimization tests
 // ---------------------------------------------------------------------------
 
-/// Mount a source manifest HEAD returning a specific digest.
-async fn mount_source_head(server: &MockServer, repo: &str, tag: &str, digest: &Digest) {
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/{repo}/manifests/{tag}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("docker-content-digest", digest.to_string())
-                .insert_header("content-type", MediaType::OciManifest.as_str())
-                .insert_header("content-length", "100"),
-        )
-        .mount(server)
-        .await;
-}
-
 /// Cold cache: source HEAD succeeds but no cache entry exists, so full GET is
 /// required. All four discovery counters must reflect exactly one cache miss.
 #[tokio::test]
@@ -5958,12 +5880,38 @@ async fn discovery_cache_miss_first_run() {
     let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
 
-    // Source: HEAD + GET both needed.
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    // Source HEAD: fires once (returns digest for cache comparison).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
 
-    // Target: HEAD 404 (not synced yet), blob + manifest push endpoints.
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    // Source GET: fires once (cache miss forces full pull).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Target HEAD: fires once (not synced yet, returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
     mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
@@ -5974,7 +5922,7 @@ async fn discovery_cache_miss_first_run() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6002,10 +5950,7 @@ async fn discovery_cache_miss_first_run() {
 
     // Verify cache was populated after successful sync.
     let c = cache.borrow();
-    assert!(
-        c.source_snapshot(&test_snap_key("src/repo", "v1"))
-            .is_some()
-    );
+    assert!(c.source_snapshot(&snap_key("src/repo", "v1")).is_some());
 }
 
 /// Warm cache: source HEAD matches cached snapshot and target HEAD returns the
@@ -6015,18 +5960,46 @@ async fn discovery_cache_hit_skips_source_get() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let manifest_digest = test_digest("aabb");
+    let manifest_digest = make_digest("aabb");
 
-    // Source: only HEAD (no GET mounted -- if GET is attempted, wiremock returns 404).
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+    // Source HEAD: fires once (returns digest for cache comparison).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
 
-    // Target: HEAD returns matching digest.
-    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &manifest_digest).await;
+    // Source GET: must NOT fire (cache hit skips the slow path).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // Target HEAD: fires once (returns matching digest).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6039,7 +6012,7 @@ async fn discovery_cache_hit_skips_source_get() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            test_snap_key("src/repo", "v1"),
+            snap_key("src/repo", "v1"),
             SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
@@ -6081,20 +6054,35 @@ async fn discovery_head_failure_falls_through() {
     let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
     let (manifest_bytes, _manifest_digest) = serialize_manifest(&manifest);
 
-    // Source HEAD returns 500.
+    // Source HEAD: fires once (returns 500, triggers fallback to GET).
     Mock::given(method("HEAD"))
         .and(path("/v2/src/repo/manifests/v1"))
         .respond_with(ResponseTemplate::new(500))
+        .expect(1)
         .mount(&source_server)
         .await;
 
-    // Source GET succeeds.
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    // Source GET: fires once (fallback after HEAD failure).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
 
-    // Target: HEAD 404, push endpoints.
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    // Target HEAD: fires once (returns 404, not synced yet).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
@@ -6103,7 +6091,7 @@ async fn discovery_head_failure_falls_through() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6144,15 +6132,41 @@ async fn discovery_target_stale_triggers_full_pull() {
     let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
 
-    // Source HEAD matches cache.
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
-    // Source GET (needed because target is stale).
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    // Source HEAD: fires once (matches cached snapshot).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Source GET: fires once (target is stale, so full pull is needed).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
 
-    // Target: HEAD returns 404 (target was GC'd / never synced).
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    // Target HEAD: fires twice -- once during discovery (cache validation finds
+    // target stale) and once during execution (pre-push manifest check).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(2)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
@@ -6161,7 +6175,7 @@ async fn discovery_target_stale_triggers_full_pull() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6174,7 +6188,7 @@ async fn discovery_target_stale_triggers_full_pull() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            test_snap_key("src/repo", "v1"),
+            snap_key("src/repo", "v1"),
             SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
@@ -6216,14 +6230,40 @@ async fn discovery_source_changed_triggers_full_pull() {
     let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
 
-    // Source: HEAD returns the NEW digest, GET returns the manifest.
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    // Source HEAD: fires once (returns NEW digest, mismatches cached old digest).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Source GET: fires once (cache miss due to digest change).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
 
-    // Target: HEAD 404, blob + manifest push endpoints.
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    // Target HEAD: fires once (returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
@@ -6232,7 +6272,7 @@ async fn discovery_source_changed_triggers_full_pull() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6241,15 +6281,15 @@ async fn discovery_source_changed_triggers_full_pull() {
     );
 
     // Pre-populate cache with an OLD source digest that won't match HEAD.
-    let old_digest = test_digest("dead");
+    let old_digest = make_digest("dead");
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            test_snap_key("src/repo", "v1"),
+            snap_key("src/repo", "v1"),
             SourceSnapshot {
                 source_digest: old_digest,
-                filtered_digest: test_digest("beef"),
+                filtered_digest: make_digest("beef"),
                 platform_filter_key: PlatformFilterKey::from_filters(None),
             },
         );
@@ -6281,7 +6321,7 @@ async fn discovery_source_changed_triggers_full_pull() {
     // Cache must be updated with the new digest.
     let c = cache.borrow();
     let snapshot = c
-        .source_snapshot(&test_snap_key("src/repo", "v1"))
+        .source_snapshot(&snap_key("src/repo", "v1"))
         .expect("cache should be populated after sync");
     assert_eq!(snapshot.source_digest, manifest_digest);
 }
@@ -6300,20 +6340,35 @@ async fn discovery_head_404_falls_through() {
     let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
     let (manifest_bytes, _manifest_digest) = serialize_manifest(&manifest);
 
-    // Source: HEAD returns 404 (custom mock, not mount_source_head).
+    // Source HEAD: fires once (returns 404, triggers fallback to GET).
     Mock::given(method("HEAD"))
         .and(path("/v2/src/repo/manifests/v1"))
         .respond_with(ResponseTemplate::new(404))
+        .expect(1)
         .mount(&source_server)
         .await;
 
-    // Source: GET succeeds.
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    // Source GET: fires once (fallback after HEAD 404).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
 
-    // Target: HEAD 404, push endpoints.
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    // Target HEAD: fires once (returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
@@ -6322,7 +6377,7 @@ async fn discovery_head_404_falls_through() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6370,7 +6425,7 @@ async fn discovery_head_timeout_falls_through() {
     let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
 
-    // Source: HEAD with a 3-second delay (exceeds the 1s discovery timeout).
+    // Source HEAD: fires once (3-second delay exceeds the 1s discovery timeout).
     Mock::given(method("HEAD"))
         .and(path("/v2/src/repo/manifests/v1"))
         .respond_with(
@@ -6380,16 +6435,31 @@ async fn discovery_head_timeout_falls_through() {
                 .insert_header("content-type", MediaType::OciManifest.as_str())
                 .insert_header("content-length", "100"),
         )
+        .expect(1)
         .mount(&source_server)
         .await;
 
-    // Source: GET succeeds (no delay).
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    // Source GET: fires once (fallback after HEAD timeout).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
 
-    // Target: HEAD 404, push endpoints.
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    // Target HEAD: fires once (returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
@@ -6398,7 +6468,7 @@ async fn discovery_head_timeout_falls_through() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6407,8 +6477,7 @@ async fn discovery_head_timeout_falls_through() {
     );
 
     // Use a 1-second discovery HEAD timeout so the 3-second delay triggers timeout.
-    let engine =
-        SyncEngine::new(fast_retry(), 10).with_discovery_head_timeout(Duration::from_secs(1));
+    let engine = SyncEngine::new(fast_retry(), 10).with_source_head_timeout(Duration::from_secs(1));
     let report = engine
         .run(
             vec![mapping],
@@ -6447,20 +6516,35 @@ async fn discovery_head_failure_ignores_valid_cache() {
     let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
 
-    // Source HEAD returns 500.
+    // Source HEAD: fires once (returns 500, cache cannot be validated).
     Mock::given(method("HEAD"))
         .and(path("/v2/src/repo/manifests/v1"))
         .respond_with(ResponseTemplate::new(500))
+        .expect(1)
         .mount(&source_server)
         .await;
 
-    // Source GET succeeds.
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    // Source GET: fires once (fallback after HEAD failure, even with valid cache).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
 
-    // Target: HEAD 404, push endpoints.
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    // Target HEAD: fires once (returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
@@ -6469,7 +6553,7 @@ async fn discovery_head_failure_ignores_valid_cache() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6482,7 +6566,7 @@ async fn discovery_head_failure_ignores_valid_cache() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            test_snap_key("src/repo", "v1"),
+            snap_key("src/repo", "v1"),
             SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
@@ -6522,12 +6606,22 @@ async fn discovery_pull_failure_does_not_populate_cache() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let manifest_digest = test_digest("aabb");
+    let manifest_digest = make_digest("aabb");
 
-    // Source: HEAD succeeds.
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+    // Source HEAD: fires once (returns digest, cache miss triggers GET).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
 
-    // Source: GET returns 500 on all attempts.
+    // Source GET: returns 500 on all attempts (retries will hit this mock).
     Mock::given(method("GET"))
         .and(path("/v2/src/repo/manifests/v1"))
         .respond_with(ResponseTemplate::new(500))
@@ -6537,7 +6631,7 @@ async fn discovery_pull_failure_does_not_populate_cache() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6581,8 +6675,7 @@ async fn discovery_pull_failure_does_not_populate_cache() {
     // Cache must NOT have been populated on failure.
     let c = cache.borrow();
     assert!(
-        c.source_snapshot(&test_snap_key("src/repo", "v1"))
-            .is_none(),
+        c.source_snapshot(&snap_key("src/repo", "v1")).is_none(),
         "cache must not be populated after pull failure"
     );
 }
@@ -6596,7 +6689,7 @@ async fn discovery_zero_platform_match_returns_error() {
     let target_server = MockServer::start().await;
 
     // Build a child manifest for s390x (content doesn't matter, it shouldn't be pulled).
-    let child_digest = test_digest("5390");
+    let child_digest = make_digest("5390");
     let child_desc = Descriptor {
         media_type: MediaType::OciManifest,
         digest: child_digest.clone(),
@@ -6624,10 +6717,20 @@ async fn discovery_zero_platform_match_returns_error() {
     let index_hash = ocync_distribution::sha256::Sha256::digest(&index_bytes);
     let index_digest = Digest::from_sha256(index_hash);
 
-    // Source: HEAD returns the index digest.
-    mount_source_head(&source_server, "src/repo", "v1", &index_digest).await;
+    // Source HEAD: fires once (returns index digest, cache miss).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", index_digest.to_string())
+                .insert_header("content-type", MediaType::OciIndex.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
 
-    // Source: GET returns the index with content-type OciIndex.
+    // Source GET: fires once (cache miss, pulls the index).
     Mock::given(method("GET"))
         .and(path("/v2/src/repo/manifests/v1"))
         .respond_with(
@@ -6635,6 +6738,7 @@ async fn discovery_zero_platform_match_returns_error() {
                 .set_body_bytes(index_bytes)
                 .insert_header("content-type", MediaType::OciIndex.as_str()),
         )
+        .expect(1)
         .mount(&source_server)
         .await;
 
@@ -6642,7 +6746,7 @@ async fn discovery_zero_platform_match_returns_error() {
     let target_client = mock_client(&target_server);
 
     // Request linux/amd64 but index only has linux/s390x.
-    let mut mapping = test_mapping(
+    let mut mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6706,19 +6810,47 @@ async fn discovery_skip_existing_with_cache_hit() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let manifest_digest = test_digest("aabb");
-    let different_target_digest = test_digest("d1ff");
+    let manifest_digest = make_digest("aabb");
+    let different_target_digest = make_digest("d1ff");
 
-    // Source: only HEAD (no GET mounted).
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+    // Source HEAD: fires once (returns digest for cache comparison).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
 
-    // Target: HEAD returns 200 with a DIFFERENT digest.
-    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &different_target_digest).await;
+    // Source GET: must NOT fire (cache hit + skip_existing skips the slow path).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // Target HEAD: fires once (returns 200 with a DIFFERENT digest).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", different_target_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mut mapping = test_mapping(
+    let mut mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6732,7 +6864,7 @@ async fn discovery_skip_existing_with_cache_hit() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            test_snap_key("src/repo", "v1"),
+            snap_key("src/repo", "v1"),
             SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
@@ -6797,9 +6929,20 @@ async fn discovery_skip_existing_with_cache_miss() {
     let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
 
-    // Source: HEAD + GET both needed (no cache).
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
-    // Source GET: expect exactly 1 (proves cache miss triggered full pull).
+    // Source HEAD: fires once (no cache, returns digest).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Source GET: fires once (cache miss forces full pull).
     Mock::given(method("GET"))
         .and(path("/v2/src/repo/manifests/v1"))
         .respond_with(
@@ -6811,9 +6954,19 @@ async fn discovery_skip_existing_with_cache_miss() {
         .mount(&source_server)
         .await;
 
-    // Target: HEAD returns 200 with a DIFFERENT digest.
-    let different_target_digest = test_digest("d1ff");
-    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &different_target_digest).await;
+    // Target HEAD: fires once (returns 200 with a DIFFERENT digest).
+    let different_target_digest = make_digest("d1ff");
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", different_target_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
 
     // No blob or manifest push endpoints needed -- skip_existing should prevent
     // any blob work. If the engine incorrectly proceeds, it will fail on missing
@@ -6822,7 +6975,7 @@ async fn discovery_skip_existing_with_cache_miss() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mut mapping = test_mapping(
+    let mut mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6897,17 +7050,54 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
     };
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
 
-    // Source: HEAD + GET.
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    // Source HEAD: fires once (matches cached snapshot).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Source GET: fires once (target B is stale, requires full pull).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
 
-    // Target A: HEAD matches filtered_digest -> will be skipped (DigestMatch).
-    mount_manifest_head_matching(&target_a_server, "tgt/repo", "v1", &manifest_digest).await;
+    // Target A HEAD: fires once (matches filtered_digest, DigestMatch skip).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_a_server)
+        .await;
 
-    // Target B: HEAD 404 -> needs sync.
-    mount_manifest_head_not_found(&target_b_server, "tgt/repo", "v1").await;
+    // Target B HEAD: fires twice -- once during discovery (cache validation
+    // finds target stale) and once during execution (pre-push manifest check).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(2)
+        .mount(&target_b_server)
+        .await;
     mount_blob_not_found(&target_b_server, "tgt/repo", &config_desc.digest).await;
     mount_blob_not_found(&target_b_server, "tgt/repo", &layer_desc.digest).await;
     mount_blob_push(&target_b_server, "tgt/repo").await;
@@ -6917,7 +7107,7 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
     let target_a_client = mock_client(&target_a_server);
     let target_b_client = mock_client(&target_b_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -6933,7 +7123,7 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            test_snap_key("src/repo", "v1"),
+            snap_key("src/repo", "v1"),
             SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
@@ -7004,20 +7194,46 @@ async fn discovery_retag_uses_correct_tags() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let manifest_digest = test_digest("aabb");
+    let manifest_digest = make_digest("aabb");
 
-    // Source: HEAD at /v2/src/repo/manifests/v1.0.
-    mount_source_head(&source_server, "src/repo", "v1.0", &manifest_digest).await;
+    // Source HEAD: fires once at /v2/src/repo/manifests/v1.0.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1.0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
 
-    // Target: HEAD at /v2/tgt/repo/manifests/latest returns matching digest.
-    mount_manifest_head_matching(&target_server, "tgt/repo", "latest", &manifest_digest).await;
+    // Source GET: must NOT fire (cache hit skips the slow path).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1.0"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&source_server)
+        .await;
 
-    // No source GET mounted -- cache hit should skip without pulling.
+    // Target HEAD: fires once at /v2/tgt/repo/manifests/latest (retag).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -7030,7 +7246,7 @@ async fn discovery_retag_uses_correct_tags() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            test_snap_key("src/repo", "v1.0"),
+            snap_key("src/repo", "v1.0"),
             SourceSnapshot {
                 source_digest: manifest_digest.clone(),
                 filtered_digest: manifest_digest.clone(),
@@ -7137,31 +7353,104 @@ async fn discovery_concurrent_mixed_outcomes() {
     let (manifest_c_bytes, _manifest_c_digest) = serialize_manifest(&manifest_c);
 
     // --- Tag A: cache hit (source HEAD matches, target HEAD matches) ---
-    mount_source_head(&source_server, "src/repo", "tag-a", &manifest_a_digest).await;
-    // No source GET for tag-a: cache hit skips it.
-    mount_manifest_head_matching(&target_server, "tgt/repo", "tag-a", &manifest_a_digest).await;
+    // Source HEAD for tag-a: fires once.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/tag-a"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_a_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET for tag-a: must NOT fire (cache hit).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/tag-a"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&source_server)
+        .await;
+    // Target HEAD for tag-a: fires once (returns matching digest).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/tag-a"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_a_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
 
     // --- Tag B: cache miss (no cache entry, full pull + push) ---
-    mount_source_head(&source_server, "src/repo", "tag-b", &manifest_b_digest).await;
-    mount_source_manifest(&source_server, "src/repo", "tag-b", &manifest_b_bytes).await;
+    // Source HEAD for tag-b: fires once.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/tag-b"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_b_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET for tag-b: fires once (cache miss).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/tag-b"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_b_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_b_desc.digest, config_b).await;
     mount_blob_pull(&source_server, "src/repo", &layer_b_desc.digest, layer_b).await;
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "tag-b").await;
+    // Target HEAD for tag-b: fires once (returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/tag-b"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_b_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_b_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "tag-b").await;
 
     // --- Tag C: HEAD failure (500 on HEAD, falls through to GET) ---
+    // Source HEAD for tag-c: fires once (returns 500).
     Mock::given(method("HEAD"))
         .and(path("/v2/src/repo/manifests/tag-c"))
         .respond_with(ResponseTemplate::new(500))
+        .expect(1)
         .mount(&source_server)
         .await;
-    mount_source_manifest(&source_server, "src/repo", "tag-c", &manifest_c_bytes).await;
+    // Source GET for tag-c: fires once (fallback after HEAD failure).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/tag-c"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_c_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_c_desc.digest, config_c).await;
     mount_blob_pull(&source_server, "src/repo", &layer_c_desc.digest, layer_c).await;
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "tag-c").await;
+    // Target HEAD for tag-c: fires once (returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/tag-c"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_c_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_c_desc.digest).await;
     // blob_push already mounted for tgt/repo (shared across tags).
@@ -7170,7 +7459,7 @@ async fn discovery_concurrent_mixed_outcomes() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping = test_mapping(
+    let mapping = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -7187,7 +7476,7 @@ async fn discovery_concurrent_mixed_outcomes() {
     {
         let mut c = cache.borrow_mut();
         c.set_source_snapshot(
-            test_snap_key("src/repo", "tag-a"),
+            snap_key("src/repo", "tag-a"),
             SourceSnapshot {
                 source_digest: manifest_a_digest.clone(),
                 filtered_digest: manifest_a_digest.clone(),
@@ -7252,12 +7541,36 @@ async fn discovery_source_change_across_cycles() {
     };
     let (manifest_1_bytes, manifest_1_digest) = serialize_manifest(&manifest_1);
 
-    // Mount cycle 1: source HEAD + GET, target 404 + push.
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_1_digest).await;
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_1_bytes).await;
+    // Cycle 1: source HEAD fires once, GET fires once, target HEAD fires once.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_1_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_1_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_1_desc.digest, config_1).await;
     mount_blob_pull(&source_server, "src/repo", &layer_1_desc.digest, layer_1).await;
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_1_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_1_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
@@ -7267,7 +7580,7 @@ async fn discovery_source_change_across_cycles() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping_1 = test_mapping(
+    let mapping_1 = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -7295,7 +7608,7 @@ async fn discovery_source_change_across_cycles() {
     {
         let c = cache.borrow();
         let snap = c
-            .source_snapshot(&test_snap_key("src/repo", "v1"))
+            .source_snapshot(&snap_key("src/repo", "v1"))
             .expect("cache populated after cycle 1");
         assert_eq!(snap.source_digest, manifest_1_digest);
     }
@@ -7319,13 +7632,42 @@ async fn discovery_source_change_across_cycles() {
     };
     let (manifest_2_bytes, manifest_2_digest) = serialize_manifest(&manifest_2);
 
-    // Mount cycle 2: source HEAD returns D2, GET returns the new manifest.
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_2_digest).await;
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_2_bytes).await;
+    // Cycle 2: source HEAD fires once (returns D2), GET fires once (cache miss).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_2_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_2_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_2_desc.digest, config_2).await;
     mount_blob_pull(&source_server, "src/repo", &layer_2_desc.digest, layer_2).await;
-    // Target: HEAD returns old digest (D1 from cycle 1), so sync is needed.
-    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &manifest_1_digest).await;
+    // Target HEAD: fires once (returns old digest D1, sync is needed).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_1_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_2_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_2_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
@@ -7335,7 +7677,7 @@ async fn discovery_source_change_across_cycles() {
     let source_client_2 = mock_client(&source_server);
     let target_client_2 = mock_client(&target_server);
 
-    let mapping_2 = test_mapping(
+    let mapping_2 = resolved_mapping(
         source_client_2,
         "src/repo",
         "tgt/repo",
@@ -7363,7 +7705,7 @@ async fn discovery_source_change_across_cycles() {
     // Cache must be updated to D2.
     let c = cache.borrow();
     let snap = c
-        .source_snapshot(&test_snap_key("src/repo", "v1"))
+        .source_snapshot(&snap_key("src/repo", "v1"))
         .expect("cache updated after cycle 2");
     assert_eq!(snap.source_digest, manifest_2_digest);
 }
@@ -7393,11 +7735,38 @@ async fn discovery_two_cycle_cache_hit() {
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
 
     // --- Cycle 1: cold cache, full pull ---
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
-    mount_source_manifest(&source_server, "src/repo", "v1", &manifest_bytes).await;
+    // Source HEAD: fires once.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET: fires once (cold cache).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
     mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+    // Target HEAD: fires once (returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
     mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
     mount_blob_push(&target_server, "tgt/repo").await;
@@ -7407,7 +7776,7 @@ async fn discovery_two_cycle_cache_hit() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mapping_1 = test_mapping(
+    let mapping_1 = resolved_mapping(
         source_client,
         "src/repo",
         "tgt/repo",
@@ -7435,17 +7804,44 @@ async fn discovery_two_cycle_cache_hit() {
     source_server.reset().await;
     target_server.reset().await;
 
-    // Source: HEAD returns same digest. No GET mounted — if the engine
-    // attempts a GET, wiremock returns 404 and the test fails.
-    mount_source_head(&source_server, "src/repo", "v1", &manifest_digest).await;
+    // Source HEAD: fires once (returns same digest, cache hit).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
 
-    // Target: HEAD returns matching digest (image is already there from cycle 1).
-    mount_manifest_head_matching(&target_server, "tgt/repo", "v1", &manifest_digest).await;
+    // Source GET: must NOT fire (warm cache hit skips the slow path).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // Target HEAD: fires once (returns matching digest from cycle 1).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
 
     let source_client_2 = mock_client(&source_server);
     let target_client_2 = mock_client(&target_server);
 
-    let mapping_2 = test_mapping(
+    let mapping_2 = resolved_mapping(
         source_client_2,
         "src/repo",
         "tgt/repo",
@@ -7470,4 +7866,499 @@ async fn discovery_two_cycle_cache_hit() {
     assert_eq!(report_2.stats.discovery_cache_misses, 0);
     assert_eq!(report_2.stats.discovery_head_failures, 0);
     assert_eq!(report_2.stats.discovery_target_stale, 0);
+}
+
+/// Platform filter change between cycles: cycle 1 syncs with `linux/amd64`,
+/// populating the cache. Cycle 2 uses `linux/arm64` — the `PlatformFilterKey`
+/// mismatch must trigger a cache miss even though the source digest hasn't
+/// changed, because the filtered manifest will differ.
+#[tokio::test]
+async fn discovery_platform_filter_change_triggers_cache_miss() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // Build a multi-arch index with two children.
+    let amd64_config = b"config-amd64";
+    let amd64_layer = b"layer-amd64";
+    let amd64_config_desc = blob_descriptor(amd64_config, MediaType::OciConfig);
+    let amd64_layer_desc = blob_descriptor(amd64_layer, MediaType::OciLayerGzip);
+    let amd64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: amd64_config_desc.clone(),
+        layers: vec![amd64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (amd64_bytes, amd64_digest) = serialize_manifest(&amd64_manifest);
+
+    let arm64_config = b"config-arm64";
+    let arm64_layer = b"layer-arm64";
+    let arm64_config_desc = blob_descriptor(arm64_config, MediaType::OciConfig);
+    let arm64_layer_desc = blob_descriptor(arm64_layer, MediaType::OciLayerGzip);
+    let arm64_manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: arm64_config_desc.clone(),
+        layers: vec![arm64_layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (arm64_bytes, arm64_digest) = serialize_manifest(&arm64_manifest);
+
+    let index = ImageIndex {
+        schema_version: 2,
+        media_type: None,
+        manifests: vec![
+            Descriptor {
+                media_type: MediaType::OciManifest,
+                digest: amd64_digest.clone(),
+                size: amd64_bytes.len() as u64,
+                platform: Some(Platform {
+                    architecture: "amd64".into(),
+                    os: "linux".into(),
+                    variant: None,
+                    os_version: None,
+                    os_features: None,
+                }),
+                artifact_type: None,
+                annotations: None,
+            },
+            Descriptor {
+                media_type: MediaType::OciManifest,
+                digest: arm64_digest.clone(),
+                size: arm64_bytes.len() as u64,
+                platform: Some(Platform {
+                    architecture: "arm64".into(),
+                    os: "linux".into(),
+                    variant: None,
+                    os_version: None,
+                    os_features: None,
+                }),
+                artifact_type: None,
+                annotations: None,
+            },
+        ],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let index_bytes = serde_json::to_vec(&index).unwrap();
+    let index_digest =
+        Digest::from_sha256(ocync_distribution::sha256::Sha256::digest(&index_bytes));
+
+    // --- Cycle 1: sync with linux/amd64 filter ---
+    // Source HEAD: fires once.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", index_digest.to_string())
+                .insert_header("content-type", MediaType::OciIndex.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET for the index: fires once.
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(index_bytes.clone())
+                .insert_header("content-type", MediaType::OciIndex.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET for the amd64 child manifest: fires once.
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src/repo/manifests/{amd64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(amd64_bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    mount_blob_pull(
+        &source_server,
+        "src/repo",
+        &amd64_config_desc.digest,
+        amd64_config,
+    )
+    .await;
+    mount_blob_pull(
+        &source_server,
+        "src/repo",
+        &amd64_layer_desc.digest,
+        amd64_layer,
+    )
+    .await;
+
+    // Target HEAD: fires once (returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    mount_blob_not_found(&target_server, "tgt/repo", &amd64_config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &amd64_layer_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+    // Child manifest push.
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/tgt/repo/manifests/{amd64_digest}")))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&target_server)
+        .await;
+
+    let cache = empty_cache();
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mut mapping_1 = resolved_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+    mapping_1.platforms = Some(vec!["linux/amd64".parse().unwrap()]);
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report_1 = engine
+        .run(
+            vec![mapping_1],
+            cache.clone(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report_1.stats.images_synced, 1);
+    assert_eq!(report_1.stats.discovery_cache_misses, 1);
+
+    // Cache should hold the amd64 platform filter key.
+    {
+        let c = cache.borrow();
+        let snap = c
+            .source_snapshot(&snap_key("src/repo", "v1"))
+            .expect("cache populated after cycle 1");
+        assert_eq!(snap.source_digest, index_digest);
+        assert_eq!(
+            snap.platform_filter_key,
+            PlatformFilterKey::from_filters(Some(&["linux/amd64".parse().unwrap()]))
+        );
+    }
+
+    // --- Cycle 2: change platform filter to linux/arm64 ---
+    source_server.reset().await;
+    target_server.reset().await;
+
+    // Source HEAD: fires once (same index digest, but platform key changed).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", index_digest.to_string())
+                .insert_header("content-type", MediaType::OciIndex.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET for the index: fires once (platform key mismatch triggers full pull).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(index_bytes)
+                .insert_header("content-type", MediaType::OciIndex.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET for the arm64 child manifest: fires once.
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src/repo/manifests/{arm64_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(arm64_bytes)
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    mount_blob_pull(
+        &source_server,
+        "src/repo",
+        &arm64_config_desc.digest,
+        arm64_config,
+    )
+    .await;
+    mount_blob_pull(
+        &source_server,
+        "src/repo",
+        &arm64_layer_desc.digest,
+        arm64_layer,
+    )
+    .await;
+
+    // Target HEAD: fires once (returns 404).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    mount_blob_not_found(&target_server, "tgt/repo", &arm64_config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &arm64_layer_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/tgt/repo/manifests/{arm64_digest}")))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&target_server)
+        .await;
+
+    let source_client_2 = mock_client(&source_server);
+    let target_client_2 = mock_client(&target_server);
+
+    let mut mapping_2 = resolved_mapping(
+        source_client_2,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client_2)],
+        vec![TagPair::same("v1".to_owned())],
+    );
+    mapping_2.platforms = Some(vec!["linux/arm64".parse().unwrap()]);
+
+    let report_2 = engine
+        .run(
+            vec![mapping_2],
+            cache.clone(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Platform filter changed → cache miss, full pull of arm64 child.
+    assert_eq!(report_2.stats.images_synced, 1);
+    assert_eq!(report_2.stats.discovery_cache_misses, 1);
+    assert_eq!(report_2.stats.discovery_cache_hits, 0);
+    assert_eq!(report_2.stats.discovery_head_failures, 0);
+    assert_eq!(report_2.stats.discovery_target_stale, 0);
+
+    // Cache should now hold the arm64 platform filter key.
+    let c = cache.borrow();
+    let snap = c
+        .source_snapshot(&snap_key("src/repo", "v1"))
+        .expect("cache updated after cycle 2");
+    assert_eq!(
+        snap.platform_filter_key,
+        PlatformFilterKey::from_filters(Some(&["linux/arm64".parse().unwrap()]))
+    );
+}
+
+/// Engine-level snapshot pruning: after a sync run, snapshot entries for tags
+/// no longer in the mapping set must be removed. This prevents unbounded cache
+/// growth when source tags are deleted.
+#[tokio::test]
+async fn discovery_snapshot_pruning_removes_deleted_tags() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-prune";
+    let layer_data = b"layer-prune";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = simple_image_manifest(&config_desc.digest, &layer_desc.digest);
+    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
+
+    // --- Cycle 1: sync two tags (v1 and v2) ---
+    // Source HEAD for v1: fires once.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET for v1: fires once (cold cache).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Target HEAD for v1: fires once.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+
+    // Source HEAD for v2: fires once.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET for v2: fires once (cold cache).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Target HEAD for v2: fires once.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v2"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "tgt/repo", "v2").await;
+
+    mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+
+    let cache = empty_cache();
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_1 = resolved_mapping(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![
+            TagPair::same("v1".to_owned()),
+            TagPair::same("v2".to_owned()),
+        ],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report_1 = engine
+        .run(
+            vec![mapping_1],
+            cache.clone(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report_1.stats.images_synced, 2);
+
+    // Both tags should be in the snapshot cache.
+    {
+        let c = cache.borrow();
+        assert!(c.source_snapshot(&snap_key("src/repo", "v1")).is_some());
+        assert!(c.source_snapshot(&snap_key("src/repo", "v2")).is_some());
+    }
+
+    // --- Cycle 2: tag v2 was deleted from the source, only v1 remains ---
+    source_server.reset().await;
+    target_server.reset().await;
+
+    // Only v1 in the mapping (v2 was removed).
+    // Source HEAD for v1: fires once (cache hit).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    // Source GET for v1: must NOT fire (warm cache hit).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&source_server)
+        .await;
+    // Target HEAD for v1: fires once (returns matching digest).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    let source_client_2 = mock_client(&source_server);
+    let target_client_2 = mock_client(&target_server);
+
+    let mapping_2 = resolved_mapping(
+        source_client_2,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client_2)],
+        vec![TagPair::same("v1".to_owned())],
+        // v2 is gone from the mapping set.
+    );
+
+    let report_2 = engine
+        .run(
+            vec![mapping_2],
+            cache.clone(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // v1 should be a cache hit (source + target match).
+    assert_eq!(report_2.stats.images_skipped, 1);
+    assert_eq!(report_2.stats.discovery_cache_hits, 1);
+
+    // After the run, v2's snapshot must have been pruned.
+    let c = cache.borrow();
+    assert!(
+        c.source_snapshot(&snap_key("src/repo", "v1")).is_some(),
+        "v1 should still be in the snapshot cache"
+    );
+    assert!(
+        c.source_snapshot(&snap_key("src/repo", "v2")).is_none(),
+        "v2 should have been pruned from the snapshot cache"
+    );
 }

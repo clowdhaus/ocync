@@ -1,9 +1,5 @@
 # ocync Design Specification
 
-**Date**: 2026-04-10
-**Status**: Draft
-**Author**: Bryant Biggs
-
 ---
 
 ## Overview

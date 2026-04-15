@@ -1,13 +1,14 @@
 //! The `watch` subcommand -- daemon mode for periodic sync with graceful shutdown.
 
 use std::cell::RefCell;
-use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
 use ocync_sync::cache::TransferStateCache;
+use tokio::net::TcpListener;
 
 use crate::cli::commands::synchronize;
+use crate::cli::config::load_config;
 use crate::cli::health::HealthState;
 use crate::cli::shutdown::ShutdownSignal;
 use crate::cli::{CliError, ExitCode};
@@ -25,33 +26,47 @@ pub(crate) async fn run(
 
     let health_state = Rc::new(RefCell::new(HealthState::new(interval)));
 
+    // Load config once upfront for cache path and TTL resolution.
+    // Uses the same resolution logic as the sync command.
+    let config = load_config(&args.config)?;
+    let (_cache_dir, cache_path) = synchronize::resolve_cache_path(&config, &args.config);
+    let cache_ttl = synchronize::resolve_cache_ttl(&config);
+
+    // Bind the health listener early so bind errors surface before the
+    // sync loop starts. This also avoids TOCTOU races with port allocation.
+    let health_listener = match TcpListener::bind(("0.0.0.0", args.health_port)).await {
+        Ok(l) => {
+            tracing::info!(port = args.health_port, "health server listening");
+            Some(l)
+        }
+        Err(err) => {
+            tracing::error!(
+                port = args.health_port,
+                error = %err,
+                "health server failed to bind, watch mode continuing without health endpoint"
+            );
+            None
+        }
+    };
+
     // A LocalSet is required for spawn_local (health server uses
     // Rc<RefCell<>> which is not Send).
     let local = tokio::task::LocalSet::new();
     let exit_code = local
         .run_until(async {
             // Load cache from disk once (warm start from prior session).
-            let cache_dir = args
-                .config
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(".ocync/cache");
-            let cache_path = cache_dir.join("transfer_state.bin");
             let cache = Rc::new(RefCell::new(TransferStateCache::load(
                 &cache_path,
-                Duration::from_secs(12 * 3600),
+                cache_ttl,
             )));
 
             // Spawn the health server as a background local task.
-            let health_handle = {
+            let health_handle = health_listener.map(|listener| {
                 let state = Rc::clone(&health_state);
-                let port = args.health_port;
                 tokio::task::spawn_local(async move {
-                    if let Err(err) = crate::cli::health::serve(port, state).await {
-                        tracing::error!(error = %err, "health server failed");
-                    }
+                    crate::cli::health::serve(listener, state).await;
                 })
-            };
+            });
 
             let exit_code = loop {
                 let sync_args = SyncArgs {
@@ -94,7 +109,9 @@ pub(crate) async fn run(
                 tracing::warn!(error = %e, "failed to persist cache on shutdown");
             }
 
-            health_handle.abort();
+            if let Some(h) = health_handle {
+                h.abort();
+            }
             exit_code
         })
         .await;
