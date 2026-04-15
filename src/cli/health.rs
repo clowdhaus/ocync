@@ -1,8 +1,8 @@
-//! Health endpoint for watch mode.
+//! Health and readiness endpoints for watch mode.
 //!
-//! Exposes `/healthz` for Kubernetes liveness probes. Returns 200 if
-//! the last successful sync completed within `2 * interval`, 503
-//! otherwise.
+//! Exposes `/healthz` (liveness — always 200) and `/readyz` (readiness —
+//! 200 if last sync within `2 * interval`, 503 otherwise) for Kubernetes
+//! probes.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -49,19 +49,24 @@ fn format_response(status: &str, body: &str) -> String {
     )
 }
 
-/// Route a request path to a formatted HTTP response string based on health state.
+/// Route a request path to a formatted HTTP response string.
+///
+/// - `/healthz` — liveness: always 200 (process is running).
+/// - `/readyz`  — readiness: 200 if last sync within `2 * interval`, 503 otherwise.
 fn handle_request(path: &str, state: &HealthState) -> String {
     match path {
-        "/healthz" if state.is_healthy() => format_response("200 OK", "ok\n"),
-        "/healthz" => format_response("503 Service Unavailable", "sync stale\n"),
+        "/healthz" => format_response("200 OK", "ok\n"),
+        "/readyz" if state.is_healthy() => format_response("200 OK", "ok\n"),
+        "/readyz" => format_response("503 Service Unavailable", "sync stale\n"),
         _ => format_response("404 Not Found", "not found\n"),
     }
 }
 
 /// Start the health server on a pre-bound listener.
 ///
-/// Serves `/healthz` until the task is cancelled. Must be called from
-/// within a `spawn_local` on the `current_thread` runtime.
+/// Serves `/healthz` (liveness) and `/readyz` (readiness) until the task
+/// is cancelled. Must be called from within a `spawn_local` on the
+/// `current_thread` runtime.
 ///
 /// Accepts a `TcpListener` rather than a port number so the caller
 /// controls binding (avoids TOCTOU races in tests and lets production
@@ -104,11 +109,11 @@ mod tests {
     // -- handler unit tests (no TCP, no port) --
 
     #[test]
-    fn healthz_returns_503_before_first_sync() {
+    fn healthz_returns_200_before_first_sync() {
         let state = HealthState::new(Duration::from_secs(60));
         let resp = handle_request("/healthz", &state);
-        assert!(resp.contains("503 Service Unavailable"));
-        assert!(resp.ends_with("sync stale\n"));
+        assert!(resp.contains("200 OK"));
+        assert!(resp.ends_with("ok\n"));
     }
 
     #[test]
@@ -121,11 +126,38 @@ mod tests {
     }
 
     #[test]
-    fn healthz_returns_503_when_stale() {
+    fn healthz_returns_200_when_stale() {
         let interval = Duration::from_millis(10);
         let mut state = HealthState::new(interval);
         state.last_success = Some(Instant::now() - interval * 3);
         let resp = handle_request("/healthz", &state);
+        assert!(resp.contains("200 OK"));
+        assert!(resp.ends_with("ok\n"));
+    }
+
+    #[test]
+    fn readyz_returns_503_before_first_sync() {
+        let state = HealthState::new(Duration::from_secs(60));
+        let resp = handle_request("/readyz", &state);
+        assert!(resp.contains("503 Service Unavailable"));
+        assert!(resp.ends_with("sync stale\n"));
+    }
+
+    #[test]
+    fn readyz_returns_200_after_successful_sync() {
+        let mut state = HealthState::new(Duration::from_secs(60));
+        state.record_success();
+        let resp = handle_request("/readyz", &state);
+        assert!(resp.contains("200 OK"));
+        assert!(resp.ends_with("ok\n"));
+    }
+
+    #[test]
+    fn readyz_returns_503_when_stale() {
+        let interval = Duration::from_millis(10);
+        let mut state = HealthState::new(interval);
+        state.last_success = Some(Instant::now() - interval * 3);
+        let resp = handle_request("/readyz", &state);
         assert!(resp.contains("503 Service Unavailable"));
         assert!(resp.ends_with("sync stale\n"));
     }
@@ -237,12 +269,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn serve_healthz_200() {
+    async fn serve_healthz_always_200() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
+                // No record_success — /healthz should still return 200.
                 let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
-                state.borrow_mut().record_success();
 
                 let resp =
                     serve_and_request(state, b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -254,21 +286,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn serve_healthz_503() {
+    async fn serve_readyz_503_before_sync() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
-                // No record_success — should return 503.
 
                 let resp =
-                    serve_and_request(state, b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    serve_and_request(state, b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
                         .await;
                 assert!(
                     resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
                     "got: {resp}"
                 );
                 assert!(resp.ends_with("sync stale\n"), "got: {resp}");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_readyz_200_after_sync() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
+                state.borrow_mut().record_success();
+
+                let resp =
+                    serve_and_request(state, b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .await;
+                assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "got: {resp}");
+                assert!(resp.ends_with("ok\n"), "got: {resp}");
             })
             .await;
     }
