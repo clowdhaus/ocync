@@ -7138,7 +7138,7 @@ async fn discovery_concurrent_mixed_outcomes() {
         artifact_type: None,
         annotations: None,
     };
-    let (manifest_c_bytes, manifest_c_digest) = serialize_manifest(&manifest_c);
+    let (manifest_c_bytes, _manifest_c_digest) = serialize_manifest(&manifest_c);
 
     // --- Tag A: cache hit (source HEAD matches, target HEAD matches) ---
     mount_source_head(&source_server, "src/repo", "tag-a", &manifest_a_digest).await;
