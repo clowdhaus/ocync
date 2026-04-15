@@ -1,12 +1,86 @@
-//! Verbosity-aware text progress reporter.
+//! Verbosity-aware progress reporters for sync output.
+//!
+//! [`TextProgress`] writes plain status lines to stderr (non-TTY).
+//! [`BarProgress`] shows `indicatif` spinners on stderr (TTY).
+//! Both write the run summary to stdout.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{self, Write};
+use std::time::Duration;
 
+#[cfg(test)]
+use indicatif::ProgressDrawTarget;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use ocync_sync::progress::ProgressReporter;
 use ocync_sync::{ImageResult, ImageStatus, SyncReport};
 
 use crate::cli::output::{format_bytes, format_duration};
+
+/// Format a per-image status line, or `None` if the status should be silent
+/// at the given verbosity level.
+///
+/// Failed images always produce a line. Synced/skipped images produce a
+/// line only at verbosity >= 1.
+fn format_image_line(result: &ImageResult, verbosity: u8) -> Option<String> {
+    match &result.status {
+        ImageStatus::Failed { kind, error, .. } => Some(format!(
+            "FAILED  {} -> {}  ({kind}: {error})",
+            result.source, result.target,
+        )),
+        ImageStatus::Synced if verbosity >= 1 => Some(format!(
+            "synced  {} -> {}  ({}, {})",
+            result.source,
+            result.target,
+            format_bytes(result.bytes_transferred),
+            format_duration(result.duration),
+        )),
+        ImageStatus::Skipped { reason } if verbosity >= 1 => Some(format!(
+            "skipped {} -> {}  ({reason})",
+            result.source, result.target,
+        )),
+        _ => None,
+    }
+}
+
+/// Write the run summary to `stdout`, or do nothing if `suppress_summary`
+/// is true or the report contains no images.
+fn write_run_summary(
+    stdout: &RefCell<Box<dyn Write>>,
+    report: &SyncReport,
+    suppress_summary: bool,
+) {
+    if suppress_summary {
+        return;
+    }
+    if report.images.is_empty() {
+        return;
+    }
+    let s = &report.stats;
+    let discovery = if s.discovery_cache_hits > 0 || s.discovery_cache_misses > 0 {
+        format!(
+            " | discovery: {} cached, {} pulled",
+            s.discovery_cache_hits, s.discovery_cache_misses,
+        )
+    } else {
+        String::new()
+    };
+    if let Err(e) = writeln!(
+        stdout.borrow_mut(),
+        "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {}{}",
+        s.images_synced,
+        s.images_skipped,
+        s.images_failed,
+        s.blobs_transferred,
+        s.blobs_skipped,
+        s.blobs_mounted,
+        format_bytes(s.bytes_transferred),
+        format_duration(report.duration),
+        discovery,
+    ) {
+        tracing::warn!(error = %e, "failed to write progress summary to stdout");
+    }
+}
 
 /// Text progress reporter with configurable verbosity.
 ///
@@ -67,80 +141,115 @@ impl TextProgress {
     }
 }
 
+/// TTY progress reporter using `indicatif` spinners.
+///
+/// Shows a spinner per in-flight image on stderr. When an image completes,
+/// the spinner is replaced with a final status line (failures always shown,
+/// synced/skipped shown at verbosity >= 1, silently cleared at verbosity 0).
+///
+/// Falls back to [`TextProgress`] when stderr is not a terminal — the
+/// selection is made in `main.rs`, not here.
+pub(crate) struct BarProgress {
+    multi: MultiProgress,
+    bars: RefCell<HashMap<String, ProgressBar>>,
+    verbosity: u8,
+    suppress_summary: bool,
+    stdout: RefCell<Box<dyn Write>>,
+}
+
+impl std::fmt::Debug for BarProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BarProgress")
+            .field("verbosity", &self.verbosity)
+            .field("suppress_summary", &self.suppress_summary)
+            .field("active_bars", &self.bars.borrow().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BarProgress {
+    /// Create a new bar progress reporter writing spinners to stderr
+    /// and the run summary to stdout.
+    pub(crate) fn new(verbosity: u8, suppress_summary: bool) -> Self {
+        Self {
+            multi: MultiProgress::new(),
+            bars: RefCell::new(HashMap::new()),
+            verbosity,
+            suppress_summary,
+            stdout: RefCell::new(Box::new(io::stdout())),
+        }
+    }
+
+    /// Create a bar progress reporter with a hidden draw target and
+    /// custom stdout writer (for testing).
+    #[cfg(test)]
+    fn with_writers(verbosity: u8, suppress_summary: bool, stdout: Box<dyn Write>) -> Self {
+        Self {
+            multi: MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
+            bars: RefCell::new(HashMap::new()),
+            verbosity,
+            suppress_summary,
+            stdout: RefCell::new(stdout),
+        }
+    }
+
+    /// Build the map key for an image.
+    fn bar_key(source: &str, target: &str) -> String {
+        format!("{source} -> {target}")
+    }
+}
+
+impl ProgressReporter for BarProgress {
+    fn image_started(&self, source: &str, target: &str) {
+        let style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .expect("hardcoded template is valid");
+        let pb = self.multi.add(ProgressBar::new_spinner());
+        pb.set_style(style);
+        pb.set_message(format!("syncing {source} -> {target}"));
+        pb.enable_steady_tick(Duration::from_millis(100));
+        self.bars
+            .borrow_mut()
+            .insert(Self::bar_key(source, target), pb);
+    }
+
+    fn image_completed(&self, result: &ImageResult) {
+        let key = Self::bar_key(&result.source, &result.target);
+        let mut bars = self.bars.borrow_mut();
+        let Some(pb) = bars.remove(&key) else {
+            tracing::warn!(
+                source = %result.source,
+                target = %result.target,
+                "image_completed called without matching image_started"
+            );
+            return;
+        };
+
+        match format_image_line(result, self.verbosity) {
+            Some(line) => pb.finish_with_message(line),
+            None => pb.finish_and_clear(),
+        }
+    }
+
+    fn run_completed(&self, report: &SyncReport) {
+        write_run_summary(&self.stdout, report, self.suppress_summary);
+    }
+}
+
 impl ProgressReporter for TextProgress {
     fn image_started(&self, _source: &str, _target: &str) {
         // No-op for text output — only progress bar implementations need this.
     }
 
     fn image_completed(&self, result: &ImageResult) {
-        match &result.status {
-            ImageStatus::Failed { kind, error, .. } => {
-                if let Err(e) = writeln!(
-                    self.stderr.borrow_mut(),
-                    "FAILED  {} -> {}  ({kind}: {error})",
-                    result.source,
-                    result.target,
-                ) {
-                    tracing::warn!(error = %e, "failed to write progress to stderr");
-                }
+        if let Some(line) = format_image_line(result, self.verbosity) {
+            if let Err(e) = writeln!(self.stderr.borrow_mut(), "{line}") {
+                tracing::warn!(error = %e, "failed to write progress to stderr");
             }
-            ImageStatus::Synced if self.verbosity >= 1 => {
-                if let Err(e) = writeln!(
-                    self.stderr.borrow_mut(),
-                    "synced  {} -> {}  ({}, {})",
-                    result.source,
-                    result.target,
-                    format_bytes(result.bytes_transferred),
-                    format_duration(result.duration),
-                ) {
-                    tracing::warn!(error = %e, "failed to write progress to stderr");
-                }
-            }
-            ImageStatus::Skipped { reason } if self.verbosity >= 1 => {
-                if let Err(e) = writeln!(
-                    self.stderr.borrow_mut(),
-                    "skipped {} -> {}  ({reason})",
-                    result.source,
-                    result.target,
-                ) {
-                    tracing::warn!(error = %e, "failed to write progress to stderr");
-                }
-            }
-            _ => {}
         }
     }
 
     fn run_completed(&self, report: &SyncReport) {
-        if self.suppress_summary {
-            return;
-        }
-        if report.images.is_empty() {
-            return;
-        }
-        let s = &report.stats;
-        let discovery = if s.discovery_cache_hits > 0 || s.discovery_cache_misses > 0 {
-            format!(
-                " | discovery: {} cached, {} pulled",
-                s.discovery_cache_hits, s.discovery_cache_misses,
-            )
-        } else {
-            String::new()
-        };
-        if let Err(e) = writeln!(
-            self.stdout.borrow_mut(),
-            "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {}{}",
-            s.images_synced,
-            s.images_skipped,
-            s.images_failed,
-            s.blobs_transferred,
-            s.blobs_skipped,
-            s.blobs_mounted,
-            format_bytes(s.bytes_transferred),
-            format_duration(report.duration),
-            discovery,
-        ) {
-            tracing::warn!(error = %e, "failed to write progress summary to stdout");
-        }
+        write_run_summary(&self.stdout, report, self.suppress_summary);
     }
 }
 
@@ -561,6 +670,180 @@ mod tests {
         assert!(
             stdout.borrow().is_empty(),
             "suppress_summary should not write to stdout on image_completed"
+        );
+    }
+
+    // -- BarProgress tests --
+
+    fn test_bar_progress(verbosity: u8) -> (BarProgress, Buf) {
+        test_bar_progress_with_suppress(verbosity, false)
+    }
+
+    fn test_bar_progress_with_suppress(
+        verbosity: u8,
+        suppress_summary: bool,
+    ) -> (BarProgress, Buf) {
+        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
+        let progress = BarProgress::with_writers(
+            verbosity,
+            suppress_summary,
+            Box::new(RcWriter(Rc::clone(&stdout_buf))),
+        );
+        (progress, stdout_buf)
+    }
+
+    #[test]
+    fn bar_image_started_creates_bar() {
+        let (progress, _stdout) = test_bar_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        assert_eq!(progress.bars.borrow().len(), 1);
+    }
+
+    #[test]
+    fn bar_image_started_multiple_images() {
+        let (progress, _stdout) = test_bar_progress(0);
+        progress.image_started("source/a:v1", "target/a:v1");
+        progress.image_started("source/b:v1", "target/b:v1");
+        assert_eq!(progress.bars.borrow().len(), 2);
+    }
+
+    #[test]
+    fn bar_image_completed_removes_bar() {
+        let (progress, _stdout) = test_bar_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        let result = make_result(ImageStatus::Synced, 1024);
+        progress.image_completed(&result);
+        assert!(progress.bars.borrow().is_empty());
+    }
+
+    #[test]
+    fn bar_image_completed_failed_always_finishes_with_message() {
+        let (progress, _stdout) = test_bar_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        let result = make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::ManifestPush,
+                error: "timeout".into(),
+                retries: 2,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        assert!(progress.bars.borrow().is_empty());
+    }
+
+    #[test]
+    fn bar_image_completed_synced_v0_clears() {
+        let (progress, _stdout) = test_bar_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        let result = make_result(ImageStatus::Synced, 1024);
+        progress.image_completed(&result);
+        assert!(progress.bars.borrow().is_empty());
+    }
+
+    #[test]
+    fn bar_image_completed_synced_v1_finishes() {
+        let (progress, _stdout) = test_bar_progress(1);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        let result = make_result(ImageStatus::Synced, 187_000_000);
+        progress.image_completed(&result);
+        assert!(progress.bars.borrow().is_empty());
+    }
+
+    #[test]
+    fn bar_image_completed_skipped_v0_clears() {
+        let (progress, _stdout) = test_bar_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        assert!(progress.bars.borrow().is_empty());
+    }
+
+    #[test]
+    fn bar_image_completed_skipped_v1_finishes() {
+        let (progress, _stdout) = test_bar_progress(1);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        assert!(progress.bars.borrow().is_empty());
+    }
+
+    #[test]
+    fn bar_image_completed_missing_key_does_not_panic() {
+        let (progress, _stdout) = test_bar_progress(0);
+        // No image_started — should warn, not panic.
+        let result = make_result(ImageStatus::Synced, 1024);
+        progress.image_completed(&result);
+        assert!(progress.bars.borrow().is_empty());
+    }
+
+    #[test]
+    fn bar_run_completed_writes_summary() {
+        let (progress, stdout) = test_bar_progress(0);
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
+        assert_eq!(
+            output,
+            "sync complete: 3 synced, 47 skipped, 1 failed | blobs: 12 transferred, 0 skipped, 34 mounted | 432.0 MB in 47s\n"
+        );
+    }
+
+    #[test]
+    fn bar_run_completed_suppressed() {
+        let (progress, stdout) = test_bar_progress_with_suppress(0, true);
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        assert!(stdout.borrow().is_empty());
+    }
+
+    #[test]
+    fn bar_run_completed_empty_report() {
+        let (progress, stdout) = test_bar_progress(0);
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![],
+            stats: SyncStats::default(),
+            duration: Duration::ZERO,
+        };
+        progress.run_completed(&report);
+        assert!(stdout.borrow().is_empty());
+    }
+
+    #[test]
+    fn bar_all_cleaned_up_after_multiple_images() {
+        let (progress, _stdout) = test_bar_progress(1);
+        progress.image_started("source/a:v1", "target/a:v1");
+        progress.image_started("source/b:v1", "target/b:v1");
+
+        let mut r1 = make_result(ImageStatus::Synced, 1024);
+        r1.source = "source/a:v1".into();
+        r1.target = "target/a:v1".into();
+        progress.image_completed(&r1);
+
+        let mut r2 = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            },
+            0,
+        );
+        r2.source = "source/b:v1".into();
+        r2.target = "target/b:v1".into();
+        progress.image_completed(&r2);
+
+        assert!(
+            progress.bars.borrow().is_empty(),
+            "all bars should be cleaned up"
         );
     }
 }

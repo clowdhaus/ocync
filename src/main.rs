@@ -2,6 +2,7 @@
 
 mod cli;
 
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use anstyle::{Ansi256Color, Color, Style};
@@ -308,6 +309,11 @@ async fn main() -> std::process::ExitCode {
 
     let progress: Box<dyn ocync_sync::progress::ProgressReporter> = if cli.quiet {
         Box::new(NullProgress)
+    } else if std::io::stderr().is_terminal() {
+        Box::new(cli::progress::BarProgress::new(
+            effective_verbosity,
+            suppress_summary,
+        ))
     } else {
         Box::new(cli::progress::TextProgress::new(
             effective_verbosity,
