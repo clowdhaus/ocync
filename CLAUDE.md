@@ -18,7 +18,7 @@ Every PR must be self-contained. Code in the diff must be called, tested, and in
 - No error variants that are never constructed
 - No struct fields that are never read
 - No enum variants for "future use"
-- No speculative derives — every `derive` trait (`Hash`, `Eq`, `Serialize`, etc.) must have a live caller; remove unused derives during pre-commit audit
+- No speculative derives or trait impls — every `derive` trait (`Hash`, `Eq`, `Serialize`, etc.) and every hand-written trait impl (`Deref`, `Display`, `From`, etc.) must have a live caller; remove unused derives and impls during pre-commit audit
 - No Cargo feature flags anywhere — single binary, all registries, always; this is a CLI tool, not a library
 - If you can't write a test that exercises a code path in this PR, it doesn't belong in this PR
 
@@ -111,7 +111,7 @@ Tests must verify **behavior under failure and concurrency**, not just happy-pat
 
 ### Assert request counts, not just results
 
-Every multi-target engine test must use wiremock `.expect(N)` on source endpoints to verify the pull-once fan-out invariant. A test that passes when the source manifest is pulled 3 times instead of 1 does not protect the architecture. Assert exact byte counts, blob counts, and request counts — never `> 0` or `status == Synced` alone. This applies to ALL endpoints in the test, not just source manifests — child manifest GETs, target manifest PUTs, blob pushes, and blob pulls each need `.expect(N)` when the count is architecturally significant. Helper functions like `mount_blob_pull` and `mount_manifest_push` don't set expectations; use inline `Mock::given()...expect(N)` for any endpoint where the count matters.
+Every multi-target engine test must use wiremock `.expect(N)` on source endpoints to verify the pull-once fan-out invariant. A test that passes when the source manifest is pulled 3 times instead of 1 does not protect the architecture. Assert exact byte counts, blob counts, and request counts — never `> 0` or `status == Synced` alone. This applies to ALL endpoints in the test, not just source manifests — child manifest GETs, target manifest PUTs, blob pushes, and blob pulls each need `.expect(N)` when the count is architecturally significant. Helper functions that mount mocks must not be used for endpoints where request count is architecturally significant — the helper hides the `.expect(N)` and makes it impossible to assert at the call site. Use inline `Mock::given()...expect(N)` for any endpoint where the count matters (source HEAD, source GET, target HEAD in discovery tests). Reserve helpers for endpoints where the count doesn't matter (blob pushes, blob 404s).
 
 ### Verify optimizations take the designed path
 
@@ -215,8 +215,8 @@ Never trust the implementer's self-report alone.
 
 ## Plans and specs
 
-- **Design spec**: `docs/specs/2026-04-10-ocync-design.md` — full design document
-- **Transfer optimization design**: `docs/specs/2026-04-12-transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse
+- **Design spec**: `docs/specs/ocync-design.md` — full design document
+- **Transfer optimization design**: `docs/specs/transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse
 - **Implementation plan**: `docs/superpowers/plans/` (gitignored) — remaining v1 work is `2026-04-12-remaining-v1-implementation.md` (remaining: auth providers, progress/health/metrics, FIPS/packaging)
 
 ## Commands
