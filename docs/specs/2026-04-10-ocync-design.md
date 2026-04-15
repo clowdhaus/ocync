@@ -62,12 +62,13 @@ ocync/
 │       └── src/
 │           ├── lib.rs
 │           ├── filter.rs          # Tag filtering pipeline (glob, semver, exclude, sort, latest)
-│           ├── plan.rs            # DAG resolution, blob dedup, push ordering
 │           ├── engine.rs          # Concurrent execution, rate limiting, retry
 │           └── progress.rs        # Progress reporting trait
 ```
 
 ### Feature Flags (ocync-distribution)
+
+> **Note:** The feature flag design below is superseded by the "no Cargo feature flags" rule in CLAUDE.md. The current implementation compiles all registry providers and uses runtime detection (`detect_provider_kind()` and `ProviderKind` enum) instead of compile-time feature gates. TLS backend selection uses build-time configuration rather than feature flags. This section is retained for historical context but does not reflect the current architecture.
 
 ```toml
 [features]
@@ -99,9 +100,9 @@ ghcr = []
 | Semver | `semver` | Version range parsing |
 | Glob | `globset` | Glob pattern matching |
 | Canonical JSON | `olpc-cjson` | Deterministic manifest serialization |
-| Rate limiting | `governor` | Token bucket per registry |
+| Rate limiting | AIMD controller | Adaptive per-action congestion windows (replaces token bucket) |
 | Metrics | `prometheus-client` | Prometheus exposition format |
-| HTTP server | `axum` | Health/metrics endpoints in watch mode |
+| HTTP server | `tokio` TCP listener | Health endpoints in watch mode (lightweight, no framework dependency) |
 | IDs | `ulid` | Correlation IDs (time-ordered) |
 
 ### SHA-256 Abstraction
@@ -432,9 +433,9 @@ For 50 images with 200 unique layers, this replaces ~300 individual OCI API call
 
 Rate limiting has two independent components that must not be confused:
 
-1. **Steady-state rate limiting** — proactive pacing using a token bucket algorithm (`governor` crate, leaky-bucket style). One token bucket per registry. Tokens are consumed before each request. This prevents bursts from overwhelming registries.
+1. **Steady-state rate limiting** — adaptive per-(registry, action) AIMD congestion windows. Each action (ManifestHead, ManifestPull, BlobHead, etc.) has an independent window that grows on success and shrinks on 429. See the transfer optimization spec for AIMD controller design.
 
-2. **Adaptive backoff** — reactive per-request sleep triggered by 429/5xx responses. This is completely separate from the rate limiter. When a 429 is received, the individual request sleeps (honoring `Retry-After` if present) and retries. The rate limiter is NOT adjusted — it continues at its configured pace for other concurrent requests.
+2. **Adaptive backoff** — reactive per-request sleep triggered by 429/5xx responses. This is completely separate from the AIMD windows. When a 429 is received, the individual request sleeps (honoring `Retry-After` if present) and retries. The AIMD window for that action shrinks (once per congestion epoch), but other actions' windows are unaffected.
 
 ### Per-Registry Rate Limiting
 
@@ -472,7 +473,7 @@ registries:
 # Result: pull = unlimited, push = 30/second
 ```
 
-If not configured, defaults: `max_concurrent: 10`, `chunk_size: 4194304` (4MB).
+If not configured, defaults: `max_concurrent: 50`, `chunk_size: 8388608` (8MB).
 
 ### Global Concurrent Transfer Cap
 
@@ -481,11 +482,11 @@ global:
   max_concurrent_transfers: 50        # default: 50
 ```
 
-A process-wide Tokio semaphore is acquired before the per-registry semaphore. This bounds total memory usage regardless of how many registries are configured. Without this, 20 registries at `max_concurrent: 10` each could spawn 200 concurrent transfers.
+A process-wide Tokio semaphore is acquired before the per-registry semaphore. This bounds total memory usage regardless of how many registries are configured. Without this, 20 registries at `max_concurrent: 50` each could spawn 1000 concurrent transfers.
 
 ### Chunk Size Configuration
 
-Default: 4MB (`4194304` bytes). Configurable per registry.
+Default: 8MB (`8388608` bytes). Configurable per registry.
 
 For ML image workloads with multi-GB layers, increase to 16-32MB to reduce round-trips:
 
@@ -603,7 +604,7 @@ The pushed index will have a **different digest** than the source index (because
 If a requested platform is not available in the source image index:
 - Log WARNING: `platform linux/arm64 not found in source image index for library/nginx:1.27`
 - Continue with available platforms (do NOT fail)
-- If NO requested platforms exist, skip the image entirely
+- If NO requested platforms match any manifest in the source index, return an error with actionable context: the configured platform filter, the platforms available in the source index, and the source reference. An empty filtered index is never pushed to targets — it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading.
 
 ---
 
@@ -1579,31 +1580,33 @@ watch:
 On receiving SIGHUP:
 1. Read and parse the new config file(s)
 2. Validate the new config (full pipeline, steps 1-8)
-3. If valid: swap to new config, clear target state cache
+3. If valid: swap to new config, clear tag digest cache (forces full source re-verification on next cycle)
 4. If invalid: log ERROR with validation details, keep old config, continue with next cycle
 
-### Target State Cache
+### Tag Digest Cache (Watch Mode)
 
-Watch mode maintains an in-memory cache to avoid redundant target HEAD requests:
+Watch mode maintains the transfer state cache in memory across sync cycles to avoid redundant source manifest pulls:
 
-```
-cache: Map<(TargetRegistry, Repo, Tag), Digest>
-```
-
-- **Populated** after successful HEAD checks and syncs
-- **Used** to skip target HEAD requests for tags whose digest hasn't changed at source
+- **Source-side caching**: after a successful source manifest pull, records `(source_authority, repo, tag) → SourceSnapshot` containing the source HEAD digest, filtered digest (after platform filtering), and platform filter config hash
+- **Target verification is always live**: target HEAD checks are performed every cycle regardless of cache state — the cache only skips source-side work, never target verification
+- **Startup**: loads existing cache from disk (warm start from prior CronJob or watch session)
+- **Persistence**: persists to disk on graceful shutdown (SIGTERM/SIGINT) only, not every cycle — avoids per-cycle disk I/O while preserving crash recovery
 - **End-of-cycle pruning**: tags removed from source (no longer in filtered tag list) are evicted from cache
-- **Cleared on SIGHUP** (config reload)
+- **Cleared on SIGHUP** (config reload) — forces re-verification of all tags after config changes
+
+See the discovery optimization spec for the full tag digest cache design, including platform filter hash determinism, cache format versioning, and fallback behavior.
 
 ### Health Endpoints
 
-Watch mode starts an `axum` HTTP server on a configurable port (default 9090):
+Watch mode starts an HTTP health server on a configurable port (`--health-port`, default 8080):
 
 | Endpoint | Purpose | Response |
 |---|---|---|
 | `/healthz` | Liveness probe | HTTP 200 if process is alive (trivial check) |
 | `/readyz` | Readiness probe | HTTP 200 if last sync completed within `2 * watch.interval`. HTTP 503 if overdue. |
 | `/metrics` | Prometheus metrics | See Prometheus Metrics section |
+
+The health server uses a lightweight TCP listener with manual HTTP response formatting — no framework dependency. Prometheus metrics exposition (`/metrics`) and readiness probes (`/readyz`) are planned for a future spec; the current health server provides liveness checking only.
 
 Health endpoints are NOT enabled in CronJob/one-shot mode — only in `ocync watch`.
 
@@ -1617,7 +1620,9 @@ If `watch.failure.consecutive_failure_threshold` consecutive cycles produce only
 
 ---
 
-## Prometheus Metrics (P0)
+## Prometheus Metrics (Planned)
+
+Prometheus metrics are planned but deferred until after the core sync engine, discovery optimization, and watch mode ship. The initial release uses `SyncStats` counters in `--json` structured output for observability. The metrics schema below defines the target state for the metrics endpoint.
 
 Metrics use the `prometheus-client` crate. Exposed at `/metrics` in watch mode.
 
