@@ -1,7 +1,7 @@
 //! Verbosity-aware progress reporters for sync output.
 //!
 //! [`TextProgress`] writes plain status lines to stderr (non-TTY).
-//! [`BarProgress`] shows `indicatif` spinners on stderr (TTY).
+//! [`TtyProgress`] shows `indicatif` spinners on stderr (TTY).
 //! Both write the run summary to stdout.
 
 use std::cell::RefCell;
@@ -99,15 +99,6 @@ pub(crate) struct TextProgress {
     stdout: RefCell<Box<dyn Write>>,
 }
 
-impl std::fmt::Debug for TextProgress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TextProgress")
-            .field("verbosity", &self.verbosity)
-            .field("suppress_summary", &self.suppress_summary)
-            .finish_non_exhaustive()
-    }
-}
-
 impl TextProgress {
     /// Create a new text progress reporter writing to real stderr/stdout.
     ///
@@ -148,32 +139,22 @@ impl TextProgress {
 ///
 /// Falls back to [`TextProgress`] when stderr is not a terminal — the
 /// selection is made in `main.rs`, not here.
-pub(crate) struct BarProgress {
+pub(crate) struct TtyProgress {
     multi: MultiProgress,
-    bars: RefCell<HashMap<String, ProgressBar>>,
+    spinners: RefCell<HashMap<String, ProgressBar>>,
     style: ProgressStyle,
     verbosity: u8,
     suppress_summary: bool,
     stdout: RefCell<Box<dyn Write>>,
 }
 
-impl std::fmt::Debug for BarProgress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BarProgress")
-            .field("verbosity", &self.verbosity)
-            .field("suppress_summary", &self.suppress_summary)
-            .field("active_bars", &self.bars.borrow().len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl BarProgress {
-    /// Create a new bar progress reporter writing spinners to stderr
+impl TtyProgress {
+    /// Create a new TTY progress reporter writing spinners to stderr
     /// and the run summary to stdout.
     pub(crate) fn new(verbosity: u8, suppress_summary: bool) -> Self {
         Self {
             multi: MultiProgress::new(),
-            bars: RefCell::new(HashMap::new()),
+            spinners: RefCell::new(HashMap::new()),
             style: Self::spinner_style(),
             verbosity,
             suppress_summary,
@@ -181,13 +162,13 @@ impl BarProgress {
         }
     }
 
-    /// Create a bar progress reporter with a hidden draw target and
+    /// Create a TTY progress reporter with a hidden draw target and
     /// custom stdout writer (for testing).
     #[cfg(test)]
     fn with_writers(verbosity: u8, suppress_summary: bool, stdout: Box<dyn Write>) -> Self {
         Self {
             multi: MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
-            bars: RefCell::new(HashMap::new()),
+            spinners: RefCell::new(HashMap::new()),
             style: Self::spinner_style(),
             verbosity,
             suppress_summary,
@@ -195,31 +176,31 @@ impl BarProgress {
         }
     }
 
-    /// Spinner style shared by all progress bars.
+    /// Spinner style shared by all spinners.
     fn spinner_style() -> ProgressStyle {
         ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("hardcoded template is valid")
     }
 
     /// Build the map key for an image.
-    fn bar_key(source: &str, target: &str) -> String {
+    fn spinner_key(source: &str, target: &str) -> String {
         format!("{source} -> {target}")
     }
 }
 
-impl ProgressReporter for BarProgress {
+impl ProgressReporter for TtyProgress {
     fn image_started(&self, source: &str, target: &str) {
         let pb = self.multi.add(ProgressBar::new_spinner());
         pb.set_style(self.style.clone());
         pb.set_message(format!("syncing {source} -> {target}"));
-        self.bars
+        self.spinners
             .borrow_mut()
-            .insert(Self::bar_key(source, target), pb);
+            .insert(Self::spinner_key(source, target), pb);
     }
 
     fn image_completed(&self, result: &ImageResult) {
-        let key = Self::bar_key(&result.source, &result.target);
-        let mut bars = self.bars.borrow_mut();
-        let Some(pb) = bars.remove(&key) else {
+        let key = Self::spinner_key(&result.source, &result.target);
+        let mut spinners = self.spinners.borrow_mut();
+        let Some(pb) = spinners.remove(&key) else {
             tracing::warn!(
                 source = %result.source,
                 target = %result.target,
@@ -460,6 +441,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn image_line_exact_format_skipped() {
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            },
+            0,
+        );
+        let line = format_image_line(&result, 1).unwrap();
+        assert_eq!(
+            line,
+            "skipped source/repo:v1 -> target/repo:v1  (digest match)"
+        );
+    }
+
     // -- write_run_summary tests --
 
     #[test]
@@ -513,9 +509,9 @@ mod tests {
         };
         write_run_summary(&stdout, &report, false);
         let output = String::from_utf8(buf.borrow().clone()).unwrap();
-        assert!(
-            output.contains("| discovery: 40 cached, 10 pulled"),
-            "got: {output}"
+        assert_eq!(
+            output,
+            "sync complete: 3 synced, 47 skipped, 0 failed | blobs: 12 transferred, 5 skipped, 34 mounted | 432.0 MB in 47s | discovery: 40 cached, 10 pulled\n"
         );
     }
 
@@ -704,12 +700,12 @@ mod tests {
         );
     }
 
-    // -- BarProgress tests (wiring: bar lifecycle and summary output) --
+    // -- TtyProgress tests (wiring: bar lifecycle and summary output) --
 
-    fn test_bar_progress(verbosity: u8) -> (BarProgress, Buf) {
+    fn test_bar_progress(verbosity: u8) -> (TtyProgress, Buf) {
         let stdout_buf = Rc::new(RefCell::new(Vec::new()));
         let progress =
-            BarProgress::with_writers(verbosity, false, Box::new(RcWriter(Rc::clone(&stdout_buf))));
+            TtyProgress::with_writers(verbosity, false, Box::new(RcWriter(Rc::clone(&stdout_buf))));
         (progress, stdout_buf)
     }
 
@@ -717,7 +713,7 @@ mod tests {
     fn bar_started_creates_entry() {
         let (progress, _stdout) = test_bar_progress(0);
         progress.image_started("source/repo:v1", "target/repo:v1");
-        assert_eq!(progress.bars.borrow().len(), 1);
+        assert_eq!(progress.spinners.borrow().len(), 1);
     }
 
     #[test]
@@ -725,7 +721,7 @@ mod tests {
         let (progress, _stdout) = test_bar_progress(0);
         progress.image_started("source/a:v1", "target/a:v1");
         progress.image_started("source/b:v1", "target/b:v1");
-        assert_eq!(progress.bars.borrow().len(), 2);
+        assert_eq!(progress.spinners.borrow().len(), 2);
     }
 
     #[test]
@@ -733,7 +729,7 @@ mod tests {
         let (progress, _stdout) = test_bar_progress(0);
         progress.image_started("source/repo:v1", "target/repo:v1");
         progress.image_completed(&make_result(ImageStatus::Synced, 1024));
-        assert!(progress.bars.borrow().is_empty());
+        assert!(progress.spinners.borrow().is_empty());
     }
 
     #[test]
@@ -748,7 +744,7 @@ mod tests {
             },
             0,
         ));
-        assert!(progress.bars.borrow().is_empty());
+        assert!(progress.spinners.borrow().is_empty());
     }
 
     #[test]
@@ -756,7 +752,7 @@ mod tests {
         let (progress, _stdout) = test_bar_progress(0);
         // No image_started — should warn and return, not panic.
         progress.image_completed(&make_result(ImageStatus::Synced, 1024));
-        assert!(progress.bars.borrow().is_empty());
+        assert!(progress.spinners.borrow().is_empty());
     }
 
     #[test]
@@ -780,11 +776,11 @@ mod tests {
         r2.target = "target/b:v1".into();
         progress.image_completed(&r2);
 
-        assert!(progress.bars.borrow().is_empty());
+        assert!(progress.spinners.borrow().is_empty());
     }
 
     #[test]
-    fn bar_run_completed_writes_summary_to_stdout() {
+    fn tty_run_completed_writes_summary_to_stdout() {
         let (progress, stdout) = test_bar_progress(0);
         let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
         progress.run_completed(&report);
@@ -792,6 +788,19 @@ mod tests {
         assert!(
             output.starts_with("sync complete:"),
             "summary should go to stdout, got: {output}"
+        );
+    }
+
+    #[test]
+    fn tty_suppress_summary_produces_no_stdout() {
+        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
+        let progress =
+            TtyProgress::with_writers(0, true, Box::new(RcWriter(Rc::clone(&stdout_buf))));
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        assert!(
+            stdout_buf.borrow().is_empty(),
+            "suppress_summary should suppress stdout"
         );
     }
 }

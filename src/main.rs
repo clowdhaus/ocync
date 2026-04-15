@@ -310,7 +310,7 @@ async fn main() -> std::process::ExitCode {
     let progress: Box<dyn ocync_sync::progress::ProgressReporter> = if cli.quiet {
         Box::new(NullProgress)
     } else if std::io::stderr().is_terminal() {
-        Box::new(cli::progress::BarProgress::new(
+        Box::new(cli::progress::TtyProgress::new(
             effective_verbosity,
             suppress_summary,
         ))

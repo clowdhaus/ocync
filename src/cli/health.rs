@@ -112,7 +112,7 @@ mod tests {
     fn healthz_returns_200_before_first_sync() {
         let state = HealthState::new(Duration::from_secs(60));
         let resp = handle_request("/healthz", &state);
-        assert!(resp.contains("200 OK"));
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.ends_with("ok\n"));
     }
 
@@ -121,7 +121,7 @@ mod tests {
         let mut state = HealthState::new(Duration::from_secs(60));
         state.record_success();
         let resp = handle_request("/healthz", &state);
-        assert!(resp.contains("200 OK"));
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.ends_with("ok\n"));
     }
 
@@ -131,7 +131,7 @@ mod tests {
         let mut state = HealthState::new(interval);
         state.last_success = Some(Instant::now() - interval * 3);
         let resp = handle_request("/healthz", &state);
-        assert!(resp.contains("200 OK"));
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.ends_with("ok\n"));
     }
 
@@ -139,7 +139,7 @@ mod tests {
     fn readyz_returns_503_before_first_sync() {
         let state = HealthState::new(Duration::from_secs(60));
         let resp = handle_request("/readyz", &state);
-        assert!(resp.contains("503 Service Unavailable"));
+        assert!(resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(resp.ends_with("sync stale\n"));
     }
 
@@ -148,7 +148,7 @@ mod tests {
         let mut state = HealthState::new(Duration::from_secs(60));
         state.record_success();
         let resp = handle_request("/readyz", &state);
-        assert!(resp.contains("200 OK"));
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.ends_with("ok\n"));
     }
 
@@ -158,7 +158,7 @@ mod tests {
         let mut state = HealthState::new(interval);
         state.last_success = Some(Instant::now() - interval * 3);
         let resp = handle_request("/readyz", &state);
-        assert!(resp.contains("503 Service Unavailable"));
+        assert!(resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(resp.ends_with("sync stale\n"));
     }
 
@@ -166,7 +166,7 @@ mod tests {
     fn unknown_path_returns_404() {
         let state = HealthState::new(Duration::from_secs(60));
         let resp = handle_request("/foo", &state);
-        assert!(resp.contains("404 Not Found"));
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found\r\n"));
         assert!(resp.ends_with("not found\n"));
     }
 
