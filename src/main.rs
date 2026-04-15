@@ -2,6 +2,7 @@
 
 mod cli;
 
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use anstyle::{Ansi256Color, Color, Style};
@@ -74,8 +75,8 @@ const WATCH_LONG_ABOUT: &str = "\
 Run sync continuously on a recurring schedule
 
 Runs the sync operation in a loop at the configured interval. Handles graceful
-shutdown on SIGINT/SIGTERM. Exposes a /healthz endpoint for Kubernetes liveness
-probes.
+shutdown on SIGINT/SIGTERM. Exposes /healthz (liveness) and /readyz (readiness)
+endpoints for Kubernetes probes.
 
 Examples:
   ocync watch -c config.yaml
@@ -308,6 +309,11 @@ async fn main() -> std::process::ExitCode {
 
     let progress: Box<dyn ocync_sync::progress::ProgressReporter> = if cli.quiet {
         Box::new(NullProgress)
+    } else if std::io::stderr().is_terminal() {
+        Box::new(cli::progress::TtyProgress::new(
+            effective_verbosity,
+            suppress_summary,
+        ))
     } else {
         Box::new(cli::progress::TextProgress::new(
             effective_verbosity,

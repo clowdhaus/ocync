@@ -1,12 +1,89 @@
-//! Verbosity-aware text progress reporter.
+//! Verbosity-aware progress reporters for sync output.
+//!
+//! [`TextProgress`] writes plain status lines to stderr (non-TTY).
+//! [`TtyProgress`] shows `indicatif` spinners on stderr (TTY).
+//! Both write the run summary to stdout.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{self, Write};
 
+#[cfg(test)]
+use indicatif::ProgressDrawTarget;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use ocync_sync::progress::ProgressReporter;
 use ocync_sync::{ImageResult, ImageStatus, SyncReport};
 
 use crate::cli::output::{format_bytes, format_duration};
+
+/// Format a per-image status line, or `None` if the status should be silent
+/// at the given verbosity level.
+///
+/// Failed images always produce a line. Synced/skipped images produce a
+/// line only at verbosity >= 1.
+fn format_image_line(result: &ImageResult, verbosity: u8) -> Option<String> {
+    match &result.status {
+        ImageStatus::Failed { kind, error, .. } if error.is_empty() => Some(format!(
+            "FAILED  {} -> {}  ({kind})",
+            result.source, result.target,
+        )),
+        ImageStatus::Failed { kind, error, .. } => Some(format!(
+            "FAILED  {} -> {}  ({kind}: {error})",
+            result.source, result.target,
+        )),
+        ImageStatus::Synced if verbosity >= 1 => Some(format!(
+            "synced  {} -> {}  ({}, {})",
+            result.source,
+            result.target,
+            format_bytes(result.bytes_transferred),
+            format_duration(result.duration),
+        )),
+        ImageStatus::Skipped { reason } if verbosity >= 1 => Some(format!(
+            "skipped {} -> {}  ({reason})",
+            result.source, result.target,
+        )),
+        _ => None,
+    }
+}
+
+/// Write the run summary to `stdout`, or do nothing if `suppress_summary`
+/// is true or the report contains no images.
+fn write_run_summary(
+    stdout: &RefCell<Box<dyn Write>>,
+    report: &SyncReport,
+    suppress_summary: bool,
+) {
+    if suppress_summary {
+        return;
+    }
+    if report.images.is_empty() {
+        return;
+    }
+    let s = &report.stats;
+    let discovery = if s.discovery_cache_hits > 0 || s.discovery_cache_misses > 0 {
+        format!(
+            " | discovery: {} cached, {} pulled",
+            s.discovery_cache_hits, s.discovery_cache_misses,
+        )
+    } else {
+        String::new()
+    };
+    if let Err(e) = writeln!(
+        stdout.borrow_mut(),
+        "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {}{}",
+        s.images_synced,
+        s.images_skipped,
+        s.images_failed,
+        s.blobs_transferred,
+        s.blobs_skipped,
+        s.blobs_mounted,
+        format_bytes(s.bytes_transferred),
+        format_duration(report.duration),
+        discovery,
+    ) {
+        tracing::warn!(error = %e, "failed to write progress summary to stdout");
+    }
+}
 
 /// Text progress reporter with configurable verbosity.
 ///
@@ -24,15 +101,6 @@ pub(crate) struct TextProgress {
     suppress_summary: bool,
     stderr: RefCell<Box<dyn Write>>,
     stdout: RefCell<Box<dyn Write>>,
-}
-
-impl std::fmt::Debug for TextProgress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TextProgress")
-            .field("verbosity", &self.verbosity)
-            .field("suppress_summary", &self.suppress_summary)
-            .finish_non_exhaustive()
-    }
 }
 
 impl TextProgress {
@@ -67,80 +135,105 @@ impl TextProgress {
     }
 }
 
+/// TTY progress reporter using `indicatif` spinners.
+///
+/// Shows a spinner per in-flight image on stderr. When an image completes,
+/// the spinner is replaced with a final status line (failures always shown,
+/// synced/skipped shown at verbosity >= 1, silently cleared at verbosity 0).
+///
+/// Falls back to [`TextProgress`] when stderr is not a terminal — the
+/// selection is made in `main.rs`, not here.
+pub(crate) struct TtyProgress {
+    multi: MultiProgress,
+    spinners: RefCell<HashMap<(String, String), ProgressBar>>,
+    style: ProgressStyle,
+    verbosity: u8,
+    suppress_summary: bool,
+    stdout: RefCell<Box<dyn Write>>,
+}
+
+impl TtyProgress {
+    /// Create a new TTY progress reporter writing spinners to stderr
+    /// and the run summary to stdout.
+    pub(crate) fn new(verbosity: u8, suppress_summary: bool) -> Self {
+        Self {
+            multi: MultiProgress::new(),
+            spinners: RefCell::new(HashMap::new()),
+            style: Self::spinner_style(),
+            verbosity,
+            suppress_summary,
+            stdout: RefCell::new(Box::new(io::stdout())),
+        }
+    }
+
+    /// Create a TTY progress reporter with a hidden draw target and
+    /// custom stdout writer (for testing).
+    #[cfg(test)]
+    fn with_writers(verbosity: u8, suppress_summary: bool, stdout: Box<dyn Write>) -> Self {
+        Self {
+            multi: MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
+            spinners: RefCell::new(HashMap::new()),
+            style: Self::spinner_style(),
+            verbosity,
+            suppress_summary,
+            stdout: RefCell::new(stdout),
+        }
+    }
+
+    /// Spinner style shared by all spinners.
+    fn spinner_style() -> ProgressStyle {
+        ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("hardcoded template is valid")
+    }
+}
+
+impl ProgressReporter for TtyProgress {
+    fn image_started(&self, source: &str, target: &str) {
+        let pb = self.multi.add(ProgressBar::new_spinner());
+        pb.set_style(self.style.clone());
+        pb.set_message(format!("syncing {source} -> {target}"));
+        self.spinners
+            .borrow_mut()
+            .insert((source.to_owned(), target.to_owned()), pb);
+    }
+
+    fn image_completed(&self, result: &ImageResult) {
+        let key = (result.source.clone(), result.target.clone());
+        let mut spinners = self.spinners.borrow_mut();
+        let Some(pb) = spinners.remove(&key) else {
+            tracing::warn!(
+                source = %result.source,
+                target = %result.target,
+                "image_completed called without matching image_started"
+            );
+            return;
+        };
+
+        match format_image_line(result, self.verbosity) {
+            Some(line) => pb.finish_with_message(line),
+            None => pb.finish_and_clear(),
+        }
+    }
+
+    fn run_completed(&self, report: &SyncReport) {
+        write_run_summary(&self.stdout, report, self.suppress_summary);
+    }
+}
+
 impl ProgressReporter for TextProgress {
     fn image_started(&self, _source: &str, _target: &str) {
         // No-op for text output — only progress bar implementations need this.
     }
 
     fn image_completed(&self, result: &ImageResult) {
-        match &result.status {
-            ImageStatus::Failed { kind, error, .. } => {
-                if let Err(e) = writeln!(
-                    self.stderr.borrow_mut(),
-                    "FAILED  {} -> {}  ({kind}: {error})",
-                    result.source,
-                    result.target,
-                ) {
-                    tracing::warn!(error = %e, "failed to write progress to stderr");
-                }
+        if let Some(line) = format_image_line(result, self.verbosity) {
+            if let Err(e) = writeln!(self.stderr.borrow_mut(), "{line}") {
+                tracing::warn!(error = %e, "failed to write progress to stderr");
             }
-            ImageStatus::Synced if self.verbosity >= 1 => {
-                if let Err(e) = writeln!(
-                    self.stderr.borrow_mut(),
-                    "synced  {} -> {}  ({}, {})",
-                    result.source,
-                    result.target,
-                    format_bytes(result.bytes_transferred),
-                    format_duration(result.duration),
-                ) {
-                    tracing::warn!(error = %e, "failed to write progress to stderr");
-                }
-            }
-            ImageStatus::Skipped { reason } if self.verbosity >= 1 => {
-                if let Err(e) = writeln!(
-                    self.stderr.borrow_mut(),
-                    "skipped {} -> {}  ({reason})",
-                    result.source,
-                    result.target,
-                ) {
-                    tracing::warn!(error = %e, "failed to write progress to stderr");
-                }
-            }
-            _ => {}
         }
     }
 
     fn run_completed(&self, report: &SyncReport) {
-        if self.suppress_summary {
-            return;
-        }
-        if report.images.is_empty() {
-            return;
-        }
-        let s = &report.stats;
-        let discovery = if s.discovery_cache_hits > 0 || s.discovery_cache_misses > 0 {
-            format!(
-                " | discovery: {} cached, {} pulled",
-                s.discovery_cache_hits, s.discovery_cache_misses,
-            )
-        } else {
-            String::new()
-        };
-        if let Err(e) = writeln!(
-            self.stdout.borrow_mut(),
-            "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {}{}",
-            s.images_synced,
-            s.images_skipped,
-            s.images_failed,
-            s.blobs_transferred,
-            s.blobs_skipped,
-            s.blobs_mounted,
-            format_bytes(s.bytes_transferred),
-            format_duration(report.duration),
-            discovery,
-        ) {
-            tracing::warn!(error = %e, "failed to write progress summary to stdout");
-        }
+        write_run_summary(&self.stdout, report, self.suppress_summary);
     }
 }
 
@@ -167,27 +260,6 @@ mod tests {
     }
 
     type Buf = Rc<RefCell<Vec<u8>>>;
-
-    fn test_progress(verbosity: u8) -> (TextProgress, Buf, Buf) {
-        test_progress_with_suppress(verbosity, false)
-    }
-
-    fn test_progress_with_suppress(
-        verbosity: u8,
-        suppress_summary: bool,
-    ) -> (TextProgress, Buf, Buf) {
-        let stderr_buf = Rc::new(RefCell::new(Vec::new()));
-        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
-
-        let progress = TextProgress::with_writers(
-            verbosity,
-            suppress_summary,
-            Box::new(RcWriter(Rc::clone(&stderr_buf))),
-            Box::new(RcWriter(Rc::clone(&stdout_buf))),
-        );
-
-        (progress, stderr_buf, stdout_buf)
-    }
 
     fn make_result(status: ImageStatus, bytes: u64) -> ImageResult {
         ImageResult {
@@ -219,11 +291,10 @@ mod tests {
         }
     }
 
-    // -- image_completed tests --
+    // -- format_image_line tests (shared formatting logic) --
 
     #[test]
-    fn verbosity_0_prints_failed() {
-        let (progress, stderr, _stdout) = test_progress(0);
+    fn image_line_failed_always_returns_some() {
         let result = make_result(
             ImageStatus::Failed {
                 kind: ErrorKind::ManifestPush,
@@ -232,155 +303,381 @@ mod tests {
             },
             0,
         );
-        progress.image_completed(&result);
-        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(
-            output.contains("FAILED"),
-            "should print FAILED, got: {output}"
+        let line = format_image_line(&result, 0).expect("failed should always produce a line");
+        assert!(line.starts_with("FAILED  "), "got: {line}");
+        assert!(line.contains("manifest push"), "got: {line}");
+        assert!(line.contains("connection refused"), "got: {line}");
+    }
+
+    #[test]
+    fn image_line_failed_at_any_verbosity() {
+        let result = make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::BlobTransfer,
+                error: "timeout".into(),
+                retries: 1,
+            },
+            0,
         );
-        assert!(
-            output.contains("manifest push"),
-            "should contain error kind"
+        // Failed lines appear at every verbosity level.
+        for v in [0, 1, 2, 255] {
+            assert!(
+                format_image_line(&result, v).is_some(),
+                "failed should produce a line at verbosity {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_line_failed_with_empty_error_omits_colon() {
+        let result = make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::ManifestPull,
+                error: String::new(),
+                retries: 0,
+            },
+            0,
         );
-        assert!(
-            output.contains("connection refused"),
-            "should contain error message"
+        let line = format_image_line(&result, 0).unwrap();
+        assert_eq!(
+            line,
+            "FAILED  source/repo:v1 -> target/repo:v1  (manifest pull)"
         );
     }
 
     #[test]
-    fn verbosity_0_silent_on_synced() {
-        let (progress, stderr, _stdout) = test_progress(0);
+    fn image_line_synced_v0_returns_none() {
         let result = make_result(ImageStatus::Synced, 187_000_000);
-        progress.image_completed(&result);
-        let output = stderr.borrow();
-        assert!(
-            output.is_empty(),
-            "verbosity 0 should not print synced images"
-        );
+        assert!(format_image_line(&result, 0).is_none());
     }
 
     #[test]
-    fn verbosity_0_silent_on_skipped() {
-        let (progress, stderr, _stdout) = test_progress(0);
+    fn image_line_synced_v1_includes_bytes_and_duration() {
+        let result = make_result(ImageStatus::Synced, 187_000_000);
+        let line = format_image_line(&result, 1).expect("synced at v1 should produce a line");
+        assert!(line.starts_with("synced  "), "got: {line}");
+        assert!(line.contains("187.0 MB"), "got: {line}");
+        assert!(line.contains("14s"), "got: {line}");
+    }
+
+    #[test]
+    fn image_line_synced_zero_bytes() {
+        let result = make_result(ImageStatus::Synced, 0);
+        let line = format_image_line(&result, 1).unwrap();
+        assert!(line.contains("0 B"), "got: {line}");
+    }
+
+    #[test]
+    fn image_line_skipped_v0_returns_none() {
         let result = make_result(
             ImageStatus::Skipped {
                 reason: SkipReason::DigestMatch,
             },
             0,
         );
-        progress.image_completed(&result);
-        let output = stderr.borrow();
-        assert!(
-            output.is_empty(),
-            "verbosity 0 should not print skipped images"
-        );
+        assert!(format_image_line(&result, 0).is_none());
     }
 
     #[test]
-    fn verbosity_1_prints_synced() {
-        let (progress, stderr, _stdout) = test_progress(1);
-        let result = make_result(ImageStatus::Synced, 187_000_000);
-        progress.image_completed(&result);
-        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(
-            output.contains("synced"),
-            "should print synced, got: {output}"
-        );
-        assert!(
-            output.contains("187.0 MB"),
-            "should contain formatted bytes"
-        );
-    }
-
-    #[test]
-    fn verbosity_1_prints_skipped() {
-        let (progress, stderr, _stdout) = test_progress(1);
+    fn image_line_skipped_v1_includes_reason() {
         let result = make_result(
             ImageStatus::Skipped {
                 reason: SkipReason::DigestMatch,
             },
             0,
         );
-        progress.image_completed(&result);
-        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(
-            output.contains("skipped"),
-            "should print skipped, got: {output}"
-        );
-        assert!(
-            output.contains("digest match"),
-            "should contain skip reason"
-        );
+        let line = format_image_line(&result, 1).expect("skipped at v1 should produce a line");
+        assert!(line.starts_with("skipped "), "got: {line}");
+        assert!(line.contains("digest match"), "got: {line}");
     }
 
     #[test]
-    fn verbosity_1_prints_skip_existing() {
-        let (progress, stderr, _stdout) = test_progress(1);
+    fn image_line_skip_existing_reason() {
         let result = make_result(
             ImageStatus::Skipped {
                 reason: SkipReason::SkipExisting,
             },
             0,
         );
-        progress.image_completed(&result);
-        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(output.contains("skipped"), "should print skipped");
-        assert!(
-            output.contains("skip existing"),
-            "should contain skip existing reason"
+        let line = format_image_line(&result, 1).unwrap();
+        assert!(line.contains("skip existing"), "got: {line}");
+    }
+
+    #[test]
+    fn image_line_immutable_tag_reason() {
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::ImmutableTag,
+            },
+            0,
+        );
+        let line = format_image_line(&result, 1).unwrap();
+        assert!(line.starts_with("skipped "), "got: {line}");
+        assert!(line.contains("immutable tag"), "got: {line}");
+    }
+
+    #[test]
+    fn image_line_exact_format_synced() {
+        let result = make_result(ImageStatus::Synced, 432_000_000);
+        let line = format_image_line(&result, 1).unwrap();
+        assert_eq!(
+            line,
+            "synced  source/repo:v1 -> target/repo:v1  (432.0 MB, 14s)"
         );
     }
 
-    // -- run_completed tests --
+    #[test]
+    fn image_line_exact_format_failed() {
+        let result = make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::BlobTransfer,
+                error: "network error".into(),
+                retries: 2,
+            },
+            0,
+        );
+        let line = format_image_line(&result, 0).unwrap();
+        assert_eq!(
+            line,
+            "FAILED  source/repo:v1 -> target/repo:v1  (blob transfer: network error)"
+        );
+    }
 
     #[test]
-    fn run_completed_prints_summary() {
-        let (progress, _stderr, stdout) = test_progress(0);
+    fn image_line_exact_format_skipped() {
+        let result = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            },
+            0,
+        );
+        let line = format_image_line(&result, 1).unwrap();
+        assert_eq!(
+            line,
+            "skipped source/repo:v1 -> target/repo:v1  (digest match)"
+        );
+    }
+
+    // -- write_run_summary tests --
+
+    #[test]
+    fn summary_exact_format() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 3,
+                images_skipped: 47,
+                images_failed: 1,
+                blobs_transferred: 12,
+                blobs_skipped: 5,
+                blobs_mounted: 34,
+                bytes_transferred: 432_000_000,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(47),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert_eq!(
+            output,
+            "sync complete: 3 synced, 47 skipped, 1 failed | blobs: 12 transferred, 5 skipped, 34 mounted | 432.0 MB in 47s\n"
+        );
+    }
+
+    #[test]
+    fn summary_with_discovery_stats() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 3,
+                images_skipped: 47,
+                images_failed: 0,
+                blobs_transferred: 12,
+                blobs_skipped: 5,
+                blobs_mounted: 34,
+                bytes_transferred: 432_000_000,
+                discovery_cache_hits: 40,
+                discovery_cache_misses: 10,
+                discovery_head_failures: 2,
+                discovery_target_stale: 1,
+            },
+            duration: Duration::from_secs(47),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert_eq!(
+            output,
+            "sync complete: 3 synced, 47 skipped, 0 failed | blobs: 12 transferred, 5 skipped, 34 mounted | 432.0 MB in 47s | discovery: 40 cached, 10 pulled\n"
+        );
+    }
+
+    #[test]
+    fn summary_omits_discovery_when_zero() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
         let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
-        progress.run_completed(&report);
-        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(!output.contains("discovery"), "got: {output}");
+    }
+
+    #[test]
+    fn summary_with_only_cache_hits_includes_discovery() {
+        // Distinguishes the `||` from `&&` in the discovery condition:
+        // even when misses == 0, hits > 0 should show the discovery suffix.
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 1,
+                discovery_cache_hits: 5,
+                discovery_cache_misses: 0,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(1),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
         assert!(
-            output.contains("sync complete:"),
-            "should print summary, got: {output}"
-        );
-        assert!(output.contains("3 synced"), "should contain synced count");
-        assert!(
-            output.contains("47 skipped"),
-            "should contain skipped count"
-        );
-        assert!(output.contains("1 failed"), "should contain failed count");
-        assert!(
-            output.contains("12 transferred"),
-            "should contain blobs transferred count"
-        );
-        assert!(
-            output.contains("0 skipped, 34 mounted"),
-            "should contain blobs_skipped and blobs_mounted in order"
-        );
-        assert!(
-            output.contains("432.0 MB"),
-            "should contain formatted bytes"
+            output.contains("discovery: 5 cached, 0 pulled"),
+            "got: {output}"
         );
     }
 
     #[test]
-    fn run_completed_empty_report_no_output() {
-        let (progress, _stderr, stdout) = test_progress(0);
+    fn summary_with_only_cache_misses_includes_discovery() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 1,
+                discovery_cache_hits: 0,
+                discovery_cache_misses: 3,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(1),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            output.contains("discovery: 0 cached, 3 pulled"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn summary_suppressed_produces_no_output() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        write_run_summary(&stdout, &report, true);
+        assert!(buf.borrow().is_empty());
+    }
+
+    #[test]
+    fn summary_empty_report_produces_no_output() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
         let report = SyncReport {
             run_id: Uuid::now_v7(),
             images: vec![],
             stats: SyncStats::default(),
             duration: Duration::ZERO,
         };
-        progress.run_completed(&report);
-        let output = stdout.borrow();
-        assert!(output.is_empty(), "empty report should produce no summary");
+        write_run_summary(&stdout, &report, false);
+        assert!(buf.borrow().is_empty());
+    }
+
+    // -- TextProgress tests (wiring: writes to correct streams) --
+
+    fn test_text_progress(verbosity: u8) -> (TextProgress, Buf, Buf) {
+        test_text_progress_with_suppress(verbosity, false)
+    }
+
+    fn test_text_progress_with_suppress(
+        verbosity: u8,
+        suppress_summary: bool,
+    ) -> (TextProgress, Buf, Buf) {
+        let stderr_buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
+        let progress = TextProgress::with_writers(
+            verbosity,
+            suppress_summary,
+            Box::new(RcWriter(Rc::clone(&stderr_buf))),
+            Box::new(RcWriter(Rc::clone(&stdout_buf))),
+        );
+        (progress, stderr_buf, stdout_buf)
     }
 
     #[test]
-    fn stream_separation_failed_stderr_summary_stdout() {
-        let (progress, stderr, stdout) = test_progress(0);
+    fn text_image_started_is_noop() {
+        let (progress, stderr, stdout) = test_text_progress(1);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        assert!(
+            stderr.borrow().is_empty(),
+            "image_started should not write to stderr"
+        );
+        assert!(
+            stdout.borrow().is_empty(),
+            "image_started should not write to stdout"
+        );
+    }
+
+    #[test]
+    fn text_image_completed_writes_to_stderr() {
+        let (progress, stderr, stdout) = test_text_progress(1);
+        let result = make_result(ImageStatus::Synced, 187_000_000);
+        progress.image_completed(&result);
+        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert!(output.starts_with("synced  "), "got: {output}");
+        assert!(
+            stdout.borrow().is_empty(),
+            "per-image output must NOT go to stdout"
+        );
+    }
+
+    #[test]
+    fn text_image_completed_silent_at_v0() {
+        let (progress, stderr, stdout) = test_text_progress(0);
+        let result = make_result(ImageStatus::Synced, 187_000_000);
+        progress.image_completed(&result);
+        assert!(stderr.borrow().is_empty());
+        assert!(stdout.borrow().is_empty());
+    }
+
+    #[test]
+    fn text_failed_always_writes_to_stderr() {
+        let (progress, stderr, stdout) = test_text_progress(0);
+        let result = make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::ManifestPush,
+                error: "timeout".into(),
+                retries: 2,
+            },
+            0,
+        );
+        progress.image_completed(&result);
+        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
+        assert!(output.starts_with("FAILED  "), "got: {output}");
+        assert!(
+            stdout.borrow().is_empty(),
+            "per-image output must NOT go to stdout"
+        );
+    }
+
+    #[test]
+    fn text_stream_separation() {
+        let (progress, stderr, stdout) = test_text_progress(0);
         let failed = make_result(
             ImageStatus::Failed {
                 kind: ErrorKind::ManifestPull,
@@ -397,10 +694,11 @@ mod tests {
         let stderr_text = String::from_utf8(stderr.borrow().clone()).unwrap();
         let stdout_text = String::from_utf8(stdout.borrow().clone()).unwrap();
 
+        // Per-image output on stderr, summary on stdout, never crossed.
         assert!(stderr_text.contains("FAILED"), "FAILED should be on stderr");
         assert!(
             !stdout_text.contains("FAILED"),
-            "FAILED should NOT be on stdout"
+            "FAILED must NOT be on stdout"
         );
         assert!(
             stdout_text.contains("sync complete:"),
@@ -408,13 +706,13 @@ mod tests {
         );
         assert!(
             !stderr_text.contains("sync complete:"),
-            "summary should NOT be on stderr"
+            "summary must NOT be on stderr"
         );
     }
 
     #[test]
-    fn multiple_images_mixed_status() {
-        let (progress, stderr, _stdout) = test_progress(1);
+    fn text_multiple_images_mixed_status() {
+        let (progress, stderr, _stdout) = test_text_progress(1);
 
         progress.image_completed(&make_result(ImageStatus::Synced, 100_000_000));
         progress.image_completed(&make_result(ImageStatus::Synced, 200_000_000));
@@ -435,115 +733,23 @@ mod tests {
 
         let output = String::from_utf8(stderr.borrow().clone()).unwrap();
         let lines: Vec<&str> = output.lines().collect();
-        let synced_lines = lines.iter().filter(|l| l.starts_with("synced  ")).count();
-        let skipped_lines = lines.iter().filter(|l| l.starts_with("skipped ")).count();
-        let failed_lines = lines.iter().filter(|l| l.starts_with("FAILED  ")).count();
-        assert_eq!(synced_lines, 2, "should have 2 synced lines");
-        assert_eq!(skipped_lines, 1, "should have 1 skipped line");
-        assert_eq!(failed_lines, 1, "should have 1 FAILED line");
-    }
-
-    #[test]
-    fn verbosity_1_prints_immutable_tag_skip() {
-        let (progress, stderr, _stdout) = test_progress(1);
-        let result = make_result(
-            ImageStatus::Skipped {
-                reason: SkipReason::ImmutableTag,
-            },
-            0,
-        );
-        progress.image_completed(&result);
-        let output = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(output.starts_with("skipped "), "should print skipped");
-        assert!(
-            output.contains("immutable tag"),
-            "should contain immutable tag reason"
-        );
-    }
-
-    #[test]
-    fn run_completed_exact_format() {
-        let (progress, _stderr, stdout) = test_progress(0);
-        let report = SyncReport {
-            run_id: Uuid::now_v7(),
-            images: vec![make_result(ImageStatus::Synced, 1024)],
-            stats: SyncStats {
-                images_synced: 3,
-                images_skipped: 47,
-                images_failed: 1,
-                blobs_transferred: 12,
-                blobs_skipped: 5,
-                blobs_mounted: 34,
-                bytes_transferred: 432_000_000,
-                ..SyncStats::default()
-            },
-            duration: Duration::from_secs(47),
-        };
-        progress.run_completed(&report);
-        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
         assert_eq!(
-            output,
-            "sync complete: 3 synced, 47 skipped, 1 failed | blobs: 12 transferred, 5 skipped, 34 mounted | 432.0 MB in 47s\n"
+            lines.iter().filter(|l| l.starts_with("synced  ")).count(),
+            2
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("skipped ")).count(),
+            1
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("FAILED  ")).count(),
+            1
         );
     }
 
     #[test]
-    fn run_completed_with_discovery_stats() {
-        let (progress, _stderr, stdout) = test_progress(0);
-        let report = SyncReport {
-            run_id: Uuid::now_v7(),
-            images: vec![make_result(ImageStatus::Synced, 1024)],
-            stats: SyncStats {
-                images_synced: 3,
-                images_skipped: 47,
-                images_failed: 0,
-                blobs_transferred: 12,
-                blobs_skipped: 5,
-                blobs_mounted: 34,
-                bytes_transferred: 432_000_000,
-                discovery_cache_hits: 40,
-                discovery_cache_misses: 10,
-                discovery_head_failures: 2,
-                discovery_target_stale: 1,
-            },
-            duration: Duration::from_secs(47),
-        };
-        progress.run_completed(&report);
-        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
-        assert!(
-            output.contains("| discovery: 40 cached, 10 pulled"),
-            "should include discovery stats, got: {output}"
-        );
-    }
-
-    #[test]
-    fn run_completed_omits_discovery_when_zero() {
-        let (progress, _stderr, stdout) = test_progress(0);
-        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
-        progress.run_completed(&report);
-        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
-        assert!(
-            !output.contains("discovery"),
-            "should omit discovery stats when zero, got: {output}"
-        );
-    }
-
-    // -- suppress_summary tests --
-
-    #[test]
-    fn run_completed_suppressed_when_flag_set() {
-        let (progress, _stderr, stdout) = test_progress_with_suppress(0, true);
-        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
-        progress.run_completed(&report);
-        assert!(
-            stdout.borrow().is_empty(),
-            "suppress_summary should suppress summary on stdout"
-        );
-    }
-
-    #[test]
-    fn suppress_summary_still_prints_failures_to_stderr() {
-        let (progress, stderr, stdout) = test_progress_with_suppress(0, true);
+    fn text_suppress_summary_still_prints_failures() {
+        let (progress, stderr, stdout) = test_text_progress_with_suppress(0, true);
         let result = make_result(
             ImageStatus::Failed {
                 kind: ErrorKind::ManifestPush,
@@ -553,14 +759,164 @@ mod tests {
             0,
         );
         progress.image_completed(&result);
-        let stderr_text = String::from_utf8(stderr.borrow().clone()).unwrap();
+
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+
         assert!(
-            stderr_text.contains("FAILED"),
-            "suppress_summary should still print failures to stderr"
+            !stderr.borrow().is_empty(),
+            "failures should still go to stderr"
         );
         assert!(
             stdout.borrow().is_empty(),
-            "suppress_summary should not write to stdout on image_completed"
+            "suppress_summary should suppress stdout"
         );
     }
+
+    // -- TtyProgress tests (wiring: spinner lifecycle and summary output) --
+
+    fn test_tty_progress(verbosity: u8) -> (TtyProgress, Buf) {
+        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
+        let progress =
+            TtyProgress::with_writers(verbosity, false, Box::new(RcWriter(Rc::clone(&stdout_buf))));
+        (progress, stdout_buf)
+    }
+
+    #[test]
+    fn tty_started_creates_entry() {
+        let (progress, _stdout) = test_tty_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        assert_eq!(progress.spinners.borrow().len(), 1);
+    }
+
+    #[test]
+    fn tty_started_multiple_creates_multiple() {
+        let (progress, _stdout) = test_tty_progress(0);
+        progress.image_started("source/a:v1", "target/a:v1");
+        progress.image_started("source/b:v1", "target/b:v1");
+        assert_eq!(progress.spinners.borrow().len(), 2);
+    }
+
+    #[test]
+    fn tty_completed_removes_entry() {
+        let (progress, _stdout) = test_tty_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
+        assert!(progress.spinners.borrow().is_empty());
+    }
+
+    #[test]
+    fn tty_completed_failed_removes_entry() {
+        let (progress, _stdout) = test_tty_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        progress.image_completed(&make_result(
+            ImageStatus::Failed {
+                kind: ErrorKind::ManifestPush,
+                error: "timeout".into(),
+                retries: 2,
+            },
+            0,
+        ));
+        assert!(progress.spinners.borrow().is_empty());
+    }
+
+    #[test]
+    fn tty_completed_without_started_does_not_panic() {
+        let (progress, _stdout) = test_tty_progress(0);
+        // No image_started — should warn and return, not panic.
+        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
+        assert!(progress.spinners.borrow().is_empty());
+    }
+
+    #[test]
+    fn tty_multiple_images_all_cleaned_up() {
+        let (progress, _stdout) = test_tty_progress(1);
+        progress.image_started("source/a:v1", "target/a:v1");
+        progress.image_started("source/b:v1", "target/b:v1");
+
+        let mut r1 = make_result(ImageStatus::Synced, 1024);
+        r1.source = "source/a:v1".into();
+        r1.target = "target/a:v1".into();
+        progress.image_completed(&r1);
+
+        let mut r2 = make_result(
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch,
+            },
+            0,
+        );
+        r2.source = "source/b:v1".into();
+        r2.target = "target/b:v1".into();
+        progress.image_completed(&r2);
+
+        assert!(progress.spinners.borrow().is_empty());
+    }
+
+    #[test]
+    fn tty_run_completed_writes_summary_to_stdout() {
+        let (progress, stdout) = test_tty_progress(0);
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
+        assert!(
+            output.starts_with("sync complete:"),
+            "summary should go to stdout, got: {output}"
+        );
+    }
+
+    #[test]
+    fn tty_suppress_summary_produces_no_stdout() {
+        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
+        let progress =
+            TtyProgress::with_writers(0, true, Box::new(RcWriter(Rc::clone(&stdout_buf))));
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        assert!(
+            stdout_buf.borrow().is_empty(),
+            "suppress_summary should suppress stdout"
+        );
+    }
+
+    #[test]
+    fn tty_suppress_summary_still_runs_spinners() {
+        // Spinner lifecycle must work even when summary is suppressed
+        // (e.g., --json mode). Spinners go to stderr, summary to stdout —
+        // suppressing stdout must not interfere with spinner create/remove.
+        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
+        let progress =
+            TtyProgress::with_writers(0, true, Box::new(RcWriter(Rc::clone(&stdout_buf))));
+
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        assert_eq!(progress.spinners.borrow().len(), 1);
+
+        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
+        assert!(progress.spinners.borrow().is_empty());
+
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        assert!(
+            stdout_buf.borrow().is_empty(),
+            "suppress_summary should suppress stdout"
+        );
+    }
+
+    #[test]
+    fn tty_started_same_image_twice_overwrites() {
+        // If image_started is called twice for the same (source, target),
+        // the second spinner replaces the first. The map should still have
+        // exactly one entry, and image_completed should clean it up.
+        let (progress, _stdout) = test_tty_progress(0);
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        progress.image_started("source/repo:v1", "target/repo:v1");
+        assert_eq!(progress.spinners.borrow().len(), 1);
+
+        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
+        assert!(progress.spinners.borrow().is_empty());
+    }
+
+    // Note: spinner message content (the transient "syncing ..." text shown
+    // during in-flight transfers) cannot be asserted because indicatif's
+    // ProgressDrawTarget::hidden() swallows all rendering. The final message
+    // on completion uses format_image_line(), which IS thoroughly tested above.
+    // Only the cosmetic in-flight prefix is untested.
 }

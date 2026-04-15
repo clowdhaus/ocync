@@ -459,12 +459,12 @@ impl SyncEngine {
                     };
 
                     let staging_ref = Rc::clone(&staging);
-                    let source_display = format!("{} -> {}", item.source, item.target_name);
-                    let target_display = item.target.to_string();
+                    let source_str = item.source.to_string();
+                    let target_str = item.target.to_string();
 
                     execution_futures.push(Box::pin(async move {
                         let _permit = sem.acquire().await.unwrap();
-                        progress.image_started(&source_display, &target_display);
+                        progress.image_started(&source_str, &target_str);
                         execute_item(item, &cache_ref, &staging_ref, &freq_counts, &retry).await
                     }));
                 }
