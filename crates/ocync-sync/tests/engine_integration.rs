@@ -6429,7 +6429,7 @@ async fn discovery_head_timeout_falls_through() {
 }
 
 /// Bridge test: cache has a valid entry but source HEAD returns 500. The engine
-/// must NOT use the cached filtered_digest — it must fall through to the full
+/// must NOT use the cached `filtered_digest` — it must fall through to the full
 /// pull path because the HEAD failure prevents cache validation.
 #[tokio::test]
 async fn discovery_head_failure_ignores_valid_cache() {
@@ -6873,7 +6873,7 @@ async fn discovery_skip_existing_with_cache_miss() {
 }
 
 /// Multi-target fan-out with cache: source HEAD matches cache, Target A matches
-/// `filtered_digest` (DigestMatch skip), Target B returns 404 (stale). The engine
+/// `filtered_digest` (`DigestMatch` skip), Target B returns 404 (stale). The engine
 /// must do a full source pull for Target B only. Discovery path is `TargetStale`.
 #[tokio::test]
 async fn discovery_mixed_fanout_one_match_one_stale() {
@@ -7000,7 +7000,7 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
 
 /// Retag: source tag `v1.0` mapped to target tag `latest`. Cache is keyed on
 /// source tag. Source HEAD uses `v1.0`, target HEAD uses `latest`. With cache
-/// pre-populated, the engine should take the CacheHit path and skip.
+/// pre-populated, the engine should take the `CacheHit` path and skip.
 #[tokio::test]
 async fn discovery_retag_uses_correct_tags() {
     let source_server = MockServer::start().await;

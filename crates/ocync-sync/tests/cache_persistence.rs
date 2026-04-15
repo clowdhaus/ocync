@@ -414,7 +414,7 @@ fn platform_filter_key_different_sets_differ() {
     let a: PlatformFilter = "linux/amd64".parse().unwrap();
     let b: PlatformFilter = "linux/arm64".parse().unwrap();
     assert_ne!(
-        platform_filter_key(Some(&[a.clone()])),
+        platform_filter_key(Some(std::slice::from_ref(&a))),
         platform_filter_key(Some(&[a, b])),
     );
 }
