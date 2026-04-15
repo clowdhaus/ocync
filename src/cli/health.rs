@@ -170,6 +170,19 @@ mod tests {
         assert!(resp.ends_with("not found\n"));
     }
 
+    #[test]
+    fn healthz_200_while_readyz_503() {
+        // Core invariant: liveness is always 200 even when readiness is 503.
+        let state = HealthState::new(Duration::from_secs(60));
+        let liveness = handle_request("/healthz", &state);
+        let readiness = handle_request("/readyz", &state);
+        assert!(liveness.contains("200 OK"), "liveness: {liveness}");
+        assert!(
+            readiness.contains("503 Service Unavailable"),
+            "readiness: {readiness}"
+        );
+    }
+
     // -- state logic unit tests --
 
     #[test]
