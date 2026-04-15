@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{
-    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryName, ResolvedMapping, SyncEngine, TagPair,
+    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedMapping, SyncEngine, TagPair,
     TargetEntry,
 };
 use ocync_sync::retry::RetryConfig;
@@ -41,7 +41,7 @@ pub(crate) async fn run(
         source_repo: args.source.repository().into(),
         target_repo: args.destination.repository().into(),
         targets: vec![TargetEntry {
-            name: RegistryName::new(bare_hostname(args.destination.registry())),
+            name: RegistryAlias::new(bare_hostname(args.destination.registry())),
             client: target_client,
             batch_checker: None,
         }],

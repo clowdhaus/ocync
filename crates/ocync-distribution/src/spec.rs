@@ -1,6 +1,6 @@
 //! OCI image spec types — manifests, descriptors, and platforms.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -133,7 +133,7 @@ pub struct Descriptor {
 
     /// Arbitrary metadata as key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<BTreeMap<String, String>>,
+    pub annotations: Option<HashMap<String, String>>,
 }
 
 /// OCI platform specification.
@@ -326,12 +326,6 @@ impl std::ops::Deref for RegistryAuthority {
     }
 }
 
-impl fmt::Display for RegistryAuthority {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// OCI image manifest (single-platform).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -355,7 +349,7 @@ pub struct ImageManifest {
 
     /// Arbitrary metadata as key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<BTreeMap<String, String>>,
+    pub annotations: Option<HashMap<String, String>>,
 }
 
 /// OCI image index (multi-platform manifest list).
@@ -379,7 +373,7 @@ pub struct ImageIndex {
 
     /// Arbitrary metadata as key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<BTreeMap<String, String>>,
+    pub annotations: Option<HashMap<String, String>>,
 }
 
 /// A parsed manifest — either a single image or a multi-platform index.

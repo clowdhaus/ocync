@@ -51,11 +51,11 @@ struct CacheHeader {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SnapshotKey {
     /// Registry authority (e.g. `cgr.dev:443`).
-    pub authority: RegistryAuthority,
+    authority: RegistryAuthority,
     /// Repository path (e.g. `chainguard/nginx`).
-    pub repo: RepositoryName,
+    repo: RepositoryName,
     /// Tag name (e.g. `latest`).
-    pub tag: String,
+    tag: String,
 }
 
 impl SnapshotKey {
@@ -94,19 +94,6 @@ impl PlatformFilterKey {
     }
 }
 
-impl std::ops::Deref for PlatformFilterKey {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for PlatformFilterKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// Cached source manifest state for the tag digest cache.
 ///
 /// Records what was observed at the source (HEAD digest) and what was
@@ -116,7 +103,7 @@ impl std::fmt::Display for PlatformFilterKey {
 pub struct SourceSnapshot {
     /// Source manifest digest as returned by HEAD (unfiltered for multi-arch).
     pub source_digest: Digest,
-    /// Digest of the filtered manifest intended for targets.
+    /// Digest of the manifest intended for targets (after platform filtering).
     pub filtered_digest: Digest,
     /// Platform filter active when this entry was written.
     pub platform_filter_key: PlatformFilterKey,
@@ -511,5 +498,28 @@ mod tests {
             Some(&BlobStatus::ExistsAtTarget)
         );
         assert_eq!(filtered.status("reg.io", &digest2()), None);
+    }
+
+    #[test]
+    fn prune_snapshots_with_empty_live_keys_clears_all() {
+        let mut cache = TransferStateCache::new();
+        cache.set_source_snapshot(
+            SnapshotKey::new(&RegistryAuthority::new("src.io:443"), &repo("r"), "v1"),
+            SourceSnapshot {
+                source_digest: digest(),
+                filtered_digest: digest2(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
+            },
+        );
+        cache.prune_snapshots(&HashSet::new());
+        assert!(
+            cache
+                .source_snapshot(&SnapshotKey::new(
+                    &RegistryAuthority::new("src.io:443"),
+                    &repo("r"),
+                    "v1"
+                ))
+                .is_none()
+        );
     }
 }

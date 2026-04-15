@@ -1,8 +1,5 @@
 # Transfer Optimization Design
 
-Date: 2026-04-12
-Status: Proposed
-
 ---
 
 ## Summary

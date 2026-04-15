@@ -118,9 +118,17 @@ impl ProgressReporter for TextProgress {
             return;
         }
         let s = &report.stats;
+        let discovery = if s.discovery_cache_hits > 0 || s.discovery_cache_misses > 0 {
+            format!(
+                " | discovery: {} cached, {} pulled",
+                s.discovery_cache_hits, s.discovery_cache_misses,
+            )
+        } else {
+            String::new()
+        };
         if let Err(e) = writeln!(
             self.stdout.borrow_mut(),
-            "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {}",
+            "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {}{}",
             s.images_synced,
             s.images_skipped,
             s.images_failed,
@@ -129,6 +137,7 @@ impl ProgressReporter for TextProgress {
             s.blobs_mounted,
             format_bytes(s.bytes_transferred),
             format_duration(report.duration),
+            discovery,
         ) {
             tracing::warn!(error = %e, "failed to write progress summary to stdout");
         }
@@ -475,6 +484,47 @@ mod tests {
         assert_eq!(
             output,
             "sync complete: 3 synced, 47 skipped, 1 failed | blobs: 12 transferred, 5 skipped, 34 mounted | 432.0 MB in 47s\n"
+        );
+    }
+
+    #[test]
+    fn run_completed_with_discovery_stats() {
+        let (progress, _stderr, stdout) = test_progress(0);
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 3,
+                images_skipped: 47,
+                images_failed: 0,
+                blobs_transferred: 12,
+                blobs_skipped: 5,
+                blobs_mounted: 34,
+                bytes_transferred: 432_000_000,
+                discovery_cache_hits: 40,
+                discovery_cache_misses: 10,
+                discovery_head_failures: 2,
+                discovery_target_stale: 1,
+            },
+            duration: Duration::from_secs(47),
+        };
+        progress.run_completed(&report);
+        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
+        assert!(
+            output.contains("| discovery: 40 cached, 10 pulled"),
+            "should include discovery stats, got: {output}"
+        );
+    }
+
+    #[test]
+    fn run_completed_omits_discovery_when_zero() {
+        let (progress, _stderr, stdout) = test_progress(0);
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        progress.run_completed(&report);
+        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
+        assert!(
+            !output.contains("discovery"),
+            "should omit discovery stats when zero, got: {output}"
         );
     }
 

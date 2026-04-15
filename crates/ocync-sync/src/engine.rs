@@ -78,23 +78,23 @@ impl fmt::Display for ImageRef {
 /// ad-hoc commands. Must be unique per mapping -- it is used as the outer
 /// key in the blob dedup map.
 #[derive(Debug, Clone)]
-pub struct RegistryName(String);
+pub struct RegistryAlias(String);
 
-impl RegistryName {
-    /// Create a new registry name.
+impl RegistryAlias {
+    /// Create a new registry alias.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
 }
 
-impl std::ops::Deref for RegistryName {
+impl std::ops::Deref for RegistryAlias {
     type Target = str;
     fn deref(&self) -> &str {
         &self.0
     }
 }
 
-impl fmt::Display for RegistryName {
+impl fmt::Display for RegistryAlias {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -144,7 +144,7 @@ pub struct TargetEntry {
     ///
     /// Must be unique per mapping. Typically the config-defined registry name
     /// (e.g. `us-ecr`) or the bare hostname for ad-hoc commands.
-    pub name: RegistryName,
+    pub name: RegistryAlias,
     /// Client for this target registry.
     pub client: Arc<RegistryClient>,
     /// Optional batch blob checker for this target (ECR batch API).
@@ -215,6 +215,19 @@ fn collect_image_blobs(manifest: &ImageManifest) -> Vec<&Descriptor> {
     blobs
 }
 
+/// Build an `ImageResult` for a skipped image (zero transfer, zero duration).
+fn skip_image_result(source: &ImageRef, target: &ImageRef, reason: SkipReason) -> ImageResult {
+    ImageResult {
+        image_id: Uuid::now_v7(),
+        source: source.to_string(),
+        target: target.to_string(),
+        status: ImageStatus::Skipped { reason },
+        bytes_transferred: 0,
+        blob_stats: BlobTransferStats::default(),
+        duration: Duration::ZERO,
+    }
+}
+
 /// Source manifest data pre-pulled once per tag.
 ///
 /// Separating the source pull from the target push ensures manifests
@@ -243,7 +256,7 @@ struct TransferTask {
     /// Source client for pulling blobs.
     source_client: Arc<RegistryClient>,
     /// Target registry name (dedup key).
-    target_name: RegistryName,
+    target_name: RegistryAlias,
     /// Target client for pushing.
     target_client: Arc<RegistryClient>,
     /// Source image reference (repo + tag, for display/logging and blob pulls).
@@ -270,11 +283,11 @@ enum DiscoveryOutcome {
     Failed(Vec<ImageResult>),
 }
 
-/// Signal from `discover_tag()` indicating which discovery path was taken.
+/// Signal from `discover_tag()` indicating which discovery route was taken.
 ///
-/// Used by the pipeline loop to accumulate per-path counters for
+/// Used by the pipeline loop to accumulate per-route counters for
 /// `SyncStats` observability without polluting `DiscoveryOutcome`.
-enum DiscoveryPath {
+enum DiscoveryRoute {
     /// Source HEAD matched cache, no full source pull needed.
     CacheHit,
     /// Full source manifest pull was required (cold cache, source changed, config changed).
@@ -283,13 +296,6 @@ enum DiscoveryPath {
     HeadFailure,
     /// Source cache matched but target HEAD mismatch forced full pull.
     TargetStale,
-}
-
-/// Wrapper returned by `discover_tag()` to carry both the outcome and the
-/// discovery cache signal.
-struct DiscoveryResult {
-    outcome: DiscoveryOutcome,
-    path: DiscoveryPath,
 }
 
 /// Blob frequency tracker for ordering blobs by popularity.
@@ -336,7 +342,7 @@ pub struct SyncEngine {
     max_concurrent: usize,
     drain_deadline: Duration,
     /// Timeout for the optimization source HEAD request. Default: 5 seconds.
-    discovery_head_timeout: Duration,
+    source_head_timeout: Duration,
 }
 
 impl SyncEngine {
@@ -349,7 +355,7 @@ impl SyncEngine {
             retry,
             max_concurrent,
             drain_deadline: Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
-            discovery_head_timeout: Duration::from_secs(5),
+            source_head_timeout: Duration::from_secs(5),
         }
     }
 
@@ -364,8 +370,8 @@ impl SyncEngine {
     ///
     /// Default: 5 seconds. If the HEAD doesn't complete within this duration,
     /// the engine falls through to the full source manifest pull.
-    pub fn with_discovery_head_timeout(mut self, timeout: Duration) -> Self {
-        self.discovery_head_timeout = timeout;
+    pub fn with_source_head_timeout(mut self, timeout: Duration) -> Self {
+        self.source_head_timeout = timeout;
         self
     }
 
@@ -428,7 +434,7 @@ impl SyncEngine {
                     platforms: mapping.platforms.clone(),
                     skip_existing: mapping.skip_existing,
                     cache: Rc::clone(&cache),
-                    discovery_head_timeout: self.discovery_head_timeout,
+                    source_head_timeout: self.source_head_timeout,
                 };
 
                 discovery_futures.push(async move { discover_tag(params).await });
@@ -493,23 +499,23 @@ impl SyncEngine {
                     );
                     break;
                 }
-                Some(result) = discovery_futures.next(),
+                Some((outcome, route)) = discovery_futures.next(),
                     if !shutting_down && !discovery_futures.is_empty() =>
                 {
-                    // Accumulate discovery path counters.
-                    match result.path {
-                        DiscoveryPath::CacheHit => discovery_hits += 1,
-                        DiscoveryPath::CacheMiss => discovery_misses += 1,
-                        DiscoveryPath::HeadFailure => {
+                    // Accumulate discovery route counters.
+                    match route {
+                        DiscoveryRoute::CacheHit => discovery_hits += 1,
+                        DiscoveryRoute::CacheMiss => discovery_misses += 1,
+                        DiscoveryRoute::HeadFailure => {
                             discovery_misses += 1;
                             discovery_head_failures += 1;
                         }
-                        DiscoveryPath::TargetStale => {
+                        DiscoveryRoute::TargetStale => {
                             discovery_misses += 1;
                             discovery_target_stale += 1;
                         }
                     }
-                    match result.outcome {
+                    match outcome {
                         DiscoveryOutcome::Skip(skip_results) => {
                             for r in &skip_results {
                                 progress.image_completed(r);
@@ -592,13 +598,14 @@ struct DiscoveryParams {
     /// When `true`, skip syncing when the target already has any manifest.
     skip_existing: bool,
     cache: Rc<RefCell<TransferStateCache>>,
-    discovery_head_timeout: Duration,
+    source_head_timeout: Duration,
 }
 
 /// Discover a single (mapping, tag) pair: HEAD source, check cache, pull if needed.
 ///
-/// Returns a `DiscoveryResult` carrying both the transfer outcome and a signal
-/// for which discovery path was taken (cache hit, miss, head failure, or stale).
+/// Returns `(DiscoveryOutcome, DiscoveryRoute)` — the transfer outcome and a
+/// signal for which discovery path was taken (cache hit, miss, head failure, or
+/// stale).
 ///
 /// The optimization flow:
 /// 1. HEAD source manifest with a short timeout
@@ -614,7 +621,7 @@ struct DiscoveryParams {
 ///
 /// When `skip_existing` is `true`, targets that return any manifest HEAD response
 /// (regardless of digest) are skipped without further comparison.
-async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
+async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRoute) {
     let DiscoveryParams {
         source_client,
         source_authority,
@@ -625,14 +632,14 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
         platforms,
         skip_existing,
         cache,
-        discovery_head_timeout,
+        source_head_timeout,
     } = params;
 
     let platform_key = PlatformFilterKey::from_filters(platforms.as_deref());
 
     // --- Step 1: HEAD source manifest with short timeout ---
     let source_head_digest = match tokio::time::timeout(
-        discovery_head_timeout,
+        source_head_timeout,
         source_client.manifest_head(&source.repo, &source.tag),
     )
     .await
@@ -707,17 +714,11 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
                                 "skipping -- target manifest exists (skip_existing)"
                             );
                             tracing::debug!(target: "ocync::metrics", "skip_existing");
-                            skipped_results.push(ImageResult {
-                                image_id: Uuid::now_v7(),
-                                source: source.to_string(),
-                                target: target.to_string(),
-                                status: ImageStatus::Skipped {
-                                    reason: SkipReason::SkipExisting,
-                                },
-                                bytes_transferred: 0,
-                                blob_stats: BlobTransferStats::default(),
-                                duration: Duration::ZERO,
-                            });
+                            skipped_results.push(skip_image_result(
+                                &source,
+                                &target,
+                                SkipReason::SkipExisting,
+                            ));
                         }
                         Ok(Some(head)) if head.digest == compare_digest => {
                             info!(
@@ -728,17 +729,11 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
                                 "skipping -- digest matches at target (cache hit)"
                             );
                             tracing::debug!(target: "ocync::metrics", "unchanged_skip");
-                            skipped_results.push(ImageResult {
-                                image_id: Uuid::now_v7(),
-                                source: source.to_string(),
-                                target: target.to_string(),
-                                status: ImageStatus::Skipped {
-                                    reason: SkipReason::DigestMatch,
-                                },
-                                bytes_transferred: 0,
-                                blob_stats: BlobTransferStats::default(),
-                                duration: Duration::ZERO,
-                            });
+                            skipped_results.push(skip_image_result(
+                                &source,
+                                &target,
+                                SkipReason::DigestMatch,
+                            ));
                         }
                         other => {
                             if let Err(e) = &other {
@@ -760,10 +755,10 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
 
                 if mismatched_targets.is_empty() {
                     // All targets match -- skip entirely (preserve existing cache entry).
-                    return DiscoveryResult {
-                        outcome: DiscoveryOutcome::Skip(skipped_results),
-                        path: DiscoveryPath::CacheHit,
-                    };
+                    return (
+                        DiscoveryOutcome::Skip(skipped_results),
+                        DiscoveryRoute::CacheHit,
+                    );
                 }
 
                 // Some targets stale -- need full pull for those targets.
@@ -783,10 +778,7 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
                 })
                 .await;
 
-                return DiscoveryResult {
-                    outcome,
-                    path: DiscoveryPath::TargetStale,
-                };
+                return (outcome, DiscoveryRoute::TargetStale);
             }
             // Cache entry exists but source changed or config changed -- fall through.
         }
@@ -794,10 +786,10 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
     }
 
     // --- Full pull path (cache miss, HEAD failed, or source changed) ---
-    let path = if source_head_digest.is_none() {
-        DiscoveryPath::HeadFailure
+    let route = if source_head_digest.is_none() {
+        DiscoveryRoute::HeadFailure
     } else {
-        DiscoveryPath::CacheMiss
+        DiscoveryRoute::CacheMiss
     };
 
     let outcome = full_pull_and_build_tasks(FullPullParams {
@@ -816,7 +808,7 @@ async fn discover_tag(params: DiscoveryParams) -> DiscoveryResult {
     })
     .await;
 
-    DiscoveryResult { outcome, path }
+    (outcome, route)
 }
 
 /// Parameters for [`full_pull_and_build_tasks`], bundled to keep the argument
@@ -935,17 +927,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                     "skipping -- target manifest exists (skip_existing)"
                 );
                 tracing::debug!(target: "ocync::metrics", "skip_existing");
-                skipped_results.push(ImageResult {
-                    image_id: Uuid::now_v7(),
-                    source: source.to_string(),
-                    target: target.to_string(),
-                    status: ImageStatus::Skipped {
-                        reason: SkipReason::SkipExisting,
-                    },
-                    bytes_transferred: 0,
-                    blob_stats: BlobTransferStats::default(),
-                    duration: Duration::ZERO,
-                });
+                skipped_results.push(skip_image_result(source, target, SkipReason::SkipExisting));
             }
             Ok(Some(head)) if head.digest == *source_digest => {
                 info!(
@@ -956,17 +938,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                     "skipping -- digest matches at target"
                 );
                 tracing::debug!(target: "ocync::metrics", "unchanged_skip");
-                skipped_results.push(ImageResult {
-                    image_id: Uuid::now_v7(),
-                    source: source.to_string(),
-                    target: target.to_string(),
-                    status: ImageStatus::Skipped {
-                        reason: SkipReason::DigestMatch,
-                    },
-                    bytes_transferred: 0,
-                    blob_stats: BlobTransferStats::default(),
-                    duration: Duration::ZERO,
-                });
+                skipped_results.push(skip_image_result(source, target, SkipReason::DigestMatch));
             }
             other => {
                 if let Err(e) = &other {
@@ -1278,7 +1250,7 @@ struct TransferContext<'a> {
     source_client: &'a RegistryClient,
     source_repo: &'a RepositoryName,
     target_client: &'a RegistryClient,
-    target_name: &'a RegistryName,
+    target_name: &'a RegistryAlias,
     target_repo: &'a RepositoryName,
     /// Optional batch blob checker for pre-populating the cache.
     batch_checker: Option<&'a Rc<dyn BatchBlobChecker>>,

@@ -13,7 +13,7 @@ use ocync_distribution::{RegistryClient, RepositoryName};
 use ocync_sync::SyncReport;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{
-    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryName, ResolvedMapping, SyncEngine, TagPair,
+    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedMapping, SyncEngine, TagPair,
     TargetEntry,
 };
 use ocync_sync::filter::FilterConfig;
@@ -28,7 +28,40 @@ use crate::cli::config::{
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
 /// Default cache TTL: 12 hours.
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
+pub(crate) const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
+
+/// Default cache file name within the cache directory.
+const CACHE_FILE_NAME: &str = "transfer_state.bin";
+
+/// Resolve the cache directory and file path from config.
+///
+/// Uses `global.cache_dir` if configured, otherwise places the cache
+/// directory adjacent to the config file at `.ocync/cache/`.
+pub(crate) fn resolve_cache_path(config: &Config, config_file: &Path) -> (PathBuf, PathBuf) {
+    let cache_dir = config
+        .global
+        .as_ref()
+        .and_then(|g| g.cache_dir.as_deref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            config_file
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(".ocync/cache")
+        });
+    let cache_path = cache_dir.join(CACHE_FILE_NAME);
+    (cache_dir, cache_path)
+}
+
+/// Parse and return the cache TTL from config, defaulting to 12 hours.
+pub(crate) fn resolve_cache_ttl(config: &Config) -> Duration {
+    config
+        .global
+        .as_ref()
+        .and_then(|g| g.cache_ttl.as_deref())
+        .and_then(parse_duration)
+        .unwrap_or(DEFAULT_CACHE_TTL)
+}
 
 /// Run the sync command: load config, resolve mappings, and execute.
 ///
@@ -59,29 +92,8 @@ pub(crate) async fn run(
         return Ok(ExitCode::Success);
     }
 
-    // Resolve cache directory: explicit config > default next to config file.
-    let cache_dir = config
-        .global
-        .as_ref()
-        .and_then(|g| g.cache_dir.as_deref())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            args.config
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(".ocync/cache")
-        });
-
-    // Parse cache TTL from config (default 12h).
-    // The config validator ensures only valid duration strings reach here.
-    let cache_ttl = config
-        .global
-        .as_ref()
-        .and_then(|g| g.cache_ttl.as_deref())
-        .and_then(parse_duration)
-        .unwrap_or(DEFAULT_CACHE_TTL);
-
-    let cache_path = cache_dir.join("transfer_state.bin");
+    let (cache_dir, cache_path) = resolve_cache_path(&config, &args.config);
+    let cache_ttl = resolve_cache_ttl(&config);
     let (cache, should_persist) = match external_cache {
         Some(ext) => (ext, false),
         None => {
@@ -297,7 +309,7 @@ async fn resolve_mapping(
             })?;
             let batch_checker = batch_checkers.get(&name).cloned();
             Ok(TargetEntry {
-                name: RegistryName::new(name),
+                name: RegistryAlias::new(name),
                 client,
                 batch_checker,
             })
