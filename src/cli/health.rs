@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use http::StatusCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -41,24 +42,26 @@ impl HealthState {
     }
 }
 
-/// Format a complete HTTP/1.1 response string with a text/plain body.
-fn format_response(status: &str, body: &str) -> String {
+/// Format a complete HTTP/1.1 response with a text/plain body.
+fn format_response(status: StatusCode, body: &str) -> String {
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Unknown"),
         body.len(),
     )
 }
 
-/// Route a request path to a formatted HTTP response string.
+/// Route a request path to a formatted HTTP response based on health state.
 ///
 /// - `/healthz` — liveness: always 200 (process is running).
 /// - `/readyz`  — readiness: 200 if last sync within `2 * interval`, 503 otherwise.
 fn handle_request(path: &str, state: &HealthState) -> String {
     match path {
-        "/healthz" => format_response("200 OK", "ok\n"),
-        "/readyz" if state.is_healthy() => format_response("200 OK", "ok\n"),
-        "/readyz" => format_response("503 Service Unavailable", "sync stale\n"),
-        _ => format_response("404 Not Found", "not found\n"),
+        "/healthz" => format_response(StatusCode::OK, "ok\n"),
+        "/readyz" if state.is_healthy() => format_response(StatusCode::OK, "ok\n"),
+        "/readyz" => format_response(StatusCode::SERVICE_UNAVAILABLE, "sync stale\n"),
+        _ => format_response(StatusCode::NOT_FOUND, "not found\n"),
     }
 }
 
@@ -229,7 +232,7 @@ mod tests {
     #[test]
     fn format_response_200() {
         assert_eq!(
-            format_response("200 OK", "ok\n"),
+            format_response(StatusCode::OK, "ok\n"),
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n"
         );
     }
@@ -237,7 +240,7 @@ mod tests {
     #[test]
     fn format_response_503() {
         assert_eq!(
-            format_response("503 Service Unavailable", "sync stale\n"),
+            format_response(StatusCode::SERVICE_UNAVAILABLE, "sync stale\n"),
             "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nsync stale\n"
         );
     }
@@ -245,7 +248,7 @@ mod tests {
     #[test]
     fn format_response_404() {
         assert_eq!(
-            format_response("404 Not Found", "not found\n"),
+            format_response(StatusCode::NOT_FOUND, "not found\n"),
             "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nnot found\n"
         );
     }
