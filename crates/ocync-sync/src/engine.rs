@@ -1431,17 +1431,28 @@ async fn transfer_image_blobs(
                     tracing::debug!(target: "ocync::metrics", result = "success", "mount");
                     continue;
                 }
-                Ok(MountResult::NotMounted) | Err(_) => {
-                    // Either the server returned 202 (no mount) or the client
-                    // short-circuited because the target provider never
-                    // fulfills mount (ECR). Invalidate the stale source hint
-                    // and fall through to HEAD + push.
+                Ok(MountResult::NotFulfilled) | Err(_) => {
+                    // Server declined the mount (or errored). The cached
+                    // source hint is probably stale — invalidate so the
+                    // next sync re-evaluates. Note: this also wipes the
+                    // in-progress claim, which is acceptable here because
+                    // our own task is still holding it.
                     debug!(%digest, target = %ctx.target_name, "mount not fulfilled, falling back to HEAD+push");
                     ctx.cache
                         .borrow_mut()
                         .invalidate_blob(ctx.target_name, digest);
                     tracing::debug!(target: "ocync::metrics", result = "fallback", "mount");
                     tracing::debug!(target: "ocync::metrics", "cache_invalidation");
+                }
+                Ok(MountResult::Skipped) => {
+                    // Client short-circuited (provider never fulfills mount).
+                    // The source hint was never tested on the wire, so it's
+                    // still valid — do NOT invalidate. Preserving the entry
+                    // keeps our in-progress claim intact so concurrent tasks
+                    // transferring the same blob to a different repo at this
+                    // target wait for our push and reuse the staged data
+                    // (pull-once fan-out). See `docs/specs/findings.md`.
+                    tracing::debug!(target: "ocync::metrics", result = "skipped", "mount");
                 }
             }
         }

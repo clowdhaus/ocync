@@ -96,16 +96,24 @@ target.
   so adding a new provider forces a compile-time decision. `Ecr` returns
   `false`; all other known providers return `true`.
 - `blob_mount` short-circuits when the target hostname resolves to a
-  provider that does not fulfill mount — returns `MountResult::NotMounted`
+  provider that does not fulfill mount — returns `MountResult::Skipped`
   without issuing the POST, saving one round-trip per shared blob per
   target.
-- `MountResult` is a two-variant enum (`Mounted` / `NotMounted`). The
-  engine invalidates the cached mount source on `NotMounted` and falls
-  through to HEAD + push.
-- Protocol coverage: `tests/registry2_mount.rs` pins `Mounted` against the
-  OCI reference `registry:2` container. `engine_integration::
-  sync_warm_cache_ecr_target_short_circuits_mount` pins the engine-level
-  wire behavior (0 mount POSTs on ECR).
+- `MountResult` has three variants to express what the engine needs to
+  know:
+  - `Mounted` — registry fulfilled the mount (201).
+  - `NotFulfilled` — registry returned 202; the cached mount-source hint
+    is probably stale, engine invalidates.
+  - `Skipped` — client short-circuited without a request; the hint was
+    never tested, engine does NOT invalidate. This preserves the
+    in-progress claim so concurrent tasks transferring the same blob
+    to a different repo at this target wait for the push and reuse the
+    staged data (pull-once fan-out).
+- Protocol coverage: `tests/registry2_mount.rs` pins `Mounted` and
+  `NotFulfilled` against the OCI reference `registry:2` container.
+  `engine_integration::sync_warm_cache_ecr_target_short_circuits_mount`
+  pins the engine-level wire behavior (0 mount POSTs on ECR) and the
+  cache-preservation property (Skipped must not invalidate).
 
 ### To re-validate
 

@@ -1966,11 +1966,16 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
 }
 
 /// When the target is ECR, `blob_mount` short-circuits (ECR never fulfills
-/// OCI mount — it returns 202 to every POST). The engine must not issue
-/// a mount POST to the target and must fall through to HEAD + push.
+/// OCI mount — it returns 202 to every POST). The engine must:
+///   1. Not issue a mount POST (`.expect(0)`).
+///   2. Preserve the cached mount-source entry (NOT invalidate on `Skipped`),
+///      because the hint was never tested on the wire and the engine's
+///      `InProgress` claim riding on that same entry is required for the
+///      pull-once fan-out when multiple repos at this target share a blob.
 ///
-/// `.expect(0)` on the POST is the assertion that catches a regression.
-/// If a future refactor re-introduces the wasted POST, this test fails.
+/// Both assertions are load-bearing: regressing #1 wastes a round-trip per
+/// shared blob; regressing #2 breaks concurrent multi-repo ECR dedup and
+/// doubles source bandwidth for shared layers.
 #[tokio::test]
 async fn sync_warm_cache_ecr_target_short_circuits_mount() {
     let source_server = MockServer::start().await;
@@ -2045,6 +2050,7 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
         vec![TagPair::same("v1")],
     );
 
+    let cache_for_assertion = Rc::clone(&cache);
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
         .run(
@@ -2062,6 +2068,25 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
     assert_eq!(report.images[0].blob_stats.transferred, 2);
     assert_eq!(report.stats.blobs_mounted, 0);
     assert_eq!(report.stats.blobs_transferred, 2);
+
+    // After the short-circuit, both blobs transferred via HEAD + push;
+    // the engine then records each blob as Completed at repo-b. The
+    // mount-source lookup from a sibling repo (e.g. repo-c) must still
+    // return one of the live repos — repo-a is the pre-warmed entry and
+    // repo-b is the just-pushed one. If invalidation had fired, the
+    // whole entry would be gone and this would return None.
+    let c = cache_for_assertion.borrow();
+    let sibling = RepositoryName::new("repo-c");
+    assert!(
+        c.blob_mount_source(target_name, &config_desc.digest, &sibling)
+            .is_some(),
+        "config blob entry must survive short-circuit — invalidation would break concurrent dedup"
+    );
+    assert!(
+        c.blob_mount_source(target_name, &layer_desc.digest, &sibling)
+            .is_some(),
+        "layer blob entry must survive short-circuit — invalidation would break concurrent dedup"
+    );
 }
 
 /// Small blobs (below the 1 MiB monolithic threshold) use POST+PUT with no

@@ -3,7 +3,7 @@
 //!
 //! Pins the protocol-compliant baseline for `blob_mount`: a committed
 //! source blob returns [`MountResult::Mounted`], a missing source returns
-//! [`MountResult::NotMounted`]. Real-ECR behavior is deliberately not
+//! [`MountResult::NotFulfilled`]. Real-ECR behavior is deliberately not
 //! covered here (see `docs/specs/findings.md` — ECR never fulfills mount,
 //! so the client short-circuits and the engine integration test pins
 //! that end-to-end).
@@ -120,9 +120,9 @@ async fn mount_committed_blob_returns_mounted() {
 }
 
 /// When the source blob doesn't exist in `source_repo`, the registry must
-/// return 202 (not 201) and the client surfaces `NotMounted`.
+/// return 202 (not 201) and the client surfaces `NotFulfilled`.
 #[tokio::test]
-async fn mount_missing_source_returns_not_mounted() {
+async fn mount_missing_source_returns_not_fulfilled() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
 
@@ -137,8 +137,8 @@ async fn mount_missing_source_returns_not_mounted() {
         .expect("blob_mount request failed");
 
     assert!(
-        matches!(result, MountResult::NotMounted),
-        "expected NotMounted when source missing, got {result:?}"
+        matches!(result, MountResult::NotFulfilled),
+        "expected NotFulfilled when source missing, got {result:?}"
     );
 }
 

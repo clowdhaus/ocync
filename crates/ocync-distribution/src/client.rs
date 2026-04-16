@@ -75,11 +75,10 @@ impl RegistryClientBuilder {
     /// Pin DNS resolution for `host` to `addr`, bypassing the system
     /// resolver for that hostname only.
     ///
-    /// Useful for integration tests (route a real-looking hostname like
-    /// `123456789012.dkr.ecr.us-east-1.amazonaws.com` at a local mock
-    /// server's port) and for production callers that need DNS pinning
-    /// as a defense-in-depth measure. Multiple calls stack; later calls
-    /// do not replace earlier ones.
+    /// Used by integration tests to route a real-looking hostname (e.g.
+    /// `123456789012.dkr.ecr.us-east-1.amazonaws.com`) at a local mock
+    /// server, so the client exercises the same provider-detection path
+    /// it would against the real registry. Multiple calls stack.
     pub fn resolve(mut self, host: impl Into<String>, addr: std::net::SocketAddr) -> Self {
         self.dns_overrides.push((host.into(), addr));
         self
