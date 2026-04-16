@@ -69,3 +69,19 @@ images:
     tags: ["latest"]
   - source: "docker.io/library/redis"
     tags: ["latest"]
+
+  # Large multi-layer images — exercise real-world optimization paths
+  # (shared layers, chunked uploads, cross-repo mount effectiveness).
+  # SOCI workshop images are on public.ecr.aws (no docker.io rate limits).
+  - source: "public.ecr.aws/soci-workshop-examples/ffmpeg"
+    tags: ["latest"] # ~500 MB
+  - source: "public.ecr.aws/soci-workshop-examples/tensorflow"
+    tags: ["latest"] # ~1.8 GB, shares Ubuntu/Python layers with tensorflow_gpu
+  - source: "public.ecr.aws/soci-workshop-examples/tensorflow_gpu"
+    tags: ["latest"] # ~5 GB, same base as tensorflow — mount candidate
+  - source: "public.ecr.aws/soci-workshop-examples/node"
+    tags: ["latest"] # ~1 GB
+  - source: "public.ecr.aws/soci-workshop-examples/mongo"
+    tags: ["latest"] # ~700 MB
+  - source: "public.ecr.aws/soci-workshop-examples/rabbitmq"
+    tags: ["latest"] # ~250 MB

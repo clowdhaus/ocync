@@ -6,6 +6,21 @@ exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&
 echo "=== ocync benchmark runner bootstrap ==="
 echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# ── Swap (prevent OOM during Rust linking on smaller instances) ──────────────
+# c6in.large has only 4GB RAM; rustc's linker runs out of memory with our
+# full dep tree (aws-sdk + reqwest + rustls + etc). 8GB swap gives plenty
+# of headroom without needing a larger instance type.
+
+if ! swapon --show | grep -q '/swapfile'; then
+  echo "--- Creating 8GB swap file"
+  fallocate -l 8G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo "swap: $(free -h | awk '/Swap/ {print $2}')"
+fi
+
 # ── System packages ───────────────────────────────────────────────────────────
 
 dnf update -y
