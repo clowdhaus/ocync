@@ -10,7 +10,7 @@ Comparative benchmark harness that measures ocync against dregsy and regsync on 
 
 ## Image corpus
 
-A curated set of public images from three sources, defined in a single TOML config file.
+A curated set of public images from three sources, defined in a single YAML config file.
 
 ### Sources
 
@@ -20,27 +20,28 @@ A curated set of public images from three sources, defined in a single TOML conf
 
 ### Corpus config format
 
-```toml
-[corpus]
-target_registry = "123456789.dkr.ecr.us-east-1.amazonaws.com"
-target_prefix = "bench"
+```yaml
+corpus:
+  target_registry: "${BENCH_TARGET_REGISTRY}"
+  target_prefix: "bench"
 
-[[images]]
-source = "cgr.dev/chainguard/static"
-tags = ["latest"]
+images:
+  - source: "cgr.dev/chainguard/static"
+    tags: ["latest"]
 
-[[images]]
-source = "cgr.dev/chainguard/python"
-tags = ["latest", "3.12"]
+  - source: "cgr.dev/chainguard/python"
+    tags: ["latest", "3.12"]
 
-[[images]]
-source = "public.ecr.aws/amazonlinux/amazonlinux"
-tags = ["2023", "2"]
+  - source: "public.ecr.aws/amazonlinux/amazonlinux"
+    tags: ["2023", "2"]
 
-[[images]]
-source = "docker.io/library/alpine"
-tags = ["3.20", "latest"]
+  - source: "docker.io/library/alpine"
+    tags: ["3.20", "latest"]
 ```
+
+Environment variables (`${VAR}` syntax) are expanded before parsing. The `BENCH_TARGET_REGISTRY` variable must be set to the target ECR registry hostname.
+
+A separate overrides file (`bench/corpus-partial-overrides.yaml`) defines tag replacements for the partial sync scenario, avoiding full corpus duplication.
 
 ### Scaling curve
 
@@ -59,18 +60,23 @@ EC2 instance in the same region as the target ECR. The benchmark runs on multipl
 
 ### Instance matrix
 
-| Instance | vCPU | Memory | Network baseline | Network burst | Purpose |
-|----------|------|--------|-----------------|---------------|---------|
-| c6in.large | 2 | 4 GB | 25 Gbps | 25 Gbps | Resource floor — minimum viable |
-| c6in.xlarge | 4 | 8 GB | 30 Gbps | 30 Gbps | Concurrency headroom test |
-| c6in.2xlarge | 8 | 16 GB | 40 Gbps | 40 Gbps | Upper bound — diminishing returns test |
+The matrix spans instance families and generations to determine whether ocync is CPU-bound, memory-bound, or network-bound, and to validate that performance holds on current-generation hardware.
 
-c6in instances are chosen deliberately:
-- **Non-burstable networking**: baseline equals max. t3 instances have burstable networking where baseline is ~1.5 Gbps — a sustained benchmark would exhaust network credits mid-run and produce misleading results.
-- **Enhanced Networking (ENA)**: consistent, low-jitter network performance.
-- **Sufficient network headroom**: even the smallest (25 Gbps) far exceeds ECR's per-connection throughput, so the network interface is never the bottleneck — we're measuring ECR and tool behavior, not instance networking.
+| Instance | Family | vCPU | Memory | Network | Purpose |
+|----------|--------|------|--------|---------|---------|
+| c6in.large | Compute (6th gen) | 2 | 4 GB | 25 Gbps | Baseline — compute-optimized, high network |
+| c7g.large | Compute (Graviton3) | 2 | 4 GB | 12.5 Gbps | ARM comparison — cost efficiency test |
+| m7i.large | General (7th gen) | 2 | 8 GB | 12.5 Gbps | Memory headroom — does 2x RAM help? |
+| m7g.large | General (Graviton3) | 2 | 8 GB | 12.5 Gbps | ARM + memory — best cost/perf candidate |
+| c6in.xlarge | Compute (6th gen) | 4 | 8 GB | 30 Gbps | vCPU scaling — does more CPU help? |
 
-The tool comparison (ocync vs dregsy vs regsync) runs on a single fixed instance (c6in.large). The resource profiling runs ocync-only across all instance sizes to find the point where performance stops improving.
+Selection criteria:
+- **No burstable instances** (t-series): baseline networking is ~1.5 Gbps, a sustained benchmark would exhaust network credits mid-run.
+- **Both x86 and ARM**: Graviton instances are 20-40% cheaper. If ocync performs equally well, that's a strong Helm chart recommendation.
+- **Compute vs general purpose**: determines whether the bottleneck is CPU (compute wins) or memory (general purpose wins). For an I/O-heavy tool like ocync, neither may matter — network and registry latency likely dominate.
+- **Same vCPU count across families** (2 vCPU for most): isolates the family/generation variable rather than conflating it with core count. c6in.xlarge (4 vCPU) tests whether more cores help concurrency.
+
+The tool comparison (ocync vs dregsy vs regsync) runs on a single fixed instance (c6in.large). The resource profiling runs ocync-only across all instance sizes to find the sweet spot.
 
 ### EBS volume
 
@@ -98,7 +104,7 @@ These time-series go into the report alongside the benchmark results. The Helm c
 
 ### Cost
 
-c6in instances cost $0.18–$0.72/hr depending on size. The full matrix (3 instance sizes x benchmark suite) completes in under 3 hours, costing roughly $2-4 total including EBS.
+Instance costs range $0.07–$0.36/hr. The full matrix (5 instance sizes x benchmark suite) completes in under 4 hours, costing roughly $3-6 total including EBS. Graviton instances (c7g, m7g) are ~20% cheaper than their x86 equivalents.
 
 ### Reproducibility
 
@@ -111,7 +117,7 @@ Two modes: interactive (primary), CI (future).
 **Interactive mode (what we build first):**
 
 1. `terraform apply` in `bench/terraform/` provisions the environment:
-   - VPC with private subnets and ECR VPC endpoints
+   - VPC with private subnets, public subnets, NAT gateway, and ECR VPC endpoints
    - EC2 instance with user data that installs: Rust (rustup), Go (for dregsy/regsync), mitmproxy (pip), git
    - IAM instance profile with ECR full access + SSM access
    - gp3 volume (100 GB, 6,000 IOPS, 400 MB/s)
@@ -131,12 +137,13 @@ GitHub Actions workflow that automates the same flow: `terraform apply` → SSM 
 
 All Terraform config lives in `bench/terraform/`, using `terraform-aws-modules`:
 
-- `terraform-aws-modules/vpc/aws` — VPC with private subnets and VPC endpoints for ECR (`com.amazonaws.<region>.ecr.api`, `com.amazonaws.<region>.ecr.dkr`, `com.amazonaws.<region>.s3` gateway for ECR's S3-backed blob storage). Private networking gives consistent latency and avoids public internet variability.
+- `clowdhaus/tags/aws` — organization-standard tags (environment, repository, created_by, deployed_by)
+- `terraform-aws-modules/vpc/aws` — VPC with private subnets, public subnets, single NAT gateway, and VPC endpoints for ECR (`ecr.api`, `ecr.dkr` interface endpoints, `s3` gateway for ECR's blob storage). NAT gateway provides internet access for pulling from public registries (cgr.dev, docker.io, public.ecr.aws). VPC endpoints give private-network access to the target ECR registry.
+- `terraform-aws-modules/vpc/aws//modules/vpc-endpoints` — ECR and S3 VPC endpoints with module-managed security group
 - `terraform-aws-modules/ec2-instance/aws` — benchmark instance with user data, gp3 volume config, security group, IAM role + instance profile (ECR full access and SSM managed policy) — all created by the module
 
 Files:
-- `main.tf` — module calls, data sources
-- `variables.tf` — region, instance type (defaults to c6in.large), ECR target registry
+- `main.tf` — locals, module calls, data sources
 - `outputs.tf` — instance ID (for SSM)
 - `user-data.sh` — bootstrap script (install Rust, Go, mitmproxy, system deps)
 
@@ -192,7 +199,7 @@ cargo xtask bench partial
 cargo xtask bench scale
 cargo xtask bench all
 cargo xtask bench --tools ocync,regsync    # subset of tools
-cargo xtask bench --corpus small           # first 10 images only
+cargo xtask bench --limit 10              # first 10 images only
 cargo xtask bench --regression             # ocync-only, compare against baseline
 ```
 
@@ -210,7 +217,7 @@ Tool versions are recorded in the report metadata.
 
 ### Config generation
 
-The harness reads the corpus TOML and generates equivalent config files for each tool:
+The harness reads the corpus YAML and generates equivalent config files for each tool:
 
 - `ocync.yaml` — ocync native config
 - `dregsy.yaml` — dregsy task-based config
@@ -299,8 +306,8 @@ Written to `bench-results/YYYY-MM-DD-HHMMSS/`:
 
 ```json
 [
-  {"images": 10, "ocync_seconds": 8, "regsync_seconds": 22, "dregsy_seconds": 55},
-  {"images": 25, "ocync_seconds": 15, "regsync_seconds": 48, "dregsy_seconds": 130}
+  {"images": 10, "results": {"ocync": 8.0}},
+  {"images": 25, "results": {"ocync": 15.0}}
 ]
 ```
 
@@ -311,15 +318,16 @@ No chart rendering in the xtask (no plotting dependency). The structured JSON is
 Per-instance-size summary for ocync runs:
 
 ```
-| Instance   | Wall-clock | Peak CPU | Peak RSS | Avg Net MB/s | Recommended |
-|------------|------------|----------|----------|--------------|-------------|
-| t3.small   | 1m 52s     | 78%      | 380 MB   | 42 MB/s      |             |
-| t3.medium  | 1m 14s     | 62%      | 410 MB   | 48 MB/s      | *           |
-| c6i.large  | 1m 08s     | 45%      | 420 MB   | 52 MB/s      |             |
-| c6i.xlarge | 1m 06s     | 28%      | 425 MB   | 53 MB/s      |             |
+| Instance       | Wall-clock | Peak CPU | Peak RSS | Avg Net MB/s | Recommended |
+|----------------|------------|----------|----------|--------------|-------------|
+| c6in.large     |            |          |          |              |             |
+| c7g.large      |            |          |          |              |             |
+| m7i.large      |            |          |          |              |             |
+| m7g.large      |            |          |          |              |             |
+| c6in.xlarge    |            |          |          |              |             |
 ```
 
-Numbers are illustrative. The "recommended" marker goes on the smallest instance where adding more resources yields less than 10% improvement — this becomes the Helm chart default for `resources.requests`.
+Table populated after first benchmark run. The "recommended" marker goes on the smallest instance where adding more resources yields less than 10% improvement — this becomes the Helm chart default for `resources.requests`.
 
 Detailed time-series data (CPU, memory, network at 1-second intervals) written to `bench-results/YYYY-MM-DD-HHMMSS/resource-profiles/` as JSON per instance size.
 

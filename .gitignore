@@ -19,6 +19,9 @@ target
 # Superpowers working documents
 docs/superpowers/
 
+# Benchmark results (generated)
+bench-results/
+
 # Git worktrees
 .worktrees/
 

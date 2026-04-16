@@ -1,0 +1,71 @@
+# Benchmark image corpus.
+#
+# Sources: Chainguard free images, AWS Public ECR, Docker Hub (minimal).
+# Each image syncs to ECR under the bench/ prefix.
+
+corpus:
+  target_registry: "${BENCH_TARGET_REGISTRY}"
+  target_prefix: "bench"
+
+images:
+  # Chainguard free tier images (cgr.dev)
+  - source: "cgr.dev/chainguard/static"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/busybox"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/git"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/go"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/python"
+    tags: ["latest"]  # version-pinned tags (3.12 etc) are Chainguard paid-tier only
+  - source: "cgr.dev/chainguard/node"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/nginx"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/redis"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/curl"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/wolfi-base"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/postgres"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/ruby"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/rust"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/jdk"
+    tags: ["latest"]
+  - source: "cgr.dev/chainguard/php"
+    tags: ["latest"]
+
+  # AWS Public ECR images (public.ecr.aws)
+  - source: "public.ecr.aws/amazonlinux/amazonlinux"
+    tags: ["2023", "2"]
+  - source: "public.ecr.aws/ubuntu/ubuntu"
+    tags: ["22.04", "20.04"]
+  - source: "public.ecr.aws/aws-cli/aws-cli"
+    tags: ["latest"]
+  - source: "public.ecr.aws/lambda/python"
+    tags: ["3.12", "3.11"]
+  - source: "public.ecr.aws/lambda/nodejs"
+    tags: ["20", "18"]
+  - source: "public.ecr.aws/amazoncorretto/amazoncorretto"
+    tags: ["21", "17"]
+  - source: "public.ecr.aws/docker/library/postgres"
+    tags: ["16", "15"]
+  - source: "public.ecr.aws/docker/library/redis"
+    tags: ["7", "6"]
+  - source: "public.ecr.aws/docker/library/nginx"
+    tags: ["1.27", "1.26"]
+  - source: "public.ecr.aws/docker/library/golang"
+    tags: ["1.22", "1.21"]
+
+  # Docker Hub images (docker.io) — minimal to avoid rate limits
+  - source: "docker.io/library/alpine"
+    tags: ["3.20", "latest"]
+  - source: "docker.io/library/nginx"
+    tags: ["latest"]
+  - source: "docker.io/library/redis"
+    tags: ["latest"]
