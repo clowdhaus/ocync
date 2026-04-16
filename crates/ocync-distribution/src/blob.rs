@@ -25,13 +25,15 @@ const OCTET_STREAM: &str = "application/octet-stream";
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
 pub enum MountResult {
-    /// The blob was successfully mounted.
+    /// Registry fulfilled the mount (201 Created). The blob is now
+    /// referenced from the target repo without a data transfer.
     Mounted,
-    /// The registry did not support mounting; use the returned upload URL instead.
-    FallbackUpload {
-        /// The URL to use for a chunked upload.
-        upload_url: String,
-    },
+    /// Mount did not happen. Either the registry returned 202 without
+    /// fulfilling the mount, or the client short-circuited before
+    /// issuing the POST because the target provider is known to never
+    /// fulfill mount (see [`ProviderKind::fulfills_cross_repo_mount`]).
+    /// Callers fall through to HEAD + push either way.
+    NotMounted,
 }
 
 /// Build the path segment for a blob: `/blobs/{digest}`.
@@ -122,14 +124,26 @@ impl RegistryClient {
     /// Attempt a cross-repository blob mount.
     ///
     /// Issues a POST to `/v2/{repository}/blobs/uploads/?mount={digest}&from={from_repo}`.
-    /// If the registry supports it, returns [`MountResult::Mounted`]. Otherwise,
-    /// falls back to a regular upload URL.
+    /// Returns [`MountResult::Mounted`] on 201 and [`MountResult::NotMounted`] on 202
+    /// or when the client short-circuits because the target provider never fulfills
+    /// mount (see [`ProviderKind::fulfills_cross_repo_mount`]).
     pub async fn blob_mount(
         &self,
         repository: &RepositoryName,
         digest: &Digest,
         from_repo: &RepositoryName,
     ) -> Result<MountResult, Error> {
+        let provider_kind = self.base_url.host_str().and_then(detect_provider_kind);
+        if provider_kind.is_some_and(|k| !k.fulfills_cross_repo_mount()) {
+            debug!(
+                target = %repository,
+                %digest,
+                ?provider_kind,
+                "skipping cross-repo mount POST: provider does not fulfill mount"
+            );
+            return Ok(MountResult::NotMounted);
+        }
+
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let scopes = [
             Scope::pull_push(repository.as_str()),
@@ -521,20 +535,16 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Str
 }
 
 /// Classify a mount response into [`MountResult`].
+///
+/// The 202 response carries a fresh upload URL that the engine could
+/// in principle chain on; in practice it falls through to a fresh
+/// HEAD + push, so the URL is discarded and only the binary outcome
+/// is surfaced.
 async fn classify_mount_response(resp: reqwest::Response) -> Result<MountResult, Error> {
     let status = resp.status();
-
     match status {
         StatusCode::CREATED => Ok(MountResult::Mounted),
-        StatusCode::ACCEPTED => {
-            let upload_url = resp
-                .headers()
-                .get(LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_owned();
-            Ok(MountResult::FallbackUpload { upload_url })
-        }
+        StatusCode::ACCEPTED => Ok(MountResult::NotMounted),
         _ => {
             let message = resp.text().await.unwrap_or_default();
             Err(Error::RegistryError { status, message })
@@ -612,43 +622,19 @@ mod tests {
         );
     }
 
-    /// Build a `RegistryClient` with a GHCR hostname resolving to a local port.
-    fn build_ghcr_client(port: u16) -> RegistryClient {
-        let base_url = url::Url::parse(&format!("http://ghcr.io:{port}")).unwrap();
-        let http = reqwest::Client::builder()
-            .resolve(
-                "ghcr.io",
-                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            )
-            .build()
-            .unwrap();
-
+    /// Build a `RegistryClient` with the given hostname, routing all traffic
+    /// for that hostname to a local wiremock port. Used by the tests below
+    /// that need a real-looking hostname (e.g. `ghcr.io`,
+    /// `<acct>.dkr.ecr.<region>.amazonaws.com`) to exercise hostname-keyed
+    /// behavior in the client.
+    fn build_test_client(host: &str, port: u16) -> RegistryClient {
+        let base_url = url::Url::parse(&format!("http://{host}:{port}")).unwrap();
         RegistryClient {
-            base_url,
-            http,
-            auth: None,
-            aimd: crate::aimd::AimdController::new("ghcr.io", 8),
-            chunk_size: 4,
-        }
-    }
-
-    /// Build a `RegistryClient` with a GAR hostname resolving to a local port.
-    fn build_gar_client(port: u16) -> RegistryClient {
-        let base_url = url::Url::parse(&format!("http://us-docker.pkg.dev:{port}")).unwrap();
-        let http = reqwest::Client::builder()
-            .resolve(
-                "us-docker.pkg.dev",
-                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            )
-            .build()
-            .unwrap();
-
-        RegistryClient {
-            base_url,
-            http,
-            auth: None,
-            aimd: crate::aimd::AimdController::new("us-docker.pkg.dev", 8),
-            chunk_size: 4,
+            chunk_size: 4, // small chunk keeps streaming tests fast
+            ..crate::client::RegistryClientBuilder::new(base_url)
+                .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+                .build()
+                .unwrap()
         }
     }
 
@@ -705,7 +691,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_gar_client(port);
+        let client = build_test_client("us-docker.pkg.dev", port);
 
         let repo = RepositoryName::new("my-project/my-repo");
         let result = client
@@ -761,7 +747,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_ghcr_client(port);
+        let client = build_test_client("ghcr.io", port);
 
         // Pass None so the monolithic threshold does not intercept the call;
         // we are verifying the GHCR-specific single-PATCH path directly.
@@ -813,7 +799,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_ghcr_client(port);
+        let client = build_test_client("ghcr.io", port);
 
         // No known_size — GHCR path still taken based on hostname alone.
         let repo = RepositoryName::new("repo");
@@ -823,5 +809,95 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, digest);
+    }
+
+    /// Covers the hostname-keyed mount routing:
+    ///
+    /// - ECR (private + public): client short-circuits, zero POSTs issued,
+    ///   returns `NotMounted`.
+    /// - GHCR, 201 response: `Mounted`.
+    /// - GHCR, 202 response: `NotMounted` (server fallback).
+    /// - Unknown host, 201 response: `Mounted` (optimistic default).
+    ///
+    /// The short-circuit rows are negative assertions: `.expect(0)` on the
+    /// POST catches a regression that would re-introduce the wasted call.
+    #[tokio::test]
+    async fn blob_mount_routes_per_provider() {
+        /// `server` is `None` for rows where the short-circuit should fire
+        /// and no POST should reach the wire.
+        struct Case {
+            host: &'static str,
+            server: Option<u16>,
+            expect_mounted: bool,
+        }
+
+        let cases = [
+            Case {
+                host: "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+                server: None,
+                expect_mounted: false,
+            },
+            Case {
+                // Inferred from ECR private — same AWS backend, assumed
+                // to share mount behavior until proven otherwise.
+                host: "public.ecr.aws",
+                server: None,
+                expect_mounted: false,
+            },
+            Case {
+                host: "ghcr.io",
+                server: Some(201),
+                expect_mounted: true,
+            },
+            Case {
+                host: "ghcr.io",
+                server: Some(202),
+                expect_mounted: false,
+            },
+            Case {
+                host: "my-private-registry.example.com",
+                server: Some(201),
+                expect_mounted: true,
+            },
+        ];
+
+        for case in cases {
+            let server = wiremock::MockServer::start().await;
+            let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+            let (expected_post_count, response_status) = match case.server {
+                Some(s) => (1, s),
+                // Short-circuit expected; 500 is unreachable but flags
+                // loudly if the `.expect(0)` guard breaks.
+                None => (0, 500),
+            };
+
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v2/tgt/repo/blobs/uploads/"))
+                .respond_with(wiremock::ResponseTemplate::new(response_status))
+                .expect(expected_post_count)
+                .mount(&server)
+                .await;
+
+            let client = build_test_client(case.host, port);
+            let result = client
+                .blob_mount(
+                    &RepositoryName::new("tgt/repo"),
+                    &test_digest(case.host.as_bytes()),
+                    &RepositoryName::new("src/repo"),
+                )
+                .await
+                .unwrap();
+
+            let ok = matches!(
+                (case.expect_mounted, &result),
+                (true, MountResult::Mounted) | (false, MountResult::NotMounted)
+            );
+            assert!(
+                ok,
+                "{} ({:?}): unexpected result {result:?}",
+                case.host, case.server
+            );
+        }
     }
 }

@@ -16,20 +16,20 @@ enum Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli {
-        Cli::Bench(args) => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tokio runtime");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
 
-            match rt.block_on(bench::run(args)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            }
+    let result = match cli {
+        Cli::Bench(args) => rt.block_on(bench::run(args)),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
         }
     }
 }

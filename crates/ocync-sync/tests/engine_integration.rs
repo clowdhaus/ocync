@@ -45,6 +45,25 @@ fn mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClient> {
     )
 }
 
+/// Build a `RegistryClient` whose `base_url` has an ECR hostname but all
+/// traffic is redirected (via `RegistryClientBuilder::resolve`) to the mock
+/// server's local port. Used to exercise ECR-specific code paths (mount
+/// short-circuit) without a real ECR endpoint.
+fn ecr_mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClient> {
+    let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
+    let mock_port = mock_url(server).port().unwrap();
+    let base_url = Url::parse(&format!("http://{host}:{mock_port}")).unwrap();
+    Arc::new(
+        RegistryClientBuilder::new(base_url)
+            .resolve(
+                host,
+                std::net::SocketAddr::from(([127, 0, 0, 1], mock_port)),
+            )
+            .build()
+            .unwrap(),
+    )
+}
+
 fn fast_retry() -> RetryConfig {
     RetryConfig {
         max_retries: 2,
@@ -1944,6 +1963,104 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
     assert_eq!(report.images[0].blob_stats.skipped, 0);
     assert_eq!(report.stats.blobs_mounted, 2);
     assert_eq!(report.stats.blobs_transferred, 0);
+}
+
+/// When the target is ECR, `blob_mount` short-circuits (ECR never fulfills
+/// OCI mount — it returns 202 to every POST). The engine must not issue
+/// the mount POST, falling through to HEAD + push instead.
+///
+/// `.expect(0)` on the POST is the assertion that pins the short-circuit.
+#[tokio::test]
+async fn sync_warm_cache_ecr_target_short_circuits_mount() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"ecr-config-data";
+    let layer_data = b"ecr-layer-data";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source serves manifest and both blobs (pulls must happen because
+    // mount is short-circuited).
+    mount_source_manifest(&source_server, "repo-b", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo-b", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "repo-b", &layer_desc.digest, layer_data).await;
+
+    mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
+
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo-b/blobs/{}", config_desc.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo-b/blobs/{}", layer_desc.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    // The whole point of the short-circuit: zero mount POSTs.
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-b/blobs/uploads/"))
+        .and(query_param("from", "repo-a"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+
+    mount_blob_push(&target_server, "repo-b").await;
+    mount_manifest_push(&target_server, "repo-b", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = ecr_mock_client(&target_server);
+
+    // Pre-warm: mount source hint present — the engine's lookup would
+    // normally trigger a POST, but the client short-circuits on ECR.
+    let cache = empty_cache();
+    let target_name = "ecr-target";
+    {
+        let mut c = cache.borrow_mut();
+        c.set_blob_completed(target_name, config_desc.digest.clone(), "repo-a".into());
+        c.set_blob_completed(target_name, layer_desc.digest.clone(), "repo-a".into());
+    }
+
+    let mapping = resolved_mapping(
+        source_client,
+        "repo-b",
+        "repo-b",
+        vec![target_entry(target_name, target_client)],
+        vec![TagPair::same("v1")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_eq!(report.images[0].blob_stats.mounted, 0);
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+    assert_eq!(report.stats.blobs_mounted, 0);
+    assert_eq!(report.stats.blobs_transferred, 2);
 }
 
 /// Small blobs (below the 1 MiB monolithic threshold) use POST+PUT with no

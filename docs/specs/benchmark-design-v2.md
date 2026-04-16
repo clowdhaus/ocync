@@ -52,19 +52,17 @@ claim? For ocync: does each optimization take the designed fast path
 against the registry we target?
 
 **Where it lives:** alongside the existing integration tests in
-`crates/ocync-distribution/tests/`. New suites:
+`crates/ocync-distribution/tests/`. Conventions:
 
-- `registry2_mount.rs` — mount fast-path assertions against the
-  reference `registry:2` image via testcontainers. Cheap, deterministic,
-  runs in CI on every PR.
-- `ecr_mount.rs` — equivalent assertions against real ECR, gated by
-  `cargo test --features ecr-integration` (needs AWS credentials and
-  costs ~$0.01 per run). Runs nightly in CI from an IAM role with
-  scoped ECR permissions.
-- `xtask probe --registry <host>` — ad-hoc developer tool that
-  performs a single mount/push/mount sequence against any registry
-  and prints the observed protocol behavior. Use when filing an AWS
-  support ticket or diagnosing a new registry provider.
+- `registry2_*.rs` suites run mount/client/push fast-path assertions
+  against the reference `registry:2` image via testcontainers. Cheap,
+  deterministic, runs in CI on every PR.
+- Registry-specific quirks that cannot be exercised against
+  `registry:2` (e.g. ECR's "never fulfills mount" behavior) are
+  captured as evidence in `docs/specs/findings.md` and pinned by
+  engine-level integration tests asserting the adapted code path. A
+  real-cloud CI suite is out of scope until a second empirical
+  observation justifies the infrastructure.
 
 **Hard rule (enforced at code-review time):** every ocync optimization
 that claims bytes/requests savings ships with a matching Layer-1 test
@@ -171,51 +169,46 @@ part of CI. Runs are manually initiated.
 
 ## Migration plan
 
-Three sequenced PRs on `main`, each independently mergeable.
+Three sequenced stages on `main`, each independently mergeable as its
+own PR. "Stage N" below refers to a plan-ordered milestone, not a
+GitHub PR number (which is monotonic and assigned at PR open time).
 
-### PR #1 — Layer 1 (Protocol tests + ECR mount resolution)
+### Stage 1 — Layer 1 (ECR mount resolution + protocol baseline)
 
-**Goal:** Before changing anything about Layer 2, answer the
-outstanding ECR-mount question definitively and establish the
-"optimization needs a protocol test" enforcement point.
+**Goal:** Before changing anything about Layer 2, resolve the ECR
+mount question empirically and establish the `registry:2` protocol
+baseline that future optimizations will extend.
 
-**Deliverables:**
+**Shipped (PR #25):**
 
-- `xtask probe --registry <host>` subcommand. Creates two ephemeral
-  repos, pushes a blob to one, waits optionally, attempts mount to
-  the other, prints observed status code. Cleans up.
-- `crates/ocync-distribution/tests/registry2_mount.rs` — testcontainer
-  suite asserting mount returns 201 with correct `Location` header
-  against the OCI reference registry. Pins protocol-compliant
-  baseline.
-- `crates/ocync-distribution/tests/ecr_mount.rs` — real-ECR suite
-  behind `--features ecr-integration`. Asserts actual ECR mount
-  behavior on a fresh pair of repos with a known-committed source
-  blob. This is what we should have had before merging the mount
-  optimization.
-- Based on probe result:
-  - If ECR returns 202 even with a fully-committed source blob: add
-    an ECR-target short-circuit so ocync skips mount attempts on ECR
-    entirely (saves ~1 POST per shared blob). Document in CLAUDE.md.
-  - If ECR does return 201 under some specific conditions: document
-    the conditions as a CLAUDE.md memory entry and update the engine
-    to meet them (likely a timing adjustment or `from=` encoding fix).
+- `ProviderKind::fulfills_cross_repo_mount()` short-circuits
+  `blob_mount` on ECR targets — no POST is issued, saving one
+  round-trip per shared blob. `MountResult` is a two-variant enum
+  (`Mounted` / `NotMounted`).
+- `crates/ocync-distribution/tests/registry2_mount.rs` pins the
+  protocol-compliant baseline (committed source → 201 → `Mounted`;
+  missing source → 202 → `NotMounted`) against `registry:2` via
+  testcontainers.
+- `crates/ocync-sync/tests/engine_integration::
+  sync_warm_cache_ecr_target_short_circuits_mount` pins the engine
+  behavior end-to-end with `.expect(0)` on the mount POST when the
+  target is ECR.
+- `docs/specs/findings.md` records the empirical evidence (193/193
+  observed mount POSTs returned 202 across multiple triggers and wait
+  times) and the re-validate procedure.
 
-**Acceptance criteria:**
-
-- `cargo test --package ocync-distribution` passes including the new
-  registry:2 suite.
-- `cargo test --features ecr-integration` passes against real ECR.
-- `xtask probe` produces deterministic output against both registry:2
-  and ECR.
-- ECR mount behavior is documented in `CLAUDE.md` with a matching
-  test — not "we observed 202 that one time" but "ECR returns {201
-  when X | 202 always}" backed by the probe + test.
+**What was intentionally not shipped:** a real-ECR CI suite, a
+diagnostic probe tool, and a feature-flag-gated integration test.
+These were considered but deferred — the engine-level test + protocol
+baseline catch the regressions the infrastructure would catch, and a
+one-time empirical observation doesn't justify a permanent real-cloud
+CI path. If a second observation ever calls the decision into question,
+the probe harness can come back on evidence.
 
 **Out of scope:** Layer 2 changes. Competitor-tool code. Performance
 measurement.
 
-### PR #2 — Layer 2 (Throughput benchmark)
+### Stage 2 — Layer 2 (Throughput benchmark)
 
 **Goal:** Restructure `xtask/src/bench/` so ocync-only measurements
 are trustworthy and reproducible.
@@ -253,7 +246,7 @@ are trustworthy and reproducible.
 **Out of scope:** Competitor-tool comparison. Multi-instance
 parallelism.
 
-### PR #3 — Layer 3 (Cross-tool comparison, extracted)
+### Stage 3 — Layer 3 (Cross-tool comparison, extracted)
 
 **Goal:** Move competitor-tool code out of the main benchmark path
 and position it correctly.
@@ -296,7 +289,7 @@ if the mount optimization had shipped with an ECR-integration test
 asserting `mounts > 0 && status == 201`, CI would have failed on the
 original PR and we would have shipped the short-circuit up front.
 
-## Open questions (for PR #1 to resolve)
+## Open questions (for Stage 1 to resolve)
 
 - Does ECR return 201 to any OCI mount under any conditions? The
   probe answers this in seconds. Informs whether the optimization is

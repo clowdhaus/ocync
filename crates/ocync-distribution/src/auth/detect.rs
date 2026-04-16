@@ -33,6 +33,34 @@ pub enum ProviderKind {
     Chainguard,
 }
 
+impl ProviderKind {
+    /// Whether this provider is known to fulfill OCI cross-repo blob mount.
+    ///
+    /// Returns `false` for providers observed (or safely inferred) to never
+    /// return `201 Created` to a mount POST. When `false`,
+    /// [`crate::blob::RegistryClient::blob_mount`] short-circuits without
+    /// issuing a network request.
+    ///
+    /// Non-fulfilling providers:
+    /// - [`ProviderKind::Ecr`]: 193 observed mount POSTs returned 202, never
+    ///   201 (see `docs/specs/findings.md`).
+    /// - [`ProviderKind::EcrPublic`]: inferred from [`ProviderKind::Ecr`]
+    ///   (same AWS backend team, same distribution service family). Not
+    ///   independently benchmarked; if a future observation shows ECR Public
+    ///   does fulfill mount, flip this arm and add a re-validate entry.
+    ///
+    /// Uses an exhaustive `match` so adding a new [`ProviderKind`] variant
+    /// forces a compile-time decision here.
+    pub fn fulfills_cross_repo_mount(&self) -> bool {
+        match self {
+            Self::Ecr | Self::EcrPublic => false,
+            Self::Gcr | Self::Gar | Self::Acr | Self::Ghcr | Self::DockerHub | Self::Chainguard => {
+                true
+            }
+        }
+    }
+}
+
 /// Compiled regex for ECR private registry hostnames.
 ///
 /// Pattern: `<12-digit-account>.dkr[.-]ecr[-fips].<region>.<partition-domain>`

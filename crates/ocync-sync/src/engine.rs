@@ -1431,9 +1431,8 @@ async fn transfer_image_blobs(
                     tracing::debug!(target: "ocync::metrics", result = "success", "mount");
                     continue;
                 }
-                Ok(MountResult::FallbackUpload { .. }) | Err(_) => {
-                    debug!(%digest, target = %ctx.target_name, "mount failed, falling back to HEAD+push");
-                    // Invalidate the stale mount source entry.
+                Ok(MountResult::NotMounted) | Err(_) => {
+                    debug!(%digest, target = %ctx.target_name, "mount not fulfilled, falling back to HEAD+push");
                     ctx.cache
                         .borrow_mut()
                         .invalidate_blob(ctx.target_name, digest);

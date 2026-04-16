@@ -21,6 +21,12 @@ pub struct RegistryClientBuilder {
     auth: Option<Box<dyn AuthProvider>>,
     max_concurrent: usize,
     chunk_size: usize,
+    /// Static DNS overrides applied to the internal reqwest client.
+    /// Each entry maps a hostname to a fixed socket address, bypassing
+    /// DNS resolution. Used by integration tests to route ECR-hostname
+    /// requests at a local mock server without leaking `reqwest::Client`
+    /// into the public API.
+    dns_overrides: Vec<(String, std::net::SocketAddr)>,
 }
 
 impl std::fmt::Debug for RegistryClientBuilder {
@@ -29,6 +35,7 @@ impl std::fmt::Debug for RegistryClientBuilder {
             .field("url", &self.url)
             .field("max_concurrent", &self.max_concurrent)
             .field("chunk_size", &self.chunk_size)
+            .field("dns_overrides", &self.dns_overrides)
             .finish_non_exhaustive()
     }
 }
@@ -43,6 +50,7 @@ impl RegistryClientBuilder {
             auth: None,
             max_concurrent: DEFAULT_MAX_CONCURRENT_REQUESTS,
             chunk_size: DEFAULT_CHUNK_SIZE,
+            dns_overrides: Vec::new(),
         }
     }
 
@@ -64,11 +72,25 @@ impl RegistryClientBuilder {
         self
     }
 
+    /// Pin DNS resolution for `host` to `addr`, bypassing the system
+    /// resolver for that hostname only.
+    ///
+    /// Used by integration tests to route a real-looking hostname (e.g.
+    /// `123456789012.dkr.ecr.us-east-1.amazonaws.com`) at a local mock
+    /// server, so the client exercises the same provider-detection path
+    /// it would against the real registry. Multiple calls stack.
+    pub fn resolve(mut self, host: impl Into<String>, addr: std::net::SocketAddr) -> Self {
+        self.dns_overrides.push((host.into(), addr));
+        self
+    }
+
     /// Build the registry client.
     pub fn build(self) -> Result<RegistryClient, Error> {
-        let http = reqwest::Client::builder()
-            .user_agent(USER_AGENT_VALUE)
-            .build()?;
+        let mut http_builder = reqwest::Client::builder().user_agent(USER_AGENT_VALUE);
+        for (host, addr) in &self.dns_overrides {
+            http_builder = http_builder.resolve(host, *addr);
+        }
+        let http = http_builder.build()?;
 
         let aimd = AimdController::new(
             self.url.host_str().unwrap_or("unknown"),

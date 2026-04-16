@@ -5,12 +5,11 @@
 //! status code mismatches, auth header formatting, and protocol errors
 //! that wiremock mocks can't surface.
 //!
+//! Mount-specific protocol tests live in the sibling `registry2_mount.rs`.
+//!
 //! Requirements:
 //! - Docker must be running
-//! - Run with: `cargo test --package ocync-distribution --test ecr_integration`
-//!
-//! Gated behind the `test-registry` feature (default-enabled) so CI
-//! environments without Docker can skip them.
+//! - Run with: `cargo test --package ocync-distribution --test registry2_client`
 
 use bytes::Bytes;
 use futures_util::stream;
