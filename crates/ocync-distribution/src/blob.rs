@@ -23,29 +23,17 @@ const MONOLITHIC_THRESHOLD: u64 = 1024 * 1024;
 const OCTET_STREAM: &str = "application/octet-stream";
 
 /// Result of a cross-repository blob mount attempt.
-///
-/// `NotFulfilled` and `Skipped` both mean "mount did not happen, fall
-/// through to HEAD + push," but they are kept distinct because callers
-/// that maintain a mount-source cache must treat them differently:
-///
-/// - `NotFulfilled` came from a registry response, so the cached hint
-///   (which repo the blob lived in) is probably stale and should be
-///   invalidated.
-/// - `Skipped` happened entirely client-side; the hint was never tested
-///   on the wire and is still trustworthy.
 #[derive(Debug)]
 pub enum MountResult {
     /// Registry fulfilled the mount (201 Created). The blob is now
     /// referenced from the target repo without a data transfer.
     Mounted,
-    /// Registry returned 202 without fulfilling the mount. Any cached
-    /// mount-source hint is suspect.
-    NotFulfilled,
-    /// Client short-circuited before issuing the POST because the target
-    /// provider is known to never fulfill mount (see
-    /// [`ProviderKind::fulfills_cross_repo_mount`]). No network request
-    /// was made; any cached mount-source hint is still valid.
-    Skipped,
+    /// Mount did not happen. Either the registry returned 202 without
+    /// fulfilling the mount, or the client short-circuited before
+    /// issuing the POST because the target provider is known to never
+    /// fulfill mount (see [`ProviderKind::fulfills_cross_repo_mount`]).
+    /// Callers fall through to HEAD + push either way.
+    NotMounted,
 }
 
 /// Build the path segment for a blob: `/blobs/{digest}`.
@@ -136,9 +124,9 @@ impl RegistryClient {
     /// Attempt a cross-repository blob mount.
     ///
     /// Issues a POST to `/v2/{repository}/blobs/uploads/?mount={digest}&from={from_repo}`.
-    /// Returns [`MountResult::Mounted`] on 201, [`MountResult::NotFulfilled`] on 202,
-    /// or [`MountResult::Skipped`] without a network request when the target provider
-    /// is known to never fulfill mount (see [`ProviderKind::fulfills_cross_repo_mount`]).
+    /// Returns [`MountResult::Mounted`] on 201 and [`MountResult::NotMounted`] on 202
+    /// or when the client short-circuits because the target provider never fulfills
+    /// mount (see [`ProviderKind::fulfills_cross_repo_mount`]).
     pub async fn blob_mount(
         &self,
         repository: &RepositoryName,
@@ -153,7 +141,7 @@ impl RegistryClient {
                 ?provider_kind,
                 "skipping cross-repo mount POST: provider does not fulfill mount"
             );
-            return Ok(MountResult::Skipped);
+            return Ok(MountResult::NotMounted);
         }
 
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
@@ -556,7 +544,7 @@ async fn classify_mount_response(resp: reqwest::Response) -> Result<MountResult,
     let status = resp.status();
     match status {
         StatusCode::CREATED => Ok(MountResult::Mounted),
-        StatusCode::ACCEPTED => Ok(MountResult::NotFulfilled),
+        StatusCode::ACCEPTED => Ok(MountResult::NotMounted),
         _ => {
             let message = resp.text().await.unwrap_or_default();
             Err(Error::RegistryError { status, message })
@@ -823,16 +811,16 @@ mod tests {
         assert_eq!(result, digest);
     }
 
-    /// Covers the hostname-keyed mount routing and the three `MountResult`
-    /// outcomes:
+    /// Covers the hostname-keyed mount routing:
     ///
-    /// - ECR: client short-circuits, zero POSTs issued, `Skipped`.
+    /// - ECR (private + public): client short-circuits, zero POSTs issued,
+    ///   returns `NotMounted`.
     /// - GHCR, 201 response: `Mounted`.
-    /// - GHCR, 202 response: `NotFulfilled` (server-side fallback).
+    /// - GHCR, 202 response: `NotMounted` (server fallback).
     /// - Unknown host, 201 response: `Mounted` (optimistic default).
     ///
-    /// The ECR row's `.expect(0)` is the negative assertion that pins the
-    /// short-circuit — if it breaks, the test fails.
+    /// The short-circuit rows are negative assertions: `.expect(0)` on the
+    /// POST catches a regression that would re-introduce the wasted call.
     #[tokio::test]
     async fn blob_mount_routes_per_provider() {
         /// `server` is `None` for rows where the short-circuit should fire
@@ -840,42 +828,36 @@ mod tests {
         struct Case {
             host: &'static str,
             server: Option<u16>,
-            expected: MountOutcome,
-        }
-
-        enum MountOutcome {
-            Mounted,
-            NotFulfilled,
-            Skipped,
+            expect_mounted: bool,
         }
 
         let cases = [
             Case {
                 host: "123456789012.dkr.ecr.us-east-1.amazonaws.com",
                 server: None,
-                expected: MountOutcome::Skipped,
+                expect_mounted: false,
             },
             Case {
                 // Inferred from ECR private — same AWS backend, assumed
                 // to share mount behavior until proven otherwise.
                 host: "public.ecr.aws",
                 server: None,
-                expected: MountOutcome::Skipped,
+                expect_mounted: false,
             },
             Case {
                 host: "ghcr.io",
                 server: Some(201),
-                expected: MountOutcome::Mounted,
+                expect_mounted: true,
             },
             Case {
                 host: "ghcr.io",
                 server: Some(202),
-                expected: MountOutcome::NotFulfilled,
+                expect_mounted: false,
             },
             Case {
                 host: "my-private-registry.example.com",
                 server: Some(201),
-                expected: MountOutcome::Mounted,
+                expect_mounted: true,
             },
         ];
 
@@ -885,9 +867,8 @@ mod tests {
 
             let (expected_post_count, response_status) = match case.server {
                 Some(s) => (1, s),
-                // Short-circuit expected — any POST that escapes fails the
-                // test. The response template is unreachable; 500 flags it
-                // loudly if the `.expect(0)` guard ever breaks.
+                // Short-circuit expected; 500 is unreachable but flags
+                // loudly if the `.expect(0)` guard breaks.
                 None => (0, 500),
             };
 
@@ -908,10 +889,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            let ok = match case.expected {
-                MountOutcome::Mounted => matches!(result, MountResult::Mounted),
-                MountOutcome::NotFulfilled => matches!(result, MountResult::NotFulfilled),
-                MountOutcome::Skipped => matches!(result, MountResult::Skipped),
+            let ok = match (case.expect_mounted, &result) {
+                (true, MountResult::Mounted) | (false, MountResult::NotMounted) => true,
+                _ => false,
             };
             assert!(
                 ok,

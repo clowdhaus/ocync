@@ -93,30 +93,27 @@ target.
 ### Action taken
 
 - `ProviderKind::fulfills_cross_repo_mount()` uses an exhaustive `match`
-  so adding a new provider forces a compile-time decision. `Ecr` returns
-  `false`; all other known providers return `true`.
+  so adding a new provider forces a compile-time decision. `Ecr` and
+  `EcrPublic` return `false`; all other known providers return `true`.
+  ECR Public is inferred from private ECR (same AWS backend team). If a
+  future observation shows ECR Public does fulfill mount, flip the arm
+  and add a re-validate entry.
 - `blob_mount` short-circuits when the target hostname resolves to a
-  provider that does not fulfill mount — returns `MountResult::Skipped`
+  provider that does not fulfill mount — returns `MountResult::NotMounted`
   without issuing the POST, saving one round-trip per shared blob per
-  target. Applies to `ProviderKind::Ecr` (measured) and
-  `ProviderKind::EcrPublic` (inferred — same AWS backend team; if a
-  future observation shows ECR Public does fulfill mount, flip the
-  arm and add a re-validate entry here).
-- `MountResult` has three variants to express what the engine needs to
-  know:
-  - `Mounted` — registry fulfilled the mount (201).
-  - `NotFulfilled` — registry returned 202; the cached mount-source hint
-    is probably stale, engine invalidates.
-  - `Skipped` — client short-circuited without a request; the hint was
-    never tested, engine does NOT invalidate. This preserves the
-    in-progress claim so concurrent tasks transferring the same blob
-    to a different repo at this target wait for the push and reuse the
-    staged data (pull-once fan-out).
+  target.
+- `MountResult` is two-variant (`Mounted` / `NotMounted`). A mid-review
+  iteration tried a three-variant distinction (separate `Skipped` for
+  short-circuit vs `NotFulfilled` for server-202) intended to preserve
+  the in-progress claim on short-circuit. Empirical wiremock testing
+  showed the distinction did not change observable bytes or request
+  counts: staging handles pull-once dedup at the filesystem layer, and
+  `set_blob_completed` after push re-populates whatever the invalidation
+  briefly wiped. The simpler two-variant enum ships.
 - Protocol coverage: `tests/registry2_mount.rs` pins `Mounted` and
-  `NotFulfilled` against the OCI reference `registry:2` container.
+  `NotMounted` against the OCI reference `registry:2` container.
   `engine_integration::sync_warm_cache_ecr_target_short_circuits_mount`
-  pins the engine-level wire behavior (0 mount POSTs on ECR) and the
-  cache-preservation property (Skipped must not invalidate).
+  pins the engine-level wire behavior (0 mount POSTs on ECR).
 
 ### To re-validate
 
