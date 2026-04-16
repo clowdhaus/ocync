@@ -97,13 +97,13 @@ Codified in `xtask/src/bench/config_gen.rs`:
 - **dregsy** requires `auth-refresh: 12h` on ECR targets. Without it, dregsy skips the AWS SDK refresher and falls through to skopeo's fragile credential resolution.
 - **dregsy** exits 1 on any failed skopeo copy, even with 99% success. Parse per-image logs for real metrics, not exit code.
 
-### Baseline (5 images, 6 tags, c6in.large, cold sync to ECR us-east-1)
+### Baseline
 
-| Tool | Wall clock | Exit | Requests | Response bytes |
-|------|-----------|------|----------|----------------|
-| ocync | 243.6s | 0 | 720 | 659 MB |
-| dregsy | 179.5s | 1 (partial) | 326 | 333 MB |
-| regsync | 343.5s | 0 | 466 | 648 MB |
+No valid cross-tool baseline exists yet. The prior comparison (ocync=720, dregsy=326, regsync=466 requests) is invalid — dregsy partially failed (exit 1) and all runs were proxy-bottlenecked. A fair 3-tool comparison where all tools complete successfully is required before any efficiency claims.
+
+ocync-only mount short-circuit measurement (c6in.large, Jupyter corpus, cold → ECR):
+- Before: 3,397 requests, 148 mount POSTs (all 202), 11.5 GB
+- After: 3,249 requests, 0 mount POSTs, 11.5 GB
 
 ### Bench-proxy
 
