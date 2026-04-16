@@ -189,9 +189,15 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     Some(n) => partial_corpus.limit(n),
                     None => partial_corpus,
                 };
-                let result =
-                    run_partial(&args, &corpus, &partial_corpus, &tools, &ecr_client, &output_dir)
-                        .await?;
+                let result = run_partial(
+                    &args,
+                    &corpus,
+                    &partial_corpus,
+                    &tools,
+                    &ecr_client,
+                    &output_dir,
+                )
+                .await?;
                 report.scenarios.push(result);
             }
             RunnableScenario::Scale => {
@@ -461,7 +467,8 @@ async fn run_partial(
 
         // Prime with base corpus (unmeasured).
         let config_dir = tempfile::tempdir()?;
-        let _prime = run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
+        let _prime =
+            run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
         eprintln!(
             "  partial: {} prime complete, running with partial corpus",
             tool
@@ -469,7 +476,8 @@ async fn run_partial(
 
         // Measured run with partial corpus.
         let config_dir = tempfile::tempdir()?;
-        let run = run_single_tool(args, tool, partial_corpus, config_dir.path(), output_dir).await?;
+        let run =
+            run_single_tool(args, tool, partial_corpus, config_dir.path(), output_dir).await?;
         runs.push(run);
 
         ecr::delete_repos(ecr_client, base_corpus).await?;
