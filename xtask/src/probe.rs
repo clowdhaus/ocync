@@ -8,7 +8,7 @@
 //!
 //! Uses [`RegistryClient::blob_mount_unchecked`] to bypass the client-level
 //! short-circuit — if we used `blob_mount`, every call would return
-//! `MountResult::NotSupported` on ECR by design.
+//! `MountResult::SkippedByClient` on ECR by design.
 //!
 //! Related: `docs/specs/benchmark-design-v2.md` §PR #1, the
 //! `project_ecr_mount_behavior` memory, and the `registry2_mount.rs` /
@@ -23,10 +23,12 @@
 //!     --wait-secs 10
 //! ```
 
+use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_ecr::operation::delete_repository::DeleteRepositoryError;
 use clap::Args;
+use futures_util::FutureExt;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::auth::ecr::EcrAuth;
 use ocync_distribution::blob::MountResult;
@@ -128,17 +130,21 @@ pub(crate) async fn run(args: ProbeArgs) -> Result<(), Box<dyn std::error::Error
         return Err(e);
     }
 
-    let run_result = probe_body(
+    // `catch_unwind` ensures that even a panic inside `probe_body` (e.g.
+    // an unwrap failure on an unexpected SDK response) still runs the
+    // cleanup branch below. Without this, a panic would leave two paid
+    // ECR repositories dangling until manual intervention.
+    let body_fut = AssertUnwindSafe(probe_body(
         &registry,
         &source_name,
         &target_name,
         iterations,
         wait_secs,
         blob_size,
-    )
-    .await;
+    ))
+    .catch_unwind();
+    let body_outcome = body_fut.await;
 
-    // Cleanup regardless of body outcome (unless --keep-repos).
     if keep_repos {
         eprintln!("probe: --keep-repos set; leaving '{source_name}' and '{target_name}' in place");
     } else {
@@ -146,7 +152,10 @@ pub(crate) async fn run(args: ProbeArgs) -> Result<(), Box<dyn std::error::Error
         delete_repo(&sdk, &target_name).await;
     }
 
-    run_result
+    match body_outcome {
+        Ok(result) => result,
+        Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+    }
 }
 
 /// The work of the probe, factored out so cleanup runs regardless of
@@ -205,11 +214,13 @@ async fn probe_one_mount(
     let outcome = match res {
         Ok(MountResult::Mounted) => AttemptOutcome::Mounted,
         Ok(MountResult::FallbackUpload { .. }) => AttemptOutcome::FallbackUpload,
-        Ok(MountResult::NotSupported) => {
+        Ok(MountResult::SkippedByClient) => {
             // `blob_mount_unchecked` bypasses the short-circuit, so this branch
             // should be unreachable — treat as an error so the summary
             // surfaces the anomaly rather than silently succeeding.
-            eprintln!("probe: warning: blob_mount_unchecked returned NotSupported (unreachable)");
+            eprintln!(
+                "probe: warning: blob_mount_unchecked returned SkippedByClient (unreachable)"
+            );
             AttemptOutcome::Error
         }
         Err(e) => {

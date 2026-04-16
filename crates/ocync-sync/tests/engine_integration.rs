@@ -46,23 +46,19 @@ fn mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClient> {
 }
 
 /// Build a `RegistryClient` whose `base_url` has an ECR hostname but all
-/// traffic is redirected (via `reqwest::resolve`) to the mock server's local
-/// port. Used to exercise ECR-specific code paths (mount short-circuit) without
-/// a real ECR endpoint.
+/// traffic is redirected (via `RegistryClientBuilder::resolve`) to the mock
+/// server's local port. Used to exercise ECR-specific code paths (mount
+/// short-circuit) without a real ECR endpoint.
 fn ecr_mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClient> {
     let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
     let mock_port = mock_url(server).port().unwrap();
     let base_url = Url::parse(&format!("http://{host}:{mock_port}")).unwrap();
-    let http = reqwest::Client::builder()
-        .resolve(
-            host,
-            std::net::SocketAddr::from(([127, 0, 0, 1], mock_port)),
-        )
-        .build()
-        .unwrap();
     Arc::new(
         RegistryClientBuilder::new(base_url)
-            .http_client(http)
+            .resolve(
+                host,
+                std::net::SocketAddr::from(([127, 0, 0, 1], mock_port)),
+            )
             .build()
             .unwrap(),
     )
@@ -2007,10 +2003,24 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
     mount_blob_pull(&source_server, "repo-b", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "repo-b", &layer_desc.digest, layer_data).await;
 
-    // Target: manifest HEAD 404, blobs don't exist yet.
+    // Target: manifest HEAD 404.
     mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
-    mount_blob_not_found(&target_server, "repo-b", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo-b", &layer_desc.digest).await;
+
+    // Inline HEAD mocks with `.expect(1)` each — the short-circuit must
+    // fall through to HEAD + push, and the count pins that exactly one
+    // HEAD per blob is issued (not zero, not cached, not repeated).
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo-b/blobs/{}", config_desc.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo-b/blobs/{}", layer_desc.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&target_server)
+        .await;
 
     // NEGATIVE ASSERTION: zero mount POSTs should arrive at the target.
     // This is the whole point of the short-circuit — the POST is wasted on

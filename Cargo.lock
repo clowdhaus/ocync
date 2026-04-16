@@ -4045,6 +4045,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-ecr",
  "clap",
+ "futures-util",
  "ocync-distribution",
  "serde",
  "serde_json",

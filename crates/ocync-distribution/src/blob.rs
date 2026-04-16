@@ -22,40 +22,30 @@ const MONOLITHIC_THRESHOLD: u64 = 1024 * 1024;
 /// Content type for raw blob data in OCI upload requests.
 const OCTET_STREAM: &str = "application/octet-stream";
 
-/// Whether the given provider is known to fulfill OCI cross-repo blob mount.
-///
-/// Returns `false` for providers where mount is observed to always fail — in
-/// that case [`RegistryClient::blob_mount`] short-circuits the mount POST
-/// entirely and returns [`MountResult::NotSupported`]. Defaults to `true`
-/// for unknown providers (optimistic: attempt mount, fall back on 202).
-///
-/// Current non-supporting providers:
-/// - [`ProviderKind::Ecr`]: 193 observed mount POSTs returned 202, never
-///   201. See `project_ecr_mount_behavior` in memory and the real-ECR
-///   integration test in `crates/ocync-distribution/tests/ecr_mount.rs`.
-pub fn supports_cross_repo_mount(kind: Option<ProviderKind>) -> bool {
-    !matches!(kind, Some(ProviderKind::Ecr))
-}
-
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
 pub enum MountResult {
-    /// The blob was successfully mounted.
+    /// The registry returned `201 Created` — the blob is now referenced
+    /// from the target repo without a data transfer.
     Mounted,
-    /// The registry did not support mounting; use the returned upload URL instead.
+    /// The registry returned `202 Accepted` with a fresh upload URL —
+    /// the caller should PATCH data to `upload_url` to complete the
+    /// transfer via a normal chunked upload.
     FallbackUpload {
-        /// The URL to use for a chunked upload.
+        /// The URL to use for the fallback PATCH upload.
         upload_url: String,
     },
-    /// The target provider is known to never fulfill cross-repo mount, so
-    /// `blob_mount` returns this without issuing any network request.
-    /// Callers should proceed directly to HEAD + push rather than treating
-    /// the mount as a fallback upload attempt.
+    /// The client chose not to issue the mount POST at all because the
+    /// target provider is known to never fulfill mount (e.g. AWS ECR
+    /// returns 202 to every OCI mount, never 201 — see
+    /// `docs/specs/findings.md`). Callers should proceed directly to
+    /// HEAD + push; no fallback upload URL is available.
     ///
-    /// Currently returned for AWS ECR: all observed mount POSTs return 202
-    /// (never 201 — see `project_ecr_mount_behavior` in CLAUDE.md memory).
-    /// Skipping the POST saves one round-trip per shared blob per target.
-    NotSupported,
+    /// This variant represents a *client-side* decision driven by
+    /// [`ProviderKind::fulfills_cross_repo_mount`] — it is not a server
+    /// capability signal. Use [`RegistryClient::blob_mount_unchecked`]
+    /// to observe what the provider actually returns.
+    SkippedByClient,
 }
 
 /// Build the path segment for a blob: `/blobs/{digest}`.
@@ -149,9 +139,9 @@ impl RegistryClient {
     /// If the registry supports it, returns [`MountResult::Mounted`]. Otherwise,
     /// falls back to a regular upload URL.
     ///
-    /// Returns [`MountResult::NotSupported`] without issuing a network request
-    /// for providers known to never fulfill mount (currently ECR). Callers
-    /// should treat this as a signal to go directly to HEAD + push.
+    /// Returns [`MountResult::SkippedByClient`] without issuing a network
+    /// request for providers known to never fulfill mount (currently ECR).
+    /// Callers should treat this as a signal to go directly to HEAD + push.
     ///
     /// Use [`blob_mount_unchecked`](Self::blob_mount_unchecked) to bypass the short-circuit
     /// for diagnostic purposes (e.g. `xtask probe`).
@@ -162,14 +152,15 @@ impl RegistryClient {
         from_repo: &RepositoryName,
     ) -> Result<MountResult, Error> {
         let provider_kind = self.base_url.host_str().and_then(detect_provider_kind);
-        if !supports_cross_repo_mount(provider_kind) {
+        let fulfills = provider_kind.is_none_or(|k| k.fulfills_cross_repo_mount());
+        if !fulfills {
             tracing::debug!(
                 target = %repository,
                 %digest,
                 ?provider_kind,
                 "skipping cross-repo mount POST: provider does not fulfill mount"
             );
-            return Ok(MountResult::NotSupported);
+            return Ok(MountResult::SkippedByClient);
         }
 
         self.blob_mount_unchecked(repository, digest, from_repo)
@@ -606,19 +597,24 @@ async fn classify_mount_response(resp: reqwest::Response) -> Result<MountResult,
 mod tests {
     use super::*;
 
-    // --- supports_cross_repo_mount ---
+    // --- ProviderKind::fulfills_cross_repo_mount ---
 
     #[test]
-    fn supports_mount_ecr_returns_false() {
+    fn fulfills_mount_ecr_returns_false() {
         // ECR always returns 202 to OCI mount POSTs, so the client
         // short-circuits and skips the POST entirely.
-        assert!(!supports_cross_repo_mount(Some(ProviderKind::Ecr)));
+        assert!(!ProviderKind::Ecr.fulfills_cross_repo_mount());
     }
 
     #[test]
-    fn supports_mount_non_ecr_returns_true() {
+    fn fulfills_mount_non_ecr_returns_true() {
         // All other known providers are attempted optimistically. Failure
         // falls through to `MountResult::FallbackUpload` at the client layer.
+        //
+        // Change-detector test: if a new `ProviderKind` variant is added,
+        // this test does NOT cover it. Always re-audit this list when
+        // adding a new provider — falsely assuming "fulfills mount" for a
+        // non-fulfilling provider regresses efficiency silently.
         for kind in [
             ProviderKind::EcrPublic,
             ProviderKind::Gcr,
@@ -629,17 +625,10 @@ mod tests {
             ProviderKind::Chainguard,
         ] {
             assert!(
-                supports_cross_repo_mount(Some(kind)),
-                "expected {kind:?} to support cross-repo mount (until proven otherwise)"
+                kind.fulfills_cross_repo_mount(),
+                "expected {kind:?} to fulfill cross-repo mount (until proven otherwise)"
             );
         }
-    }
-
-    #[test]
-    fn supports_mount_unknown_defaults_true() {
-        // Unknown providers get the optimistic default: attempt mount, fall
-        // back on 202. Private registries and Harbor land here.
-        assert!(supports_cross_repo_mount(None));
     }
 
     #[test]
@@ -946,7 +935,7 @@ mod tests {
 
     /// ECR never fulfills OCI cross-repo mount (178/178 returned 202 in
     /// benchmark observations), so `blob_mount` on an ECR target must
-    /// short-circuit and return [`MountResult::NotSupported`] without
+    /// short-circuit and return [`MountResult::SkippedByClient`] without
     /// issuing any HTTP request. The wiremock server below refuses all
     /// requests — if the short-circuit is missing, the test fails.
     #[tokio::test]
@@ -970,14 +959,18 @@ mod tests {
         let result = client.blob_mount(&repo, &digest, &from_repo).await.unwrap();
 
         assert!(
-            matches!(result, MountResult::NotSupported),
-            "expected MountResult::NotSupported on ECR target, got {result:?}"
+            matches!(result, MountResult::SkippedByClient),
+            "expected MountResult::SkippedByClient on ECR target, got {result:?}"
         );
     }
 
     /// `blob_mount_unchecked` must bypass the ECR short-circuit and actually
     /// issue the POST. Used by the `xtask probe` diagnostic subcommand to
     /// observe what ECR returns on the wire.
+    ///
+    /// Also asserts no PATCH/PUT follows — the mount call must return
+    /// after classifying the 202 response, NOT silently continue into a
+    /// full fallback upload.
     #[tokio::test]
     async fn blob_mount_unchecked_on_ecr_issues_request() {
         let server = wiremock::MockServer::start().await;
@@ -993,6 +986,18 @@ mod tests {
                     .append_header("Location", "/v2/tgt/repo/blobs/uploads/uuid-ecr"),
             )
             .expect(1)
+            .mount(&server)
+            .await;
+
+        // NEGATIVE: mount classification must not cascade into an upload.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -1012,8 +1017,64 @@ mod tests {
         );
     }
 
+    /// Build a `RegistryClient` with an unknown hostname (no matching
+    /// `ProviderKind`). Used to assert the short-circuit defaults to
+    /// optimistic for unrecognized providers.
+    fn build_unknown_client(port: u16) -> RegistryClient {
+        let host = "my-private-registry.example.com";
+        let base_url = url::Url::parse(&format!("http://{host}:{port}")).unwrap();
+        let http = reqwest::Client::builder()
+            .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .build()
+            .unwrap();
+
+        RegistryClient {
+            base_url,
+            http,
+            auth: None,
+            aimd: crate::aimd::AimdController::new(host, 8),
+            chunk_size: 4,
+        }
+    }
+
+    /// Unknown providers default to optimistic: the short-circuit must
+    /// NOT fire, and the POST must reach the server. Without this test, a
+    /// future regression that gated mount on "only known providers"
+    /// would pass silently for every non-ECR self-hosted registry
+    /// (Quay, Harbor, etc.).
+    #[tokio::test]
+    async fn blob_mount_on_unknown_host_issues_request() {
+        let server = wiremock::MockServer::start().await;
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/tgt/repo/blobs/uploads/"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_unknown_client(port);
+        let result = client
+            .blob_mount(
+                &RepositoryName::new("tgt/repo"),
+                &test_digest(b"unknown host mount"),
+                &RepositoryName::new("src/repo"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, MountResult::Mounted),
+            "unknown providers must not short-circuit; expected Mounted, got {result:?}"
+        );
+    }
+
     /// GHCR is expected to honor mount (not short-circuited). When the
     /// registry returns 201, the client surfaces `MountResult::Mounted`.
+    ///
+    /// Also asserts no PATCH/PUT follows — a 201 mount is complete; a
+    /// bug that issued a fallback upload anyway would fail here.
     #[tokio::test]
     async fn blob_mount_on_ghcr_issues_request() {
         let server = wiremock::MockServer::start().await;
@@ -1024,6 +1085,18 @@ mod tests {
             .and(wiremock::matchers::query_param("from", "src/repo"))
             .respond_with(wiremock::ResponseTemplate::new(201))
             .expect(1)
+            .mount(&server)
+            .await;
+
+        // NEGATIVE: 201 mount-success must not be followed by any upload.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
             .mount(&server)
             .await;
 

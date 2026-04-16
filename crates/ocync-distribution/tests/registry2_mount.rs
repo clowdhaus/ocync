@@ -9,7 +9,7 @@
 //! The complementary suite, `ecr_mount.rs`, answers the same question
 //! against real AWS ECR — gated behind `--features ecr-integration`.
 //! Together they guard the `MountResult::Mounted` vs
-//! `MountResult::NotSupported` decision at the client layer.
+//! `MountResult::SkippedByClient` decision at the client layer.
 //!
 //! Requirements:
 //! - Docker must be running

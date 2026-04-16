@@ -40,6 +40,10 @@ url = { version = "2", default-features = false }
 [dev-dependencies]
 aws-config.workspace = true
 aws-sdk-ecr.workspace = true
+# Integration tests pull in `catch_unwind` (via `FutureExt`) to guarantee
+# ECR test-repo cleanup even if a test body panics. The production code
+# path uses the slimmer `default-features = false` set above.
+futures-util = { version = "0.3", features = ["std"] }
 testcontainers = { version = "0.27", default-features = false }
 tokio = { workspace = true, features = ["sync", "time", "test-util", "macros", "rt-multi-thread"] }
 wiremock = "0.6"

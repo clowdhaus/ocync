@@ -90,24 +90,25 @@ target.
 
 ### Action taken (PR #25)
 
-- `MountResult::NotSupported` variant added; `blob_mount` returns it
+- `MountResult::SkippedByClient` variant added; `blob_mount` returns it
   without a network request when the target is ECR.
-- `supports_cross_repo_mount(Option<ProviderKind>)` helper in
-  `ocync-distribution::blob` is the single point where registry mount
-  capability is recorded.
+- `ProviderKind::fulfills_cross_repo_mount(&self) -> bool` method on
+  the provider enum is the single point where registry mount capability
+  is recorded.
 - `blob_mount_unchecked` exposes the unconditional POST for diagnostic
   tooling (`xtask probe`) so future observations can bypass the
   short-circuit.
 - Protocol tests pair a positive case (`registry:2` returns 201,
   `MountResult::Mounted`) with a negative case (real ECR returns 202,
-  `MountResult::FallbackUpload` via unchecked; `MountResult::NotSupported`
+  `MountResult::FallbackUpload` via unchecked; `MountResult::SkippedByClient`
   via `blob_mount`).
 
 ### To re-validate
 
-If AWS behavior changes, flip `supports_cross_repo_mount` to allow ECR
-and update both `tests/ecr_mount.rs::ecr_mount_returns_not_supported`
-and `tests/ecr_mount.rs::ecr_mount_unchecked_returns_fallback_upload`
+If AWS behavior changes, flip `ProviderKind::fulfills_cross_repo_mount`
+to allow ECR and update both
+`tests/ecr_mount.rs::ecr_mount_returns_skipped_by_client` and
+`tests/ecr_mount.rs::ecr_mount_unchecked_returns_fallback_upload`
 together. Re-confirm with:
 
 ```

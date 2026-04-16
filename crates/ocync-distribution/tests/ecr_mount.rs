@@ -4,7 +4,7 @@
 //! baseline against the OCI reference implementation; this one asserts what
 //! actually happens at ECR. Per Bryant's observation (178/178 OCI mount
 //! POSTs returned 202 during the first instrumented benchmark),
-//! `ocync_distribution::blob::MountResult::NotSupported` is the expected
+//! `ocync_distribution::blob::MountResult::SkippedByClient` is the expected
 //! outcome — the client short-circuits the POST entirely on ECR targets.
 //!
 //! # Running
@@ -33,9 +33,11 @@
 #![cfg(feature = "ecr-integration")]
 
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_ecr::operation::delete_repository::DeleteRepositoryError;
+use futures_util::FutureExt;
 use ocync_distribution::auth::ecr::EcrAuth;
 use ocync_distribution::blob::MountResult;
 use ocync_distribution::client::RegistryClientBuilder;
@@ -135,11 +137,13 @@ async fn delete_repo(sdk: &aws_sdk_ecr::Client, name: &str) {
 }
 
 /// Run `body` against a freshly-created source + target repo pair and
-/// guarantee both are deleted regardless of body outcome.
+/// guarantee both are deleted regardless of body outcome — including
+/// panics from assertions inside the body.
 ///
-/// The body is expected to return a `Result<T, String>` so no assertion
-/// panics can leak a repo. Tests that want to panic on failure should do
-/// so AFTER this helper returns, once cleanup has already run.
+/// The body returns `Result<T, String>` for non-panic errors. If the
+/// body future panics, the helper catches the panic, runs cleanup, then
+/// re-raises so the test failure reporting is unchanged. Without this,
+/// a failing `assert!` inside the body would leak paid ECR repos.
 async fn with_ephemeral_repos<F, Fut, T>(
     sdk: &aws_sdk_ecr::Client,
     source: &str,
@@ -156,10 +160,20 @@ where
         delete_repo(sdk, source).await;
         return Err(e);
     }
-    let outcome = body().await;
+
+    // Catch panics in body so cleanup always runs. `AssertUnwindSafe`
+    // is safe here because the body closure captures only borrowed
+    // references that outlive this call.
+    let body_fut = AssertUnwindSafe(body()).catch_unwind();
+    let outcome = body_fut.await;
+
     delete_repo(sdk, source).await;
     delete_repo(sdk, target).await;
-    outcome
+
+    match outcome {
+        Ok(result) => result,
+        Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+    }
 }
 
 /// Deterministic tiny blob used by the mount tests.
@@ -179,17 +193,17 @@ fn tiny_blob_digest() -> Digest {
 // ---------------------------------------------------------------------------
 
 /// **Client-layer pinning:** on ECR, [`RegistryClient::blob_mount`] must
-/// return [`MountResult::NotSupported`] without issuing any network
+/// return [`MountResult::SkippedByClient`] without issuing any network
 /// request. This asserts the short-circuit is wired correctly; paired
 /// with [`ecr_mount_unchecked_returns_fallback_upload`] below, which
 /// pins what ECR actually returns on the wire.
 ///
 /// If ECR ever starts fulfilling OCI mount (returning 201) this test
 /// still passes — the short-circuit is based on provider detection, not
-/// live response. When that day comes, flip `supports_cross_repo_mount`
+/// live response. When that day comes, flip `ProviderKind::fulfills_cross_repo_mount`
 /// and update both this assertion and the unchecked companion.
 #[tokio::test]
-async fn ecr_mount_returns_not_supported() {
+async fn ecr_mount_returns_skipped_by_client() {
     let Some(hostname) = ecr_hostname_or_skip() else {
         return;
     };
@@ -222,11 +236,11 @@ async fn ecr_mount_returns_not_supported() {
     })
     .await;
 
-    let result = outcome.expect("ecr_mount_returns_not_supported body failed");
+    let result = outcome.expect("ecr_mount_returns_skipped_by_client body failed");
     assert!(
-        matches!(result, MountResult::NotSupported),
-        "expected MountResult::NotSupported on ECR target, got {result:?}. \
-         If ECR now fulfills mount, update `supports_cross_repo_mount` and \
+        matches!(result, MountResult::SkippedByClient),
+        "expected MountResult::SkippedByClient on ECR target, got {result:?}. \
+         If ECR now fulfills mount, update `ProviderKind::fulfills_cross_repo_mount` and \
          this test together."
     );
 }
@@ -272,8 +286,14 @@ async fn ecr_mount_unchecked_returns_fallback_upload() {
     assert!(
         matches!(result, MountResult::FallbackUpload { .. }),
         "expected FallbackUpload (202) from real ECR, got {result:?}. \
-         If AWS is now returning 201 on mount, flip `supports_cross_repo_mount` \
-         to allow ECR and update both this test and the `_returns_not_supported` \
+         If AWS is now returning 201 on mount, flip `ProviderKind::fulfills_cross_repo_mount` \
+         to allow ECR and update both this test and the `_returns_skipped_by_client` \
          companion."
     );
 }
+
+// The doc comment on `ecr_mount_returns_skipped_by_client` is decoupled
+// from wire behavior on purpose — the short-circuit is provider-keyed.
+// `ecr_mount_unchecked_returns_fallback_upload` is the test that detects
+// AWS behavior changes; a change there forces a paired update to both
+// tests and to `ProviderKind::fulfills_cross_repo_mount`.
