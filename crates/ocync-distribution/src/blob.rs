@@ -384,7 +384,13 @@ impl RegistryClient {
                 },
             )
             .await?;
-        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
+        // The OCI spec requires 202 Accepted for PATCH chunks, but ECR
+        // returns 201 Created. Accept both to handle this deviation.
+        let status = resp.status();
+        if status != StatusCode::ACCEPTED && status != StatusCode::CREATED {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(Error::RegistryError { status, message });
+        }
         extract_location(&resp, &self.base_url)
     }
 
