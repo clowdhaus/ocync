@@ -196,7 +196,7 @@ Network code requires `wiremock` tests verifying actual HTTP request sequences, 
 
 ### testcontainers for protocol correctness
 
-wiremock tests verify code handles expected responses, but can't catch protocol mismatches where real registries return different status codes (ECR returns 201 on PATCH instead of spec's 202). Every HTTP protocol path needs a `testcontainers` test against `registry:2` (CNCF Distribution) in addition to wiremock tests. Run with `cargo test --package ocync-distribution --test ecr_integration`. Requires Docker.
+wiremock tests verify code handles expected responses, but can't catch protocol mismatches where real registries return different status codes (ECR returns 201 on PATCH instead of spec's 202). Every HTTP protocol path needs a `testcontainers` test against `registry:2` (CNCF Distribution) in addition to wiremock tests. Suites live in `crates/ocync-distribution/tests/registry2_*.rs`; run with `cargo test --package ocync-distribution --test registry2_client` (general client operations) or `... --test registry2_mount` (cross-repo mount). Requires Docker.
 
 ### Engine tests must cover the production shutdown path
 
@@ -237,7 +237,8 @@ cargo fmt --check && cargo clippy -- -D warnings && cargo test && cargo deny che
 cargo test
 
 # Integration tests against local registry (requires Docker)
-cargo test --package ocync-distribution --test ecr_integration
+cargo test --package ocync-distribution --test registry2_client
+cargo test --package ocync-distribution --test registry2_mount
 
 # Check formatting
 cargo fmt --check

@@ -10,6 +10,15 @@ description = "OCI Distribution client library"
 [lints]
 workspace = true
 
+[features]
+# Enables `tests/ecr_mount.rs` — wire-level cross-repo mount tests against
+# real AWS ECR. Requires AWS credentials in the environment and the
+# `OCYNC_TEST_ECR_HOSTNAME` env var pointing at an ECR registry hostname
+# (e.g. `123456789012.dkr.ecr.us-east-1.amazonaws.com`). Costs a few cents
+# per run (repo create/delete + blob push). Not a production feature —
+# gates test compilation only.
+ecr-integration = []
+
 [dependencies]
 aws-config.workspace = true
 aws-lc-rs.workspace = true

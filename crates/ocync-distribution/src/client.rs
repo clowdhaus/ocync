@@ -21,6 +21,7 @@ pub struct RegistryClientBuilder {
     auth: Option<Box<dyn AuthProvider>>,
     max_concurrent: usize,
     chunk_size: usize,
+    http: Option<reqwest::Client>,
 }
 
 impl std::fmt::Debug for RegistryClientBuilder {
@@ -43,6 +44,7 @@ impl RegistryClientBuilder {
             auth: None,
             max_concurrent: DEFAULT_MAX_CONCURRENT_REQUESTS,
             chunk_size: DEFAULT_CHUNK_SIZE,
+            http: None,
         }
     }
 
@@ -64,11 +66,25 @@ impl RegistryClientBuilder {
         self
     }
 
+    /// Supply a pre-configured [`reqwest::Client`] instead of the default.
+    ///
+    /// Use when the caller needs DNS overrides, custom TLS roots, a
+    /// different user-agent, or proxy configuration beyond what the builder
+    /// exposes. Integration tests use this to route ECR-hostname requests
+    /// to a local mock server.
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = Some(client);
+        self
+    }
+
     /// Build the registry client.
     pub fn build(self) -> Result<RegistryClient, Error> {
-        let http = reqwest::Client::builder()
-            .user_agent(USER_AGENT_VALUE)
-            .build()?;
+        let http = match self.http {
+            Some(c) => c,
+            None => reqwest::Client::builder()
+                .user_agent(USER_AGENT_VALUE)
+                .build()?,
+        };
 
         let aimd = AimdController::new(
             self.url.host_str().unwrap_or("unknown"),

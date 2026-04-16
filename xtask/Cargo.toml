@@ -12,8 +12,10 @@ workspace = true
 aws-config.workspace = true
 aws-sdk-ecr.workspace = true
 clap.workspace = true
+ocync-distribution.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "process", "time"] }
+url.workspace = true

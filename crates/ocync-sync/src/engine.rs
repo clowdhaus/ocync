@@ -1440,6 +1440,18 @@ async fn transfer_image_blobs(
                     tracing::debug!(target: "ocync::metrics", result = "fallback", "mount");
                     tracing::debug!(target: "ocync::metrics", "cache_invalidation");
                 }
+                Ok(MountResult::NotSupported) => {
+                    // Provider is known to never fulfill mount (e.g. ECR).
+                    // The client short-circuited without issuing a POST.
+                    // The mount source is still valid — don't invalidate;
+                    // it remains useful for same-repo HEAD-skip. Fall
+                    // through to HEAD + push.
+                    tracing::debug!(
+                        target: "ocync::metrics",
+                        result = "not_supported",
+                        "mount",
+                    );
+                }
             }
         }
 
