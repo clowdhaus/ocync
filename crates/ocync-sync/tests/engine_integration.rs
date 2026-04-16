@@ -8485,19 +8485,21 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     // for src-b's task to hit the shared blob and see in-progress state.
     let delay = Duration::from_millis(500);
     Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/src-a/blobs/{}",
-            config_desc.digest
-        )))
-        .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_bytes(config_data.as_ref()))
+        .and(path(format!("/v2/src-a/blobs/{}", config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(delay)
+                .set_body_bytes(config_data.as_ref()),
+        )
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/src-a/blobs/{}",
-            layer_desc.digest
-        )))
-        .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_bytes(layer_data.as_ref()))
+        .and(path(format!("/v2/src-a/blobs/{}", layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(delay)
+                .set_body_bytes(layer_data.as_ref()),
+        )
         .mount(&source_server)
         .await;
     mount_blob_pull(&source_server, "src-b", &config_desc.digest, config_data).await;
@@ -8586,7 +8588,10 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
         .iter()
         .find(|r| r.target.contains("tgt-b"))
         .unwrap();
-    assert_eq!(tgt_a.blob_stats.transferred, 2, "tgt-a should upload both blobs");
+    assert_eq!(
+        tgt_a.blob_stats.transferred, 2,
+        "tgt-a should upload both blobs"
+    );
     assert_eq!(tgt_b.blob_stats.mounted, 2, "tgt-b should mount both blobs");
     assert_eq!(tgt_b.blob_stats.transferred, 0, "tgt-b must not upload");
 }

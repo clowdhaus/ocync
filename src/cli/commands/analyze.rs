@@ -225,7 +225,10 @@ fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) {
 
     println!("Analyzed {image_count} image mappings");
     println!();
-    println!("Unique blobs: {total_blobs} ({})", format_bytes(total_bytes));
+    println!(
+        "Unique blobs: {total_blobs} ({})",
+        format_bytes(total_bytes)
+    );
     println!(
         "Shared blobs: {} ({}) across 2+ images",
         shared.len(),
@@ -243,10 +246,7 @@ fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) {
     }
 }
 
-fn print_json(
-    blobs: &HashMap<Digest, BlobAggregate>,
-    image_count: usize,
-) -> Result<(), CliError> {
+fn print_json(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) -> Result<(), CliError> {
     let mut mount_savings_by_target: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     for blob in blobs.values() {
         for (target, repos) in &blob.target_repos {

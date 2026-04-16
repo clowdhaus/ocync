@@ -212,7 +212,8 @@ impl TransferStateCache {
         digest: &Digest,
         current_repo: &RepositoryName,
     ) -> Option<&'a RepositoryName> {
-        self.dedup.in_progress_uploader(target, digest, current_repo)
+        self.dedup
+            .in_progress_uploader(target, digest, current_repo)
     }
 
     /// Mark a blob as successfully transferred to the given repo at the target.
