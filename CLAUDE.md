@@ -114,6 +114,6 @@ Codified in `xtask/src/bench/config_gen.rs`:
 
 ### Known registry-specific behavior
 
-- **ECR never fulfills OCI cross-repo mount** (confirmed 2026-04-16, 193/193 POSTs returned 202 across multiple triggers and wait times). Client short-circuits via `ProviderKind::fulfills_cross_repo_mount` — `blob_mount` returns without a network request on ECR. See `docs/specs/findings.md` for the full observation and `ProviderKind::fulfills_cross_repo_mount` for the re-validate procedure.
+- **ECR never fulfills OCI cross-repo mount** (confirmed 2026-04-16, 193/193 POSTs returned 202). Short-circuit via `ProviderKind::fulfills_cross_repo_mount` saves 148 requests per 5-image cold sync, zero bytes — rate-limit optimization only. Applies to ECR private (measured) and ECR Public (inferred). See `docs/specs/findings.md` for evidence + re-validate procedure.
 - **GHCR multi-PATCH chunked upload is broken** (each PATCH overwrites previous chunks). Client falls back to single-PATCH + PUT.
 - **GAR does not support chunked uploads.** Client buffers and uses monolithic upload.
