@@ -22,7 +22,7 @@ provider "aws" {
 }
 
 locals {
-  instance_type   = "c6in.large"
+  instance_type   = "c6in.4xlarge"
   ebs_volume_size = 100
   ebs_iops        = 6000
   ebs_throughput  = 400 # MB/s

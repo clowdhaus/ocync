@@ -1,14 +1,57 @@
 # Benchmark image corpus.
 #
-# Sources: Chainguard free images, AWS Public ECR, Docker Hub (minimal).
-# Each image syncs to ECR under the bench/ prefix.
+# Sources: Docker Hub (Jupyter + nvidia/cuda + tensorflow), Chainguard free
+# images, AWS Public ECR, SOCI workshop. Each image syncs to ECR under the
+# bench/ prefix.
+#
+# Ordering: mount-exercising images first (Jupyter family shares GB-sized base
+# layers across distinct source names and therefore distinct target repos —
+# the canonical cross-repo mount scenario). Use `--limit N` to scope the
+# benchmark to the first N entries for fast iteration.
 
 corpus:
   target_registry: "${BENCH_TARGET_REGISTRY}"
   target_prefix: "bench"
 
 images:
-  # Chainguard free tier images (cgr.dev)
+  # ── Jupyter docker-stacks (cross-repo mount exercise) ──────────────────────
+  # Multi-stage lineage: base-notebook → minimal-notebook → scipy-notebook →
+  # (datascience|pyspark|tensorflow)-notebook. Each image is ~1.5–4 GB with
+  # large shared base layers. Distinct source names → distinct target repos →
+  # cross-repo mount candidates for the shared layers.
+  - source: "docker.io/jupyter/base-notebook"
+    tags: ["latest"]
+  - source: "docker.io/jupyter/minimal-notebook"
+    tags: ["latest"]
+  - source: "docker.io/jupyter/scipy-notebook"
+    tags: ["latest"]
+  - source: "docker.io/jupyter/datascience-notebook"
+    tags: ["latest"]
+  - source: "docker.io/jupyter/pyspark-notebook"
+    tags: ["latest"]
+  - source: "docker.io/jupyter/tensorflow-notebook"
+    tags: ["latest"]
+
+  # ── NVIDIA CUDA (chunked-upload stress + intra-repo blob sharing) ─────────
+  # NGC's nvcr.io requires auth; the docker.io/nvidia/cuda mirror is
+  # anonymously pullable. 12.6.2 runtime/devel share ~1.5 GB across tags
+  # (same target repo, so this exercises intra-repo dedup, not cross-repo
+  # mount — included for large-blob chunked-upload throughput).
+  - source: "docker.io/nvidia/cuda"
+    tags:
+      - "12.6.2-base-ubuntu22.04"         # ~92 MB
+      - "12.6.2-cudnn-runtime-ubuntu22.04" # ~2.1 GB
+      - "12.6.2-cudnn-devel-ubuntu22.04"  # ~4.6 GB
+
+  # ── TensorFlow GPU (large single-tag throughput + minor-version dedup) ────
+  - source: "docker.io/tensorflow/tensorflow"
+    tags:
+      - "2.18.0-gpu"  # ~3.86 GB
+      - "2.17.0-gpu"  # ~3.83 GB
+
+  # ── Chainguard free tier images (cgr.dev) ──────────────────────────────────
+  # Small; useful for cross-repo mount stress when concurrency windows overlap
+  # (all share the wolfi-base layer). Retained as historical baseline.
   - source: "cgr.dev/chainguard/static"
     tags: ["latest"]
   - source: "cgr.dev/chainguard/busybox"
@@ -40,7 +83,7 @@ images:
   - source: "cgr.dev/chainguard/php"
     tags: ["latest"]
 
-  # AWS Public ECR images (public.ecr.aws)
+  # ── AWS Public ECR images ──────────────────────────────────────────────────
   - source: "public.ecr.aws/amazonlinux/amazonlinux"
     tags: ["2023", "2"]
   - source: "public.ecr.aws/ubuntu/ubuntu"
@@ -62,7 +105,7 @@ images:
   - source: "public.ecr.aws/docker/library/golang"
     tags: ["1.22", "1.21"]
 
-  # Docker Hub images (docker.io) — minimal to avoid rate limits
+  # ── Docker Hub library images ──────────────────────────────────────────────
   - source: "docker.io/library/alpine"
     tags: ["3.20", "latest"]
   - source: "docker.io/library/nginx"
@@ -70,15 +113,16 @@ images:
   - source: "docker.io/library/redis"
     tags: ["latest"]
 
-  # Large multi-layer images — exercise real-world optimization paths
-  # (shared layers, chunked uploads, cross-repo mount effectiveness).
-  # SOCI workshop images are on public.ecr.aws (no docker.io rate limits).
+  # ── SOCI workshop images ──────────────────────────────────────────────────
+  # Large multi-layer images from public.ecr.aws — useful for chunked upload
+  # and large-blob throughput; limited cross-repo mount potential (each image
+  # is an independent build).
   - source: "public.ecr.aws/soci-workshop-examples/ffmpeg"
     tags: ["latest"] # ~500 MB
   - source: "public.ecr.aws/soci-workshop-examples/tensorflow"
-    tags: ["latest"] # ~1.8 GB, shares Ubuntu/Python layers with tensorflow_gpu
+    tags: ["latest"] # ~1.8 GB
   - source: "public.ecr.aws/soci-workshop-examples/tensorflow_gpu"
-    tags: ["latest"] # ~5 GB, same base as tensorflow — mount candidate
+    tags: ["latest"] # ~5 GB, shares base with tensorflow
   - source: "public.ecr.aws/soci-workshop-examples/node"
     tags: ["latest"] # ~1 GB
   - source: "public.ecr.aws/soci-workshop-examples/mongo"
