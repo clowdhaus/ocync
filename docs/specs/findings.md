@@ -133,14 +133,28 @@ re-evaluate. AWS may fulfill mount only under specific conditions (same
 account, specific regions, specific IAM scopes) — analyze the response
 body and `Location` header before flipping the short-circuit globally.
 
-### Cost of this particular finding
+### Cost of this particular finding (measured)
 
-Approximately one round-trip per shared blob per target on ECR — the
-fallback path (HEAD + push) already transferred the blob correctly, so
-this is a wall-clock saving, not a bytes or rate-limit saving. The
-larger significance is procedural: the original mount optimization
-shipped without a wire-level test against real ECR, so the silent no-op
-went undetected until a proxy log made it visible.
+3-arm benchmark on c6in.large, cold Chainguard Jupyter corpus (5 images,
+6 tags each) → ECR us-east-1, one iteration:
+
+| Arm | Wall clock | Requests | Bytes | Mount POSTs attempted |
+|-----|-----------|----------|-------|-----------------------|
+| `main` (pre-PR, no short-circuit) | 207.0s | 3,397 | 11.5 GB | 148 (all 202) |
+| two-variant fix (`15debfc`) | 194.5s | 3,249 | 11.5 GB | 0 |
+| three-variant fix (`80896bc`) | 207.1s | 3,249 | 11.5 GB | 0 |
+
+Savings vs baseline: **148 avoided POSTs, identical bytes.** The
+short-circuit is a rate-limit / request-count optimization, not a bytes
+optimization — which matches the theoretical analysis.
+
+The two-variant and three-variant fixes were observationally identical
+on every axis (requests, bytes, mount counts), confirming the
+three-variant distinction did not pay for its complexity.
+
+The procedural significance: the original mount optimization shipped
+without a wire-level test against real ECR, so the silent no-op went
+undetected until a proxy log made it visible.
 
 ---
 
