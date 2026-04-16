@@ -98,8 +98,12 @@ async fn mount_committed_blob_returns_mounted() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
 
-    let source_repo = RepositoryName::new("mount/source");
-    let target_repo = RepositoryName::new("mount/target");
+    // Use different repository prefixes (not sibling names) so this test
+    // also covers the "cross-prefix" mount case — the OCI spec allows
+    // mount between any two repos on the same registry, and the client's
+    // `from=` query parameter must accept arbitrary repo paths.
+    let source_repo = RepositoryName::new("org-a/service-x");
+    let target_repo = RepositoryName::new("org-b/mirror/service-x");
     let data = b"registry2 mount test blob";
     let digest = push_blob(&client, &source_repo, data).await;
 
@@ -186,30 +190,4 @@ async fn mount_preserves_source_blob() {
         Bytes::from_static(data),
         "source blob content changed after mount"
     );
-}
-
-/// Cross-repo mount across different repository prefixes (not sibling names).
-/// Exercises that the `from=` query parameter accepts arbitrary repo paths,
-/// not just same-prefix siblings.
-#[tokio::test]
-async fn mount_cross_repo_different_prefix() {
-    let (_container, url) = start_registry().await;
-    let client = local_client(url);
-
-    let source_repo = RepositoryName::new("org-a/service-x");
-    let target_repo = RepositoryName::new("org-b/mirror/service-x");
-    let data = b"cross-prefix mount blob";
-    let digest = push_blob(&client, &source_repo, data).await;
-
-    let result = client
-        .blob_mount(&target_repo, &digest, &source_repo)
-        .await
-        .expect("blob_mount request failed");
-
-    assert!(
-        matches!(result, MountResult::Mounted),
-        "cross-prefix mount must succeed, got {result:?}"
-    );
-    let size = assert_blob_exists(&client, &target_repo, &digest).await;
-    assert_eq!(size, data.len() as u64);
 }

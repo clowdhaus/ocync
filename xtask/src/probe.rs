@@ -6,7 +6,7 @@
 //! mount (returning 201), or does it always fall back to a fresh upload
 //! (202)?"
 //!
-//! Uses [`RegistryClient::blob_mount_raw`] to bypass the client-level
+//! Uses [`RegistryClient::blob_mount_unchecked`] to bypass the client-level
 //! short-circuit — if we used `blob_mount`, every call would return
 //! `MountResult::NotSupported` on ECR by design.
 //!
@@ -73,7 +73,7 @@ pub(crate) struct ProbeArgs {
 /// Summary of one mount attempt.
 #[derive(Debug, Clone, Copy)]
 struct AttemptResult {
-    /// The status code the probe observed from the `blob_mount_raw` call.
+    /// The status code the probe observed from the `blob_mount_unchecked` call.
     outcome: AttemptOutcome,
     /// Round-trip latency of the mount POST.
     latency: Duration,
@@ -85,7 +85,7 @@ enum AttemptOutcome {
     Mounted,
     /// Registry returned 202 — fresh upload URL, mount not fulfilled.
     FallbackUpload,
-    /// `blob_mount_raw` itself errored (timeout, 4xx/5xx, etc.).
+    /// `blob_mount_unchecked` itself errored (timeout, 4xx/5xx, etc.).
     Error,
 }
 
@@ -119,10 +119,15 @@ pub(crate) async fn run(args: ProbeArgs) -> Result<(), Box<dyn std::error::Error
     eprintln!("probe: creating ephemeral repos '{source_name}' and '{target_name}'");
 
     let sdk = ecr_sdk_client(&registry).await?;
-    create_repo(&sdk, &source_name).await?;
-    create_repo(&sdk, &target_name).await?;
 
-    // Run the probe body and always clean up (unless --keep-repos).
+    // Source created first; if target creation fails, source is cleaned
+    // before propagating the error so we don't leak an ECR repo.
+    create_repo(&sdk, &source_name).await?;
+    if let Err(e) = create_repo(&sdk, &target_name).await {
+        delete_repo(&sdk, &source_name).await;
+        return Err(e);
+    }
+
     let run_result = probe_body(
         &registry,
         &source_name,
@@ -133,6 +138,7 @@ pub(crate) async fn run(args: ProbeArgs) -> Result<(), Box<dyn std::error::Error
     )
     .await;
 
+    // Cleanup regardless of body outcome (unless --keep-repos).
     if keep_repos {
         eprintln!("probe: --keep-repos set; leaving '{source_name}' and '{target_name}' in place");
     } else {
@@ -194,16 +200,16 @@ async fn probe_one_mount(
     source: &RepositoryName,
 ) -> AttemptResult {
     let start = Instant::now();
-    let res = client.blob_mount_raw(target, digest, source).await;
+    let res = client.blob_mount_unchecked(target, digest, source).await;
     let latency = start.elapsed();
     let outcome = match res {
         Ok(MountResult::Mounted) => AttemptOutcome::Mounted,
         Ok(MountResult::FallbackUpload { .. }) => AttemptOutcome::FallbackUpload,
         Ok(MountResult::NotSupported) => {
-            // `blob_mount_raw` bypasses the short-circuit, so this branch
+            // `blob_mount_unchecked` bypasses the short-circuit, so this branch
             // should be unreachable — treat as an error so the summary
             // surfaces the anomaly rather than silently succeeding.
-            eprintln!("probe: warning: blob_mount_raw returned NotSupported (unreachable)");
+            eprintln!("probe: warning: blob_mount_unchecked returned NotSupported (unreachable)");
             AttemptOutcome::Error
         }
         Err(e) => {
@@ -254,13 +260,18 @@ fn print_summary(attempts: &[AttemptResult]) {
 // ---------------------------------------------------------------------------
 
 /// Build a unique repo-name suffix so repeated probe runs don't collide
-/// with stale repos left over from a previous invocation.
+/// with stale repos left over from a previous invocation, and successive
+/// calls within the same process produce distinct suffixes (guarantee
+/// via an atomic counter, independent of clock resolution).
 fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{nanos:x}")
+    format!("{nanos:x}{counter:x}")
 }
 
 /// Deterministic blob payload of the requested size, tagged with the
@@ -284,16 +295,14 @@ async fn build_client(registry: &str) -> Result<RegistryClient, Box<dyn std::err
     Ok(RegistryClientBuilder::new(base_url).auth(auth).build()?)
 }
 
-/// Extract the AWS region from an ECR hostname and construct an SDK client.
+/// Construct an ECR SDK client keyed to the given ECR hostname.
+///
+/// Uses `ocync_distribution::ecr::load_sdk_config` so the region-parsing
+/// logic is identical to what the auth provider uses — avoids the class
+/// of bugs where a diagnostic tool and the production code disagree about
+/// which region an ECR hostname belongs to.
 async fn ecr_sdk_client(registry: &str) -> Result<aws_sdk_ecr::Client, Box<dyn std::error::Error>> {
-    let region = registry
-        .split('.')
-        .nth(3)
-        .ok_or("cannot extract AWS region from ECR hostname")?;
-    let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.to_owned()))
-        .load()
-        .await;
+    let cfg = ocync_distribution::ecr::load_sdk_config(registry).await?;
     Ok(aws_sdk_ecr::Client::new(&cfg))
 }
 

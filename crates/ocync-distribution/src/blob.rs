@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::aimd::RegistryAction;
 use crate::auth::Scope;
-use crate::auth::detect::{ProviderKind, detect_provider_kind, supports_cross_repo_mount};
+use crate::auth::detect::{ProviderKind, detect_provider_kind};
 use crate::client::{RegistryClient, build_url};
 use crate::digest::Digest;
 use crate::error::Error;
@@ -21,6 +21,21 @@ const MONOLITHIC_THRESHOLD: u64 = 1024 * 1024;
 
 /// Content type for raw blob data in OCI upload requests.
 const OCTET_STREAM: &str = "application/octet-stream";
+
+/// Whether the given provider is known to fulfill OCI cross-repo blob mount.
+///
+/// Returns `false` for providers where mount is observed to always fail — in
+/// that case [`RegistryClient::blob_mount`] short-circuits the mount POST
+/// entirely and returns [`MountResult::NotSupported`]. Defaults to `true`
+/// for unknown providers (optimistic: attempt mount, fall back on 202).
+///
+/// Current non-supporting providers:
+/// - [`ProviderKind::Ecr`]: 193 observed mount POSTs returned 202, never
+///   201. See `project_ecr_mount_behavior` in memory and the real-ECR
+///   integration test in `crates/ocync-distribution/tests/ecr_mount.rs`.
+pub fn supports_cross_repo_mount(kind: Option<ProviderKind>) -> bool {
+    !matches!(kind, Some(ProviderKind::Ecr))
+}
 
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
@@ -138,7 +153,7 @@ impl RegistryClient {
     /// for providers known to never fulfill mount (currently ECR). Callers
     /// should treat this as a signal to go directly to HEAD + push.
     ///
-    /// Use [`blob_mount_raw`](Self::blob_mount_raw) to bypass the short-circuit
+    /// Use [`blob_mount_unchecked`](Self::blob_mount_unchecked) to bypass the short-circuit
     /// for diagnostic purposes (e.g. `xtask probe`).
     pub async fn blob_mount(
         &self,
@@ -157,7 +172,8 @@ impl RegistryClient {
             return Ok(MountResult::NotSupported);
         }
 
-        self.blob_mount_raw(repository, digest, from_repo).await
+        self.blob_mount_unchecked(repository, digest, from_repo)
+            .await
     }
 
     /// Issue a cross-repository mount POST unconditionally, bypassing the
@@ -168,7 +184,7 @@ impl RegistryClient {
     /// providers that [`blob_mount`](Self::blob_mount) skips because they
     /// are known to never fulfill mount. Production code should always use
     /// `blob_mount`, which saves a round-trip for those providers.
-    pub async fn blob_mount_raw(
+    pub async fn blob_mount_unchecked(
         &self,
         repository: &RepositoryName,
         digest: &Digest,
@@ -590,6 +606,42 @@ async fn classify_mount_response(resp: reqwest::Response) -> Result<MountResult,
 mod tests {
     use super::*;
 
+    // --- supports_cross_repo_mount ---
+
+    #[test]
+    fn supports_mount_ecr_returns_false() {
+        // ECR always returns 202 to OCI mount POSTs, so the client
+        // short-circuits and skips the POST entirely.
+        assert!(!supports_cross_repo_mount(Some(ProviderKind::Ecr)));
+    }
+
+    #[test]
+    fn supports_mount_non_ecr_returns_true() {
+        // All other known providers are attempted optimistically. Failure
+        // falls through to `MountResult::FallbackUpload` at the client layer.
+        for kind in [
+            ProviderKind::EcrPublic,
+            ProviderKind::Gcr,
+            ProviderKind::Gar,
+            ProviderKind::Acr,
+            ProviderKind::Ghcr,
+            ProviderKind::DockerHub,
+            ProviderKind::Chainguard,
+        ] {
+            assert!(
+                supports_cross_repo_mount(Some(kind)),
+                "expected {kind:?} to support cross-repo mount (until proven otherwise)"
+            );
+        }
+    }
+
+    #[test]
+    fn supports_mount_unknown_defaults_true() {
+        // Unknown providers get the optimistic default: attempt mount, fall
+        // back on 202. Private registries and Harbor land here.
+        assert!(supports_cross_repo_mount(None));
+    }
+
     #[test]
     fn blob_path_format() {
         let digest: Digest =
@@ -923,11 +975,11 @@ mod tests {
         );
     }
 
-    /// `blob_mount_raw` must bypass the ECR short-circuit and actually
+    /// `blob_mount_unchecked` must bypass the ECR short-circuit and actually
     /// issue the POST. Used by the `xtask probe` diagnostic subcommand to
     /// observe what ECR returns on the wire.
     #[tokio::test]
-    async fn blob_mount_raw_on_ecr_issues_request() {
+    async fn blob_mount_unchecked_on_ecr_issues_request() {
         let server = wiremock::MockServer::start().await;
         let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
 
@@ -950,7 +1002,7 @@ mod tests {
         let digest = test_digest(b"ecr raw mount bypass");
 
         let result = client
-            .blob_mount_raw(&repo, &digest, &from_repo)
+            .blob_mount_unchecked(&repo, &digest, &from_repo)
             .await
             .unwrap();
 

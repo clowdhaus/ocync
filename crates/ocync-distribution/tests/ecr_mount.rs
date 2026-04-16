@@ -32,6 +32,7 @@
 
 #![cfg(feature = "ecr-integration")]
 
+use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_ecr::operation::delete_repository::DeleteRepositoryError;
@@ -45,15 +46,25 @@ use url::Url;
 /// Environment variable carrying the ECR hostname to test against.
 const ECR_HOSTNAME_ENV: &str = "OCYNC_TEST_ECR_HOSTNAME";
 
-/// Read the ECR hostname or panic with a helpful message.
-fn ecr_hostname() -> String {
-    std::env::var(ECR_HOSTNAME_ENV).unwrap_or_else(|_| {
-        panic!(
-            "{ECR_HOSTNAME_ENV} must be set to an ECR hostname like \
-             '123456789012.dkr.ecr.us-east-1.amazonaws.com' to run \
-             ecr_mount tests"
-        )
-    })
+/// Read the ECR hostname, or return `None` so the test can skip.
+///
+/// Enabling `--features ecr-integration` compiles these tests. The env
+/// var indicates *which* account to test against; when unset (e.g. on a
+/// local dev machine without AWS creds) the test skips with a message
+/// rather than panicking. Real runs happen on the benchmark instance,
+/// which has both the feature and the env var wired up.
+fn ecr_hostname_or_skip() -> Option<String> {
+    match std::env::var(ECR_HOSTNAME_ENV) {
+        Ok(h) => Some(h),
+        Err(_) => {
+            eprintln!(
+                "skipping: {ECR_HOSTNAME_ENV} not set — to run this suite, \
+                 export the env var to an ECR hostname like \
+                 '123456789012.dkr.ecr.us-east-1.amazonaws.com'"
+            );
+            None
+        }
+    }
 }
 
 /// Build a unique repo-name suffix for test isolation (no collisions across
@@ -78,28 +89,26 @@ async fn ecr_client(hostname: &str) -> RegistryClient {
         .expect("RegistryClientBuilder::build failed")
 }
 
-/// Load an ECR SDK client for repo create/delete. Region is derived by the
-/// SDK from the same AWS config chain (env/profile/instance role).
+/// Load an ECR SDK client for repo create/delete. Delegates to the
+/// distribution crate's `load_sdk_config` so the test path shares the
+/// same hostname→region logic as production.
 async fn ecr_sdk(hostname: &str) -> aws_sdk_ecr::Client {
-    let region = hostname
-        .split('.')
-        .nth(3)
-        .expect("ECR hostname must contain region segment");
-    let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.to_owned()))
-        .load()
-        .await;
+    let cfg = ocync_distribution::ecr::load_sdk_config(hostname)
+        .await
+        .expect("load_sdk_config failed — check ECR hostname format");
     aws_sdk_ecr::Client::new(&cfg)
 }
 
-/// Create an empty ECR repository. Logs and panics on failure.
-async fn create_repo(sdk: &aws_sdk_ecr::Client, name: &str) {
+/// Create an empty ECR repository. Returns an error string on failure so
+/// callers can run cleanup for any already-created repos before surfacing.
+async fn create_repo(sdk: &aws_sdk_ecr::Client, name: &str) -> Result<(), String> {
     sdk.create_repository()
         .repository_name(name)
         .send()
         .await
-        .unwrap_or_else(|e| panic!("CreateRepository({name}) failed: {e}"));
+        .map_err(|e| format!("CreateRepository({name}) failed: {e}"))?;
     eprintln!("  created test repo: {name}");
+    Ok(())
 }
 
 /// Force-delete an ECR repository (ignores NotFound). Logs on failure —
@@ -125,6 +134,34 @@ async fn delete_repo(sdk: &aws_sdk_ecr::Client, name: &str) {
     }
 }
 
+/// Run `body` against a freshly-created source + target repo pair and
+/// guarantee both are deleted regardless of body outcome.
+///
+/// The body is expected to return a `Result<T, String>` so no assertion
+/// panics can leak a repo. Tests that want to panic on failure should do
+/// so AFTER this helper returns, once cleanup has already run.
+async fn with_ephemeral_repos<F, Fut, T>(
+    sdk: &aws_sdk_ecr::Client,
+    source: &str,
+    target: &str,
+    body: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    create_repo(sdk, source).await?;
+    // Source is now live — any subsequent error MUST clean it up.
+    if let Err(e) = create_repo(sdk, target).await {
+        delete_repo(sdk, source).await;
+        return Err(e);
+    }
+    let outcome = body().await;
+    delete_repo(sdk, source).await;
+    delete_repo(sdk, target).await;
+    outcome
+}
+
 /// Deterministic tiny blob used by the mount tests.
 fn tiny_blob_bytes() -> &'static [u8] {
     // Small, constant payload — the mount assertion is behavioral, not
@@ -141,53 +178,102 @@ fn tiny_blob_digest() -> Digest {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// **Protocol pinning:** on ECR, `blob_mount` must return
-/// `MountResult::NotSupported` without issuing any network request.
+/// **Client-layer pinning:** on ECR, [`RegistryClient::blob_mount`] must
+/// return [`MountResult::NotSupported`] without issuing any network
+/// request. This asserts the short-circuit is wired correctly; paired
+/// with [`ecr_mount_unchecked_returns_fallback_upload`] below, which
+/// pins what ECR actually returns on the wire.
 ///
-/// This is the Layer-1 assertion that the mount short-circuit stays active
-/// against the real registry. If ECR ever starts fulfilling OCI mount
-/// (returning 201), this test will still pass — the short-circuit is based
-/// on provider detection, not live response. When that day comes, flip the
-/// `supports_cross_repo_mount` branch and update this assertion to
-/// `MountResult::Mounted`.
+/// If ECR ever starts fulfilling OCI mount (returning 201) this test
+/// still passes — the short-circuit is based on provider detection, not
+/// live response. When that day comes, flip `supports_cross_repo_mount`
+/// and update both this assertion and the unchecked companion.
 #[tokio::test]
 async fn ecr_mount_returns_not_supported() {
-    let hostname = ecr_hostname();
+    let Some(hostname) = ecr_hostname_or_skip() else {
+        return;
+    };
     let suffix = unique_suffix();
     let source_name = format!("ocync-probe-src-{suffix}");
     let target_name = format!("ocync-probe-tgt-{suffix}");
 
     let sdk = ecr_sdk(&hostname).await;
-    create_repo(&sdk, &source_name).await;
-    create_repo(&sdk, &target_name).await;
 
-    let client = ecr_client(&hostname).await;
-    let source_repo = RepositoryName::new(&source_name);
-    let target_repo = RepositoryName::new(&target_name);
+    let outcome = with_ephemeral_repos(&sdk, &source_name, &target_name, || async {
+        let client = ecr_client(&hostname).await;
+        let source_repo = RepositoryName::new(&source_name);
+        let target_repo = RepositoryName::new(&target_name);
 
-    // Push a blob to the source so that, if the short-circuit WERE broken,
-    // the mount POST could in principle succeed and we'd see `Mounted` and
-    // know to update the expectation.
-    let digest = client
-        .blob_push(&source_repo, tiny_blob_bytes())
-        .await
-        .expect("source blob push failed");
-    assert_eq!(digest, tiny_blob_digest());
+        // Push to source so that, if the short-circuit WERE broken, the
+        // mount POST could in principle succeed and we'd see `Mounted`
+        // (and know to update the expectation).
+        let digest = client
+            .blob_push(&source_repo, tiny_blob_bytes())
+            .await
+            .map_err(|e| format!("source blob push failed: {e}"))?;
+        if digest != tiny_blob_digest() {
+            return Err(format!("digest mismatch: got {digest}"));
+        }
 
-    // Attempt mount — client must short-circuit without hitting the wire.
-    let result = client
-        .blob_mount(&target_repo, &digest, &source_repo)
-        .await
-        .expect("blob_mount call failed");
+        client
+            .blob_mount(&target_repo, &digest, &source_repo)
+            .await
+            .map_err(|e| format!("blob_mount call failed: {e}"))
+    })
+    .await;
 
-    // Cleanup regardless of assertion outcome.
-    delete_repo(&sdk, &source_name).await;
-    delete_repo(&sdk, &target_name).await;
-
+    let result = outcome.expect("ecr_mount_returns_not_supported body failed");
     assert!(
         matches!(result, MountResult::NotSupported),
         "expected MountResult::NotSupported on ECR target, got {result:?}. \
          If ECR now fulfills mount, update `supports_cross_repo_mount` and \
          this test together."
+    );
+}
+
+/// **Wire-layer pinning:** on ECR, [`RegistryClient::blob_mount_unchecked`]
+/// (which bypasses the short-circuit) must return
+/// [`MountResult::FallbackUpload`] — i.e. ECR's actual response to the
+/// mount POST is still 202, not 201.
+///
+/// This is the test that the mount optimization should have shipped with
+/// originally. It's the signal that tells us if AWS ever changes its
+/// behavior: the moment ECR starts returning 201, this test fails and
+/// forces a paired update to the short-circuit.
+#[tokio::test]
+async fn ecr_mount_unchecked_returns_fallback_upload() {
+    let Some(hostname) = ecr_hostname_or_skip() else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let source_name = format!("ocync-probe-src-{suffix}");
+    let target_name = format!("ocync-probe-tgt-{suffix}");
+
+    let sdk = ecr_sdk(&hostname).await;
+
+    let outcome = with_ephemeral_repos(&sdk, &source_name, &target_name, || async {
+        let client = ecr_client(&hostname).await;
+        let source_repo = RepositoryName::new(&source_name);
+        let target_repo = RepositoryName::new(&target_name);
+
+        let digest = client
+            .blob_push(&source_repo, tiny_blob_bytes())
+            .await
+            .map_err(|e| format!("source blob push failed: {e}"))?;
+
+        client
+            .blob_mount_unchecked(&target_repo, &digest, &source_repo)
+            .await
+            .map_err(|e| format!("blob_mount_unchecked call failed: {e}"))
+    })
+    .await;
+
+    let result = outcome.expect("ecr_mount_unchecked body failed");
+    assert!(
+        matches!(result, MountResult::FallbackUpload { .. }),
+        "expected FallbackUpload (202) from real ECR, got {result:?}. \
+         If AWS is now returning 201 on mount, flip `supports_cross_repo_mount` \
+         to allow ECR and update both this test and the `_returns_not_supported` \
+         companion."
     );
 }

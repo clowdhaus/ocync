@@ -69,20 +69,6 @@ static GAR_RE: LazyLock<Regex> =
 static ACR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9]+\.azurecr\.(?:io|cn|us)$").unwrap());
 
-/// Whether the given provider is known to fulfill OCI cross-repo blob mount.
-///
-/// Returns `false` for providers where mount is observed to always fail — in
-/// that case the client short-circuits the mount POST entirely. Defaults to
-/// `true` for unknown providers (optimistic: attempt mount, fall back on 202).
-///
-/// Current non-supporting providers:
-/// - [`ProviderKind::Ecr`]: all observed mount POSTs return 202 (never 201).
-///   See `project_ecr_mount_behavior` in CLAUDE.md memory and the real-ECR
-///   integration test in `crates/ocync-distribution/tests/ecr_mount.rs`.
-pub fn supports_cross_repo_mount(kind: Option<ProviderKind>) -> bool {
-    !matches!(kind, Some(ProviderKind::Ecr))
-}
-
 /// Detect the registry provider kind from a hostname.
 ///
 /// Normalizes the hostname to lowercase, strips any port number and trailing
@@ -418,41 +404,5 @@ mod tests {
         assert_eq!(detect_provider_kind("."), None);
         assert_eq!(detect_provider_kind("..."), None);
         assert_eq!(detect_provider_kind(" "), None);
-    }
-
-    // --- supports_cross_repo_mount ---
-
-    #[test]
-    fn supports_mount_ecr_returns_false() {
-        // ECR always returns 202 to OCI mount POSTs, so the client
-        // short-circuits and skips the POST entirely.
-        assert!(!supports_cross_repo_mount(Some(ProviderKind::Ecr)));
-    }
-
-    #[test]
-    fn supports_mount_non_ecr_returns_true() {
-        // All other known providers are attempted optimistically. Failure
-        // falls through to `MountResult::FallbackUpload` at the client layer.
-        for kind in [
-            ProviderKind::EcrPublic,
-            ProviderKind::Gcr,
-            ProviderKind::Gar,
-            ProviderKind::Acr,
-            ProviderKind::Ghcr,
-            ProviderKind::DockerHub,
-            ProviderKind::Chainguard,
-        ] {
-            assert!(
-                supports_cross_repo_mount(Some(kind)),
-                "expected {kind:?} to support cross-repo mount (until proven otherwise)"
-            );
-        }
-    }
-
-    #[test]
-    fn supports_mount_unknown_defaults_true() {
-        // Unknown providers get the optimistic default: attempt mount, fall
-        // back on 202. Private registries and Harbor land here.
-        assert!(supports_cross_repo_mount(None));
     }
 }
