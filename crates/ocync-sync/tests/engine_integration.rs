@@ -8362,3 +8362,75 @@ async fn discovery_snapshot_pruning_removes_deleted_tags() {
         "v2 should have been pruned from the snapshot cache"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test: engine exits cleanly with untriggered shutdown signal
+// ---------------------------------------------------------------------------
+
+/// The engine must exit after all work completes even when a shutdown signal
+/// is registered but never triggered. Before the fix, the select! loop's
+/// shutdown branch stayed enabled with an always-pending `notified().await`,
+/// preventing the `else` exit from firing.
+///
+/// This test uses a 10-second timeout to detect the hang — if the engine
+/// doesn't exit within 10s of completing all transfers, the test fails.
+#[tokio::test]
+async fn sync_exits_with_untriggered_shutdown_signal() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-shutdown-exit";
+    let layer_data = b"layer-shutdown-exit";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "repo").await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
+
+    // Create shutdown signal but DO NOT trigger it — this is the production
+    // scenario where the user never sends SIGTERM.
+    let shutdown = ShutdownSignal::new();
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&shutdown),
+        ),
+    )
+    .await
+    .expect("engine hung — did not exit within 10s after completing all work");
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.exit_code(), 0);
+}

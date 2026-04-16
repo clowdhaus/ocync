@@ -479,7 +479,14 @@ impl SyncEngine {
                 _ = async {
                     // Guard above ensures shutdown.is_some(); unwrap cannot panic.
                     shutdown.unwrap().notified().await
-                }, if shutdown.is_some() && !shutting_down => {
+                }, if shutdown.is_some()
+                    && !shutting_down
+                    // Disable when all work is done — otherwise this branch
+                    // blocks the `else` exit path indefinitely.
+                    && !(discovery_futures.is_empty()
+                        && execution_futures.is_empty()
+                        && pending.is_empty()) =>
+                {
                     shutting_down = true;
                     drain_deadline = Some(
                         tokio::time::Instant::now() + self.drain_deadline,
