@@ -856,6 +856,13 @@ mod tests {
                 expected: MountOutcome::Skipped,
             },
             Case {
+                // Inferred from ECR private — same AWS backend, assumed
+                // to share mount behavior until proven otherwise.
+                host: "public.ecr.aws",
+                server: None,
+                expected: MountOutcome::Skipped,
+            },
+            Case {
                 host: "ghcr.io",
                 server: Some(201),
                 expected: MountOutcome::Mounted,

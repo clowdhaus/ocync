@@ -98,7 +98,10 @@ target.
 - `blob_mount` short-circuits when the target hostname resolves to a
   provider that does not fulfill mount — returns `MountResult::Skipped`
   without issuing the POST, saving one round-trip per shared blob per
-  target.
+  target. Applies to `ProviderKind::Ecr` (measured) and
+  `ProviderKind::EcrPublic` (inferred — same AWS backend team; if a
+  future observation shows ECR Public does fulfill mount, flip the
+  arm and add a re-validate entry here).
 - `MountResult` has three variants to express what the engine needs to
   know:
   - `Mounted` — registry fulfilled the mount (201).
