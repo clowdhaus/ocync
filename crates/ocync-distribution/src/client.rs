@@ -13,8 +13,7 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
 const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
 
-/// HTTP `Authorization` header scheme prefix for bearer tokens.
-const BEARER_PREFIX: &str = "Bearer";
+use crate::auth::AuthScheme;
 
 /// Builder for [`RegistryClient`].
 pub struct RegistryClientBuilder {
@@ -260,7 +259,11 @@ impl RegistryClient {
             let token = auth.get_token(scopes).await?;
             let value = token.value();
             if !value.is_empty() {
-                let header_value = HeaderValue::from_str(&format!("{BEARER_PREFIX} {value}"))
+                let prefix = match token.scheme() {
+                    AuthScheme::Bearer => "Bearer",
+                    AuthScheme::Basic => "Basic",
+                };
+                let header_value = HeaderValue::from_str(&format!("{prefix} {value}"))
                     .map_err(|e| Error::Other(format!("invalid auth header: {e}")))?;
                 headers.insert(AUTHORIZATION, header_value);
             }
