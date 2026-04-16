@@ -30,6 +30,14 @@ pub(crate) struct BlobInfo {
     /// `BTreeSet` guarantees deterministic iteration order, which makes
     /// [`BlobDedupMap::mount_source`] return a consistent result.
     pub repos: BTreeSet<RepositoryName>,
+    /// When [`status`] is [`BlobStatus::InProgress`], the repository whose
+    /// transfer is currently uploading this blob. Other concurrent transfers
+    /// of the same blob can wait on completion, then mount from this repo
+    /// instead of re-pulling and re-pushing.
+    ///
+    /// Skipped during serialization — this is runtime-only coordination state.
+    #[serde(skip)]
+    pub uploader_repo: Option<RepositoryName>,
 }
 
 /// Per-registry index of tracked blobs.
@@ -65,6 +73,7 @@ impl BlobDedupMap {
             .or_insert_with(|| BlobInfo {
                 status: BlobStatus::InProgress,
                 repos: BTreeSet::new(),
+                uploader_repo: None,
             })
     }
 
@@ -89,12 +98,21 @@ impl BlobDedupMap {
         entry.repos.insert(repo.clone());
     }
 
-    /// Mark a blob as in-progress at the target.
+    /// Mark a blob as in-progress at the target, uploaded by `repo`.
+    ///
+    /// Recording the uploading repo lets other concurrent transfers of the
+    /// same blob wait for completion and then mount from `repo` instead of
+    /// re-pulling and re-pushing. See [`in_progress_uploader`].
     ///
     /// `Completed → InProgress` is expected when re-processing a blob for a
     /// different repo at the same target (cross-repo mount fallback). Only
     /// `Failed → InProgress` is warned since it may indicate a logic error.
-    pub(crate) fn set_in_progress(&mut self, target: &str, digest: &Digest) {
+    pub(crate) fn set_in_progress(
+        &mut self,
+        target: &str,
+        digest: &Digest,
+        repo: &RepositoryName,
+    ) {
         let entry = self.entry_mut(target, digest);
         if matches!(entry.status, BlobStatus::Failed(_)) {
             warn!(
@@ -106,6 +124,26 @@ impl BlobDedupMap {
             );
         }
         entry.status = BlobStatus::InProgress;
+        entry.uploader_repo = Some(repo.clone());
+    }
+
+    /// Return the uploading repository if a blob is currently in-progress in
+    /// a repository other than `target_repo`, suitable as a mount source once
+    /// the upload completes.
+    ///
+    /// Returns `None` if the blob is not in-progress, or if the uploader is
+    /// `target_repo` itself (no cross-repo mount possible).
+    pub(crate) fn in_progress_uploader<'a>(
+        &'a self,
+        target: &str,
+        digest: &Digest,
+        target_repo: &RepositoryName,
+    ) -> Option<&'a RepositoryName> {
+        let info = self.inner.get(target)?.get(digest)?;
+        if !matches!(info.status, BlobStatus::InProgress) {
+            return None;
+        }
+        info.uploader_repo.as_ref().filter(|r| *r != target_repo)
     }
 
     /// Mark a blob as completed at the target in the given repo.
@@ -199,6 +237,7 @@ impl BlobDedupMap {
                             BlobInfo {
                                 status: info.status.clone(),
                                 repos: info.repos.clone(),
+                                uploader_repo: None,
                             },
                         )
                     })
@@ -310,7 +349,7 @@ mod tests {
         let d = test_digest();
 
         map.set_completed("reg-a.io", &d, &repo("library/alpine"));
-        map.set_in_progress("reg-b.io", &d);
+        map.set_in_progress("reg-b.io", &d, &repo("library/alpine"));
 
         assert_eq!(map.status("reg-a.io", &d), Some(&BlobStatus::Completed));
         assert_eq!(map.status("reg-b.io", &d), Some(&BlobStatus::InProgress));
@@ -322,7 +361,7 @@ mod tests {
         let mut map = BlobDedupMap::new();
         let d = test_digest();
 
-        map.set_in_progress("reg.io", &d);
+        map.set_in_progress("reg.io", &d, &repo("library/alpine"));
         assert_eq!(map.status("reg.io", &d), Some(&BlobStatus::InProgress));
 
         map.set_completed("reg.io", &d, &repo("library/alpine"));

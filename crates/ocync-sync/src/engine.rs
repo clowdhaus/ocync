@@ -1245,6 +1245,23 @@ fn blobs_from_manifest(source_data: &PulledManifest) -> Vec<&Descriptor> {
     }
 }
 
+/// Outcome of the atomic check-and-claim on a blob's in-progress state.
+///
+/// Used by [`execute_transfer_blobs`] to decide whether to wait for another
+/// repository's in-flight upload or to claim the upload itself. See the
+/// Step 2a comment for the reasoning.
+enum ClaimAction {
+    /// Another repository is currently uploading this blob; wait on `notify`
+    /// then re-check. `uploader` is included for diagnostic logs.
+    Wait {
+        uploader: RepositoryName,
+        notify: Rc<tokio::sync::Notify>,
+    },
+    /// This repository has claimed the upload (set in-progress state). Proceed
+    /// with HEAD + push; on completion, call `notify_blob` to wake waiters.
+    Claimed,
+}
+
 /// Context for transferring blobs from source to a single target.
 ///
 /// Bundles the parameters needed by [`transfer_image_blobs`] to keep
@@ -1343,7 +1360,54 @@ async fn transfer_image_blobs(
             continue;
         }
 
-        // Step 2: Check cache for cross-repo mount source.
+        // Step 2a: Atomic check-and-claim. If another concurrent transfer is
+        // already uploading this blob to a different repo at the same target,
+        // wait for it to finish so we can mount from its repo rather than
+        // redundantly uploading. Otherwise, claim the upload ourselves by
+        // setting in-progress state BEFORE the HEAD check — the HEAD awaits
+        // on network I/O, and without the claim, other tasks would race past
+        // the check and duplicate the upload. Critical for multi-image syncs
+        // with shared layers (e.g. Chainguard images share wolfi-base).
+        loop {
+            let action: ClaimAction = {
+                let mut c = ctx.cache.borrow_mut();
+                match c
+                    .blob_in_progress_uploader(ctx.target_name, digest, ctx.target_repo)
+                    .cloned()
+                {
+                    Some(uploader) => ClaimAction::Wait {
+                        uploader,
+                        notify: c.blob_notify(ctx.target_name, digest),
+                    },
+                    None => {
+                        // Claim the upload atomically before yielding.
+                        c.set_blob_in_progress(
+                            ctx.target_name,
+                            digest.clone(),
+                            ctx.target_repo.to_owned(),
+                        );
+                        ClaimAction::Claimed
+                    }
+                }
+            };
+            match action {
+                ClaimAction::Wait { uploader, notify } => {
+                    debug!(
+                        %digest,
+                        %uploader,
+                        target = %ctx.target_name,
+                        "waiting for in-flight upload to complete before mounting",
+                    );
+                    notify.notified().await;
+                    // Loop: the upload completed (mount_source now populated)
+                    // or failed (another task may have taken over). Re-check.
+                    continue;
+                }
+                ClaimAction::Claimed => break,
+            }
+        }
+
+        // Step 2b: Check cache for cross-repo mount source.
         let mount_source = {
             let c = ctx.cache.borrow();
             c.blob_mount_source(ctx.target_name, digest, ctx.target_repo)
@@ -1409,9 +1473,8 @@ async fn transfer_image_blobs(
         // already staged from a previous target, push from the local file
         // instead of re-pulling from source. Otherwise pull from source and
         // write to staging so subsequent targets can reuse it.
-        ctx.cache
-            .borrow_mut()
-            .set_blob_in_progress(ctx.target_name, digest.clone());
+        //
+        // Note: in-progress state was already claimed in Step 2a.
 
         let transfer_result: Result<(), crate::Error> = if ctx.staging.is_enabled() {
             if !ctx.staging.exists(digest) {
@@ -1490,18 +1553,24 @@ async fn transfer_image_blobs(
             Ok(()) => {
                 outcome.bytes_transferred += size;
                 outcome.stats.transferred += 1;
-                ctx.cache.borrow_mut().set_blob_completed(
-                    ctx.target_name,
-                    digest.clone(),
-                    ctx.target_repo.to_owned(),
-                );
+                {
+                    let mut c = ctx.cache.borrow_mut();
+                    c.set_blob_completed(
+                        ctx.target_name,
+                        digest.clone(),
+                        ctx.target_repo.to_owned(),
+                    );
+                    c.notify_blob(ctx.target_name, digest);
+                }
             }
             Err(err) => {
-                ctx.cache.borrow_mut().set_blob_failed(
-                    ctx.target_name,
-                    digest.clone(),
-                    err.to_string(),
-                );
+                {
+                    let mut c = ctx.cache.borrow_mut();
+                    c.set_blob_failed(ctx.target_name, digest.clone(), err.to_string());
+                    // Wake concurrent transfers waiting on our upload so they
+                    // can retry instead of hanging forever.
+                    c.notify_blob(ctx.target_name, digest);
+                }
                 outcome.error = Some(err);
                 return outcome; // Stop transferring blobs for this target on first failure.
             }
