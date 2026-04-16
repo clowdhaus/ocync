@@ -889,10 +889,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            let ok = match (case.expect_mounted, &result) {
-                (true, MountResult::Mounted) | (false, MountResult::NotMounted) => true,
-                _ => false,
-            };
+            let ok = matches!(
+                (case.expect_mounted, &result),
+                (true, MountResult::Mounted) | (false, MountResult::NotMounted)
+            );
             assert!(
                 ok,
                 "{} ({:?}): unexpected result {result:?}",
