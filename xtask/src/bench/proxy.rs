@@ -62,6 +62,13 @@ pub(crate) struct ProxyMetrics {
     pub(crate) total_response_bytes: u64,
     /// Number of blob GET requests made to a URL that was already fetched.
     pub(crate) duplicate_blob_gets: u64,
+    /// Cross-repo mount POST requests attempted (URLs containing
+    /// `?mount=<digest>&from=<repo>`).
+    pub(crate) mount_attempts: u64,
+    /// Mount attempts that the target registry fulfilled (201 Created).
+    /// The rest either produced a 202 "upload session started" fallback
+    /// or an explicit error status.
+    pub(crate) mount_successes: u64,
 }
 
 /// Spawns a `bench-proxy` process and waits for it to bind its port.
@@ -140,6 +147,8 @@ pub(crate) fn aggregate(entries: &[ProxyEntry]) -> ProxyMetrics {
     let mut status_429_count = 0u64;
     let mut total_request_bytes = 0u64;
     let mut total_response_bytes = 0u64;
+    let mut mount_attempts = 0u64;
+    let mut mount_successes = 0u64;
 
     // Track GET requests to blob URLs for duplicate detection.
     let mut blob_get_counts: HashMap<String, u64> = HashMap::new();
@@ -157,6 +166,19 @@ pub(crate) fn aggregate(entries: &[ProxyEntry]) -> ProxyMetrics {
         if entry.method == "GET" && entry.url.contains("/blobs/sha256:") {
             *blob_get_counts.entry(entry.url.clone()).or_insert(0) += 1;
         }
+
+        // OCI cross-repo blob mount: `POST /v2/.../blobs/uploads/?mount=<digest>&from=<repo>`.
+        // A successful mount returns 201 Created and skips the data upload entirely; a
+        // 202 means the registry started a new upload session (mount fallback).
+        if entry.method == "POST"
+            && entry.url.contains("/blobs/uploads/")
+            && entry.url.contains("mount=")
+        {
+            mount_attempts += 1;
+            if entry.status == 201 {
+                mount_successes += 1;
+            }
+        }
     }
 
     // A duplicate is any blob URL fetched more than once; count the extra fetches.
@@ -173,6 +195,8 @@ pub(crate) fn aggregate(entries: &[ProxyEntry]) -> ProxyMetrics {
         total_request_bytes,
         total_response_bytes,
         duplicate_blob_gets,
+        mount_attempts,
+        mount_successes,
     }
 }
 

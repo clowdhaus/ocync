@@ -392,6 +392,8 @@ mod tests {
             total_request_bytes: 50_000,
             total_response_bytes: 2_100_000_000,
             duplicate_blob_gets: 0,
+            mount_attempts: 0,
+            mount_successes: 0,
         });
 
         let dir = tempfile::tempdir().unwrap();

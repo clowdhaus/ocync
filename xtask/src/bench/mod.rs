@@ -175,11 +175,11 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     for scenario in scenarios {
         match scenario {
             RunnableScenario::Cold => {
-                let result = run_cold(&args, &corpus, &tools, &ecr_client).await?;
+                let result = run_cold(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
                 report.scenarios.push(result);
             }
             RunnableScenario::Warm => {
-                let result = run_warm(&args, &corpus, &tools, &ecr_client).await?;
+                let result = run_warm(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
                 report.scenarios.push(result);
             }
             RunnableScenario::Partial => {
@@ -190,14 +190,16 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     None => partial_corpus,
                 };
                 let result =
-                    run_partial(&args, &corpus, &partial_corpus, &tools, &ecr_client).await?;
+                    run_partial(&args, &corpus, &partial_corpus, &tools, &ecr_client, &output_dir)
+                        .await?;
                 report.scenarios.push(result);
             }
             RunnableScenario::Scale => {
                 // Scale scenario uses ocync only per spec.
                 if tools.contains(&Tool::Ocync) {
                     let ocync_only = vec![Tool::Ocync];
-                    let points = run_scale(&args, &corpus, &ocync_only, &ecr_client).await?;
+                    let points =
+                        run_scale(&args, &corpus, &ocync_only, &ecr_client, &output_dir).await?;
                     report.scale = points;
                 } else {
                     eprintln!("bench: scale scenario requires ocync (skipping)");
@@ -277,6 +279,7 @@ async fn run_single_tool(
     tool: Tool,
     corpus: &Corpus,
     config_dir: &Path,
+    output_dir: &Path,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
     // 1. Generate config.
     let config_content = match tool {
@@ -295,7 +298,13 @@ async fn run_single_tool(
     // The proxy binary, CA cert, and CA private key are configured via the
     // `--proxy-binary`, `--proxy-ca`, and `--proxy-ca-key` CLI flags, which
     // default to paths populated by the instance bootstrap (user-data.sh).
-    let log_path = config_dir.join(format!("{tool}-proxy.jsonl"));
+    //
+    // The log lives under `output_dir` (not the auto-cleaned tempdir) so
+    // post-run analysis (`grep mount= …proxy.jsonl`) can inspect exactly
+    // which API calls the tool issued.
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
+    let log_path = output_dir.join(format!("{tool}-proxy.jsonl"));
     let handle = proxy::start(
         &args.proxy_binary,
         &args.proxy_ca,
@@ -319,7 +328,7 @@ async fn run_single_tool(
     let metrics = proxy::aggregate(&entries);
 
     eprintln!(
-        "  {}: wall_clock={:.1}s exit={} requests={} response_bytes={}",
+        "  {}: wall_clock={:.1}s exit={} requests={} response_bytes={} mounts={}/{}",
         tool,
         result.wall_clock.as_secs_f64(),
         result
@@ -327,6 +336,8 @@ async fn run_single_tool(
             .map_or_else(|| "signal".to_string(), |c| c.to_string()),
         metrics.total_requests,
         report::format_bytes(metrics.total_response_bytes),
+        metrics.mount_successes,
+        metrics.mount_attempts,
     );
 
     // 7. Parse ocync JSON if applicable.
@@ -351,6 +362,7 @@ async fn run_cold(
     corpus: &Corpus,
     tools: &[Tool],
     ecr_client: &aws_sdk_ecr::Client,
+    output_dir: &Path,
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     eprintln!(
         "bench: running cold scenario ({} iterations)",
@@ -367,7 +379,7 @@ async fn run_cold(
             ecr::create_repos(ecr_client, corpus).await?;
 
             let config_dir = tempfile::tempdir()?;
-            let run = run_single_tool(args, tool, corpus, config_dir.path()).await?;
+            let run = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
 
             ecr::delete_repos(ecr_client, corpus).await?;
 
@@ -399,6 +411,7 @@ async fn run_warm(
     corpus: &Corpus,
     tools: &[Tool],
     ecr_client: &aws_sdk_ecr::Client,
+    output_dir: &Path,
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     eprintln!("bench: running warm scenario");
     let mut runs = Vec::new();
@@ -410,12 +423,12 @@ async fn run_warm(
 
         // Prime run (unmeasured).
         let config_dir = tempfile::tempdir()?;
-        let _prime = run_single_tool(args, tool, corpus, config_dir.path()).await?;
+        let _prime = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
         eprintln!("  warm: {} prime complete, running measured pass", tool);
 
         // Measured run.
         let config_dir = tempfile::tempdir()?;
-        let run = run_single_tool(args, tool, corpus, config_dir.path()).await?;
+        let run = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
         runs.push(run);
 
         ecr::delete_repos(ecr_client, corpus).await?;
@@ -436,6 +449,7 @@ async fn run_partial(
     partial_corpus: &Corpus,
     tools: &[Tool],
     ecr_client: &aws_sdk_ecr::Client,
+    output_dir: &Path,
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     eprintln!("bench: running partial scenario");
     let mut runs = Vec::new();
@@ -447,7 +461,7 @@ async fn run_partial(
 
         // Prime with base corpus (unmeasured).
         let config_dir = tempfile::tempdir()?;
-        let _prime = run_single_tool(args, tool, base_corpus, config_dir.path()).await?;
+        let _prime = run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
         eprintln!(
             "  partial: {} prime complete, running with partial corpus",
             tool
@@ -455,7 +469,7 @@ async fn run_partial(
 
         // Measured run with partial corpus.
         let config_dir = tempfile::tempdir()?;
-        let run = run_single_tool(args, tool, partial_corpus, config_dir.path()).await?;
+        let run = run_single_tool(args, tool, partial_corpus, config_dir.path(), output_dir).await?;
         runs.push(run);
 
         ecr::delete_repos(ecr_client, base_corpus).await?;
@@ -475,6 +489,7 @@ async fn run_scale(
     corpus: &Corpus,
     tools: &[Tool],
     ecr_client: &aws_sdk_ecr::Client,
+    output_dir: &Path,
 ) -> Result<Vec<ScalePoint>, Box<dyn std::error::Error>> {
     eprintln!("bench: running scale scenario");
     let total = corpus.images.len();
@@ -498,7 +513,7 @@ async fn run_scale(
             ecr::create_repos(ecr_client, &subset).await?;
 
             let config_dir = tempfile::tempdir()?;
-            let run = run_single_tool(args, tool, &subset, config_dir.path()).await?;
+            let run = run_single_tool(args, tool, &subset, config_dir.path(), output_dir).await?;
             results.insert(tool.to_string(), run.wall_clock_secs);
 
             ecr::delete_repos(ecr_client, &subset).await?;
