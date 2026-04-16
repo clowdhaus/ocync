@@ -1,0 +1,36 @@
+[package]
+name = "bench-proxy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MITM HTTPS forward proxy for ocync benchmark traffic capture"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+clap = { workspace = true, features = ["color"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http = { workspace = true }
+http-body-util = { version = "0.1", default-features = false }
+hyper = { version = "1", default-features = false, features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server-auto", "client-legacy"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "x509-parser", "pem"] }
+reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+rustls-pki-types = { version = "1", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "fs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+tracing = { workspace = true, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

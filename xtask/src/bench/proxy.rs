@@ -1,4 +1,11 @@
-//! mitmproxy lifecycle management and log parsing for benchmark HTTP traffic capture.
+//! `bench-proxy` lifecycle management and log parsing for benchmark
+//! HTTP traffic capture.
+//!
+//! The benchmark used to spawn `mitmdump` (Python, single-threaded TLS)
+//! here. That capped throughput at ~250 Mbps regardless of instance
+//! size, which made multi-GB corpora painful to iterate on. We now
+//! spawn our own `bench-proxy` binary (pure-Rust, tokio + rustls) that
+//! scales with CPU cores and writes the same JSONL schema.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -7,7 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::process::Child;
 
-/// Handle to a running mitmdump process.
+/// Handle to a running `bench-proxy` process.
 pub(crate) struct ProxyHandle {
     child: Child,
     log_path: PathBuf,
@@ -57,34 +64,42 @@ pub(crate) struct ProxyMetrics {
     pub(crate) duplicate_blob_gets: u64,
 }
 
-/// Spawns a mitmdump process and waits for it to bind its port.
+/// Spawns a `bench-proxy` process and waits for it to bind its port.
 ///
-/// Returns a `ProxyHandle` on success. Waits up to 2 seconds for the port
-/// to become ready before returning.
+/// Returns a `ProxyHandle` on success. Waits up to 2 seconds for the
+/// port to become ready before returning. The proxy's CA certificate
+/// must already be installed in the system trust store so client tools
+/// (ocync, skopeo, regsync) accept the dynamically-issued leaf certs.
+///
+/// `ca_cert` and `ca_key` point at PEM files created previously via
+/// `bench-proxy ca-init`. Typically these are installed system-wide
+/// during instance bootstrap; the CA cert also needs to be trusted by
+/// the clients under test.
 pub(crate) async fn start(
-    addon_path: &Path,
+    binary: &Path,
+    ca_cert: &Path,
+    ca_key: &Path,
     log_path: &Path,
     port: u16,
 ) -> Result<ProxyHandle, Box<dyn std::error::Error>> {
     let log_path = log_path.to_path_buf();
 
-    let child = tokio::process::Command::new("mitmdump")
+    let child = tokio::process::Command::new(binary)
         .args([
-            "--mode",
-            "regular",
-            "--listen-port",
-            &port.to_string(),
-            "-s",
-            &addon_path.to_string_lossy(),
-            "--set",
-            &format!("logfile={}", log_path.display()),
-            "--set",
-            "ssl_insecure=true",
+            "serve",
+            "--ca",
+            &ca_cert.to_string_lossy(),
+            "--ca-key",
+            &ca_key.to_string_lossy(),
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--log",
+            &log_path.to_string_lossy(),
         ])
         .kill_on_drop(true)
         .spawn()?;
 
-    // Give mitmdump time to bind the port before callers configure the proxy.
+    // Give the proxy time to bind the port before callers configure the proxy.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     Ok(ProxyHandle {

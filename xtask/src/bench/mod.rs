@@ -44,9 +44,23 @@ pub(crate) struct BenchArgs {
     #[arg(long, default_value = "3")]
     pub(crate) iterations: usize,
 
-    /// mitmproxy listen port (default: 8080).
+    /// Proxy listen port (default: 8080).
     #[arg(long, default_value = "8080")]
     pub(crate) proxy_port: u16,
+
+    /// Path to the `bench-proxy` binary (produced by `cargo build
+    /// --release --package bench-proxy`).
+    #[arg(long, default_value = "target/release/bench-proxy")]
+    pub(crate) proxy_binary: PathBuf,
+
+    /// Path to the `bench-proxy` CA certificate PEM (must be trusted by
+    /// client tools).
+    #[arg(long, default_value = "/etc/bench-proxy/ca.pem")]
+    pub(crate) proxy_ca: PathBuf,
+
+    /// Path to the `bench-proxy` CA private key PEM.
+    #[arg(long, default_value = "/etc/bench-proxy/ca-key.pem")]
+    pub(crate) proxy_ca_key: PathBuf,
 
     /// Output directory for results (default: bench-results/{timestamp}).
     #[arg(long)]
@@ -276,15 +290,25 @@ async fn run_single_tool(
     std::fs::write(&config_path, &config_content)
         .map_err(|e| format!("write config {}: {e}", config_path.display()))?;
 
-    // 3. Start mitmproxy.
-    let addon_path = PathBuf::from("bench/mitmproxy-addon.py");
-    let log_path = config_dir.join(format!("{}-proxy.jsonl", tool));
-    let handle = proxy::start(&addon_path, &log_path, args.proxy_port).await?;
+    // 3. Start bench-proxy (our pure-Rust MITM replacement for mitmdump).
+    //
+    // The proxy binary, CA cert, and CA private key are configured via the
+    // `--proxy-binary`, `--proxy-ca`, and `--proxy-ca-key` CLI flags, which
+    // default to paths populated by the instance bootstrap (user-data.sh).
+    let log_path = config_dir.join(format!("{tool}-proxy.jsonl"));
+    let handle = proxy::start(
+        &args.proxy_binary,
+        &args.proxy_ca,
+        &args.proxy_ca_key,
+        &log_path,
+        args.proxy_port,
+    )
+    .await?;
     let proxy_url = handle.proxy_url();
 
     // 4. Run the tool.
     //
-    // The mitmproxy CA must be installed in the system trust store (via
+    // The bench-proxy CA must be installed in the system trust store (via
     // update-ca-trust on AL2023) so that rustls-native-certs and OpenSSL
     // both trust the MITM'd connections. HTTPS_PROXY alone is sufficient.
     let workspace_root = Path::new(".");

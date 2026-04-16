@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "xtask"]
+members = ["bench/proxy", "crates/*", "xtask"]
 
 [workspace.package]
 edition = "2024"

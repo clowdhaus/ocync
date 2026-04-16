@@ -34,9 +34,7 @@ dnf install -y \
   gcc \
   make \
   openssl-devel \
-  gpgme-devel \
-  python3 \
-  python3-pip
+  gpgme-devel
 
 # ── Rust ──────────────────────────────────────────────────────────────────────
 
@@ -84,20 +82,17 @@ echo "Go: $(go version)"
 export HOME=/root GOPATH=/root/go GOCACHE=/root/.cache/go-build
 export PATH="/usr/local/go/bin:$GOPATH/bin:$PATH"
 
-# ── mitmproxy ─────────────────────────────────────────────────────────────────
-
-echo "--- Installing mitmproxy via pip3"
-pip3 install --quiet mitmproxy
-
-# Generate mitmproxy CA cert as ec2-user, then install into system trust store.
-# Both rustls-native-certs (ocync/Rust) and Go's x509 package read from the
-# system store, ensuring all tools trust the MITM'd proxy connections.
-echo "--- Generating mitmproxy CA certificate (as ec2-user)"
-su - ec2-user -c 'timeout 3 mitmdump --quiet || true'
-
-echo "--- Installing mitmproxy CA into system trust store"
-cp /home/ec2-user/.mitmproxy/mitmproxy-ca-cert.pem /etc/pki/ca-trust/source/anchors/mitmproxy-ca.pem
-update-ca-trust
+# ── bench-proxy CA ────────────────────────────────────────────────────────────
+#
+# The pure-Rust `bench-proxy` binary (built as part of the ocync cargo build
+# below) replaces mitmdump. It needs a CA keypair on disk that's trusted by
+# every client tool on this instance. Both rustls-native-certs (ocync/Rust)
+# and Go's x509 package read from the system trust store, so a single
+# update-ca-trust reaches all benchmark tools.
+#
+# The CA is generated AFTER the ocync build completes (further down) because
+# the binary that generates it (`bench-proxy ca-init`) is built alongside
+# ocync in the same cargo invocation.
 
 # ── ECR credential helper ────────────────────────────────────────────────────
 
@@ -161,11 +156,31 @@ su - ec2-user -c "
   git clone --branch benchmark-suite https://${GH_TOKEN}@github.com/clowdhaus/ocync.git \$HOME/ocync
   cd \$HOME/ocync
   git remote set-url origin https://github.com/clowdhaus/ocync.git
-  cargo build --release --package ocync
+  cargo build --release --package ocync --package bench-proxy
   cp target/release/ocync \$HOME/.cargo/bin/ocync
+  cp target/release/bench-proxy \$HOME/.cargo/bin/bench-proxy
 "
 
 echo "ocync: $(su - ec2-user -c '/home/ec2-user/.cargo/bin/ocync version')"
+echo "bench-proxy: built"
+
+# ── Generate bench-proxy CA and install into system trust store ──────────────
+
+echo "--- Generating bench-proxy CA"
+mkdir -p /etc/bench-proxy
+su - ec2-user -c "/home/ec2-user/.cargo/bin/bench-proxy ca-init \
+  --out /tmp/bench-proxy-ca.pem \
+  --key /tmp/bench-proxy-ca-key.pem"
+install -m 0644 /tmp/bench-proxy-ca.pem /etc/bench-proxy/ca.pem
+install -m 0600 /tmp/bench-proxy-ca-key.pem /etc/bench-proxy/ca-key.pem
+# ec2-user needs to read the private key to run the proxy — make the
+# directory readable and the key owned by ec2-user.
+chown -R ec2-user:ec2-user /etc/bench-proxy
+rm -f /tmp/bench-proxy-ca.pem /tmp/bench-proxy-ca-key.pem
+
+echo "--- Installing bench-proxy CA into system trust store"
+cp /etc/bench-proxy/ca.pem /etc/pki/ca-trust/source/anchors/bench-proxy-ca.pem
+update-ca-trust
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
