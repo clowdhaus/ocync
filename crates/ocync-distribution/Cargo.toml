@@ -20,7 +20,7 @@ futures-util = { version = "0.3", default-features = false }
 http.workspace = true
 hex.workspace = true
 regex-lite = { version = "0.1", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "json", "system-proxy"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -29,5 +29,8 @@ tracing.workspace = true
 url = { version = "2", default-features = false }
 
 [dev-dependencies]
+aws-config.workspace = true
+aws-sdk-ecr.workspace = true
+testcontainers = { version = "0.27", default-features = false }
 tokio = { workspace = true, features = ["sync", "time", "test-util", "macros", "rt-multi-thread"] }
 wiremock = "0.6"
