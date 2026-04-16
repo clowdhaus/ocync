@@ -225,6 +225,7 @@ Never trust the implementer's self-report alone.
 
 - **Design spec**: `docs/specs/ocync-design.md` — full design document
 - **Transfer optimization design**: `docs/specs/transfer-optimization-design.md` — pipeline architecture, transfer state cache, adaptive concurrency, multi-target blob reuse
+- **Benchmark design v2**: `docs/specs/benchmark-design-v2.md` — layered split (protocol tests / throughput / cross-tool) adopted after PR #23 shipped. Read before modifying `xtask/src/bench/` or `bench/proxy/`; the three sequenced follow-up PRs listed there are the intended path.
 - **Implementation plan**: `docs/superpowers/plans/` (gitignored) — remaining v1 work is `2026-04-12-remaining-v1-implementation.md` (remaining: auth providers, progress/health/metrics, FIPS/packaging)
 
 ## Commands
