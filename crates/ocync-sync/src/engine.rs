@@ -1431,26 +1431,17 @@ async fn transfer_image_blobs(
                     tracing::debug!(target: "ocync::metrics", result = "success", "mount");
                     continue;
                 }
-                Ok(MountResult::FallbackUpload { .. }) | Err(_) => {
-                    debug!(%digest, target = %ctx.target_name, "mount failed, falling back to HEAD+push");
-                    // Invalidate the stale mount source entry.
+                Ok(MountResult::NotMounted) | Err(_) => {
+                    // Either the server returned 202 (no mount) or the client
+                    // short-circuited because the target provider never
+                    // fulfills mount (ECR). Invalidate the stale source hint
+                    // and fall through to HEAD + push.
+                    debug!(%digest, target = %ctx.target_name, "mount not fulfilled, falling back to HEAD+push");
                     ctx.cache
                         .borrow_mut()
                         .invalidate_blob(ctx.target_name, digest);
                     tracing::debug!(target: "ocync::metrics", result = "fallback", "mount");
                     tracing::debug!(target: "ocync::metrics", "cache_invalidation");
-                }
-                Ok(MountResult::SkippedByClient) => {
-                    // Provider is known to never fulfill mount (e.g. ECR).
-                    // The client short-circuited without issuing a POST.
-                    // The mount source is still valid — don't invalidate;
-                    // it remains useful for same-repo HEAD-skip. Fall
-                    // through to HEAD + push.
-                    tracing::debug!(
-                        target: "ocync::metrics",
-                        result = "not_supported",
-                        "mount",
-                    );
                 }
             }
         }

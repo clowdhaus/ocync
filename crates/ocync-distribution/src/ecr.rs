@@ -60,15 +60,7 @@ fn ecr_registry_id(hostname: &str) -> Option<&str> {
 /// Extracts the region from the hostname and configures the SDK with it.
 /// FIPS endpoint support is handled at the SDK level: set
 /// `AWS_USE_FIPS_ENDPOINT=true` before calling this function.
-///
-/// The matching SDK client is constructed by callers:
-/// `aws_sdk_ecr::Client::new(&load_sdk_config(hostname).await?)`.
-///
-/// Exported so diagnostic tools (`xtask probe`) and feature-gated
-/// integration tests (`tests/ecr_mount.rs`) can reuse the exact same
-/// hostname→region logic the auth providers rely on — no parallel
-/// hostname parsers.
-pub async fn load_sdk_config(hostname: &str) -> Result<aws_config::SdkConfig, Error> {
+pub(crate) async fn load_sdk_config(hostname: &str) -> Result<aws_config::SdkConfig, Error> {
     let region = ecr_region(hostname).ok_or_else(|| {
         Error::Other(format!(
             "cannot extract AWS region from ECR hostname '{hostname}'"

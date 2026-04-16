@@ -1966,17 +1966,11 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
 }
 
 /// When the target is ECR, `blob_mount` short-circuits (ECR never fulfills
-/// OCI mount — it returns 202 to every POST). The engine must:
-///   - NOT issue a mount POST to the target (`expect(0)`).
-///   - NOT invalidate the cached mount source (it's still a valid record
-///     of where the blob lives at this target, useful for same-repo HEAD
-///     skip).
-///   - Fall through to HEAD + push, transferring the blob normally.
+/// OCI mount — it returns 202 to every POST). The engine must not issue
+/// a mount POST to the target and must fall through to HEAD + push.
 ///
-/// This is the wire-level assertion that pins the short-circuit. Without
-/// it, a future refactor could re-introduce the wasted mount POST (ECR
-/// returns 202, the engine invalidates the cache, spins one round-trip
-/// per shared blob for nothing).
+/// `.expect(0)` on the POST is the assertion that catches a regression.
+/// If a future refactor re-introduces the wasted POST, this test fails.
 #[tokio::test]
 async fn sync_warm_cache_ecr_target_short_circuits_mount() {
     let source_server = MockServer::start().await;
@@ -1997,18 +1991,14 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
     };
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
-    // Source: serves manifest and both blob pulls. The pulls MUST happen
-    // because mount is short-circuited on ECR.
+    // Source serves manifest and both blobs (pulls must happen because
+    // mount is short-circuited).
     mount_source_manifest(&source_server, "repo-b", "v1", &manifest_bytes).await;
     mount_blob_pull(&source_server, "repo-b", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "repo-b", &layer_desc.digest, layer_data).await;
 
-    // Target: manifest HEAD 404.
     mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
 
-    // Inline HEAD mocks with `.expect(1)` each — the short-circuit must
-    // fall through to HEAD + push, and the count pins that exactly one
-    // HEAD per blob is issued (not zero, not cached, not repeated).
     Mock::given(method("HEAD"))
         .and(path(format!("/v2/repo-b/blobs/{}", config_desc.digest)))
         .respond_with(ResponseTemplate::new(404))
@@ -2022,9 +2012,7 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
         .mount(&target_server)
         .await;
 
-    // NEGATIVE ASSERTION: zero mount POSTs should arrive at the target.
-    // This is the whole point of the short-circuit — the POST is wasted on
-    // ECR because every POST returns 202 and falls back to upload anyway.
+    // The whole point of the short-circuit: zero mount POSTs.
     Mock::given(method("POST"))
         .and(path("/v2/repo-b/blobs/uploads/"))
         .and(query_param("from", "repo-a"))
@@ -2033,16 +2021,14 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
         .mount(&target_server)
         .await;
 
-    // Normal monolithic upload path (POST init + PUT finalize) for the
-    // blobs that go through after the mount skip.
     mount_blob_push(&target_server, "repo-b").await;
     mount_manifest_push(&target_server, "repo-b", "v1").await;
 
     let source_client = mock_client(&source_server);
     let target_client = ecr_mock_client(&target_server);
 
-    // Pre-warm: target has the blobs at repo-a. The engine will look this
-    // up as a mount source, then the client will short-circuit the POST.
+    // Pre-warm: mount source hint present — the engine's lookup would
+    // normally trigger a POST, but the client short-circuits on ECR.
     let cache = empty_cache();
     let target_name = "ecr-target";
     {
@@ -2059,7 +2045,6 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
         vec![TagPair::same("v1")],
     );
 
-    let cache_for_assertion = Rc::clone(&cache);
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
         .run(
@@ -2073,34 +2058,10 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
-    // Short-circuit means no mounts — the blobs transfer via HEAD + push.
     assert_eq!(report.images[0].blob_stats.mounted, 0);
     assert_eq!(report.images[0].blob_stats.transferred, 2);
     assert_eq!(report.stats.blobs_mounted, 0);
     assert_eq!(report.stats.blobs_transferred, 2);
-
-    // Cache mount sources must NOT have been invalidated — the source blob
-    // is still a valid record of where the blob lives at this target.
-    // Invalidating on NotSupported would lose useful same-repo data.
-    let c = cache_for_assertion.borrow();
-    assert_eq!(
-        c.blob_mount_source(
-            target_name,
-            &config_desc.digest,
-            &RepositoryName::new("repo-b"),
-        ),
-        Some(&RepositoryName::new("repo-a")),
-        "config blob mount source must not be invalidated on NotSupported",
-    );
-    assert_eq!(
-        c.blob_mount_source(
-            target_name,
-            &layer_desc.digest,
-            &RepositoryName::new("repo-b"),
-        ),
-        Some(&RepositoryName::new("repo-a")),
-        "layer blob mount source must not be invalidated on NotSupported",
-    );
 }
 
 /// Small blobs (below the 1 MiB monolithic threshold) use POST+PUT with no

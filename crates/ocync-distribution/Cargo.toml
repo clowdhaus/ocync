@@ -10,15 +10,6 @@ description = "OCI Distribution client library"
 [lints]
 workspace = true
 
-[features]
-# Enables `tests/ecr_mount.rs` — wire-level cross-repo mount tests against
-# real AWS ECR. Requires AWS credentials in the environment and the
-# `OCYNC_TEST_ECR_HOSTNAME` env var pointing at an ECR registry hostname
-# (e.g. `123456789012.dkr.ecr.us-east-1.amazonaws.com`). Costs a few cents
-# per run (repo create/delete + blob push). Not a production feature —
-# gates test compilation only.
-ecr-integration = []
-
 [dependencies]
 aws-config.workspace = true
 aws-lc-rs.workspace = true
@@ -40,10 +31,6 @@ url = { version = "2", default-features = false }
 [dev-dependencies]
 aws-config.workspace = true
 aws-sdk-ecr.workspace = true
-# Integration tests pull in `catch_unwind` (via `FutureExt`) to guarantee
-# ECR test-repo cleanup even if a test body panics. The production code
-# path uses the slimmer `default-features = false` set above.
-futures-util = { version = "0.3", features = ["std"] }
 testcontainers = { version = "0.27", default-features = false }
 tokio = { workspace = true, features = ["sync", "time", "test-util", "macros", "rt-multi-thread"] }
 wiremock = "0.6"

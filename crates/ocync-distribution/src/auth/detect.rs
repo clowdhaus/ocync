@@ -37,16 +37,26 @@ impl ProviderKind {
     /// Whether this provider is known to fulfill OCI cross-repo blob mount.
     ///
     /// Returns `false` for providers observed to never return `201 Created`
-    /// to a mount POST — the client short-circuits in those cases and
-    /// returns [`crate::blob::MountResult::SkippedByClient`] without a
-    /// network request.
+    /// to a mount POST. When `false`, [`crate::blob::RegistryClient::blob_mount`]
+    /// short-circuits without issuing a network request.
     ///
-    /// Current non-fulfilling providers:
-    /// - [`ProviderKind::Ecr`]: 193 observed mount POSTs returned 202,
-    ///   never 201. See `docs/specs/findings.md` and
-    ///   `tests/ecr_mount.rs` for the evidence and the pinning test.
+    /// Non-fulfilling providers:
+    /// - [`ProviderKind::Ecr`]: 193 observed mount POSTs returned 202, never
+    ///   201 (see `docs/specs/findings.md`).
+    ///
+    /// Uses an exhaustive `match` so adding a new [`ProviderKind`] variant
+    /// forces a compile-time decision here.
     pub fn fulfills_cross_repo_mount(&self) -> bool {
-        !matches!(self, Self::Ecr)
+        match self {
+            Self::Ecr => false,
+            Self::EcrPublic
+            | Self::Gcr
+            | Self::Gar
+            | Self::Acr
+            | Self::Ghcr
+            | Self::DockerHub
+            | Self::Chainguard => true,
+        }
     }
 }
 

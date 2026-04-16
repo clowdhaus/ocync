@@ -4045,14 +4045,11 @@ dependencies = [
  "aws-config",
  "aws-sdk-ecr",
  "clap",
- "futures-util",
- "ocync-distribution",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
  "tokio",
- "url",
 ]
 
 [[package]]

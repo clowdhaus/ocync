@@ -25,27 +25,18 @@ const OCTET_STREAM: &str = "application/octet-stream";
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
 pub enum MountResult {
-    /// The registry returned `201 Created` — the blob is now referenced
-    /// from the target repo without a data transfer.
+    /// Registry fulfilled the mount (201 Created). The blob is now
+    /// referenced from the target repo without a data transfer.
     Mounted,
-    /// The registry returned `202 Accepted` with a fresh upload URL —
-    /// the caller should PATCH data to `upload_url` to complete the
-    /// transfer via a normal chunked upload.
-    FallbackUpload {
-        /// The URL to use for the fallback PATCH upload.
-        upload_url: String,
-    },
-    /// The client chose not to issue the mount POST at all because the
-    /// target provider is known to never fulfill mount (e.g. AWS ECR
-    /// returns 202 to every OCI mount, never 201 — see
-    /// `docs/specs/findings.md`). Callers should proceed directly to
-    /// HEAD + push; no fallback upload URL is available.
+    /// Mount did not succeed — either the registry returned 202 (no
+    /// mount, fresh upload URL which the caller ignores in favor of a
+    /// full HEAD + push) or the client short-circuited before issuing
+    /// the POST because the target provider is known to never fulfill
+    /// mount (see [`ProviderKind::fulfills_cross_repo_mount`]).
     ///
-    /// This variant represents a *client-side* decision driven by
-    /// [`ProviderKind::fulfills_cross_repo_mount`] — it is not a server
-    /// capability signal. Use [`RegistryClient::blob_mount_unchecked`]
-    /// to observe what the provider actually returns.
-    SkippedByClient,
+    /// Callers should fall through to HEAD + push regardless of which
+    /// of these produced the result.
+    NotMounted,
 }
 
 /// Build the path segment for a blob: `/blobs/{digest}`.
@@ -136,15 +127,9 @@ impl RegistryClient {
     /// Attempt a cross-repository blob mount.
     ///
     /// Issues a POST to `/v2/{repository}/blobs/uploads/?mount={digest}&from={from_repo}`.
-    /// If the registry supports it, returns [`MountResult::Mounted`]. Otherwise,
-    /// falls back to a regular upload URL.
-    ///
-    /// Returns [`MountResult::SkippedByClient`] without issuing a network
-    /// request for providers known to never fulfill mount (currently ECR).
-    /// Callers should treat this as a signal to go directly to HEAD + push.
-    ///
-    /// Use [`blob_mount_unchecked`](Self::blob_mount_unchecked) to bypass the short-circuit
-    /// for diagnostic purposes (e.g. `xtask probe`).
+    /// Returns [`MountResult::Mounted`] on 201, [`MountResult::NotMounted`] on 202
+    /// (or when the client short-circuits because the target provider is known
+    /// to never fulfill mount — see [`ProviderKind::fulfills_cross_repo_mount`]).
     pub async fn blob_mount(
         &self,
         repository: &RepositoryName,
@@ -152,35 +137,16 @@ impl RegistryClient {
         from_repo: &RepositoryName,
     ) -> Result<MountResult, Error> {
         let provider_kind = self.base_url.host_str().and_then(detect_provider_kind);
-        let fulfills = provider_kind.is_none_or(|k| k.fulfills_cross_repo_mount());
-        if !fulfills {
-            tracing::debug!(
+        if provider_kind.is_some_and(|k| !k.fulfills_cross_repo_mount()) {
+            debug!(
                 target = %repository,
                 %digest,
                 ?provider_kind,
                 "skipping cross-repo mount POST: provider does not fulfill mount"
             );
-            return Ok(MountResult::SkippedByClient);
+            return Ok(MountResult::NotMounted);
         }
 
-        self.blob_mount_unchecked(repository, digest, from_repo)
-            .await
-    }
-
-    /// Issue a cross-repository mount POST unconditionally, bypassing the
-    /// provider short-circuit.
-    ///
-    /// Intended for diagnostic tools (e.g. the `xtask probe` subcommand)
-    /// that need to observe what a registry actually returns — including
-    /// providers that [`blob_mount`](Self::blob_mount) skips because they
-    /// are known to never fulfill mount. Production code should always use
-    /// `blob_mount`, which saves a round-trip for those providers.
-    pub async fn blob_mount_unchecked(
-        &self,
-        repository: &RepositoryName,
-        digest: &Digest,
-        from_repo: &RepositoryName,
-    ) -> Result<MountResult, Error> {
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let scopes = [
             Scope::pull_push(repository.as_str()),
@@ -572,20 +538,16 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Str
 }
 
 /// Classify a mount response into [`MountResult`].
+///
+/// 201 Created → the registry fulfilled the mount. 202 Accepted → the
+/// registry returned a fresh upload URL instead; the engine falls through
+/// to HEAD + push rather than chaining on the URL, so we discard it and
+/// surface only the binary outcome. Other status codes are errors.
 async fn classify_mount_response(resp: reqwest::Response) -> Result<MountResult, Error> {
     let status = resp.status();
-
     match status {
         StatusCode::CREATED => Ok(MountResult::Mounted),
-        StatusCode::ACCEPTED => {
-            let upload_url = resp
-                .headers()
-                .get(LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_owned();
-            Ok(MountResult::FallbackUpload { upload_url })
-        }
+        StatusCode::ACCEPTED => Ok(MountResult::NotMounted),
         _ => {
             let message = resp.text().await.unwrap_or_default();
             Err(Error::RegistryError { status, message })
@@ -596,40 +558,6 @@ async fn classify_mount_response(resp: reqwest::Response) -> Result<MountResult,
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- ProviderKind::fulfills_cross_repo_mount ---
-
-    #[test]
-    fn fulfills_mount_ecr_returns_false() {
-        // ECR always returns 202 to OCI mount POSTs, so the client
-        // short-circuits and skips the POST entirely.
-        assert!(!ProviderKind::Ecr.fulfills_cross_repo_mount());
-    }
-
-    #[test]
-    fn fulfills_mount_non_ecr_returns_true() {
-        // All other known providers are attempted optimistically. Failure
-        // falls through to `MountResult::FallbackUpload` at the client layer.
-        //
-        // Change-detector test: if a new `ProviderKind` variant is added,
-        // this test does NOT cover it. Always re-audit this list when
-        // adding a new provider — falsely assuming "fulfills mount" for a
-        // non-fulfilling provider regresses efficiency silently.
-        for kind in [
-            ProviderKind::EcrPublic,
-            ProviderKind::Gcr,
-            ProviderKind::Gar,
-            ProviderKind::Acr,
-            ProviderKind::Ghcr,
-            ProviderKind::DockerHub,
-            ProviderKind::Chainguard,
-        ] {
-            assert!(
-                kind.fulfills_cross_repo_mount(),
-                "expected {kind:?} to fulfill cross-repo mount (until proven otherwise)"
-            );
-        }
-    }
 
     #[test]
     fn blob_path_format() {
@@ -697,34 +625,12 @@ mod tests {
         );
     }
 
-    /// Build a `RegistryClient` with a GHCR hostname resolving to a local port.
-    fn build_ghcr_client(port: u16) -> RegistryClient {
-        let base_url = url::Url::parse(&format!("http://ghcr.io:{port}")).unwrap();
-        let http = reqwest::Client::builder()
-            .resolve(
-                "ghcr.io",
-                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            )
-            .build()
-            .unwrap();
-
-        RegistryClient {
-            base_url,
-            http,
-            auth: None,
-            aimd: crate::aimd::AimdController::new("ghcr.io", 8),
-            chunk_size: 4,
-        }
-    }
-
-    /// Build a `RegistryClient` with an ECR hostname resolving to a local port.
-    ///
-    /// Used to assert that `blob_mount` short-circuits without issuing a
-    /// network request when the target is ECR (which never fulfills
-    /// cross-repo mount and always returns 202 per
-    /// `project_ecr_mount_behavior` memory).
-    fn build_ecr_client(port: u16) -> RegistryClient {
-        let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
+    /// Build a `RegistryClient` with the given hostname, routing all traffic
+    /// for that hostname to a local wiremock port. Used by the tests below
+    /// that need a real-looking hostname (e.g. `ghcr.io`,
+    /// `<acct>.dkr.ecr.<region>.amazonaws.com`) to exercise hostname-keyed
+    /// behavior in the client.
+    fn build_test_client(host: &str, port: u16) -> RegistryClient {
         let base_url = url::Url::parse(&format!("http://{host}:{port}")).unwrap();
         let http = reqwest::Client::builder()
             .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
@@ -736,26 +642,6 @@ mod tests {
             http,
             auth: None,
             aimd: crate::aimd::AimdController::new(host, 8),
-            chunk_size: 4,
-        }
-    }
-
-    /// Build a `RegistryClient` with a GAR hostname resolving to a local port.
-    fn build_gar_client(port: u16) -> RegistryClient {
-        let base_url = url::Url::parse(&format!("http://us-docker.pkg.dev:{port}")).unwrap();
-        let http = reqwest::Client::builder()
-            .resolve(
-                "us-docker.pkg.dev",
-                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            )
-            .build()
-            .unwrap();
-
-        RegistryClient {
-            base_url,
-            http,
-            auth: None,
-            aimd: crate::aimd::AimdController::new("us-docker.pkg.dev", 8),
             chunk_size: 4,
         }
     }
@@ -813,7 +699,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_gar_client(port);
+        let client = build_test_client("us-docker.pkg.dev", port);
 
         let repo = RepositoryName::new("my-project/my-repo");
         let result = client
@@ -869,7 +755,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_ghcr_client(port);
+        let client = build_test_client("ghcr.io", port);
 
         // Pass None so the monolithic threshold does not intercept the call;
         // we are verifying the GHCR-specific single-PATCH path directly.
@@ -921,7 +807,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_ghcr_client(port);
+        let client = build_test_client("ghcr.io", port);
 
         // No known_size — GHCR path still taken based on hostname alone.
         let repo = RepositoryName::new("repo");
@@ -933,183 +819,78 @@ mod tests {
         assert_eq!(result, digest);
     }
 
-    /// ECR never fulfills OCI cross-repo mount (178/178 returned 202 in
-    /// benchmark observations), so `blob_mount` on an ECR target must
-    /// short-circuit and return [`MountResult::SkippedByClient`] without
-    /// issuing any HTTP request. The wiremock server below refuses all
-    /// requests — if the short-circuit is missing, the test fails.
-    #[tokio::test]
-    async fn blob_mount_on_ecr_short_circuits() {
-        let server = wiremock::MockServer::start().await;
-        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
-
-        // If the short-circuit is broken, blob_mount would hit this mock,
-        // which would panic because no matcher is registered.
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let client = build_ecr_client(port);
-        let repo = RepositoryName::new("target/repo");
-        let from_repo = RepositoryName::new("source/repo");
-        let digest = test_digest(b"ecr mount short-circuit");
-
-        let result = client.blob_mount(&repo, &digest, &from_repo).await.unwrap();
-
-        assert!(
-            matches!(result, MountResult::SkippedByClient),
-            "expected MountResult::SkippedByClient on ECR target, got {result:?}"
-        );
-    }
-
-    /// `blob_mount_unchecked` must bypass the ECR short-circuit and actually
-    /// issue the POST. Used by the `xtask probe` diagnostic subcommand to
-    /// observe what ECR returns on the wire.
+    /// Covers the hostname-keyed mount routing:
+    /// - ECR short-circuits without issuing the POST (0 calls, `NotMounted`)
+    /// - GHCR attempts mount; 201 maps to `Mounted`
+    /// - Unknown hostnames default to optimistic; 201 maps to `Mounted`
     ///
-    /// Also asserts no PATCH/PUT follows — the mount call must return
-    /// after classifying the 202 response, NOT silently continue into a
-    /// full fallback upload.
+    /// The ECR row is the negative assertion — if the short-circuit breaks,
+    /// the `.expect(0)` fails.
     #[tokio::test]
-    async fn blob_mount_unchecked_on_ecr_issues_request() {
-        let server = wiremock::MockServer::start().await;
-        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
-
-        // Stub the POST to return 202 (what ECR actually does) so the caller
-        // can observe the raw fallback-upload classification.
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/v2/tgt/repo/blobs/uploads/"))
-            .and(wiremock::matchers::query_param("from", "src/repo"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202)
-                    .append_header("Location", "/v2/tgt/repo/blobs/uploads/uuid-ecr"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // NEGATIVE: mount classification must not cascade into an upload.
-        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
-            .respond_with(wiremock::ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .respond_with(wiremock::ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let client = build_ecr_client(port);
-        let repo = RepositoryName::new("tgt/repo");
-        let from_repo = RepositoryName::new("src/repo");
-        let digest = test_digest(b"ecr raw mount bypass");
-
-        let result = client
-            .blob_mount_unchecked(&repo, &digest, &from_repo)
-            .await
-            .unwrap();
-
-        assert!(
-            matches!(result, MountResult::FallbackUpload { .. }),
-            "expected FallbackUpload for 202 response, got {result:?}"
-        );
-    }
-
-    /// Build a `RegistryClient` with an unknown hostname (no matching
-    /// `ProviderKind`). Used to assert the short-circuit defaults to
-    /// optimistic for unrecognized providers.
-    fn build_unknown_client(port: u16) -> RegistryClient {
-        let host = "my-private-registry.example.com";
-        let base_url = url::Url::parse(&format!("http://{host}:{port}")).unwrap();
-        let http = reqwest::Client::builder()
-            .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
-            .build()
-            .unwrap();
-
-        RegistryClient {
-            base_url,
-            http,
-            auth: None,
-            aimd: crate::aimd::AimdController::new(host, 8),
-            chunk_size: 4,
+    async fn blob_mount_routes_per_provider() {
+        struct Case {
+            host: &'static str,
+            expected_post_count: u64,
+            // When `expected_post_count > 0`, the server returns this status.
+            server_status: u16,
+            expect_mounted: bool,
         }
-    }
 
-    /// Unknown providers default to optimistic: the short-circuit must
-    /// NOT fire, and the POST must reach the server. Without this test, a
-    /// future regression that gated mount on "only known providers"
-    /// would pass silently for every non-ECR self-hosted registry
-    /// (Quay, Harbor, etc.).
-    #[tokio::test]
-    async fn blob_mount_on_unknown_host_issues_request() {
-        let server = wiremock::MockServer::start().await;
-        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+        let cases = [
+            Case {
+                host: "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+                expected_post_count: 0,
+                server_status: 500, // unreachable — short-circuit fires first
+                expect_mounted: false,
+            },
+            Case {
+                host: "ghcr.io",
+                expected_post_count: 1,
+                server_status: 201,
+                expect_mounted: true,
+            },
+            Case {
+                host: "my-private-registry.example.com",
+                expected_post_count: 1,
+                server_status: 201,
+                expect_mounted: true,
+            },
+        ];
 
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/v2/tgt/repo/blobs/uploads/"))
-            .respond_with(wiremock::ResponseTemplate::new(201))
-            .expect(1)
-            .mount(&server)
-            .await;
+        for case in cases {
+            let server = wiremock::MockServer::start().await;
+            let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
 
-        let client = build_unknown_client(port);
-        let result = client
-            .blob_mount(
-                &RepositoryName::new("tgt/repo"),
-                &test_digest(b"unknown host mount"),
-                &RepositoryName::new("src/repo"),
-            )
-            .await
-            .unwrap();
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v2/tgt/repo/blobs/uploads/"))
+                .respond_with(wiremock::ResponseTemplate::new(case.server_status))
+                .expect(case.expected_post_count)
+                .mount(&server)
+                .await;
 
-        assert!(
-            matches!(result, MountResult::Mounted),
-            "unknown providers must not short-circuit; expected Mounted, got {result:?}"
-        );
-    }
+            let client = build_test_client(case.host, port);
+            let result = client
+                .blob_mount(
+                    &RepositoryName::new("tgt/repo"),
+                    &test_digest(case.host.as_bytes()),
+                    &RepositoryName::new("src/repo"),
+                )
+                .await
+                .unwrap();
 
-    /// GHCR is expected to honor mount (not short-circuited). When the
-    /// registry returns 201, the client surfaces `MountResult::Mounted`.
-    ///
-    /// Also asserts no PATCH/PUT follows — a 201 mount is complete; a
-    /// bug that issued a fallback upload anyway would fail here.
-    #[tokio::test]
-    async fn blob_mount_on_ghcr_issues_request() {
-        let server = wiremock::MockServer::start().await;
-        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
-
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/v2/tgt/repo/blobs/uploads/"))
-            .and(wiremock::matchers::query_param("from", "src/repo"))
-            .respond_with(wiremock::ResponseTemplate::new(201))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // NEGATIVE: 201 mount-success must not be followed by any upload.
-        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
-            .respond_with(wiremock::ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .respond_with(wiremock::ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let client = build_ghcr_client(port);
-        let repo = RepositoryName::new("tgt/repo");
-        let from_repo = RepositoryName::new("src/repo");
-        let digest = test_digest(b"ghcr mount happy path");
-
-        let result = client.blob_mount(&repo, &digest, &from_repo).await.unwrap();
-
-        assert!(
-            matches!(result, MountResult::Mounted),
-            "expected MountResult::Mounted on GHCR target, got {result:?}"
-        );
+            if case.expect_mounted {
+                assert!(
+                    matches!(result, MountResult::Mounted),
+                    "{}: expected Mounted, got {result:?}",
+                    case.host
+                );
+            } else {
+                assert!(
+                    matches!(result, MountResult::NotMounted),
+                    "{}: expected NotMounted, got {result:?}",
+                    case.host
+                );
+            }
+        }
     }
 }

@@ -1,15 +1,12 @@
 //! Cross-repo blob mount protocol tests against the OCI reference
 //! `registry:2` image (CNCF Distribution).
 //!
-//! These are Layer 1 protocol tests per `docs/specs/benchmark-design-v2.md`:
-//! they answer the question "does the wire protocol fulfill mount the way
-//! the OCI spec says it should?" using the reference implementation as the
-//! baseline.
-//!
-//! The complementary suite, `ecr_mount.rs`, answers the same question
-//! against real AWS ECR — gated behind `--features ecr-integration`.
-//! Together they guard the `MountResult::Mounted` vs
-//! `MountResult::SkippedByClient` decision at the client layer.
+//! Pins the protocol-compliant baseline for `blob_mount`: a committed
+//! source blob returns [`MountResult::Mounted`], a missing source returns
+//! [`MountResult::NotMounted`]. Real-ECR behavior is deliberately not
+//! covered here (see `docs/specs/findings.md` — ECR never fulfills mount,
+//! so the client short-circuits and the engine integration test pins
+//! that end-to-end).
 //!
 //! Requirements:
 //! - Docker must be running
@@ -123,13 +120,9 @@ async fn mount_committed_blob_returns_mounted() {
 }
 
 /// When the source blob doesn't exist in `source_repo`, the registry must
-/// return 202 (not 201) and the client surfaces `FallbackUpload`.
-///
-/// This pins the negative case: without a committed source, mount cannot
-/// succeed. Asserts the client returns `FallbackUpload` with a non-empty
-/// upload URL (so a fallback PATCH upload could proceed from here).
+/// return 202 (not 201) and the client surfaces `NotMounted`.
 #[tokio::test]
-async fn mount_missing_source_returns_fallback_upload() {
+async fn mount_missing_source_returns_not_mounted() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
 
@@ -143,15 +136,10 @@ async fn mount_missing_source_returns_fallback_upload() {
         .await
         .expect("blob_mount request failed");
 
-    match result {
-        MountResult::FallbackUpload { upload_url } => {
-            assert!(
-                !upload_url.is_empty(),
-                "fallback upload URL must be populated so PATCH can proceed"
-            );
-        }
-        other => panic!("expected FallbackUpload when source missing, got {other:?}"),
-    }
+    assert!(
+        matches!(result, MountResult::NotMounted),
+        "expected NotMounted when source missing, got {result:?}"
+    );
 }
 
 /// After a successful mount, the source blob must remain intact in the

@@ -55,15 +55,17 @@ Created` (the spec-compliant mount-success response).
 | Trigger | Corpus | Mount attempts | 201 | 202 | Errors |
 |---|---|---|---|---|---|
 | Jupyter benchmark (commit `56bbfac`) | 5 images × 6 tags, Chainguard → ECR us-east-1 | 178 | 0 | 178 | 0 |
-| `xtask probe` 0s wait (commit `c2d33d6`) | synthetic 1 KiB blob | 5 | 0 | 5 | 0 |
-| `xtask probe` 10s wait | same | 5 | 0 | 5 | 0 |
-| `xtask probe` 60s wait | same | 5 | 0 | 5 | 0 |
+| Ad-hoc probe, 0s wait (commit `c2d33d6`) | synthetic 1 KiB blob | 5 | 0 | 5 | 0 |
+| Ad-hoc probe, 10s wait | same | 5 | 0 | 5 | 0 |
+| Ad-hoc probe, 60s wait | same | 5 | 0 | 5 | 0 |
 | **Total** | | **193** | **0** | **193** | **0** |
 
-The probe deliberately varied the interval between source blob commit and
-mount attempt (0s / 10s / 60s) to test the hypothesis that ECR requires
-settling time before fulfilling mount. It does not — all three delays
-produced the same result.
+The ad-hoc probe deliberately varied the interval between source blob
+commit and mount attempt (0s / 10s / 60s) to test the hypothesis that
+ECR requires settling time before fulfilling mount. It does not — all
+three delays produced the same result. The probe tool was subsequently
+removed from the tree; see the re-validate section below for the
+manual procedure if the observation needs to be re-run.
 
 ### Implication
 
@@ -88,48 +90,49 @@ is one more round-trip than a direct POST + PATCH would have been. Net
 cost of attempted mount on ECR: ~1 round-trip per shared blob per
 target.
 
-### Action taken (PR #25)
+### Action taken
 
-- `MountResult::SkippedByClient` variant added; `blob_mount` returns it
-  without a network request when the target is ECR.
-- `ProviderKind::fulfills_cross_repo_mount(&self) -> bool` method on
-  the provider enum is the single point where registry mount capability
-  is recorded.
-- `blob_mount_unchecked` exposes the unconditional POST for diagnostic
-  tooling (`xtask probe`) so future observations can bypass the
-  short-circuit.
-- Protocol tests pair a positive case (`registry:2` returns 201,
-  `MountResult::Mounted`) with a negative case (real ECR returns 202,
-  `MountResult::FallbackUpload` via unchecked; `MountResult::SkippedByClient`
-  via `blob_mount`).
+- `ProviderKind::fulfills_cross_repo_mount()` uses an exhaustive `match`
+  so adding a new provider forces a compile-time decision. `Ecr` returns
+  `false`; all other known providers return `true`.
+- `blob_mount` short-circuits when the target hostname resolves to a
+  provider that does not fulfill mount — returns `MountResult::NotMounted`
+  without issuing the POST, saving one round-trip per shared blob per
+  target.
+- `MountResult` is a two-variant enum (`Mounted` / `NotMounted`). The
+  engine invalidates the cached mount source on `NotMounted` and falls
+  through to HEAD + push.
+- Protocol coverage: `tests/registry2_mount.rs` pins `Mounted` against the
+  OCI reference `registry:2` container. `engine_integration::
+  sync_warm_cache_ecr_target_short_circuits_mount` pins the engine-level
+  wire behavior (0 mount POSTs on ECR).
 
 ### To re-validate
 
-If AWS behavior changes, flip `ProviderKind::fulfills_cross_repo_mount`
-to allow ECR and update both
-`tests/ecr_mount.rs::ecr_mount_returns_skipped_by_client` and
-`tests/ecr_mount.rs::ecr_mount_unchecked_returns_fallback_upload`
-together. Re-confirm with:
+If AWS behavior changes, observation typically comes from a sync where a
+mount would have otherwise succeeded. To re-run the original diagnostic
+manually against a throwaway ECR account:
 
-```
-cargo xtask probe \
-    --registry <account>.dkr.ecr.<region>.amazonaws.com \
-    --iterations 5
-```
+1. Push a small blob to a source repo in the target ECR account.
+2. `aws ecr get-login-password | docker login --username AWS --password-stdin <registry>`.
+3. `curl -sS -X POST "<registry>/v2/<target-repo>/blobs/uploads/?mount=<digest>&from=<source-repo>" -I`.
+4. If the response is `201 Created` (not `202 Accepted`), flip
+   `ProviderKind::fulfills_cross_repo_mount` to allow ECR and update
+   `tests/registry2_mount.rs` style coverage with an ECR case.
 
-One 201 in the probe output is sufficient grounds to re-evaluate; AWS
-may fulfill mount only under specific conditions (IAM scope, same
-account vs. cross-account, specific regions), in which case the probe's
-output should be analyzed before flipping the short-circuit.
+One `201` across multiple accounts/regions is sufficient grounds to
+re-evaluate. AWS may fulfill mount only under specific conditions (same
+account, specific regions, specific IAM scopes) — analyze the response
+body and `Location` header before flipping the short-circuit globally.
 
 ### Cost of this particular finding
 
-Approximately 30 seconds of round-trip latency per 178-blob sync —
-measurable but not the dominant efficiency lever on the primary use
-case. The larger significance: the mount optimization shipped without a
-wire-level test against real ECR, so the silent no-op went undetected
-for months. See `feedback_optimization_protocol_test.md` for the rule
-that now prevents this class of bug.
+Approximately one round-trip per shared blob per target on ECR — the
+fallback path (HEAD + push) already transferred the blob correctly, so
+this is a wall-clock saving, not a bytes or rate-limit saving. The
+larger significance is procedural: the original mount optimization
+shipped without a wire-level test against real ECR, so the silent no-op
+went undetected until a proxy log made it visible.
 
 ---
 

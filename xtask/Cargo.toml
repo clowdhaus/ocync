@@ -12,13 +12,8 @@ workspace = true
 aws-config.workspace = true
 aws-sdk-ecr.workspace = true
 clap.workspace = true
-# `std` feature enables `FutureExt::catch_unwind` used by the `probe`
-# subcommand to guarantee ephemeral-repo cleanup even if the body panics.
-futures-util = { version = "0.3", features = ["std"] }
-ocync-distribution.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "process", "time"] }
-url.workspace = true

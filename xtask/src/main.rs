@@ -1,7 +1,6 @@
 //! xtask — workspace automation commands.
 
 mod bench;
-mod probe;
 
 use std::process::ExitCode;
 
@@ -13,8 +12,6 @@ use clap::Parser;
 enum Cli {
     /// Run benchmark suite comparing ocync against dregsy and regsync.
     Bench(bench::BenchArgs),
-    /// Probe a registry's cross-repo mount behavior (currently ECR only).
-    Probe(probe::ProbeArgs),
 }
 
 fn main() -> ExitCode {
@@ -24,9 +21,8 @@ fn main() -> ExitCode {
         .build()
         .expect("failed to build tokio runtime");
 
-    let result: Result<(), Box<dyn std::error::Error>> = match cli {
+    let result = match cli {
         Cli::Bench(args) => rt.block_on(bench::run(args)),
-        Cli::Probe(args) => rt.block_on(probe::run(args)),
     };
 
     match result {
