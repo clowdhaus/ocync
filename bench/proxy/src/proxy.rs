@@ -122,7 +122,15 @@ pub(crate) async fn serve(
     // validate against the same trust store as the tools under test —
     // the proxy's own CA cert goes *in* the client's trust store, but
     // the proxy itself validates origin certs normally.
+    //
+    // `Policy::none()` is critical: Docker Hub responds to blob GETs
+    // with 302 redirects to pre-signed S3 URLs that are tied to the
+    // origin host. Following redirects inside the proxy would rewrite
+    // the Host header and break the S3 signature. The client under
+    // test (ocync) will follow the 302 itself and open a new CONNECT
+    // for the S3 host, which is what lets the signature verify.
     let upstream = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(32)
         .build()
         .map_err(|e| format!("reqwest client: {e}"))?;
