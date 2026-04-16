@@ -212,7 +212,9 @@ fn parse_size(s: &str) -> Option<u64> {
 }
 
 /// Build a `RegistryClient` for each named registry in config, keyed by name.
-async fn build_clients(config: &Config) -> Result<HashMap<String, Arc<RegistryClient>>, CliError> {
+pub(crate) async fn build_clients(
+    config: &Config,
+) -> Result<HashMap<String, Arc<RegistryClient>>, CliError> {
     let mut clients = HashMap::with_capacity(config.registries.len());
     for (name, reg) in &config.registries {
         let hostname = bare_hostname(&reg.url);
@@ -255,7 +257,7 @@ async fn build_batch_checkers(
 ///
 /// Falls back to `defaults.source`, `defaults.targets`, and `defaults.tags`
 /// when the mapping does not specify its own values.
-async fn resolve_mapping(
+pub(crate) async fn resolve_mapping(
     mapping: &MappingConfig,
     config: &Config,
     clients: &HashMap<String, Arc<RegistryClient>>,

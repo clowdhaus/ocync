@@ -8362,3 +8362,236 @@ async fn discovery_snapshot_pruning_removes_deleted_tags() {
         "v2 should have been pruned from the snapshot cache"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test: engine exits cleanly with untriggered shutdown signal
+// ---------------------------------------------------------------------------
+
+/// The engine must exit after all work completes even when a shutdown signal
+/// is registered but never triggered. Before the fix, the select! loop's
+/// shutdown branch stayed enabled with an always-pending `notified().await`,
+/// preventing the `else` exit from firing.
+///
+/// This test uses a 10-second timeout to detect the hang — if the engine
+/// doesn't exit within 10s of completing all transfers, the test fails.
+#[tokio::test]
+async fn sync_exits_with_untriggered_shutdown_signal() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-shutdown-exit";
+    let layer_data = b"layer-shutdown-exit";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "repo").await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
+
+    // Create shutdown signal but DO NOT trigger it — this is the production
+    // scenario where the user never sends SIGTERM.
+    let shutdown = ShutdownSignal::new();
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&shutdown),
+        ),
+    )
+    .await
+    .expect("engine hung — did not exit within 10s after completing all work");
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.exit_code(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Test: concurrent transfers wait on in-progress uploads to enable cross-repo mount
+// ---------------------------------------------------------------------------
+
+/// When two concurrent transfers target different repos at the same registry
+/// and share a blob, the second transfer must wait for the first to finish
+/// uploading, then mount from the first repo — not re-upload the blob.
+///
+/// Without the coordination fix, both tasks race past the cache check (no
+/// completed entry yet since the first upload is still in-flight) and both
+/// perform full uploads. The fix adds an in-progress uploader check + Notify
+/// so the second task waits for completion.
+///
+/// Assertion strategy:
+/// - Add a 500ms delay on the source blob GET for repo-a so the upload is
+///   still in flight when repo-b reaches the same blob
+/// - Assert the blob push endpoint for repo-b receives ZERO POSTs without
+///   a mount= query param (every POST must be a mount attempt)
+/// - Assert the mount endpoint receives exactly ONE mount attempt
+#[tokio::test]
+async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
+    use std::time::Duration;
+    use wiremock::matchers::query_param;
+
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"cfg-concurrent-mount";
+    let layer_data = b"layer-concurrent-mount";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Both source repos serve the same manifest and blobs.
+    mount_source_manifest(&source_server, "src-a", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "src-b", "v1", &manifest_bytes).await;
+    // Delayed blob pulls for src-a so the upload stays in-flight long enough
+    // for src-b's task to hit the shared blob and see in-progress state.
+    let delay = Duration::from_millis(500);
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src-a/blobs/{}", config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(delay)
+                .set_body_bytes(config_data.as_ref()),
+        )
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src-a/blobs/{}", layer_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(delay)
+                .set_body_bytes(layer_data.as_ref()),
+        )
+        .mount(&source_server)
+        .await;
+    mount_blob_pull(&source_server, "src-b", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src-b", &layer_desc.digest, layer_data).await;
+
+    // Target: both repos need HEAD 404 and blobs-not-found.
+    mount_manifest_head_not_found(&target_server, "tgt-a", "v1").await;
+    mount_manifest_head_not_found(&target_server, "tgt-b", "v1").await;
+    mount_blob_not_found(&target_server, "tgt-a", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt-a", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt-b", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt-b", &layer_desc.digest).await;
+
+    // tgt-a: accepts full upload (POST + PATCH + PUT).
+    mount_blob_push(&target_server, "tgt-a").await;
+
+    // tgt-b: expect mount (POST with mount= query) → 201 Created. This mock
+    // matches only POSTs with a `mount` query param; full-upload POSTs
+    // (no mount= param) are left unmatched → wiremock returns 404 → test
+    // fails. The `.expect(2)` asserts both blobs were mounted.
+    Mock::given(method("POST"))
+        .and(path("/v2/tgt-b/blobs/uploads/"))
+        .and(query_param("mount", config_desc.digest.to_string()))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/tgt-b/blobs/uploads/"))
+        .and(query_param("mount", layer_desc.digest.to_string()))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    mount_manifest_push(&target_server, "tgt-a", "v1").await;
+    mount_manifest_push(&target_server, "tgt-b", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_a = resolved_mapping(
+        Arc::clone(&source_client),
+        "src-a",
+        "tgt-a",
+        vec![target_entry("target", Arc::clone(&target_client))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_b = resolved_mapping(
+        source_client,
+        "src-b",
+        "tgt-b",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
+
+    // max_concurrent = 10: both mappings run concurrently.
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 2);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "both images should sync",
+    );
+    assert_eq!(report.stats.images_synced, 2);
+    // tgt-a uploaded both blobs; tgt-b mounted both.
+    let tgt_a = report
+        .images
+        .iter()
+        .find(|r| r.target.contains("tgt-a"))
+        .unwrap();
+    let tgt_b = report
+        .images
+        .iter()
+        .find(|r| r.target.contains("tgt-b"))
+        .unwrap();
+    assert_eq!(
+        tgt_a.blob_stats.transferred, 2,
+        "tgt-a should upload both blobs"
+    );
+    assert_eq!(tgt_b.blob_stats.mounted, 2, "tgt-b should mount both blobs");
+    assert_eq!(tgt_b.blob_stats.transferred, 0, "tgt-b must not upload");
+}

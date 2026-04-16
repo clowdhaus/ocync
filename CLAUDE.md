@@ -19,7 +19,7 @@ Every PR must be self-contained. Code in the diff must be called, tested, and in
 - No struct fields that are never read
 - No enum variants for "future use"
 - No speculative derives or trait impls — every `derive` trait (`Hash`, `Eq`, `Serialize`, etc.) and every hand-written trait impl (`Deref`, `Display`, `From`, etc.) must have a live caller; remove unused derives and impls during pre-commit audit
-- No Cargo feature flags anywhere — single binary, all registries, always; this is a CLI tool, not a library
+- No Cargo feature flags for registry selection or optional functionality — single binary, all registries, always; this is a CLI tool, not a library. Exception: crypto backend selection (`fips` vs `non-fips`) is a build-time feature because FIPS requires platform-specific linking (static on Linux, shared on macOS/Windows). Default is `fips`.
 - If you can't write a test that exercises a code path in this PR, it doesn't belong in this PR
 
 ## Pre-commit audit
@@ -43,7 +43,7 @@ Source-side work (manifest pulls) must NEVER be repeated per target. Blobs are i
 
 ### Pipeline select! loop discipline
 
-The pipeline `select!` must use `biased;` (prefer execution completions to free permits) and emptiness guards (`if !pool.is_empty()`) on every branch. Optional branches (shutdown signal, drain deadline) must use guard conditions (`if shutdown.is_some()`) — never `match` with `std::future::pending()` inside the async block, as this creates a permanently-pending future that prevents the `else` arm from firing when both pools drain. The drain deadline branch must also guard on `!execution_futures.is_empty()` so the engine exits immediately when all work completes rather than waiting for the full deadline.
+The pipeline `select!` must use `biased;` (prefer execution completions to free permits) and emptiness guards (`if !pool.is_empty()`) on every branch. Optional branches (shutdown signal, drain deadline) must use guard conditions (`if shutdown.is_some()`) — never `match` with `std::future::pending()` inside the async block, as this creates a permanently-pending future that prevents the `else` arm from firing when both pools drain. The drain deadline branch must also guard on `!execution_futures.is_empty()` so the engine exits immediately when all work completes rather than waiting for the full deadline. The shutdown branch must also guard on work-remaining (`!(discovery_futures.is_empty() && execution_futures.is_empty() && pending.is_empty())`) — without this, the branch blocks the `else` exit after normal completion because `shutdown.notified().await` never resolves when no signal is sent.
 
 OCI blobs are repo-scoped: a blob pushed to `registry/repo-a` is NOT accessible from `registry/repo-b` without a cross-repo mount or separate push. The blob dedup map must check `known_repos` for the current repo before skipping — never skip based on status alone.
 
@@ -80,9 +80,9 @@ New optimization layers must:
 - **Docs**: every `.rs` file gets a `//!` module doc comment; all `pub` items get `///` doc comments
 - **Errors**: invalid user config must return `Result` errors, never silently degrade; users can't distinguish "nothing matched" from "config broken"
 - **Types**: prefer enums/newtypes over `String`/`u16` for domain concepts (media types, artifact types, status codes, repository names, registry identifiers). String newtypes use `Deref<Target=str>` for ergonomic borrowing; rely on implicit deref for `&str` params, use `.as_str()` only for generic bounds (`impl Into<String>`) and tracing fields. Only derive traits with live callers — no speculative `Hash`, `Eq`, or `Serialize` "just in case"
-- **Dependencies**: `default-features = false` on everything; justify every new dep; prefer hand-written code under ~100 lines over a crate; use `regex-lite` for ASCII patterns; all shared deps must use `[workspace.dependencies]` — never add direct version references to crate-level Cargo.toml when the dep exists elsewhere in the workspace
+- **Dependencies**: `default-features = false` on everything; justify every new dep; prefer hand-written code under ~100 lines over a crate; use `regex-lite` for ASCII patterns; all shared deps must use `[workspace.dependencies]` — never add direct version references to crate-level Cargo.toml when the dep exists elsewhere in the workspace. reqwest with `default-features = false` silently disables proxy env var support (`system-proxy` feature) and defaults to hardcoded Mozilla CAs (`webpki-roots`); always enable `system-proxy` and use `rustls-tls-native-roots` (not `rustls-tls`) for system trust store access
 - **Security**: manual `Debug` impls use `&"[REDACTED]"` for secrets; tracing HTTP crate caps via `add_directive()` after `EnvFilter`, never in base filter string
-- **Auth**: expose both `get_token()` and `invalidate()`; never hand-roll 401 retry — use shared `invalidate_auth()` + retry helpers; use API-provided expiry over constants
+- **Auth**: expose both `get_token()` and `invalidate()`; never hand-roll 401 retry — use shared `invalidate_auth()` + retry helpers; use API-provided expiry over constants. ECR private registries use `WWW-Authenticate: Basic` (not Bearer token exchange) — the auth scheme must be determined by parsing the challenge header, not hardcoded. Tokens must carry their auth scheme (Basic vs Bearer) so `auth_headers()` formats correctly.
 - **Process control**: return `ExitCode` via `Termination` trait, never call `process::exit()`
 - **Config parsing**: env var expansion on raw YAML before serde deserialization, not round-trip after; parse functions return `Option`/`Result`, never silently fall back to defaults; validators and parsers must accept the same inputs
 - **Units**: parse and display functions for byte sizes use SI decimal prefixes (1 KB = 1,000) consistently; never mix SI parsing with binary display
@@ -194,6 +194,14 @@ Network code requires `wiremock` tests verifying actual HTTP request sequences, 
 - Stream error propagation (error mid-transfer, not just at start/end)
 - Auth sequences: scope params, token rotation, 401 retry with invalidation
 
+### testcontainers for protocol correctness
+
+wiremock tests verify code handles expected responses, but can't catch protocol mismatches where real registries return different status codes (ECR returns 201 on PATCH instead of spec's 202). Every HTTP protocol path needs a `testcontainers` test against `registry:2` (CNCF Distribution) in addition to wiremock tests. Run with `cargo test --package ocync-distribution --test ecr_integration`. Requires Docker.
+
+### Engine tests must cover the production shutdown path
+
+Engine integration tests must include at least one test with `Some(&shutdown)` that is never triggered. This is the normal production path (`sync` and `watch` commands always pass `Some`). Passing `None` masks termination bugs where select! branches block the exit.
+
 ## Review protocol
 
 Before claiming work is complete, dispatch independent review agents with specific questions:
@@ -228,6 +236,9 @@ cargo fmt --check && cargo clippy -- -D warnings && cargo test && cargo deny che
 # Run all tests
 cargo test
 
+# Integration tests against local registry (requires Docker)
+cargo test --package ocync-distribution --test ecr_integration
+
 # Check formatting
 cargo fmt --check
 
@@ -237,3 +248,54 @@ cargo clippy -- -D warnings
 # License/advisory check
 cargo deny check
 ```
+
+## Benchmarks
+
+Prerequisites: Terraform, AWS credentials with ECR access, SSM parameter `/ocync/bench/github-token` populated.
+
+```bash
+# Provision benchmark infrastructure
+cd bench/terraform && terraform init && terraform apply
+
+# Run benchmarks on the instance (via SSM after bootstrap completes)
+# Args go BEFORE the scenario subcommand:
+cargo xtask bench --limit 3 --tools ocync --iterations 1 cold
+cargo xtask bench --tools ocync,dregsy,regsync all
+
+# Tear down
+cd bench/terraform && terraform destroy
+```
+
+The instance bootstraps automatically with all tools pre-configured:
+- **ocync** — built from source; uses the AWS SDK directly for ECR auth (no Docker needed)
+- **dregsy + skopeo** — skopeo built with `-tags "exclude_graphdriver_btrfs exclude_graphdriver_devicemapper containers_image_openpgp"` (AL2023 has no btrfs/devicemapper headers)
+- **regsync** — Go binary from `go install`
+- **amazon-ecr-credential-helper** — Go binary + `~/.docker/config.json` with `credHelpers` block (dregsy and regsync use the Docker credential chain for ECR, not the AWS SDK directly)
+- **bench-proxy** — pure-Rust MITM proxy at `bench/proxy/` built alongside ocync. Replaces mitmproxy, which capped at ~250 Mbps on single-threaded Python TLS and blocked multi-GB corpora. CA is generated by `bench-proxy ca-init` during bootstrap and installed into `/etc/pki/ca-trust/source/anchors/` via `update-ca-trust` — both rustls-native-certs and Go's x509 package read from there
+
+`BENCH_TARGET_REGISTRY` must be set to the ECR hostname. `user_data_replace_on_change = true` recreates the instance on bootstrap changes (but NOT on `root_block_device` changes — those require explicit taint).
+
+**Tool architecture note**: ocync uses the AWS SDK for ECR auth; dregsy/regsync use the Docker credential chain via `amazon-ecr-credential-helper`. Both approaches work on the same instance because the credential helper uses the ambient AWS credential chain (IAM instance profile).
+
+**Competitor config gotchas** (codified in `xtask/src/bench/config_gen.rs`):
+- **regsync** requires `repoAuth: true` on source creds for registries that issue per-repo tokens (cgr.dev, gcr.io, nvcr.io). Without it, multi-image syncs fail with HTTP 403 on the second image. Do NOT set `credExpire` as a duration string — YAML parser fails (no `UnmarshalYAML` on `timejson.Duration`); rely on the 1h default.
+- **dregsy** requires `auth-refresh: 12h` on the ECR target. Without it, dregsy skips its internal AWS SDK refresher and falls through to skopeo's fragile credential resolution. dregsy auto-creates ECR repos via `CreateECRTarget` (harmless with our pre-create, but architecturally distinct from ocync).
+- **dregsy** exits 1 on ANY failed `skopeo copy`, even with 99% success. Parse per-image logs for real success metrics, not exit code.
+
+**Benchmark baseline** (5 images, 6 tags, c6in.large, cold sync to ECR us-east-1):
+
+| Tool | Wall clock | Exit | Requests | Response bytes |
+|------|-----------|------|----------|----------------|
+| ocync | 243.6s | 0 | 720 | 659 MB |
+| dregsy | 179.5s | 1 (partial) | 326 | 333 MB |
+| regsync | 343.5s | 0 | 466 | 648 MB |
+
+dregsy's lower wall-clock reflects partial failure (halted after ~180s); regsync's higher byte count matches ocync suggesting complete transfers. Real performance comparison requires dregsy to complete successfully.
+
+**Proxy-side rules (bench-proxy)**:
+- **Forward 3xx, don't follow.** Docker Hub returns 302 to pre-signed S3 URLs whose SigV4 signatures are bound to `Host: registry-1.docker.io`. Following redirects inside the proxy rewrites Host to `s3.amazonaws.com` and S3 rejects with `SignatureDoesNotMatch`. Upstream reqwest must be built with `redirect(Policy::none())`. The client under test (ocync / skopeo / regsync) follows 302s itself and opens a fresh CONNECT for the redirect host, which keeps the signature valid.
+- **Leaf cert cache is sync.** `rustls::server::ResolvesServerCert::resolve` is called synchronously from the connection-driving task. Using `tokio::sync::RwLock` + `block_on` panics with "Cannot start a runtime from within a runtime". Use `std::sync::RwLock<HashMap>` — leaf generation (rcgen keygen + one CA sign) is pure CPU and takes ~1 ms.
+- **Proxy logs live in the output dir, not the tempdir.** `xtask::bench::mod` now passes `output_dir` into `run_single_tool` so `{tool}-proxy.jsonl` survives after the run completes. Post-run analysis (`grep mount=`, latency distributions) needs the raw log.
+- **Mount metrics surface in ProxyMetrics.** The per-tool stderr summary prints `mounts=<succ>/<attempt>` for quick feedback on whether cross-repo mount is firing at all. Zero attempts = code path cold; attempts but zero successes = registry not fulfilling mount (known ECR behavior for mid-flight source blobs).
+
+**ECR cross-repo mount is a no-op in practice (as of this session).** Every `POST .../blobs/uploads/?mount=<digest>&from=<repo>` we've observed returns 202 (new upload session), not 201 (mount succeeded). ocync falls back to full blob upload. This is under investigation — either the optimization needs to skip mount attempts on ECR targets to save a round trip, or there's a protocol quirk (URL encoding of `from=`, IAM scope) blocking it. Do NOT claim the mount optimization works on ECR without at least one observed 201 in the proxy log.

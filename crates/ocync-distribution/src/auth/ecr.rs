@@ -8,7 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::sync::RwLock;
 
-use crate::auth::{AuthProvider, Scope, Token};
+use crate::auth::{AuthProvider, AuthScheme, Scope, Token};
 use crate::error::Error;
 
 /// Default ECR token lifetime (12 hours).
@@ -109,11 +109,12 @@ impl EcrApi for AwsEcrApi {
     }
 }
 
-/// Decode an ECR authorization token.
+/// Validate an ECR authorization token.
 ///
 /// ECR tokens are base64-encoded strings in the format `AWS:<token>`.
-/// Returns the password portion (everything after `AWS:`).
-pub(crate) fn decode_ecr_token(encoded: &str, registry: &str) -> Result<String, Error> {
+/// Validates the format and returns the original encoded string unchanged —
+/// ECR expects it sent as `Authorization: Basic <encoded>`.
+pub(crate) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Error> {
     let decoded = BASE64.decode(encoded).map_err(|e| Error::AuthFailed {
         registry: registry.to_owned(),
         reason: format!("invalid base64 in ECR token: {e}"),
@@ -124,12 +125,14 @@ pub(crate) fn decode_ecr_token(encoded: &str, registry: &str) -> Result<String, 
         reason: format!("ECR token is not valid UTF-8: {e}"),
     })?;
 
-    let password = text.strip_prefix("AWS:").ok_or_else(|| Error::AuthFailed {
-        registry: registry.to_owned(),
-        reason: "ECR token does not start with 'AWS:'".into(),
-    })?;
+    if !text.starts_with("AWS:") {
+        return Err(Error::AuthFailed {
+            registry: registry.to_owned(),
+            reason: "ECR token does not start with 'AWS:'".into(),
+        });
+    }
 
-    Ok(password.to_owned())
+    Ok(())
 }
 
 /// AWS ECR authentication provider.
@@ -230,9 +233,11 @@ impl EcrAuth {
         }
 
         let response = self.api.get_authorization_token().await?;
-        let password = decode_ecr_token(&response.encoded_token, &self.hostname)?;
+        validate_ecr_token(&response.encoded_token, &self.hostname)?;
         let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
-        let token = Token::with_ttl(password, ttl);
+        // ECR expects `Authorization: Basic <base64(AWS:password)>`. The encoded
+        // token from GetAuthorizationToken is already in the right format.
+        let token = Token::with_ttl(response.encoded_token, ttl).with_scheme(AuthScheme::Basic);
 
         *cached = Some(token.clone());
 
@@ -339,19 +344,18 @@ mod tests {
         }
     }
 
-    // --- decode_ecr_token tests ---
+    // --- validate_ecr_token tests ---
 
     #[test]
-    fn decode_valid_token() {
+    fn validate_valid_token() {
         let encoded = BASE64.encode("AWS:my-secret-token");
-        let password = decode_ecr_token(&encoded, "test-registry").unwrap();
-        assert_eq!(password, "my-secret-token");
+        validate_ecr_token(&encoded, "test-registry").unwrap();
     }
 
     #[test]
-    fn decode_token_invalid_prefix() {
+    fn validate_token_invalid_prefix() {
         let encoded = BASE64.encode("NOTAWS:token");
-        let result = decode_ecr_token(&encoded, "test-registry");
+        let result = validate_ecr_token(&encoded, "test-registry");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("AWS:"));
@@ -359,16 +363,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_token_invalid_base64() {
-        let result = decode_ecr_token("not-valid-base64!!!", "test-registry");
+    fn validate_token_invalid_base64() {
+        let result = validate_ecr_token("not-valid-base64!!!", "test-registry");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("test-registry"));
     }
 
     #[test]
-    fn decode_token_includes_registry_in_error() {
+    fn validate_token_includes_registry_in_error() {
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let err = decode_ecr_token("!!!", host).unwrap_err().to_string();
+        let err = validate_ecr_token("!!!", host).unwrap_err().to_string();
         assert!(err.contains(host));
     }
 
@@ -383,12 +387,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_returns_decoded_token() {
+    async fn auth_returns_basic_scheme_with_encoded_token() {
         let encoded = BASE64.encode("AWS:my-secret");
         let auth = EcrAuth::with_api(TEST_HOST, MockEcrApi::succeeding(&encoded));
 
         let token = auth.get_token(&[]).await.unwrap();
-        assert_eq!(token.value(), "my-secret");
+        // Token value is the original base64-encoded string, not the decoded password.
+        assert_eq!(token.value(), encoded);
+        assert_eq!(*token.scheme(), AuthScheme::Basic);
     }
 
     #[tokio::test]
@@ -396,19 +402,25 @@ mod tests {
         // Queue has exactly one response. If the second get_token call hits
         // the API it will fail (queue empty), proving the cache works.
         let encoded = BASE64.encode("AWS:cached-token");
-        let auth = EcrAuth::with_api(TEST_HOST, MockEcrApi::with_tokens(vec![Some(encoded)]));
+        let auth = EcrAuth::with_api(
+            TEST_HOST,
+            MockEcrApi::with_tokens(vec![Some(encoded.clone())]),
+        );
 
         let t1 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t1.value(), "cached-token");
+        assert_eq!(t1.value(), encoded);
 
         let t2 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t2.value(), "cached-token");
+        assert_eq!(t2.value(), encoded);
     }
 
     #[tokio::test]
     async fn auth_refreshes_near_expiry_token() {
         let encoded = BASE64.encode("AWS:refreshed-token");
-        let auth = EcrAuth::with_api(TEST_HOST, MockEcrApi::with_tokens(vec![Some(encoded)]));
+        let auth = EcrAuth::with_api(
+            TEST_HOST,
+            MockEcrApi::with_tokens(vec![Some(encoded.clone())]),
+        );
 
         // Inject a near-expiry token (1 min remaining < 15 min threshold).
         auth.set_cached_token(Token::with_ttl("stale", Duration::from_secs(60)))
@@ -416,18 +428,20 @@ mod tests {
 
         // Should trigger refresh because should_refresh() returns true.
         let token = auth.get_token(&[]).await.unwrap();
-        assert_eq!(token.value(), "refreshed-token");
+        assert_eq!(token.value(), encoded);
     }
 
     #[tokio::test]
     async fn auth_respects_api_provided_expiry() {
         // First response has a short TTL (5 min < 15 min threshold).
+        let short_encoded = BASE64.encode("AWS:short-lived");
+        let fresh_encoded = BASE64.encode("AWS:refreshed");
         let short = EcrTokenResponse {
-            encoded_token: BASE64.encode("AWS:short-lived"),
+            encoded_token: short_encoded.clone(),
             expires_in: Some(Duration::from_secs(5 * 60)),
         };
         let fresh = EcrTokenResponse {
-            encoded_token: BASE64.encode("AWS:refreshed"),
+            encoded_token: fresh_encoded.clone(),
             expires_in: None,
         };
         let auth = EcrAuth::with_api(
@@ -437,21 +451,23 @@ mod tests {
 
         // First call returns the short-lived token.
         let t1 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t1.value(), "short-lived");
+        assert_eq!(t1.value(), short_encoded);
 
         // Second call triggers refresh because the cached token is near expiry.
         let t2 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t2.value(), "refreshed");
+        assert_eq!(t2.value(), fresh_encoded);
     }
 
     #[tokio::test]
     async fn auth_expired_api_token_triggers_immediate_refresh() {
+        let expired_encoded = BASE64.encode("AWS:expired");
+        let fresh_encoded = BASE64.encode("AWS:fresh");
         let expired = EcrTokenResponse {
-            encoded_token: BASE64.encode("AWS:expired"),
+            encoded_token: expired_encoded.clone(),
             expires_in: Some(Duration::ZERO),
         };
         let fresh = EcrTokenResponse {
-            encoded_token: BASE64.encode("AWS:fresh"),
+            encoded_token: fresh_encoded.clone(),
             expires_in: None,
         };
         let auth = EcrAuth::with_api(
@@ -460,11 +476,11 @@ mod tests {
         );
 
         let t1 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t1.value(), "expired");
+        assert_eq!(t1.value(), expired_encoded);
 
         // Token has Duration::ZERO TTL — next call must refresh.
         let t2 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t2.value(), "fresh");
+        assert_eq!(t2.value(), fresh_encoded);
     }
 
     #[tokio::test]
@@ -473,16 +489,16 @@ mod tests {
         let encoded2 = BASE64.encode("AWS:second-token");
         let auth = EcrAuth::with_api(
             TEST_HOST,
-            MockEcrApi::with_tokens(vec![Some(encoded1), Some(encoded2)]),
+            MockEcrApi::with_tokens(vec![Some(encoded1.clone()), Some(encoded2.clone())]),
         );
 
         let t1 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t1.value(), "first-token");
+        assert_eq!(t1.value(), encoded1);
 
         auth.invalidate().await;
 
         let t2 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t2.value(), "second-token");
+        assert_eq!(t2.value(), encoded2);
     }
 
     #[tokio::test]
@@ -492,7 +508,7 @@ mod tests {
         let encoded = BASE64.encode("AWS:concurrent");
         let auth = Arc::new(EcrAuth::with_api(
             TEST_HOST,
-            MockEcrApi::with_tokens(vec![Some(encoded)]),
+            MockEcrApi::with_tokens(vec![Some(encoded.clone())]),
         ));
 
         let mut handles = Vec::new();
@@ -503,7 +519,7 @@ mod tests {
 
         for handle in handles {
             let token = handle.await.unwrap().unwrap();
-            assert_eq!(token.value(), "concurrent");
+            assert_eq!(token.value(), encoded);
         }
     }
 
@@ -535,7 +551,7 @@ mod tests {
 
         let scopes = [Scope::pull("library/nginx"), Scope::pull_push("myrepo")];
         let token = auth.get_token(&scopes).await.unwrap();
-        assert_eq!(token.value(), "scoped-token");
+        assert_eq!(token.value(), encoded);
     }
 
     #[tokio::test]

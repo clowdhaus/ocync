@@ -110,6 +110,25 @@ pub(crate) fn bare_hostname(s: &str) -> &str {
         .trim_end_matches('/')
 }
 
+/// Map a registry hostname to the host used for the v2 API endpoint.
+///
+/// Docker Hub is a special case: its canonical identifier `docker.io` is what
+/// appears in image references and in auth token scopes, but the v2 API is
+/// served from `registry-1.docker.io`. The bare `docker.io` hostname 302s to
+/// `www.docker.com` (Docker's marketing site), so any HTTP request there
+/// fails. Every other container tool (docker, skopeo, crane, regclient)
+/// performs this same rewrite.
+///
+/// Only the HTTP endpoint is rewritten — auth scope, token service, and the
+/// canonical registry identifier used by [`bare_hostname`] stay as
+/// `docker.io`, which is what Docker Hub's token server expects.
+pub(crate) fn endpoint_host(hostname: &str) -> &str {
+    match hostname {
+        "docker.io" => "registry-1.docker.io",
+        other => other,
+    }
+}
+
 /// Build a [`RegistryClient`] for the given hostname, using the appropriate
 /// auth provider based on explicit `auth_type` or hostname auto-detection.
 ///
@@ -119,16 +138,26 @@ pub(crate) async fn build_registry_client(
     hostname: &str,
     registry_config: Option<&RegistryConfig>,
 ) -> Result<RegistryClient, CliError> {
+    let bare_host = bare_hostname(hostname);
+    // Rewrite the HTTP endpoint host while keeping `bare_host` as-is for auth
+    // scope. Docker Hub requires this split: requests go to registry-1.docker.io,
+    // but the token scope/service stays docker.io.
+    let endpoint = endpoint_host(bare_host);
     let base_url = if hostname.starts_with("http://") || hostname.starts_with("https://") {
-        hostname.to_string()
+        // Preserve scheme; rewrite only the host substring (noop unless
+        // bare_host was exactly `docker.io`).
+        if endpoint == bare_host {
+            hostname.to_string()
+        } else {
+            hostname.replace(bare_host, endpoint)
+        }
     } else {
-        format!("https://{hostname}")
+        format!("https://{endpoint}")
     };
 
     let url = Url::parse(&base_url)
         .map_err(|e| CliError::Input(format!("invalid registry URL '{base_url}': {e}")))?;
 
-    let bare_host = bare_hostname(hostname);
     let http = reqwest::Client::new();
 
     let auth_type = registry_config.and_then(|r| r.auth_type.as_ref());
@@ -146,7 +175,7 @@ pub(crate) async fn build_registry_client(
                 .and_then(|r| r.credentials.as_ref())
                 .expect("basic auth requires credentials (validated)");
             let auth = BasicAuth::new(
-                bare_host,
+                endpoint,
                 http,
                 Credentials::Basic {
                     username: creds.username.clone(),
@@ -176,7 +205,7 @@ pub(crate) async fn build_registry_client(
                     "failed to load docker config for '{bare_host}': {e}"
                 ))
             })?;
-            let auth = DockerConfigAuth::new(bare_host, &docker_config, http)?;
+            let auth = DockerConfigAuth::new(endpoint, &docker_config, http)?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::DockerConfig) => {
@@ -185,11 +214,11 @@ pub(crate) async fn build_registry_client(
                     "failed to load docker config for '{bare_host}': {e}"
                 ))
             })?;
-            let auth = DockerConfigAuth::new(bare_host, &docker_config, http)?;
+            let auth = DockerConfigAuth::new(endpoint, &docker_config, http)?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Anonymous) => {
-            let auth = AnonymousAuth::new(bare_host, http);
+            let auth = AnonymousAuth::new(endpoint, http);
             RegistryClient::builder(url).auth(auth)
         }
         None => {
@@ -208,12 +237,11 @@ pub(crate) async fn build_registry_client(
                 // Try docker config — falls back to anonymous exchange if no creds found.
                 match DockerConfig::load_default() {
                     Ok(config) => {
-                        let auth =
-                            DockerConfigAuth::new(bare_host, &config, http).map_err(|e| {
-                                CliError::Input(format!(
-                                    "docker config credential resolution for '{bare_host}': {e}"
-                                ))
-                            })?;
+                        let auth = DockerConfigAuth::new(endpoint, &config, http).map_err(|e| {
+                            CliError::Input(format!(
+                                "docker config credential resolution for '{bare_host}': {e}"
+                            ))
+                        })?;
                         RegistryClient::builder(url).auth(auth)
                     }
                     Err(_) => {
@@ -222,7 +250,7 @@ pub(crate) async fn build_registry_client(
                             registry = bare_host,
                             "no docker config found, using anonymous auth"
                         );
-                        let auth = AnonymousAuth::new(bare_host, http);
+                        let auth = AnonymousAuth::new(endpoint, http);
                         RegistryClient::builder(url).auth(auth)
                     }
                 }
@@ -436,6 +464,32 @@ mod tests {
     #[test]
     fn bare_hostname_preserves_port() {
         assert_eq!(bare_hostname("localhost:5000"), "localhost:5000");
+    }
+
+    #[test]
+    fn endpoint_host_rewrites_docker_io() {
+        // Docker Hub's v2 API lives at registry-1.docker.io; the bare
+        // `docker.io` hostname redirects to the marketing site.
+        assert_eq!(endpoint_host("docker.io"), "registry-1.docker.io");
+    }
+
+    #[test]
+    fn endpoint_host_passes_through_other_registries() {
+        assert_eq!(endpoint_host("cgr.dev"), "cgr.dev");
+        assert_eq!(endpoint_host("ghcr.io"), "ghcr.io");
+        assert_eq!(endpoint_host("public.ecr.aws"), "public.ecr.aws");
+        assert_eq!(
+            endpoint_host("registry-1.docker.io"),
+            "registry-1.docker.io"
+        );
+    }
+
+    #[test]
+    fn endpoint_host_does_not_rewrite_non_canonical_docker_variants() {
+        // `docker.io:5000` is a different server entirely — only the exact
+        // canonical hostname is rewritten.
+        assert_eq!(endpoint_host("docker.io:5000"), "docker.io:5000");
+        assert_eq!(endpoint_host("sub.docker.io"), "sub.docker.io");
     }
 
     #[test]

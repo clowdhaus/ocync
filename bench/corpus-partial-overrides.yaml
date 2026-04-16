@@ -1,0 +1,13 @@
+# Partial sync overrides — applied on top of corpus.yaml.
+#
+# Each entry replaces the tags for the matching source image.
+# Used by the "partial" benchmark scenario to measure incremental sync.
+
+overrides:
+  # Chainguard paid-tier tags (3.11/3.12 etc) aren't anonymously accessible,
+  # so partial-sync variations must use registries without this restriction.
+  - source: "public.ecr.aws/amazoncorretto/amazoncorretto"
+    tags: ["11", "17"]  # base has 21
+
+  - source: "public.ecr.aws/lambda/python"
+    tags: ["3.11", "3.10"]  # base has 3.12, 3.11

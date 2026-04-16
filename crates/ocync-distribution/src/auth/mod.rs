@@ -91,13 +91,25 @@ impl fmt::Display for Action {
     }
 }
 
-/// A bearer token with optional expiry tracking.
+/// HTTP authentication scheme for a token.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AuthScheme {
+    /// `Authorization: Bearer <token>` — used by Docker v2 token exchange.
+    #[default]
+    Bearer,
+    /// `Authorization: Basic <base64>` — used by ECR (value is pre-encoded).
+    Basic,
+}
+
+/// An authentication token with optional expiry tracking.
 #[derive(Clone)]
 pub struct Token {
-    /// The raw bearer token string.
+    /// The raw token string.
     value: String,
     /// When this token expires (if known).
     expires_at: Option<Instant>,
+    /// How to format the `Authorization` header.
+    scheme: AuthScheme,
 }
 
 impl fmt::Debug for Token {
@@ -110,33 +122,47 @@ impl fmt::Debug for Token {
 }
 
 impl Token {
-    /// Create a token that never expires.
+    /// Create a Bearer token that never expires.
     pub fn new(value: impl Into<String>) -> Self {
         Self {
             value: value.into(),
             expires_at: None,
+            scheme: AuthScheme::Bearer,
         }
     }
 
-    /// Create a token with a known time-to-live.
+    /// Create a Bearer token with a known time-to-live.
     pub fn with_ttl(value: impl Into<String>, ttl: Duration) -> Self {
         Self {
             value: value.into(),
             expires_at: Some(Instant::now() + ttl),
+            scheme: AuthScheme::Bearer,
         }
     }
 
-    /// Create a token that expires at a specific instant.
+    /// Create a Bearer token that expires at a specific instant.
     pub fn with_expiry(value: impl Into<String>, expires_at: Instant) -> Self {
         Self {
             value: value.into(),
             expires_at: Some(expires_at),
+            scheme: AuthScheme::Bearer,
         }
     }
 
-    /// The raw bearer token value.
+    /// Set the auth scheme (default is Bearer).
+    pub fn with_scheme(mut self, scheme: AuthScheme) -> Self {
+        self.scheme = scheme;
+        self
+    }
+
+    /// The raw token value.
     pub fn value(&self) -> &str {
         &self.value
+    }
+
+    /// The auth scheme for this token.
+    pub fn scheme(&self) -> &AuthScheme {
+        &self.scheme
     }
 
     /// Whether this token has already expired.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["bench/proxy", "crates/*", "xtask"]
 
 [workspace.package]
 edition = "2024"
@@ -11,16 +11,20 @@ repository = "https://github.com/clowdhaus/ocync"
 [workspace.dependencies]
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "rt-tokio", "rustls", "sso"] }
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+aws-sdk-ecr = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 bytes = { version = "1", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 http = { version = "1", default-features = false }
 indicatif = { version = "0.17", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+serde_yaml = { package = "serde_yaml_ng", version = "0.10", default-features = false }
+tempfile = { version = "3", default-features = false }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false }
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["system-proxy"] }
 url = { version = "2", default-features = false }
 uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
 ocync-distribution = { path = "crates/ocync-distribution" }
@@ -52,14 +56,14 @@ workspace = true
 
 [dependencies]
 anstyle = { version = "1", default-features = false }
-clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "color"] }
+clap = { workspace = true, features = ["color"] }
 http.workspace = true
 indicatif.workspace = true
 ocync-distribution.workspace = true
 ocync-sync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = { package = "serde_yaml_ng", version = "0.10", default-features = false }
+serde_yaml.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "macros", "signal"] }
 reqwest.workspace = true

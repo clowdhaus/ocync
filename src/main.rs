@@ -165,6 +165,14 @@ redacted by default unless --show-secrets is passed.")]
     #[command(long_about = WATCH_LONG_ABOUT)]
     Watch(WatchArgs),
 
+    /// Analyze blob sharing and cross-repo mount potential without syncing.
+    ///
+    /// Pulls source manifests only (no blobs) and reports how many blobs are
+    /// shared across images, how many bytes could be saved via cross-repo
+    /// mount on the target registries, and per-image layer counts. Useful for
+    /// estimating sync cost before running.
+    Analyze(cli::commands::analyze::AnalyzeArgs),
+
     /// Print version and build information.
     Version,
 }
@@ -297,6 +305,7 @@ async fn main() -> std::process::ExitCode {
     let suppress_summary = match &cli.command {
         Commands::Sync(args) => args.json,
         Commands::Watch(args) => args.json,
+        Commands::Analyze(args) => args.json,
         Commands::Copy(_) => true,
         _ => false,
     };
@@ -335,6 +344,7 @@ async fn main() -> std::process::ExitCode {
         Commands::Watch(args) => {
             cli::commands::watch::run(&args, &*progress, shutdown.clone()).await
         }
+        Commands::Analyze(args) => cli::commands::analyze::run(&args).await,
         Commands::Version => Ok(cli::commands::version::run()),
     };
 

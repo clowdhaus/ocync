@@ -1,5 +1,6 @@
 //! CLI command implementations.
 
+pub(crate) mod analyze;
 pub(crate) mod auth;
 pub(crate) mod copy;
 pub(crate) mod expand;

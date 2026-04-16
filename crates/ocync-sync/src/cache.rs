@@ -20,11 +20,13 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ocync_distribution::Digest;
 use ocync_distribution::spec::{PlatformFilter, RegistryAuthority, RepositoryName};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::plan::{BlobDedupMap, BlobStatus};
@@ -125,6 +127,14 @@ type SourceSnapshotMap = HashMap<SnapshotKey, SourceSnapshot>;
 pub struct TransferStateCache {
     dedup: BlobDedupMap,
     snapshots: SourceSnapshotMap,
+    /// Runtime-only: per-(target, digest) [`Notify`] used to wake waiters when
+    /// an in-progress blob upload completes or fails. Concurrent transfers of
+    /// the same blob from different source repos wait on this to avoid
+    /// redundant uploads — the winner pushes, losers mount from it.
+    ///
+    /// Lives outside `BlobDedupMap` so it's not part of the persisted cache
+    /// format. Entries are cleaned up on persist via `reset_transient_state`.
+    blob_notifies: HashMap<(String, Digest), Rc<Notify>>,
 }
 
 impl TransferStateCache {
@@ -161,9 +171,49 @@ impl TransferStateCache {
         self.dedup.set_exists(target, &digest, &repo);
     }
 
-    /// Mark a blob as in-progress at the target.
-    pub fn set_blob_in_progress(&mut self, target: &str, digest: Digest) {
-        self.dedup.set_in_progress(target, &digest);
+    /// Mark a blob as in-progress at the target, uploaded by `repo`.
+    ///
+    /// Recording the uploading repo enables concurrent transfers of the same
+    /// blob to wait for completion and mount from `repo` via
+    /// [`blob_in_progress_uploader`] + [`blob_notify`].
+    pub fn set_blob_in_progress(&mut self, target: &str, digest: Digest, repo: RepositoryName) {
+        self.dedup.set_in_progress(target, &digest, &repo);
+    }
+
+    /// Return the [`Notify`] for a blob at a target, creating it if absent.
+    ///
+    /// Waiters call `notified().await` on the returned handle before dropping
+    /// the cache borrow; the uploading task calls [`notify_blob`] after
+    /// marking the blob completed or failed.
+    pub fn blob_notify(&mut self, target: &str, digest: &Digest) -> Rc<Notify> {
+        self.blob_notifies
+            .entry((target.to_owned(), digest.clone()))
+            .or_insert_with(|| Rc::new(Notify::new()))
+            .clone()
+    }
+
+    /// Wake all waiters for a blob's transfer completion.
+    ///
+    /// Called by the uploading task after [`set_blob_completed`] or
+    /// [`set_blob_failed`] so concurrent transfers of the same blob can
+    /// proceed (either to mount from the completed repo or to retry).
+    pub fn notify_blob(&self, target: &str, digest: &Digest) {
+        if let Some(n) = self.blob_notifies.get(&(target.to_owned(), digest.clone())) {
+            n.notify_waiters();
+        }
+    }
+
+    /// Return the repository currently uploading `digest` at `target`, if any,
+    /// as long as it differs from `current_repo`. Used by concurrent transfers
+    /// to identify a mount source before initiating their own upload.
+    pub fn blob_in_progress_uploader<'a>(
+        &'a self,
+        target: &str,
+        digest: &Digest,
+        current_repo: &RepositoryName,
+    ) -> Option<&'a RepositoryName> {
+        self.dedup
+            .in_progress_uploader(target, digest, current_repo)
     }
 
     /// Mark a blob as successfully transferred to the given repo at the target.
@@ -353,7 +403,11 @@ impl TransferStateCache {
             LoadError::Corrupt
         })?;
 
-        Ok(Self { dedup, snapshots })
+        Ok(Self {
+            dedup,
+            snapshots,
+            blob_notifies: HashMap::new(),
+        })
     }
 }
 
@@ -488,7 +542,7 @@ mod tests {
     fn filter_persistable_excludes_transient() {
         let mut cache = TransferStateCache::new();
         cache.set_blob_exists("reg.io", digest(), "repo/a".into());
-        cache.set_blob_in_progress("reg.io", digest2());
+        cache.set_blob_in_progress("reg.io", digest2(), "repo/a".into());
         cache.set_blob_failed("reg.io", digest2(), "oops".into());
 
         // Only ExistsAtTarget should survive

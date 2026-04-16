@@ -242,7 +242,7 @@ fn in_progress_blobs_not_persisted() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_in_progress("reg.io", digest_a());
+    cache.set_blob_in_progress("reg.io", digest_a(), "repo/a".into());
 
     cache.persist(&path).unwrap();
 
