@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rcgen::string::Ia5String;
 use rcgen::{
@@ -18,7 +18,6 @@ use rustls::crypto::aws_lc_rs;
 use rustls::sign::CertifiedKey;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use thiserror::Error;
-use tokio::sync::RwLock;
 
 /// Errors from CA/leaf certificate operations.
 #[derive(Debug, Error)]
@@ -62,16 +61,24 @@ impl std::fmt::Debug for CaSigner {
 impl CaSigner {
     /// Look up or generate a leaf certificate for `sni_host`.
     ///
-    /// Generated certs include `sni_host` as a DNS SAN, are valid for
-    /// ~1 year, and are signed by the loaded CA. Entries are cached
-    /// indefinitely — the proxy is restarted between benchmark runs so
-    /// unbounded growth is not a concern.
-    pub(crate) async fn leaf_for(&self, sni_host: &str) -> Result<Arc<CertifiedKey>, Error> {
-        if let Some(cached) = self.leaf_cache.read().await.get(sni_host) {
+    /// Synchronous because rustls's `ResolvesServerCert::resolve` is
+    /// itself sync — it's invoked on the connection-driving task and
+    /// cannot call `.await`. Using a synchronous `std::sync::RwLock`
+    /// avoids the "runtime-in-runtime" panic from `block_on`-ing a
+    /// `tokio::sync::RwLock` from within the executor. Leaf generation
+    /// (ECDSA keygen + one CA sign) takes ~1 ms; cache hits take only
+    /// a read-lock so contention is negligible in practice.
+    pub(crate) fn leaf_for(&self, sni_host: &str) -> Result<Arc<CertifiedKey>, Error> {
+        if let Ok(guard) = self.leaf_cache.read()
+            && let Some(cached) = guard.get(sni_host)
+        {
             return Ok(cached.clone());
         }
 
-        let mut guard = self.leaf_cache.write().await;
+        let mut guard = self
+            .leaf_cache
+            .write()
+            .map_err(|_| Error::Signer("leaf cache poisoned".into()))?;
         // Another task may have filled the entry while we waited.
         if let Some(cached) = guard.get(sni_host) {
             return Ok(cached.clone());
@@ -214,12 +221,12 @@ mod tests {
         tokio::fs::write(&key_path, &key_pem).await.unwrap();
 
         let signer = load_ca(&cert_path, &key_path).await.unwrap();
-        let a = signer.leaf_for("example.com").await.unwrap();
-        let b = signer.leaf_for("example.com").await.unwrap();
+        let a = signer.leaf_for("example.com").unwrap();
+        let b = signer.leaf_for("example.com").unwrap();
         // Same Arc must be returned for repeated lookups.
         assert!(Arc::ptr_eq(&a, &b));
         // Different host returns a different leaf.
-        let c = signer.leaf_for("other.example").await.unwrap();
+        let c = signer.leaf_for("other.example").unwrap();
         assert!(!Arc::ptr_eq(&a, &c));
     }
 }

@@ -282,15 +282,8 @@ struct DynamicResolver {
 
 impl ResolvesServerCert for DynamicResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?.to_owned();
-        let ca = self.ca.clone();
-        // rustls calls this from a sync context; block_on is acceptable
-        // because leaf generation is fast (ECDSA keygen + one sign) and
-        // cache hits take only a read-lock.
-        let rt = tokio::runtime::Handle::try_current().ok()?;
-        let sni_for_task = sni.clone();
-        let res = rt.block_on(async move { ca.leaf_for(&sni_for_task).await });
-        match res {
+        let sni = client_hello.server_name()?;
+        match self.ca.leaf_for(sni) {
             Ok(ck) => Some(ck),
             Err(e) => {
                 warn!(sni = %sni, error = %e, "leaf cert generation failed");
