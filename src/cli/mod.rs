@@ -175,7 +175,7 @@ pub(crate) async fn build_registry_client(
                 .and_then(|r| r.credentials.as_ref())
                 .expect("basic auth requires credentials (validated)");
             let auth = BasicAuth::new(
-                bare_host,
+                endpoint,
                 http,
                 Credentials::Basic {
                     username: creds.username.clone(),
@@ -205,7 +205,7 @@ pub(crate) async fn build_registry_client(
                     "failed to load docker config for '{bare_host}': {e}"
                 ))
             })?;
-            let auth = DockerConfigAuth::new(bare_host, &docker_config, http)?;
+            let auth = DockerConfigAuth::new(endpoint, &docker_config, http)?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::DockerConfig) => {
@@ -214,11 +214,11 @@ pub(crate) async fn build_registry_client(
                     "failed to load docker config for '{bare_host}': {e}"
                 ))
             })?;
-            let auth = DockerConfigAuth::new(bare_host, &docker_config, http)?;
+            let auth = DockerConfigAuth::new(endpoint, &docker_config, http)?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Anonymous) => {
-            let auth = AnonymousAuth::new(bare_host, http);
+            let auth = AnonymousAuth::new(endpoint, http);
             RegistryClient::builder(url).auth(auth)
         }
         None => {
@@ -237,12 +237,11 @@ pub(crate) async fn build_registry_client(
                 // Try docker config — falls back to anonymous exchange if no creds found.
                 match DockerConfig::load_default() {
                     Ok(config) => {
-                        let auth =
-                            DockerConfigAuth::new(bare_host, &config, http).map_err(|e| {
-                                CliError::Input(format!(
-                                    "docker config credential resolution for '{bare_host}': {e}"
-                                ))
-                            })?;
+                        let auth = DockerConfigAuth::new(endpoint, &config, http).map_err(|e| {
+                            CliError::Input(format!(
+                                "docker config credential resolution for '{bare_host}': {e}"
+                            ))
+                        })?;
                         RegistryClient::builder(url).auth(auth)
                     }
                     Err(_) => {
@@ -251,7 +250,7 @@ pub(crate) async fn build_registry_client(
                             registry = bare_host,
                             "no docker config found, using anonymous auth"
                         );
-                        let auth = AnonymousAuth::new(bare_host, http);
+                        let auth = AnonymousAuth::new(endpoint, http);
                         RegistryClient::builder(url).auth(auth)
                     }
                 }
