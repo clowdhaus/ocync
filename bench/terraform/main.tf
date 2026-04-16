@@ -171,10 +171,12 @@ module "ec2" {
     }
   }
 
-  # gp3 root volume with provisioned performance
+  # gp3 root volume with provisioned performance.
+  # Note: the v6 ec2-instance module uses `size` and `type` (not `volume_size`
+  # and `volume_type`) — the latter are silently ignored by the module.
   root_block_device = {
-    volume_type           = "gp3"
-    volume_size           = local.ebs_volume_size
+    type                  = "gp3"
+    size                  = local.ebs_volume_size
     iops                  = local.ebs_iops
     throughput            = local.ebs_throughput
     delete_on_termination = true

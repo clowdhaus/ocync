@@ -8,12 +8,17 @@ echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # ── Swap (prevent OOM during Rust linking on smaller instances) ──────────────
 # c6in.large has only 4GB RAM; rustc's linker runs out of memory with our
-# full dep tree (aws-sdk + reqwest + rustls + etc). 8GB swap gives plenty
-# of headroom without needing a larger instance type.
+# full dep tree (aws-sdk + reqwest + rustls + etc). Size the swap to half
+# the available disk, capped at 8GB — always fits even if the root volume
+# is still resizing when user-data runs.
 
 if ! swapon --show | grep -q '/swapfile'; then
-  echo "--- Creating 8GB swap file"
-  fallocate -l 8G /swapfile
+  avail_gb=$(df -BG --output=avail / | awk 'NR==2 {print $1+0}')
+  swap_gb=$(( avail_gb / 2 ))
+  [ "$swap_gb" -gt 8 ] && swap_gb=8
+  [ "$swap_gb" -lt 1 ] && swap_gb=1
+  echo "--- Creating ${swap_gb}GB swap file (of ${avail_gb}GB available)"
+  fallocate -l ${swap_gb}G /swapfile
   chmod 600 /swapfile
   mkswap /swapfile
   swapon /swapfile
