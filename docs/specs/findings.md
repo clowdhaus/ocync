@@ -258,18 +258,47 @@ HEADs add 7.6% to the total request count with zero value.
 
 ### Action taken
 
-- Results recorded in this doc; no code changes in this PR.
-- `bench/CLAUDE.md` added for future session onboarding.
+Three optimizations implemented (branch `benchmark-comparison`):
 
-### Optimization opportunities (ranked by request savings)
+1. **MONOLITHIC_THRESHOLD raised from 1 MB to 256 MB.** Most blobs now
+   use POST+PUT (2 requests) instead of POST+PATCH×N+PUT. Blobs above
+   256 MB still use chunked upload with DEFAULT_CHUNK_SIZE of 32 MB.
+
+2. **EARLY_REFRESH_WINDOW lowered from 15 min to 30 sec.** Docker Hub
+   tokens have 300s TTL. The prior 15-minute window caused
+   `should_refresh()` to always return true, completely bypassing the
+   token cache (272 redundant auth exchanges → 5).
+
+3. **Batch-check HEAD skip.** When ECR batch API confirms blobs are
+   absent, the per-blob HEAD is skipped. A `HashSet<Digest>` of
+   batch-checked digests is passed to the per-blob loop; blobs in the
+   set skip Step 3 (HEAD). TOCTOU-safe: if a blob appears between
+   batch-check and push, the redundant push succeeds (registry
+   deduplicates on content-addressable digest).
+
+Also: `bench/CLAUDE.md` added for future session onboarding.
+
+**Post-optimization result (same corpus, same instance):**
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| Total requests | 3,249 | 1,225 | -62% |
+| PATCH | 1,419 | 176 | -88% |
+| HEAD (blob) | 247 | 0 | -100% |
+| Auth tokens | 272 | 5 | -98% |
+| GET | 1,058 | 524 | -50% |
+| Wall clock | 189.6s | 162.3s | -14% |
+| Response bytes | 11.5 GB | 11.5 GB | 0% |
+
+ocync now uses fewer requests than regsync (1,225 vs 1,302) for the
+same multi-arch work.
+
+### Remaining optimization opportunities
 
 | # | Optimization | Requests saved | Bytes saved | Complexity |
 |---|-------------|---------------|-------------|------------|
-| 1 | Monolithic upload for blobs < 100 MB | ~1,100 | 0 | Medium |
-| 2 | Increase chunk size to 32 MB (if keeping chunked) | ~1,035 | 0 | Trivial |
-| 3 | Skip blob HEAD when batch-check says absent (cold) | ~247 | 0 | Low |
-| 4 | Cross-image blob download dedup | ~168 | ~5.6 GB | High |
-| 5 | Optimize warm-sync manifest comparison | ~54 | ~344 KB | Low |
+| 1 | Cross-image blob download dedup | ~168 | ~5.6 GB | High |
+| 2 | Optimize warm-sync manifest comparison | ~54 | ~344 KB | Low |
 
 ### To re-validate
 
@@ -280,7 +309,6 @@ export BENCH_TARGET_REGISTRY=660548353186.dkr.ecr.us-east-1.amazonaws.com
 cargo xtask bench --tools ocync,dregsy,regsync --iterations 1 --limit 5 cold
 # Warm comparison
 cargo xtask bench --tools ocync,dregsy,regsync --limit 5 warm
-# Chunk size experiment: change DEFAULT_CHUNK_SIZE in client.rs, rebuild, re-run cold
 ```
 
 ---

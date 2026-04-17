@@ -103,11 +103,13 @@ Codified in `xtask/src/bench/config_gen.rs`:
 
 | Tool | Platforms | Wall clock | Requests | Response bytes |
 |------|----------|-----------|----------|----------------|
-| ocync | 2 (multi-arch) | 189.6s | 3,249 | 11.5 GB |
+| ocync (post-optimization) | 2 (multi-arch) | 162.3s | 1,225 | 11.5 GB |
 | regsync v0.11.3 | 2 (multi-arch) | 172.3s | 1,302 | 11.5 GB |
 | dregsy (skopeo) | 1 (tag only) | 92.8s | 1,538 | 5.9 GB |
 
-dregsy's byte advantage is not real — it syncs 1 platform vs 2 (5 manifest PUTs vs 15). The fair comparison is ocync vs regsync: ocync uses 2.5× more requests for the same bytes, entirely due to chunked upload (1,419 PATCHes at 8 MB).
+dregsy's byte advantage is not real — it syncs 1 platform vs 2 (5 manifest PUTs vs 15). ocync now uses fewer requests than regsync for the same bytes.
+
+Pre-optimization ocync was 3,249 requests. Three fixes reduced it by 62%: monolithic upload (MONOLITHIC_THRESHOLD 1 MB → 256 MB), auth cache fix (EARLY_REFRESH_WINDOW 15 min → 30 sec — Docker Hub 300s tokens were never cached), and batch-check HEAD skip (247 blob HEADs eliminated on cold sync).
 
 **Warm sync** (prime + measured pass):
 
@@ -116,13 +118,6 @@ dregsy's byte advantage is not real — it syncs 1 platform vs 2 (5 manifest PUT
 | ocync | 2.5s | 81 | 371 KB |
 | regsync | 4s | 27 | 27 KB |
 | dregsy | 5.2s | 200 | 163 KB |
-
-**Chunk size experiment** (ocync-only):
-
-| Chunk | PATCHes | Total requests | Wall clock |
-|-------|---------|----------------|------------|
-| 8 MB | 1,419 | 3,249 | 197.5s |
-| 32 MB | 384 | 2,214 | 163.3s |
 
 See `docs/specs/findings.md` for full analysis and optimization ranking.
 

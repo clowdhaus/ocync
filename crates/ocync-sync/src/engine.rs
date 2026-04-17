@@ -18,7 +18,7 @@
 //! never held across `.await` points.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::rc::Rc;
@@ -558,7 +558,7 @@ impl SyncEngine {
         // Prune snapshot entries for tags no longer in the mapping set.
         // Prevents unbounded cache growth when source tags are deleted.
         {
-            let live_keys: std::collections::HashSet<SnapshotKey> = mappings
+            let live_keys: HashSet<SnapshotKey> = mappings
                 .iter()
                 .flat_map(|m| {
                     m.tags
@@ -1307,8 +1307,11 @@ async fn transfer_image_blobs(
     // per-blob loop then hits cache at Step 1 for existing blobs and skips
     // the per-blob HEAD at Step 3 for absent blobs (both were already
     // checked by the batch API, so per-blob HEAD is redundant).
-    let batch_checked: std::collections::HashSet<Digest> = if let Some(checker) = ctx.batch_checker
-    {
+    //
+    // TOCTOU: a blob could appear between the batch-check and the per-blob
+    // push loop. This is harmless -- the redundant push succeeds because
+    // the registry deduplicates on content-addressable digest.
+    let batch_checked: HashSet<Digest> = if let Some(checker) = ctx.batch_checker {
         let all_digests: Vec<Digest> = blobs.iter().map(|b| b.digest.clone()).collect();
         match checker
             .check_blob_existence(ctx.target_repo, &all_digests)
@@ -1325,7 +1328,7 @@ async fn transfer_image_blobs(
                 }
                 // Record all checked digests so the per-blob loop can skip
                 // HEAD for absent blobs too (batch already confirmed absent).
-                let checked: std::collections::HashSet<Digest> = all_digests.into_iter().collect();
+                let checked: HashSet<Digest> = all_digests.into_iter().collect();
                 debug!(
                     target_name = %ctx.target_name,
                     repo = %ctx.target_repo,
@@ -1342,11 +1345,11 @@ async fn transfer_image_blobs(
                     "batch check failed, falling back to per-blob HEAD"
                 );
                 // Graceful degradation: continue with per-blob HEAD checks.
-                std::collections::HashSet::new()
+                HashSet::new()
             }
         }
     } else {
-        std::collections::HashSet::new()
+        HashSet::new()
     };
 
     let mut outcome = TargetBlobOutcome::default();

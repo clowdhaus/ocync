@@ -232,8 +232,9 @@ impl RegistryClient {
     /// 3. PUT to finalize with `?digest=` query param — the registry verifies
     ///    the uploaded content matches the digest.
     ///
-    /// When `known_size` is `Some(n)` and `n <= 1 MiB`, the stream is buffered
-    /// and sent as a monolithic upload, saving one HTTP round-trip.
+    /// When `known_size` is `Some(n)` and `n <= `[`MONOLITHIC_THRESHOLD`], the
+    /// stream is buffered and sent as a monolithic upload, saving one HTTP
+    /// round-trip.
     ///
     /// **GHCR fallback**: GitHub Container Registry's multi-PATCH chunked
     /// upload is broken — each PATCH overwrites all previous chunks. Blobs
@@ -904,5 +905,54 @@ mod tests {
                 case.host, case.server
             );
         }
+    }
+
+    /// Blobs with `known_size` below [`MONOLITHIC_THRESHOLD`] must use the
+    /// monolithic POST+PUT path. PATCH must never be called.
+    #[tokio::test]
+    async fn blob_push_stream_monolithic_skips_patch() {
+        let server = wiremock::MockServer::start().await;
+        let data = b"small monolithic blob";
+        let digest = test_digest(data);
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        // POST: initiate monolithic upload.
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/mono/repo/blobs/uploads/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/mono/repo/blobs/uploads/mono-uuid"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PUT: monolithic upload with full body.
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::query_param(
+                "digest",
+                digest.to_string(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PATCH: must NOT be called for monolithic uploads.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = build_test_client("registry.example.com", port);
+
+        let repo = RepositoryName::new("mono/repo");
+        let result = client
+            .blob_push_stream(&repo, &digest, Some(100), data_stream(data, 4))
+            .await
+            .unwrap();
+
+        assert_eq!(result, digest);
     }
 }

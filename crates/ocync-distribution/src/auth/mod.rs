@@ -24,11 +24,12 @@ use std::time::{Duration, Instant};
 
 use crate::error::Error;
 
-/// Minimum remaining lifetime before a token should be proactively refreshed.
-/// Must be shorter than the shortest token TTL we encounter (Docker Hub
-/// returns 300s). The prior value of 15 minutes caused every Docker Hub
-/// token to be "stale" immediately, bypassing the cache entirely.
-const REFRESH_THRESHOLD: Duration = Duration::from_secs(30);
+/// Tokens are proactively refreshed when their remaining lifetime drops
+/// below this window. Must be shorter than the shortest token TTL we
+/// encounter (Docker Hub returns 300s). The prior value of 15 minutes
+/// caused every Docker Hub token to be "stale" immediately, bypassing
+/// the cache entirely.
+const EARLY_REFRESH_WINDOW: Duration = Duration::from_secs(30);
 
 /// OAuth2-style scope for registry token requests.
 ///
@@ -173,12 +174,13 @@ impl Token {
         self.expires_at.is_some_and(|exp| Instant::now() >= exp)
     }
 
-    /// Whether this token should be refreshed soon (less than 30 seconds remaining).
+    /// Whether this token should be proactively refreshed (remaining lifetime
+    /// is below [`EARLY_REFRESH_WINDOW`]).
     pub fn should_refresh(&self) -> bool {
         match self.expires_at {
             Some(exp) => {
                 let now = Instant::now();
-                now >= exp || exp.duration_since(now) < REFRESH_THRESHOLD
+                now >= exp || exp.duration_since(now) < EARLY_REFRESH_WINDOW
             }
             None => false,
         }
