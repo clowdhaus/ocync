@@ -99,11 +99,7 @@ Codified in `xtask/src/bench/config_gen.rs`:
 
 ### Baseline
 
-See `docs/specs/findings.md` for current numbers, methodology, and optimization history. Key takeaways:
-
-- **dregsy's byte/speed advantage is illusory** — it syncs 1 platform vs 2 (5 manifest PUTs vs 15). Not a valid efficiency comparison.
-- **ocync uses fewer requests than regsync** for the same multi-arch work on cold sync.
-- **Warm sync is ocync's strongest feature** — persistent TransferStateCache makes re-sync nearly free.
+ocync leads on requests (cold) and wall-clock (warm) vs regsync for the same multi-arch work. dregsy comparison is invalid — it syncs 1 platform instead of 2. See `docs/specs/findings.md § Current competitive position` for the full table and methodology.
 
 ### Bench-proxy
 

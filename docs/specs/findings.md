@@ -166,11 +166,11 @@ Fair 3-tool comparison on c6in.4xlarge, Jupyter corpus (5 images, 1 tag
 each, `latest`), cold sync to ECR us-east-1, 1 iteration per tool.
 All three tools exited 0 (no partial failures). Branch: `benchmark-comparison`.
 
-**Cold sync (multi-arch correction applied):**
+**Cold sync pre-optimization (historical — see "Action taken" for current):**
 
 | Tool | Platforms synced | Wall clock | Requests | Response bytes | Upload strategy |
 |------|-----------------|-----------|----------|----------------|----------------|
-| ocync | 2 (multi-arch) | 189.6s | 3,249 | 11.5 GB | Chunked POST+PATCH+PUT (8 MB) |
+| ocync (pre-opt) | 2 (multi-arch) | 189.6s | 3,249 | 11.5 GB | Chunked POST+PATCH+PUT (8 MB) |
 | regsync v0.11.3 | 2 (multi-arch) | 172.3s | 1,302 | 11.5 GB | Monolithic POST+PUT |
 | dregsy (skopeo) | 1 (single tag) | 92.8s | 1,538 | 5.9 GB | Single PATCH |
 
@@ -290,8 +290,25 @@ Also: `bench/CLAUDE.md` added for future session onboarding.
 | Wall clock | 189.6s | 162.3s | -14% |
 | Response bytes | 11.5 GB | 11.5 GB | 0% |
 
-ocync now uses fewer requests than regsync (1,225 vs 1,302) for the
-same multi-arch work.
+### Current competitive position (cold sync, Jupyter 5-image corpus)
+
+| Tool | Platforms | Requests | Response bytes | Wall clock |
+|------|----------|---------|----------------|------------|
+| **ocync** | 2 (multi-arch) | **1,225** | 11.5 GB | **162.3s** |
+| regsync v0.11.3 | 2 (multi-arch) | 1,302 | 11.5 GB | 172.3s |
+| dregsy (skopeo) | 1 (single tag) | 1,538 | 5.9 GB | 92.8s |
+
+ocync wins on requests and wall-clock vs regsync (same work). dregsy
+comparison is invalid — it syncs 1 platform, not 2 (see Observation).
+
+| Tool | Requests | Response bytes | Wall clock |
+|------|---------|----------------|------------|
+| **ocync** | **81** | 371 KB | **2.5s** |
+| regsync | 27 | 27 KB | 4s |
+| dregsy | 200 | 163 KB | 5.2s |
+
+Warm sync: ocync wins wall-clock decisively. regsync uses fewer
+requests (manifest-digest comparison only) but is sequential.
 
 ### Remaining optimization opportunities
 
