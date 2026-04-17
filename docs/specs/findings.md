@@ -279,19 +279,77 @@ Azure Container Registry enforces a ~20 MB request body limit on
 monolithic PUT. Our streaming PUT needs a `ProviderKind::Acr`
 fallback to chunked PATCH for larger blobs.
 
-### Upload strategy comparison across tools
+### Comprehensive tool comparison
 
-| Tool | Strategy | Requests/blob | Cross-image dedup |
-|------|---------|:---:|:---:|
-| **ocync** | POST + streaming PUT | **2** | Yes (TransferStateCache) |
-| containerd | POST + streaming PUT | 2 | Yes (StatusTracker) |
-| regsync | POST + PUT (buffered) | 2 | No |
-| crane | POST + streaming PATCH + PUT | 3 | Yes (sync.Map) |
-| skopeo | POST + PATCH + PUT | 3 | No |
+**Upload strategy:**
 
-ocync and containerd are tied for most request-efficient. AIMD
-adaptive concurrency is unique to ocync — no competitor implements
-anything similar.
+| Tool | Strategy | Requests/blob | Buffering |
+|------|---------|:---:|-----------|
+| **ocync** | POST + streaming PUT | **2** | None (streamed) |
+| containerd | POST + streaming PUT | 2 | None (io.Pipe) |
+| regsync (regclient) | POST + PUT | 2 | Full blob in memory |
+| crane (go-containerregistry) | POST + streaming PATCH + PUT | 3 | None (streamed) |
+| skopeo (containers/image) | POST + PATCH + PUT | 3 | None (streamed) |
+
+**Concurrency and rate limiting:**
+
+| Tool | Default concurrency | Adaptive backoff | Rate limit strategy |
+|------|:---:|:---:|-----|
+| **ocync** | 50 (AIMD adaptive) | Yes (per-registry, per-action) | AIMD congestion control on 429 |
+| containerd | 5 layers | No | Lock-based dedup, no 429 handling |
+| regsync | 3 per registry | No | Reads `ratelimit-remaining` header, pauses proactively |
+| crane | 4 jobs | Retry with backoff (1s, 3s) | Retry on 408/429/5xx, 3 attempts |
+| skopeo | per-image flag | No | No retry, aborts on 429 |
+
+**Blob deduplication:**
+
+| Tool | Cross-image push dedup | Cross-image pull dedup | Persistent cache |
+|------|:---:|:---:|:---:|
+| **ocync** | Yes (TransferStateCache) | No | Yes (postcard binary) |
+| containerd | Yes (StatusTracker) | No | No |
+| regsync | No | No | No (in-memory only) |
+| crane | Yes (sync.Map by digest) | No | No |
+| skopeo | No | No | BoltDB BlobInfoCache (mount hints) |
+
+No tool deduplicates cross-image blob downloads from source. This is
+the #1 remaining optimization opportunity — 168 redundant source GETs
+(5.6 GB) on the Jupyter corpus.
+
+**Multi-arch handling:**
+
+| Tool | Default behavior | Configurable |
+|------|-----------------|:---:|
+| **ocync** | Copies all platforms in manifest list | No (always multi-arch) |
+| regsync | Copies all platforms | No |
+| dregsy (skopeo) | Copies native platform only | Yes (`platform: all`) |
+| crane | Copies all platforms | Yes (`--platform`) |
+| containerd | Copies specified platform | Yes |
+
+**Registry-specific fallbacks:**
+
+| Tool | GHCR | GAR | ACR | ECR mount |
+|------|------|-----|-----|-----------|
+| **ocync** | Single PATCH (no Content-Range) | Buffered monolithic | Not yet handled | Short-circuits (no POST) |
+| regsync | Chunked fallback | Monolithic | Chunked fallback | Attempts mount |
+| crane | Unknown | Unknown | Unknown | Attempts mount |
+| skopeo | Single PATCH | Historically broken | Unknown | BlobInfoCache mount hints |
+
+**Auth:**
+
+| Tool | Docker Hub tokens | ECR auth | Token caching |
+|------|:-:|:-:|-----|
+| **ocync** | Per-scope, 30s early refresh | AWS SDK (Basic auth) | Per-scope HashMap, mutex coalesced |
+| regsync | Per-registry or per-repo (`repoAuth`) | Docker credential helper | Per-host, single token |
+| crane | Per-registry transport | Docker credential helper | Per-transport |
+| skopeo | Per-invocation | Docker credential helper | None across invocations |
+
+**Warm sync efficiency (Jupyter 5-image corpus):**
+
+| Tool | Requests | Bytes | Wall clock | How |
+|------|:---:|:---:|:---:|-----|
+| **ocync** | 81 | 371 KB | **2.5s** | Persistent cache skips blob I/O |
+| regsync | **27** | **27 KB** | 4s | Manifest digest comparison only |
+| dregsy | 200 | 163 KB | 5.2s | Re-HEADs all blobs |
 
 ### BatchGetImage for warm sync
 
