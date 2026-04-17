@@ -199,12 +199,17 @@ Four optimizations implemented (branch `benchmark-comparison`):
 
 | Tool | Platforms | Requests | Response bytes | Wall clock |
 |------|----------|---------|----------------|------------|
-| **ocync** (streaming PUT) | 2 (multi-arch) | **1,049** | 11.5 GB | **183.1s** |
-| regsync v0.11.3 | 2 (multi-arch) | 1,302 | 11.5 GB | 172.3s |
-| dregsy (skopeo) | 1 (single tag) | 1,538 | 5.9 GB | 92.8s |
+| **ocync** (streaming PUT) | 2 (multi-arch) | **1,049** | 11.5 GB | 217.9s |
+| dregsy (skopeo, `platform: all`) | multi-arch | 1,266 | 4.9 GB | 153.4s |
+| regsync v0.11.3 | 2 (multi-arch) | 1,302 | 11.5 GB | 180.2s |
 
-ocync wins on requests and wall-clock vs regsync (same work). dregsy
-comparison is invalid — it syncs 1 platform, not 2 (see Observation).
+ocync wins on requests (1,049 vs 1,266 vs 1,302). dregsy transfers
+fewer bytes (4.9 GB vs 11.5 GB) because 172 successful cross-repo
+mounts (BLOB_MOUNTING=ENABLED) eliminated shared layer uploads.
+regsync's mounts all fail (omits `from=` parameter).
+
+With ECR blob mounting enabled, ocync's mount short-circuit is a
+disadvantage — re-enabling mounts would save both requests and bytes.
 
 | Tool | Requests | Response bytes | Wall clock |
 |------|---------|----------------|------------|
