@@ -1,4 +1,4 @@
-//! Integration tests for `blob_push_stream` — chunked streaming uploads.
+//! Integration tests for `blob_push_stream` — streaming PUT uploads.
 
 use bytes::Bytes;
 use futures_util::stream;
@@ -7,8 +7,8 @@ use ocync_distribution::Digest;
 use ocync_distribution::RepositoryName;
 use ocync_distribution::client::RegistryClientBuilder;
 use url::Url;
-use wiremock::matchers::{header, method, path, query_param};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Compute the SHA-256 digest for test data.
 fn test_digest(data: &[u8]) -> Digest {
@@ -32,30 +32,7 @@ fn mock_base_url(server: &MockServer) -> Url {
     Url::parse(&server.uri()).unwrap()
 }
 
-/// Custom matcher for Content-Range header values.
-struct ContentRangeMatcher {
-    expected: String,
-}
-
-impl ContentRangeMatcher {
-    fn new(expected: &str) -> Self {
-        Self {
-            expected: expected.to_owned(),
-        }
-    }
-}
-
-impl wiremock::Match for ContentRangeMatcher {
-    fn matches(&self, request: &Request) -> bool {
-        request
-            .headers
-            .get(http::header::CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == self.expected)
-    }
-}
-
-// ─── Happy path: POST → PATCH → PUT ────────────────────────────────────────
+// ─── Happy path: POST → streaming PUT ──────────────────────────────────────
 
 #[tokio::test]
 async fn happy_path() {
@@ -74,33 +51,22 @@ async fn happy_path() {
         .mount(&server)
         .await;
 
-    // PATCH: single chunk (data fits in one chunk_size=64 buffer).
-    let patch_next = format!("{upload_path}?after-patch");
-    Mock::given(method("PATCH"))
-        .and(path(upload_path))
-        .and(ContentRangeMatcher::new("0-11"))
-        .and(header("content-type", "application/octet-stream"))
-        .and(header("content-length", "12"))
-        .respond_with(
-            ResponseTemplate::new(StatusCode::ACCEPTED)
-                .append_header("Location", patch_next.as_str()),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // PUT: finalize with digest query param, Content-Length: 0.
+    // PUT: streaming upload with blob body (no Content-Length).
     Mock::given(method("PUT"))
         .and(query_param("digest", digest.to_string()))
-        .and(header("content-type", "application/octet-stream"))
-        .and(header("content-length", "0"))
         .respond_with(ResponseTemplate::new(StatusCode::CREATED))
         .expect(1)
         .mount(&server)
         .await;
 
+    // PATCH: must NOT be called for streaming uploads.
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(64)
         .build()
         .unwrap();
 
@@ -113,16 +79,13 @@ async fn happy_path() {
     assert_eq!(result, digest);
 }
 
-// ─── Multi-chunk: small chunk_size produces multiple PATCHes ────────────────
+// ─── Multi-chunk stream: all chunks flow through a single PUT ───────────────
 
 #[tokio::test]
-async fn multi_chunk() {
+async fn multi_chunk_stream() {
     let server = MockServer::start().await;
-    let data = b"abcdefghijkl"; // 12 bytes
+    let data = b"abcdefghijkl"; // 12 bytes, streamed in small chunks
     let digest = test_digest(data);
-
-    // chunk_size=4, stream chunk=2 → buffer accumulates to 4 before each PATCH.
-    // Expected: 3 PATCH requests with ranges 0-3, 4-7, 8-11.
     let upload_path = "/v2/repo/blobs/uploads/uuid-1";
 
     // POST: initiate.
@@ -135,40 +98,7 @@ async fn multi_chunk() {
         .mount(&server)
         .await;
 
-    // PATCH 1: bytes 0-3.
-    Mock::given(method("PATCH"))
-        .and(ContentRangeMatcher::new("0-3"))
-        .respond_with(
-            ResponseTemplate::new(StatusCode::ACCEPTED)
-                .append_header("Location", "/v2/repo/blobs/uploads/uuid-2"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // PATCH 2: bytes 4-7.
-    Mock::given(method("PATCH"))
-        .and(ContentRangeMatcher::new("4-7"))
-        .respond_with(
-            ResponseTemplate::new(StatusCode::ACCEPTED)
-                .append_header("Location", "/v2/repo/blobs/uploads/uuid-3"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // PATCH 3: bytes 8-11.
-    Mock::given(method("PATCH"))
-        .and(ContentRangeMatcher::new("8-11"))
-        .respond_with(
-            ResponseTemplate::new(StatusCode::ACCEPTED)
-                .append_header("Location", "/v2/repo/blobs/uploads/uuid-4"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // PUT: finalize.
+    // PUT: streaming upload with full blob body.
     Mock::given(method("PUT"))
         .and(query_param("digest", digest.to_string()))
         .respond_with(ResponseTemplate::new(StatusCode::CREATED))
@@ -176,8 +106,14 @@ async fn multi_chunk() {
         .mount(&server)
         .await;
 
+    // PATCH: must NOT be called.
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(4)
         .build()
         .unwrap();
 
@@ -190,12 +126,12 @@ async fn multi_chunk() {
     assert_eq!(result, digest);
 }
 
-// ─── Exact chunk boundary: data_len == chunk_size, no remainder flush ────────
+// ─── Single-chunk stream: entire data in one stream chunk ───────────────────
 
 #[tokio::test]
-async fn exact_chunk_boundary() {
+async fn single_chunk_stream() {
     let server = MockServer::start().await;
-    let data = b"abcd"; // 4 bytes == chunk_size
+    let data = b"abcd"; // 4 bytes, streamed as a single chunk
     let digest = test_digest(data);
     let upload_path = "/v2/repo/blobs/uploads/uuid-1";
 
@@ -208,17 +144,7 @@ async fn exact_chunk_boundary() {
         .mount(&server)
         .await;
 
-    // Single PATCH: bytes 0-3, no remainder flush.
-    Mock::given(method("PATCH"))
-        .and(ContentRangeMatcher::new("0-3"))
-        .respond_with(
-            ResponseTemplate::new(StatusCode::ACCEPTED)
-                .append_header("Location", "/v2/repo/blobs/uploads/uuid-2"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
+    // PUT: streaming upload.
     Mock::given(method("PUT"))
         .and(query_param("digest", digest.to_string()))
         .respond_with(ResponseTemplate::new(StatusCode::CREATED))
@@ -226,8 +152,14 @@ async fn exact_chunk_boundary() {
         .mount(&server)
         .await;
 
+    // PATCH: must NOT be called.
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(4)
         .build()
         .unwrap();
 
@@ -273,7 +205,6 @@ async fn empty_stream() {
         .await;
 
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(64)
         .build()
         .unwrap();
 
@@ -302,7 +233,6 @@ async fn post_initiation_rejected() {
         .await;
 
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(64)
         .build()
         .unwrap();
 
@@ -319,12 +249,12 @@ async fn post_initiation_rejected() {
     );
 }
 
-// ─── Error: PATCH chunk fails mid-upload ────────────────────────────────────
+// ─── Error: PUT upload fails ────────────────────────────────────────────────
 
 #[tokio::test]
-async fn patch_chunk_failure() {
+async fn put_upload_failure() {
     let server = MockServer::start().await;
-    let data = b"abcdefgh"; // 8 bytes, chunk_size=4 → 2 PATCHes
+    let data = b"abcdefgh"; // 8 bytes
     let digest = test_digest(data);
     let upload_path = "/v2/repo/blobs/uploads/uuid-1";
 
@@ -337,27 +267,14 @@ async fn patch_chunk_failure() {
         .mount(&server)
         .await;
 
-    // First PATCH succeeds.
-    Mock::given(method("PATCH"))
-        .and(ContentRangeMatcher::new("0-3"))
-        .respond_with(
-            ResponseTemplate::new(StatusCode::ACCEPTED)
-                .append_header("Location", "/v2/repo/blobs/uploads/uuid-2"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // Second PATCH returns 500.
-    Mock::given(method("PATCH"))
-        .and(ContentRangeMatcher::new("4-7"))
+    // PUT: streaming upload returns 500.
+    Mock::given(method("PUT"))
         .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
         .expect(1)
         .mount(&server)
         .await;
 
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(4)
         .build()
         .unwrap();
 
@@ -371,10 +288,10 @@ async fn patch_chunk_failure() {
     assert!(msg.contains("500"), "expected 500 error: {msg}");
 }
 
-// ─── Error: PUT finalize rejected by registry ───────────────────────────────
+// ─── Error: PUT rejected by registry (e.g., digest mismatch) ───────────────
 
 #[tokio::test]
-async fn put_finalize_rejected() {
+async fn put_rejected() {
     let server = MockServer::start().await;
     let data = b"payload";
     let digest = test_digest(data);
@@ -389,24 +306,21 @@ async fn put_finalize_rejected() {
         .mount(&server)
         .await;
 
-    Mock::given(method("PATCH"))
-        .respond_with(
-            ResponseTemplate::new(StatusCode::ACCEPTED)
-                .append_header("Location", "/v2/repo/blobs/uploads/uuid-2"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // PUT: registry rejects the finalization (e.g., digest mismatch).
+    // PUT: registry rejects the upload (e.g., digest mismatch).
     Mock::given(method("PUT"))
         .respond_with(ResponseTemplate::new(400).set_body_string("digest invalid"))
         .expect(1)
         .mount(&server)
         .await;
 
+    // PATCH: must NOT be called.
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(64)
         .build()
         .unwrap();
 
@@ -449,7 +363,6 @@ async fn stream_error_propagates() {
     ]);
 
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(64)
         .build()
         .unwrap();
 
@@ -480,7 +393,6 @@ async fn post_returns_200_is_rejected() {
         .await;
 
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(64)
         .build()
         .unwrap();
 
@@ -497,17 +409,17 @@ async fn post_returns_200_is_rejected() {
     );
 }
 
-// ─── Monolithic threshold: small blobs use POST+PUT ──────────────────────────
+// ─── Small blob with known size: POST + streaming PUT ───────────────────────
 
-/// Blobs at or below 1 MiB use monolithic POST+PUT upload (no PATCH).
+/// Small blobs with a known size use the same POST + streaming PUT path.
 #[tokio::test]
-async fn small_blob_uses_monolithic_upload() {
+async fn small_blob_with_known_size() {
     let server = MockServer::start().await;
-    // 10 bytes — well under the 1 MiB threshold.
+    // 10 bytes with known_size provided.
     let data = b"small blob";
     let digest = test_digest(data);
 
-    // POST: initiate monolithic upload.
+    // POST: initiate upload.
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
         .respond_with(
@@ -518,7 +430,7 @@ async fn small_blob_uses_monolithic_upload() {
         .mount(&server)
         .await;
 
-    // PUT: monolithic upload with digest query param.
+    // PUT: streaming upload with digest query param.
     Mock::given(method("PUT"))
         .and(query_param("digest", digest.to_string()))
         .respond_with(ResponseTemplate::new(201))
@@ -526,7 +438,7 @@ async fn small_blob_uses_monolithic_upload() {
         .mount(&server)
         .await;
 
-    // PATCH: must NOT be called for small blobs.
+    // PATCH: must NOT be called.
     Mock::given(method("PATCH"))
         .respond_with(ResponseTemplate::new(500))
         .expect(0)
@@ -534,7 +446,6 @@ async fn small_blob_uses_monolithic_upload() {
         .await;
 
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(4)
         .build()
         .unwrap();
 
@@ -552,9 +463,9 @@ async fn small_blob_uses_monolithic_upload() {
     assert_eq!(result, digest);
 }
 
-/// Blobs with no `known_size` are not subject to the monolithic threshold.
+/// Blobs with no `known_size` use the same streaming PUT path.
 #[tokio::test]
-async fn unknown_size_skips_monolithic_threshold() {
+async fn unknown_size_uses_streaming_put() {
     let server = MockServer::start().await;
     let data = b"no size known";
     let digest = test_digest(data);
@@ -567,15 +478,7 @@ async fn unknown_size_skips_monolithic_threshold() {
         .mount(&server)
         .await;
 
-    // PATCH must be called (chunked path taken).
-    Mock::given(method("PATCH"))
-        .respond_with(
-            ResponseTemplate::new(202).append_header("Location", "/v2/repo/blobs/uploads/uuid-2"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
+    // PUT: streaming upload.
     Mock::given(method("PUT"))
         .and(query_param("digest", digest.to_string()))
         .respond_with(ResponseTemplate::new(201))
@@ -583,8 +486,14 @@ async fn unknown_size_skips_monolithic_threshold() {
         .mount(&server)
         .await;
 
+    // PATCH: must NOT be called.
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
     let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .chunk_size(64)
         .build()
         .unwrap();
 

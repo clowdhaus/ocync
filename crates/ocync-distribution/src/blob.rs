@@ -3,26 +3,17 @@
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LOCATION};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, LOCATION};
 use tracing::{debug, warn};
 
 use crate::aimd::RegistryAction;
 use crate::auth::Scope;
 use crate::auth::detect::{ProviderKind, detect_provider_kind};
-use crate::client::{RegistryClient, build_url};
+use crate::client::{RegistryClient, build_url, report_permit};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
 use crate::spec::RepositoryName;
-
-/// Blobs at or below this size are uploaded monolithically (POST + PUT) to
-/// save the extra round-trip cost of chunked upload negotiation. Set high
-/// enough to cover the vast majority of OCI layers — benchmarking shows
-/// monolithic upload eliminates ~1,400 PATCH requests on a typical Jupyter
-/// corpus with zero increase in bytes transferred. The few blobs that
-/// exceed this threshold (multi-GB CUDA/ML layers) still use chunked
-/// upload to avoid buffering the entire layer in memory.
-const MONOLITHIC_THRESHOLD: u64 = 256 * 1024 * 1024;
 
 /// Content type for raw blob data in OCI upload requests.
 const OCTET_STREAM: &str = "application/octet-stream";
@@ -224,17 +215,13 @@ impl RegistryClient {
         Ok(digest)
     }
 
-    /// Push a blob to the given repository using a chunked streaming upload.
+    /// Push a blob to the given repository using a streaming upload.
     ///
-    /// 1. POST `/v2/{repository}/blobs/uploads/` to initiate the upload.
-    /// 2. Accumulate stream chunks into `chunk_size` buffers, issuing PATCH
-    ///    requests with `Content-Range` headers for each buffer.
-    /// 3. PUT to finalize with `?digest=` query param — the registry verifies
-    ///    the uploaded content matches the digest.
-    ///
-    /// When `known_size` is `Some(n)` and `n <= `[`MONOLITHIC_THRESHOLD`], the
-    /// stream is buffered and sent as a monolithic upload, saving one HTTP
-    /// round-trip.
+    /// Default path (2 requests, zero buffering):
+    /// 1. POST `/v2/{repository}/blobs/uploads/` to initiate.
+    /// 2. PUT with the stream as request body — the blob flows from source
+    ///    to target without buffering in memory. The registry verifies the
+    ///    digest provided in the `?digest=` query param.
     ///
     /// **GHCR fallback**: GitHub Container Registry's multi-PATCH chunked
     /// upload is broken — each PATCH overwrites all previous chunks. Blobs
@@ -248,32 +235,14 @@ impl RegistryClient {
         repository: &RepositoryName,
         expected_digest: &Digest,
         known_size: Option<u64>,
-        stream: impl Stream<Item = Result<Bytes, E>>,
+        stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     ) -> Result<Digest, Error>
     where
-        E: Into<Error>,
+        E: Into<Error> + Send,
     {
         // Map stream errors to our Error type at the boundary so all
         // internal code works uniformly with `Result<Bytes, Error>`.
         let stream = stream.map(|r| r.map_err(Into::into));
-
-        // Monolithic threshold: small blobs skip chunked upload entirely.
-        if known_size.is_some_and(|s| s <= MONOLITHIC_THRESHOLD) {
-            debug!(
-                repository = repository.as_str(),
-                %expected_digest,
-                size = known_size.unwrap(),
-                "blob below monolithic threshold, using POST+PUT upload"
-            );
-            let body = buffer_stream(stream, known_size).await?;
-            let actual_digest = self.blob_push(repository, &body).await?;
-            if &actual_digest != expected_digest {
-                return Err(Error::Other(format!(
-                    "monolithic upload digest mismatch: expected {expected_digest}, got {actual_digest}"
-                )));
-            }
-            return Ok(actual_digest);
-        }
 
         // Registry-specific upload fallbacks, detected via the canonical
         // provider detection (handles case-insensitivity, ports, trailing dots).
@@ -299,13 +268,13 @@ impl RegistryClient {
         debug!(
             repository = repository.as_str(),
             %expected_digest,
-            chunk_size = self.chunk_size,
-            "starting chunked blob upload"
+            "starting streaming blob upload"
         );
 
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let scopes = [Scope::pull_push(repository.as_str())];
 
+        // POST to initiate the upload session.
         let resp = self
             .send_with_aimd(
                 RegistryAction::BlobUploadInit,
@@ -317,101 +286,33 @@ impl RegistryClient {
         let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
         let upload_url = extract_location(&resp, &self.base_url)?;
 
-        // Stream chunks, issuing PATCH for each chunk_size buffer.
-        let mut buffer = Vec::with_capacity(self.chunk_size);
-        let mut current_url = upload_url;
-        let mut offset: u64 = 0;
-
-        futures_util::pin_mut!(stream);
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            buffer.extend_from_slice(&chunk);
-
-            if buffer.len() >= self.chunk_size {
-                let range_start = offset;
-                let range_end = offset + buffer.len() as u64 - 1;
-                offset += buffer.len() as u64;
-
-                let patch_chunk =
-                    std::mem::replace(&mut buffer, Vec::with_capacity(self.chunk_size));
-                current_url = self
-                    .send_patch_chunk(&scopes, &current_url, range_start, range_end, patch_chunk)
-                    .await?;
-            }
-        }
-
-        // Flush any remaining data in the buffer.
-        if !buffer.is_empty() {
-            let range_start = offset;
-            let range_end = offset + buffer.len() as u64 - 1;
-            current_url = self
-                .send_patch_chunk(&scopes, &current_url, range_start, range_end, buffer)
-                .await?;
-        }
-
-        // PUT to finalize — the registry verifies the digest.
+        // Streaming PUT — send the blob body through a single HTTP request.
+        // Uses Transfer-Encoding: chunked (no Content-Length), so the body
+        // flows from source to registry without buffering in memory.
+        //
+        // Cannot use send_with_aimd here: the stream is consumed once, so
+        // the 401-retry closure pattern (which rebuilds the request) does
+        // not work. Auth was validated by the POST above; if the PUT gets
+        // a 401, the engine-level retry re-pulls and re-pushes.
+        let permit = self.aimd.acquire(RegistryAction::BlobUploadComplete).await;
+        let headers = self.auth_headers(&scopes).await?;
         let digest_str = expected_digest.to_string();
-        let resp = self
-            .send_with_aimd(
-                RegistryAction::BlobUploadComplete,
-                &scopes,
-                "blob push stream finalize",
-                |headers| {
-                    self.http
-                        .put(&current_url)
-                        .headers(headers)
-                        .query(&[("digest", &digest_str)])
-                        .header(CONTENT_LENGTH, "0")
-                        .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
-                },
-            )
-            .await?;
+        let body = reqwest::Body::wrap_stream(stream);
+        let result = self
+            .http
+            .put(&upload_url)
+            .headers(headers)
+            .query(&[("digest", &digest_str)])
+            .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
+            .body(body)
+            .send()
+            .await
+            .map_err(Error::from);
+        report_permit(permit, &result);
+        let resp = result?;
         expect_status(resp, StatusCode::CREATED).await?;
 
         Ok(expected_digest.clone())
-    }
-
-    /// Send a PATCH chunk for a chunked upload and return the next upload URL.
-    async fn send_patch_chunk(
-        &self,
-        scopes: &[Scope],
-        upload_url: &str,
-        range_start: u64,
-        range_end: u64,
-        chunk: Vec<u8>,
-    ) -> Result<String, Error> {
-        let content_range = HeaderValue::from_str(&format!("{range_start}-{range_end}"))
-            .map_err(|e| Error::Other(format!("failed to build Content-Range header: {e}")))?;
-        let chunk_len = chunk.len();
-        let url = upload_url.to_owned();
-        // Convert to Bytes so .clone() in the retry closure is a cheap
-        // reference-count increment instead of a full memcpy per chunk.
-        let chunk = Bytes::from(chunk);
-
-        let resp = self
-            .send_with_aimd(
-                RegistryAction::BlobUploadChunk,
-                scopes,
-                "blob push stream patch",
-                |headers| {
-                    self.http
-                        .patch(&url)
-                        .headers(headers)
-                        .header(CONTENT_RANGE, content_range.clone())
-                        .header(CONTENT_LENGTH, chunk_len.to_string())
-                        .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
-                        .body(chunk.clone())
-                },
-            )
-            .await?;
-        // The OCI spec requires 202 Accepted for PATCH chunks, but ECR
-        // returns 201 Created. Accept both to handle this deviation.
-        let status = resp.status();
-        if status != StatusCode::ACCEPTED && status != StatusCode::CREATED {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(Error::RegistryError { status, message });
-        }
-        extract_location(&resp, &self.base_url)
     }
 
     /// GAR fallback: buffer the entire stream and delegate to monolithic push.
@@ -635,13 +536,10 @@ mod tests {
     /// behavior in the client.
     fn build_test_client(host: &str, port: u16) -> RegistryClient {
         let base_url = url::Url::parse(&format!("http://{host}:{port}")).unwrap();
-        RegistryClient {
-            chunk_size: 4, // small chunk keeps streaming tests fast
-            ..crate::client::RegistryClientBuilder::new(base_url)
-                .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
-                .build()
-                .unwrap()
-        }
+        crate::client::RegistryClientBuilder::new(base_url)
+            .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .build()
+            .unwrap()
     }
 
     fn test_digest(data: &[u8]) -> Digest {
@@ -907,27 +805,27 @@ mod tests {
         }
     }
 
-    /// Blobs with `known_size` below [`MONOLITHIC_THRESHOLD`] must use the
-    /// monolithic POST+PUT path. PATCH must never be called.
+    /// Default upload path uses streaming PUT (POST + PUT). PATCH must
+    /// never be called — the entire blob flows through a single PUT request.
     #[tokio::test]
-    async fn blob_push_stream_monolithic_skips_patch() {
+    async fn blob_push_stream_uses_streaming_put() {
         let server = wiremock::MockServer::start().await;
-        let data = b"small monolithic blob";
+        let data = b"streaming upload blob data";
         let digest = test_digest(data);
         let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
 
-        // POST: initiate monolithic upload.
+        // POST: initiate upload.
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/v2/mono/repo/blobs/uploads/"))
+            .and(wiremock::matchers::path("/v2/stream/repo/blobs/uploads/"))
             .respond_with(
                 wiremock::ResponseTemplate::new(202)
-                    .append_header("Location", "/v2/mono/repo/blobs/uploads/mono-uuid"),
+                    .append_header("Location", "/v2/stream/repo/blobs/uploads/stream-uuid"),
             )
             .expect(1)
             .mount(&server)
             .await;
 
-        // PUT: monolithic upload with full body.
+        // PUT: streaming upload with full body (no Content-Length).
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::query_param(
                 "digest",
@@ -938,7 +836,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        // PATCH: must NOT be called for monolithic uploads.
+        // PATCH: must NOT be called for streaming uploads.
         wiremock::Mock::given(wiremock::matchers::method("PATCH"))
             .respond_with(wiremock::ResponseTemplate::new(500))
             .expect(0)
@@ -947,9 +845,9 @@ mod tests {
 
         let client = build_test_client("registry.example.com", port);
 
-        let repo = RepositoryName::new("mono/repo");
+        let repo = RepositoryName::new("stream/repo");
         let result = client
-            .blob_push_stream(&repo, &digest, Some(100), data_stream(data, 4))
+            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
             .await
             .unwrap();
 

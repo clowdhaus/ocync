@@ -10,7 +10,6 @@ use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
-const DEFAULT_CHUNK_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
 
 use crate::auth::AuthScheme;
@@ -20,7 +19,6 @@ pub struct RegistryClientBuilder {
     url: Url,
     auth: Option<Box<dyn AuthProvider>>,
     max_concurrent: usize,
-    chunk_size: usize,
     /// Static DNS overrides applied to the internal reqwest client.
     /// Each entry maps a hostname to a fixed socket address, bypassing
     /// DNS resolution. Used by integration tests to route ECR-hostname
@@ -34,7 +32,6 @@ impl std::fmt::Debug for RegistryClientBuilder {
         f.debug_struct("RegistryClientBuilder")
             .field("url", &self.url)
             .field("max_concurrent", &self.max_concurrent)
-            .field("chunk_size", &self.chunk_size)
             .field("dns_overrides", &self.dns_overrides)
             .finish_non_exhaustive()
     }
@@ -49,7 +46,6 @@ impl RegistryClientBuilder {
             url,
             auth: None,
             max_concurrent: DEFAULT_MAX_CONCURRENT_REQUESTS,
-            chunk_size: DEFAULT_CHUNK_SIZE,
             dns_overrides: Vec::new(),
         }
     }
@@ -63,12 +59,6 @@ impl RegistryClientBuilder {
     /// Set the maximum number of concurrent requests.
     pub fn max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = n;
-        self
-    }
-
-    /// Set the chunk size for blob uploads (in bytes).
-    pub fn chunk_size(mut self, size: usize) -> Self {
-        self.chunk_size = size;
         self
     }
 
@@ -101,7 +91,6 @@ impl RegistryClientBuilder {
             http,
             auth: self.auth,
             aimd,
-            chunk_size: self.chunk_size,
         })
     }
 }
@@ -115,14 +104,12 @@ pub struct RegistryClient {
     pub(crate) http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
-    pub(crate) chunk_size: usize,
 }
 
 impl std::fmt::Debug for RegistryClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegistryClient")
             .field("base_url", &self.base_url)
-            .field("chunk_size", &self.chunk_size)
             .finish_non_exhaustive()
     }
 }
@@ -274,7 +261,7 @@ impl RegistryClient {
     }
 
     /// Build auth headers for a request.
-    async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
+    pub(crate) async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
         let mut headers = HeaderMap::new();
 
         if let Some(ref auth) = self.auth {
@@ -300,7 +287,10 @@ impl RegistryClient {
 /// Calls [`AimdPermit::throttled`] on 429, [`AimdPermit::success`] otherwise.
 /// Transport errors (no response at all) are treated as success by the permit's
 /// drop impl, so we only need to handle the `Ok` case explicitly.
-fn report_permit(permit: crate::aimd::AimdPermit<'_>, result: &Result<reqwest::Response, Error>) {
+pub(crate) fn report_permit(
+    permit: crate::aimd::AimdPermit<'_>,
+    result: &Result<reqwest::Response, Error>,
+) {
     match result {
         Ok(resp) if resp.status() == StatusCode::TOO_MANY_REQUESTS => permit.throttled(),
         _ => permit.success(),
@@ -468,17 +458,7 @@ mod tests {
     fn builder_defaults() {
         let client = RegistryClient::builder(test_base_url()).build().unwrap();
         assert_eq!(client.base_url.as_str(), "https://registry-1.docker.io/");
-        assert_eq!(client.chunk_size, DEFAULT_CHUNK_SIZE);
         assert!(client.auth.is_none());
-    }
-
-    #[test]
-    fn builder_custom_chunk_size() {
-        let client = RegistryClient::builder(test_base_url())
-            .chunk_size(4 * 1024 * 1024)
-            .build()
-            .unwrap();
-        assert_eq!(client.chunk_size, 4 * 1024 * 1024);
     }
 
     #[test]
