@@ -235,17 +235,31 @@ Three parallel research agents surveyed ECR optimization, OCI upload
 best practices across tools, and Docker Hub rate limiting. Actionable
 findings only — full reports in session artifacts.
 
-### ECR blob mounting -- does not work (tested 2026-04-17)
+### ECR blob mounting -- works, with conditions (tested 2026-04-17)
 
 AWS launched opt-in `BLOB_MOUNTING` account setting (January 2026).
-Docs claim cross-repo mount POSTs return 201 when enabled. **Tested:
-does not work.** With BLOB_MOUNTING=ENABLED, fresh repos (AES256
-default encryption), ecr:* IAM permissions, 15s propagation delay --
-all mount POSTs return 202, all HEAD on target return 404.
+Enable: `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`
 
-Zero verified reports of ECR returning 201 on mount exist online.
+**Tested and confirmed working.** Mount POST returns 201 when:
+1. `BLOB_MOUNTING` is `ENABLED` on the account
+2. The source blob is referenced by a committed manifest (image must
+   be fully pushed, not just standalone blobs)
+3. The `from` parameter specifies the source repo name
+4. Both repos have identical encryption config (AES256 default works)
+
+**Standalone blobs without manifests return 202 (mount fails).** This
+is why our initial curl tests failed -- we pushed raw blobs without
+committing a manifest. dregsy's benchmark confirmed 172/172 mounts
+succeeded because it pushes complete images sequentially.
+
+regsync's mounts all failed (0/247) because it omits the `from=`
+parameter entirely -- it sends `?mount=<digest>` without telling ECR
+which repo to mount from.
+
 Our `ProviderKind::fulfills_cross_repo_mount` returning `false` for
-ECR remains correct.
+ECR should be updated to detect `BLOB_MOUNTING` and conditionally
+re-enable mount attempts. This is a significant optimization for
+sync workflows with shared base layers.
 
 Requirements: same account + region, identical encryption config,
 pusher needs `ecr:GetDownloadUrlForLayer` on source repo. Not
@@ -366,7 +380,7 @@ understanding. Each entry ships as its own PR.
 
 | # | Optimization | Impact | Complexity | Status |
 |---|-------------|--------|------------|--------|
-| ~~1~~ | ~~ECR blob mounting~~ | ~~Saves shared layer transfers~~ | ~~Medium~~ | **Does not work.** Tested 2026-04-17: BLOB_MOUNTING=ENABLED, fresh repos, AES256, ecr:* IAM, 15s delay. All mounts return 202, all HEAD 404. Zero verified reports online of ECR returning 201 on mount. Setting exists as API surface only. |
+| 1 | **ECR blob mounting** -- detect `BLOB_MOUNTING`, re-enable mount when set | Saves blob transfer for every shared layer across ECR repos | Medium | **Confirmed working.** Requires blob to be part of a committed image. See findings entry for details. |
 | 2 | **Cross-image blob download dedup** — download each unique blob from source once, push to N target repos | ~168 source GETs, ~5.6 GB on Jupyter corpus | High | Not started |
 | 3 | **Docker Hub authentication** — always authenticate pulls, add credential support for source registries | 10× more pull quota (100/hr vs 10/hr) | Low | Not started |
 | 4 | **ACR streaming PUT fallback** — `ProviderKind::Acr` with chunked PATCH for blobs > 20 MB | Correctness on ACR (currently broken for large blobs) | Low | Not started |
