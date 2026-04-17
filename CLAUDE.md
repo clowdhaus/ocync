@@ -97,29 +97,13 @@ Codified in `xtask/src/bench/config_gen.rs`:
 - **dregsy** requires `auth-refresh: 12h` on ECR targets. Without it, dregsy skips the AWS SDK refresher and falls through to skopeo's fragile credential resolution.
 - **dregsy** exits 1 on any failed skopeo copy, even with 99% success. Parse per-image logs for real metrics, not exit code.
 
-### Baseline (validated 2026-04-16, c6in.4xlarge, Jupyter corpus 5 images × 1 tag, cold → ECR)
+### Baseline
 
-**Cold sync** — all tools exit 0, no partial failures:
+See `docs/specs/findings.md` for current numbers, methodology, and optimization history. Key takeaways:
 
-| Tool | Platforms | Wall clock | Requests | Response bytes |
-|------|----------|-----------|----------|----------------|
-| ocync (post-optimization) | 2 (multi-arch) | 162.3s | 1,225 | 11.5 GB |
-| regsync v0.11.3 | 2 (multi-arch) | 172.3s | 1,302 | 11.5 GB |
-| dregsy (skopeo) | 1 (tag only) | 92.8s | 1,538 | 5.9 GB |
-
-dregsy's byte advantage is not real — it syncs 1 platform vs 2 (5 manifest PUTs vs 15). ocync now uses fewer requests than regsync for the same bytes.
-
-Pre-optimization ocync was 3,249 requests. Three fixes reduced it by 62%: monolithic upload (MONOLITHIC_THRESHOLD 1 MB → 256 MB), auth cache fix (EARLY_REFRESH_WINDOW 15 min → 30 sec — Docker Hub 300s tokens were never cached), and batch-check HEAD skip (247 blob HEADs eliminated on cold sync).
-
-**Warm sync** (prime + measured pass):
-
-| Tool | Wall clock | Requests | Response bytes |
-|------|-----------|----------|----------------|
-| ocync | 2.5s | 81 | 371 KB |
-| regsync | 4s | 27 | 27 KB |
-| dregsy | 5.2s | 200 | 163 KB |
-
-See `docs/specs/findings.md` for full analysis and optimization ranking.
+- **dregsy's byte/speed advantage is illusory** — it syncs 1 platform vs 2 (5 manifest PUTs vs 15). Not a valid efficiency comparison.
+- **ocync uses fewer requests than regsync** for the same multi-arch work on cold sync.
+- **Warm sync is ocync's strongest feature** — persistent TransferStateCache makes re-sync nearly free.
 
 ### Bench-proxy
 

@@ -4,22 +4,25 @@ Benchmark infrastructure for comparing ocync against dregsy and regsync.
 
 ## Instance access
 
-- **Instance ID**: `i-042193c339708c702` (us-east-1) — check Terraform state if stale
-- **Access**: SSM only (no public IP, no SSH key)
-- **Commands run as root** by default — always use `sudo -u ec2-user bash -lc "..."` for build/bench commands
+- **Region**: us-east-1. Instance ID from `cd bench/terraform && terraform output instance_id`.
+- **Access**: SSM only (no public IP, no SSH key).
+- **Commands run as root** by default — always use `sudo -u ec2-user bash -lc "..."` for build/bench commands.
 - **SSM send-command** truncates output at 2500 chars. For long output, redirect to a file and read it back.
 
 ```bash
+# Get instance ID
+INSTANCE_ID=$(cd bench/terraform && terraform output -raw instance_id)
+
 # Quick command
 aws ssm send-command \
-  --instance-ids i-042193c339708c702 \
+  --instance-ids "$INSTANCE_ID" \
   --document-name AWS-RunShellScript \
   --parameters 'commands=["sudo -u ec2-user bash -lc \"cd ~/ocync && cargo xtask bench --help\""]' \
   --region us-east-1 --output text --query 'Command.CommandId'
 
 # Get output (wait a few seconds)
 aws ssm get-command-invocation \
-  --command-id <ID> --instance-id i-042193c339708c702 \
+  --command-id <ID> --instance-id "$INSTANCE_ID" \
   --region us-east-1 --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
 ```
 
@@ -36,10 +39,11 @@ aws ssm get-command-invocation \
 
 ## Environment variables
 
-`BENCH_TARGET_REGISTRY` must be set before running benchmarks. It is **not** baked into user-data.
+`BENCH_TARGET_REGISTRY` must be set before running benchmarks. Derive it from the AWS account:
 
 ```bash
-export BENCH_TARGET_REGISTRY=660548353186.dkr.ecr.us-east-1.amazonaws.com
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
 ```
 
 AWS credentials come from the instance profile (IAM role) — no manual config needed.
@@ -48,7 +52,8 @@ AWS credentials come from the instance profile (IAM role) — no manual config n
 
 ```bash
 cd /home/ec2-user/ocync
-export BENCH_TARGET_REGISTRY=660548353186.dkr.ecr.us-east-1.amazonaws.com
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
 
 # Quick smoke test (3 images, 1 iteration, ocync only)
 cargo xtask bench --tools ocync --iterations 1 --limit 3 cold
@@ -67,16 +72,18 @@ The xtask harness handles: building ocync from source, starting bench-proxy (MIT
 
 ## Updating source code on the instance
 
+The repo is private — git fetch needs a token from SSM Parameter Store (`/ocync/bench/github-token`). The `user-data.sh` bootstrap script clones with the token then strips it from the remote URL.
+
 ```bash
 cd /home/ec2-user/ocync
-git fetch origin
-git checkout <branch>
+GH_TOKEN=$(aws ssm get-parameter --name /ocync/bench/github-token --with-decryption --query Parameter.Value --output text)
+git remote set-url origin "https://${GH_TOKEN}@github.com/clowdhaus/ocync.git"
+git fetch origin && git checkout <branch>
+git remote set-url origin https://github.com/clowdhaus/ocync.git
 cargo build --release --package ocync --package bench-proxy
-cp target/release/ocync ~/.cargo/bin/ocync
-cp target/release/bench-proxy ~/.cargo/bin/bench-proxy
 ```
 
-Note: `user-data.sh` hardcodes `benchmark-suite` branch for fresh bootstraps. Change line 157 to match if recreating the instance.
+Note: `user-data.sh` hardcodes `benchmark-suite` branch for fresh bootstraps.
 
 ## Analyzing proxy logs
 
@@ -102,5 +109,3 @@ Managed by Terraform in `bench/terraform/`. `user_data_replace_on_change = true`
 cd bench/terraform && terraform init && terraform apply   # create
 cd bench/terraform && terraform destroy                    # destroy
 ```
-
-Instance type: c6in.4xlarge, 100GB gp3 (6000 IOPS, 400 MB/s throughput).
