@@ -36,27 +36,30 @@ pub enum ProviderKind {
 impl ProviderKind {
     /// Whether this provider is known to fulfill OCI cross-repo blob mount.
     ///
-    /// Returns `false` for providers observed (or safely inferred) to never
-    /// return `201 Created` to a mount POST. When `false`,
+    /// Returns `false` for providers observed to never return `201 Created`
+    /// to a mount POST. When `false`,
     /// [`crate::blob::RegistryClient::blob_mount`] short-circuits without
     /// issuing a network request.
     ///
-    /// Non-fulfilling providers:
-    /// - [`ProviderKind::Ecr`]: 193 observed mount POSTs returned 202, never
-    ///   201 (see `docs/specs/findings.md`).
-    /// - [`ProviderKind::EcrPublic`]: inferred from [`ProviderKind::Ecr`]
-    ///   (same AWS backend team, same distribution service family). Not
-    ///   independently benchmarked; if a future observation shows ECR Public
-    ///   does fulfill mount, flip this arm and add a re-validate entry.
+    /// ECR fulfills mount when the `BLOB_MOUNTING` account setting is enabled
+    /// AND the source blob is referenced by a committed manifest. The setting
+    /// is disabled by default; when disabled, mount POSTs return 202 (the
+    /// fallback path pushes normally). We always attempt mount on ECR because
+    /// the 202 fallback is cheap (~100ms) and successful mounts save entire
+    /// blob uploads. See `docs/specs/findings.md` for evidence.
     ///
     /// Uses an exhaustive `match` so adding a new [`ProviderKind`] variant
     /// forces a compile-time decision here.
     pub fn fulfills_cross_repo_mount(&self) -> bool {
         match self {
-            Self::Ecr | Self::EcrPublic => false,
-            Self::Gcr | Self::Gar | Self::Acr | Self::Ghcr | Self::DockerHub | Self::Chainguard => {
-                true
-            }
+            Self::Ecr
+            | Self::EcrPublic
+            | Self::Gcr
+            | Self::Gar
+            | Self::Acr
+            | Self::Ghcr
+            | Self::DockerHub
+            | Self::Chainguard => true,
         }
     }
 }

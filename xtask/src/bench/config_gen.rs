@@ -127,6 +127,11 @@ pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
             let to = corpus.target_repo(&img.source);
             out.push_str(&format!("      - from: {from}\n"));
             out.push_str(&format!("        to: {to}\n"));
+            // Deep-copy all platforms so dregsy syncs the full manifest
+            // list, matching ocync and regsync behavior. Without this,
+            // skopeo copies only the native platform (single manifest PUT)
+            // and the comparison is not apples-to-apples.
+            out.push_str("        platform: all\n");
             out.push_str("        tags:\n");
             for tag in &img.tags {
                 out.push_str(&format!("          - \"{tag}\"\n"));
@@ -256,6 +261,7 @@ tasks:
     mappings:
       - from: chainguard/static
         to: bench/chainguard-static
+        platform: all
         tags:
           - \"latest\"
   - name: sync-docker-io
@@ -267,6 +273,7 @@ tasks:
     mappings:
       - from: library/alpine
         to: bench/library-alpine
+        platform: all
         tags:
           - \"3.20\"
           - \"latest\"

@@ -95,15 +95,16 @@ The bench instance bootstraps with: **ocync** (built from source, AWS SDK for EC
 Codified in `xtask/src/bench/config_gen.rs`:
 - **regsync** requires `repoAuth: true` on source creds for per-repo-token registries (cgr.dev, gcr.io, nvcr.io). Without it, multi-image syncs fail with HTTP 403 on the second image. Do NOT set `credExpire` as a duration string — YAML parser fails; rely on 1h default.
 - **dregsy** requires `auth-refresh: 12h` on ECR targets. Without it, dregsy skips the AWS SDK refresher and falls through to skopeo's fragile credential resolution.
+- **dregsy** requires `platform: all` per mapping for multi-arch copy. Without it, skopeo copies only the native platform — the comparison is not apples-to-apples.
 - **dregsy** exits 1 on any failed skopeo copy, even with 99% success. Parse per-image logs for real metrics, not exit code.
 
-### Baseline (5 images, 6 tags, c6in.large, cold sync to ECR us-east-1)
+### Baseline and optimization backlog
 
-| Tool | Wall clock | Exit | Requests | Response bytes |
-|------|-----------|------|----------|----------------|
-| ocync | 243.6s | 0 | 720 | 659 MB |
-| dregsy | 179.5s | 1 (partial) | 326 | 333 MB |
-| regsync | 343.5s | 0 | 466 | 648 MB |
+See `docs/specs/findings.md` for:
+- **-- Current competitive position** — comparison table (ocync vs regsync vs dregsy)
+- **-- Optimization backlog** — ranked list of next optimizations with impact/complexity/status
+
+Prior dregsy results were invalid (1 platform instead of 2). Re-run with `platform: all` needed for fair baseline.
 
 ### Bench-proxy
 

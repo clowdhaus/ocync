@@ -323,7 +323,7 @@ async fn handle_request(
     let url = format!("https://{}{}", target.as_str(), path_and_query);
 
     // Collect request headers, skipping hop-by-hop entries we must not
-    // forward per RFC 7230 §6.1.
+    // forward per RFC 7230  section6.1.
     let mut headers = http::HeaderMap::new();
     for (name, value) in req.headers() {
         if is_hop_by_hop(name) {
@@ -451,7 +451,7 @@ fn error_response(code: u16, msg: String) -> Response<ProxyBody> {
         .expect("error response builder")
 }
 
-/// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1).
+/// Hop-by-hop headers that must not be forwarded (RFC 7230  section6.1).
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name,
