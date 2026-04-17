@@ -199,7 +199,7 @@ Four optimizations implemented (branch `benchmark-comparison`):
 
 | Tool | Platforms | Requests | Response bytes | Wall clock |
 |------|----------|---------|----------------|------------|
-| **ocync** | 2 (multi-arch) | **1,225** | 11.5 GB | **162.3s** |
+| **ocync** (streaming PUT) | 2 (multi-arch) | **1,049** | 11.5 GB | **183.1s** |
 | regsync v0.11.3 | 2 (multi-arch) | 1,302 | 11.5 GB | 172.3s |
 | dregsy (skopeo) | 1 (single tag) | 1,538 | 5.9 GB | 92.8s |
 
@@ -305,7 +305,7 @@ understanding. Each entry ships as its own PR.
 
 | # | Optimization | Impact | Complexity | Status |
 |---|-------------|--------|------------|--------|
-| 1 | **ECR blob mounting** — detect `BLOB_MOUNTING` setting, conditionally re-enable mount | Saves blob transfer for every shared layer on ECR targets | Medium | Not started |
+| 1 | **ECR blob mounting** — detect `BLOB_MOUNTING` setting, conditionally re-enable mount | Saves blob transfer for every shared layer on ECR targets | Medium | Blocked: tested 2026-04-17 with BLOB_MOUNTING=ENABLED, still returns 202/404. May need specific IAM perms or repo config. |
 | 2 | **Cross-image blob download dedup** — download each unique blob from source once, push to N target repos | ~168 source GETs, ~5.6 GB on Jupyter corpus | High | Not started |
 | 3 | **Docker Hub authentication** — always authenticate pulls, add credential support for source registries | 10× more pull quota (100/hr vs 10/hr) | Low | Not started |
 | 4 | **ACR streaming PUT fallback** — `ProviderKind::Acr` with chunked PATCH for blobs > 20 MB | Correctness on ACR (currently broken for large blobs) | Low | Not started |
@@ -318,7 +318,7 @@ understanding. Each entry ships as its own PR.
 
 | Optimization | Requests saved | Status |
 |-------------|---------------|--------|
-| Streaming PUT upload (eliminate chunked PATCH) | ~1,400 | Done |
+| Streaming PUT upload (eliminate chunked PATCH + monolithic buffer) | ~2,200 (3,249 to 1,049) | Done |
 | Auth cache fix (EARLY_REFRESH_WINDOW 15 min → 30s) | ~267 | Done |
 | Batch-check HEAD skip (cold sync) | ~247 | Done |
 | ECR mount short-circuit (PR #25) | ~148 | Done |
