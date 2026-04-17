@@ -24,11 +24,8 @@ pub enum MountResult {
     /// Registry fulfilled the mount (201 Created). The blob is now
     /// referenced from the target repo without a data transfer.
     Mounted,
-    /// Mount did not happen. Either the registry returned 202 without
-    /// fulfilling the mount, or the client short-circuited before
-    /// issuing the POST because the target provider is known to never
-    /// fulfill mount (see [`ProviderKind::fulfills_cross_repo_mount`]).
-    /// Callers fall through to HEAD + push either way.
+    /// Mount did not happen — the registry returned 202 without
+    /// fulfilling the mount. Callers fall through to push.
     NotMounted,
 }
 
@@ -120,26 +117,14 @@ impl RegistryClient {
     /// Attempt a cross-repository blob mount.
     ///
     /// Issues a POST to `/v2/{repository}/blobs/uploads/?mount={digest}&from={from_repo}`.
-    /// Returns [`MountResult::Mounted`] on 201 and [`MountResult::NotMounted`] on 202
-    /// or when the client short-circuits because the target provider never fulfills
-    /// mount (see [`ProviderKind::fulfills_cross_repo_mount`]).
+    /// Returns [`MountResult::Mounted`] on 201 and [`MountResult::NotMounted`] on 202.
+    /// On 202 the caller falls through to the normal push path.
     pub async fn blob_mount(
         &self,
         repository: &RepositoryName,
         digest: &Digest,
         from_repo: &RepositoryName,
     ) -> Result<MountResult, Error> {
-        let provider_kind = self.base_url.host_str().and_then(detect_provider_kind);
-        if provider_kind.is_some_and(|k| !k.fulfills_cross_repo_mount()) {
-            debug!(
-                target = %repository,
-                %digest,
-                ?provider_kind,
-                "skipping cross-repo mount POST: provider does not fulfill mount"
-            );
-            return Ok(MountResult::NotMounted);
-        }
-
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let scopes = [
             Scope::pull_push(repository.as_str()),
@@ -738,14 +723,12 @@ mod tests {
         let cases = [
             Case {
                 host: "123456789012.dkr.ecr.us-east-1.amazonaws.com",
-                server: None,
-                expect_mounted: false,
+                server: Some(201),
+                expect_mounted: true,
             },
             Case {
-                // Inferred from ECR private — same AWS backend, assumed
-                // to share mount behavior until proven otherwise.
-                host: "public.ecr.aws",
-                server: None,
+                host: "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+                server: Some(202),
                 expect_mounted: false,
             },
             Case {
@@ -769,17 +752,12 @@ mod tests {
             let server = wiremock::MockServer::start().await;
             let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
 
-            let (expected_post_count, response_status) = match case.server {
-                Some(s) => (1, s),
-                // Short-circuit expected; 500 is unreachable but flags
-                // loudly if the `.expect(0)` guard breaks.
-                None => (0, 500),
-            };
+            let response_status = case.server.unwrap();
 
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .and(wiremock::matchers::path("/v2/tgt/repo/blobs/uploads/"))
                 .respond_with(wiremock::ResponseTemplate::new(response_status))
-                .expect(expected_post_count)
+                .expect(1)
                 .mount(&server)
                 .await;
 

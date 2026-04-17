@@ -1965,13 +1965,13 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
     assert_eq!(report.stats.blobs_transferred, 0);
 }
 
-/// When the target is ECR, `blob_mount` short-circuits (ECR never fulfills
-/// OCI mount — it returns 202 to every POST). The engine must not issue
-/// the mount POST, falling through to HEAD + push instead.
-///
-/// `.expect(0)` on the POST is the assertion that pins the short-circuit.
+/// When the target is ECR and `BLOB_MOUNTING` is disabled (the default),
+/// mount POSTs return 202 (not fulfilled). The engine issues the POST,
+/// gets 202, falls through to HEAD + push. Mount attempts are not
+/// short-circuited — the 202 fallback is cheap and enables the mount
+/// optimization when `BLOB_MOUNTING` is enabled.
 #[tokio::test]
-async fn sync_warm_cache_ecr_target_short_circuits_mount() {
+async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
@@ -1990,33 +1990,21 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
     };
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
-    // Source serves manifest and both blobs (pulls must happen because
-    // mount is short-circuited).
     mount_source_manifest(&source_server, "repo-b", "v1", &manifest_bytes).await;
     mount_blob_pull(&source_server, "repo-b", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "repo-b", &layer_desc.digest, layer_data).await;
 
     mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
 
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo-b/blobs/{}", config_desc.digest)))
-        .respond_with(ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&target_server)
-        .await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo-b/blobs/{}", layer_desc.digest)))
-        .respond_with(ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&target_server)
-        .await;
-
-    // The whole point of the short-circuit: zero mount POSTs.
+    // Mount POST returns 202 (not fulfilled) — engine falls through to push.
     Mock::given(method("POST"))
         .and(path("/v2/repo-b/blobs/uploads/"))
         .and(query_param("from", "repo-a"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
+        .respond_with(
+            ResponseTemplate::new(202)
+                .append_header("Location", "/v2/repo-b/blobs/uploads/fallback-uuid"),
+        )
+        .expect(2)
         .mount(&target_server)
         .await;
 
@@ -2026,8 +2014,6 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
     let source_client = mock_client(&source_server);
     let target_client = ecr_mock_client(&target_server);
 
-    // Pre-warm: mount source hint present — the engine's lookup would
-    // normally trigger a POST, but the client short-circuits on ECR.
     let cache = empty_cache();
     let target_name = "ecr-target";
     {
@@ -2057,20 +2043,21 @@ async fn sync_warm_cache_ecr_target_short_circuits_mount() {
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // Mount attempted but not fulfilled (202) — blobs transferred instead.
     assert_eq!(report.images[0].blob_stats.mounted, 0);
     assert_eq!(report.images[0].blob_stats.transferred, 2);
     assert_eq!(report.stats.blobs_mounted, 0);
     assert_eq!(report.stats.blobs_transferred, 2);
 }
 
-/// Small blobs (below the 1 MiB monolithic threshold) use POST+PUT with no
-/// PATCH. The mock expects exactly 1 POST and 1 PUT per blob, and 0 PATCH requests.
+/// All blobs use streaming PUT (POST + PUT) with no PATCH. The mock expects
+/// exactly 1 POST and 1 PUT per blob, and 0 PATCH requests.
 #[tokio::test]
 async fn sync_small_blob_uses_monolithic_upload() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    // Both blobs are well below the 1 MiB monolithic threshold.
+    // Small blobs — streaming PUT handles all sizes.
     let config_data = b"small-config";
     let layer_data = b"small-layer";
 
