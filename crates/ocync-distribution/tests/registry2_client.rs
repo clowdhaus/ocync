@@ -126,20 +126,21 @@ async fn blob_push_monolithic_and_exists() {
     assert_eq!(size, data.len() as u64);
 }
 
-/// Push a blob via the streaming (chunked) path.
+/// Push a blob via the streaming upload path.
 #[tokio::test]
 async fn blob_push_stream_chunked() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
     let repo = RepositoryName::new("test/streamed");
 
-    // Data larger than the monolithic threshold (1 MiB) to force the chunked path.
     let data = vec![0xABu8; 2 * 1024 * 1024];
     let expected_digest = test_digest(&data);
+    let data_len = data.len() as u64;
 
-    let stream = stream::once(async { Ok::<_, Error>(Bytes::from(data.clone())) });
+    let body = Bytes::from(data);
+    let stream = stream::once(async move { Ok::<_, Error>(body) });
     let digest = client
-        .blob_push_stream(&repo, &expected_digest, Some(data.len() as u64), stream)
+        .blob_push_stream(&repo, &expected_digest, Some(data_len), stream)
         .await
         .expect("blob_push_stream failed");
 
@@ -150,7 +151,7 @@ async fn blob_push_stream_chunked() {
         .await
         .expect("blob_exists failed")
         .expect("blob should exist after stream push");
-    assert_eq!(size, data.len() as u64);
+    assert_eq!(size, data_len);
 }
 
 /// Verify `blob_exists` returns `None` for a nonexistent blob.
