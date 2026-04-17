@@ -76,7 +76,7 @@ engine's fallback path (HEAD → push) was the actual transfer mechanism
 regardless.
 
 This is also a design assumption falsification against
-`docs/specs/transfer-optimization-design.md §Same-Registry Optimization`,
+`docs/specs/transfer-optimization-design.md  sectionSame-Registry Optimization`,
 which describes cross-repo mount as a primary optimization for
 `ecr-us/team-a/nginx` → `ecr-us/team-b/nginx`. In practice, that blob
 must be re-uploaded on ECR, not mounted.
@@ -166,103 +166,21 @@ Fair 3-tool comparison on c6in.4xlarge, Jupyter corpus (5 images, 1 tag
 each, `latest`), cold sync to ECR us-east-1, 1 iteration per tool.
 All three tools exited 0 (no partial failures). Branch: `benchmark-comparison`.
 
-**Cold sync pre-optimization (historical — see "Action taken" for current):**
-
-| Tool | Platforms synced | Wall clock | Requests | Response bytes | Upload strategy |
-|------|-----------------|-----------|----------|----------------|----------------|
-| ocync (pre-opt) | 2 (multi-arch) | 189.6s | 3,249 | 11.5 GB | Chunked POST+PATCH+PUT (8 MB) |
-| regsync v0.11.3 | 2 (multi-arch) | 172.3s | 1,302 | 11.5 GB | Monolithic POST+PUT |
-| dregsy (skopeo) | 1 (single tag) | 92.8s | 1,538 | 5.9 GB | Single PATCH |
-
-**dregsy's 5.9 GB is not an efficiency advantage** — it syncs only one
-platform per tag (5 manifest PUTs) while ocync and regsync sync both
-platforms in the manifest list (15 manifest PUTs each). The byte
-difference is half-the-work, not better dedup.
-
-**ocync vs regsync (same work, same bytes):** ocync uses **2.5× more
-requests** (3,249 vs 1,302) for the same 11.5 GB transfer. The
-difference is entirely in upload strategy:
-
-| Tool | POST (init) | PATCH (chunks) | PUT (finalize) | HEAD | GET |
-|------|------------|----------------|----------------|------|-----|
-| ocync | 253 | 1,419 | 262 | 257 | 1,058 |
-| regsync | 248 | 0 | 262 | 278 | 514 |
-
-regsync uses monolithic upload (POST init + PUT full blob in one
-request, no PATCH). ocync's chunked upload adds ~1,419 PATCH requests
-(8 MB chunks × 247 blobs = ~1,419 PATCHes) and ~500 additional source
-GETs (ocync re-downloads shared blobs per-mapping; regsync deduplicates
-within a run).
-
-**Unique blob digests downloaded from Docker Hub:**
-
-| Tool | Unique digests | S3 GETs (actual downloads) | Re-downloads |
-|------|---------------|---------------------------|-------------|
-| ocync | 79 | 247 | 168 (2.1× per unique blob) |
-| regsync | 79 | 247 | 168 |
-| dregsy | 40 | 126 | 86 |
-
-Both multi-arch tools download the same 79 unique blobs and make the
-same 247 S3 GET requests — neither deduplicates cross-image blob
-downloads within a single run.
-
-**Warm sync (no-op, prime + measured pass, same corpus):**
-
-| Tool | Wall clock | Requests | Response bytes |
-|------|-----------|----------|----------------|
-| ocync | **2.5s** | 81 | 371 KB |
-| regsync | 4s | 27 | 27 KB |
-| dregsy | 5.2s | 200 | 163 KB |
-
-ocync's persistent TransferStateCache gives the fastest wall-clock on
-warm sync. regsync uses fewer requests (manifest-digest-only comparison)
-but is slower (sequential). dregsy re-HEADs all blobs (154 HEADs).
-
-**Chunk size experiment (ocync-only, same corpus):**
-
-| Chunk size | PATCH count | Total requests | Wall clock |
-|-----------|-------------|----------------|------------|
-| 8 MB (default) | 1,419 | 3,249 | 197.5s |
-| 32 MB | 384 | 2,214 | 163.3s |
-
-32 MB chunks reduce PATCHes by 3.7× and total requests by 32%.
-
-**Blob HEAD elimination (cold sync):**
-
-247 blob HEAD requests on the target returned 404 (100%). On cold
-sync, ECR batch-check already confirms all blobs are absent. These
-HEADs add 7.6% to the total request count with zero value.
-
-### Implication
-
-1. **Upload strategy is the #1 request-count lever.** Switching to
-   monolithic upload for blobs below a threshold (e.g. 100 MB) would
-   eliminate ~1,100 PATCH requests on this corpus. Alternatively,
-   increasing chunk size to 32 MB saves ~1,035 requests with a trivial
-   constant change.
-
-2. **No cross-image blob dedup exists in any tool.** All three tools
-   re-download (from source) and re-upload (to target) shared blobs
-   when they appear in different source images mapped to different
-   target repos. A session-scoped blob cache (download once, push to
-   N targets) would save 168 source downloads (68%) on this corpus.
-
-3. **Warm sync is ocync's strongest competitive feature.** 2.5s vs
-   4–5s, and the gap widens with larger corpora (persistent cache
-   skips all blob I/O). However, regsync's 27-request approach
-   (compare manifest digests only) is more request-efficient than
-   ocync's 81-request approach.
-
-4. **dregsy's wall-clock advantage is illusory.** It syncs fewer
-   platforms → fewer bytes → faster. Not a valid efficiency comparison.
+Pre-optimization, ocync used 3,249 requests (chunked PATCH upload,
+broken auth cache, redundant blob HEADs) vs regsync's 1,302 for the
+same 11.5 GB multi-arch transfer. dregsy's 1,538 requests / 5.9 GB
+were not comparable — it synced only 1 platform. No tool deduplicated
+cross-image blob downloads from source (168 redundant GETs / 5.6 GB
+on this corpus).
 
 ### Action taken
 
-Three optimizations implemented (branch `benchmark-comparison`):
+Four optimizations implemented (branch `benchmark-comparison`):
 
-1. **MONOLITHIC_THRESHOLD raised from 1 MB to 256 MB.** Most blobs now
-   use POST+PUT (2 requests) instead of POST+PATCH×N+PUT. Blobs above
-   256 MB still use chunked upload with DEFAULT_CHUNK_SIZE of 32 MB.
+1. **Streaming PUT upload.** POST + single streaming PUT with
+   `Transfer-Encoding: chunked`, zero buffering. Replaced chunked
+   POST+PATCH×N+PUT (eliminated ~1,400 PATCH requests) and the
+   monolithic buffer path. GHCR/GAR fallbacks retained.
 
 2. **EARLY_REFRESH_WINDOW lowered from 15 min to 30 sec.** Docker Hub
    tokens have 300s TTL. The prior 15-minute window caused
@@ -270,25 +188,12 @@ Three optimizations implemented (branch `benchmark-comparison`):
    token cache (272 redundant auth exchanges → 5).
 
 3. **Batch-check HEAD skip.** When ECR batch API confirms blobs are
-   absent, the per-blob HEAD is skipped. A `HashSet<Digest>` of
-   batch-checked digests is passed to the per-blob loop; blobs in the
-   set skip Step 3 (HEAD). TOCTOU-safe: if a blob appears between
-   batch-check and push, the redundant push succeeds (registry
-   deduplicates on content-addressable digest).
+   absent, the per-blob HEAD is skipped (247 requests eliminated on
+   cold sync).
 
-Also: `bench/CLAUDE.md` added for future session onboarding.
-
-**Post-optimization result (same corpus, same instance):**
-
-| Metric | Before | After | Change |
-|--------|--------|-------|--------|
-| Total requests | 3,249 | 1,225 | -62% |
-| PATCH | 1,419 | 176 | -88% |
-| HEAD (blob) | 247 | 0 | -100% |
-| Auth tokens | 272 | 5 | -98% |
-| GET | 1,058 | 524 | -50% |
-| Wall clock | 189.6s | 162.3s | -14% |
-| Response bytes | 11.5 GB | 11.5 GB | 0% |
+4. **Removed dead code.** `MONOLITHIC_THRESHOLD`, `DEFAULT_CHUNK_SIZE`,
+   `chunk_size` field/builder, `send_patch_chunk`, `ContentRangeMatcher`.
+   Net -213 lines.
 
 ### Current competitive position (cold sync, Jupyter 5-image corpus)
 
@@ -310,23 +215,113 @@ comparison is invalid — it syncs 1 platform, not 2 (see Observation).
 Warm sync: ocync wins wall-clock decisively. regsync uses fewer
 requests (manifest-digest comparison only) but is sequential.
 
-### Remaining optimization opportunities
-
-| # | Optimization | Requests saved | Bytes saved | Complexity |
-|---|-------------|---------------|-------------|------------|
-| 1 | Cross-image blob download dedup | ~168 | ~5.6 GB | High |
-| 2 | Optimize warm-sync manifest comparison | ~54 | ~344 KB | Low |
-
 ### To re-validate
 
+Re-run after Docker Hub rate limit resets. dregsy now configured with
+`platform: all` for fair multi-arch comparison.
+
 ```bash
-cd /home/ec2-user/ocync
-export BENCH_TARGET_REGISTRY=660548353186.dkr.ecr.us-east-1.amazonaws.com
-# Cold comparison
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
 cargo xtask bench --tools ocync,dregsy,regsync --iterations 1 --limit 5 cold
-# Warm comparison
 cargo xtask bench --tools ocync,dregsy,regsync --limit 5 warm
 ```
+
+---
+
+## 2026-04-16 — Research findings: ECR, OCI upload, Docker Hub
+
+Three parallel research agents surveyed ECR optimization, OCI upload
+best practices across tools, and Docker Hub rate limiting. Actionable
+findings only — full reports in session artifacts.
+
+### ECR blob mounting now available (January 2026)
+
+AWS launched opt-in `BLOB_MOUNTING` account setting. When enabled,
+cross-repo mount POSTs return 201 instead of 202. Our
+`ProviderKind::fulfills_cross_repo_mount` returning `false` for ECR
+is now conditionally wrong.
+
+Enable: `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`
+
+Requirements: same account + region, identical encryption config,
+pusher needs `ecr:GetDownloadUrlForLayer` on source repo. Not
+supported for pull-through cache repos.
+
+ECR uses content-addressable storage at the S3 layer — blobs
+uploaded to one repo are stored in a shared bucket
+(`prod-<region>-starport-layer-bucket`). HEAD for a blob digest
+returns 200 from any repo where the blob was previously referenced.
+This is what we observed in the benchmark (dregsy's 227 HEAD 200s
+on target ECR).
+
+### Docker Hub rate limits tightened (April 2025)
+
+| Tier | Old | New (Apr 2025+) |
+|------|-----|----------------|
+| Anonymous | 100 pulls / 6h | **10 pulls / hour / IP** |
+| Authenticated free | 200 pulls / 6h | **100 pulls / hour** |
+| Pro/Team/Business | Higher | **Unlimited** (fair use) |
+
+What counts as a pull: manifest GET only. Blob GETs and manifest
+HEADs are free. HEAD requests are subject to a separate abuse rate
+limit (~314 HEADs in 8 min triggers 429). Rate limit headers
+(`ratelimit-remaining`) appear on HEAD responses too.
+
+Authentication is now mandatory for any serious sync workload.
+
+### ACR requires chunked upload for blobs > 20 MB
+
+Azure Container Registry enforces a ~20 MB request body limit on
+monolithic PUT. Our streaming PUT needs a `ProviderKind::Acr`
+fallback to chunked PATCH for larger blobs.
+
+### Upload strategy comparison across tools
+
+| Tool | Strategy | Requests/blob | Cross-image dedup |
+|------|---------|:---:|:---:|
+| **ocync** | POST + streaming PUT | **2** | Yes (TransferStateCache) |
+| containerd | POST + streaming PUT | 2 | Yes (StatusTracker) |
+| regsync | POST + PUT (buffered) | 2 | No |
+| crane | POST + streaming PATCH + PUT | 3 | Yes (sync.Map) |
+| skopeo | POST + PATCH + PUT | 3 | No |
+
+ocync and containerd are tied for most request-efficient. AIMD
+adaptive concurrency is unique to ocync — no competitor implements
+anything similar.
+
+### BatchGetImage for warm sync
+
+ECR `BatchGetImage` SDK API checks up to 100 manifests per call.
+Could replace per-manifest HEAD checks in warm sync (81 → ~1-2
+calls). Returns full manifest bodies, not just existence.
+
+---
+
+## Optimization backlog
+
+Ranked by estimated impact. Updated as findings change our
+understanding. Each entry ships as its own PR.
+
+| # | Optimization | Impact | Complexity | Status |
+|---|-------------|--------|------------|--------|
+| 1 | **ECR blob mounting** — detect `BLOB_MOUNTING` setting, conditionally re-enable mount | Saves blob transfer for every shared layer on ECR targets | Medium | Not started |
+| 2 | **Cross-image blob download dedup** — download each unique blob from source once, push to N target repos | ~168 source GETs, ~5.6 GB on Jupyter corpus | High | Not started |
+| 3 | **Docker Hub authentication** — always authenticate pulls, add credential support for source registries | 10× more pull quota (100/hr vs 10/hr) | Low | Not started |
+| 4 | **ACR streaming PUT fallback** — `ProviderKind::Acr` with chunked PATCH for blobs > 20 MB | Correctness on ACR (currently broken for large blobs) | Low | Not started |
+| 5 | **BatchGetImage for warm sync** — replace per-manifest HEAD with SDK batch call | ~79 requests → ~1 call on warm sync | Medium | Not started |
+| 6 | **Multi-scope Docker Hub tokens** — batch N repo scopes into 1 token exchange | 5 auth exchanges → 1 (Docker Hub only, cgr.dev incompatible) | Low | Not started |
+| 7 | **Rate limit header parsing** — read `ratelimit-remaining` from Docker Hub and throttle proactively | Avoid 429s before they happen | Low | Not started |
+| 8 | **Verify HTTP/2 on ECR** — check ALPN negotiation, enable multiplexing | Connection reuse for 50 concurrent requests | Trivial | Not started |
+
+### Completed optimizations (this branch)
+
+| Optimization | Requests saved | Status |
+|-------------|---------------|--------|
+| Streaming PUT upload (eliminate chunked PATCH) | ~1,400 | Done |
+| Auth cache fix (EARLY_REFRESH_WINDOW 15 min → 30s) | ~267 | Done |
+| Batch-check HEAD skip (cold sync) | ~247 | Done |
+| ECR mount short-circuit (PR #25) | ~148 | Done |
 
 ---
 

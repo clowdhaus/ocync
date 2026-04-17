@@ -98,9 +98,13 @@ Codified in `xtask/src/bench/config_gen.rs`:
 - **dregsy** requires `platform: all` per mapping for multi-arch copy. Without it, skopeo copies only the native platform — the comparison is not apples-to-apples.
 - **dregsy** exits 1 on any failed skopeo copy, even with 99% success. Parse per-image logs for real metrics, not exit code.
 
-### Baseline
+### Baseline and optimization backlog
 
-See `docs/specs/findings.md § Current competitive position` for the comparison table. Prior dregsy results (5.9 GB / 1,538 requests) were invalid — it was syncing 1 platform instead of 2. Re-run with `platform: all` needed for a fair baseline.
+See `docs/specs/findings.md` for:
+- **-- Current competitive position** — comparison table (ocync vs regsync vs dregsy)
+- **-- Optimization backlog** — ranked list of next optimizations with impact/complexity/status
+
+Prior dregsy results were invalid (1 platform instead of 2). Re-run with `platform: all` needed for fair baseline.
 
 ### Bench-proxy
 
