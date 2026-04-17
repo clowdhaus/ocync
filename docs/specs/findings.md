@@ -158,6 +158,133 @@ undetected until a proxy log made it visible.
 
 ---
 
+## 2026-04-16 — 3-tool cold/warm comparison and upload strategy analysis
+
+### Observation
+
+Fair 3-tool comparison on c6in.4xlarge, Jupyter corpus (5 images, 1 tag
+each, `latest`), cold sync to ECR us-east-1, 1 iteration per tool.
+All three tools exited 0 (no partial failures). Branch: `benchmark-comparison`.
+
+**Cold sync (multi-arch correction applied):**
+
+| Tool | Platforms synced | Wall clock | Requests | Response bytes | Upload strategy |
+|------|-----------------|-----------|----------|----------------|----------------|
+| ocync | 2 (multi-arch) | 189.6s | 3,249 | 11.5 GB | Chunked POST+PATCH+PUT (8 MB) |
+| regsync v0.11.3 | 2 (multi-arch) | 172.3s | 1,302 | 11.5 GB | Monolithic POST+PUT |
+| dregsy (skopeo) | 1 (single tag) | 92.8s | 1,538 | 5.9 GB | Single PATCH |
+
+**dregsy's 5.9 GB is not an efficiency advantage** — it syncs only one
+platform per tag (5 manifest PUTs) while ocync and regsync sync both
+platforms in the manifest list (15 manifest PUTs each). The byte
+difference is half-the-work, not better dedup.
+
+**ocync vs regsync (same work, same bytes):** ocync uses **2.5× more
+requests** (3,249 vs 1,302) for the same 11.5 GB transfer. The
+difference is entirely in upload strategy:
+
+| Tool | POST (init) | PATCH (chunks) | PUT (finalize) | HEAD | GET |
+|------|------------|----------------|----------------|------|-----|
+| ocync | 253 | 1,419 | 262 | 257 | 1,058 |
+| regsync | 248 | 0 | 262 | 278 | 514 |
+
+regsync uses monolithic upload (POST init + PUT full blob in one
+request, no PATCH). ocync's chunked upload adds ~1,419 PATCH requests
+(8 MB chunks × 247 blobs = ~1,419 PATCHes) and ~500 additional source
+GETs (ocync re-downloads shared blobs per-mapping; regsync deduplicates
+within a run).
+
+**Unique blob digests downloaded from Docker Hub:**
+
+| Tool | Unique digests | S3 GETs (actual downloads) | Re-downloads |
+|------|---------------|---------------------------|-------------|
+| ocync | 79 | 247 | 168 (2.1× per unique blob) |
+| regsync | 79 | 247 | 168 |
+| dregsy | 40 | 126 | 86 |
+
+Both multi-arch tools download the same 79 unique blobs and make the
+same 247 S3 GET requests — neither deduplicates cross-image blob
+downloads within a single run.
+
+**Warm sync (no-op, prime + measured pass, same corpus):**
+
+| Tool | Wall clock | Requests | Response bytes |
+|------|-----------|----------|----------------|
+| ocync | **2.5s** | 81 | 371 KB |
+| regsync | 4s | 27 | 27 KB |
+| dregsy | 5.2s | 200 | 163 KB |
+
+ocync's persistent TransferStateCache gives the fastest wall-clock on
+warm sync. regsync uses fewer requests (manifest-digest-only comparison)
+but is slower (sequential). dregsy re-HEADs all blobs (154 HEADs).
+
+**Chunk size experiment (ocync-only, same corpus):**
+
+| Chunk size | PATCH count | Total requests | Wall clock |
+|-----------|-------------|----------------|------------|
+| 8 MB (default) | 1,419 | 3,249 | 197.5s |
+| 32 MB | 384 | 2,214 | 163.3s |
+
+32 MB chunks reduce PATCHes by 3.7× and total requests by 32%.
+
+**Blob HEAD elimination (cold sync):**
+
+247 blob HEAD requests on the target returned 404 (100%). On cold
+sync, ECR batch-check already confirms all blobs are absent. These
+HEADs add 7.6% to the total request count with zero value.
+
+### Implication
+
+1. **Upload strategy is the #1 request-count lever.** Switching to
+   monolithic upload for blobs below a threshold (e.g. 100 MB) would
+   eliminate ~1,100 PATCH requests on this corpus. Alternatively,
+   increasing chunk size to 32 MB saves ~1,035 requests with a trivial
+   constant change.
+
+2. **No cross-image blob dedup exists in any tool.** All three tools
+   re-download (from source) and re-upload (to target) shared blobs
+   when they appear in different source images mapped to different
+   target repos. A session-scoped blob cache (download once, push to
+   N targets) would save 168 source downloads (68%) on this corpus.
+
+3. **Warm sync is ocync's strongest competitive feature.** 2.5s vs
+   4–5s, and the gap widens with larger corpora (persistent cache
+   skips all blob I/O). However, regsync's 27-request approach
+   (compare manifest digests only) is more request-efficient than
+   ocync's 81-request approach.
+
+4. **dregsy's wall-clock advantage is illusory.** It syncs fewer
+   platforms → fewer bytes → faster. Not a valid efficiency comparison.
+
+### Action taken
+
+- Results recorded in this doc; no code changes in this PR.
+- `bench/CLAUDE.md` added for future session onboarding.
+
+### Optimization opportunities (ranked by request savings)
+
+| # | Optimization | Requests saved | Bytes saved | Complexity |
+|---|-------------|---------------|-------------|------------|
+| 1 | Monolithic upload for blobs < 100 MB | ~1,100 | 0 | Medium |
+| 2 | Increase chunk size to 32 MB (if keeping chunked) | ~1,035 | 0 | Trivial |
+| 3 | Skip blob HEAD when batch-check says absent (cold) | ~247 | 0 | Low |
+| 4 | Cross-image blob download dedup | ~168 | ~5.6 GB | High |
+| 5 | Optimize warm-sync manifest comparison | ~54 | ~344 KB | Low |
+
+### To re-validate
+
+```bash
+cd /home/ec2-user/ocync
+export BENCH_TARGET_REGISTRY=660548353186.dkr.ecr.us-east-1.amazonaws.com
+# Cold comparison
+cargo xtask bench --tools ocync,dregsy,regsync --iterations 1 --limit 5 cold
+# Warm comparison
+cargo xtask bench --tools ocync,dregsy,regsync --limit 5 warm
+# Chunk size experiment: change DEFAULT_CHUNK_SIZE in client.rs, rebuild, re-run cold
+```
+
+---
+
 <!--
 Entry template for future findings — copy and fill in.
 

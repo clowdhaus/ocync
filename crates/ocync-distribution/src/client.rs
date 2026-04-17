@@ -10,7 +10,7 @@ use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
-const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+const DEFAULT_CHUNK_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
 
 use crate::auth::AuthScheme;

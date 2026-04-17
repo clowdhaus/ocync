@@ -97,13 +97,34 @@ Codified in `xtask/src/bench/config_gen.rs`:
 - **dregsy** requires `auth-refresh: 12h` on ECR targets. Without it, dregsy skips the AWS SDK refresher and falls through to skopeo's fragile credential resolution.
 - **dregsy** exits 1 on any failed skopeo copy, even with 99% success. Parse per-image logs for real metrics, not exit code.
 
-### Baseline
+### Baseline (validated 2026-04-16, c6in.4xlarge, Jupyter corpus 5 images × 1 tag, cold → ECR)
 
-No valid cross-tool baseline exists yet. The prior comparison (ocync=720, dregsy=326, regsync=466 requests) is invalid — dregsy partially failed (exit 1) and all runs were proxy-bottlenecked. A fair 3-tool comparison where all tools complete successfully is required before any efficiency claims.
+**Cold sync** — all tools exit 0, no partial failures:
 
-ocync-only mount short-circuit measurement (c6in.large, Jupyter corpus, cold → ECR):
-- Before: 3,397 requests, 148 mount POSTs (all 202), 11.5 GB
-- After: 3,249 requests, 0 mount POSTs, 11.5 GB
+| Tool | Platforms | Wall clock | Requests | Response bytes |
+|------|----------|-----------|----------|----------------|
+| ocync | 2 (multi-arch) | 189.6s | 3,249 | 11.5 GB |
+| regsync v0.11.3 | 2 (multi-arch) | 172.3s | 1,302 | 11.5 GB |
+| dregsy (skopeo) | 1 (tag only) | 92.8s | 1,538 | 5.9 GB |
+
+dregsy's byte advantage is not real — it syncs 1 platform vs 2 (5 manifest PUTs vs 15). The fair comparison is ocync vs regsync: ocync uses 2.5× more requests for the same bytes, entirely due to chunked upload (1,419 PATCHes at 8 MB).
+
+**Warm sync** (prime + measured pass):
+
+| Tool | Wall clock | Requests | Response bytes |
+|------|-----------|----------|----------------|
+| ocync | 2.5s | 81 | 371 KB |
+| regsync | 4s | 27 | 27 KB |
+| dregsy | 5.2s | 200 | 163 KB |
+
+**Chunk size experiment** (ocync-only):
+
+| Chunk | PATCHes | Total requests | Wall clock |
+|-------|---------|----------------|------------|
+| 8 MB | 1,419 | 3,249 | 197.5s |
+| 32 MB | 384 | 2,214 | 163.3s |
+
+See `docs/specs/findings.md` for full analysis and optimization ranking.
 
 ### Bench-proxy
 

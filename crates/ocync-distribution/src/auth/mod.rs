@@ -25,7 +25,10 @@ use std::time::{Duration, Instant};
 use crate::error::Error;
 
 /// Minimum remaining lifetime before a token should be proactively refreshed.
-const REFRESH_THRESHOLD: Duration = Duration::from_secs(15 * 60);
+/// Must be shorter than the shortest token TTL we encounter (Docker Hub
+/// returns 300s). The prior value of 15 minutes caused every Docker Hub
+/// token to be "stale" immediately, bypassing the cache entirely.
+const REFRESH_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// OAuth2-style scope for registry token requests.
 ///
@@ -170,7 +173,7 @@ impl Token {
         self.expires_at.is_some_and(|exp| Instant::now() >= exp)
     }
 
-    /// Whether this token should be refreshed soon (less than 15 minutes remaining).
+    /// Whether this token should be refreshed soon (less than 30 seconds remaining).
     pub fn should_refresh(&self) -> bool {
         match self.expires_at {
             Some(exp) => {
@@ -294,16 +297,16 @@ mod tests {
 
     #[test]
     fn token_within_refresh_threshold() {
-        // 10 minutes remaining — less than the 15-minute threshold
-        let token = Token::with_ttl("abc123", Duration::from_secs(600));
+        // 20 seconds remaining — less than the 30-second threshold
+        let token = Token::with_ttl("abc123", Duration::from_secs(20));
         assert!(!token.is_expired());
         assert!(token.should_refresh());
     }
 
     #[test]
     fn token_beyond_refresh_threshold() {
-        // 20 minutes remaining — above the 15-minute threshold
-        let token = Token::with_ttl("abc123", Duration::from_secs(1200));
+        // 60 seconds remaining — above the 30-second threshold
+        let token = Token::with_ttl("abc123", Duration::from_secs(60));
         assert!(!token.is_expired());
         assert!(!token.should_refresh());
     }
