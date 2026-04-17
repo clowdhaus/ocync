@@ -422,8 +422,8 @@ mod tests {
             MockEcrApi::with_tokens(vec![Some(encoded.clone())]),
         );
 
-        // Inject a near-expiry token (1 min remaining < 15 min threshold).
-        auth.set_cached_token(Token::with_ttl("stale", Duration::from_secs(60)))
+        // Inject a near-expiry token (10s remaining < 30s EARLY_REFRESH_WINDOW).
+        auth.set_cached_token(Token::with_ttl("stale", Duration::from_secs(10)))
             .await;
 
         // Should trigger refresh because should_refresh() returns true.
@@ -433,12 +433,12 @@ mod tests {
 
     #[tokio::test]
     async fn auth_respects_api_provided_expiry() {
-        // First response has a short TTL (5 min < 15 min threshold).
+        // First response has a short TTL (20s < 30s EARLY_REFRESH_WINDOW).
         let short_encoded = BASE64.encode("AWS:short-lived");
         let fresh_encoded = BASE64.encode("AWS:refreshed");
         let short = EcrTokenResponse {
             encoded_token: short_encoded.clone(),
-            expires_in: Some(Duration::from_secs(5 * 60)),
+            expires_in: Some(Duration::from_secs(20)),
         };
         let fresh = EcrTokenResponse {
             encoded_token: fresh_encoded.clone(),

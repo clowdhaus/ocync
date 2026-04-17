@@ -4341,19 +4341,19 @@ async fn sync_batch_checker_empty_result_transfers_all() {
         .mount(&source_server)
         .await;
 
-    // Target: manifest HEAD 404, blob HEAD expect(1) per blob (fallback from
-    // empty batch result), blob push, manifest push.
+    // Target: manifest HEAD 404, blob HEAD expect(0) because batch-check
+    // already confirmed absent (all digests in batch_checked set skip HEAD).
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
     Mock::given(method("HEAD"))
         .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
         .respond_with(ResponseTemplate::new(404))
-        .expect(1)
+        .expect(0)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
         .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
         .respond_with(ResponseTemplate::new(404))
-        .expect(1)
+        .expect(0)
         .mount(&target_server)
         .await;
     mount_blob_push(&target_server, "repo").await;
