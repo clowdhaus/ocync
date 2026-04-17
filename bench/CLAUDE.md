@@ -48,6 +48,10 @@ export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
 
 AWS credentials come from the instance profile (IAM role) — no manual config needed.
 
+Docker Hub access token (for authenticated pulls, avoids 10 pull/hr anonymous limit):
+- SSM parameter: `/ocync/bench/dockerhub-access-token`
+- Used for read/pull only
+
 ## Running benchmarks
 
 ```bash

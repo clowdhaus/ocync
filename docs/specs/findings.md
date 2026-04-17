@@ -235,14 +235,17 @@ Three parallel research agents surveyed ECR optimization, OCI upload
 best practices across tools, and Docker Hub rate limiting. Actionable
 findings only — full reports in session artifacts.
 
-### ECR blob mounting now available (January 2026)
+### ECR blob mounting -- does not work (tested 2026-04-17)
 
-AWS launched opt-in `BLOB_MOUNTING` account setting. When enabled,
-cross-repo mount POSTs return 201 instead of 202. Our
-`ProviderKind::fulfills_cross_repo_mount` returning `false` for ECR
-is now conditionally wrong.
+AWS launched opt-in `BLOB_MOUNTING` account setting (January 2026).
+Docs claim cross-repo mount POSTs return 201 when enabled. **Tested:
+does not work.** With BLOB_MOUNTING=ENABLED, fresh repos (AES256
+default encryption), ecr:* IAM permissions, 15s propagation delay --
+all mount POSTs return 202, all HEAD on target return 404.
 
-Enable: `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`
+Zero verified reports of ECR returning 201 on mount exist online.
+Our `ProviderKind::fulfills_cross_repo_mount` returning `false` for
+ECR remains correct.
 
 Requirements: same account + region, identical encryption config,
 pusher needs `ecr:GetDownloadUrlForLayer` on source repo. Not
@@ -305,7 +308,7 @@ understanding. Each entry ships as its own PR.
 
 | # | Optimization | Impact | Complexity | Status |
 |---|-------------|--------|------------|--------|
-| 1 | **ECR blob mounting** — detect `BLOB_MOUNTING` setting, conditionally re-enable mount | Saves blob transfer for every shared layer on ECR targets | Medium | Blocked: tested 2026-04-17 with BLOB_MOUNTING=ENABLED, still returns 202/404. May need specific IAM perms or repo config. |
+| ~~1~~ | ~~ECR blob mounting~~ | ~~Saves shared layer transfers~~ | ~~Medium~~ | **Does not work.** Tested 2026-04-17: BLOB_MOUNTING=ENABLED, fresh repos, AES256, ecr:* IAM, 15s delay. All mounts return 202, all HEAD 404. Zero verified reports online of ECR returning 201 on mount. Setting exists as API surface only. |
 | 2 | **Cross-image blob download dedup** — download each unique blob from source once, push to N target repos | ~168 source GETs, ~5.6 GB on Jupyter corpus | High | Not started |
 | 3 | **Docker Hub authentication** — always authenticate pulls, add credential support for source registries | 10× more pull quota (100/hr vs 10/hr) | Low | Not started |
 | 4 | **ACR streaming PUT fallback** — `ProviderKind::Acr` with chunked PATCH for blobs > 20 MB | Correctness on ACR (currently broken for large blobs) | Low | Not started |
