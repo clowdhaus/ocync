@@ -20,3 +20,5 @@ docs/superpowers/
 
 # Benchmark ephemeral per-run directories (summary.md, proxy logs)
 bench/results/*/
+.superpowers/
+.playwright-mcp/

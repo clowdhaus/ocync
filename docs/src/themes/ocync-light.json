@@ -1,0 +1,78 @@
+{
+  "name": "ocync-light",
+  "type": "light",
+  "colors": {
+    "editor.background": "#f3f1ff",
+    "editor.foreground": "#1a0f91"
+  },
+  "tokenColors": [
+    {
+      "scope": ["comment", "punctuation.definition.comment"],
+      "settings": { "foreground": "#8880b0", "fontStyle": "italic" }
+    },
+    {
+      "scope": ["keyword", "keyword.control", "storage.type", "storage.modifier"],
+      "settings": { "foreground": "#d020d0" }
+    },
+    {
+      "scope": ["keyword.operator", "keyword.operator.assignment"],
+      "settings": { "foreground": "#4840a8" }
+    },
+    {
+      "scope": ["string", "string.quoted", "string.template"],
+      "settings": { "foreground": "#0891b2" }
+    },
+    {
+      "scope": ["entity.name.function", "support.function", "meta.function-call"],
+      "settings": { "foreground": "#c026d3" }
+    },
+    {
+      "scope": ["entity.name.type", "entity.name.class", "support.type", "support.class"],
+      "settings": { "foreground": "#7c3aed" }
+    },
+    {
+      "scope": ["constant.numeric"],
+      "settings": { "foreground": "#c026d3" }
+    },
+    {
+      "scope": ["constant.language"],
+      "settings": { "foreground": "#d020d0" }
+    },
+    {
+      "scope": ["variable", "variable.other"],
+      "settings": { "foreground": "#1a0f91" }
+    },
+    {
+      "scope": ["variable.parameter"],
+      "settings": { "foreground": "#0891b2" }
+    },
+    {
+      "scope": ["entity.name.tag"],
+      "settings": { "foreground": "#d020d0" }
+    },
+    {
+      "scope": ["entity.other.attribute-name"],
+      "settings": { "foreground": "#7c3aed" }
+    },
+    {
+      "scope": ["punctuation", "meta.brace"],
+      "settings": { "foreground": "#4840a8" }
+    },
+    {
+      "scope": ["meta.object-literal.key", "support.type.property-name"],
+      "settings": { "foreground": "#0891b2" }
+    },
+    {
+      "scope": ["markup.heading"],
+      "settings": { "foreground": "#d020d0", "fontStyle": "bold" }
+    },
+    {
+      "scope": ["markup.inline.raw"],
+      "settings": { "foreground": "#0891b2" }
+    },
+    {
+      "scope": ["source.shell", "keyword.operator.redirect"],
+      "settings": { "foreground": "#c026d3" }
+    }
+  ]
+}

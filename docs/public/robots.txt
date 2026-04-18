@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://clowdhaus.github.io/ocync/sitemap-index.xml
