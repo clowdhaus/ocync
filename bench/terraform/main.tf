@@ -128,15 +128,27 @@ data "aws_caller_identity" "current" {}
 
 resource "aws_iam_policy" "bench_ssm_params" {
   name        = "ocync-bench-ssm-params"
-  description = "Allow reading benchmark SSM parameters"
+  description = "Allow reading benchmark SSM parameters and describing instance types"
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["ssm:GetParameter", "ssm:GetParameters"]
-      Resource = "arn:aws:ssm:us-east-1:${data.aws_caller_identity.current.account_id}:parameter/ocync/bench/*"
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter", "ssm:GetParameters"]
+        Resource = "arn:aws:ssm:us-east-1:${data.aws_caller_identity.current.account_id}:parameter/ocync/bench/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstanceTypes"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ecr-public:GetAuthorizationToken", "sts:GetServiceBearerToken"]
+        Resource = "*"
+      },
+    ]
   })
 
   tags = module.tags.tags

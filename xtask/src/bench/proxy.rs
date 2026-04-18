@@ -69,6 +69,10 @@ pub(crate) struct ProxyMetrics {
     /// The rest either produced a 202 "upload session started" fallback
     /// or an explicit error status.
     pub(crate) mount_successes: u64,
+    /// Blob GET requests to source (non-target) registries.
+    pub(crate) source_blob_gets: u64,
+    /// Total response bytes from source blob GETs.
+    pub(crate) source_blob_bytes: u64,
 }
 
 /// Spawns a `bench-proxy` process and waits for it to bind its port.
@@ -142,13 +146,18 @@ fn parse_log(path: &Path) -> Result<Vec<ProxyEntry>, Box<dyn std::error::Error>>
 }
 
 /// Computes aggregated metrics from a slice of proxy log entries.
-pub(crate) fn aggregate(entries: &[ProxyEntry]) -> ProxyMetrics {
+///
+/// `target_registry` is the ECR hostname (e.g. `111...dkr.ecr.us-east-1.amazonaws.com`).
+/// Requests to this host are target operations; all others are source pulls.
+pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyMetrics {
     let mut requests_by_method: BTreeMap<String, u64> = BTreeMap::new();
     let mut status_429_count = 0u64;
     let mut total_request_bytes = 0u64;
     let mut total_response_bytes = 0u64;
     let mut mount_attempts = 0u64;
     let mut mount_successes = 0u64;
+    let mut source_blob_gets = 0u64;
+    let mut source_blob_bytes = 0u64;
 
     // Track GET requests to blob URLs for duplicate detection.
     let mut blob_get_counts: HashMap<String, u64> = HashMap::new();
@@ -165,6 +174,11 @@ pub(crate) fn aggregate(entries: &[ProxyEntry]) -> ProxyMetrics {
 
         if entry.method == "GET" && entry.url.contains("/blobs/sha256:") {
             *blob_get_counts.entry(entry.url.clone()).or_insert(0) += 1;
+            // Track source pulls (non-target registry).
+            if entry.host != target_registry {
+                source_blob_gets += 1;
+                source_blob_bytes += entry.response_bytes;
+            }
         }
 
         // OCI cross-repo blob mount: `POST /v2/.../blobs/uploads/?mount=<digest>&from=<repo>`.
@@ -197,6 +211,8 @@ pub(crate) fn aggregate(entries: &[ProxyEntry]) -> ProxyMetrics {
         duplicate_blob_gets,
         mount_attempts,
         mount_successes,
+        source_blob_gets,
+        source_blob_bytes,
     }
 }
 
@@ -248,7 +264,7 @@ mod tests {
 
     #[test]
     fn aggregate_counts_methods() {
-        let metrics = aggregate(&sample_entries());
+        let metrics = aggregate(&sample_entries(), "ecr.aws");
         assert_eq!(metrics.total_requests, 4);
         assert_eq!(metrics.requests_by_method["HEAD"], 1);
         assert_eq!(metrics.requests_by_method["GET"], 2);
@@ -257,24 +273,27 @@ mod tests {
 
     #[test]
     fn aggregate_counts_429s() {
-        assert_eq!(aggregate(&sample_entries()).status_429_count, 1);
+        assert_eq!(aggregate(&sample_entries(), "ecr.aws").status_429_count, 1);
     }
 
     #[test]
     fn aggregate_detects_duplicate_blob_gets() {
-        assert_eq!(aggregate(&sample_entries()).duplicate_blob_gets, 1);
+        assert_eq!(
+            aggregate(&sample_entries(), "ecr.aws").duplicate_blob_gets,
+            1
+        );
     }
 
     #[test]
     fn aggregate_sums_bytes() {
-        let metrics = aggregate(&sample_entries());
+        let metrics = aggregate(&sample_entries(), "ecr.aws");
         assert_eq!(metrics.total_request_bytes, 2200);
         assert_eq!(metrics.total_response_bytes, 10100);
     }
 
     #[test]
     fn aggregate_empty_entries() {
-        let metrics = aggregate(&[]);
+        let metrics = aggregate(&[], "ecr.aws");
         assert_eq!(metrics.total_requests, 0);
         assert_eq!(metrics.duplicate_blob_gets, 0);
         assert!(metrics.requests_by_method.is_empty());
@@ -347,7 +366,7 @@ mod tests {
                 duration_ms: 10,
             },
         ];
-        let metrics = aggregate(&entries);
+        let metrics = aggregate(&entries, "ecr.aws");
         assert_eq!(metrics.duplicate_blob_gets, 0);
     }
 
@@ -373,8 +392,47 @@ mod tests {
                 duration_ms: 80,
             },
         ];
-        let metrics = aggregate(&entries);
+        let metrics = aggregate(&entries, "ecr.aws");
         assert_eq!(metrics.duplicate_blob_gets, 0);
+    }
+
+    #[test]
+    fn aggregate_source_blob_gets() {
+        let entries = vec![
+            // Source blob GET (host != target).
+            ProxyEntry {
+                method: "GET".into(),
+                host: "docker.io".into(),
+                url: "/v2/library/nginx/blobs/sha256:abc".into(),
+                request_bytes: 50,
+                response_bytes: 9000,
+                status: 200,
+                duration_ms: 100,
+            },
+            // Target blob GET (host == target).
+            ProxyEntry {
+                method: "GET".into(),
+                host: "ecr.aws".into(),
+                url: "/v2/bench/nginx/blobs/sha256:abc".into(),
+                request_bytes: 50,
+                response_bytes: 9000,
+                status: 200,
+                duration_ms: 80,
+            },
+            // Source non-blob GET (not /blobs/sha256:) -- should NOT count.
+            ProxyEntry {
+                method: "GET".into(),
+                host: "docker.io".into(),
+                url: "/v2/library/nginx/manifests/latest".into(),
+                request_bytes: 50,
+                response_bytes: 1000,
+                status: 200,
+                duration_ms: 50,
+            },
+        ];
+        let metrics = aggregate(&entries, "ecr.aws");
+        assert_eq!(metrics.source_blob_gets, 1);
+        assert_eq!(metrics.source_blob_bytes, 9000);
     }
 
     #[test]

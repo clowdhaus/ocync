@@ -2,6 +2,13 @@
 
 use serde::Deserialize;
 
+/// Docker Hub credentials for authenticated pulls (avoids 10 pulls/hr anon limit).
+#[derive(Clone, Debug)]
+pub(crate) struct DockerHubAuth {
+    pub(crate) username: String,
+    pub(crate) token: String,
+}
+
 /// Top-level corpus configuration.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Corpus {
@@ -11,6 +18,9 @@ pub(crate) struct Corpus {
     /// Image entries to sync.
     #[serde(rename = "images")]
     pub(crate) images: Vec<ImageEntry>,
+    /// Docker Hub auth credentials (populated at runtime, not from YAML).
+    #[serde(skip)]
+    pub(crate) dockerhub_auth: Option<DockerHubAuth>,
 }
 
 /// Corpus-level settings (target registry, prefix).
@@ -44,6 +54,7 @@ impl Corpus {
         Corpus {
             settings: self.settings.clone(),
             images: self.images.iter().take(n).cloned().collect(),
+            dockerhub_auth: self.dockerhub_auth.clone(),
         }
     }
 
@@ -86,6 +97,7 @@ impl Corpus {
                 img.tags.clone_from(&ovr.tags);
             }
         }
+        // dockerhub_auth is carried forward via clone.
         result
     }
 }

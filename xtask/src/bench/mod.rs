@@ -5,6 +5,7 @@ pub(crate) mod corpus;
 pub(crate) mod ecr;
 pub(crate) mod proxy;
 pub(crate) mod regression;
+pub(crate) mod remote;
 pub(crate) mod report;
 pub(crate) mod runner;
 
@@ -40,8 +41,8 @@ pub(crate) struct BenchArgs {
     #[arg(long)]
     pub(crate) limit: Option<usize>,
 
-    /// Number of iterations for the cold scenario (default: 3).
-    #[arg(long, default_value = "3")]
+    /// Number of iterations for the cold scenario (default: 1).
+    #[arg(long, default_value = "1")]
     pub(crate) iterations: usize,
 
     /// Proxy listen port (default: 8080).
@@ -99,13 +100,64 @@ enum RunnableScenario {
     Scale,
 }
 
+/// Read an SSM parameter by name, returning `None` on any failure.
+fn read_ssm_parameter(name: &str) -> Option<String> {
+    std::process::Command::new("aws")
+        .args([
+            "ssm",
+            "get-parameter",
+            "--name",
+            name,
+            "--with-decryption",
+            "--query",
+            "Parameter.Value",
+            "--output",
+            "text",
+            "--region",
+            "us-east-1",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Progress file path for remote monitoring.
+const PROGRESS_FILE: &str = "/tmp/bench-progress.txt";
+
+/// Write a progress line to both stderr and the progress file.
+///
+/// The progress file is polled by `bench-remote` for real-time status.
+fn progress(msg: &str) {
+    eprintln!("{msg}");
+    // Best-effort write; don't fail the benchmark if the file can't be written.
+    let _ = std::fs::write(PROGRESS_FILE, format!("{msg}\n"));
+}
+
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Parse corpus (apply limit if set).
     let loaded = corpus::load(&args.corpus)?;
-    let corpus = match args.limit {
+    let mut corpus = match args.limit {
         Some(n) => loaded.limit(n),
         None => loaded,
+    };
+
+    // Inject Docker Hub auth from SSM if available.
+    if let Some(token) = read_ssm_parameter("/ocync/bench/dockerhub-access-token") {
+        let username = read_ssm_parameter("/ocync/bench/dockerhub-username")
+            .unwrap_or_else(|| "ocync-bench".into());
+        eprintln!("bench: Docker Hub auth configured (username={username})");
+        corpus.dockerhub_auth = Some(corpus::DockerHubAuth { username, token });
+    } else {
+        eprintln!("bench: Docker Hub auth not available, using anonymous pulls");
     };
 
     // 2. Parse tools from args.
@@ -149,8 +201,20 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
 
     // 5. Create report.
+    let instance = report::InstanceInfo::collect();
+    eprintln!(
+        "bench: instance={} cpu={} vcpus={} mem={}MiB net={} region={}",
+        instance.instance_type,
+        instance.cpu_model,
+        instance.vcpus,
+        instance.memory_mib,
+        instance.network_performance,
+        instance.region,
+    );
+
     let mut report = BenchReport {
         timestamp,
+        instance,
         corpus_size: corpus.images.len(),
         total_tags: corpus.total_tags(),
         tool_versions,
@@ -331,19 +395,26 @@ async fn run_single_tool(
 
     // 6. Stop proxy, parse log, aggregate metrics.
     let entries = proxy::stop(handle).await?;
-    let metrics = proxy::aggregate(&entries);
+    let metrics = proxy::aggregate(&entries, &corpus.settings.target_registry);
 
+    let rss_display = result
+        .peak_rss_kb
+        .map(|kb| report::format_bytes(kb * 1024))
+        .unwrap_or_else(|| "n/a".into());
     eprintln!(
-        "  {}: wall_clock={:.1}s exit={} requests={} response_bytes={} mounts={}/{}",
+        "  {}: wall_clock={:.1}s exit={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
         tool,
         result.wall_clock.as_secs_f64(),
         result
             .exit_code
             .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+        rss_display,
         metrics.total_requests,
         report::format_bytes(metrics.total_response_bytes),
         metrics.mount_successes,
         metrics.mount_attempts,
+        metrics.source_blob_gets,
+        report::format_bytes(metrics.source_blob_bytes),
     );
 
     // 7. Parse ocync JSON if applicable.
@@ -357,6 +428,7 @@ async fn run_single_tool(
         tool: tool.to_string(),
         wall_clock_secs: result.wall_clock.as_secs_f64(),
         exit_code: result.exit_code,
+        peak_rss_kb: result.peak_rss_kb,
         proxy_metrics: Some(metrics),
         ocync_json,
     })
@@ -370,17 +442,22 @@ async fn run_cold(
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
-    eprintln!(
+    progress(&format!(
         "bench: running cold scenario ({} iterations)",
         args.iterations
-    );
+    ));
     let mut runs = Vec::new();
 
     for &tool in tools {
         let mut iteration_runs = Vec::new();
 
         for i in 0..args.iterations {
-            eprintln!("  cold: {} iteration {}/{}", tool, i + 1, args.iterations);
+            progress(&format!(
+                "  cold: {} iteration {}/{}",
+                tool,
+                i + 1,
+                args.iterations
+            ));
 
             ecr::create_repos(ecr_client, corpus).await?;
 
@@ -389,6 +466,13 @@ async fn run_cold(
 
             ecr::delete_repos(ecr_client, corpus).await?;
 
+            progress(&format!(
+                "  cold: {} iteration {}/{} complete ({:.1}s)",
+                tool,
+                i + 1,
+                args.iterations,
+                run.wall_clock_secs
+            ));
             iteration_runs.push(run);
 
             if i + 1 < args.iterations {
@@ -419,22 +503,26 @@ async fn run_warm(
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
-    eprintln!("bench: running warm scenario");
+    progress("bench: running warm scenario");
     let mut runs = Vec::new();
 
     for &tool in tools {
-        eprintln!("  warm: {}", tool);
+        progress(&format!("  warm: {} (priming)", tool));
 
         ecr::create_repos(ecr_client, corpus).await?;
 
         // Prime run (unmeasured).
         let config_dir = tempfile::tempdir()?;
         let _prime = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
-        eprintln!("  warm: {} prime complete, running measured pass", tool);
+        progress(&format!("  warm: {} measuring", tool));
 
         // Measured run.
         let config_dir = tempfile::tempdir()?;
         let run = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
+        progress(&format!(
+            "  warm: {} complete ({:.1}s)",
+            tool, run.wall_clock_secs
+        ));
         runs.push(run);
 
         ecr::delete_repos(ecr_client, corpus).await?;
@@ -457,11 +545,11 @@ async fn run_partial(
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
-    eprintln!("bench: running partial scenario");
+    progress("bench: running partial scenario");
     let mut runs = Vec::new();
 
     for &tool in tools {
-        eprintln!("  partial: {}", tool);
+        progress(&format!("  partial: {} (priming)", tool));
 
         ecr::create_repos(ecr_client, base_corpus).await?;
 
@@ -469,15 +557,16 @@ async fn run_partial(
         let config_dir = tempfile::tempdir()?;
         let _prime =
             run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
-        eprintln!(
-            "  partial: {} prime complete, running with partial corpus",
-            tool
-        );
+        progress(&format!("  partial: {} measuring", tool));
 
         // Measured run with partial corpus.
         let config_dir = tempfile::tempdir()?;
         let run =
             run_single_tool(args, tool, partial_corpus, config_dir.path(), output_dir).await?;
+        progress(&format!(
+            "  partial: {} complete ({:.1}s)",
+            tool, run.wall_clock_secs
+        ));
         runs.push(run);
 
         ecr::delete_repos(ecr_client, base_corpus).await?;
@@ -499,7 +588,7 @@ async fn run_scale(
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
 ) -> Result<Vec<ScalePoint>, Box<dyn std::error::Error>> {
-    eprintln!("bench: running scale scenario");
+    progress("bench: running scale scenario");
     let total = corpus.images.len();
     let mut sizes: Vec<usize> = [10, 25, 50, total]
         .iter()
@@ -511,12 +600,12 @@ async fn run_scale(
     let mut points = Vec::new();
 
     for &size in &sizes {
-        eprintln!("  scale: {size} images");
+        progress(&format!("  scale: {size} images"));
         let subset = corpus.limit(size);
         let mut results: BTreeMap<String, f64> = BTreeMap::new();
 
         for &tool in tools {
-            eprintln!("  scale: {} @ {size} images", tool);
+            progress(&format!("  scale: {} @ {size} images", tool));
 
             ecr::create_repos(ecr_client, &subset).await?;
 

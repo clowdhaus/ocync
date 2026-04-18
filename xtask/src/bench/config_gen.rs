@@ -4,6 +4,37 @@ use std::collections::BTreeMap;
 
 use crate::bench::corpus::{Corpus, ImageEntry};
 
+/// Base64-encode a byte slice using the standard alphabet with padding.
+///
+/// Hand-rolled to avoid adding a `base64` crate dependency for a single
+/// call site (dregsy auth field).
+pub(crate) fn base64_encode(input: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 /// Extract the registry hostname from a source image reference.
 ///
 /// `cgr.dev/chainguard/static` → `cgr.dev`
@@ -63,6 +94,15 @@ pub(crate) fn ocync_config(corpus: &Corpus) -> String {
         let key = registry_key(reg);
         out.push_str(&format!("  {key}:\n"));
         out.push_str(&format!("    url: {reg}\n"));
+        // Docker Hub: inject basic auth to avoid 10 pulls/hr anonymous limit.
+        if *reg == "docker.io" {
+            if let Some(auth) = &corpus.dockerhub_auth {
+                out.push_str("    auth_type: basic\n");
+                out.push_str("    credentials:\n");
+                out.push_str(&format!("      username: {}\n", auth.username));
+                out.push_str(&format!("      password: {}\n", auth.token));
+            }
+        }
     }
     out.push_str(&format!("  {ecr_key}:\n"));
     out.push_str(&format!("    url: {}\n", corpus.settings.target_registry));
@@ -114,6 +154,13 @@ pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
         out.push_str(&format!("  - name: {task_name}\n"));
         out.push_str("    source:\n");
         out.push_str(&format!("      registry: {registry}\n"));
+        // Docker Hub: inject base64-encoded auth to avoid 10 pulls/hr anonymous limit.
+        if *registry == "docker.io" {
+            if let Some(auth) = &corpus.dockerhub_auth {
+                let encoded = base64_encode(&format!("{}:{}", auth.username, auth.token));
+                out.push_str(&format!("      auth: {encoded}\n"));
+            }
+        }
         out.push_str("    target:\n");
         out.push_str(&format!(
             "      registry: {}\n",
@@ -167,6 +214,13 @@ pub(crate) fn regsync_config(corpus: &Corpus) -> String {
         // Per-repo auth: required for registries that issue per-scope tokens and
         // reject multi-scope requests (cgr.dev, gcr.io, nvcr.io).
         out.push_str("    repoAuth: true\n");
+        // Docker Hub: inject user/pass to avoid 10 pulls/hr anonymous limit.
+        if *reg == "docker.io" {
+            if let Some(auth) = &corpus.dockerhub_auth {
+                out.push_str(&format!("    user: {}\n", auth.username));
+                out.push_str(&format!("    pass: {}\n", auth.token));
+            }
+        }
     }
     out.push_str(&format!(
         "  - registry: {}\n",
@@ -311,6 +365,145 @@ sync:
         - \"latest\"
 ";
         assert_eq!(config, expected);
+    }
+
+    fn test_corpus_with_dockerhub_auth() -> Corpus {
+        use crate::bench::corpus::DockerHubAuth;
+        let mut corpus = test_corpus();
+        corpus.dockerhub_auth = Some(DockerHubAuth {
+            username: "ocync-bench".to_string(),
+            token: "dkr_pat_abc123".to_string(),
+        });
+        corpus
+    }
+
+    #[test]
+    fn ocync_config_with_dockerhub_auth() {
+        let config = ocync_config(&test_corpus_with_dockerhub_auth());
+        let expected = "\
+registries:
+  cgr-dev:
+    url: cgr.dev
+  docker-io:
+    url: docker.io
+    auth_type: basic
+    credentials:
+      username: ocync-bench
+      password: dkr_pat_abc123
+  ecr:
+    url: 111111111111.dkr.ecr.us-east-1.amazonaws.com
+    auth_type: ecr
+
+mappings:
+  - from: chainguard/static
+    to: bench/chainguard-static
+    source: cgr-dev
+    targets: [ecr]
+    tags:
+      glob:
+        - \"latest\"
+  - from: library/alpine
+    to: bench/library-alpine
+    source: docker-io
+    targets: [ecr]
+    tags:
+      glob:
+        - \"3.20\"
+        - \"latest\"
+";
+        assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn dregsy_config_with_dockerhub_auth() {
+        let config = dregsy_config(&test_corpus_with_dockerhub_auth());
+        let expected = "\
+relay: skopeo
+
+tasks:
+  - name: sync-cgr-dev
+    source:
+      registry: cgr.dev
+    target:
+      registry: 111111111111.dkr.ecr.us-east-1.amazonaws.com
+      auth-refresh: 12h
+    mappings:
+      - from: chainguard/static
+        to: bench/chainguard-static
+        platform: all
+        tags:
+          - \"latest\"
+  - name: sync-docker-io
+    source:
+      registry: docker.io
+      auth: b2N5bmMtYmVuY2g6ZGtyX3BhdF9hYmMxMjM=
+    target:
+      registry: 111111111111.dkr.ecr.us-east-1.amazonaws.com
+      auth-refresh: 12h
+    mappings:
+      - from: library/alpine
+        to: bench/library-alpine
+        platform: all
+        tags:
+          - \"3.20\"
+          - \"latest\"
+";
+        assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn regsync_config_with_dockerhub_auth() {
+        let config = regsync_config(&test_corpus_with_dockerhub_auth());
+        let expected = "\
+version: 1
+
+creds:
+  - registry: cgr.dev
+    repoAuth: true
+  - registry: docker.io
+    repoAuth: true
+    user: ocync-bench
+    pass: dkr_pat_abc123
+  - registry: 111111111111.dkr.ecr.us-east-1.amazonaws.com
+    credHelper: docker-credential-ecr-login
+
+sync:
+  - source: \"cgr.dev/chainguard/static\"
+    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/chainguard-static\"
+    type: image
+    tags:
+      allow:
+        - \"latest\"
+  - source: \"docker.io/library/alpine\"
+    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine\"
+    type: image
+    tags:
+      allow:
+        - \"3.20\"
+        - \"latest\"
+";
+        assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn base64_encode_known_vectors() {
+        // RFC 4648 test vectors.
+        assert_eq!(base64_encode(""), "");
+        assert_eq!(base64_encode("f"), "Zg==");
+        assert_eq!(base64_encode("fo"), "Zm8=");
+        assert_eq!(base64_encode("foo"), "Zm9v");
+        assert_eq!(base64_encode("foob"), "Zm9vYg==");
+        assert_eq!(base64_encode("fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode("foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_encode_auth_string() {
+        // Verify the exact encoding used in dregsy auth field.
+        assert_eq!(
+            base64_encode("ocync-bench:dkr_pat_abc123"),
+            "b2N5bmMtYmVuY2g6ZGtyX3BhdF9hYmMxMjM="
+        );
     }
 
     #[test]

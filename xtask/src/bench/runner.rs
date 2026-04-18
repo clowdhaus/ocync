@@ -52,6 +52,8 @@ pub(crate) struct RunResult {
     pub(crate) exit_code: Option<i32>,
     /// Captured standard output.
     pub(crate) stdout: String,
+    /// Peak resident set size in KB (from `/usr/bin/time -v`), if available.
+    pub(crate) peak_rss_kb: Option<u64>,
 }
 
 /// Runs a tool with its version flag and returns the version string.
@@ -80,10 +82,17 @@ pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
     Ok(version.trim().to_string())
 }
 
-/// Builds ocync in release mode from the given workspace root.
+/// Builds ocync and bench-proxy in release mode from the given workspace root.
 pub(crate) async fn build_ocync(workspace_root: &Path) -> Result<(), String> {
     let status = tokio::process::Command::new("cargo")
-        .args(["build", "--release", "--package", "ocync"])
+        .args([
+            "build",
+            "--release",
+            "--package",
+            "ocync",
+            "--package",
+            "bench-proxy",
+        ])
         .current_dir(workspace_root)
         .status()
         .await
@@ -93,7 +102,7 @@ pub(crate) async fn build_ocync(workspace_root: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "cargo build --release --package ocync exited with status {}",
+            "cargo build --release exited with status {}",
             status
                 .code()
                 .map_or_else(|| "signal".to_string(), |c| c.to_string()),
@@ -138,17 +147,36 @@ pub(crate) async fn run_tool(
 
     let start = Instant::now();
 
-    let output = tokio::process::Command::new(binary.as_ref())
-        .args(&args)
-        .env("HTTPS_PROXY", proxy_url)
-        .output()
-        .await
-        .map_err(|e| format!("failed to spawn {}: {e}", tool.binary()))?;
+    // Wrap with /usr/bin/time -v to capture peak RSS. GNU time writes its
+    // report to stderr; the tool's own stderr is interleaved but the RSS
+    // line has a distinctive prefix we can parse.
+    let use_gnu_time = Path::new("/usr/bin/time").exists();
+    let output = if use_gnu_time {
+        let mut time_args = vec!["-v", binary.as_ref()];
+        time_args.extend(args.iter().copied());
+        tokio::process::Command::new("/usr/bin/time")
+            .args(&time_args)
+            .env("HTTPS_PROXY", proxy_url)
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn /usr/bin/time {}: {e}", tool.binary()))?
+    } else {
+        tokio::process::Command::new(binary.as_ref())
+            .args(&args)
+            .env("HTTPS_PROXY", proxy_url)
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn {}: {e}", tool.binary()))?
+    };
 
     let wall_clock = start.elapsed();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
+    // Parse peak RSS from GNU time output.
+    let peak_rss_kb = parse_gnu_time_rss(&stderr);
+
     // Log stderr when the tool exits non-zero so failures are diagnosable.
+    // GNU time exits with the wrapped command's exit code.
     if !output.status.success() && !stderr.trim().is_empty() {
         eprintln!("  {} stderr:\n{}", tool, textwrap_indent(&stderr, "    "));
     }
@@ -157,7 +185,19 @@ pub(crate) async fn run_tool(
         wall_clock,
         exit_code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        peak_rss_kb,
     })
+}
+
+/// Parse `Maximum resident set size (kbytes): NNN` from GNU time -v output.
+fn parse_gnu_time_rss(stderr: &str) -> Option<u64> {
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Maximum resident set size (kbytes):") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
 }
 
 /// Indents every line of `text` with `prefix`.
