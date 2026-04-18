@@ -24,19 +24,49 @@
 //! cache entries. Orphaned `.tmp.*` files from a previous crash are cleaned up
 //! by [`BlobStage::cleanup_tmp_files`].
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use ocync_distribution::Digest;
+use tokio::sync::Notify;
+
+/// Action returned by [`BlobStage::claim_or_check`] for source-pull dedup.
+///
+/// Prevents concurrent image tasks from pulling the same blob from source
+/// when staging is enabled. The first task claims the pull; concurrent tasks
+/// wait for the file to appear on disk.
+#[derive(Debug)]
+pub enum StagePullAction {
+    /// Blob already staged on disk. Skip source pull, read from staging.
+    Exists,
+    /// Claimed: this task should pull from source and stage the blob.
+    /// Call [`BlobStage::notify_staged`] after writing, or
+    /// [`BlobStage::notify_failed`] on failure.
+    Pull,
+    /// Another task is currently pulling this blob. Await the [`Notify`],
+    /// then call `claim_or_check` again (the pull may have failed).
+    Wait(Rc<Notify>),
+}
 
 /// Content-addressable blob staging area for multi-target sync.
 ///
 /// When enabled, blobs are pulled once from source and stored locally so all
 /// target pushes can read from the local file rather than re-pulling from
 /// source. When disabled (single-target), all methods are no-ops.
+///
+/// Cross-image source-pull dedup is coordinated via [`claim_or_check`]:
+/// the first task to request a digest claims the pull, concurrent tasks wait
+/// for the file to appear, then all read from the same staged file.
 #[derive(Debug)]
 pub struct BlobStage {
     base_dir: Option<PathBuf>,
+    /// In-progress source pulls keyed by digest. When a task claims a pull,
+    /// it inserts a `Notify`; waiters clone and `.notified().await` on it.
+    /// Removed on completion ([`notify_staged`]) or failure ([`notify_failed`]).
+    pulls: RefCell<HashMap<Digest, Rc<Notify>>>,
 }
 
 impl BlobStage {
@@ -46,6 +76,7 @@ impl BlobStage {
     pub fn new(base_dir: PathBuf) -> Self {
         Self {
             base_dir: Some(base_dir),
+            pulls: RefCell::new(HashMap::new()),
         }
     }
 
@@ -53,7 +84,10 @@ impl BlobStage {
     ///
     /// All operations on a disabled stage are no-ops; no disk I/O occurs.
     pub fn disabled() -> Self {
-        Self { base_dir: None }
+        Self {
+            base_dir: None,
+            pulls: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Returns `true` if staging is enabled.
@@ -66,6 +100,53 @@ impl BlobStage {
     /// Always returns `false` when staging is disabled.
     pub fn exists(&self, digest: &Digest) -> bool {
         self.blob_path(digest).is_some_and(|p| p.exists())
+    }
+
+    /// Check-and-claim for source-pull dedup.
+    ///
+    /// Returns [`StagePullAction::Exists`] if the blob is already on disk,
+    /// [`StagePullAction::Pull`] if this task should pull it (claiming the
+    /// digest), or [`StagePullAction::Wait`] if another task is pulling it.
+    ///
+    /// When staging is disabled, always returns `Pull` (no dedup possible).
+    ///
+    /// Callers must call [`notify_staged`] after a successful pull or
+    /// [`notify_failed`] on failure. Failing to do so will deadlock waiters.
+    pub fn claim_or_check(&self, digest: &Digest) -> StagePullAction {
+        if !self.is_enabled() {
+            return StagePullAction::Pull;
+        }
+        if self.exists(digest) {
+            return StagePullAction::Exists;
+        }
+        let mut pulls = self.pulls.borrow_mut();
+        if let Some(notify) = pulls.get(digest) {
+            StagePullAction::Wait(Rc::clone(notify))
+        } else {
+            pulls.insert(digest.clone(), Rc::new(Notify::new()));
+            StagePullAction::Pull
+        }
+    }
+
+    /// Signal that a staged pull completed successfully.
+    ///
+    /// Removes the in-progress entry and wakes any waiting tasks. Waiters
+    /// will re-enter [`claim_or_check`] and find the blob on disk via
+    /// [`exists`].
+    pub fn notify_staged(&self, digest: &Digest) {
+        if let Some(notify) = self.pulls.borrow_mut().remove(digest) {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Signal that a staged pull failed.
+    ///
+    /// Removes the in-progress entry and wakes waiters so one of them can
+    /// retry the pull from its own source.
+    pub fn notify_failed(&self, digest: &Digest) {
+        if let Some(notify) = self.pulls.borrow_mut().remove(digest) {
+            notify.notify_waiters();
+        }
     }
 
     /// Write `data` to the staging area for `digest` using an atomic
@@ -82,7 +163,10 @@ impl BlobStage {
             std::fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = dest.with_extension(format!("tmp.{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = dest.with_extension(format!("tmp.{}.{seq}", std::process::id()));
 
         {
             use std::io::Write as _;
@@ -224,7 +308,10 @@ impl BlobStage {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp_path = dest.with_extension(format!("tmp.{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = dest.with_extension(format!("tmp.{}.{seq}", std::process::id()));
         let file = std::fs::File::create(&tmp_path)?;
         Ok(StagedWriter {
             file,

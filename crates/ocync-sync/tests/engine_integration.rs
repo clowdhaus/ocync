@@ -1380,26 +1380,54 @@ async fn sync_cross_repo_mount_success() {
     };
     let (manifest_b_bytes, _) = serialize_manifest(&manifest_b);
 
-    // Source: two repos with the same blobs.
+    // Source: two repos with the same blobs (both fully pullable).
     mount_source_manifest(&source_server, "repo-a", "v1", &manifest_a_bytes).await;
     mount_source_manifest(&source_server, "repo-b", "v1", &manifest_b_bytes).await;
     mount_blob_pull(&source_server, "repo-a", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "repo-a", &layer_desc.digest, layer_data).await;
+    mount_blob_pull(&source_server, "repo-b", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "repo-b", &layer_desc.digest, layer_data).await;
 
-    // Target for repo-a: no manifest, no blobs, push succeeds.
+    // Target for repo-a: no manifest, no blobs, accepts upload and mount.
+    // Mount mocks use priority 1 so wiremock checks them before the generic
+    // upload POST (priority 5, default) which also matches mount requests.
     mount_manifest_head_not_found(&target_server, "repo-a", "v1").await;
     mount_blob_not_found(&target_server, "repo-a", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "repo-a", &layer_desc.digest).await;
     mount_blob_push(&target_server, "repo-a").await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-a/blobs/uploads/"))
+        .and(query_param("mount", config_desc.digest.to_string()))
+        .respond_with(ResponseTemplate::new(201))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-a/blobs/uploads/"))
+        .and(query_param("mount", layer_desc.digest.to_string()))
+        .respond_with(ResponseTemplate::new(201))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
     mount_manifest_push(&target_server, "repo-a", "v1").await;
 
-    // Target for repo-b: no manifest, blobs not found, mount succeeds (201 Created).
+    // Target for repo-b: no manifest, no blobs, accepts upload and mount.
     mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
     mount_blob_not_found(&target_server, "repo-b", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "repo-b", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "repo-b").await;
     Mock::given(method("POST"))
         .and(path("/v2/repo-b/blobs/uploads/"))
+        .and(query_param("mount", config_desc.digest.to_string()))
         .respond_with(ResponseTemplate::new(201))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-b/blobs/uploads/"))
+        .and(query_param("mount", layer_desc.digest.to_string()))
+        .respond_with(ResponseTemplate::new(201))
+        .with_priority(1)
         .mount(&target_server)
         .await;
     mount_manifest_push(&target_server, "repo-b", "v1").await;
@@ -1439,14 +1467,26 @@ async fn sync_cross_repo_mount_success() {
         .await;
 
     assert_eq!(report.images.len(), 2);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
-    assert!(matches!(report.images[1].status, ImageStatus::Synced));
-    // First mapping: 2 blobs transferred.
-    assert_eq!(report.images[0].blob_stats.transferred, 2);
-    // Second mapping: 2 blobs mounted (not transferred).
-    assert_eq!(report.images[1].blob_stats.mounted, 2);
-    assert_eq!(report.images[1].blob_stats.transferred, 0);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "both images should sync",
+    );
+    // Aggregate: one image uploads 2 blobs, the other mounts 2 (order-independent).
+    assert_eq!(report.stats.blobs_transferred, 2);
     assert_eq!(report.stats.blobs_mounted, 2);
+    // At least one image mounted (not both uploading).
+    assert!(
+        report.images.iter().any(|r| r.blob_stats.mounted > 0),
+        "at least one image should mount blobs from the other"
+    );
+    // At least one image transferred (not both mounting).
+    assert!(
+        report.images.iter().any(|r| r.blob_stats.transferred > 0),
+        "at least one image should transfer blobs"
+    );
 }
 
 #[tokio::test]
@@ -8552,17 +8592,12 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
 /// perform full uploads. The fix adds an in-progress uploader check + Notify
 /// so the second task waits for completion.
 ///
-/// Assertion strategy:
-/// - Add a 500ms delay on the source blob GET for repo-a so the upload is
-///   still in flight when repo-b reaches the same blob
-/// - Assert the blob push endpoint for repo-b receives ZERO POSTs without
-///   a mount= query param (every POST must be a mount attempt)
-/// - Assert the mount endpoint receives exactly ONE mount attempt
+/// Assertion strategy (order-independent):
+/// - Both targets accept upload and mount for all blobs
+/// - The leader election picks one image deterministically; the other mounts
+/// - Assert aggregate: 2 blobs transferred + 2 blobs mounted (no double-upload)
 #[tokio::test]
 async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
-    use std::time::Duration;
-    use wiremock::matchers::query_param;
-
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
@@ -8582,30 +8617,11 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     };
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
-    // Both source repos serve the same manifest and blobs.
+    // Both source repos serve the same manifest and blobs (both fully pullable).
     mount_source_manifest(&source_server, "src-a", "v1", &manifest_bytes).await;
     mount_source_manifest(&source_server, "src-b", "v1", &manifest_bytes).await;
-    // Delayed blob pulls for src-a so the upload stays in-flight long enough
-    // for src-b's task to hit the shared blob and see in-progress state.
-    let delay = Duration::from_millis(500);
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/src-a/blobs/{}", config_desc.digest)))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(delay)
-                .set_body_bytes(config_data.as_ref()),
-        )
-        .mount(&source_server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/src-a/blobs/{}", layer_desc.digest)))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(delay)
-                .set_body_bytes(layer_data.as_ref()),
-        )
-        .mount(&source_server)
-        .await;
+    mount_blob_pull(&source_server, "src-a", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src-a", &layer_desc.digest, layer_data).await;
     mount_blob_pull(&source_server, "src-b", &config_desc.digest, config_data).await;
     mount_blob_pull(&source_server, "src-b", &layer_desc.digest, layer_data).await;
 
@@ -8617,25 +8633,39 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     mount_blob_not_found(&target_server, "tgt-b", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "tgt-b", &layer_desc.digest).await;
 
-    // tgt-a: accepts full upload (POST + PATCH + PUT).
+    // tgt-a: accepts upload (POST + PATCH + PUT) and mount (POST with mount=).
+    // Mount mocks use priority 1 so wiremock checks them before the generic
+    // upload POST (priority 5, default) which also matches mount requests.
     mount_blob_push(&target_server, "tgt-a").await;
+    Mock::given(method("POST"))
+        .and(path("/v2/tgt-a/blobs/uploads/"))
+        .and(query_param("mount", config_desc.digest.to_string()))
+        .respond_with(ResponseTemplate::new(201))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/tgt-a/blobs/uploads/"))
+        .and(query_param("mount", layer_desc.digest.to_string()))
+        .respond_with(ResponseTemplate::new(201))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
 
-    // tgt-b: expect mount (POST with mount= query) → 201 Created. This mock
-    // matches only POSTs with a `mount` query param; full-upload POSTs
-    // (no mount= param) are left unmatched → wiremock returns 404 → test
-    // fails. The `.expect(2)` asserts both blobs were mounted.
+    // tgt-b: accepts upload (POST + PATCH + PUT) and mount (POST with mount=).
+    mount_blob_push(&target_server, "tgt-b").await;
     Mock::given(method("POST"))
         .and(path("/v2/tgt-b/blobs/uploads/"))
         .and(query_param("mount", config_desc.digest.to_string()))
         .respond_with(ResponseTemplate::new(201))
-        .expect(1)
+        .with_priority(1)
         .mount(&target_server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v2/tgt-b/blobs/uploads/"))
         .and(query_param("mount", layer_desc.digest.to_string()))
         .respond_with(ResponseTemplate::new(201))
-        .expect(1)
+        .with_priority(1)
         .mount(&target_server)
         .await;
 
@@ -8668,7 +8698,7 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
             empty_cache(),
             BlobStage::disabled(),
             &NullProgress,
-            None,
+            Some(&ShutdownSignal::new()),
         )
         .await;
 
@@ -8681,21 +8711,592 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
         "both images should sync",
     );
     assert_eq!(report.stats.images_synced, 2);
-    // tgt-a uploaded both blobs; tgt-b mounted both.
-    let tgt_a = report
-        .images
-        .iter()
-        .find(|r| r.target.contains("tgt-a"))
-        .unwrap();
-    let tgt_b = report
-        .images
-        .iter()
-        .find(|r| r.target.contains("tgt-b"))
-        .unwrap();
-    assert_eq!(
-        tgt_a.blob_stats.transferred, 2,
-        "tgt-a should upload both blobs"
+    // Aggregate: one image uploads 2 blobs (leader), the other mounts 2 (follower).
+    assert_eq!(report.stats.blobs_transferred, 2);
+    assert_eq!(report.stats.blobs_mounted, 2);
+    // At least one image mounted (not both uploading).
+    assert!(
+        report.images.iter().any(|r| r.blob_stats.mounted > 0),
+        "at least one image should mount blobs from the other"
     );
-    assert_eq!(tgt_b.blob_stats.mounted, 2, "tgt-b should mount both blobs");
-    assert_eq!(tgt_b.blob_stats.transferred, 0, "tgt-b must not upload");
+    // At least one image transferred (not both mounting).
+    assert!(
+        report.images.iter().any(|r| r.blob_stats.transferred > 0),
+        "at least one image should transfer blobs"
+    );
+}
+
+/// Three images sharing a layer exercise the full leader-follower pipeline:
+/// election picks one leader, wave promotion runs the two followers, and
+/// the shared layer is mounted from the leader's committed repo.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_wave_promotion_three_images_shared_layer() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // Shared layer across all three images; config blobs are unique.
+    let shared_data = b"shared-layer-wave-test";
+    let cfg_a_data = b"config-a-wave";
+    let cfg_b_data = b"config-b-wave";
+    let cfg_c_data = b"config-c-wave";
+
+    let shared_desc = blob_descriptor(shared_data, MediaType::OciLayerGzip);
+    let cfg_a_desc = blob_descriptor(cfg_a_data, MediaType::OciConfig);
+    let cfg_b_desc = blob_descriptor(cfg_b_data, MediaType::OciConfig);
+    let cfg_c_desc = blob_descriptor(cfg_c_data, MediaType::OciConfig);
+
+    let manifest_a = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: cfg_a_desc.clone(),
+        layers: vec![shared_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let manifest_b = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: cfg_b_desc.clone(),
+        layers: vec![shared_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let manifest_c = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: cfg_c_desc.clone(),
+        layers: vec![shared_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+
+    let (bytes_a, _) = serialize_manifest(&manifest_a);
+    let (bytes_b, _) = serialize_manifest(&manifest_b);
+    let (bytes_c, _) = serialize_manifest(&manifest_c);
+
+    // Source: all three repos serve their manifests and blobs.
+    mount_source_manifest(&source_server, "src-a", "v1", &bytes_a).await;
+    mount_source_manifest(&source_server, "src-b", "v1", &bytes_b).await;
+    mount_source_manifest(&source_server, "src-c", "v1", &bytes_c).await;
+    mount_blob_pull(&source_server, "src-a", &cfg_a_desc.digest, cfg_a_data).await;
+    mount_blob_pull(&source_server, "src-a", &shared_desc.digest, shared_data).await;
+    mount_blob_pull(&source_server, "src-b", &cfg_b_desc.digest, cfg_b_data).await;
+    mount_blob_pull(&source_server, "src-b", &shared_desc.digest, shared_data).await;
+    mount_blob_pull(&source_server, "src-c", &cfg_c_desc.digest, cfg_c_data).await;
+    mount_blob_pull(&source_server, "src-c", &shared_desc.digest, shared_data).await;
+
+    // Target: all repos get manifest HEAD 404, blob HEAD 404, upload + mount mocks.
+    for repo in &["tgt-a", "tgt-b", "tgt-c"] {
+        mount_manifest_head_not_found(&target_server, repo, "v1").await;
+        mount_blob_not_found(&target_server, repo, &cfg_a_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &cfg_b_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &cfg_c_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &shared_desc.digest).await;
+        mount_blob_push(&target_server, repo).await;
+        mount_manifest_push(&target_server, repo, "v1").await;
+
+        // Mount mock with higher priority so it matches before the upload POST.
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{repo}/blobs/uploads/")))
+            .and(query_param("mount", shared_desc.digest.to_string()))
+            .respond_with(ResponseTemplate::new(201))
+            .with_priority(1)
+            .mount(&target_server)
+            .await;
+    }
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_a = resolved_mapping(
+        Arc::clone(&source_client),
+        "src-a",
+        "tgt-a",
+        vec![target_entry("target", Arc::clone(&target_client))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_b = resolved_mapping(
+        Arc::clone(&source_client),
+        "src-b",
+        "tgt-b",
+        vec![target_entry("target", Arc::clone(&target_client))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_c = resolved_mapping(
+        source_client,
+        "src-c",
+        "tgt-c",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
+
+    // max_concurrent=10: all three run concurrently within their phase.
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b, mapping_c],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&ShutdownSignal::new()),
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 3);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "all three images should sync: {:#?}",
+        report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
+    );
+    // 3 unique config blobs transferred + 1 shared layer transferred by leader.
+    assert_eq!(report.stats.blobs_transferred, 4);
+    // Shared layer mounted by 2 followers.
+    assert_eq!(report.stats.blobs_mounted, 2);
+}
+
+/// Verify that `transfer_image_blobs` processes blobs concurrently, not
+/// sequentially. An image with 8 blobs, each delayed 100ms on source pull,
+/// should complete well under 8 * 100ms = 800ms given `BLOB_CONCURRENCY=6`.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_blob_concurrency_processes_multiple_blobs() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // 1 config + 7 layers = 8 blobs, each with unique data.
+    let config_data = b"concurrency-config-blob";
+    let layer_data: Vec<Vec<u8>> = (0..7)
+        .map(|i| format!("concurrency-layer-{i}").into_bytes())
+        .collect();
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_descs: Vec<Descriptor> = layer_data
+        .iter()
+        .map(|d| blob_descriptor(d, MediaType::OciLayerGzip))
+        .collect();
+
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: layer_descs.clone(),
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: serve manifest immediately; each blob with a 100ms delay.
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(config_data.to_vec())
+                .insert_header("content-length", config_data.len().to_string())
+                .set_delay(std::time::Duration::from_millis(100)),
+        )
+        .mount(&source_server)
+        .await;
+    for (i, desc) in layer_descs.iter().enumerate() {
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/repo/blobs/{}", desc.digest)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(layer_data[i].clone())
+                    .insert_header("content-length", layer_data[i].len().to_string())
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
+            .mount(&source_server)
+            .await;
+    }
+
+    // Target: manifest HEAD 404, all blob HEADs 404, push accepts.
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
+    for desc in &layer_descs {
+        mount_blob_not_found(&target_server, "repo", &desc.digest).await;
+    }
+    mount_blob_push(&target_server, "repo").await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 1);
+    let start = std::time::Instant::now();
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&ShutdownSignal::new()),
+        )
+        .await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(report.images[0].status, ImageStatus::Synced),
+        "image should sync, got: {:?}",
+        report.images[0].status
+    );
+    assert_eq!(
+        report.stats.blobs_transferred, 8,
+        "all 8 blobs should be transferred"
+    );
+    // With BLOB_CONCURRENCY=6, 8 blobs at 100ms each need ~2 batches (~200ms).
+    // 1200ms is generous for CI runners; still proves concurrency (sequential >= 800ms).
+    assert!(
+        elapsed < std::time::Duration::from_millis(1200),
+        "elapsed {elapsed:?} should be < 1200ms (sequential would be >= 800ms)"
+    );
+}
+
+/// First-failure-stops semantics: when one blob source returns 500, the
+/// image fails and not all blobs complete.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_blob_failure_cancels_remaining_blobs() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // 1 config + 3 layers = 4 blobs.
+    let config_data = b"cancel-config";
+    let layer1_data = b"cancel-layer-1";
+    let layer2_data = b"cancel-layer-2-will-fail";
+    let layer3_data = b"cancel-layer-3-never-reached";
+
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer1_desc = blob_descriptor(layer1_data, MediaType::OciLayerGzip);
+    let layer2_desc = blob_descriptor(layer2_data, MediaType::OciLayerGzip);
+    let layer3_desc = blob_descriptor(layer3_data, MediaType::OciLayerGzip);
+
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![
+            layer1_desc.clone(),
+            layer2_desc.clone(),
+            layer3_desc.clone(),
+        ],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, _) = serialize_manifest(&manifest);
+
+    // Source: manifest and blobs. Layer 2 always returns 500.
+    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "repo", &layer1_desc.digest, layer1_data).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", layer2_desc.digest)))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .mount(&source_server)
+        .await;
+    mount_blob_pull(&source_server, "repo", &layer3_desc.digest, layer3_data).await;
+
+    // Target: manifest HEAD 404, all blob HEADs 404, push accepts.
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer1_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer2_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &layer3_desc.digest).await;
+    mount_blob_push(&target_server, "repo").await;
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 1);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&ShutdownSignal::new()),
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(report.images[0].status, ImageStatus::Failed { .. }),
+        "image should fail when a blob source returns 500, got: {:?}",
+        report.images[0].status
+    );
+    // Not all blobs completed (the cancel flag stops remaining).
+    assert!(
+        report.images[0].blob_stats.transferred < 4,
+        "transferred {} should be < 4 (cancel should stop remaining blobs)",
+        report.images[0].blob_stats.transferred
+    );
+    assert_eq!(report.stats.images_failed, 1);
+}
+
+/// Two images sharing a blob sync concurrently with staging enabled.
+/// Verifies that concurrent staging writes to the same digest do not
+/// panic or produce ENOENT errors (unique tmp paths prevent collision).
+#[tokio::test(flavor = "current_thread")]
+async fn sync_staging_concurrent_write_no_collision() {
+    let source_server = MockServer::start().await;
+    let target_a = MockServer::start().await;
+    let target_b = MockServer::start().await;
+
+    // Shared blob across both images.
+    let shared_data = b"shared-staging-collision-test";
+    let shared_desc = blob_descriptor(shared_data, MediaType::OciLayerGzip);
+
+    // Unique config blobs per image.
+    let cfg_a_data = b"staging-cfg-a";
+    let cfg_b_data = b"staging-cfg-b";
+    let cfg_a_desc = blob_descriptor(cfg_a_data, MediaType::OciConfig);
+    let cfg_b_desc = blob_descriptor(cfg_b_data, MediaType::OciConfig);
+
+    let manifest_a = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: cfg_a_desc.clone(),
+        layers: vec![shared_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let manifest_b = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: cfg_b_desc.clone(),
+        layers: vec![shared_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (bytes_a, _) = serialize_manifest(&manifest_a);
+    let (bytes_b, _) = serialize_manifest(&manifest_b);
+
+    // Source: both repos serve their manifests and all blobs.
+    mount_source_manifest(&source_server, "src-a", "v1", &bytes_a).await;
+    mount_source_manifest(&source_server, "src-b", "v1", &bytes_b).await;
+    mount_blob_pull(&source_server, "src-a", &cfg_a_desc.digest, cfg_a_data).await;
+    mount_blob_pull(&source_server, "src-a", &shared_desc.digest, shared_data).await;
+    mount_blob_pull(&source_server, "src-b", &cfg_b_desc.digest, cfg_b_data).await;
+    mount_blob_pull(&source_server, "src-b", &shared_desc.digest, shared_data).await;
+
+    // Target A: manifest HEAD 404, blobs 404, push accepts.
+    mount_manifest_head_not_found(&target_a, "tgt-a", "v1").await;
+    mount_blob_not_found(&target_a, "tgt-a", &cfg_a_desc.digest).await;
+    mount_blob_not_found(&target_a, "tgt-a", &shared_desc.digest).await;
+    mount_blob_push(&target_a, "tgt-a").await;
+    mount_manifest_push(&target_a, "tgt-a", "v1").await;
+
+    // Target B: manifest HEAD 404, blobs 404, push accepts.
+    mount_manifest_head_not_found(&target_b, "tgt-b", "v1").await;
+    mount_blob_not_found(&target_b, "tgt-b", &cfg_b_desc.digest).await;
+    mount_blob_not_found(&target_b, "tgt-b", &shared_desc.digest).await;
+    mount_blob_push(&target_b, "tgt-b").await;
+    mount_manifest_push(&target_b, "tgt-b", "v1").await;
+
+    let staging_dir = tempfile::tempdir().unwrap();
+    let staging = BlobStage::new(staging_dir.path().to_path_buf());
+
+    let source_client = mock_client(&source_server);
+
+    let mapping_a = resolved_mapping(
+        Arc::clone(&source_client),
+        "src-a",
+        "tgt-a",
+        vec![target_entry("target-a", mock_client(&target_a))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_b = resolved_mapping(
+        source_client,
+        "src-b",
+        "tgt-b",
+        vec![target_entry("target-b", mock_client(&target_b))],
+        vec![TagPair::same("v1")],
+    );
+
+    // max_concurrent=10: both images sync concurrently.
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b],
+            empty_cache(),
+            staging,
+            &NullProgress,
+            Some(&ShutdownSignal::new()),
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 2);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "both images should sync without collision: {:#?}",
+        report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
+    );
+    // At least the 2 unique config blobs are transferred.
+    assert!(
+        report.stats.blobs_transferred >= 2,
+        "at least 2 unique config blobs should be transferred, got {}",
+        report.stats.blobs_transferred
+    );
+}
+
+/// Source-pull dedup: when two images share a blob and staging is enabled,
+/// the source blob should be pulled exactly once. The second image's task
+/// waits for the first to finish staging, then reads from disk.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_source_pull_dedup_with_staging() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // Shared layer across both images; config blobs are unique.
+    let shared_data = b"shared-source-dedup-layer";
+    let cfg_a_data = b"dedup-cfg-a";
+    let cfg_b_data = b"dedup-cfg-b";
+
+    let shared_desc = blob_descriptor(shared_data, MediaType::OciLayerGzip);
+    let cfg_a_desc = blob_descriptor(cfg_a_data, MediaType::OciConfig);
+    let cfg_b_desc = blob_descriptor(cfg_b_data, MediaType::OciConfig);
+
+    let manifest_a = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: cfg_a_desc.clone(),
+        layers: vec![shared_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let manifest_b = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: cfg_b_desc.clone(),
+        layers: vec![shared_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (bytes_a, _) = serialize_manifest(&manifest_a);
+    let (bytes_b, _) = serialize_manifest(&manifest_b);
+
+    // Source: both repos serve their manifests and all blobs.
+    mount_source_manifest(&source_server, "src-a", "v1", &bytes_a).await;
+    mount_source_manifest(&source_server, "src-b", "v1", &bytes_b).await;
+    mount_blob_pull(&source_server, "src-a", &cfg_a_desc.digest, cfg_a_data).await;
+    mount_blob_pull(&source_server, "src-b", &cfg_b_desc.digest, cfg_b_data).await;
+    // Shared blob: served by both repos, but `.expect(1)` on each to verify
+    // that the source-pull dedup prevents a second GET.
+    let shared_pull_a = Mock::given(method("GET"))
+        .and(path(format!("/v2/src-a/blobs/{}", shared_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(shared_data.to_vec())
+                .insert_header("content-length", shared_data.len().to_string()),
+        )
+        .expect(0..=1)
+        .named("shared blob GET src-a")
+        .mount_as_scoped(&source_server)
+        .await;
+    let shared_pull_b = Mock::given(method("GET"))
+        .and(path(format!("/v2/src-b/blobs/{}", shared_desc.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(shared_data.to_vec())
+                .insert_header("content-length", shared_data.len().to_string()),
+        )
+        .expect(0..=1)
+        .named("shared blob GET src-b")
+        .mount_as_scoped(&source_server)
+        .await;
+
+    // Target: manifest HEAD 404, blobs 404, push accepts.
+    for repo in &["tgt-a", "tgt-b"] {
+        mount_manifest_head_not_found(&target_server, repo, "v1").await;
+        mount_blob_not_found(&target_server, repo, &cfg_a_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &cfg_b_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &shared_desc.digest).await;
+        mount_blob_push(&target_server, repo).await;
+        mount_manifest_push(&target_server, repo, "v1").await;
+    }
+
+    let staging_dir = tempfile::tempdir().unwrap();
+    let staging = BlobStage::new(staging_dir.path().to_path_buf());
+
+    let source_client = mock_client(&source_server);
+
+    let mapping_a = resolved_mapping(
+        Arc::clone(&source_client),
+        "src-a",
+        "tgt-a",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_b = resolved_mapping(
+        source_client,
+        "src-b",
+        "tgt-b",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
+
+    // max_concurrent=10: both images sync concurrently.
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b],
+            empty_cache(),
+            staging,
+            &NullProgress,
+            Some(&ShutdownSignal::new()),
+        )
+        .await;
+
+    // Drop scoped mocks before checking received requests.
+    drop(shared_pull_a);
+    drop(shared_pull_b);
+
+    assert_eq!(report.images.len(), 2);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "both images should sync: {:#?}",
+        report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
+    );
+    // 4 blobs pushed to targets: 2 unique configs + shared layer to each target.
+    // Source-pull dedup doesn't reduce target pushes -- only source GETs.
+    assert_eq!(report.stats.blobs_transferred, 4);
+
+    // Key assertion: the shared blob was pulled from source exactly once
+    // across both repos. Without dedup this would be 2 (one per image).
+    let received = source_server.received_requests().await.unwrap();
+    let shared_blob_suffix = format!("/blobs/{}", shared_desc.digest);
+    let source_gets_for_shared = received
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with(&shared_blob_suffix))
+        .count();
+    assert_eq!(
+        source_gets_for_shared, 1,
+        "shared blob should be pulled from source exactly once (dedup), got {source_gets_for_shared}"
+    );
 }

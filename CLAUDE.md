@@ -32,6 +32,7 @@ Every PR ships the smallest correct change + one test that catches regression. D
 - **Auth**: ECR private uses Basic auth (not Bearer token exchange); parse `WWW-Authenticate` dynamically, never hardcode
 - **Registry detection**: use `detect_provider_kind()` + `ProviderKind` enum; never match raw hostnames
 - **Process control**: return `ExitCode` via `Termination`; never `process::exit()`
+- **Concurrency model**: single-threaded tokio (`current_thread`). All shared state uses `Rc<RefCell<>>`, never `Arc<Mutex<>>`. `RefCell` borrows must be dropped before any `.await` point. Intra-image blob concurrency uses `FuturesUnordered` + local `Semaphore(6)`.
 
 ## Testing
 
@@ -41,6 +42,9 @@ Every PR ships the smallest correct change + one test that catches regression. D
 - Engine integration tests pass `Some(&shutdown)` (the production path) unless explicitly testing termination.
 - Mock trait impls must honor the real contract — filter inputs, assert context params (repo, registry) match expected values.
 - Concurrency tests run at `max_concurrent > 1`. Serializing a flaky concurrent test hides a race.
+- Mount-related integration tests must use symmetric mocks (both repos accept upload AND mount) since leader-follower election can pick either image as leader. Assert on aggregate stats, not per-image ordering.
+- `tokio::sync::Notify::notify_waiters()` does not store permits. Every code path that transitions a blob out of `InProgress` must call `notify_blob` or concurrent waiters deadlock. Same applies to `BlobStage::notify_staged`/`notify_failed` for source-pull dedup.
+- The greedy set-cover election in `elect_leaders` provably covers every shared blob. There is no "uncovered follower" path -- all followers' shared blobs are in the leader blob union. Do not add wave partitioning among followers; it is dead code.
 
 ## Git workflow
 
@@ -97,6 +101,7 @@ Codified in `xtask/src/bench/config_gen.rs`:
 - **dregsy** requires `auth-refresh: 12h` on ECR targets. Without it, dregsy skips the AWS SDK refresher and falls through to skopeo's fragile credential resolution.
 - **dregsy** requires `platform: all` per mapping for multi-arch copy. Without it, skopeo copies only the native platform — the comparison is not apples-to-apples.
 - **dregsy** exits 1 on any failed skopeo copy, even with 99% success. Parse per-image logs for real metrics, not exit code.
+- **Docker Hub auth** is read from two SSM parameters: `/ocync/bench/dockerhub-access-token` (PAT) and `/ocync/bench/dockerhub-username` (account name). Both are injected into all three tool configs. Docker Hub PATs require the account username that created the token; a wrong username causes 401.
 
 ### Baseline and optimization backlog
 
@@ -112,9 +117,13 @@ Prior dregsy results were invalid (1 platform instead of 2). Re-run with `platfo
 - **Leaf cert cache is sync.** `rustls::server::ResolvesServerCert::resolve` is called synchronously. Use `std::sync::RwLock`, not `tokio::sync::RwLock`.
 - **Proxy logs live in the output dir**, not the tempdir, so post-run analysis survives.
 - **Mount metrics** surface in `ProxyMetrics` as `mounts=<succ>/<attempt>` per tool for quick "is this code path cold" feedback.
+- **Source-pull metrics** `source_blob_gets` and `source_blob_bytes` in `ProxyMetrics` track blob GETs to non-target (source) registries. `aggregate()` takes `target_registry` to split by direction.
+- **Instance metadata** collected via IMDS (instance type, region) + `aws ec2 describe-instance-types` CLI (authoritative CPU/memory/network). Do NOT use `/proc/cpuinfo` (ARM lacks `model name`) or sysfs network speed (reports NIC link rate, not instance bandwidth). Do NOT add `aws-sdk-ec2` as a dependency (monolithic, 38G build artifacts).
+- **Historical archive** -- full `BenchReport` (Serialize) written to `bench-results/runs/{timestamp}.json` for cross-run comparison. Markdown `summary.md` has per-scenario metric tables with winners bolded.
 
 ### Known registry-specific behavior
 
-- **ECR never fulfills OCI cross-repo mount** (confirmed 2026-04-16, 193/193 POSTs returned 202). Short-circuit via `ProviderKind::fulfills_cross_repo_mount` saves 148 requests per 5-image cold sync, zero bytes — rate-limit optimization only. Applies to ECR private (measured) and ECR Public (inferred). See `docs/specs/findings.md` for evidence + re-validate procedure.
+- **ECR fulfills cross-repo mount when BLOB_MOUNTING=ENABLED** and source blob has a committed manifest. The mount short-circuit (`fulfills_cross_repo_mount`) was removed; all providers now attempt mount. Leader-follower election + wave promotion ensures mount sources have committed manifests.
+- **regsync cannot cross-repo mount in sync scenarios**: regclient only attempts `from=` when source and target share the same registry hostname (architectural limitation, not a config error).
 - **GHCR multi-PATCH chunked upload is broken** (each PATCH overwrites previous chunks). Client falls back to single-PATCH + PUT.
 - **GAR does not support chunked uploads.** Client buffers and uses monolithic upload.
