@@ -2,7 +2,7 @@
 version = 2
 ignore = [
   # number_prefix is unmaintained but is a transitive dep of indicatif
-  # (used only for byte-count formatting in progress bars, which we don't use —
+  # (used only for byte-count formatting in progress bars, which we don't use --
   # our bars are spinners). No security impact, just an unmaintained notice.
   "RUSTSEC-2025-0119",
 ]
@@ -29,6 +29,10 @@ private = { ignore = true }
 
 [bans]
 multiple-versions = "warn"
+deny = [
+  { crate = "native-tls", wrappers = [] },
+  { crate = "ring", wrappers = [] },
+]
 
 [sources]
 unknown-registry = "deny"
