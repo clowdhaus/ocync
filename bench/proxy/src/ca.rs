@@ -69,10 +69,10 @@ impl CaSigner {
     /// (ECDSA keygen + one CA sign) takes ~1 ms; cache hits take only
     /// a read-lock so contention is negligible in practice.
     pub(crate) fn leaf_for(&self, sni_host: &str) -> Result<Arc<CertifiedKey>, Error> {
-        if let Ok(guard) = self.leaf_cache.read()
-            && let Some(cached) = guard.get(sni_host)
-        {
-            return Ok(cached.clone());
+        if let Ok(guard) = self.leaf_cache.read() {
+            if let Some(cached) = guard.get(sni_host) {
+                return Ok(cached.clone());
+            }
         }
 
         let mut guard = self

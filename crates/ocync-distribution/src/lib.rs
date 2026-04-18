@@ -34,9 +34,6 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-/// Create a [`reqwest::Client`] for use in tests.
-///
-/// Ensures the crypto provider is installed before constructing the client.
 /// Create a [`reqwest::Client`] with the crypto provider installed.
 ///
 /// Convenience for tests that need an HTTP client without going through

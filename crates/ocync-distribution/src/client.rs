@@ -167,10 +167,10 @@ impl RegistryClient {
 
         let resp = self
             .send_with_aimd(op, &scopes, "GET", |mut headers| {
-                if let Some(accept) = accept
-                    && let Ok(val) = HeaderValue::from_str(accept)
-                {
-                    headers.insert(ACCEPT, val);
+                if let Some(accept) = accept {
+                    if let Ok(val) = HeaderValue::from_str(accept) {
+                        headers.insert(ACCEPT, val);
+                    }
                 }
                 self.http.get(url.clone()).headers(headers)
             })
@@ -196,10 +196,10 @@ impl RegistryClient {
 
         let resp = self
             .send_with_aimd(op, &scopes, "HEAD", |mut headers| {
-                if let Some(accept) = accept
-                    && let Ok(val) = HeaderValue::from_str(accept)
-                {
-                    headers.insert(ACCEPT, val);
+                if let Some(accept) = accept {
+                    if let Ok(val) = HeaderValue::from_str(accept) {
+                        headers.insert(ACCEPT, val);
+                    }
                 }
                 self.http.head(url.clone()).headers(headers)
             })

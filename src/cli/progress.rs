@@ -225,10 +225,10 @@ impl ProgressReporter for TextProgress {
     }
 
     fn image_completed(&self, result: &ImageResult) {
-        if let Some(line) = format_image_line(result, self.verbosity)
-            && let Err(e) = writeln!(self.stderr.borrow_mut(), "{line}")
-        {
-            tracing::warn!(error = %e, "failed to write progress to stderr");
+        if let Some(line) = format_image_line(result, self.verbosity) {
+            if let Err(e) = writeln!(self.stderr.borrow_mut(), "{line}") {
+                tracing::warn!(error = %e, "failed to write progress to stderr");
+            }
         }
     }
 

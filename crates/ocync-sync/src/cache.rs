@@ -296,18 +296,7 @@ impl TransferStateCache {
 
         std::fs::rename(&tmp_path, path)?;
 
-        // Best-effort directory fsync - the rename succeeded, so the data is
-        // reachable; only crash-before-journal-flush can lose it.
-        if let Some(parent) = path.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
-            && let Err(e) = dir.sync_all()
-        {
-            warn!(
-                path = %parent.display(),
-                error = %e,
-                "directory fsync failed after cache rename"
-            );
-        }
+        crate::staging::best_effort_dir_fsync(path);
 
         Ok(())
     }

@@ -76,9 +76,7 @@ impl AuthProvider for AnonymousAuth {
             // Hold the mutex for the entire check-then-fetch to prevent thundering herd.
             let mut cache = self.cache.lock().await;
 
-            if let Some(token) = cache.get(&key)
-                && !token.should_refresh()
-            {
+            if let Some(token) = cache.get(&key).filter(|t| t.is_valid()) {
                 return Ok(token.clone());
             }
 

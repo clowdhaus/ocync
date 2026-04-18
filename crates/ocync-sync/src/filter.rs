@@ -95,13 +95,13 @@ impl FilterConfig {
         }
 
         // 6. Min tags validation
-        if let Some(min) = self.min_tags
-            && current.len() < min
-        {
-            return Err(Error::BelowMinTags {
-                matched: current.len(),
-                minimum: min,
-            });
+        if let Some(min) = self.min_tags {
+            if current.len() < min {
+                return Err(Error::BelowMinTags {
+                    matched: current.len(),
+                    minimum: min,
+                });
+            }
         }
 
         Ok(current.into_iter().map(String::from).collect())

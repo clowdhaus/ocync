@@ -39,10 +39,9 @@ pub(crate) fn parse_next_link(link_header: &str) -> Option<String> {
             continue;
         }
         // Extract URL from angle brackets.
-        if let Some(start) = part.find('<')
-            && let Some(end) = part.find('>')
-            && start < end
-        {
+        let start = part.find('<')?;
+        let end = part.find('>')?;
+        if start < end {
             return Some(part[start + 1..end].to_owned());
         }
     }

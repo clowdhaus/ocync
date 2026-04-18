@@ -1,6 +1,6 @@
 //! Health and readiness endpoints for watch mode.
 //!
-//! Exposes `/healthz` (liveness - always 200) and `/readyz` (readiness --
+//! Exposes `/healthz` (liveness - always 200) and `/readyz` (readiness -
 //! 200 if last sync within `2 * interval`, 503 otherwise) for Kubernetes
 //! probes.
 

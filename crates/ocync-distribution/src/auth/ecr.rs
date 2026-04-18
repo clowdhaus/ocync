@@ -214,9 +214,7 @@ impl EcrAuth {
         // Fast path: read-lock cache check allows concurrent readers.
         {
             let cached = self.cached_token.read().await;
-            if let Some(ref token) = *cached
-                && !token.should_refresh()
-            {
+            if let Some(token) = cached.as_ref().filter(|t| t.is_valid()) {
                 return Ok(token.clone());
             }
         }
@@ -226,9 +224,7 @@ impl EcrAuth {
 
         // Double-check after acquiring write lock -- another task may have
         // already refreshed the token while we waited.
-        if let Some(ref token) = *cached
-            && !token.should_refresh()
-        {
+        if let Some(token) = cached.as_ref().filter(|t| t.is_valid()) {
             return Ok(token.clone());
         }
 
