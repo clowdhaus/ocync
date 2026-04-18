@@ -183,7 +183,7 @@ async fn get_double_401_returns_unauthorized() {
 async fn get_401_retry_only_happens_once() {
     let server = MockServer::start().await;
 
-    // Always returns 401 — client should try exactly twice (initial + 1 retry)
+    // Always returns 401 -- client should try exactly twice (initial + 1 retry)
     Mock::given(method("GET"))
         .and(path("/v2/repo/manifests/latest"))
         .respond_with(ResponseTemplate::new(401))

@@ -119,7 +119,7 @@ pub(crate) fn bare_hostname(s: &str) -> &str {
 /// fails. Every other container tool (docker, skopeo, crane, regclient)
 /// performs this same rewrite.
 ///
-/// Only the HTTP endpoint is rewritten — auth scope, token service, and the
+/// Only the HTTP endpoint is rewritten - auth scope, token service, and the
 /// canonical registry identifier used by [`bare_hostname`] stay as
 /// `docker.io`, which is what Docker Hub's token server expects.
 pub(crate) fn endpoint_host(hostname: &str) -> &str {
@@ -194,7 +194,7 @@ pub(crate) async fn build_registry_client(
         }
         Some(AuthType::Ghcr | AuthType::Gcr | AuthType::Acr) => {
             // These registries will eventually have native providers (OAuth2, GITHUB_TOKEN).
-            // For now, resolve credentials from docker config — covers PATs and helper-stored creds.
+            // For now, resolve credentials from docker config - covers PATs and helper-stored creds.
             tracing::debug!(
                 registry = bare_host,
                 auth_type = ?auth_type,
@@ -232,7 +232,7 @@ pub(crate) async fn build_registry_client(
                 })?;
                 RegistryClient::builder(url).auth(auth)
             } else {
-                // Try docker config — falls back to anonymous exchange if no creds found.
+                // Try docker config - falls back to anonymous exchange if no creds found.
                 match DockerConfig::load_default() {
                     Ok(config) => {
                         let auth = DockerConfigAuth::new(endpoint, &config, http).map_err(|e| {
@@ -243,7 +243,7 @@ pub(crate) async fn build_registry_client(
                         RegistryClient::builder(url).auth(auth)
                     }
                     Err(_) => {
-                        // No docker config file — use anonymous.
+                        // No docker config file - use anonymous.
                         tracing::debug!(
                             registry = bare_host,
                             "no docker config found, using anonymous auth"
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn endpoint_host_does_not_rewrite_non_canonical_docker_variants() {
-        // `docker.io:5000` is a different server entirely — only the exact
+        // `docker.io:5000` is a different server entirely - only the exact
         // canonical hostname is rewritten.
         assert_eq!(endpoint_host("docker.io:5000"), "docker.io:5000");
         assert_eq!(endpoint_host("sub.docker.io"), "sub.docker.io");

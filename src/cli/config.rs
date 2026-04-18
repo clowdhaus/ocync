@@ -293,7 +293,7 @@ pub(crate) struct MappingConfig {
 }
 
 // ---------------------------------------------------------------------------
-// TargetsValue — single group name or inline list
+// TargetsValue - single group name or inline list
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -363,14 +363,14 @@ fn is_blocked(var_name: &str) -> bool {
 
 /// Expand `${VAR}`, `${VAR:-default}`, and `${VAR:?error}` expressions.
 ///
-/// Only the `${...}` form is supported — bare `$VAR` without braces is
+/// Only the `${...}` form is supported - bare `$VAR` without braces is
 /// treated as literal text. This avoids ambiguity with shell-like strings.
 ///
 /// When `allow_secrets` is false, variables matching [`BLOCKED_PATTERNS`]
 /// (SECRET, TOKEN, etc.) are rejected to prevent accidental secret leakage
 /// into display output. This is used by `expand_config_for_display` when
 /// `--show-secrets` is not set. Config loading always passes `true` because
-/// it operates on raw YAML text without field-level context — blocking
+/// it operates on raw YAML text without field-level context - blocking
 /// secret-patterned vars during loading would reject legitimate auth config.
 pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String, ConfigError> {
     let mut result = String::with_capacity(input.len());
@@ -448,31 +448,31 @@ fn validate_global(global: &GlobalConfig) -> Result<(), ConfigError> {
             "global.max_concurrent_transfers must be >= 1".to_string(),
         ));
     }
-    if let Some(ref ttl) = global.cache_ttl {
-        if !is_valid_duration(ttl) {
-            return Err(ConfigError::Validation(format!(
-                "global.cache_ttl '{ttl}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")"
-            )));
-        }
+    if let Some(ref ttl) = global.cache_ttl
+        && !is_valid_duration(ttl)
+    {
+        return Err(ConfigError::Validation(format!(
+            "global.cache_ttl '{ttl}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")"
+        )));
     }
-    if let Some(ref size) = global.staging_size_limit {
-        if !is_valid_size(size) {
-            return Err(ConfigError::Validation(format!(
-                "global.staging_size_limit '{size}' is not a valid size (e.g. \"2GB\", \"500MB\", \"0\")"
-            )));
-        }
+    if let Some(ref size) = global.staging_size_limit
+        && !is_valid_size(size)
+    {
+        return Err(ConfigError::Validation(format!(
+            "global.staging_size_limit '{size}' is not a valid size (e.g. \"2GB\", \"500MB\", \"0\")"
+        )));
     }
     Ok(())
 }
 
 /// Validate per-registry settings.
 fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), ConfigError> {
-    if let Some(max) = registry.max_concurrent {
-        if max < 1 {
-            return Err(ConfigError::Validation(format!(
-                "registries.{name}.max_concurrent must be >= 1"
-            )));
-        }
+    if let Some(max) = registry.max_concurrent
+        && max < 1
+    {
+        return Err(ConfigError::Validation(format!(
+            "registries.{name}.max_concurrent must be >= 1"
+        )));
     }
 
     if let Some(ref auth_type) = registry.auth_type {
@@ -513,7 +513,7 @@ fn is_valid_duration(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    // Bare integer (including "0") — treated as seconds.
+    // Bare integer (including "0") - treated as seconds.
     if s.chars().all(|c| c.is_ascii_digit()) {
         return true;
     }
@@ -624,13 +624,13 @@ fn validate_references(config: &Config) -> Result<(), ConfigError> {
         config.registries.keys().map(String::as_str).collect();
 
     for mapping in &config.mappings {
-        if let Some(ref src) = mapping.source {
-            if !known.contains(src.as_str()) {
-                return Err(ConfigError::Validation(format!(
-                    "mapping '{}' references unknown registry '{src}'",
-                    mapping.from,
-                )));
-            }
+        if let Some(ref src) = mapping.source
+            && !known.contains(src.as_str())
+        {
+            return Err(ConfigError::Validation(format!(
+                "mapping '{}' references unknown registry '{src}'",
+                mapping.from,
+            )));
         }
         if let Some(ref targets) = mapping.targets {
             let context = format!("mapping '{}'", mapping.from);
@@ -647,12 +647,12 @@ fn validate_references(config: &Config) -> Result<(), ConfigError> {
     }
 
     if let Some(ref defaults) = config.defaults {
-        if let Some(ref src) = defaults.source {
-            if !known.contains(src.as_str()) {
-                return Err(ConfigError::Validation(format!(
-                    "defaults references unknown registry '{src}'",
-                )));
-            }
+        if let Some(ref src) = defaults.source
+            && !known.contains(src.as_str())
+        {
+            return Err(ConfigError::Validation(format!(
+                "defaults references unknown registry '{src}'",
+            )));
         }
         if let Some(ref targets) = defaults.targets {
             let names = resolve_target_names(targets, config, &known, "defaults")?;
@@ -677,7 +677,7 @@ fn validate_references(config: &Config) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
 
-    // -- Deserialization ----------------------------------------------------
+    // - Deserialization ----------------------------------------------------
 
     #[test]
     fn deserialize_minimal_config() {
@@ -845,7 +845,7 @@ mappings:
         assert!(err.is_err());
     }
 
-    // -- Env var expansion --------------------------------------------------
+    // - Env var expansion --------------------------------------------------
 
     #[test]
     fn expand_simple() {
@@ -941,7 +941,7 @@ mappings:
         unsafe { std::env::remove_var("OCYNC_TEST_BARE_COLON") };
     }
 
-    // -- Validation ---------------------------------------------------------
+    // - Validation ---------------------------------------------------------
 
     #[test]
     fn latest_without_sort() {
@@ -1237,7 +1237,7 @@ mappings:
         }
     }
 
-    // -- GlobalConfig -------------------------------------------------------
+    // - GlobalConfig -------------------------------------------------------
 
     #[test]
     fn deserialize_global_all_fields() {
@@ -1358,7 +1358,7 @@ mappings:
         }
     }
 
-    // -- Per-registry fields ------------------------------------------------
+    // - Per-registry fields ------------------------------------------------
 
     #[test]
     fn deserialize_registry_max_concurrent() {
@@ -1423,7 +1423,7 @@ mappings:
         validate_registry("example", &registry).unwrap();
     }
 
-    // -- Auth-type validation -------------------------------------------------
+    // - Auth-type validation -------------------------------------------------
 
     #[test]
     fn validate_basic_without_credentials_is_error() {

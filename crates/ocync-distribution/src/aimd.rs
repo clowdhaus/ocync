@@ -1,4 +1,4 @@
-//! AIMD concurrency controller — adaptive rate limiting via additive increase, multiplicative decrease.
+//! AIMD concurrency controller - adaptive rate limiting via additive increase, multiplicative decrease.
 //!
 //! Each registry action gets its own [`AimdWindow`], which grows the allowed concurrency
 //! by one unit per successful response and halves on a 429 (Too Many Requests). A
@@ -16,7 +16,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::detect::{ProviderKind, detect_provider_kind};
 
-/// Default congestion epoch — prevents multiple halvings from the same burst.
+/// Default congestion epoch - prevents multiple halvings from the same burst.
 const DEFAULT_EPOCH: Duration = Duration::from_millis(100);
 
 /// Default initial concurrency window size (conservative, per spec).
@@ -55,12 +55,12 @@ impl AimdWindow {
         }
     }
 
-    /// Current concurrency limit — ceiling of the window, capped at `cap`.
+    /// Current concurrency limit - ceiling of the window, capped at `cap`.
     pub(crate) fn limit(&self) -> usize {
         (self.window.ceil() as usize).min(self.cap)
     }
 
-    /// Record a successful response — additive increase.
+    /// Record a successful response - additive increase.
     ///
     /// Increases the window by `1.0 / window`, which produces linear growth in
     /// the number of round trips needed to double the window (TCP-style AIMD).
@@ -70,16 +70,16 @@ impl AimdWindow {
 
     /// The raw floating-point window value.
     ///
-    /// Exposed for testing only — prefer [`limit`](Self::limit) in production code.
+    /// Exposed for testing only - prefer [`limit`](Self::limit) in production code.
     #[cfg(test)]
     pub(crate) fn window_value(&self) -> f64 {
         self.window
     }
 
-    /// Record a 429 throttle response — multiplicative decrease.
+    /// Record a 429 throttle response - multiplicative decrease.
     ///
     /// Halves the window (minimum 1.0). If a halving already occurred within the
-    /// current epoch, this call is ignored — a single burst of 429s only triggers
+    /// current epoch, this call is ignored - a single burst of 429s only triggers
     /// one halving.
     pub(crate) fn on_throttle(&mut self) {
         let now = Instant::now();
@@ -101,19 +101,19 @@ pub enum RegistryAction {
     ManifestHead,
     /// `GET /v2/{name}/manifests/{reference}`
     ManifestRead,
-    /// `PUT /v2/{name}/manifests/{reference}` — ECR enforces ~10 TPS
+    /// `PUT /v2/{name}/manifests/{reference}` - ECR enforces ~10 TPS
     ManifestWrite,
     /// `HEAD /v2/{name}/blobs/{digest}`
     BlobHead,
     /// `GET /v2/{name}/blobs/{digest}`
     BlobRead,
-    /// `POST /v2/{name}/blobs/uploads/` — ECR enforces ~100 TPS
+    /// `POST /v2/{name}/blobs/uploads/` - ECR enforces ~100 TPS
     BlobUploadInit,
-    /// `PATCH /v2/{name}/blobs/uploads/{uuid}` — ECR enforces ~500 TPS
+    /// `PATCH /v2/{name}/blobs/uploads/{uuid}` - ECR enforces ~500 TPS
     BlobUploadChunk,
-    /// `PUT /v2/{name}/blobs/uploads/{uuid}?digest=` — ECR enforces ~100 TPS
+    /// `PUT /v2/{name}/blobs/uploads/{uuid}?digest=` - ECR enforces ~100 TPS
     BlobUploadComplete,
-    /// `GET /v2/{name}/tags/list` — separate from manifest reads
+    /// `GET /v2/{name}/tags/list` - separate from manifest reads
     TagList,
 }
 
@@ -125,7 +125,7 @@ pub enum RegistryAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowKey(u8);
 
-// -- ECR window keys: independent TPS limit per action (9 windows) --
+// - ECR window keys: independent TPS limit per action (9 windows) --
 const ECR_MANIFEST_HEAD: u8 = 0;
 const ECR_MANIFEST_READ: u8 = 1;
 const ECR_MANIFEST_WRITE: u8 = 2;
@@ -136,15 +136,15 @@ const ECR_BLOB_UPLOAD_CHUNK: u8 = 6;
 const ECR_BLOB_UPLOAD_COMPLETE: u8 = 7;
 const ECR_TAG_LIST: u8 = 8;
 
-// -- Docker Hub window keys: HEADs free, manifest reads quota'd, rest shared --
+// - Docker Hub window keys: HEADs free, manifest reads quota'd, rest shared --
 const DOCKER_HUB_HEADS: u8 = 10;
 const DOCKER_HUB_MANIFEST_READ: u8 = 11;
 const DOCKER_HUB_OTHER: u8 = 12;
 
-// -- GAR window key: single shared project quota --
+// - GAR window key: single shared project quota --
 const GAR_SHARED: u8 = 20;
 
-// -- Unknown registry window keys: coarse grouping --
+// - Unknown registry window keys: coarse grouping --
 const UNKNOWN_HEADS: u8 = 30;
 const UNKNOWN_READS: u8 = 31;
 const UNKNOWN_UPLOADS: u8 = 32;
@@ -155,11 +155,11 @@ const UNKNOWN_TAG_LIST: u8 = 34;
 ///
 /// The mapping reflects each registry's actual rate-limit granularity:
 ///
-/// - **ECR**: every action has an independent limit — 9 distinct windows.
+/// - **ECR**: every action has an independent limit - 9 distinct windows.
 /// - **Docker Hub**: HEAD operations are unmetered and share a window; manifest
 ///   reads have a separate 200-pull/6h quota; other operations share.
 /// - **GAR**: all actions share a single per-project quota.
-/// - **Unknown**: coarse grouping — HEADs share, reads share, uploads share,
+/// - **Unknown**: coarse grouping - HEADs share, reads share, uploads share,
 ///   manifest writes and tag listing get their own windows.
 pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey {
     match detect_provider_kind(host) {
@@ -318,7 +318,7 @@ impl AimdController {
 ///
 /// Must be resolved by calling [`success`](AimdPermit::success) or
 /// [`throttled`](AimdPermit::throttled) before the permit is dropped. If
-/// dropped without a report, the outcome is treated as a success — non-rate-limit
+/// dropped without a report, the outcome is treated as a success - non-rate-limit
 /// errors (network timeouts, auth failures) should not penalise the window.
 pub struct AimdPermit<'a> {
     key: WindowKey,
@@ -365,7 +365,7 @@ impl<'a> AimdPermit<'a> {
     /// Triggers a multiplicative decrease in the per-action window (subject to
     /// the congestion epoch). When the window shrinks, the per-action semaphore
     /// is replaced with a new one sized to the new limit. Outstanding permits
-    /// from the old semaphore complete naturally — they hold their own `Arc`
+    /// from the old semaphore complete naturally - they hold their own `Arc`
     /// reference and won't interfere with the new semaphore. This mirrors TCP
     /// congestion control: the window shrinks immediately but packets already
     /// in flight are not recalled.
@@ -395,22 +395,21 @@ impl<'a> AimdPermit<'a> {
 
 impl Drop for AimdPermit<'_> {
     fn drop(&mut self) {
-        // Treat unreported drops as success — errors unrelated to rate limits
+        // Treat unreported drops as success - errors unrelated to rate limits
         // (timeouts, auth failures, etc.) should not shrink the window.
-        if !self.reported {
-            if let Some(state) = self
+        if !self.reported
+            && let Some(state) = self
                 .windows
                 .lock()
                 .expect("aimd lock poisoned")
                 .get_mut(&self.key)
-            {
-                let old_limit = state.window.limit();
-                state.window.on_success();
-                let new_limit = state.window.limit();
-                // Grow the semaphore if the window expanded.
-                if new_limit > old_limit {
-                    state.semaphore.add_permits(new_limit - old_limit);
-                }
+        {
+            let old_limit = state.window.limit();
+            state.window.on_success();
+            let new_limit = state.window.limit();
+            // Grow the semaphore if the window expanded.
+            if new_limit > old_limit {
+                state.semaphore.add_permits(new_limit - old_limit);
             }
         }
         // aggregate_permit and action_permit are dropped automatically
@@ -425,7 +424,7 @@ mod tests {
     use super::*;
 
     // ---------------------------------------------------------------------------
-    // AimdWindow arithmetic — these tests use window_value() which is cfg(test) only
+    // AimdWindow arithmetic - these tests use window_value() which is cfg(test) only
     // ---------------------------------------------------------------------------
 
     #[test]

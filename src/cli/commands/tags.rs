@@ -1,4 +1,4 @@
-//! The `tags` subcommand — lists and filters tags from a repository.
+//! The `tags` subcommand - lists and filters tags from a repository.
 
 use ocync_distribution::RepositoryName;
 use ocync_sync::filter::FilterConfig;

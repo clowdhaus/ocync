@@ -76,10 +76,10 @@ impl AuthProvider for AnonymousAuth {
             // Hold the mutex for the entire check-then-fetch to prevent thundering herd.
             let mut cache = self.cache.lock().await;
 
-            if let Some(token) = cache.get(&key) {
-                if !token.should_refresh() {
-                    return Ok(token.clone());
-                }
+            if let Some(token) = cache.get(&key)
+                && !token.should_refresh()
+            {
+                return Ok(token.clone());
             }
 
             let token = token_exchange::exchange(&self.http, &self.base_url, &scopes, None).await?;
@@ -128,7 +128,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+        let auth = AnonymousAuth::with_base_url(server.uri(), crate::test_http_client());
         let token = auth
             .get_token(&[Scope::pull("library/nginx")])
             .await
@@ -160,7 +160,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+        let auth = AnonymousAuth::with_base_url(server.uri(), crate::test_http_client());
         let t1 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         let t2 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         assert_eq!(t1.value(), "cached");
@@ -191,7 +191,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+        let auth = AnonymousAuth::with_base_url(server.uri(), crate::test_http_client());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.invalidate().await;
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn anonymous_auth_name() {
-        let auth = AnonymousAuth::new("example.com", reqwest::Client::new());
+        let auth = AnonymousAuth::new("example.com", crate::test_http_client());
         assert_eq!(auth.name(), "anonymous");
     }
 }

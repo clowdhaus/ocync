@@ -1,4 +1,4 @@
-//! Sync engine -- pipelined concurrent orchestrator for image transfers.
+//! Sync engine - pipelined concurrent orchestrator for image transfers.
 //!
 //! The engine processes images through a pipelined architecture where discovery
 //! and execution overlap via `tokio::select!`:
@@ -75,7 +75,7 @@ impl fmt::Display for ImageRef {
 /// A registry identifier used as the blob deduplication key.
 ///
 /// Wraps the config-defined name (e.g. `us-ecr`) or bare hostname for
-/// ad-hoc commands. Must be unique per mapping -- it is used as the outer
+/// ad-hoc commands. Must be unique per mapping - it is used as the outer
 /// key in the blob dedup map.
 #[derive(Debug, Clone)]
 pub struct RegistryAlias(String);
@@ -136,7 +136,7 @@ pub struct ResolvedMapping {
 
 /// A single target registry entry.
 ///
-/// `name` must be unique across targets within a [`ResolvedMapping`] -- it is
+/// `name` must be unique across targets within a [`ResolvedMapping`] - it is
 /// used as the key in the blob deduplication map to track which blobs have
 /// already been transferred to each target.
 pub struct TargetEntry {
@@ -251,7 +251,7 @@ struct TargetBlobOutcome {
 
 /// Outcome of transferring a single blob to one target.
 enum BlobResult {
-    /// Cache hit -- blob already exists at target repo.
+    /// Cache hit - blob already exists at target repo.
     Skipped,
     /// Cross-repo mount succeeded.
     Mounted,
@@ -516,12 +516,12 @@ const BLOB_CONCURRENCY: usize = 6;
 /// Default shutdown drain deadline in seconds.
 const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 25;
 
-/// Sync engine -- orchestrates concurrent image transfers across registries.
+/// Sync engine - orchestrates concurrent image transfers across registries.
 ///
 /// Discovery futures drain first via `tokio::select!`, then leader-follower
 /// election reorders pending tasks so images sharing the most blobs execute
 /// first (enabling cross-repo mounts for followers). The plan phase is
-/// eliminated entirely -- progressive cache population replaces upfront
+/// eliminated entirely - progressive cache population replaces upfront
 /// batch HEAD checks.
 #[derive(Debug)]
 pub struct SyncEngine {
@@ -681,7 +681,7 @@ impl SyncEngine {
                 if matches!(promotion_phase, PromotionPhase::Discovering)
                     && discovery_futures.is_empty()
                 {
-                    // All discovery complete -- elect leaders and promote.
+                    // All discovery complete - elect leaders and promote.
                     // `freq_map` is frozen from this point (no more discovery
                     // mutations), so `PromoteContext` can borrow it.
                     let n = elect_leaders(&mut pending);
@@ -718,7 +718,7 @@ impl SyncEngine {
                     && phase_inflight == 0
                     && !pending.is_empty()
                 {
-                    // Leaders drained -- promote all remaining followers.
+                    // Leaders drained - promote all remaining followers.
                     let ctx = PromoteContext {
                         sem: &global_sem,
                         cache: &cache,
@@ -754,7 +754,7 @@ impl SyncEngine {
                     shutdown.unwrap().notified().await
                 }, if shutdown.is_some()
                     && !shutting_down
-                    // Disable when all work is done — otherwise this branch
+                    // Disable when all work is done - otherwise this branch
                     // blocks the `else` exit path indefinitely.
                     && !(discovery_futures.is_empty()
                         && execution_futures.is_empty()
@@ -883,7 +883,7 @@ struct DiscoveryParams {
 
 /// Discover a single (mapping, tag) pair: HEAD source, check cache, pull if needed.
 ///
-/// Returns `(DiscoveryOutcome, DiscoveryRoute)` — the transfer outcome and a
+/// Returns `(DiscoveryOutcome, DiscoveryRoute)` - the transfer outcome and a
 /// signal for which discovery path was taken (cache hit, miss, head failure, or
 /// stale).
 ///
@@ -951,118 +951,116 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
     // --- Steps 2-5: Cache lookup (only if HEAD succeeded) ---
     let snapshot_key = SnapshotKey::new(&source_authority, &source.repo, &source.tag);
     if let Some(ref head_digest) = source_head_digest {
-        // Scoped borrow -- dropped before any .await
+        // Scoped borrow - dropped before any .await
         let cached = {
             let c = cache.borrow();
             c.source_snapshot(&snapshot_key).cloned()
         };
 
-        if let Some(snapshot) = cached {
-            if *head_digest == snapshot.source_digest
-                && platform_key == snapshot.platform_filter_key
+        if let Some(snapshot) = cached
+            && *head_digest == snapshot.source_digest
+            && platform_key == snapshot.platform_filter_key
+        {
+            // Source unchanged, config unchanged. Check targets against
+            // the cached filtered_digest.
+            let compare_digest = snapshot.filtered_digest;
+
+            // HEAD-check all targets concurrently.
+            let mut head_checks = FuturesUnordered::new();
+            for entry in &targets {
+                let client = Arc::clone(&entry.client);
+                let repo = target.repo.clone();
+                let tag = target.tag.clone();
+                let name = entry.name.clone();
+                let checker = entry.batch_checker.clone();
+                head_checks.push(async move {
+                    let result = client.manifest_head(&repo, &tag).await;
+                    (name, client, checker, result)
+                });
+            }
+
+            let mut skipped_results = Vec::new();
+            let mut mismatched_targets = Vec::new();
+
+            while let Some((target_name, target_client, batch_checker, result)) =
+                head_checks.next().await
             {
-                // Source unchanged, config unchanged. Check targets against
-                // the cached filtered_digest.
-                let compare_digest = snapshot.filtered_digest;
-
-                // HEAD-check all targets concurrently.
-                let mut head_checks = FuturesUnordered::new();
-                for entry in &targets {
-                    let client = Arc::clone(&entry.client);
-                    let repo = target.repo.clone();
-                    let tag = target.tag.clone();
-                    let name = entry.name.clone();
-                    let checker = entry.batch_checker.clone();
-                    head_checks.push(async move {
-                        let result = client.manifest_head(&repo, &tag).await;
-                        (name, client, checker, result)
-                    });
-                }
-
-                let mut skipped_results = Vec::new();
-                let mut mismatched_targets = Vec::new();
-
-                while let Some((target_name, target_client, batch_checker, result)) =
-                    head_checks.next().await
-                {
-                    match result {
-                        Ok(Some(_)) if skip_existing => {
-                            info!(
-                                source_repo = %source.repo,
-                                source_tag = %source.tag,
+                match result {
+                    Ok(Some(_)) if skip_existing => {
+                        info!(
+                            source_repo = %source.repo,
+                            source_tag = %source.tag,
+                            target_repo = %target.repo,
+                            "skipping -- target manifest exists (skip_existing)"
+                        );
+                        tracing::debug!(target: "ocync::metrics", "skip_existing");
+                        skipped_results.push(skip_image_result(
+                            &source,
+                            &target,
+                            SkipReason::SkipExisting,
+                        ));
+                    }
+                    Ok(Some(head)) if head.digest == compare_digest => {
+                        info!(
+                            source_repo = %source.repo,
+                            source_tag = %source.tag,
+                            target_repo = %target.repo,
+                            digest = %compare_digest,
+                            "skipping -- digest matches at target (cache hit)"
+                        );
+                        tracing::debug!(target: "ocync::metrics", "unchanged_skip");
+                        skipped_results.push(skip_image_result(
+                            &source,
+                            &target,
+                            SkipReason::DigestMatch,
+                        ));
+                    }
+                    other => {
+                        if let Err(e) = &other {
+                            warn!(
                                 target_repo = %target.repo,
-                                "skipping -- target manifest exists (skip_existing)"
+                                target_tag = %target.tag,
+                                error = %e,
+                                "target manifest HEAD failed, proceeding with sync"
                             );
-                            tracing::debug!(target: "ocync::metrics", "skip_existing");
-                            skipped_results.push(skip_image_result(
-                                &source,
-                                &target,
-                                SkipReason::SkipExisting,
-                            ));
                         }
-                        Ok(Some(head)) if head.digest == compare_digest => {
-                            info!(
-                                source_repo = %source.repo,
-                                source_tag = %source.tag,
-                                target_repo = %target.repo,
-                                digest = %compare_digest,
-                                "skipping -- digest matches at target (cache hit)"
-                            );
-                            tracing::debug!(target: "ocync::metrics", "unchanged_skip");
-                            skipped_results.push(skip_image_result(
-                                &source,
-                                &target,
-                                SkipReason::DigestMatch,
-                            ));
-                        }
-                        other => {
-                            if let Err(e) = &other {
-                                warn!(
-                                    target_repo = %target.repo,
-                                    target_tag = %target.tag,
-                                    error = %e,
-                                    "target manifest HEAD failed, proceeding with sync"
-                                );
-                            }
-                            mismatched_targets.push(TargetEntry {
-                                name: target_name,
-                                client: target_client,
-                                batch_checker,
-                            });
-                        }
+                        mismatched_targets.push(TargetEntry {
+                            name: target_name,
+                            client: target_client,
+                            batch_checker,
+                        });
                     }
                 }
-
-                if mismatched_targets.is_empty() {
-                    // All targets match -- skip entirely (preserve existing cache entry).
-                    return (
-                        DiscoveryOutcome::Skip(skipped_results),
-                        DiscoveryRoute::CacheHit,
-                    );
-                }
-
-                // Some targets stale -- need full pull for those targets.
-                let outcome = full_pull_and_build_tasks(FullPullParams {
-                    source_client: &source_client,
-                    source: &source,
-                    target: &target,
-                    targets: &mismatched_targets,
-                    skipped_results,
-                    retry: &retry,
-                    platforms: platforms.as_deref(),
-                    skip_existing,
-                    cache: &cache,
-                    snapshot_key: &snapshot_key,
-                    head_digest: Some(head_digest),
-                    platform_key: &platform_key,
-                })
-                .await;
-
-                return (outcome, DiscoveryRoute::TargetStale);
             }
-            // Cache entry exists but source changed or config changed -- fall through.
+
+            if mismatched_targets.is_empty() {
+                // All targets match - skip entirely (preserve existing cache entry).
+                return (
+                    DiscoveryOutcome::Skip(skipped_results),
+                    DiscoveryRoute::CacheHit,
+                );
+            }
+
+            // Some targets stale - need full pull for those targets.
+            let outcome = full_pull_and_build_tasks(FullPullParams {
+                source_client: &source_client,
+                source: &source,
+                target: &target,
+                targets: &mismatched_targets,
+                skipped_results,
+                retry: &retry,
+                platforms: platforms.as_deref(),
+                skip_existing,
+                cache: &cache,
+                snapshot_key: &snapshot_key,
+                head_digest: Some(head_digest),
+                platform_key: &platform_key,
+            })
+            .await;
+
+            return (outcome, DiscoveryRoute::TargetStale);
         }
-        // No cache entry -- fall through.
+        // Cache miss or source/config changed - fall through.
     }
 
     // --- Full pull path (cache miss, HEAD failed, or source changed) ---
@@ -1586,7 +1584,7 @@ async fn transfer_image_blobs(
     // checked by the batch API, so per-blob HEAD is redundant).
     //
     // TOCTOU: a blob could appear between the batch-check and the per-blob
-    // push loop. This is harmless -- the redundant push succeeds because
+    // push loop. This is harmless - the redundant push succeeds because
     // the registry deduplicates on content-addressable digest.
     let batch_checked: HashSet<Digest> = if let Some(checker) = ctx.batch_checker {
         let all_digests: Vec<Digest> = blobs.iter().map(|b| b.digest.clone()).collect();
@@ -1663,7 +1661,7 @@ async fn transfer_image_blobs(
             BlobResult::Failed(err) => {
                 cancel.set(true);
                 outcome.error = Some(err);
-                // Don't break -- drain remaining futures so permits are
+                // Don't break - drain remaining futures so permits are
                 // released and cancel flag takes effect.
             }
         }
@@ -1682,7 +1680,7 @@ async fn transfer_single_blob(
     size: u64,
     batch_checked: &HashSet<Digest>,
 ) -> BlobResult {
-    // Step 1: Check cache -- known at this repo -> skip (0 API calls).
+    // Step 1: Check cache - known at this repo -> skip (0 API calls).
     let skip = {
         let c = ctx.cache.borrow();
         c.blob_known_at_repo(ctx.target_name, digest, ctx.target_repo)
@@ -1982,20 +1980,20 @@ where
         match f().await {
             Ok(val) => return Ok(val),
             Err(e) => {
-                if let Some(status) = e.status_code() {
-                    if retry::should_retry(status, attempt, config.max_retries) {
-                        let backoff = config.backoff_for(attempt);
-                        warn!(
-                            operation,
-                            attempt,
-                            status = %status,
-                            backoff_ms = backoff.as_millis(),
-                            "retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
+                if let Some(status) = e.status_code()
+                    && retry::should_retry(status, attempt, config.max_retries)
+                {
+                    let backoff = config.backoff_for(attempt);
+                    warn!(
+                        operation,
+                        attempt,
+                        status = %status,
+                        backoff_ms = backoff.as_millis(),
+                        "retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                    continue;
                 }
                 return Err(e);
             }
@@ -2342,9 +2340,9 @@ mod tests {
 
     #[test]
     fn elect_leaders_picks_most_shared() {
-        // base:    blobs {c0, a1, a2, a3} -- 4 blobs, base layer image
-        // child_a: blobs {c0, a1, a2, d1} -- shares 3 with base, 2 with child_b
-        // child_b: blobs {c0, a1, a3, e1} -- shares 3 with base, 2 with child_a
+        // base:    blobs {c0, a1, a2, a3} - 4 blobs, base layer image
+        // child_a: blobs {c0, a1, a2, d1} - shares 3 with base, 2 with child_b
+        // child_b: blobs {c0, a1, a3, e1} - shares 3 with base, 2 with child_a
         //
         // Scoring (sum of |intersection| with each other image):
         //   base:    |base^child_a|=3 + |base^child_b|=3 = 6
@@ -2397,9 +2395,9 @@ mod tests {
         // "base" image targets 2 registries (2 tasks, same Rc).
         // "child_a" and "child_b" derive from base.
         //
-        // base:    blobs {c0, a1, a2, a3} -- shares 3 with each child
-        // child_a: blobs {c0, a1, a2, d1} -- shares 3 with base, 2 with child_b
-        // child_b: blobs {c0, a1, a3, e1} -- shares 3 with base, 2 with child_a
+        // base:    blobs {c0, a1, a2, a3} - shares 3 with each child
+        // child_a: blobs {c0, a1, a2, d1} - shares 3 with base, 2 with child_b
+        // child_b: blobs {c0, a1, a3, e1} - shares 3 with base, 2 with child_a
         //
         // base scores 6, children score 5 each. base elected.
         // base has 2 tasks -> n = 2.
@@ -2515,7 +2513,7 @@ mod tests {
     fn elect_leaders_marginal_coverage_across_rounds() {
         // A spans both clusters via blob c0. Round 1 elects A. Round 2
         // must deduct A's blobs from marginal scores: C and D share
-        // {c0, d0}, but c0 is already covered -- only d0 is marginal.
+        // {c0, d0}, but c0 is already covered - only d0 is marginal.
         //
         // A: {a0, b0, c0}  B: {a0, b0, e0}  C: {c0, d0, f0}  D: {c0, d0, fa}
         //
@@ -2556,7 +2554,7 @@ mod tests {
 
         // A is always first leader.
         assert_eq!(leader_tags[0], "imgA");
-        // Second leader is from cluster 2 (C or D), not B -- because B
+        // Second leader is from cluster 2 (C or D), not B - because B
         // shares no marginal blobs after A's {a0,b0,c0} are deducted.
         assert!(
             leader_tags[1] == "imgC" || leader_tags[1] == "imgD",

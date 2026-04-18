@@ -1,4 +1,4 @@
-//! The `validate` subcommand — offline config validation.
+//! The `validate` subcommand - offline config validation.
 
 use crate::ValidateArgs;
 use crate::cli::config::load_config;

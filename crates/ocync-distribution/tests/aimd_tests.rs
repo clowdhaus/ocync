@@ -169,7 +169,7 @@ fn unknown_registry_coarse_grouping() {
 }
 
 // ---------------------------------------------------------------------------
-// AimdController — observable through window_limit()
+// AimdController -- observable through window_limit()
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -231,7 +231,7 @@ async fn controller_drop_without_report_treated_as_success() {
     }
     let before = ctrl.window_limit(RegistryAction::ManifestRead);
 
-    // Drop without reporting — should not decrease the window.
+    // Drop without reporting -- should not decrease the window.
     {
         let _permit = ctrl.acquire(RegistryAction::ManifestRead).await;
     }
@@ -244,7 +244,7 @@ async fn controller_drop_without_report_treated_as_success() {
 }
 
 // ---------------------------------------------------------------------------
-// Concurrent permits — verifies semaphore replacement under throttle
+// Concurrent permits -- verifies semaphore replacement under throttle
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -271,12 +271,12 @@ async fn controller_throttle_with_outstanding_permits() {
     // Sleep past the epoch so throttle takes effect.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Throttle one — this replaces the semaphore. The other permits
+    // Throttle one -- this replaces the semaphore. The other permits
     // hold references to the old semaphore and should complete normally.
     p1.throttled();
 
     let after_throttle = ctrl.window_limit(op);
-    // Window should approximately halve — verify it shrank by more than 1.
+    // Window should approximately halve -- verify it shrank by more than 1.
     assert!(
         after_throttle <= before.div_ceil(2),
         "throttle should approximately halve the window (before={before}, after={after_throttle})"

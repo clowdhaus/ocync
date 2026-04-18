@@ -36,7 +36,7 @@ pub(crate) async fn exchange(
     let resp = http.get(&v2_url).send().await?;
 
     if resp.status().is_success() {
-        // No auth required — return a dummy token.
+        // No auth required -- return a dummy token.
         return Ok(Token::new(""));
     }
 
@@ -306,7 +306,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::test_http_client();
         let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
@@ -345,7 +345,7 @@ mod tests {
             username: "user".into(),
             password: "pass".into(),
         };
-        let http = reqwest::Client::new();
+        let http = crate::test_http_client();
         let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], Some(&creds))
             .await
             .unwrap();
@@ -363,7 +363,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::test_http_client();
         let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
@@ -381,7 +381,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::test_http_client();
         let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap_err();
@@ -409,7 +409,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::test_http_client();
         let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap_err();
@@ -441,7 +441,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::test_http_client();
         let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
@@ -462,7 +462,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        // No expires_in field — token should be permanent.
+        // No expires_in field -- token should be permanent.
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/token"))
             .respond_with(
@@ -473,7 +473,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::test_http_client();
         let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
@@ -506,7 +506,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::test_http_client();
         let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap();
@@ -538,7 +538,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::test_http_client();
         let scopes = [Scope::pull("repo-a"), Scope::pull_push("repo-b")];
         let token = exchange(&http, &mock.uri(), &scopes, None).await.unwrap();
         assert_eq!(token.value(), "multi-tok");

@@ -93,10 +93,10 @@ impl AuthProvider for BasicAuth {
             // Hold the mutex for the entire check-then-fetch to prevent thundering herd.
             let mut cache = self.cache.lock().await;
 
-            if let Some(token) = cache.get(&key) {
-                if !token.should_refresh() {
-                    return Ok(token.clone());
-                }
+            if let Some(token) = cache.get(&key)
+                && !token.should_refresh()
+            {
+                return Ok(token.clone());
             }
 
             let token = token_exchange::exchange(
@@ -176,7 +176,7 @@ mod tests {
         mount_token_endpoint(&server, "tok123", 1).await;
 
         let auth =
-            BasicAuth::with_base_url(server.uri(), reqwest::Client::new(), test_credentials());
+            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
         let token = auth
             .get_token(&[Scope::pull("library/nginx")])
             .await
@@ -211,7 +211,7 @@ mod tests {
         mount_token_endpoint(&server, "cached-tok", 1).await;
 
         let auth =
-            BasicAuth::with_base_url(server.uri(), reqwest::Client::new(), test_credentials());
+            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
         let scopes = [Scope::pull("library/nginx")];
         let t1 = auth.get_token(&scopes).await.unwrap();
         let t2 = auth.get_token(&scopes).await.unwrap();
@@ -226,7 +226,7 @@ mod tests {
         mount_token_endpoint(&server, "fresh-tok", 2).await;
 
         let auth =
-            BasicAuth::with_base_url(server.uri(), reqwest::Client::new(), test_credentials());
+            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
         let scopes = [Scope::pull("library/nginx")];
         auth.get_token(&scopes).await.unwrap();
         auth.invalidate().await;
@@ -244,7 +244,7 @@ mod tests {
             .await;
 
         let auth =
-            BasicAuth::with_base_url(server.uri(), reqwest::Client::new(), test_credentials());
+            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
         let token = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         assert_eq!(token.value(), "");
     }
@@ -261,7 +261,7 @@ mod tests {
             .await;
 
         let auth =
-            BasicAuth::with_base_url(server.uri(), reqwest::Client::new(), test_credentials());
+            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
         assert!(matches!(err, Error::Http(_)));
     }
@@ -277,20 +277,20 @@ mod tests {
             .await;
 
         let auth =
-            BasicAuth::with_base_url(server.uri(), reqwest::Client::new(), test_credentials());
+            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
         assert!(err.to_string().contains("WWW-Authenticate"));
     }
 
     #[test]
     fn basic_auth_name() {
-        let auth = BasicAuth::new("example.com", reqwest::Client::new(), test_credentials());
+        let auth = BasicAuth::new("example.com", crate::test_http_client(), test_credentials());
         assert_eq!(auth.name(), "basic");
     }
 
     #[test]
     fn basic_auth_debug_redacts_credentials() {
-        let auth = BasicAuth::new("example.com", reqwest::Client::new(), test_credentials());
+        let auth = BasicAuth::new("example.com", crate::test_http_client(), test_credentials());
         let debug = format!("{auth:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("testuser"));

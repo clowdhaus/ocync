@@ -110,7 +110,7 @@ pub fn resolve_from_docker_config(
         match run_credential_helper(store, registry) {
             Ok(creds) => return Ok(Some(creds)),
             Err(_) => {
-                // Default store may not have creds for this registry — not an error.
+                // Default store may not have creds for this registry -- not an error.
                 tracing::debug!(
                     registry,
                     store,
@@ -126,28 +126,28 @@ pub fn resolve_from_docker_config(
 /// Look up static credentials from the `auths` map.
 fn lookup_auths(config: &DockerConfig, registry: &str) -> Result<Option<Credentials>, Error> {
     // Direct match.
-    if let Some(entry) = config.auths.get(registry) {
-        if let Some(creds) = entry_to_credentials(entry)? {
-            return Ok(Some(creds));
-        }
+    if let Some(entry) = config.auths.get(registry)
+        && let Some(creds) = entry_to_credentials(entry)?
+    {
+        return Ok(Some(creds));
     }
 
     // Try with/without https:// prefix.
     let with_scheme = format!("https://{registry}");
-    if let Some(entry) = config.auths.get(&with_scheme) {
-        if let Some(creds) = entry_to_credentials(entry)? {
-            return Ok(Some(creds));
-        }
+    if let Some(entry) = config.auths.get(&with_scheme)
+        && let Some(creds) = entry_to_credentials(entry)?
+    {
+        return Ok(Some(creds));
     }
 
-    // Docker Hub aliases — if the requested registry is any Docker Hub alias,
+    // Docker Hub aliases -- if the requested registry is any Docker Hub alias,
     // try all other aliases.
     if is_docker_hub(registry) {
         for alias in DOCKER_HUB_ALIASES {
-            if let Some(entry) = config.auths.get(*alias) {
-                if let Some(creds) = entry_to_credentials(entry)? {
-                    return Ok(Some(creds));
-                }
+            if let Some(entry) = config.auths.get(*alias)
+                && let Some(creds) = entry_to_credentials(entry)?
+            {
+                return Ok(Some(creds));
             }
         }
     }
@@ -176,11 +176,11 @@ fn lookup_cred_helper(config: &DockerConfig, registry: &str) -> Option<String> {
 /// Convert an `AuthEntry` to `Credentials`.
 fn entry_to_credentials(entry: &AuthEntry) -> Result<Option<Credentials>, Error> {
     // Prefer the `auth` field (base64 encoded).
-    if let Some(ref encoded) = entry.auth {
-        if !encoded.is_empty() {
-            let (username, password) = decode_auth(encoded)?;
-            return Ok(Some(Credentials::Basic { username, password }));
-        }
+    if let Some(ref encoded) = entry.auth
+        && !encoded.is_empty()
+    {
+        let (username, password) = decode_auth(encoded)?;
+        return Ok(Some(Credentials::Basic { username, password }));
     }
 
     // Fall back to separate username/password fields.
@@ -348,10 +348,10 @@ impl AuthProvider for DockerConfigAuth {
 
             let mut cache = self.cache.lock().await;
 
-            if let Some(token) = cache.get(&key) {
-                if !token.should_refresh() {
-                    return Ok(token.clone());
-                }
+            if let Some(token) = cache.get(&key)
+                && !token.should_refresh()
+            {
+                return Ok(token.clone());
             }
 
             let token = token_exchange::exchange(
@@ -494,7 +494,7 @@ mod tests {
         }"#;
         let config: DockerConfig = serde_json::from_str(json).unwrap();
 
-        // Look up via "docker.io" — should find the creds stored under the full URL alias.
+        // Look up via "docker.io" -- should find the creds stored under the full URL alias.
         let creds = resolve_from_docker_config(&config, "docker.io")
             .unwrap()
             .unwrap();
@@ -690,7 +690,8 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), Some(creds));
+        let auth =
+            DockerConfigAuth::with_base_url(mock.uri(), crate::test_http_client(), Some(creds));
         let token = auth
             .get_token(&[Scope::pull("library/nginx")])
             .await
@@ -722,7 +723,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), None);
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), crate::test_http_client(), None);
         let token = auth.get_token(&[Scope::pull("public/repo")]).await.unwrap();
         assert_eq!(token.value(), "anon-token");
     }
@@ -751,7 +752,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), None);
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), crate::test_http_client(), None);
         let t1 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         let t2 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         assert_eq!(t1.value(), "cached");
@@ -783,7 +784,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let auth = DockerConfigAuth::with_base_url(mock.uri(), reqwest::Client::new(), None);
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), crate::test_http_client(), None);
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.invalidate().await;
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
@@ -795,7 +796,7 @@ mod tests {
         let auth = DockerConfigAuth::new(
             "example.com",
             &DockerConfig::default(),
-            reqwest::Client::new(),
+            crate::test_http_client(),
         )
         .unwrap();
         assert_eq!(auth.name(), "docker-config");
@@ -819,7 +820,7 @@ mod tests {
             cred_helpers: HashMap::new(),
             creds_store: None,
         };
-        let auth = DockerConfigAuth::new("ghcr.io", &config, reqwest::Client::new()).unwrap();
+        let auth = DockerConfigAuth::new("ghcr.io", &config, crate::test_http_client()).unwrap();
         // Verify credentials were resolved (has_credentials in Debug output).
         let debug = format!("{auth:?}");
         assert!(debug.contains("has_credentials: true"));
@@ -843,8 +844,8 @@ mod tests {
             cred_helpers: HashMap::new(),
             creds_store: None,
         };
-        // quay.io not in config — should resolve as anonymous.
-        let auth = DockerConfigAuth::new("quay.io", &config, reqwest::Client::new()).unwrap();
+        // quay.io not in config -- should resolve as anonymous.
+        let auth = DockerConfigAuth::new("quay.io", &config, crate::test_http_client()).unwrap();
         let debug = format!("{auth:?}");
         assert!(debug.contains("has_credentials: false"));
     }

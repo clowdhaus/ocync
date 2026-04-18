@@ -160,7 +160,7 @@ fn zero_ttl_means_never_expire() {
     cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
     cache.persist(&path).unwrap();
 
-    // Duration::ZERO disables TTL — the cache never expires by age.
+    // Duration::ZERO disables TTL -- the cache never expires by age.
     let loaded = TransferStateCache::load(&path, Duration::ZERO);
     assert!(!loaded.is_empty());
     assert!(loaded.blob_status("reg.io", &digest_a()).is_some());
@@ -258,7 +258,7 @@ fn only_stable_entries_survive_persist() {
     let mut cache = TransferStateCache::new();
     // Stable
     cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
-    // Transient — should not appear after reload
+    // Transient -- should not appear after reload
     cache.set_blob_failed("reg.io", digest_b(), "oops".into());
 
     cache.persist(&path).unwrap();
@@ -305,7 +305,7 @@ fn persist_creates_nested_parent_dirs() {
     let mut cache = TransferStateCache::new();
     cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
 
-    // Parent dirs don't exist yet — persist() must create them.
+    // Parent dirs don't exist yet -- persist() must create them.
     cache.persist(&path).unwrap();
     assert!(path.exists());
 }

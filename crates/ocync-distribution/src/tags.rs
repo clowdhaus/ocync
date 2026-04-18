@@ -39,12 +39,11 @@ pub(crate) fn parse_next_link(link_header: &str) -> Option<String> {
             continue;
         }
         // Extract URL from angle brackets.
-        if let Some(start) = part.find('<') {
-            if let Some(end) = part.find('>') {
-                if start < end {
-                    return Some(part[start + 1..end].to_owned());
-                }
-            }
+        if let Some(start) = part.find('<')
+            && let Some(end) = part.find('>')
+            && start < end
+        {
+            return Some(part[start + 1..end].to_owned());
         }
     }
     None
@@ -85,7 +84,7 @@ impl RegistryClient {
                     if let Some(stripped) = url.strip_prefix(&prefix) {
                         path = stripped.to_owned();
                     } else if url.starts_with("http://") || url.starts_with("https://") {
-                        // Absolute URL — extract path+query after the /v2/{repo}/ prefix.
+                        // Absolute URL - extract path+query after the /v2/{repo}/ prefix.
                         if let Ok(parsed) = url::Url::parse(&url) {
                             let full_path = parsed.path();
                             if let Some(stripped) = full_path.strip_prefix(&prefix) {

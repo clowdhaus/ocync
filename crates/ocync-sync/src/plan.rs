@@ -35,7 +35,7 @@ pub(crate) struct BlobInfo {
     /// of the same blob can wait on completion, then mount from this repo
     /// instead of re-pulling and re-pushing.
     ///
-    /// Skipped during serialization — this is runtime-only coordination state.
+    /// Skipped during serialization - this is runtime-only coordination state.
     #[serde(skip)]
     pub uploader_repo: Option<RepositoryName>,
 }
@@ -63,7 +63,7 @@ impl BlobDedupMap {
 
     /// Get or create the `BlobInfo` entry for the given target and digest.
     ///
-    /// New entries start as `InProgress` — callers always overwrite the status
+    /// New entries start as `InProgress` - callers always overwrite the status
     /// immediately, so the initial value is never observed.
     fn entry_mut(&mut self, target: &str, digest: &Digest) -> &mut BlobInfo {
         self.inner

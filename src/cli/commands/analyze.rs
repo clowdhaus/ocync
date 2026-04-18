@@ -1,4 +1,4 @@
-//! The `analyze` subcommand — reports blob sharing and cross-repo mount potential
+//! The `analyze` subcommand - reports blob sharing and cross-repo mount potential
 //! without performing any sync.
 //!
 //! Pulls source manifests only (never blobs), walks index manifests to collect
@@ -207,7 +207,7 @@ fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) {
     let shared_bytes: u64 = shared.iter().map(|b| b.size).sum();
 
     // Cross-repo mount opportunity: per target registry, count blobs whose
-    // target_repos set has more than one repo — those are the mount candidates
+    // target_repos set has more than one repo - those are the mount candidates
     // (a blob pushed once can be mounted into every other repo in the set).
     let mut mount_savings_by_target: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     for blob in blobs.values() {

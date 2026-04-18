@@ -1,4 +1,4 @@
-//! The `auth check` subcommand — credential validation.
+//! The `auth check` subcommand - credential validation.
 
 use std::path::PathBuf;
 
@@ -21,12 +21,12 @@ pub(crate) async fn run_check(configs: &[PathBuf]) -> Result<ExitCode, CliError>
                         eprintln!("  OK    {name} ({safe_url})");
                     }
                     Err(err) => {
-                        eprintln!("  FAIL  {name} ({safe_url}) — {err}");
+                        eprintln!("  FAIL  {name} ({safe_url}) -- {err}");
                         all_ok = false;
                     }
                 },
                 Err(err) => {
-                    eprintln!("  FAIL  {name} — {err}");
+                    eprintln!("  FAIL  {name} -- {err}");
                     all_ok = false;
                 }
             }

@@ -1,4 +1,4 @@
-//! OCI image spec types — manifests, descriptors, and platforms.
+//! OCI image spec types - manifests, descriptors, and platforms.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -172,7 +172,7 @@ impl Platform {
     /// Returns `true` if this platform matches the given filter.
     ///
     /// Comparison is case-insensitive. When the filter specifies only `os/arch`,
-    /// the platform's `variant` field is ignored — any variant (or none) will
+    /// the platform's `variant` field is ignored - any variant (or none) will
     /// match.
     pub fn matches(&self, filter: &PlatformFilter) -> bool {
         if !self.os.eq_ignore_ascii_case(&filter.os)
@@ -301,7 +301,7 @@ impl From<&str> for RepositoryName {
 /// Registry authority as `host:port` (e.g. `cgr.dev:443`, `localhost:5000`).
 ///
 /// Used as a cache key to identify which registry a manifest was observed at.
-/// Does not include the URL scheme — registries at the same host:port but
+/// Does not include the URL scheme - registries at the same host:port but
 /// different schemes produce the same key, which is acceptable because no
 /// production registry serves both HTTP and HTTPS on the same port.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -376,7 +376,7 @@ pub struct ImageIndex {
     pub annotations: Option<HashMap<String, String>>,
 }
 
-/// A parsed manifest — either a single image or a multi-platform index.
+/// A parsed manifest - either a single image or a multi-platform index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestKind {
     /// A single-platform image manifest.
@@ -442,7 +442,7 @@ mod tests {
         })
     }
 
-    // -- MediaType tests --
+    // - MediaType tests --
 
     #[test]
     fn media_type_from_known_string() {
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(mt, MediaType::Other("application/x-custom".into()));
     }
 
-    // -- Descriptor tests --
+    // - Descriptor tests --
 
     #[test]
     fn deserialize_descriptor() {
@@ -653,7 +653,7 @@ mod tests {
         assert_eq!(digests.len(), 2);
     }
 
-    // -- Platform::matches tests --
+    // - Platform::matches tests --
 
     fn linux_amd64() -> Platform {
         Platform {

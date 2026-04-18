@@ -210,7 +210,7 @@ async fn full_image_roundtrip() {
         .await
         .expect("manifest push failed");
 
-    // 4. HEAD the manifest by tag — verify digest and media type.
+    // 4. HEAD the manifest by tag -- verify digest and media type.
     let head = client
         .manifest_head(&repo, tag)
         .await
@@ -218,7 +218,7 @@ async fn full_image_roundtrip() {
         .expect("manifest HEAD should return Some for existing tag");
     assert_eq!(head.digest, manifest_digest);
 
-    // 5. Pull the manifest by digest — verify raw bytes match.
+    // 5. Pull the manifest by digest -- verify raw bytes match.
     let pulled = client
         .manifest_pull(&repo, &manifest_digest.to_string())
         .await
@@ -242,7 +242,7 @@ async fn manifest_head_returns_none_for_missing_tag() {
     assert!(result.is_none(), "expected None for missing tag");
 }
 
-/// Push the same blob twice and verify idempotency — no error on second push.
+/// Push the same blob twice and verify idempotency -- no error on second push.
 #[tokio::test]
 async fn blob_push_idempotent() {
     let (_container, url) = start_registry().await;

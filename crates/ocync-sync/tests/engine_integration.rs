@@ -269,10 +269,10 @@ async fn mount_manifest_head_matching(server: &MockServer, repo: &str, tag: &str
 ///
 /// Returns a pre-configured set of existing digests, filtered by input.
 /// Verifies the caller passes the expected repository name (per mock
-/// contract fidelity — a bug where the engine passes the wrong repo
+/// contract fidelity -- a bug where the engine passes the wrong repo
 /// would be invisible without this check).
 struct MockBatchChecker {
-    /// Expected repository name — panics if the caller passes a different repo.
+    /// Expected repository name -- panics if the caller passes a different repo.
     expected_repo: String,
     /// Set of digests that the mock reports as existing at the target.
     existing: HashSet<Digest>,
@@ -517,7 +517,7 @@ async fn sync_blob_exists_at_target_skips_transfer() {
     let manifest = simple_image_manifest(&config_digest, &layer_digest);
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
-    // Source: serve manifest (blobs NOT served — they shouldn't be pulled).
+    // Source: serve manifest (blobs NOT served -- they shouldn't be pulled).
     mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
 
     // Target: manifest HEAD 404, but both blobs already exist.
@@ -550,7 +550,7 @@ async fn sync_blob_exists_at_target_skips_transfer() {
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
-    // No bytes transferred — blobs existed at target.
+    // No bytes transferred -- blobs existed at target.
     assert_eq!(report.images[0].bytes_transferred, 0);
     assert_eq!(report.images[0].blob_stats.skipped, 2);
     assert_eq!(report.images[0].blob_stats.transferred, 0);
@@ -1306,7 +1306,7 @@ async fn sync_retry_exhaustion_returns_final_error() {
     mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
     mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
 
-    // Layer blob: always returns 429 (retryable) — should exhaust retries.
+    // Layer blob: always returns 429 (retryable) -- should exhaust retries.
     Mock::given(method("GET"))
         .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
         .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
@@ -1876,12 +1876,12 @@ async fn sync_progressive_cache_skips_shared_blob_head_check() {
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
     mount_manifest_head_not_found(&target_server, "repo", "v2").await;
 
-    // v1 blobs: all missing at target — base, config_a, layer_a each need HEAD + push.
+    // v1 blobs: all missing at target -- base, config_a, layer_a each need HEAD + push.
     mount_blob_not_found(&target_server, "repo", &base_desc.digest).await;
     mount_blob_not_found(&target_server, "repo", &config_a_desc.digest).await;
     mount_blob_not_found(&target_server, "repo", &layer_a_desc.digest).await;
 
-    // v2 blobs: base was already completed by v1 — no HEAD issued.
+    // v2 blobs: base was already completed by v1 -- no HEAD issued.
     // config_b and layer_b are new so HEAD + push needed.
     mount_blob_not_found(&target_server, "repo", &config_b_desc.digest).await;
     mount_blob_not_found(&target_server, "repo", &layer_b_desc.digest).await;
@@ -2008,7 +2008,7 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
 /// When the target is ECR and `BLOB_MOUNTING` is disabled (the default),
 /// mount POSTs return 202 (not fulfilled). The engine issues the POST,
 /// gets 202, falls through to HEAD + push. Mount attempts are not
-/// short-circuited — the 202 fallback is cheap and enables the mount
+/// short-circuited -- the 202 fallback is cheap and enables the mount
 /// optimization when `BLOB_MOUNTING` is enabled.
 #[tokio::test]
 async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
@@ -2036,7 +2036,7 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
 
     mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
 
-    // Mount POST returns 202 (not fulfilled) — engine falls through to push.
+    // Mount POST returns 202 (not fulfilled) -- engine falls through to push.
     Mock::given(method("POST"))
         .and(path("/v2/repo-b/blobs/uploads/"))
         .and(query_param("from", "repo-a"))
@@ -2083,7 +2083,7 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
-    // Mount attempted but not fulfilled (202) — blobs transferred instead.
+    // Mount attempted but not fulfilled (202) -- blobs transferred instead.
     assert_eq!(report.images[0].blob_stats.mounted, 0);
     assert_eq!(report.images[0].blob_stats.transferred, 2);
     assert_eq!(report.stats.blobs_mounted, 0);
@@ -2097,7 +2097,7 @@ async fn sync_small_blob_uses_monolithic_upload() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    // Small blobs — streaming PUT handles all sizes.
+    // Small blobs -- streaming PUT handles all sizes.
     let config_data = b"small-config";
     let layer_data = b"small-layer";
 
@@ -2123,7 +2123,7 @@ async fn sync_small_blob_uses_monolithic_upload() {
     mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
     mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
 
-    // Monolithic upload: POST initiates, PUT finalizes — no PATCH.
+    // Monolithic upload: POST initiates, PUT finalizes -- no PATCH.
     // Use .expect() to assert exact counts per HTTP method.
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
@@ -2141,7 +2141,7 @@ async fn sync_small_blob_uses_monolithic_upload() {
         .mount(&target_server)
         .await;
 
-    // No PATCH mock registered — any PATCH would cause a wiremock 404 and fail the test.
+    // No PATCH mock registered -- any PATCH would cause a wiremock 404 and fail the test.
 
     mount_manifest_push(&target_server, "repo", "v1").await;
 
@@ -2582,7 +2582,7 @@ async fn sync_dedup_across_tags_concurrent() {
         vec![TagPair::same("v1"), TagPair::same("v2")],
     );
 
-    // Use higher concurrency — both tags can execute simultaneously.
+    // Use higher concurrency -- both tags can execute simultaneously.
     let engine = SyncEngine::new(fast_retry(), 10);
     let report = engine
         .run(
@@ -3089,7 +3089,7 @@ async fn sync_partial_blob_failure_stops_remaining() {
         .mount(&target_server)
         .await;
 
-    // No manifest PUT mock — if engine tries to push manifest, wiremock
+    // No manifest PUT mock -- if engine tries to push manifest, wiremock
     // returns 404 and the test fails differently.
 
     let mapping = resolved_mapping(
@@ -3205,7 +3205,7 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
         vec![TagPair::same("v1"), TagPair::same("v2")],
     );
 
-    // Real concurrency — NOT 1.
+    // Real concurrency -- NOT 1.
     let engine = SyncEngine::new(fast_retry(), 50);
     let report = engine
         .run(
@@ -3479,7 +3479,7 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
     };
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
-    // Source: manifest responds immediately. Blob delays are 5s — between
+    // Source: manifest responds immediately. Blob delays are 5s -- between
     // our custom 2s drain deadline and the default 25s deadline. This means
     // the transfer would succeed with the default but fails with the custom.
     mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
@@ -3677,7 +3677,7 @@ async fn sync_staging_writes_blobs_to_disk() {
 // ---------------------------------------------------------------------------
 
 /// A pre-warmed cache records a blob as completed at `(target, repo)`.
-/// Verify the engine skips it entirely — no HEAD check, no pull, no push.
+/// Verify the engine skips it entirely -- no HEAD check, no pull, no push.
 /// The blob HEAD mock is NOT registered, so any HEAD attempt would fail.
 #[tokio::test]
 async fn sync_warm_cache_skips_blob_head_check() {
@@ -3700,10 +3700,10 @@ async fn sync_warm_cache_skips_blob_head_check() {
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
     mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    // No source blob pulls mounted — they shouldn't be needed.
+    // No source blob pulls mounted -- they shouldn't be needed.
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    // No blob HEAD mocks — any HEAD attempt would cause wiremock to return 404
+    // No blob HEAD mocks -- any HEAD attempt would cause wiremock to return 404
     // which would trigger a push, which would also fail (no push mock).
     // The test succeeds only if the cache skip prevents all blob operations.
     mount_manifest_push(&target_server, "repo", "v1").await;
@@ -3737,7 +3737,7 @@ async fn sync_warm_cache_skips_blob_head_check() {
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
-    // Both blobs skipped via cache — no transfers, no HEAD checks.
+    // Both blobs skipped via cache -- no transfers, no HEAD checks.
     assert_eq!(report.images[0].blob_stats.skipped, 2);
     assert_eq!(report.images[0].blob_stats.transferred, 0);
     assert_eq!(report.images[0].bytes_transferred, 0);
@@ -4775,7 +4775,7 @@ async fn sync_batch_checker_index_manifest_all_exist() {
         .mount(&source_server)
         .await;
 
-    // Source: NO blob endpoints — batch reports all exist, no pulls needed.
+    // Source: NO blob endpoints -- batch reports all exist, no pulls needed.
 
     // Target: manifest HEAD 404, blob HEAD expect(0) for all 4 blobs.
     mount_manifest_head_not_found(&target_server, "repo", "latest").await;
@@ -4941,7 +4941,7 @@ async fn sync_batch_checker_with_prewarmed_cache() {
         .await;
 
     // Pre-warm cache: config blob already known at the target repo.
-    // Layer blob is NOT in the cache — only batch reports it.
+    // Layer blob is NOT in the cache -- only batch reports it.
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
@@ -5818,7 +5818,7 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
         .mount(&target_server)
         .await;
 
-    // Blob HEAD checks — one per blob.
+    // Blob HEAD checks -- one per blob.
     Mock::given(method("HEAD"))
         .and(path(format!("/v2/tgt/nginx/blobs/{}", config_desc.digest)))
         .respond_with(ResponseTemplate::new(404))
@@ -5833,7 +5833,7 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
         .mount(&target_server)
         .await;
 
-    // Monolithic blob push: POST initiate + PUT finalize — no PATCH for small blobs.
+    // Monolithic blob push: POST initiate + PUT finalize -- no PATCH for small blobs.
     Mock::given(method("POST"))
         .and(path("/v2/tgt/nginx/blobs/uploads/"))
         .respond_with(
@@ -5851,7 +5851,7 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
         .mount(&target_server)
         .await;
 
-    // No PATCH registered — any PATCH would cause a wiremock 404 and fail the test.
+    // No PATCH registered -- any PATCH would cause a wiremock 404 and fail the test.
 
     // Manifest PUT returns ECR immutable tag error (HTTP 400).
     Mock::given(method("PUT"))
@@ -5917,7 +5917,7 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
 }
 
 /// Non-immutable 400 errors on manifest push still produce `Failed`, not `Skipped`.
-/// This is the negative assertion — ensures only the specific ECR exception triggers
+/// This is the negative assertion -- ensures only the specific ECR exception triggers
 /// the skip path.
 #[tokio::test]
 async fn sync_non_immutable_400_still_fails() {
@@ -6646,7 +6646,7 @@ async fn discovery_head_timeout_falls_through() {
 }
 
 /// Bridge test: cache has a valid entry but source HEAD returns 500. The engine
-/// must NOT use the cached `filtered_digest` — it must fall through to the full
+/// must NOT use the cached `filtered_digest` -- it must fall through to the full
 /// pull path because the HEAD failure prevents cache validation.
 #[tokio::test]
 async fn discovery_head_failure_ignores_valid_cache() {
@@ -7855,7 +7855,7 @@ async fn discovery_source_change_across_cycles() {
 }
 
 /// Two-cycle warm cache test: cycle 1 syncs from a cold cache, populating
-/// it. Cycle 2 has the same source digest — the cache hit path fires, no
+/// it. Cycle 2 has the same source digest -- the cache hit path fires, no
 /// source GET is issued, and the image is skipped. This is the core
 /// proof that the warm cache works across engine runs.
 #[tokio::test]
@@ -8013,7 +8013,7 @@ async fn discovery_two_cycle_cache_hit() {
 }
 
 /// Platform filter change between cycles: cycle 1 syncs with `linux/amd64`,
-/// populating the cache. Cycle 2 uses `linux/arm64` — the `PlatformFilterKey`
+/// populating the cache. Cycle 2 uses `linux/arm64` -- the `PlatformFilterKey`
 /// mismatch must trigger a cache miss even though the source digest hasn't
 /// changed, because the filtered manifest will differ.
 #[tokio::test]
@@ -8516,7 +8516,7 @@ async fn discovery_snapshot_pruning_removes_deleted_tags() {
 /// shutdown branch stayed enabled with an always-pending `notified().await`,
 /// preventing the `else` exit from firing.
 ///
-/// This test uses a 10-second timeout to detect the hang — if the engine
+/// This test uses a 10-second timeout to detect the hang -- if the engine
 /// doesn't exit within 10s of completing all transfers, the test fails.
 #[tokio::test]
 async fn sync_exits_with_untriggered_shutdown_signal() {
@@ -8555,7 +8555,7 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
         vec![TagPair::same("v1")],
     );
 
-    // Create shutdown signal but DO NOT trigger it — this is the production
+    // Create shutdown signal but DO NOT trigger it -- this is the production
     // scenario where the user never sends SIGTERM.
     let shutdown = ShutdownSignal::new();
 
@@ -8571,7 +8571,7 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
         ),
     )
     .await
-    .expect("engine hung — did not exit within 10s after completing all work");
+    .expect("engine hung -- did not exit within 10s after completing all work");
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -8585,7 +8585,7 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
 
 /// When two concurrent transfers target different repos at the same registry
 /// and share a blob, the second transfer must wait for the first to finish
-/// uploading, then mount from the first repo — not re-upload the blob.
+/// uploading, then mount from the first repo -- not re-upload the blob.
 ///
 /// Without the coordination fix, both tasks race past the cache check (no
 /// completed entry yet since the first upload is still in-flight) and both
