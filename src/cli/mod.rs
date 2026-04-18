@@ -226,9 +226,7 @@ pub(crate) async fn build_registry_client(
             // everything else, anonymous as final fallback. Native providers for
             // GCR/ACR/GHCR will be inserted between ECR and docker config when
             // implemented.
-            if let Some(ProviderKind::Ecr | ProviderKind::EcrPublic) =
-                detect_provider_kind(bare_host)
-            {
+            if let Some(ProviderKind::Ecr) = detect_provider_kind(bare_host) {
                 let auth = EcrAuth::new(bare_host).await.map_err(|e| {
                     CliError::Input(format!("ECR auth setup for '{bare_host}': {e}"))
                 })?;
