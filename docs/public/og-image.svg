@@ -1,0 +1,19 @@
+<svg width="1200" height="630" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="logobg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5b21b6"/>
+      <stop offset="100%" stop-color="#1a0f91"/>
+    </linearGradient>
+    <linearGradient id="grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="50%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#F736F6"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="#1a0f91"/>
+  <rect x="560" y="150" width="80" height="80" rx="18" fill="url(#logobg)"/>
+  <path d="M605 155L587.5 195h20L593.75 230L612.5 190.5h-20L605 155z" fill="#ff44ee"/>
+  <text x="600" y="320" text-anchor="middle" font-family="system-ui, sans-serif" font-size="72" font-weight="800" fill="#F736F6">ocync</text>
+  <text x="600" y="380" text-anchor="middle" font-family="system-ui, sans-serif" font-size="28" fill="#bcc6ec">Sync OCI container images across registries</text>
+  <rect x="0" y="620" width="1200" height="10" fill="url(#grad)"/>
+</svg>

@@ -1,0 +1,384 @@
+---
+import BaseLayout from "./BaseLayout.astro";
+
+interface Props {
+  title: string;
+  description: string;
+  headings?: { depth: number; slug: string; text: string }[];
+}
+
+const { title, description, headings = [] } = Astro.props;
+const currentPath = Astro.url.pathname.replace(/\/$/, '');
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith("/") ? rawBase : `${rawBase}/`;
+
+// Section definitions: each maps to a header nav tab
+const navSections = {
+  docs: {
+    label: "Docs",
+    href: `${base}getting-started`,
+    links: [
+      { href: `${base}getting-started`, label: "Getting started" },
+      { href: `${base}configuration`, label: "Configuration" },
+      { href: `${base}cli-reference`, label: "CLI reference" },
+      { href: `${base}helm`, label: "Helm chart" },
+      { href: `${base}performance`, label: "Performance" },
+      { href: `${base}observability`, label: "Observability" },
+      { href: `${base}fips`, label: "FIPS 140-3" },
+    ],
+  },
+  registries: {
+    label: "Registries",
+    href: `${base}registries/ecr`,
+    links: [
+      { href: `${base}registries/ecr`, label: "Amazon ECR" },
+      { href: `${base}registries/docker-hub`, label: "Docker Hub" },
+      { href: `${base}registries/ghcr`, label: "GitHub (GHCR)" },
+      { href: `${base}registries/gar`, label: "Google (GAR)" },
+      { href: `${base}registries/acr`, label: "Azure (ACR)" },
+      { href: `${base}registries/chainguard`, label: "Chainguard" },
+    ],
+  },
+  design: {
+    label: "Design",
+    href: `${base}design/overview`,
+    links: [
+      { href: `${base}design/overview`, label: "Overview" },
+      { href: `${base}design/engine`, label: "Sync engine" },
+      { href: `${base}design/watch-mode`, label: "Watch mode" },
+      { href: `${base}design/benchmark`, label: "Benchmarks" },
+      { href: `${base}design/findings`, label: "Findings" },
+    ],
+  },
+};
+
+// Determine which section the current page belongs to
+type SectionKey = keyof typeof navSections;
+const activeSection = (Object.keys(navSections) as SectionKey[]).find((key) =>
+  navSections[key].links.some((link) => currentPath === link.href),
+);
+const sidebarLinks = activeSection ? navSections[activeSection].links : [];
+
+// Flatten all links for prev/next navigation
+const allLinks = Object.values(navSections).flatMap((s) => s.links);
+const currentIndex = allLinks.findIndex((link) => currentPath === link.href);
+const prevPage = currentIndex > 0 ? allLinks[currentIndex - 1] : null;
+const nextPage = currentIndex < allLinks.length - 1 ? allLinks[currentIndex + 1] : null;
+
+// Table of contents from headings (h2 and h3)
+const tocItems = headings.filter((h) => h.depth === 2 || h.depth === 3);
+
+const canonicalUrl = new URL(Astro.url.pathname, Astro.site);
+
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  headline: title,
+  description,
+  url: canonicalUrl,
+  mainEntityOfPage: { "@type": "WebPage", "@id": canonicalUrl },
+  author: {
+    "@type": "Organization",
+    name: "clowdhaus",
+    url: "https://github.com/clowdhaus",
+  },
+  publisher: {
+    "@type": "Organization",
+    name: "clowdhaus",
+  },
+};
+---
+
+<BaseLayout title={title} description={description} ogType="article" jsonLd={jsonLd}>
+  <div class="doc-shell">
+    <aside class="doc-sidebar" aria-label="Section navigation">
+      <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle navigation menu" aria-expanded="false">
+        <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="3" y1="6" x2="21" y2="6"/>
+          <line x1="3" y1="12" x2="21" y2="12"/>
+          <line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+        <span>Menu</span>
+      </button>
+      <nav aria-label="Documentation" id="sidebar-nav">
+        <ul role="list">
+          {sidebarLinks.map((link) => (
+            <li>
+              <a
+                href={link.href}
+                aria-current={currentPath === link.href ? "page" : undefined}
+              >
+                {link.label}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </nav>
+    </aside>
+
+    <main id="main-content">
+      <article class="prose">
+        <h1>{title}</h1>
+        <slot />
+      </article>
+
+      {(prevPage || nextPage) && (
+        <nav class="page-nav" aria-label="Page navigation">
+          {prevPage ? (
+            <a href={prevPage.href} class="page-nav-link page-nav-prev">
+              <span class="page-nav-dir">Previous</span>
+              <span class="page-nav-title">{prevPage.label}</span>
+            </a>
+          ) : <span />}
+          {nextPage ? (
+            <a href={nextPage.href} class="page-nav-link page-nav-next">
+              <span class="page-nav-dir">Next</span>
+              <span class="page-nav-title">{nextPage.label}</span>
+            </a>
+          ) : <span />}
+        </nav>
+      )}
+    </main>
+
+    {tocItems.length > 2 ? (
+      <aside class="toc-sidebar" aria-label="On this page">
+        <nav>
+          <p class="toc-heading">On this page</p>
+          <ul role="list">
+            {tocItems.map((item) => (
+              <li class={item.depth === 3 ? "toc-sub" : undefined}>
+                <a href={`#${item.slug}`}>{item.text}</a>
+              </li>
+            ))}
+          </ul>
+        </nav>
+      </aside>
+    ) : (
+      <div class="toc-placeholder" />
+    )}
+  </div>
+
+  <script is:inline>
+    document.addEventListener('astro:page-load', function() {
+      var toggle = document.getElementById('sidebar-toggle');
+      var nav = document.getElementById('sidebar-nav');
+      if (toggle && nav && !toggle.dataset.bound) {
+        toggle.dataset.bound = 'true';
+        toggle.addEventListener('click', function() {
+          var expanded = toggle.getAttribute('aria-expanded') === 'true';
+          toggle.setAttribute('aria-expanded', String(!expanded));
+          nav.classList.toggle('sidebar-nav-open');
+        });
+      }
+    });
+  </script>
+</BaseLayout>
+
+<style>
+  .doc-shell {
+    display: grid;
+    grid-template-columns: var(--sidebar-width) 1fr 12rem;
+    max-inline-size: var(--content-max);
+    margin-inline: auto;
+    min-block-size: calc(100dvh - 8rem);
+  }
+
+  .doc-sidebar {
+    position: sticky;
+    inset-block-start: 3.5rem;
+    align-self: start;
+    block-size: calc(100dvh - 3.5rem);
+    overflow-y: auto;
+    padding-block: var(--space-8);
+    padding-inline: var(--space-6);
+    border-inline-end: 1px solid var(--color-border);
+  }
+
+  .sidebar-toggle {
+    display: none;
+  }
+
+  .doc-sidebar ul {
+    list-style: none;
+  }
+
+  .doc-sidebar a {
+    display: block;
+    padding-block: var(--space-1);
+    padding-inline: var(--space-3);
+    border-radius: var(--radius-sm);
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    text-decoration: none;
+
+    &:hover {
+      color: var(--color-text);
+      background-color: var(--color-bg-surface);
+      text-decoration: none;
+    }
+
+    &[aria-current="page"] {
+      color: var(--color-accent);
+      background-color: var(--color-bg-surface);
+      font-weight: 600;
+    }
+  }
+
+  main {
+    padding-block: var(--space-8);
+    padding-inline: var(--space-12);
+    min-inline-size: 0;
+  }
+
+  /* Right-side table of contents */
+  .toc-sidebar {
+    position: sticky;
+    inset-block-start: 3.5rem;
+    align-self: start;
+    block-size: calc(100dvh - 3.5rem);
+    overflow-y: auto;
+    padding-block: var(--space-8);
+    padding-inline-end: var(--space-4);
+    border-inline-start: 1px solid var(--color-border);
+  }
+
+  .toc-heading {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    color: var(--color-text-muted);
+    margin-block-end: var(--space-3);
+    padding-inline-start: var(--space-4);
+  }
+
+  .toc-sidebar ul {
+    list-style: none;
+  }
+
+  .toc-sidebar li + li {
+    margin-block-start: var(--space-1);
+  }
+
+  .toc-sidebar a {
+    display: block;
+    font-size: var(--text-xs);
+    color: var(--color-text-muted);
+    text-decoration: none;
+    padding-block: 2px;
+    padding-inline-start: var(--space-4);
+    border-inline-start: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+
+    &:hover {
+      color: var(--color-link-hover);
+      border-inline-start-color: var(--color-link-hover);
+    }
+  }
+
+  .toc-sub a {
+    padding-inline-start: var(--space-8);
+  }
+
+  /* Previous / Next navigation */
+  .page-nav {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-4);
+    margin-block-start: var(--space-12);
+    padding-block-start: var(--space-8);
+    border-block-start: 1px solid var(--color-border);
+  }
+
+  .page-nav-link {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-4);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    text-decoration: none;
+    transition: border-color 0.15s;
+
+    &:hover {
+      border-color: var(--color-accent);
+      text-decoration: none;
+    }
+  }
+
+  .page-nav-next {
+    text-align: end;
+    grid-column: 2;
+  }
+
+  .page-nav-dir {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    color: var(--color-text-muted);
+  }
+
+  .page-nav-title {
+    font-weight: 600;
+    color: var(--color-accent);
+  }
+
+  @media (width < 48rem) {
+    .doc-shell {
+      grid-template-columns: 1fr;
+    }
+
+    .doc-sidebar {
+      position: static;
+      block-size: auto;
+      border-inline-end: none;
+      border-block-end: 1px solid var(--color-border);
+      padding-block: var(--space-4);
+      overflow-y: visible;
+    }
+
+    .sidebar-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-2);
+      background: none;
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-md);
+      padding: var(--space-2) var(--space-4);
+      font-size: var(--text-sm);
+      font-weight: 600;
+      color: var(--color-text-muted);
+      cursor: pointer;
+      inline-size: 100%;
+      justify-content: center;
+    }
+
+    #sidebar-nav {
+      display: none;
+      margin-block-start: var(--space-4);
+    }
+
+    #sidebar-nav.sidebar-nav-open {
+      display: block;
+    }
+
+    main {
+      padding-inline: var(--space-4);
+    }
+
+    .toc-sidebar,
+    .toc-placeholder {
+      display: none;
+    }
+
+    .page-nav {
+      grid-template-columns: 1fr;
+    }
+
+    .page-nav-next {
+      text-align: start;
+      grid-column: 1;
+    }
+  }
+</style>

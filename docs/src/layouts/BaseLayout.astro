@@ -1,0 +1,235 @@
+---
+interface Props {
+  title: string;
+  description: string;
+  ogImage?: string;
+  ogType?: string;
+  jsonLd?: Record<string, unknown>;
+}
+
+import "../styles/global.css";
+import { ClientRouter } from "astro:transitions";
+
+const base = import.meta.env.BASE_URL.endsWith("/") ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+
+const {
+  title,
+  description,
+  ogImage = `${base}og-image.png`,
+  ogType = "website",
+  jsonLd,
+} = Astro.props;
+
+const canonicalUrl = new URL(Astro.url.pathname, Astro.site);
+const fullTitle = title === "ocync" ? title : `${title} | ocync`;
+const ogImageUrl = new URL(ogImage, Astro.site);
+
+// Header nav active state
+const pathname = Astro.url.pathname.replace(/\/$/, "");
+const isDocsActive =
+  pathname === `${base}getting-started`.replace(/\/$/, "") ||
+  pathname.startsWith(`${base}configuration`.replace(/\/$/, "")) ||
+  pathname.startsWith(`${base}cli-reference`.replace(/\/$/, "")) ||
+  pathname.startsWith(`${base}helm`.replace(/\/$/, "")) ||
+  pathname.startsWith(`${base}performance`.replace(/\/$/, "")) ||
+  pathname.startsWith(`${base}observability`.replace(/\/$/, "")) ||
+  pathname.startsWith(`${base}fips`.replace(/\/$/, ""));
+const isRegistriesActive = pathname.startsWith(
+  `${base}registries`.replace(/\/$/, ""),
+);
+const isDesignActive = pathname.startsWith(
+  `${base}design/`.replace(/\/$/, ""),
+);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href={canonicalUrl} />
+
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content={ogType} />
+    <meta property="og:url" content={canonicalUrl} />
+    <meta property="og:image" content={ogImageUrl} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="ocync: Sync OCI container images across registries" />
+    <meta property="og:site_name" content="ocync" />
+    <meta property="og:locale" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={fullTitle} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImageUrl} />
+    <meta name="twitter:image:alt" content="ocync: Sync OCI container images across registries" />
+
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#1a0f91" media="(prefers-color-scheme: dark)" />
+
+    <link rel="dns-prefetch" href="https://github.com" />
+
+    <script is:inline>
+      function applyTheme() {
+        var t = localStorage.getItem("theme");
+        if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", t);
+      }
+      applyTheme();
+      document.addEventListener("astro:after-swap", applyTheme);
+    </script>
+    <ClientRouter />
+    <link rel="icon" type="image/svg+xml" href={`${base}favicon.svg`} />
+    <link rel="icon" type="image/png" sizes="192x192" href={`${base}favicon-192.png`} />
+    <link rel="icon" type="image/png" sizes="512x512" href={`${base}favicon-512.png`} />
+    <link rel="apple-touch-icon" href={`${base}apple-touch-icon.png`} />
+    <link rel="sitemap" href={`${base}sitemap-index.xml`} />
+
+    {
+      jsonLd && (
+        <script
+          type="application/ld+json"
+          set:html={JSON.stringify(jsonLd)}
+        />
+      )
+    }
+  </head>
+  <body>
+    <a href="#main-content" class="skip-link">Skip to content</a>
+
+    <header class="site-header">
+      <nav aria-label="Primary">
+        <a href={base} class="site-logo">
+          <img src={`${base}favicon.svg`} alt="" width="24" height="24" class="site-logo-mark" />
+          ocync
+        </a>
+        <ul class="site-nav" role="list">
+          <li>
+            <a
+              href={`${base}getting-started`}
+              aria-current={isDocsActive ? "true" : undefined}
+            >Docs</a>
+          </li>
+          <li>
+            <a
+              href={`${base}registries/ecr`}
+              aria-current={isRegistriesActive ? "true" : undefined}
+            >Registries</a>
+          </li>
+          <li>
+            <a
+              href={`${base}design/overview`}
+              aria-current={isDesignActive ? "true" : undefined}
+            >Design</a>
+          </li>
+          <li>
+            <a href="https://github.com/clowdhaus/ocync" rel="noopener">GitHub</a>
+          </li>
+          <li>
+            <button
+              id="theme-toggle"
+              class="theme-toggle"
+              aria-label="Switch to dark mode"
+            >
+              <svg class="icon-sun" aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+              </svg>
+              <svg class="icon-moon" aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+              </svg>
+            </button>
+          </li>
+        </ul>
+      </nav>
+    </header>
+
+    <slot />
+
+    <script is:inline>
+      document.addEventListener('astro:page-load', function() {
+        // Theme toggle
+        var toggle = document.getElementById('theme-toggle');
+        if (toggle && !toggle.dataset.bound) {
+          toggle.dataset.bound = 'true';
+          toggle.addEventListener('click', function() {
+            var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            var next = isDark ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('theme', next);
+            toggle.setAttribute('aria-label', next === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+          });
+        }
+        // Update toggle label to match current theme
+        if (toggle) {
+          var current = document.documentElement.getAttribute('data-theme');
+          toggle.setAttribute('aria-label', current === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+        }
+
+        // Copy buttons
+        document.querySelectorAll('pre').forEach(function(pre) {
+          if (pre.querySelector('.copy-btn')) return;
+          var btn = document.createElement('button');
+          btn.className = 'copy-btn';
+          btn.setAttribute('aria-label', 'Copy code');
+          btn.textContent = 'Copy';
+          btn.addEventListener('click', function() {
+            var code = pre.querySelector('code');
+            if (!code) return;
+            navigator.clipboard.writeText(code.textContent).then(function() {
+              btn.textContent = 'Copied';
+              btn.classList.add('copied');
+              setTimeout(function() {
+                btn.textContent = 'Copy';
+                btn.classList.remove('copied');
+              }, 1500);
+            });
+          });
+          pre.appendChild(btn);
+        });
+      });
+    </script>
+
+    <div class="gradient-rule" aria-hidden="true"></div>
+    <footer class="site-footer">
+      <p>
+        ocync is open source under the
+        <a href="https://github.com/clowdhaus/ocync/blob/main/LICENSE" rel="noopener"
+          >Apache-2.0 license</a
+        >.
+      </p>
+    </footer>
+  </body>
+</html>
+
+<style>
+  .theme-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-pill);
+    padding: var(--space-2);
+    cursor: pointer;
+    color: var(--color-text-muted);
+    transition: color 0.15s, border-color 0.15s;
+  }
+
+  .theme-toggle:hover {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+
+  :global(:root[data-theme="dark"]) .icon-sun { display: block; }
+  :global(:root[data-theme="dark"]) .icon-moon { display: none; }
+  :global(:root[data-theme="light"]) .icon-sun,
+  :global(:root:not([data-theme])) .icon-sun { display: none; }
+  :global(:root[data-theme="light"]) .icon-moon,
+  :global(:root:not([data-theme])) .icon-moon { display: block; }
+</style>

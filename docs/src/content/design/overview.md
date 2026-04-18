@@ -1,4 +1,8 @@
-# Design
+---
+title: Design overview
+description: User-facing design overview explaining how ocync works and why each choice was made
+order: 1
+---
 
 ocync is a Rust-based OCI registry sync tool that copies container images between registries. It is designed around a single insight: the fastest sync is the one that transfers the fewest bytes and issues the fewest API calls. Wall-clock speed is a consequence of efficiency, not a goal separate from it.
 
@@ -286,12 +290,12 @@ Benchmarked on c6in.4xlarge (Intel, 16 vCPUs, 32 GiB, up to 50 Gbps). Full corpu
 | Metric | ocync | dregsy | regsync |
 |---|---:|---:|---:|
 | Wall clock | **4m 33s** | 36m 22s | 16m 6s |
-| Peak RSS | **58 MB** | 305 MB | 27 MB |
+| Peak RSS | 58 MB | 305 MB | **27 MB** |
 | Requests | **4,131** | 11,190 | 7,719 |
 | Response bytes | **16.9 GB** | 43.4 GB | 35.4 GB |
 | Source blob GETs | **726** | 1,324 | 1,381 |
 | Mounts (success/attempt) | **362/379** | 293/293 | 0/1,380 |
-| Rate-limit 429s | **0** | 49 | 0 |
+| Rate-limit 429s | **0** | 49 | **0** |
 
 Key differentiators:
 
@@ -301,7 +305,7 @@ Key differentiators:
 - **95.5% mount success** vs regsync's 0% (regclient omits `from=` parameter for cross-registry syncs)
 - **Zero duplicate blob GETs** (source-pull dedup via staging)
 
-regsync's lower peak RSS (27 MB vs 58 MB) reflects its sequential architecture - one image, one blob at a time, with Go's ~10-15 MB baseline. ocync's 58 MB comes from concurrent blob transfers, staging maps, and the transfer state cache. The 58 MB vs 27 MB trade-off buys 3.5x faster wall clock.
+regsync's lower peak RSS (27 MB vs 58 MB) reflects its sequential architecture: one image, one blob at a time, with Go's ~10-15 MB baseline. ocync's 58 MB comes from concurrent blob transfers, staging maps, and the transfer state cache. The 58 MB vs 27 MB trade-off buys 3.5x faster wall clock.
 
 Methodology: all traffic routed through bench-proxy (pure-Rust MITM) for byte-accurate request/response counting. Instance metadata captured from `ec2:DescribeInstanceTypes` (authoritative CPU/memory/network). Full results archived to `bench-results/runs/*.json`.
 
@@ -341,6 +345,203 @@ FIPS is the default build (`--features fips`). Cryptography uses aws-lc-rs with 
 
 Linux binaries use `x86_64-unknown-linux-gnu` (not musl) because FIPS certification is validated against glibc. The `+crt-static` flag statically links glibc so the final binary has no dynamic dependencies and runs on `chainguard/static` (zero CVEs, no shell, no package manager).
 
-At startup, `install_crypto_provider()` registers `aws-lc-rs` as the process-wide rustls crypto provider. The call is idempotent -- subsequent calls are silently ignored. When built with `--features fips`, the provider uses the FIPS-validated aws-lc module; with `--features non-fips`, it uses the standard aws-lc backend.
+At startup, `install_crypto_provider()` registers `aws-lc-rs` as the process-wide rustls crypto provider. The call is idempotent; subsequent calls are silently ignored. When built with `--features fips`, the provider uses the FIPS-validated aws-lc module; with `--features non-fips`, it uses the standard aws-lc backend.
 
 macOS and Windows builds use `--no-default-features --features non-fips` (standard aws-lc-rs without FIPS mode) since FIPS certification is only relevant for Linux server deployments.
+
+## OCI artifacts and referrers
+
+OCI 1.1 introduced the referrers API for attaching artifacts (signatures, SBOMs, attestations) to container images. Each artifact manifest includes a `subject` field referencing the parent image digest. This creates a discoverable graph of metadata without polluting the tag namespace.
+
+### Discovery
+
+After syncing an image manifest, ocync queries the source registry's referrers API:
+
+```
+GET /v2/{repo}/referrers/{digest}
+```
+
+This returns an image index listing all artifacts that reference the synced manifest. Common artifact types include cosign signatures, SPDX and CycloneDX SBOMs, in-toto/SLSA attestations, and Notation signatures.
+
+### Configuration
+
+```yaml
+defaults:
+  artifacts:
+    enabled: true                      # default: true (sync all artifacts)
+    include:                           # only sync these artifact types (if specified)
+      - "application/vnd.dev.cosign.artifact.sig.v1+json"
+      - "application/spdx+json"
+    exclude: []                        # exclude specific types
+```
+
+`artifacts.enabled` defaults to `true`, meaning artifacts are synced alongside their parent images unless explicitly disabled. Include and exclude lists filter by artifact media type when finer control is needed.
+
+### `require_artifacts` flag
+
+When `require_artifacts: true` is set, ocync enforces that every synced image has at least one referrer (signature, SBOM, or attestation). If a source image has no referrers, the sync fails with an error rather than silently producing an unsigned image at the target.
+
+Setting `require_artifacts: true` with `artifacts.enabled: false` in the same scope is a CONFIG_ERROR (exit 3) because it is contradictory to require artifacts while disabling their transfer.
+
+### Signature stripping warning
+
+When `artifacts.enabled: false` is configured, ocync emits a WARNING at config validation time. Disabling artifact sync strips signatures and SBOMs from synced images, which means targets receive images without the provenance metadata that downstream consumers may depend on for verification. The `--dry-run` flag queries referrers for each image and reports exactly what would be stripped, so operators can make an informed decision before committing to this configuration.
+
+### Transfer order
+
+Artifacts have a `subject` field referencing the parent image digest, so they must be pushed AFTER the parent image exists at the target:
+
+1. Push image blobs
+2. Push image manifest
+3. Discover referrers at source
+4. For each matching artifact: push artifact blobs, then push artifact manifest (with `subject` pointing to parent)
+
+Pushing artifacts before their subject manifest exists would produce a dangling reference that most registries reject.
+
+### Fallback for older registries
+
+Not all registries support the OCI 1.1 referrers API. Some older registries use the "tag fallback" scheme, where referrers are stored as tags named `sha256-{digest}`. ocync handles both:
+
+1. Try the referrers API first (`GET /v2/{repo}/referrers/{digest}`)
+2. If 404, try tag fallback (`GET /v2/{repo}/manifests/sha256-{digest}`)
+3. If neither works, log at INFO and continue (artifacts are not available at this source)
+
+This two-step fallback ensures artifact sync works across the widest range of registries without requiring operator configuration.
+
+## Manifest format preservation
+
+### Problem
+
+Pushing a Docker v2 Schema 2 manifest to a registry expecting OCI format (or vice versa) changes the digest. The manifest bytes are different, so the SHA-256 is different, so the content-addressable identity of the image changes. Some registries reject manifests with unexpected media types entirely. Existing tools handle this poorly: digests change silently or copies fail with opaque errors.
+
+Digest preservation matters because it is the foundation of the OCI content-addressable model. An image's digest is its identity. If a sync tool changes the digest, consumers cannot verify that the target image is byte-identical to the source. Signature verification breaks (signatures reference the original digest), and deployment pipelines that pin by digest pull a different image than intended.
+
+### Policy
+
+Default: **preserve the original format exactly.** The manifest bytes are transferred verbatim to maintain digest integrity.
+
+| Setting | Behavior |
+|---|---|
+| `preserve` (default) | Push manifest bytes as-is. Digest unchanged. |
+| `oci` | Convert Docker v2 Schema 2 to OCI Image Manifest before push. Digest WILL change. Log WARNING. |
+| `docker-v2` | Convert OCI to Docker v2 Schema 2 before push. Digest WILL change. Log WARNING. |
+
+Per-registry override is available for broken registries that require a specific format:
+
+```yaml
+registries:
+  legacy-harbor:
+    url: harbor.internal.io
+    manifest_format: oci
+```
+
+### ECR immutable tag handling
+
+When pushing to an ECR repository with `image_tag_mutability: IMMUTABLE`, pushing an existing tag returns `ImageTagAlreadyExistsException`. ocync treats this as **success** because the image is already there with that tag. The exception is logged at DEBUG level (not an error, not even a warning) and the image is marked as skipped with reason `tag_immutable_exists`.
+
+This makes re-runs fully idempotent without requiring `skip_existing: true`. A sync that is interrupted and restarted will pick up where it left off, and tags that were already pushed in the previous partial run are silently accepted.
+
+## Platform subset filtering
+
+### Default: all platforms
+
+When `platforms` is omitted from the config, the full image index (all platforms) is copied. This is the safe, faithful mirror default. `platforms: all` is not a valid config value; simply omit the field to get all platforms.
+
+### Subset: trimmed index
+
+When `platforms` is specified, ocync builds a new image index containing only the requested platforms:
+
+```yaml
+mappings:
+  - from: chainguard/nginx
+    to: mirror/nginx
+    platforms: [linux/amd64, linux/arm64]
+```
+
+The source image index is pulled in full, filtered to the requested platforms, and only the blobs and manifests for those platforms are transferred. The pushed index contains only the matching platform entries and will have a **different digest** than the source index (fewer entries means different bytes means different SHA-256). This is expected and logged at INFO.
+
+### Missing platforms
+
+If a requested platform is not available in the source image index, ocync logs a WARNING and continues with the platforms that are available. A source image that offers `linux/amd64` but not `linux/arm64` will sync the amd64 platform and warn about the missing arm64 entry.
+
+If **zero** requested platforms match any manifest in the source index, ocync returns an error with actionable context: the configured platform filter, the platforms actually available in the source index, and the source reference. An empty filtered index is never pushed to targets because it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading into an unusable state.
+
+## Skip optimization hierarchy
+
+When deciding whether to sync a tag, ocync evaluates three tiers in order. The first match wins.
+
+### Tier 1: immutable_tags pattern match (0 API calls)
+
+```yaml
+defaults:
+  tags:
+    immutable_tags: "v?[0-9]*.[0-9]*.[0-9]*"
+```
+
+When a tag matches the `immutable_tags` glob pattern AND the tag name appears in the target's tag list (already fetched during planning): skip immediately. No manifest HEAD, no digest comparison. Zero additional API calls.
+
+Semver tags (`v1.2.3`, `3.12.1`) are conventionally immutable. Once a version is published, changing its contents breaks every consumer that pinned to it. The convention is strong enough that checking their digest on every sync run is waste. Operators who use mutable semver tags (uncommon but not unheard of) should not configure `immutable_tags`.
+
+### Tier 2: skip_existing (1 API call, digest ignored)
+
+```yaml
+mappings:
+  - from: library/redis
+    to: mirror/redis
+    skip_existing: true
+```
+
+When `skip_existing: true` is set: send a manifest HEAD request. If the target returns 200 (tag exists), skip. The digest is NOT compared; any version of the image at that tag is considered sufficient. Use case: mirrors where initial population is the goal, not keeping tags updated with source changes.
+
+### Tier 3: default HEAD + digest compare
+
+The default behavior. Send a manifest HEAD to the target. Compare the digest with the source manifest digest. Same digest means the image is unchanged, so skip. Different digest means the image was updated at source, so sync the new version. 404 means the tag does not exist at the target, so sync it.
+
+### Performance impact
+
+For a repository with 2,000 semver tags where only 5 are new:
+
+- **Without optimization:** 2,000 HEAD requests (~30s at ECR rate limits)
+- **With `immutable_tags`:** 5 HEAD requests for the new tags (~0.1s), 1,995 skipped from tag list
+
+The difference is 300x fewer API calls and ~30 seconds saved per repository per sync cycle. For a configuration with 20 repositories, this saves ~10 minutes of pure API latency per run.
+
+## Non-goals
+
+These are explicit non-goals, listed with rationale for each.
+
+- **No deletion/pruning.** Registries handle lifecycle (ECR lifecycle policies, Harbor retention). A sync tool that deletes is a sync tool that can destroy production images on misconfiguration.
+- **No image building.** ocync syncs existing images. Building is a separate concern with separate tooling.
+- **No signature verification.** ocync transfers signatures faithfully but does NOT verify them. Verification is the consumer's responsibility. A sync tool that verifies signatures would need to manage trust roots, which is out of scope.
+- **No Docker daemon integration.** Pure OCI Distribution API only. The Docker daemon is a local concern; registry sync is a remote-to-remote operation.
+- **No skopeo dependency.** Everything is native Rust over HTTPS. No subprocess calls, no shell-out, no binary dependency to version-match.
+- **No local disk buffering.** Blobs stream source to target without touching disk (single-target mode). Multi-target mode uses content-addressable staging, but single-target deployments pay zero disk I/O.
+- **No date sort.** Date-based sorting requires O(n) manifest + config fetches to retrieve creation timestamps, which is prohibitively expensive for large tag sets. A repository with 2,000 tags would need 2,000 additional API calls just to sort. Use `alpha` for date-stamped tags (YYYYMMDD sorts correctly in lexicographic order).
+- **No OTLP export (v1).** Prometheus metrics are the priority. OTLP is deferred to a future version.
+- **No per-mapping schedules in watch mode.** One global interval for simplicity and predictability. Per-mapping schedules create complex interactions (overlapping syncs to the same target, uneven resource usage) for marginal benefit.
+
+## Output philosophy
+
+**Silence means success.** Output means action was taken or something went wrong. Anything expected and successful is silent.
+
+Existing tools get this catastrophically wrong:
+
+- **skopeo** dumps walls of "existing blob" messages. Every blob that already exists at the target produces a line of output. A sync of 50 images where 47 are unchanged produces hundreds of lines that communicate nothing actionable.
+- **regsync** floods with repeated status noise, emitting progress updates for every operation regardless of whether the operator needs to act on them.
+- **dregsy** swallows errors while being verbose about everything else. The one category of output that demands attention is the one it suppresses.
+
+A successful ocync sync of 50 images where 47 are unchanged produces the summary only, not 500 lines of noise:
+
+```
+synced   chainguard/nginx:1.27 -> mirror/nginx:1.27       (187 MB, 14s)
+synced   chainguard/python:3.12 -> mirror/python:3.12     (245 MB, 19s)
+synced   chainguard/node:22 -> mirror/node:22             (312 MB, 22s)
+
+-- Stats --
+  Images:  3 synced, 47 skipped, 0 failed
+  Layers:  12 transferred (89 unique references), 34 mounted
+  Data:    744 MB transferred
+  Time:    47s elapsed
+```
+
+Three lines of action taken, one summary block. The 47 unchanged images are accounted for in the summary ("47 skipped") but do not each produce a line of output. Operators scan this in seconds. Errors, when they occur, are impossible to miss because they are not buried in noise.

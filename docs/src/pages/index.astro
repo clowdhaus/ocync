@@ -1,0 +1,458 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith("/") ? rawBase : `${rawBase}/`;
+
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: "ocync",
+  description:
+    "Sync OCI container images across registries with blob deduplication, cross-repo mounting, and streaming transfers.",
+  applicationCategory: "DeveloperApplication",
+  operatingSystem: "Linux, macOS, Windows",
+  license: "https://opensource.org/licenses/Apache-2.0",
+  url: "https://github.com/clowdhaus/ocync",
+  codeRepository: "https://github.com/clowdhaus/ocync",
+  programmingLanguage: "Rust",
+  downloadUrl: "https://github.com/clowdhaus/ocync/releases",
+  author: {
+    "@type": "Organization",
+    name: "clowdhaus",
+    url: "https://github.com/clowdhaus",
+  },
+  offers: {
+    "@type": "Offer",
+    price: "0",
+    priceCurrency: "USD",
+  },
+};
+
+const stats = [
+  { value: "8x", desc: "faster cold syncs", color: "stat-pink" },
+  { value: "2.6x", desc: "fewer bytes transferred", color: "stat-purple" },
+  { value: "3x", desc: "fewer API calls", color: "stat-aqua" },
+];
+
+const securityPills = [
+  "FIPS 140-3 (NIST #4816)",
+  "Hardened container images",
+  "No elevated privileges",
+  "Native registry auth",
+];
+
+const registries = [
+  "Amazon ECR",
+  "Docker Hub",
+  "GHCR",
+  "GAR",
+  "ACR",
+  "Chainguard",
+  "Any OCI registry",
+];
+---
+
+<BaseLayout
+  title="ocync"
+  description="Sync OCI container images across registries with blob deduplication, cross-repo mounting, and streaming transfers."
+  jsonLd={jsonLd}
+>
+  <main id="main-content">
+    <section class="hero" aria-labelledby="hero-heading">
+      <h1 id="hero-heading">
+        Sync container images across registries,
+        <span class="hero-emphasis">efficiently</span>.
+      </h1>
+      <p class="hero-sub">
+        ocync copies OCI images with blob deduplication, cross-repo mounting,
+        and streaming transfers. 8x faster cold syncs, 2.6x fewer bytes,
+        and zero rate-limit errors.
+      </p>
+      <div class="hero-actions">
+        <a href={`${base}getting-started`} class="btn btn-primary"
+          >Get started</a
+        >
+        <a
+          href="https://github.com/clowdhaus/ocync"
+          class="btn btn-secondary"
+          rel="noopener">GitHub</a
+        >
+      </div>
+    </section>
+
+    <section class="feature-section feature-efficiency" aria-labelledby="efficiency-heading">
+      <div class="feature-block feature-left">
+        <p class="feature-label">01 / Efficiency</p>
+        <h2 id="efficiency-heading">Pull once.<br>Push everywhere.</h2>
+        <p class="feature-copy">
+          Global blob deduplication means shared layers transfer exactly once
+          from source, then mount across all targets. AIMD concurrency adapts
+          to each registry independently: no manual tuning, no throttling.
+        </p>
+        <div class="stat-row">
+          {stats.map((stat) => (
+            <div class="stat-item">
+              <span class={`stat-number ${stat.color}`}>{stat.value}</span>
+              <span class="stat-desc">{stat.desc}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+
+    <section class="feature-section feature-security" aria-labelledby="security-heading">
+      <div class="feature-block feature-right">
+        <p class="feature-label">02 / Security</p>
+        <h2 id="security-heading">Secure by default.<br>Not by configuration.</h2>
+        <p class="feature-copy">
+          FIPS 140-3 validated cryptography ships in every Linux build. Minimal,
+          hardened deployment artifacts. No elevated privileges required, ever.
+        </p>
+        <div class="pill-row" role="list" aria-label="Security features">
+          {securityPills.map((pill) => (
+            <span class="pill" role="listitem">{pill}</span>
+          ))}
+        </div>
+      </div>
+    </section>
+
+    <section class="feature-section feature-experience" aria-labelledby="experience-heading">
+      <div class="feature-block feature-left">
+        <p class="feature-label">03 / Experience</p>
+        <h2 id="experience-heading">One binary.<br>Ship it anywhere.</h2>
+        <p class="feature-copy">
+          A single CLI binary with zero runtime dependencies. Helm chart
+          supports Deployment, CronJob, or Job. Watch mode for continuous
+          sync. Container images ready to pull.
+        </p>
+        <div class="feature-code">
+          <pre aria-label="Usage example"><code><span class="c"># Copy a single image</span>
+<span class="cmd">ocync</span> <span class="arg">copy</span> cgr.dev/chainguard/nginx:latest \
+    123456789012.dkr.ecr.us-east-1.amazonaws.com/nginx:latest
+
+<span class="c"># Or deploy with Helm</span>
+<span class="cmd">helm</span> <span class="arg">install</span> ocync oci://public.ecr.aws/clowdhaus/ocync</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="feature-section feature-registries" aria-labelledby="registries-heading">
+      <div class="feature-block feature-right">
+        <p class="feature-label">04 / Registries</p>
+        <h2 id="registries-heading">Every registry.<br>Auto-detected auth.</h2>
+        <p class="feature-copy">
+          Auto-detected auth and provider-specific optimizations. ECR blob
+          mounting. Docker Hub rate-limit awareness. Works with any
+          OCI-compliant registry out of the box.
+        </p>
+        <div class="registry-pills" role="list" aria-label="Supported registries">
+          {registries.map((name) => (
+            <span role="listitem">{name}</span>
+          ))}
+        </div>
+        <a href={`${base}registries/ecr`} class="registry-link">View registry guides</a>
+      </div>
+    </section>
+  </main>
+</BaseLayout>
+
+<style>
+  /* Hero */
+  .hero {
+    text-align: center;
+    padding-block: var(--space-24);
+    padding-inline: var(--space-6);
+    max-inline-size: 50rem;
+    margin-inline: auto;
+
+    & h1 {
+      font-size: clamp(2rem, 5vw, 3.5rem);
+      line-height: 1.1;
+      letter-spacing: -0.02em;
+      text-wrap: balance;
+    }
+  }
+
+  .hero-emphasis {
+    background: linear-gradient(135deg, var(--fuchsia), var(--purple));
+    background-clip: text;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .hero-sub {
+    font-size: var(--text-lg);
+    color: var(--color-text-muted);
+    margin-block-start: var(--space-6);
+    max-inline-size: 40rem;
+    margin-inline: auto;
+    text-wrap: pretty;
+  }
+
+  .hero-actions {
+    display: flex;
+    gap: var(--space-4);
+    justify-content: center;
+    margin-block-start: var(--space-8);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    padding-block: var(--space-3);
+    padding-inline: var(--space-8);
+    border-radius: var(--radius-pill);
+    font-weight: 700;
+    font-size: var(--text-base);
+    text-decoration: none;
+    transition: transform 0.15s;
+
+    &:hover {
+      transform: translateY(-1px);
+    }
+  }
+
+  .btn-primary {
+    background: linear-gradient(135deg, var(--fuchsia), var(--purple));
+    color: var(--color-text-inverse);
+
+    &:hover {
+      background: linear-gradient(135deg, var(--pink), var(--fuchsia));
+      color: var(--color-text-inverse);
+    }
+  }
+
+  .btn-secondary {
+    background-color: transparent;
+    color: var(--color-text);
+    border: 2px solid var(--color-accent);
+
+    &:hover {
+      background-color: var(--color-accent);
+      color: var(--color-text-inverse);
+    }
+  }
+
+  /* Feature sections: shared */
+  .feature-section {
+    padding-block: var(--space-24);
+    padding-inline: var(--space-6);
+  }
+
+  .feature-block {
+    max-inline-size: 44rem;
+  }
+
+  .feature-left {
+    margin-inline-start: max(var(--space-8), 10vw);
+  }
+
+  .feature-right {
+    margin-inline-start: auto;
+    margin-inline-end: max(var(--space-8), 10vw);
+    text-align: end;
+  }
+
+  .feature-label {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    margin-block-end: var(--space-3);
+  }
+
+  .feature-copy {
+    font-size: var(--text-lg);
+    line-height: 1.6;
+    margin-block-start: var(--space-4);
+    text-wrap: pretty;
+  }
+
+  .feature-section h2 {
+    font-size: clamp(1.75rem, 4vw, var(--text-4xl));
+    margin-block-start: 0;
+  }
+
+  /* Section-scoped color overrides via custom properties */
+  .feature-efficiency {
+    background-color: var(--ultramarine);
+    --section-label: var(--color-text-on-dark);
+    --section-heading: var(--pink);
+    --section-copy: var(--color-text-on-dark);
+  }
+
+  .feature-security {
+    background-color: var(--pink);
+    --section-label: var(--color-text-on-pink-muted);
+    --section-heading: var(--color-text-on-pink);
+    --section-copy: var(--color-text-on-pink);
+  }
+
+  .feature-experience {
+    background-color: var(--color-bg);
+    --section-label: var(--color-text-muted);
+    --section-heading: var(--color-text);
+    --section-copy: var(--color-text-muted);
+  }
+
+  .feature-registries {
+    background-color: var(--ultramarine-deep);
+    --section-label: var(--color-text-on-dark);
+    --section-heading: var(--aqua);
+    --section-copy: var(--color-text-on-dark);
+  }
+
+  .feature-section .feature-label { color: var(--section-label); }
+  .feature-section h2 { color: var(--section-heading); }
+  .feature-section .feature-copy { color: var(--section-copy); }
+
+  /* Section 1: Stats */
+  .stat-row {
+    display: flex;
+    gap: var(--space-8);
+    margin-block-start: var(--space-8);
+  }
+
+  .stat-item {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .stat-number {
+    font-size: clamp(2.5rem, 5vw, 3.5rem);
+    font-weight: 800;
+    line-height: 1;
+  }
+
+  .stat-pink { color: var(--pink); }
+  .stat-purple { color: var(--purple); }
+  .stat-aqua { color: var(--aqua); }
+
+  .stat-desc {
+    font-size: var(--text-xs);
+    color: var(--color-text-on-dark);
+    margin-block-start: var(--space-1);
+  }
+
+  /* Section 2: Security pills */
+  .pill-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-block-start: var(--space-8);
+    justify-content: flex-end;
+  }
+
+  .pill {
+    background-color: var(--color-pill-on-pink);
+    padding-block: var(--space-2);
+    padding-inline: var(--space-4);
+    border-radius: var(--radius-pill);
+    color: var(--color-text-on-pink);
+    font-size: var(--text-sm);
+    font-weight: 600;
+  }
+
+  /* Section 3: Code example */
+  .feature-code {
+    margin-block-start: var(--space-8);
+
+    & pre {
+      background-color: var(--ultramarine);
+      padding: var(--space-8);
+      border-radius: var(--radius-lg);
+    }
+
+    & code {
+      font-size: var(--text-base);
+      line-height: 2;
+      color: var(--color-text-on-dark-bright);
+      background: none;
+      padding: 0;
+    }
+
+    & .c { color: var(--color-text-on-dark-muted); }
+    & .cmd { color: var(--aqua); }
+    & .arg { color: var(--pink); }
+  }
+
+  /* Section 4: Registry pills */
+  .registry-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-block-start: var(--space-8);
+    justify-content: flex-end;
+
+    & span {
+      background-color: color-mix(in srgb, var(--aqua) 15%, transparent);
+      border: 1px solid color-mix(in srgb, var(--aqua) 30%, transparent);
+      padding-block: var(--space-2);
+      padding-inline: var(--space-4);
+      border-radius: var(--radius-pill);
+      color: var(--aqua);
+      font-size: var(--text-sm);
+      font-weight: 600;
+    }
+  }
+
+  .registry-link {
+    display: inline-block;
+    margin-block-start: var(--space-6);
+    color: var(--cyan-bright);
+    font-weight: 600;
+    font-size: var(--text-sm);
+    transition: color 0.15s;
+  }
+
+  /* Dark mode section overrides */
+  :global(:root[data-theme="dark"]) .feature-efficiency {
+    background-color: var(--ultramarine-deep);
+  }
+
+  :global(:root[data-theme="dark"]) .feature-experience {
+    background-color: var(--ultramarine-light);
+  }
+
+  /* Mobile */
+  @media (width < 48rem) {
+    .hero {
+      padding-block: var(--space-12);
+
+      & h1 {
+        font-size: var(--text-3xl);
+      }
+    }
+
+    .hero-sub {
+      font-size: var(--text-base);
+    }
+
+    .hero-actions {
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .feature-left,
+    .feature-right {
+      margin-inline: var(--space-4);
+      text-align: start;
+      max-inline-size: none;
+    }
+
+    .feature-section {
+      padding-block: var(--space-12);
+    }
+
+    .stat-row {
+      flex-wrap: wrap;
+      gap: var(--space-4);
+    }
+
+    .pill-row,
+    .registry-pills {
+      justify-content: flex-start;
+    }
+  }
+</style>
