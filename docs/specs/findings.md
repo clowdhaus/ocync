@@ -195,42 +195,47 @@ Four optimizations implemented (branch `benchmark-comparison`):
    `chunk_size` field/builder, `send_patch_chunk`, `ContentRangeMatcher`.
    Net -213 lines.
 
-### Current competitive position (cold sync, Jupyter 5-image corpus)
+### Current competitive position (cold sync, full corpus)
 
-| Tool | Platforms | Requests | Response bytes | Wall clock |
-|------|----------|---------|----------------|------------|
-| **ocync** (streaming PUT) | 2 (multi-arch) | **1,049** | 11.5 GB | 217.9s |
-| dregsy (skopeo, `platform: all`) | multi-arch | 1,266 | 4.9 GB | 153.4s |
-| regsync v0.11.3 | 2 (multi-arch) | 1,302 | 11.5 GB | 180.2s |
+Measured 2026-04-18 on c6in.4xlarge (Intel, 16 vCPUs, 32 GiB, up to 50 Gbps).
+Full corpus: 42 images, 55 tags across Docker Hub, cgr.dev, public ECR, nvcr.io.
+Docker Hub authenticated (all tools). 1 iteration per tool.
 
-ocync wins on requests (1,049 vs 1,266 vs 1,302). dregsy transfers
-fewer bytes (4.9 GB vs 11.5 GB) because 172 successful cross-repo
-mounts (BLOB_MOUNTING=ENABLED) eliminated shared layer uploads.
-regsync's mounts all fail (omits `from=` parameter).
+| Metric | ocync | dregsy | regsync |
+|---|---:|---:|---:|
+| Wall clock | **4m 33s** | 36m 22s | 16m 6s |
+| Peak RSS | **58.1 MB** | 304.5 MB | 27.0 MB |
+| Requests | **4,131** | 11,190 | 7,719 |
+| Response bytes | **16.9 GB** | 43.4 GB | 35.4 GB |
+| Source blob GETs | **726** | 1,324 | 1,381 |
+| Source blob bytes | **77.2 KB** | 120.1 KB | 160.5 KB |
+| Mounts (success/attempt) | **362/379** | 293/293 | 0/1,380 |
+| Duplicate blob GETs | **0** | 1 | 1 |
+| Rate-limit 429s | **0** | 49 | 0 |
 
-With ECR blob mounting enabled, ocync's mount short-circuit is a
-disadvantage — re-enabling mounts would save both requests and bytes.
+ocync wins every metric except peak RSS (regsync is lighter at 27 MB).
+Key differentiators:
 
-| Tool | Requests | Response bytes | Wall clock |
-|------|---------|----------------|------------|
-| **ocync** | **81** | 371 KB | **2.5s** |
-| regsync | 27 | 27 KB | 4s |
-| dregsy | 200 | 163 KB | 5.2s |
+- **8x faster** than dregsy, **3.5x faster** than regsync
+- **2.7x fewer requests** than dregsy, **1.9x fewer** than regsync
+- **2.6x fewer response bytes** than dregsy, **2.1x fewer** than regsync
+- **95.5% mount success** (362/379) vs dregsy 100% (293/293) vs regsync 0%
+- **Zero rate-limit 429s** vs dregsy's 49 (AIMD congestion control works)
+- **Zero duplicate blob GETs** (source-pull dedup prevents redundant downloads)
 
-Warm sync: ocync wins wall-clock decisively. regsync uses fewer
-requests (manifest-digest comparison only) but is sequential.
+regsync mounts all fail (regclient omits `from=` parameter for
+cross-registry syncs). dregsy hit 49 rate-limit 429s from Docker Hub
+despite authenticated pulls.
 
-### To re-validate
+**Memory:** regsync's lower RSS (27 MB) reflects its sequential
+architecture -- one image, one blob at a time, with Go's ~10-15 MB
+baseline. ocync's 58 MB comes from concurrent blob transfers
+(BLOB_CONCURRENCY=6), the staging claim/wait maps, transfer state
+cache, and blob frequency map held in memory simultaneously. dregsy's
+304 MB is skopeo buffering full layers in memory before pushing. The
+58 MB vs 27 MB trade-off buys 3.5x faster wall clock.
 
-Re-run after Docker Hub rate limit resets. dregsy now configured with
-`platform: all` for fair multi-arch comparison.
-
-```bash
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
-cargo xtask bench --tools ocync,dregsy,regsync --iterations 1 --limit 5 cold
-cargo xtask bench --tools ocync,dregsy,regsync --limit 5 warm
-```
+Historical data: `bench-results/runs/*.json` (gitignored, on instance)
 
 ---
 
@@ -378,6 +383,70 @@ calls). Returns full manifest bodies, not just existence.
 
 ---
 
+## 2026-04-17 -- Leader-follower mount optimization
+
+### Observation
+
+Leader-follower election ensures images with the most shared blobs execute
+first (leaders), committing manifests before followers start. Followers then
+mount shared blobs from the leader's repo instead of re-uploading. Tested
+on c6in.large, Jupyter corpus (5 images, 1 tag each), cold sync to ECR
+us-east-1. Branch: `feat/leader-follower-mount`.
+
+| Metric | Before (streaming PUT, no L-F) | After (leader-follower + blob concurrency) |
+|--------|-------------------------------|---------------------------------------------|
+| Requests | 1,049 | **591** |
+| Response bytes | 11.5 GB | **4.9 GB** |
+| Wall clock | 217.9s | **56.8s** |
+| Mount attempts | 0 (short-circuited) | 192 |
+| Mount success | 0 | **192 (100%)** |
+
+**591 requests vs 1,049** -- 44% fewer API calls. **4.9 GB vs 11.5 GB** --
+57% fewer bytes via cross-image staging dedup and 100% mount success.
+**56.8s vs 217.9s** -- 3.8x faster wall clock via 6-concurrent blob
+transfers within each image (matching skopeo's default parallelism).
+
+Preferred mount sources (leader repos with committed manifests) are tried
+first, avoiding 202 rejections from follower repos whose manifests have
+not yet been committed. This raised mount success from 40% to 100%.
+
+### Bugs found and fixed
+
+`ClaimAction::Wait` uses `tokio::sync::Notify::notify_waiters()` which does
+not store permits. Three code paths transitioned blobs out of `InProgress`
+without calling `notify_blob`:
+
+1. Mount success: `set_blob_completed` + continue (no notify)
+2. HEAD exists: `set_blob_exists` + continue (no notify)
+3. Mount failure: `invalidate_blob` (no notify before fallback)
+
+This caused deadlocks when two followers raced on a shared blob: one mounted
+without notifying, the other waited forever. Latent before leader-follower
+because concurrent promotion made the first claimer typically the uploader
+(no mount source available in the early phase). Fixed by adding `notify_blob`
+on all three paths.
+
+### Action taken
+
+- Greedy set-cover election (`elect_leaders`) reorders pending tasks so
+  images with the most shared blobs transfer first
+- Wave-based follower promotion: wave 1 (blobs covered by leaders) runs
+  first, wave 2 (inter-follower deps) waits for wave 1 to commit
+- `notify_blob` added to mount-success, HEAD-exists, and invalidate paths
+- Skip HEAD after NotMounted (202 already confirms blob absent)
+- Cross-image source blob dedup via staging (pull once, push from disk)
+
+### To re-validate
+
+```bash
+cargo xtask bench --tools ocync,dregsy,regsync --iterations 1 --limit 5 cold
+```
+
+Compare mount success rate, total requests, and response bytes across
+all three tools.
+
+---
+
 ## Optimization backlog
 
 Ranked by estimated impact. Updated as findings change our
@@ -385,7 +454,7 @@ understanding. Each entry ships as its own PR.
 
 | # | Optimization | Impact | Complexity | Status |
 |---|-------------|--------|------------|--------|
-| 1 | **ECR blob mounting** -- detect `BLOB_MOUNTING`, re-enable mount when set | Saves blob transfer for every shared layer across ECR repos | Medium | **Confirmed working.** Requires blob to be part of a committed image. See findings entry for details. |
+| 1 | ~~**ECR blob mounting**~~ | ~~Saves blob transfer for every shared layer~~ | ~~Medium~~ | **Done.** Leader-follower + blob concurrency: 192/192 mounts, 44% fewer requests, 57% fewer bytes, 3.8x faster. |
 | 2 | **Cross-image blob download dedup** — download each unique blob from source once, push to N target repos | ~168 source GETs, ~5.6 GB on Jupyter corpus | High | Not started |
 | 3 | **Docker Hub authentication** — always authenticate pulls, add credential support for source registries | 10× more pull quota (100/hr vs 10/hr) | Low | Not started |
 | 4 | **ACR streaming PUT fallback** — `ProviderKind::Acr` with chunked PATCH for blobs > 20 MB | Correctness on ACR (currently broken for large blobs) | Low | Not started |
@@ -394,14 +463,15 @@ understanding. Each entry ships as its own PR.
 | 7 | **Rate limit header parsing** — read `ratelimit-remaining` from Docker Hub and throttle proactively | Avoid 429s before they happen | Low | Not started |
 | 8 | **Verify HTTP/2 on ECR** — check ALPN negotiation, enable multiplexing | Connection reuse for 50 concurrent requests | Trivial | Not started |
 
-### Completed optimizations (this branch)
+### Completed optimizations
 
 | Optimization | Requests saved | Status |
 |-------------|---------------|--------|
-| Streaming PUT upload (eliminate chunked PATCH + monolithic buffer) | ~2,200 (3,249 to 1,049) | Done |
-| Auth cache fix (EARLY_REFRESH_WINDOW 15 min → 30s) | ~267 | Done |
-| Batch-check HEAD skip (cold sync) | ~247 | Done |
-| ECR mount short-circuit (PR #25) | ~148 | Done |
+| Streaming PUT upload (eliminate chunked PATCH + monolithic buffer) | ~2,200 (3,249 to 1,049) | Done (PR #26) |
+| Auth cache fix (EARLY_REFRESH_WINDOW 15 min to 30s) | ~267 | Done (PR #26) |
+| Batch-check HEAD skip (cold sync) | ~247 | Done (PR #26) |
+| ECR mount short-circuit (PR #25) | ~148 | Done (PR #25) |
+| Leader-follower mount + blob concurrency + staging dedup | ~458 (1,049 to 591), 6.6 GB bytes saved, 3.8x faster | Done (feat/leader-follower-mount) |
 
 ---
 
