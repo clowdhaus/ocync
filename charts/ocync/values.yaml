@@ -1,0 +1,165 @@
+## @param mode Deployment mode: watch | cronjob | job
+mode: watch
+
+image:
+  ## @param image.repository Container image repository
+  repository: public.ecr.aws/clowdhaus/ocync
+  ## @param image.tag Container image tag (defaults to appVersion-fips)
+  tag: ""
+  ## @param image.pullPolicy Container image pull policy
+  pullPolicy: IfNotPresent
+
+## @param imagePullSecrets Image pull secrets
+imagePullSecrets: []
+## @param nameOverride Override the name of the chart
+nameOverride: ""
+## @param fullnameOverride Override the full name of the chart
+fullnameOverride: ""
+
+serviceAccount:
+  ## @param serviceAccount.create Create a service account
+  create: true
+  ## @param serviceAccount.annotations Annotations for the service account (e.g. IRSA/Pod Identity)
+  annotations: {}
+  ## @param serviceAccount.name Override the service account name
+  name: ""
+
+## @param config ocync configuration YAML content
+## Note: global.cache_dir is automatically set to /tmp/ocync-cache so that
+## the transfer state cache and blob staging area use the writable /tmp emptyDir.
+## You can override this in your config if needed.
+## Example:
+##   config:
+##     registries:
+##       source:
+##         hostname: cgr.dev
+##       target:
+##         hostname: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+##         auth: ecr
+##     mappings:
+##       - source: { registry: source, repository: chainguard/static }
+##         targets:
+##           - { registry: target, repository: chainguard/static }
+##         tags: { latest: 5 }
+config: {}
+
+watch:
+  ## @param watch.interval Sync interval in seconds
+  interval: 300
+  ## @param watch.healthPort Health check port
+  healthPort: 8080
+
+cronjob:
+  ## @param cronjob.schedule Cron schedule expression
+  schedule: "0 */6 * * *"
+  ## @param cronjob.successfulJobsHistoryLimit Number of successful jobs to retain
+  successfulJobsHistoryLimit: 3
+  ## @param cronjob.failedJobsHistoryLimit Number of failed jobs to retain
+  failedJobsHistoryLimit: 3
+  ## @param cronjob.concurrencyPolicy CronJob concurrency policy
+  concurrencyPolicy: Forbid
+
+## @param extraArgs Additional CLI arguments
+extraArgs: []
+
+## @param env Additional environment variables
+## Uncomment to route ECR API calls through AWS FIPS endpoints:
+##   env:
+##     - name: AWS_USE_FIPS_ENDPOINT
+##       value: "true"
+env: []
+
+## @param resources Resource requests and limits
+## ocync is single-threaded (tokio current_thread) but network-bound during sync.
+## CPU request influences Karpenter instance-type selection; 500m ensures the
+## workload has enough weight to steer toward network-optimized nodes.
+## Memory: peak RSS observed at ~58 MB during full cold sync (42 images).
+resources:
+  requests:
+    cpu: 500m
+    memory: 128Mi
+    ephemeral-storage: 1Gi
+  limits:
+    memory: 256Mi
+    ephemeral-storage: 2Gi
+
+## @param nodeSelector Node selector
+nodeSelector: {}
+
+## @param tolerations Tolerations
+tolerations: []
+
+## @param affinity Affinity rules
+## Defaults to preferring EC2 network-optimized instance types (25-200 Gbps).
+## This is a soft preference -- pods schedule on any node if these are unavailable.
+## Override with affinity: {} to disable, or replace with your own rules.
+affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+            - key: node.kubernetes.io/instance-type
+              operator: In
+              values:
+                - c5n.large
+                - c5n.xlarge
+                - c5n.2xlarge
+                - c5n.4xlarge
+                - c5n.9xlarge
+                - c5n.18xlarge
+                - c6in.large
+                - c6in.xlarge
+                - c6in.2xlarge
+                - c6in.4xlarge
+                - c6in.8xlarge
+                - c6in.12xlarge
+                - c6in.16xlarge
+                - c6in.24xlarge
+                - c6in.32xlarge
+                - m5n.large
+                - m5n.xlarge
+                - m5n.2xlarge
+                - m5n.4xlarge
+                - m5n.8xlarge
+                - m5n.12xlarge
+                - m5n.16xlarge
+                - m5n.24xlarge
+                - m6in.large
+                - m6in.xlarge
+                - m6in.2xlarge
+                - m6in.4xlarge
+                - m6in.8xlarge
+                - m6in.12xlarge
+                - m6in.16xlarge
+                - m6in.24xlarge
+                - m6in.32xlarge
+                - r5n.large
+                - r5n.xlarge
+                - r5n.2xlarge
+                - r5n.4xlarge
+                - r5n.8xlarge
+                - r5n.12xlarge
+                - r5n.16xlarge
+                - r5n.24xlarge
+                - r6in.large
+                - r6in.xlarge
+                - r6in.2xlarge
+                - r6in.4xlarge
+                - r6in.8xlarge
+                - r6in.12xlarge
+                - r6in.16xlarge
+                - r6in.24xlarge
+                - r6in.32xlarge
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

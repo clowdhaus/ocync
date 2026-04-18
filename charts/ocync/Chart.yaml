@@ -1,0 +1,12 @@
+apiVersion: v2
+name: ocync
+description: OCI container image sync tool
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/clowdhaus/ocync
+sources:
+  - https://github.com/clowdhaus/ocync
+maintainers:
+  - name: Bryant Biggs
+    url: https://github.com/bryantbiggs
