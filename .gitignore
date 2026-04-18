@@ -19,8 +19,15 @@ target
 # Superpowers working documents
 docs/superpowers/
 
-# Benchmark results (generated)
-bench-results/
+# Benchmark: track snapshots (runs/*.json, */summary.md, baseline.json)
+# Ignore transient artifacts (proxy JSONL logs, per-scenario JSON)
+bench-results/*
+!bench-results/runs/
+!bench-results/*/
+!bench-results/baseline.json
+bench-results/*/*.jsonl
+bench-results/*/*.json
+!bench-results/runs/*.json
 
 # Git worktrees
 .worktrees/

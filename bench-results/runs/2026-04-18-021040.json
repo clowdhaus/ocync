@@ -1,0 +1,95 @@
+{
+  "timestamp": "2026-04-18-021040",
+  "instance": {
+    "instance_type": "c6in.4xlarge",
+    "arch": "x86_64",
+    "cpu_model": "Intel",
+    "vcpus": 16,
+    "memory_mib": 32768,
+    "network_performance": "Up to 50 Gigabit",
+    "region": "us-east-1"
+  },
+  "corpus_size": 42,
+  "total_tags": 55,
+  "tool_versions": {
+    "dregsy": "time=\"2026-04-18T02:10:05Z\" level=error msg=\"flag provided but not defined: -version\"",
+    "ocync": "ocync 0.1.0\nFIPS 140-3: compiled=no",
+    "regsync": "VCSTag:     v0.11.3\nVCSRef:     unknown\nVCSCommit:  unknown\nVCSState:   unknown\nVCSDate:    unknown\nPlatform:   linux/amd64\nGoVer:      go1.26.2\nGoCompiler: gc"
+  },
+  "scenarios": [
+    {
+      "scenario": "Cold sync (median)",
+      "runs": [
+        {
+          "tool": "ocync",
+          "wall_clock_secs": 0.005460851,
+          "exit_code": 2,
+          "peak_rss_kb": 9012,
+          "proxy_metrics": {
+            "total_requests": 0,
+            "requests_by_method": {},
+            "status_429_count": 0,
+            "total_request_bytes": 0,
+            "total_response_bytes": 0,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 0
+          },
+          "ocync_json": null
+        },
+        {
+          "tool": "dregsy",
+          "wall_clock_secs": 2182.620386792,
+          "exit_code": 1,
+          "peak_rss_kb": 297364,
+          "proxy_metrics": {
+            "total_requests": 11190,
+            "requests_by_method": {
+              "GET": 3111,
+              "HEAD": 3497,
+              "PATCH": 1324,
+              "POST": 1687,
+              "PUT": 1571
+            },
+            "status_429_count": 49,
+            "total_request_bytes": 42400905717,
+            "total_response_bytes": 43394633805,
+            "duplicate_blob_gets": 1,
+            "mount_attempts": 293,
+            "mount_successes": 293,
+            "source_blob_gets": 1324,
+            "source_blob_bytes": 120085
+          },
+          "ocync_json": null
+        },
+        {
+          "tool": "regsync",
+          "wall_clock_secs": 966.118904769,
+          "exit_code": 1,
+          "peak_rss_kb": 26348,
+          "proxy_metrics": {
+            "total_requests": 7719,
+            "requests_by_method": {
+              "GET": 3015,
+              "HEAD": 1717,
+              "POST": 1396,
+              "PUT": 1591
+            },
+            "status_429_count": 0,
+            "total_request_bytes": 35415127203,
+            "total_response_bytes": 35415415824,
+            "duplicate_blob_gets": 1,
+            "mount_attempts": 1380,
+            "mount_successes": 0,
+            "source_blob_gets": 1381,
+            "source_blob_bytes": 160518
+          },
+          "ocync_json": null
+        }
+      ]
+    }
+  ],
+  "scale": []
+}
