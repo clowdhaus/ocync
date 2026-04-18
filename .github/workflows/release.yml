@@ -1,0 +1,197 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  ECR_REGISTRY: public.ecr.aws/clowdhaus
+  IMAGE_NAME: ocync
+
+jobs:
+  build-linux:
+    name: Build Linux (${{ matrix.artifact }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            artifact: ocync-fips-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            artifact: ocync-fips-linux-arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+      - name: Build
+        env:
+          CARGO_BUILD_RUSTFLAGS: "-C target-feature=+crt-static"
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked
+      - name: Verify static binary
+        run: "! readelf -d target/${{ matrix.target }}/release/ocync | grep -q NEEDED"
+      - name: Rename binary
+        run: mv target/${{ matrix.target }}/release/ocync ${{ matrix.artifact }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  build-macos:
+    name: Build macOS (arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+      - name: Build
+        run: cargo build --release --locked --no-default-features --features non-fips
+      - name: Rename binary
+        run: mv target/release/ocync ocync-macos-arm64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ocync-macos-arm64
+          path: ocync-macos-arm64
+
+  build-windows:
+    name: Build Windows (amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+      - name: Build
+        run: cargo build --release --locked --no-default-features --features non-fips
+      - name: Rename binary
+        shell: bash
+        run: mv target/release/ocync.exe ocync-windows-amd64.exe
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ocync-windows-amd64
+          path: ocync-windows-amd64.exe
+
+  docker:
+    name: Docker (${{ matrix.suffix }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.ECR_PUBLIC_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Login to ECR Public
+        run: aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build and push
+        env:
+          TAG: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-fips-${{ matrix.suffix }}
+        run: |
+          docker build --tag "$TAG" .
+          docker push "$TAG"
+
+  docker-manifest:
+    name: Docker manifest
+    runs-on: ubuntu-24.04
+    needs: docker
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.ECR_PUBLIC_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Login to ECR Public
+        run: aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Create and push manifest (versioned)
+        env:
+          REGISTRY: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          docker manifest create \
+            "$REGISTRY:$VERSION-fips" \
+            "$REGISTRY:$VERSION-fips-amd64" \
+            "$REGISTRY:$VERSION-fips-arm64"
+          docker manifest push "$REGISTRY:$VERSION-fips"
+      - name: Create and push manifest (latest)
+        env:
+          REGISTRY: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          docker manifest create \
+            "$REGISTRY:latest-fips" \
+            "$REGISTRY:$VERSION-fips-amd64" \
+            "$REGISTRY:$VERSION-fips-arm64"
+          docker manifest push "$REGISTRY:latest-fips"
+
+  helm:
+    name: Helm
+    runs-on: ubuntu-24.04
+    needs: docker-manifest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.ECR_PUBLIC_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Login to ECR Public (Helm)
+        run: aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Package Helm chart
+        run: helm package charts/ocync --version "${{ steps.version.outputs.VERSION }}" --app-version "${{ steps.version.outputs.VERSION }}"
+      - name: Push Helm chart
+        env:
+          REGISTRY: ${{ env.ECR_REGISTRY }}
+        run: helm push ocync-*.tgz "oci://$REGISTRY"
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-24.04
+    needs:
+      - build-linux
+      - build-macos
+      - build-windows
+      - docker-manifest
+      - helm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum ocync-* > sha256sums.txt
+      - name: Create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/ocync-*
+            artifacts/sha256sums.txt
