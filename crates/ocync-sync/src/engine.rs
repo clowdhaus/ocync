@@ -957,108 +957,109 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
             c.source_snapshot(&snapshot_key).cloned()
         };
 
-        if let Some(snapshot) = cached
-            && *head_digest == snapshot.source_digest
-            && platform_key == snapshot.platform_filter_key
-        {
-            // Source unchanged, config unchanged. Check targets against
-            // the cached filtered_digest.
-            let compare_digest = snapshot.filtered_digest;
-
-            // HEAD-check all targets concurrently.
-            let mut head_checks = FuturesUnordered::new();
-            for entry in &targets {
-                let client = Arc::clone(&entry.client);
-                let repo = target.repo.clone();
-                let tag = target.tag.clone();
-                let name = entry.name.clone();
-                let checker = entry.batch_checker.clone();
-                head_checks.push(async move {
-                    let result = client.manifest_head(&repo, &tag).await;
-                    (name, client, checker, result)
-                });
-            }
-
-            let mut skipped_results = Vec::new();
-            let mut mismatched_targets = Vec::new();
-
-            while let Some((target_name, target_client, batch_checker, result)) =
-                head_checks.next().await
+        if let Some(snapshot) = cached {
+            if *head_digest == snapshot.source_digest
+                && platform_key == snapshot.platform_filter_key
             {
-                match result {
-                    Ok(Some(_)) if skip_existing => {
-                        info!(
-                            source_repo = %source.repo,
-                            source_tag = %source.tag,
-                            target_repo = %target.repo,
-                            "skipping -- target manifest exists (skip_existing)"
-                        );
-                        tracing::debug!(target: "ocync::metrics", "skip_existing");
-                        skipped_results.push(skip_image_result(
-                            &source,
-                            &target,
-                            SkipReason::SkipExisting,
-                        ));
-                    }
-                    Ok(Some(head)) if head.digest == compare_digest => {
-                        info!(
-                            source_repo = %source.repo,
-                            source_tag = %source.tag,
-                            target_repo = %target.repo,
-                            digest = %compare_digest,
-                            "skipping -- digest matches at target (cache hit)"
-                        );
-                        tracing::debug!(target: "ocync::metrics", "unchanged_skip");
-                        skipped_results.push(skip_image_result(
-                            &source,
-                            &target,
-                            SkipReason::DigestMatch,
-                        ));
-                    }
-                    other => {
-                        if let Err(e) = &other {
-                            warn!(
+                // Source unchanged, config unchanged. Check targets against
+                // the cached filtered_digest.
+                let compare_digest = snapshot.filtered_digest;
+
+                // HEAD-check all targets concurrently.
+                let mut head_checks = FuturesUnordered::new();
+                for entry in &targets {
+                    let client = Arc::clone(&entry.client);
+                    let repo = target.repo.clone();
+                    let tag = target.tag.clone();
+                    let name = entry.name.clone();
+                    let checker = entry.batch_checker.clone();
+                    head_checks.push(async move {
+                        let result = client.manifest_head(&repo, &tag).await;
+                        (name, client, checker, result)
+                    });
+                }
+
+                let mut skipped_results = Vec::new();
+                let mut mismatched_targets = Vec::new();
+
+                while let Some((target_name, target_client, batch_checker, result)) =
+                    head_checks.next().await
+                {
+                    match result {
+                        Ok(Some(_)) if skip_existing => {
+                            info!(
+                                source_repo = %source.repo,
+                                source_tag = %source.tag,
                                 target_repo = %target.repo,
-                                target_tag = %target.tag,
-                                error = %e,
-                                "target manifest HEAD failed, proceeding with sync"
+                                "skipping -- target manifest exists (skip_existing)"
                             );
+                            tracing::debug!(target: "ocync::metrics", "skip_existing");
+                            skipped_results.push(skip_image_result(
+                                &source,
+                                &target,
+                                SkipReason::SkipExisting,
+                            ));
                         }
-                        mismatched_targets.push(TargetEntry {
-                            name: target_name,
-                            client: target_client,
-                            batch_checker,
-                        });
+                        Ok(Some(head)) if head.digest == compare_digest => {
+                            info!(
+                                source_repo = %source.repo,
+                                source_tag = %source.tag,
+                                target_repo = %target.repo,
+                                digest = %compare_digest,
+                                "skipping -- digest matches at target (cache hit)"
+                            );
+                            tracing::debug!(target: "ocync::metrics", "unchanged_skip");
+                            skipped_results.push(skip_image_result(
+                                &source,
+                                &target,
+                                SkipReason::DigestMatch,
+                            ));
+                        }
+                        other => {
+                            if let Err(e) = &other {
+                                warn!(
+                                    target_repo = %target.repo,
+                                    target_tag = %target.tag,
+                                    error = %e,
+                                    "target manifest HEAD failed, proceeding with sync"
+                                );
+                            }
+                            mismatched_targets.push(TargetEntry {
+                                name: target_name,
+                                client: target_client,
+                                batch_checker,
+                            });
+                        }
                     }
                 }
+
+                if mismatched_targets.is_empty() {
+                    // All targets match - skip entirely (preserve existing cache entry).
+                    return (
+                        DiscoveryOutcome::Skip(skipped_results),
+                        DiscoveryRoute::CacheHit,
+                    );
+                }
+
+                // Some targets stale - need full pull for those targets.
+                let outcome = full_pull_and_build_tasks(FullPullParams {
+                    source_client: &source_client,
+                    source: &source,
+                    target: &target,
+                    targets: &mismatched_targets,
+                    skipped_results,
+                    retry: &retry,
+                    platforms: platforms.as_deref(),
+                    skip_existing,
+                    cache: &cache,
+                    snapshot_key: &snapshot_key,
+                    head_digest: Some(head_digest),
+                    platform_key: &platform_key,
+                })
+                .await;
+
+                return (outcome, DiscoveryRoute::TargetStale);
             }
-
-            if mismatched_targets.is_empty() {
-                // All targets match - skip entirely (preserve existing cache entry).
-                return (
-                    DiscoveryOutcome::Skip(skipped_results),
-                    DiscoveryRoute::CacheHit,
-                );
-            }
-
-            // Some targets stale - need full pull for those targets.
-            let outcome = full_pull_and_build_tasks(FullPullParams {
-                source_client: &source_client,
-                source: &source,
-                target: &target,
-                targets: &mismatched_targets,
-                skipped_results,
-                retry: &retry,
-                platforms: platforms.as_deref(),
-                skip_existing,
-                cache: &cache,
-                snapshot_key: &snapshot_key,
-                head_digest: Some(head_digest),
-                platform_key: &platform_key,
-            })
-            .await;
-
-            return (outcome, DiscoveryRoute::TargetStale);
         }
         // Cache miss or source/config changed - fall through.
     }
@@ -1980,20 +1981,20 @@ where
         match f().await {
             Ok(val) => return Ok(val),
             Err(e) => {
-                if let Some(status) = e.status_code()
-                    && retry::should_retry(status, attempt, config.max_retries)
-                {
-                    let backoff = config.backoff_for(attempt);
-                    warn!(
-                        operation,
-                        attempt,
-                        status = %status,
-                        backoff_ms = backoff.as_millis(),
-                        "retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    attempt += 1;
-                    continue;
+                if let Some(status) = e.status_code() {
+                    if retry::should_retry(status, attempt, config.max_retries) {
+                        let backoff = config.backoff_for(attempt);
+                        warn!(
+                            operation,
+                            attempt,
+                            status = %status,
+                            backoff_ms = backoff.as_millis(),
+                            "retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
                 }
                 return Err(e);
             }

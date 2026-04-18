@@ -54,7 +54,7 @@ Created` (the spec-compliant mount-success response).
 
 | Trigger | Corpus | Mount attempts | 201 | 202 | Errors |
 |---|---|---|---|---|---|
-| Jupyter benchmark (commit `56bbfac`) | 5 images × 6 tags, Chainguard → ECR us-east-1 | 178 | 0 | 178 | 0 |
+| Jupyter benchmark (commit `56bbfac`) | 5 images x 6 tags, Chainguard -> ECR us-east-1 | 178 | 0 | 178 | 0 |
 | Ad-hoc probe, 0s wait (commit `c2d33d6`) | synthetic 1 KiB blob | 5 | 0 | 5 | 0 |
 | Ad-hoc probe, 10s wait | same | 5 | 0 | 5 | 0 |
 | Ad-hoc probe, 60s wait | same | 5 | 0 | 5 | 0 |
@@ -72,13 +72,13 @@ manual procedure if the observation needs to be re-run.
 **The OCI cross-repo mount optimization is a no-op on ECR.** It likely
 always has been; the benchmark's proxy-limited throughput masked the
 wasted round-trip cost because ECR returned 202 fast (~100 ms), and the
-engine's fallback path (HEAD → push) was the actual transfer mechanism
+engine's fallback path (HEAD -> push) was the actual transfer mechanism
 regardless.
 
 This is also a design assumption falsification against
 `docs/specs/transfer-optimization-design.md  sectionSame-Registry Optimization`,
 which describes cross-repo mount as a primary optimization for
-`ecr-us/team-a/nginx` → `ecr-us/team-b/nginx`. In practice, that blob
+`ecr-us/team-a/nginx` -> `ecr-us/team-b/nginx`. In practice, that blob
 must be re-uploaded on ECR, not mounted.
 
 **Bytes saved by mount on ECR: 0.** The blob data crosses the network on
@@ -136,7 +136,7 @@ body and `Location` header before flipping the short-circuit globally.
 ### Cost of this particular finding (measured)
 
 3-arm benchmark on c6in.large, cold Chainguard Jupyter corpus (5 images,
-6 tags each) → ECR us-east-1, one iteration:
+6 tags each) -> ECR us-east-1, one iteration:
 
 | Arm | Wall clock | Requests | Bytes | Mount POSTs attempted |
 |-----|-----------|----------|-------|-----------------------|
@@ -179,13 +179,13 @@ Four optimizations implemented (branch `benchmark-comparison`):
 
 1. **Streaming PUT upload.** POST + single streaming PUT with
    `Transfer-Encoding: chunked`, zero buffering. Replaced chunked
-   POST+PATCH×N+PUT (eliminated ~1,400 PATCH requests) and the
+   POST+PATCHxN+PUT (eliminated ~1,400 PATCH requests) and the
    monolithic buffer path. GHCR/GAR fallbacks retained.
 
 2. **EARLY_REFRESH_WINDOW lowered from 15 min to 30 sec.** Docker Hub
    tokens have 300s TTL. The prior 15-minute window caused
    `should_refresh()` to always return true, completely bypassing the
-   token cache (272 redundant auth exchanges → 5).
+   token cache (272 redundant auth exchanges -> 5).
 
 3. **Batch-check HEAD skip.** When ECR batch API confirms blobs are
    absent, the per-blob HEAD is skipped (247 requests eliminated on
@@ -378,7 +378,7 @@ the #1 remaining optimization opportunity - 168 redundant source GETs
 ### BatchGetImage for warm sync
 
 ECR `BatchGetImage` SDK API checks up to 100 manifests per call.
-Could replace per-manifest HEAD checks in warm sync (81 → ~1-2
+Could replace per-manifest HEAD checks in warm sync (81 -> ~1-2
 calls). Returns full manifest bodies, not just existence.
 
 ---
@@ -456,10 +456,10 @@ understanding. Each entry ships as its own PR.
 |---|-------------|--------|------------|--------|
 | 1 | ~~**ECR blob mounting**~~ | ~~Saves blob transfer for every shared layer~~ | ~~Medium~~ | **Done.** Leader-follower + blob concurrency: 192/192 mounts, 44% fewer requests, 57% fewer bytes, 3.8x faster. |
 | 2 | **Cross-image blob download dedup** - download each unique blob from source once, push to N target repos | ~168 source GETs, ~5.6 GB on Jupyter corpus | High | Not started |
-| 3 | **Docker Hub authentication** - always authenticate pulls, add credential support for source registries | 10× more pull quota (100/hr vs 10/hr) | Low | Not started |
+| 3 | **Docker Hub authentication** - always authenticate pulls, add credential support for source registries | 10x more pull quota (100/hr vs 10/hr) | Low | Not started |
 | 4 | **ACR streaming PUT fallback** - `ProviderKind::Acr` with chunked PATCH for blobs > 20 MB | Correctness on ACR (currently broken for large blobs) | Low | Not started |
-| 5 | **BatchGetImage for warm sync** - replace per-manifest HEAD with SDK batch call | ~79 requests → ~1 call on warm sync | Medium | Not started |
-| 6 | **Multi-scope Docker Hub tokens** - batch N repo scopes into 1 token exchange | 5 auth exchanges → 1 (Docker Hub only, cgr.dev incompatible) | Low | Not started |
+| 5 | **BatchGetImage for warm sync** - replace per-manifest HEAD with SDK batch call | ~79 requests -> ~1 call on warm sync | Medium | Not started |
+| 6 | **Multi-scope Docker Hub tokens** - batch N repo scopes into 1 token exchange | 5 auth exchanges -> 1 (Docker Hub only, cgr.dev incompatible) | Low | Not started |
 | 7 | **Rate limit header parsing** - read `ratelimit-remaining` from Docker Hub and throttle proactively | Avoid 429s before they happen | Low | Not started |
 | 8 | **Verify HTTP/2 on ECR** - check ALPN negotiation, enable multiplexing | Connection reuse for 50 concurrent requests | Trivial | Not started |
 

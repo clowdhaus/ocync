@@ -397,19 +397,20 @@ impl Drop for AimdPermit<'_> {
     fn drop(&mut self) {
         // Treat unreported drops as success - errors unrelated to rate limits
         // (timeouts, auth failures, etc.) should not shrink the window.
-        if !self.reported
-            && let Some(state) = self
+        if !self.reported {
+            if let Some(state) = self
                 .windows
                 .lock()
                 .expect("aimd lock poisoned")
                 .get_mut(&self.key)
-        {
-            let old_limit = state.window.limit();
-            state.window.on_success();
-            let new_limit = state.window.limit();
-            // Grow the semaphore if the window expanded.
-            if new_limit > old_limit {
-                state.semaphore.add_permits(new_limit - old_limit);
+            {
+                let old_limit = state.window.limit();
+                state.window.on_success();
+                let new_limit = state.window.limit();
+                // Grow the semaphore if the window expanded.
+                if new_limit > old_limit {
+                    state.semaphore.add_permits(new_limit - old_limit);
+                }
             }
         }
         // aggregate_permit and action_permit are dropped automatically

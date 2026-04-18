@@ -341,6 +341,6 @@ FIPS is the default build (`--features fips`). Cryptography uses aws-lc-rs with 
 
 Linux binaries use `x86_64-unknown-linux-gnu` (not musl) because FIPS certification is validated against glibc. The `+crt-static` flag statically links glibc so the final binary has no dynamic dependencies and runs on `chainguard/static` (zero CVEs, no shell, no package manager).
 
-At startup, `try_fips_mode()` runs a self-check. On failure, the process exits immediately with a clear message rather than silently operating in a non-compliant state.
+At startup, `install_crypto_provider()` registers `aws-lc-rs` as the process-wide rustls crypto provider. The call is idempotent -- subsequent calls are silently ignored. When built with `--features fips`, the provider uses the FIPS-validated aws-lc module; with `--features non-fips`, it uses the standard aws-lc backend.
 
-macOS and Windows builds use `--features aws-lc` (non-FIPS aws-lc-rs) since FIPS certification is only relevant for Linux server deployments.
+macOS and Windows builds use `--no-default-features --features non-fips` (standard aws-lc-rs without FIPS mode) since FIPS certification is only relevant for Linux server deployments.

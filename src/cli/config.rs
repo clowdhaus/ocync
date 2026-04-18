@@ -448,31 +448,31 @@ fn validate_global(global: &GlobalConfig) -> Result<(), ConfigError> {
             "global.max_concurrent_transfers must be >= 1".to_string(),
         ));
     }
-    if let Some(ref ttl) = global.cache_ttl
-        && !is_valid_duration(ttl)
-    {
-        return Err(ConfigError::Validation(format!(
-            "global.cache_ttl '{ttl}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")"
-        )));
+    if let Some(ref ttl) = global.cache_ttl {
+        if !is_valid_duration(ttl) {
+            return Err(ConfigError::Validation(format!(
+                "global.cache_ttl '{ttl}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")"
+            )));
+        }
     }
-    if let Some(ref size) = global.staging_size_limit
-        && !is_valid_size(size)
-    {
-        return Err(ConfigError::Validation(format!(
-            "global.staging_size_limit '{size}' is not a valid size (e.g. \"2GB\", \"500MB\", \"0\")"
-        )));
+    if let Some(ref size) = global.staging_size_limit {
+        if !is_valid_size(size) {
+            return Err(ConfigError::Validation(format!(
+                "global.staging_size_limit '{size}' is not a valid size (e.g. \"2GB\", \"500MB\", \"0\")"
+            )));
+        }
     }
     Ok(())
 }
 
 /// Validate per-registry settings.
 fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), ConfigError> {
-    if let Some(max) = registry.max_concurrent
-        && max < 1
-    {
-        return Err(ConfigError::Validation(format!(
-            "registries.{name}.max_concurrent must be >= 1"
-        )));
+    if let Some(max) = registry.max_concurrent {
+        if max < 1 {
+            return Err(ConfigError::Validation(format!(
+                "registries.{name}.max_concurrent must be >= 1"
+            )));
+        }
     }
 
     if let Some(ref auth_type) = registry.auth_type {
@@ -624,13 +624,13 @@ fn validate_references(config: &Config) -> Result<(), ConfigError> {
         config.registries.keys().map(String::as_str).collect();
 
     for mapping in &config.mappings {
-        if let Some(ref src) = mapping.source
-            && !known.contains(src.as_str())
-        {
-            return Err(ConfigError::Validation(format!(
-                "mapping '{}' references unknown registry '{src}'",
-                mapping.from,
-            )));
+        if let Some(ref src) = mapping.source {
+            if !known.contains(src.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "mapping '{}' references unknown registry '{src}'",
+                    mapping.from,
+                )));
+            }
         }
         if let Some(ref targets) = mapping.targets {
             let context = format!("mapping '{}'", mapping.from);
@@ -647,12 +647,12 @@ fn validate_references(config: &Config) -> Result<(), ConfigError> {
     }
 
     if let Some(ref defaults) = config.defaults {
-        if let Some(ref src) = defaults.source
-            && !known.contains(src.as_str())
-        {
-            return Err(ConfigError::Validation(format!(
-                "defaults references unknown registry '{src}'",
-            )));
+        if let Some(ref src) = defaults.source {
+            if !known.contains(src.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "defaults references unknown registry '{src}'",
+                )));
+            }
         }
         if let Some(ref targets) = defaults.targets {
             let names = resolve_target_names(targets, config, &known, "defaults")?;

@@ -126,9 +126,10 @@ pub(crate) async fn run(
             .as_ref()
             .and_then(|g| g.staging_size_limit.as_deref())
             .and_then(parse_size)
-            && let Err(e) = stage.evict(limit)
         {
-            tracing::warn!(error = %e, "failed to evict staged blobs");
+            if let Err(e) = stage.evict(limit) {
+                tracing::warn!(error = %e, "failed to evict staged blobs");
+            }
         }
         stage
     } else {
@@ -147,8 +148,10 @@ pub(crate) async fn run(
         .await;
 
     // Persist only when we own the cache (sync command). Watch mode persists on shutdown.
-    if should_persist && let Err(e) = cache.borrow().persist(&cache_path) {
-        tracing::error!(error = %e, "failed to persist transfer state cache");
+    if should_persist {
+        if let Err(e) = cache.borrow().persist(&cache_path) {
+            tracing::error!(error = %e, "failed to persist transfer state cache");
+        }
     }
 
     write_output(&report, args.json)?;

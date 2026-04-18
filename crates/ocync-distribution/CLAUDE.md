@@ -40,7 +40,7 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 
 - `default-features = false` everywhere; justify every new dep.
 - `reqwest` needs `system-proxy` + `rustls-tls-native-roots` or proxy/trust-store is silently disabled.
-- Crypto backend: `fips` vs `aws-lc` feature flag (unavoidable platform linking).
+- Crypto backend: `fips` vs `non-fips` feature flags (unavoidable platform linking).
 
 ## Testing
 

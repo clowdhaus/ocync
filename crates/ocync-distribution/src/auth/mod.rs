@@ -174,6 +174,12 @@ impl Token {
         self.expires_at.is_some_and(|exp| Instant::now() >= exp)
     }
 
+    /// Returns `true` if the token is still usable (not expired and not within
+    /// the early-refresh window).
+    pub fn is_valid(&self) -> bool {
+        !self.should_refresh()
+    }
+
     /// Whether this token should be proactively refreshed (remaining lifetime
     /// is below [`EARLY_REFRESH_WINDOW`]).
     pub fn should_refresh(&self) -> bool {

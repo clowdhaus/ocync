@@ -95,13 +95,13 @@ pub(crate) fn ocync_config(corpus: &Corpus) -> String {
         out.push_str(&format!("  {key}:\n"));
         out.push_str(&format!("    url: {reg}\n"));
         // Docker Hub: inject basic auth to avoid 10 pulls/hr anonymous limit.
-        if *reg == "docker.io"
-            && let Some(auth) = &corpus.dockerhub_auth
-        {
-            out.push_str("    auth_type: basic\n");
-            out.push_str("    credentials:\n");
-            out.push_str(&format!("      username: {}\n", auth.username));
-            out.push_str(&format!("      password: {}\n", auth.token));
+        if *reg == "docker.io" {
+            if let Some(auth) = &corpus.dockerhub_auth {
+                out.push_str("    auth_type: basic\n");
+                out.push_str("    credentials:\n");
+                out.push_str(&format!("      username: {}\n", auth.username));
+                out.push_str(&format!("      password: {}\n", auth.token));
+            }
         }
     }
     out.push_str(&format!("  {ecr_key}:\n"));
@@ -155,11 +155,11 @@ pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
         out.push_str("    source:\n");
         out.push_str(&format!("      registry: {registry}\n"));
         // Docker Hub: inject base64-encoded auth to avoid 10 pulls/hr anonymous limit.
-        if *registry == "docker.io"
-            && let Some(auth) = &corpus.dockerhub_auth
-        {
-            let encoded = base64_encode(&format!("{}:{}", auth.username, auth.token));
-            out.push_str(&format!("      auth: {encoded}\n"));
+        if *registry == "docker.io" {
+            if let Some(auth) = &corpus.dockerhub_auth {
+                let encoded = base64_encode(&format!("{}:{}", auth.username, auth.token));
+                out.push_str(&format!("      auth: {encoded}\n"));
+            }
         }
         out.push_str("    target:\n");
         out.push_str(&format!(
@@ -215,11 +215,11 @@ pub(crate) fn regsync_config(corpus: &Corpus) -> String {
         // reject multi-scope requests (cgr.dev, gcr.io, nvcr.io).
         out.push_str("    repoAuth: true\n");
         // Docker Hub: inject user/pass to avoid 10 pulls/hr anonymous limit.
-        if *reg == "docker.io"
-            && let Some(auth) = &corpus.dockerhub_auth
-        {
-            out.push_str(&format!("    user: {}\n", auth.username));
-            out.push_str(&format!("    pass: {}\n", auth.token));
+        if *reg == "docker.io" {
+            if let Some(auth) = &corpus.dockerhub_auth {
+                out.push_str(&format!("    user: {}\n", auth.username));
+                out.push_str(&format!("    pass: {}\n", auth.token));
+            }
         }
     }
     out.push_str(&format!(

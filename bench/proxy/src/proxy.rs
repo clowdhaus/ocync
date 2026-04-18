@@ -495,10 +495,10 @@ struct LogOnDrop<S> {
 
 impl<S> Drop for LogOnDrop<S> {
     fn drop(&mut self) {
-        if !self.logged
-            && let Some(f) = self.on_drop.take()
-        {
-            f();
+        if !self.logged {
+            if let Some(f) = self.on_drop.take() {
+                f();
+            }
         }
     }
 }
@@ -511,12 +511,13 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = Pin::new(&mut self.inner).poll_next(cx);
-        if let Poll::Ready(None) = &item
-            && !self.logged
-            && let Some(f) = self.on_drop.take()
-        {
-            self.logged = true;
-            f();
+        if let Poll::Ready(None) = &item {
+            if !self.logged {
+                if let Some(f) = self.on_drop.take() {
+                    self.logged = true;
+                    f();
+                }
+            }
         }
         item
     }

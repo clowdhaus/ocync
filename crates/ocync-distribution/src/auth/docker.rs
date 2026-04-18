@@ -126,28 +126,28 @@ pub fn resolve_from_docker_config(
 /// Look up static credentials from the `auths` map.
 fn lookup_auths(config: &DockerConfig, registry: &str) -> Result<Option<Credentials>, Error> {
     // Direct match.
-    if let Some(entry) = config.auths.get(registry)
-        && let Some(creds) = entry_to_credentials(entry)?
-    {
-        return Ok(Some(creds));
+    if let Some(entry) = config.auths.get(registry) {
+        if let Some(creds) = entry_to_credentials(entry)? {
+            return Ok(Some(creds));
+        }
     }
 
     // Try with/without https:// prefix.
     let with_scheme = format!("https://{registry}");
-    if let Some(entry) = config.auths.get(&with_scheme)
-        && let Some(creds) = entry_to_credentials(entry)?
-    {
-        return Ok(Some(creds));
+    if let Some(entry) = config.auths.get(&with_scheme) {
+        if let Some(creds) = entry_to_credentials(entry)? {
+            return Ok(Some(creds));
+        }
     }
 
     // Docker Hub aliases -- if the requested registry is any Docker Hub alias,
     // try all other aliases.
     if is_docker_hub(registry) {
         for alias in DOCKER_HUB_ALIASES {
-            if let Some(entry) = config.auths.get(*alias)
-                && let Some(creds) = entry_to_credentials(entry)?
-            {
-                return Ok(Some(creds));
+            if let Some(entry) = config.auths.get(*alias) {
+                if let Some(creds) = entry_to_credentials(entry)? {
+                    return Ok(Some(creds));
+                }
             }
         }
     }
@@ -176,11 +176,11 @@ fn lookup_cred_helper(config: &DockerConfig, registry: &str) -> Option<String> {
 /// Convert an `AuthEntry` to `Credentials`.
 fn entry_to_credentials(entry: &AuthEntry) -> Result<Option<Credentials>, Error> {
     // Prefer the `auth` field (base64 encoded).
-    if let Some(ref encoded) = entry.auth
-        && !encoded.is_empty()
-    {
-        let (username, password) = decode_auth(encoded)?;
-        return Ok(Some(Credentials::Basic { username, password }));
+    if let Some(ref encoded) = entry.auth {
+        if !encoded.is_empty() {
+            let (username, password) = decode_auth(encoded)?;
+            return Ok(Some(Credentials::Basic { username, password }));
+        }
     }
 
     // Fall back to separate username/password fields.
@@ -348,9 +348,7 @@ impl AuthProvider for DockerConfigAuth {
 
             let mut cache = self.cache.lock().await;
 
-            if let Some(token) = cache.get(&key)
-                && !token.should_refresh()
-            {
+            if let Some(token) = cache.get(&key).filter(|t| t.is_valid()) {
                 return Ok(token.clone());
             }
 
