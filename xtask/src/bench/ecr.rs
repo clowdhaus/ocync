@@ -69,10 +69,10 @@ pub(crate) async fn delete_repos(client: &Client, corpus: &Corpus) -> Result<(),
                 if let Some(DeleteRepositoryError::RepositoryNotFoundException(_)) =
                     e.as_service_error()
                 {
-                    // Already gone — fine.
+                    // Already gone -- fine.
                 } else {
                     eprintln!("  warning: failed to delete repo {repo_name}: {e}");
-                    // Log and continue — don't abort cleanup for one failure.
+                    // Log and continue -- don't abort cleanup for one failure.
                 }
             }
         }

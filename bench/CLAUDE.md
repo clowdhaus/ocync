@@ -7,9 +7,9 @@ Benchmark infrastructure for comparing ocync against dregsy and regsync.
 - AWS credentials with ECR access + `ec2:DescribeInstanceTypes`
 - `session-manager-plugin` installed locally (for `bench-remote`)
 - SSM parameters populated:
-  - `/ocync/bench/github-token` -- GitHub PAT for git fetch (private repo)
-  - `/ocync/bench/dockerhub-access-token` -- Docker Hub PAT for authenticated pulls
-  - `/ocync/bench/dockerhub-username` -- Docker Hub account name
+  - `/ocync/bench/github-token` - GitHub PAT for git fetch (private repo)
+  - `/ocync/bench/dockerhub-access-token` - Docker Hub PAT for authenticated pulls
+  - `/ocync/bench/dockerhub-username` - Docker Hub account name
 
 ## Quick start
 
@@ -58,8 +58,8 @@ The `--instance-id` can also be set via `BENCH_INSTANCE_ID` env var.
 4. On completion, fetches `summary.md` and the historical JSON archive
 
 **Output:**
-- `bench-results/<timestamp>/summary.md` -- human-readable comparison table with winners bolded
-- `bench-results/runs/<timestamp>.json` -- full machine-readable archive for historical comparison
+- `bench/results/<timestamp>/summary.md` - human-readable comparison table with winners bolded
+- `bench/results/{registry}.json` - compact per-registry run record archive (tracked in git)
 
 ## Metrics captured per tool per scenario
 
@@ -100,8 +100,8 @@ cargo xtask bench --tools ocync,dregsy,regsync --iterations 3 cold
 | Cargo binaries | `/home/ec2-user/.cargo/bin/` |
 | Bench-proxy CA | `/etc/bench-proxy/ca.pem`, `/etc/bench-proxy/ca-key.pem` |
 | Competitor tools | `/usr/local/bin/{dregsy,regsync,skopeo}` |
-| Results | `/home/ec2-user/ocync/bench-results/<timestamp>/` |
-| Historical archive | `/home/ec2-user/ocync/bench-results/runs/<timestamp>.json` |
+| Results | `/home/ec2-user/ocync/bench/results/<timestamp>/` |
+| Run records | `/home/ec2-user/ocync/bench/results/{registry}.json` |
 
 `BENCH_TARGET_REGISTRY` is set automatically by `bench-remote`. When running manually, derive it from `aws sts get-caller-identity`.
 
@@ -118,7 +118,7 @@ cargo build --release --package ocync --package bench-proxy
 
 ## Instance lifecycle
 
-Managed by Terraform in `bench/terraform/`. `user_data_replace_on_change = true` -- bootstrap changes recreate the instance.
+Managed by Terraform in `bench/terraform/`. `user_data_replace_on_change = true` - bootstrap changes recreate the instance.
 
 ```bash
 cd bench/terraform && terraform init && terraform apply   # create
@@ -129,7 +129,7 @@ The IAM role includes: `AmazonEC2ContainerRegistryFullAccess`, `AmazonSSMManaged
 
 ## Analyzing proxy logs
 
-Raw per-request data lives in `<tool>-proxy.jsonl` files in the results directory.
+Raw per-request data lives in `<tool>-proxy.jsonl` files in `bench/results/<timestamp>/`.
 
 ```bash
 # Count requests by method
@@ -144,3 +144,17 @@ jq -r 'select(.url | contains("mount="))' <tool>-proxy.jsonl | jq -r '.status' |
 # Total response bytes
 jq '[.response_bytes] | add' <tool>-proxy.jsonl
 ```
+
+## Run record archive
+
+Each benchmark run appends a compact record to `bench/results/{registry}.json` (e.g. `ecr.json`). These files are tracked in git for longitudinal comparison across machines, cloud providers, and code versions.
+
+The registry key is derived from the target registry hostname:
+- `*.ecr.*.amazonaws.com` -> `ecr.json`
+- `gcr.io` / `*.gcr.io` / `*-docker.pkg.dev` -> `gcr.json`
+- `*.azurecr.io` -> `acr.json`
+- Anything else -> `other.json`
+
+Each record includes: timestamp, git ref, machine metadata (provider, instance type, arch, vCPUs, memory, network, region), corpus size, and all 9 per-tool metrics per scenario.
+
+Ephemeral per-run directories (`bench/results/<timestamp>/`) are gitignored. The summary.md and proxy JSONL logs are session artifacts for immediate review.

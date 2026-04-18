@@ -1,4 +1,4 @@
-//! xtask — workspace automation commands.
+//! xtask -- workspace automation commands.
 
 mod bench;
 

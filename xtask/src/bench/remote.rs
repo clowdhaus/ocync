@@ -47,7 +47,7 @@ pub(crate) struct BenchRemoteArgs {
     pub(crate) limit: Option<usize>,
 
     /// Local directory to save fetched results.
-    #[arg(long, default_value = "bench-results")]
+    #[arg(long, default_value = "bench/results")]
     pub(crate) output: String,
 }
 
@@ -230,7 +230,7 @@ async fn fetch_results(args: &BenchRemoteArgs) -> Result<(), Box<dyn std::error:
     let ls_output = ssm_exec(
         instance_id,
         region,
-        "ls -td /home/ec2-user/ocync/bench-results/2* 2>/dev/null | head -1",
+        "ls -td /home/ec2-user/ocync/bench/results/2* 2>/dev/null | head -1",
     )
     .await?;
     let remote_dir = ls_output.trim();
@@ -241,10 +241,10 @@ async fn fetch_results(args: &BenchRemoteArgs) -> Result<(), Box<dyn std::error:
 
     let summary = ssm_exec(instance_id, region, &format!("cat {remote_dir}/summary.md")).await?;
 
-    let archive_json = ssm_exec(
+    let registry_json = ssm_exec(
         instance_id,
         region,
-        "ls -t /home/ec2-user/ocync/bench-results/runs/*.json 2>/dev/null | head -1 | xargs cat",
+        "ls -t /home/ec2-user/ocync/bench/results/*.json 2>/dev/null | grep -v baseline | head -1 | xargs cat",
     )
     .await?;
 
@@ -260,18 +260,18 @@ async fn fetch_results(args: &BenchRemoteArgs) -> Result<(), Box<dyn std::error:
     std::fs::write(&summary_path, &summary)?;
     eprintln!("bench-remote: wrote {}", summary_path.display());
 
-    if !archive_json.trim().is_empty() {
-        let runs_dir = Path::new(&args.output).join("runs");
-        std::fs::create_dir_all(&runs_dir)?;
-        let archive_filename =
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&archive_json) {
-                format!("{}.json", val["timestamp"].as_str().unwrap_or("unknown"))
-            } else {
-                format!("{remote_basename}.json")
-            };
-        let archive_path = runs_dir.join(&archive_filename);
-        std::fs::write(&archive_path, &archive_json)?;
-        eprintln!("bench-remote: wrote {}", archive_path.display());
+    if !registry_json.trim().is_empty() {
+        // Derive the filename from the remote instance.
+        let registry_filename = ssm_exec(
+            instance_id,
+            region,
+            "ls -t /home/ec2-user/ocync/bench/results/*.json 2>/dev/null | grep -v baseline | head -1 | xargs basename",
+        )
+        .await
+        .unwrap_or_else(|_| "ecr.json".into());
+        let registry_path = Path::new(&args.output).join(registry_filename.trim());
+        std::fs::write(&registry_path, &registry_json)?;
+        eprintln!("bench-remote: wrote {}", registry_path.display());
     }
 
     eprintln!("\n{summary}");
