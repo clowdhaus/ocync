@@ -76,6 +76,7 @@ impl RegistryClientBuilder {
 
     /// Build the registry client.
     pub fn build(self) -> Result<RegistryClient, Error> {
+        crate::install_crypto_provider();
         let mut http_builder = reqwest::Client::builder().user_agent(USER_AGENT_VALUE);
         for (host, addr) in &self.dns_overrides {
             http_builder = http_builder.resolve(host, *addr);
@@ -166,10 +167,10 @@ impl RegistryClient {
 
         let resp = self
             .send_with_aimd(op, &scopes, "GET", |mut headers| {
-                if let Some(accept) = accept {
-                    if let Ok(val) = HeaderValue::from_str(accept) {
-                        headers.insert(ACCEPT, val);
-                    }
+                if let Some(accept) = accept
+                    && let Ok(val) = HeaderValue::from_str(accept)
+                {
+                    headers.insert(ACCEPT, val);
                 }
                 self.http.get(url.clone()).headers(headers)
             })
@@ -195,10 +196,10 @@ impl RegistryClient {
 
         let resp = self
             .send_with_aimd(op, &scopes, "HEAD", |mut headers| {
-                if let Some(accept) = accept {
-                    if let Ok(val) = HeaderValue::from_str(accept) {
-                        headers.insert(ACCEPT, val);
-                    }
+                if let Some(accept) = accept
+                    && let Ok(val) = HeaderValue::from_str(accept)
+                {
+                    headers.insert(ACCEPT, val);
                 }
                 self.http.head(url.clone()).headers(headers)
             })
@@ -229,7 +230,7 @@ impl RegistryClient {
     ///
     /// Builds the request via `build_request` (called with fresh auth headers),
     /// sends it, and if a 401 is returned, invalidates the cached token and
-    /// retries once. Does NOT acquire an AIMD permit — callers manage their
+    /// retries once. Does NOT acquire an AIMD permit - callers manage their
     /// own permits.
     async fn send_with_retry(
         &self,

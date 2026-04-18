@@ -95,13 +95,13 @@ impl FilterConfig {
         }
 
         // 6. Min tags validation
-        if let Some(min) = self.min_tags {
-            if current.len() < min {
-                return Err(Error::BelowMinTags {
-                    matched: current.len(),
-                    minimum: min,
-                });
-            }
+        if let Some(min) = self.min_tags
+            && current.len() < min
+        {
+            return Err(Error::BelowMinTags {
+                matched: current.len(),
+                minimum: min,
+            });
         }
 
         Ok(current.into_iter().map(String::from).collect())
@@ -238,7 +238,7 @@ fn parse_semver(tag: &str) -> Option<semver::Version> {
 mod tests {
     use super::*;
 
-    // -- glob tests --------------------------------------------------------
+    // - glob tests --------------------------------------------------------
 
     #[test]
     fn glob_star_matches_all() {
@@ -268,7 +268,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidGlob { .. }));
     }
 
-    // -- semver tests ------------------------------------------------------
+    // - semver tests ------------------------------------------------------
 
     #[test]
     fn semver_range_filter() {
@@ -311,7 +311,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // -- prerelease tests --------------------------------------------------
+    // - prerelease tests --------------------------------------------------
 
     #[test]
     fn prerelease_include() {
@@ -375,7 +375,7 @@ mod tests {
         assert_eq!(result, vec!["1.9.0"]);
     }
 
-    // -- exclude tests -----------------------------------------------------
+    // - exclude tests -----------------------------------------------------
 
     #[test]
     fn exclude_basic() {
@@ -398,7 +398,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidGlob { .. }));
     }
 
-    // -- sort tests --------------------------------------------------------
+    // - sort tests --------------------------------------------------------
 
     #[test]
     fn sort_semver_descending() {
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(tags, vec!["2.0.0", "v1.5.0", "v1.0.0"]);
     }
 
-    // -- prerelease + range edge cases -------------------------------------
+    // - prerelease + range edge cases -------------------------------------
 
     /// `Only` mode with a narrowing range drops pre-releases whose base
     /// version is below the range AND drops stable versions.
@@ -468,7 +468,7 @@ mod tests {
         assert_eq!(result, vec!["1.2.0-rc1"]);
     }
 
-    // -- recommended workflow: Include + exclude globs ---------------------
+    // - recommended workflow: Include + exclude globs ---------------------
 
     /// The documented workflow for keeping `-alpine`/`-slim` while excluding
     /// actual pre-releases: use `SemverPrerelease::Include` with exclude
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(result, vec!["1.0.0", "1.0.0-alpine", "1.0.0-slim"]);
     }
 
-    // -- parse_semver edge cases -------------------------------------------
+    // - parse_semver edge cases -------------------------------------------
 
     /// Date-based tags like `20240101` are not valid semver and are dropped.
     #[test]
@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(result, vec!["1.0.0"]);
     }
 
-    // -- pipeline tests ----------------------------------------------------
+    // - pipeline tests ----------------------------------------------------
 
     #[test]
     fn pipeline_default_config_passes_all() {

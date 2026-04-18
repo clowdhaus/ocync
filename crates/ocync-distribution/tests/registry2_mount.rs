@@ -4,7 +4,7 @@
 //! Pins the protocol-compliant baseline for `blob_mount`: a committed
 //! source blob returns [`MountResult::Mounted`], a missing source returns
 //! [`MountResult::NotMounted`]. Real-ECR behavior is deliberately not
-//! covered here (see `docs/specs/findings.md` — ECR never fulfills mount,
+//! covered here (see `docs/findings.md` -- ECR never fulfills mount,
 //! so the client short-circuits and the engine integration test pins
 //! that end-to-end).
 //!
@@ -87,7 +87,7 @@ async fn assert_blob_exists(
 /// Happy path: push a blob to `source`, mount it to `target`, registry
 /// responds 201 and `MountResult::Mounted` is surfaced to the caller.
 ///
-/// Pins the protocol-compliant baseline — the OCI reference fulfills mount.
+/// Pins the protocol-compliant baseline -- the OCI reference fulfills mount.
 /// Any deviation in the client's response classification (e.g. treating 201
 /// as a fallback upload) would fail here.
 #[tokio::test]
@@ -96,7 +96,7 @@ async fn mount_committed_blob_returns_mounted() {
     let client = local_client(url);
 
     // Use different repository prefixes (not sibling names) so this test
-    // also covers the "cross-prefix" mount case — the OCI spec allows
+    // also covers the "cross-prefix" mount case -- the OCI spec allows
     // mount between any two repos on the same registry, and the client's
     // `from=` query parameter must accept arbitrary repo paths.
     let source_repo = RepositoryName::new("org-a/service-x");

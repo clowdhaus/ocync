@@ -111,11 +111,11 @@ impl FromStr for Reference {
             if is_registry(first) {
                 (first.to_owned(), name[slash + 1..].to_owned())
             } else {
-                // e.g. "myuser/myrepo" — Docker Hub implied
+                // e.g. "myuser/myrepo" - Docker Hub implied
                 (DOCKER_HUB_REGISTRY.to_owned(), name.to_owned())
             }
         } else {
-            // Single component — Docker Hub official image
+            // Single component - Docker Hub official image
             (
                 DOCKER_HUB_REGISTRY.to_owned(),
                 format!("{DOCKER_HUB_OFFICIAL_REPO_PREFIX}{name}"),

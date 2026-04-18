@@ -162,9 +162,9 @@ fn evict_removes_smallest_files_first() {
     // Sorted by ascending size: A(10), B(20), C(30).
     stage.evict(40).unwrap();
 
-    // A (10 bytes) evicted first. Total = 50 — still over 40.
+    // A (10 bytes) evicted first. Total = 50 -- still over 40.
     assert!(!stage.exists(&digest_a()), "smallest blob must be evicted");
-    // B (20 bytes) evicted next. Total = 30 — now under 40. C is kept.
+    // B (20 bytes) evicted next. Total = 30 -- now under 40. C is kept.
     assert!(
         !stage.exists(&digest_b()),
         "second-smallest blob must be evicted"

@@ -8,12 +8,12 @@ ocync is a Rust-based OCI registry sync tool that copies container images betwee
 
 ### Design Principles
 
-- **Library-first** — crate boundaries designed for embedding; CLI is a thin consumer
-- **Pure OCI Distribution API** — no skopeo, no Docker daemon, direct HTTPS to registries
-- **Additive sync only** — never deletes; registries handle lifecycle/retention
-- **Nothing implicit** — no default tags, no silent `:latest`, explicit config required
+- **Library-first** - crate boundaries designed for embedding; CLI is a thin consumer
+- **Pure OCI Distribution API** - no skopeo, no Docker daemon, direct HTTPS to registries
+- **Additive sync only** - never deletes; registries handle lifecycle/retention
+- **Nothing implicit** - no default tags, no silent `:latest`, explicit config required
 - **ECR-first** with broad registry support via native auth providers
-- **FIPS-ready** — first-class FIPS 140-3 support via feature flag
+- **FIPS-ready** - first-class FIPS 140-3 support via feature flag
 
 ---
 
@@ -108,7 +108,7 @@ A `#[cfg]`-gated wrapper struct (~40 LOC) provides a unified hashing interface:
 - **Default build**: delegates to `sha2::Sha256`
 - **FIPS build** (`--features fips`): delegates to `aws_lc_rs::digest::Context` with `SHA256`
 
-Zero runtime dispatch overhead — the `#[cfg]` resolves at compile time. The wrapper exposes `update(&[u8])` and `finalize() -> [u8; 32]`. All call sites use the wrapper; no direct imports of `sha2` or `aws_lc_rs::digest` outside the wrapper module.
+Zero runtime dispatch overhead - the `#[cfg]` resolves at compile time. The wrapper exposes `update(&[u8])` and `finalize() -> [u8; 32]`. All call sites use the wrapper; no direct imports of `sha2` or `aws_lc_rs::digest` outside the wrapper module.
 
 ### AuthProvider Trait
 
@@ -160,7 +160,7 @@ cargo tree -e features | grep ring        # must be empty (unless explicitly all
 
 ### Pipelined Sync (Discovery + Execution Overlap)
 
-The sync engine uses a pipelined architecture where discovery and execution overlap via `tokio::select!` over two `FuturesUnordered` pools with a `VecDeque` pending queue between them. This eliminates the latency cost of an upfront planning phase — execution begins as soon as the first image is discovered.
+The sync engine uses a pipelined architecture where discovery and execution overlap via `tokio::select!` over two `FuturesUnordered` pools with a `VecDeque` pending queue between them. This eliminates the latency cost of an upfront planning phase - execution begins as soon as the first image is discovered.
 
 **Discovery pool**: Concurrent futures that pull source manifests (once per tag) and HEAD-check each target manifest. Index manifests are fully resolved (all children pulled) before leaving discovery. Source data is shared across targets for the same tag via `Rc<PulledManifest>`.
 
@@ -168,14 +168,14 @@ The sync engine uses a pipelined architecture where discovery and execution over
 
 **Execution pool**: Each `(tag, target)` pair becomes an independent future. Within each future, blobs are processed in frequency-descending order (most-shared blobs first for maximum cross-image cache benefit):
 
-1. **Cache check** — persistent `TransferStateCache` (survives across runs) records blob status per target
-2. **Cross-repo mount** — if blob exists at same target in a different repo, attempt mount
-3. **HEAD check** — verify blob existence at target (progressive cache population, not upfront batch)
-4. **Pull + push** — stream from source, push to target (or read from disk staging for multi-target)
+1. **Cache check** - persistent `TransferStateCache` (survives across runs) records blob status per target
+2. **Cross-repo mount** - if blob exists at same target in a different repo, attempt mount
+3. **HEAD check** - verify blob existence at target (progressive cache population, not upfront batch)
+4. **Pull + push** - stream from source, push to target (or read from disk staging for multi-target)
 
 After all blobs complete for a `(tag, target)`: push manifests (children first for indexes, then top-level by tag).
 
-**Pipeline `select!` discipline**: Uses `biased;` (prefer execution completions to free permits) and emptiness guards on every branch. Shutdown and drain deadline branches use guard conditions — never `std::future::pending()` inside async blocks.
+**Pipeline `select!` discipline**: Uses `biased;` (prefer execution completions to free permits) and emptiness guards on every branch. Shutdown and drain deadline branches use guard conditions - never `std::future::pending()` inside async blocks.
 
 **Stats report**: actual unique layers transferred vs total layer references across all images. Example: "12 unique layers transferred (referenced 89 times across 50 images)".
 
@@ -184,7 +184,7 @@ After all blobs complete for a `(tag, target)`: push manifests (children first f
 ```
 For each filtered tag:
 
-1. MANIFEST CHECK (1 HEAD request — cheapest possible check)
+1. MANIFEST CHECK (1 HEAD request - cheapest possible check)
    HEAD /v2/{repo}/manifests/{tag} at target
    → Same digest as source? SKIP ENTIRE IMAGE. Zero transfer.
    → 404 or different digest? Continue.
@@ -227,10 +227,10 @@ For each filtered tag:
 ### Push Ordering (DAG)
 
 Images are pushed in strict dependency order to avoid registry rejection:
-1. **Blobs** (layers + config) — deduplicated via persistent cache and progressive population
-2. **Platform-specific manifests** — only after ALL their blobs exist at target
-3. **Image indexes** (manifest lists) — only after ALL referenced manifests exist
-4. **Referrers** (signatures, SBOMs) — only after their subject manifest exists
+1. **Blobs** (layers + config) - deduplicated via persistent cache and progressive population
+2. **Platform-specific manifests** - only after ALL their blobs exist at target
+3. **Image indexes** (manifest lists) - only after ALL referenced manifests exist
+4. **Referrers** (signatures, SBOMs) - only after their subject manifest exists
 
 ### Blob Deduplication (Persistent Cache)
 
@@ -241,16 +241,16 @@ blob_state: Map<(TargetName, Digest), BlobInfo>
 
 BlobInfo:
   status: BlobStatus
-  known_repos: BTreeSet<String>   — repos at this target known to have the blob
+  known_repos: BTreeSet<String>   - repos at this target known to have the blob
 
 BlobStatus:
-  ExistsAtTarget    — HEAD returned 200 (or warm cache hit), skip
-  InProgress        — another future is uploading, skip (plan-phase eliminated races)
-  Completed         — upload finished by another future, skip
-  Failed            — upload failed, eligible for retry on next run
+  ExistsAtTarget    - HEAD returned 200 (or warm cache hit), skip
+  InProgress        - another future is uploading, skip (plan-phase eliminated races)
+  Completed         - upload finished by another future, skip
+  Failed            - upload failed, eligible for retry on next run
 ```
 
-Only `ExistsAtTarget` and `Completed` states are persisted — transient states (`InProgress`, `Failed`) are stripped before serialization. Cache population is progressive: HEAD checks happen inline during execution rather than in an upfront batch, and results immediately benefit subsequent images sharing the same blob.
+Only `ExistsAtTarget` and `Completed` states are persisted - transient states (`InProgress`, `Failed`) are stripped before serialization. Cache population is progressive: HEAD checks happen inline during execution rather than in an upfront batch, and results immediately benefit subsequent images sharing the same blob.
 
 **Lazy invalidation**: when a mount or push fails for a cached blob, the entry is invalidated and the operation falls back to a fresh pull+push. This handles target-side staleness (lifecycle policies, manual deletion).
 
@@ -262,7 +262,7 @@ The blob dedup map is extended to track which repositories at each target regist
 blob_locations: Map<(TargetRegistry, Digest), BlobInfo>
 
 BlobInfo:
-  repos: Set<String>   — repository paths known to have this blob
+  repos: Set<String>   - repository paths known to have this blob
 ```
 
 When mounting a blob into a new repository, any repo from the `repos` set can serve as the `from` parameter. The engine picks the alphabetically first repo (deterministic via `BTreeSet` iteration).
@@ -301,7 +301,7 @@ source registry GET → [bytes stream] → {cache_dir}/blobs/{algo}/{hex} (atomi
                               target N push ← read from disk
 ```
 
-Staging uses atomic write protocol (tmp file → fsync → rename → dir fsync) for crash safety. Orphaned tmp files from crashes are cleaned up on startup. Eviction by total staging size keeps disk usage bounded (`global.staging_size_limit`). Staging is automatically disabled for single-target deployments (`BlobStage::disabled()` — zero overhead).
+Staging uses atomic write protocol (tmp file → fsync → rename → dir fsync) for crash safety. Orphaned tmp files from crashes are cleaned up on startup. Eviction by total staging size keeps disk usage bounded (`global.staging_size_limit`). Staging is automatically disabled for single-target deployments (`BlobStage::disabled()` - zero overhead).
 
 ### Layer Recompression (gzip → zstd)
 
@@ -342,7 +342,7 @@ source GET → [gzip bytes] → decompress → zstd compress → target PATCH/PU
 
 **Key implications:**
 
-- **Digest changes are expected and logged at INFO.** Source and target digests will differ for recompressed images. This is inherent — different bytes produce different digests.
+- **Digest changes are expected and logged at INFO.** Source and target digests will differ for recompressed images. This is inherent - different bytes produce different digests.
 - **Signatures become invalid.** Cosign/Notation signatures reference the original manifest digest. If `recompress` is enabled alongside `artifacts.enabled: true`, ocync logs a WARNING: "Recompression invalidates existing signatures. Synced artifacts will reference the original digest."
 - **`require_artifacts: true` + `recompress` is a CONFIG_ERROR.** You cannot require valid signatures while recompressing, because recompression invalidates them.
 - **`skip_existing` and `immutable_tags` still work.** The target digest is tracked per-tag in the target state cache. Once a recompressed image is pushed, subsequent syncs skip it (the target tag exists with the recompressed digest).
@@ -367,7 +367,7 @@ recompress_level: 3              # zstd compression level (1-22, default: 3)
 
 ### Registry-Specific Optimizations
 
-The standard OCI Distribution API is single-resource per request — no batch endpoints exist in the spec. However, ECR exposes native AWS APIs that dramatically reduce round-trips during the planning phase. ocync uses these when available, falling back to standard OCI calls for other registries.
+The standard OCI Distribution API is single-resource per request - no batch endpoints exist in the spec. However, ECR exposes native AWS APIs that dramatically reduce round-trips during the planning phase. ocync uses these when available, falling back to standard OCI calls for other registries.
 
 #### ECR Batch APIs (feature-gated behind `ecr`)
 
@@ -391,13 +391,13 @@ When the target or source is an ECR registry, ocync uses the AWS SDK instead of 
 6. Build transfer plan from results
 ```
 
-For 50 images with 200 unique layers, this replaces ~300 individual OCI API calls with ~6 batch calls — **98% fewer round-trips in the planning phase**.
+For 50 images with 200 unique layers, this replaces ~300 individual OCI API calls with ~6 batch calls - **98% fewer round-trips in the planning phase**.
 
 **ECR-specific constraints:**
 
-- `PutImage` has **no batch equivalent** and is rate-limited to **10 TPS** (adjustable via Service Quotas). This is the bottleneck for manifest pushes — 50 images takes a minimum of 5 seconds.
+- `PutImage` has **no batch equivalent** and is rate-limited to **10 TPS** (adjustable via Service Quotas). This is the bottleneck for manifest pushes - 50 images takes a minimum of 5 seconds.
 - `BatchGetImage` is **not available on ECR Public** (`public.ecr.aws`). ECR Public source registries fall back to standard OCI manifest GETs.
-- All batch APIs are **regional** — cross-region requires separate calls per region.
+- All batch APIs are **regional** - cross-region requires separate calls per region.
 - Cross-account batch calls require repository policies granting the caller's IAM principal the relevant `ecr:Batch*` actions.
 - `InitiateLayerUpload` (100 TPS) and `CompleteLayerUpload` (100 TPS) are the upload-phase bottlenecks. `UploadLayerPart` is 500 TPS.
 
@@ -419,7 +419,7 @@ For 50 images with 200 unique layers, this replaces ~300 individual OCI API call
 
 **GAR monolithic upload constraint:** GAR does not support chunked (`PATCH`) uploads. The blob upload pipeline must detect GAR endpoints and use monolithic `POST`+`PUT` (buffer entire blob in memory). This increases memory usage for large layers but is unavoidable.
 
-**Docker Hub rate limit awareness:** Docker Hub returns `ratelimit-limit` and `ratelimit-remaining` headers on manifest responses. ocync parses these and exposes them in sync reports. HEAD requests do NOT count toward the pull limit — this validates the HEAD-first `skip_existing` design.
+**Docker Hub rate limit awareness:** Docker Hub returns `ratelimit-limit` and `ratelimit-remaining` headers on manifest responses. ocync parses these and exposes them in sync reports. HEAD requests do NOT count toward the pull limit - this validates the HEAD-first `skip_existing` design.
 
 ---
 
@@ -429,9 +429,9 @@ For 50 images with 200 unique layers, this replaces ~300 individual OCI API call
 
 Rate limiting has two independent components that must not be confused:
 
-1. **Steady-state rate limiting** — adaptive per-(registry, action) AIMD congestion windows. Each action (ManifestHead, ManifestPull, BlobHead, etc.) has an independent window that grows on success and shrinks on 429. See the transfer optimization spec for AIMD controller design.
+1. **Steady-state rate limiting** - adaptive per-(registry, action) AIMD congestion windows. Each action (ManifestHead, ManifestPull, BlobHead, etc.) has an independent window that grows on success and shrinks on 429. See the transfer optimization spec for AIMD controller design.
 
-2. **Adaptive backoff** — reactive per-request sleep triggered by 429/5xx responses. This is completely separate from the AIMD windows. When a 429 is received, the individual request sleeps (honoring `Retry-After` if present) and retries. The AIMD window for that action shrinks (once per congestion epoch), but other actions' windows are unaffected.
+2. **Adaptive backoff** - reactive per-request sleep triggered by 429/5xx responses. This is completely separate from the AIMD windows. When a 429 is received, the individual request sleeps (honoring `Retry-After` if present) and retries. The AIMD window for that action shrinks (once per congestion epoch), but other actions' windows are unaffected.
 
 ### Per-Registry Rate Limiting
 
@@ -515,7 +515,7 @@ Unlike skopeo (which only retries blob transfers), ocync retries at every phase:
 - Blob HEAD/GET/PUT
 - Manifest PUT
 
-If a transient error occurs during tag listing, it retries tag listing — not the entire sync.
+If a transient error occurs during tag listing, it retries tag listing - not the entire sync.
 
 ### Separate Read vs Write Limits
 
@@ -539,14 +539,14 @@ For Docker Hub: before starting a large sync, HEAD the rate-limit-test endpoint 
 
 ### Problem
 
-Pushing a Docker v2 Schema 2 manifest to a registry that expects OCI format (or vice versa) changes the digest. Some registries reject manifests with unexpected media types. Existing tools (skopeo, regsync) struggle with this — digests change silently or copies fail.
+Pushing a Docker v2 Schema 2 manifest to a registry that expects OCI format (or vice versa) changes the digest. Some registries reject manifests with unexpected media types. Existing tools (skopeo, regsync) struggle with this - digests change silently or copies fail.
 
 ### Policy
 
 Default: **preserve the original format exactly.** The manifest bytes are transferred verbatim to maintain digest integrity.
 
 ```yaml
-# Per-registry override (rare — only needed for broken registries)
+# Per-registry override (rare - only needed for broken registries)
 registries:
   legacy-harbor:
     url: harbor.internal.io
@@ -574,7 +574,7 @@ This makes re-runs fully idempotent without requiring `skip_existing: true`.
 
 ### Default: All Platforms
 
-When `platforms` is omitted from the config, the full image index (all platforms) is copied. This is the safe, faithful mirror default. `platforms: all` is **not** a valid config value — simply omit the field to get all platforms.
+When `platforms` is omitted from the config, the full image index (all platforms) is copied. This is the safe, faithful mirror default. `platforms: all` is **not** a valid config value - simply omit the field to get all platforms.
 
 ### Subset: Trimmed Index
 
@@ -600,7 +600,7 @@ The pushed index will have a **different digest** than the source index (because
 If a requested platform is not available in the source image index:
 - Log WARNING: `platform linux/arm64 not found in source image index for library/nginx:1.27`
 - Continue with available platforms (do NOT fail)
-- If NO requested platforms match any manifest in the source index, return an error with actionable context: the configured platform filter, the platforms available in the source index, and the source reference. An empty filtered index is never pushed to targets — it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading.
+- If NO requested platforms match any manifest in the source index, return an error with actionable context: the configured platform filter, the platforms available in the source index, and the source reference. An empty filtered index is never pushed to targets - it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading.
 
 ---
 
@@ -610,7 +610,7 @@ If a requested platform is not available in the source image index:
 
 When deciding whether to sync a tag, ocync evaluates three tiers in order. The first match wins:
 
-**Tier 1 — `immutable_tags` pattern match + tag exists in target tag list → SKIP (0 API calls)**
+**Tier 1 - `immutable_tags` pattern match + tag exists in target tag list → SKIP (0 API calls)**
 
 ```yaml
 defaults:
@@ -622,7 +622,7 @@ When a tag matches the `immutable_tags` glob pattern AND the tag name appears in
 
 Rationale: semver tags (`v1.2.3`, `3.12.1`) are conventionally immutable. Once published, they never change. Checking their digest on every sync run wastes API calls.
 
-**Tier 2 — `skip_existing: true` + HEAD returns 200 → SKIP (1 API call, digest ignored)**
+**Tier 2 - `skip_existing: true` + HEAD returns 200 → SKIP (1 API call, digest ignored)**
 
 ```yaml
 mappings:
@@ -631,11 +631,11 @@ mappings:
     skip_existing: true
 ```
 
-When `skip_existing: true` is set: send a manifest HEAD request. If the target returns 200 (tag exists), skip. The digest is NOT compared — any version of the image at that tag is considered sufficient.
+When `skip_existing: true` is set: send a manifest HEAD request. If the target returns 200 (tag exists), skip. The digest is NOT compared - any version of the image at that tag is considered sufficient.
 
 Use case: mirrors where you only care about initial population, not keeping tags updated.
 
-**Tier 3 — Default: HEAD + digest compare → SKIP if match, SYNC if different**
+**Tier 3 - Default: HEAD + digest compare → SKIP if match, SYNC if different**
 
 The default behavior. Send a manifest HEAD to the target. Compare the digest with the source manifest digest:
 - Same digest → SKIP (image unchanged)
@@ -768,7 +768,7 @@ Concurrency is three independent layers:
    - **GAR**: 1 shared window (per-project quota)
    - **Others**: 5 coarse windows (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST)
 
-Every HTTP request acquires permits from levels 2 and 3. Level 1 is engine-level only. When an AIMD window shrinks, the per-action `Arc<Semaphore>` is replaced (not shrunk by forgetting one permit) — Tokio has no `remove_permits` API.
+Every HTTP request acquires permits from levels 2 and 3. Level 1 is engine-level only. When an AIMD window shrinks, the per-action `Arc<Semaphore>` is replaced (not shrunk by forgetting one permit) - Tokio has no `remove_permits` API.
 
 ---
 
@@ -782,14 +782,14 @@ YAML and TOML supported (auto-detected by file extension). Environment variable 
 
 Configuration is processed in 8 sequential steps:
 
-1. **Read raw** — load file(s) as raw text
-2. **Expand env vars** — substitute `${VAR}`, `${VAR:-default}`, `${VAR:?error}` (security rules apply — see Env Var Expansion Security)
-3. **Serde parse** — deserialize YAML/TOML into typed config structs
-4. **Merge partials** — merge multiple config files (see Multiple Config Files)
-5. **Apply defaults** — merge `defaults` block into each mapping (see Defaults Merge)
-6. **Expand bulk** — expand `bulk` mappings into individual mappings
-7. **Resolve references** — validate that all `source`, `targets`, and `target_groups` entries reference names defined in `registries`. Unknown names are CONFIG_ERROR (exit 3).
-8. **Validate semantics** — cross-field validation (e.g., `sort` required when `latest` is set, `require_artifacts` conflicts with `artifacts.enabled: false`, registry URL format, duplicate names)
+1. **Read raw** - load file(s) as raw text
+2. **Expand env vars** - substitute `${VAR}`, `${VAR:-default}`, `${VAR:?error}` (security rules apply - see Env Var Expansion Security)
+3. **Serde parse** - deserialize YAML/TOML into typed config structs
+4. **Merge partials** - merge multiple config files (see Multiple Config Files)
+5. **Apply defaults** - merge `defaults` block into each mapping (see Defaults Merge)
+6. **Expand bulk** - expand `bulk` mappings into individual mappings
+7. **Resolve references** - validate that all `source`, `targets`, and `target_groups` entries reference names defined in `registries`. Unknown names are CONFIG_ERROR (exit 3).
+8. **Validate semantics** - cross-field validation (e.g., `sort` required when `latest` is set, `require_artifacts` conflicts with `artifacts.enabled: false`, registry URL format, duplicate names)
 
 ### Schema
 
@@ -912,10 +912,10 @@ mappings:
 
 ### `source`, `targets`, and `to` Semantics
 
-- **`source`** — references a registry name from the `registries` block. Inline URLs not supported.
-- **`targets`** — either a target_group name (string, e.g., `all-regions`) OR an inline list of registry names (e.g., `[us-ecr, eu-ecr]`). Inline URLs not supported.
-- **`to`** — a repository path relative to the target registry. MUST NOT contain a hostname. The effective destination is `{registry.url}/{to}:{tag}`.
-- **`from`** — a repository path relative to the source registry. MUST NOT contain a hostname.
+- **`source`** - references a registry name from the `registries` block. Inline URLs not supported.
+- **`targets`** - either a target_group name (string, e.g., `all-regions`) OR an inline list of registry names (e.g., `[us-ecr, eu-ecr]`). Inline URLs not supported.
+- **`to`** - a repository path relative to the target registry. MUST NOT contain a hostname. The effective destination is `{registry.url}/{to}:{tag}`.
+- **`from`** - a repository path relative to the source registry. MUST NOT contain a hostname.
 - **Different paths per target**: not supported within a single mapping. If you need different `to` paths for different targets, create separate mappings.
 
 **`ocync copy`** is the exception: it uses full OCI references (`docker.io/library/nginx:1.27`) and operates standalone without config.
@@ -983,8 +983,8 @@ ocync sync --config a.yaml --config b.yaml   # explicit multi-file (CLI arg orde
 
 | Section | Merge behavior |
 |---|---|
-| `registries` | Additive. All files contribute registries. Names must be unique across files — duplicate name = CONFIG_ERROR (exit 3). |
-| `target_groups` | Additive. All files contribute groups. Names must be unique — duplicate = CONFIG_ERROR. |
+| `registries` | Additive. All files contribute registries. Names must be unique across files - duplicate name = CONFIG_ERROR (exit 3). |
+| `target_groups` | Additive. All files contribute groups. Names must be unique - duplicate = CONFIG_ERROR. |
 | `defaults` | Single file only. If multiple files define `defaults`, CONFIG_ERROR. |
 | `mappings` | Concatenated in file order. Directory: alphabetical. CLI args: argument order. |
 | `log_format`, `log_level`, `global` | Single file only. Multiple definitions = CONFIG_ERROR. |
@@ -1019,7 +1019,7 @@ glob (raw string match) → semver (parsed version) → exclude (raw) → sort +
                                                                immutable_tags check on survivors
 ```
 
-All stages are AND (narrowing). Each stage reduces the set. The filter pipeline runs first, THEN `immutable_tags` is evaluated on surviving tags (see skip_existing section). This ordering doesn't affect correctness — immutable_tags is a skip optimization, not a filter — but it is conceptually clearer: filter first to find what you want, then decide what to skip.
+All stages are AND (narrowing). Each stage reduces the set. The filter pipeline runs first, THEN `immutable_tags` is evaluated on surviving tags (see skip_existing section). This ordering doesn't affect correctness - immutable_tags is a skip optimization, not a filter - but it is conceptually clearer: filter first to find what you want, then decide what to skip.
 
 ### Fields
 
@@ -1029,21 +1029,21 @@ All stages are AND (narrowing). Each stage reduces the set. The filter pipeline 
 | `semver` | string | Semver range constraint (e.g., `>= 3.11, < 4.0`) |
 | `semver_prerelease` | enum | `include` / `exclude` (default) / `only` |
 | `exclude` | string or list | Glob deny patterns, OR within list |
-| `sort` | enum | `semver` / `alpha` — REQUIRED when `latest` is set |
+| `sort` | enum | `semver` / `alpha` - REQUIRED when `latest` is set |
 | `latest` | integer | Keep N most recent after sort |
 | `min_tags` | integer | Fail if fewer than N tags match (opt-in strictness) |
 | `immutable_tags` | string (glob) | Tags matching this pattern skip digest comparison when they exist at target |
 
 **`sort` values**:
-- `semver` — sort by parsed semantic version (highest first)
-- `alpha` — sort by lexicographic string comparison (highest first). Covers date-stamped tags (e.g., `20260410`, `2026-04-10`) since YYYYMMDD sorts correctly in alpha order.
+- `semver` - sort by parsed semantic version (highest first)
+- `alpha` - sort by lexicographic string comparison (highest first). Covers date-stamped tags (e.g., `20260410`, `2026-04-10`) since YYYYMMDD sorts correctly in alpha order.
 
 `date` sort is NOT supported. Date-based sorting would require O(n) manifest + config fetches to retrieve creation timestamps, which is prohibitively expensive for large tag sets. Use `alpha` for date-stamped tags.
 
 ### Rules
 
 - **No `tags` block = config error.** Must specify at least `glob: "*"` to sync all tags.
-- **`latest` requires `sort`** — no implicit sort order. CONFIG_ERROR (exit 3) at parse step 8.
+- **`latest` requires `sort`** - no implicit sort order. CONFIG_ERROR (exit 3) at parse step 8.
 - **Glob semantics**: `*` matches any characters including `-._`; always full-match (anchored); case-sensitive.
 - **Semver parsing**: accepts `X.Y.Z`, `vX.Y.Z` (v stripped), `X.Y` (→ X.Y.0), `X.Y.Z-pre` (prerelease). Non-parseable tags are dropped with WARN.
 - **Zero matches**: WARNING by default; ERROR if `min_tags` is set and not met.
@@ -1063,10 +1063,10 @@ Shows the pipeline step-by-step for debugging.
 
 ### Model
 
-- **One RegistryClient per registry** — avoids auth scope accumulation
-- **Auto-detect by hostname** — ECR, GCR, ACR, GHCR, Docker Hub patterns (see exact patterns below)
-- **Explicit `auth_type` override** — for proxies, mirrors, or non-standard hostnames
-- **Per-registry credential chains** — independent role ARNs, credential files, helpers
+- **One RegistryClient per registry** - avoids auth scope accumulation
+- **Auto-detect by hostname** - ECR, GCR, ACR, GHCR, Docker Hub patterns (see exact patterns below)
+- **Explicit `auth_type` override** - for proxies, mirrors, or non-standard hostnames
+- **Per-registry credential chains** - independent role ARNs, credential files, helpers
 - **Proactive token refresh** at 75% lifetime + reactive 401 retry (one attempt)
 
 ### Credentials Block
@@ -1088,19 +1088,19 @@ registries:
 ```
 
 **Credential fields** (all optional, mutually exclusive auth methods):
-- `token` — bearer token (static or from env var)
-- `username` + `password` — basic auth
-- `token_file` — path to a file containing a bearer token (re-read on each refresh)
+- `token` - bearer token (static or from env var)
+- `username` + `password` - basic auth
+- `token_file` - path to a file containing a bearer token (re-read on each refresh)
 
 ### Credential Resolution Priority
 
 For each registry, credentials are resolved in this order (first match wins):
 
-1. **Explicit `credentials` block** — `token`, `username`/`password`, or `token_file` in the registry config
-2. **Docker config.json static auth** — base64-encoded credentials in `~/.docker/config.json` `auths` section
-3. **Docker credHelpers** — credential helper binary from `credHelpers` section. Requires shell access. If the binary is missing: log WARNING and fall through to next method (critical for distroless images where helpers can't execute).
-4. **Native auto-detect** — ECR/GCR/ACR/GHCR provider based on hostname pattern
-5. **Anonymous** — WWW-Authenticate challenge → anonymous token exchange
+1. **Explicit `credentials` block** - `token`, `username`/`password`, or `token_file` in the registry config
+2. **Docker config.json static auth** - base64-encoded credentials in `~/.docker/config.json` `auths` section
+3. **Docker credHelpers** - credential helper binary from `credHelpers` section. Requires shell access. If the binary is missing: log WARNING and fall through to next method (critical for distroless images where helpers can't execute).
+4. **Native auto-detect** - ECR/GCR/ACR/GHCR provider based on hostname pattern
+5. **Anonymous** - WWW-Authenticate challenge → anonymous token exchange
 
 ### Hostname Auto-Detection Patterns
 
@@ -1267,7 +1267,7 @@ At process startup (before any network I/O):
 | `ocync sync --config <path>` | Run all mappings |
 | `ocync sync --dry-run` | Validate against live registries (all reads, no writes). Queries referrers, reports what would be synced/skipped. |
 | `ocync copy <src> <dst>` | Ad-hoc single image copy using full OCI references (standalone, no config) |
-| `ocync tags <repo>` | List/filter tags — shows pipeline step-by-step |
+| `ocync tags <repo>` | List/filter tags - shows pipeline step-by-step |
 | `ocync auth check` | Validate credentials for all registries (shows FIPS endpoint status) |
 | `ocync validate <config>` | Offline config syntax/schema check |
 | `ocync expand <config>` | Show fully resolved config (env vars, bulk, defaults). Sensitive vars show `[REDACTED]` unless `--show-secrets`. |
@@ -1280,7 +1280,7 @@ At process startup (before any network I/O):
 
 ### Philosophy: Silence Means Success
 
-Existing tools get logging catastrophically wrong — skopeo dumps walls of "existing blob" messages, regsync floods with repeated status noise, dregsy swallows errors while being verbose about everything else.
+Existing tools get logging catastrophically wrong - skopeo dumps walls of "existing blob" messages, regsync floods with repeated status noise, dregsy swallows errors while being verbose about everything else.
 
 **ocync's rule: output means action was taken or something went wrong. Anything expected and successful is silent.**
 
@@ -1335,8 +1335,8 @@ FAILED   chainguard/node:22 → mirror/node:22             (429 rate limited)
 
 Every sync operation carries two correlation IDs, both ULIDs (time-ordered, 26 characters, monotonic within a millisecond):
 
-- **`run_id`** — one per sync cycle (CLI invocation) or watch-mode cycle. All log lines and results within a single sync run share the same `run_id`.
-- **`image_id`** — one per image being synced. All log lines related to a specific image (blob transfers, manifest pushes, retries) share the same `image_id`.
+- **`run_id`** - one per sync cycle (CLI invocation) or watch-mode cycle. All log lines and results within a single sync run share the same `run_id`.
+- **`image_id`** - one per image being synced. All log lines related to a specific image (blob transfers, manifest pushes, retries) share the same `image_id`.
 
 Both IDs appear in:
 - All structured log lines (JSON format)
@@ -1347,7 +1347,7 @@ Implementation: `tracing::Span` fields. The `run_id` span wraps the entire sync 
 
 ### Verbosity Levels
 
-Independent of format — verbosity controls WHAT is logged, format controls HOW.
+Independent of format - verbosity controls WHAT is logged, format controls HOW.
 
 | Level | What shows | Use case |
 |---|---|---|
@@ -1361,8 +1361,8 @@ Verbosity is also overridable via env var: `OCYNC_LOG_LEVEL=debug` (maps to `-v`
 
 ### What You NEVER See at Default Level
 
-- "Blob already exists" (expected case — silence)
-- "Manifest unchanged" (it's a skip — silence)
+- "Blob already exists" (expected case - silence)
+- "Manifest unchanged" (it's a skip - silence)
 - "Authenticated successfully" (if it works, don't mention it)
 - HTTP request/response details
 - Filter pipeline internals
@@ -1383,7 +1383,7 @@ FAILED   chainguard/node:22 → mirror/node:22             (429 rate limited)
 ───────────────────────────────────────────────────────────
 ```
 
-A successful sync of 50 images where 47 are unchanged produces **the summary only** — not 500 lines of noise.
+A successful sync of 50 images where 47 are unchanged produces **the summary only** - not 500 lines of noise.
 
 ### Stats (Always Shown)
 
@@ -1405,8 +1405,8 @@ The stats summary is always printed at the end (even at default verbosity) becau
 
 When stderr is not a TTY, long-running transfers emit periodic heartbeats:
 ```
-[2026-04-10T14:30:30Z] chainguard/large-model:v2 — 234/512 MB (45%) at 12.3 MB/s, ~22s remaining
-[2026-04-10T14:31:00Z] chainguard/large-model:v2 — 389/512 MB (76%) at 11.8 MB/s, ~10s remaining
+[2026-04-10T14:30:30Z] chainguard/large-model:v2 - 234/512 MB (45%) at 12.3 MB/s, ~22s remaining
+[2026-04-10T14:31:00Z] chainguard/large-model:v2 - 389/512 MB (76%) at 11.8 MB/s, ~10s remaining
 ```
 
 Interval: every 30s for transfers > 60s. Shorter transfers get no heartbeat (just the completion line).
@@ -1455,7 +1455,7 @@ This enables post-mortem debugging without flooding the terminal.
 | 1 | PARTIAL_FAILURE | Some succeeded, some failed |
 | 2 | TOTAL_FAILURE | Nothing succeeded. Also used for FIPS self-check failure. |
 | 3 | CONFIG_ERROR | Config parse/validation failure (including unknown registry references) |
-| 4 | AUTH_ERROR | Pre-sync authentication failed for one or more registries (not mid-sync auth failures — those produce per-image failures in the SyncReport) |
+| 4 | AUTH_ERROR | Pre-sync authentication failed for one or more registries (not mid-sync auth failures - those produce per-image failures in the SyncReport) |
 
 ### `sync()` Returns `SyncReport`, Not `Result`
 
@@ -1515,7 +1515,7 @@ ENTRYPOINT ["ocync"]
 ```dockerfile
 FROM rust:1.85 AS builder
 # Target: x86_64-unknown-linux-gnu + static CRT linking
-# FIPS certification is against glibc, not musl — must use gnu target
+# FIPS certification is against glibc, not musl - must use gnu target
 ENV RUSTFLAGS="-C target-feature=+crt-static"
 RUN cargo build --release --features fips --target x86_64-unknown-linux-gnu
 
@@ -1535,7 +1535,7 @@ ENTRYPOINT ["ocync"]
 
 ### Non-FIPS builds
 
-No FIPS build complexity. Standard `cargo build` with default features uses `rustls` + `aws-lc-rs` (non-FIPS mode) — fast, no CMake/Go required.
+No FIPS build complexity. Standard `cargo build` with default features uses `rustls` + `aws-lc-rs` (non-FIPS mode) - fast, no CMake/Go required.
 
 ---
 
@@ -1584,11 +1584,11 @@ On receiving SIGHUP:
 Watch mode maintains the transfer state cache in memory across sync cycles to avoid redundant source manifest pulls:
 
 - **Source-side caching**: after a successful source manifest pull, records `(source_authority, repo, tag) → SourceSnapshot` containing the source HEAD digest, filtered digest (after platform filtering), and platform filter config hash
-- **Target verification is always live**: target HEAD checks are performed every cycle regardless of cache state — the cache only skips source-side work, never target verification
+- **Target verification is always live**: target HEAD checks are performed every cycle regardless of cache state - the cache only skips source-side work, never target verification
 - **Startup**: loads existing cache from disk (warm start from prior CronJob or watch session)
-- **Persistence**: persists to disk on graceful shutdown (SIGTERM/SIGINT) only, not every cycle — avoids per-cycle disk I/O while preserving crash recovery
+- **Persistence**: persists to disk on graceful shutdown (SIGTERM/SIGINT) only, not every cycle - avoids per-cycle disk I/O while preserving crash recovery
 - **End-of-cycle pruning**: tags removed from source (no longer in filtered tag list) are evicted from cache
-- **Cleared on SIGHUP** (config reload) — forces re-verification of all tags after config changes
+- **Cleared on SIGHUP** (config reload) - forces re-verification of all tags after config changes
 
 See the discovery optimization spec for the full tag digest cache design, including platform filter hash determinism, cache format versioning, and fallback behavior.
 
@@ -1602,9 +1602,9 @@ Watch mode starts an HTTP health server on a configurable port (`--health-port`,
 | `/readyz` | Readiness probe | HTTP 200 if last sync completed within `2 * watch.interval`. HTTP 503 if overdue. |
 | `/metrics` | Prometheus metrics | See Prometheus Metrics section |
 
-The health server uses a lightweight TCP listener with manual HTTP response formatting — no framework dependency. Prometheus metrics exposition (`/metrics`) and readiness probes (`/readyz`) are planned for a future spec; the current health server provides liveness checking only.
+The health server uses a lightweight TCP listener with manual HTTP response formatting - no framework dependency. Prometheus metrics exposition (`/metrics`) and readiness probes (`/readyz`) are planned for a future spec; the current health server provides liveness checking only.
 
-Health endpoints are NOT enabled in CronJob/one-shot mode — only in `ocync watch`.
+Health endpoints are NOT enabled in CronJob/one-shot mode - only in `ocync watch`.
 
 ### Consecutive Failure Handling
 
@@ -1612,7 +1612,7 @@ If `watch.failure.consecutive_failure_threshold` consecutive cycles produce only
 - Log CRITICAL with failure count
 - `/readyz` returns 503
 - `mappings_consecutive_failures` gauge updates per mapping
-- ocync continues running (does not exit — let K8s handle restart if needed via liveness probe timeout)
+- ocync continues running (does not exit - let K8s handle restart if needed via liveness probe timeout)
 
 ---
 
@@ -1639,10 +1639,10 @@ Metrics use the `prometheus-client` crate. Exposed at `/metrics` in watch mode.
 
 | Metric | Labels | Description |
 |---|---|---|
-| `ocync_sync_in_progress` | — | 1 if sync is running, 0 otherwise |
+| `ocync_sync_in_progress` | - | 1 if sync is running, 0 otherwise |
 | `ocync_mappings_consecutive_failures` | `mapping` | Consecutive failure count per mapping |
 | `ocync_rate_limit_remaining` | `registry` | Remaining rate limit budget (if detectable) |
-| `ocync_config_last_reload_timestamp` | — | Unix timestamp of last successful config reload |
+| `ocync_config_last_reload_timestamp` | - | Unix timestamp of last successful config reload |
 
 ### Histograms
 
@@ -1675,11 +1675,11 @@ Default drain deadline: 25s (configurable via `SyncEngine::with_drain_deadline()
 
 On receiving SIGTERM or SIGINT:
 
-1. **Stop promoting new work** — pending items in the `VecDeque` are not promoted to execution
-2. **Stop discovery** — discovery futures are no longer polled
-3. **Drain in-flight execution** — active execution futures continue until completion or drain deadline
-4. **Persist cache** — `TransferStateCache` is persisted to disk after the pipeline loop exits, preserving progress for the next run
-5. **Abandon if deadline exceeded** — if drain deadline fires while execution futures remain, they are abandoned and logged
+1. **Stop promoting new work** - pending items in the `VecDeque` are not promoted to execution
+2. **Stop discovery** - discovery futures are no longer polled
+3. **Drain in-flight execution** - active execution futures continue until completion or drain deadline
+4. **Persist cache** - `TransferStateCache` is persisted to disk after the pipeline loop exits, preserving progress for the next run
+5. **Abandon if deadline exceeded** - if drain deadline fires while execution futures remain, they are abandoned and logged
 
 The `select!` drain deadline branch guards on `!execution_futures.is_empty()` so the engine exits immediately when all work completes rather than waiting for the full deadline.
 
@@ -1793,13 +1793,13 @@ policyFiles:
 ```
 
 **CronJob design decisions:**
-- **`backoffLimit: 0`** — ocync has internal retries; the next scheduled run IS the retry. Kubernetes cannot distinguish between exit codes for intelligent retry decisions, so K8s-level retries just waste compute.
-- **`failedJobsHistoryLimit: 3`** — keep last 3 failed jobs for `kubectl logs` debugging
-- **`activeDeadlineSeconds: 900`** — hard timeout as a safety net (15 minutes default)
-- **`concurrencyPolicy: Forbid`** — prevent overlapping syncs
+- **`backoffLimit: 0`** - ocync has internal retries; the next scheduled run IS the retry. Kubernetes cannot distinguish between exit codes for intelligent retry decisions, so K8s-level retries just waste compute.
+- **`failedJobsHistoryLimit: 3`** - keep last 3 failed jobs for `kubectl logs` debugging
+- **`activeDeadlineSeconds: 900`** - hard timeout as a safety net (15 minutes default)
+- **`concurrencyPolicy: Forbid`** - prevent overlapping syncs
 
 **Key Helm features:**
-- IRSA annotation on ServiceAccount (EKS) / workload identity (GKE) — no static AWS credentials
+- IRSA annotation on ServiceAccount (EKS) / workload identity (GKE) - no static AWS credentials
 - ConfigMap for ocync config + policy files
 - Optional Secret for registries that need static credentials
 - Pod annotations for Prometheus scraping (when using `watch` mode as a Deployment)
@@ -1816,12 +1816,12 @@ policyFiles:
 
 ## Non-Goals (Explicit)
 
-- **No deletion/pruning** — registries handle lifecycle (ECR lifecycle policies, Harbor retention)
-- **No image building** — ocync syncs existing images, it does not build them
-- **No signature verification** — ocync transfers signatures faithfully but does NOT verify them; verification is the consumer's responsibility
-- **No Docker daemon integration** — pure OCI Distribution API only
-- **No skopeo dependency** — everything is native
-- **No local disk buffering** — blobs stream source → target without touching disk
-- **No `date` sort** — O(n) manifest+config fetches make date-based sorting prohibitively expensive; use `alpha` for date-stamped tags
-- **No OTLP export (v1)** — Prometheus metrics are P0; OTLP is deferred to a future version
-- **No per-mapping schedules in watch mode** — one global interval for simplicity and predictability
+- **No deletion/pruning** - registries handle lifecycle (ECR lifecycle policies, Harbor retention)
+- **No image building** - ocync syncs existing images, it does not build them
+- **No signature verification** - ocync transfers signatures faithfully but does NOT verify them; verification is the consumer's responsibility
+- **No Docker daemon integration** - pure OCI Distribution API only
+- **No skopeo dependency** - everything is native
+- **No local disk buffering** - blobs stream source → target without touching disk
+- **No `date` sort** - O(n) manifest+config fetches make date-based sorting prohibitively expensive; use `alpha` for date-stamped tags
+- **No OTLP export (v1)** - Prometheus metrics are P0; OTLP is deferred to a future version
+- **No per-mapping schedules in watch mode** - one global interval for simplicity and predictability

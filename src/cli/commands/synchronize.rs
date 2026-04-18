@@ -1,4 +1,4 @@
-//! The `sync` subcommand -- runs all mappings from config.
+//! The `sync` subcommand - runs all mappings from config.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -110,7 +110,7 @@ pub(crate) async fn run(
     // Multi-image: pull once, push from staging when the same blob appears in
     // another image (cross-image source dedup).
     //
-    // Trade-off: this is a conservative heuristic -- disjoint mappings pay a
+    // Trade-off: this is a conservative heuristic - disjoint mappings pay a
     // disk round-trip per blob for zero benefit. Tighter detection would
     // require manifest data (unavailable pre-discovery). The overhead is
     // small (local I/O) relative to the network savings when blobs overlap.
@@ -126,10 +126,9 @@ pub(crate) async fn run(
             .as_ref()
             .and_then(|g| g.staging_size_limit.as_deref())
             .and_then(parse_size)
+            && let Err(e) = stage.evict(limit)
         {
-            if let Err(e) = stage.evict(limit) {
-                tracing::warn!(error = %e, "failed to evict staged blobs");
-            }
+            tracing::warn!(error = %e, "failed to evict staged blobs");
         }
         stage
     } else {
@@ -148,10 +147,8 @@ pub(crate) async fn run(
         .await;
 
     // Persist only when we own the cache (sync command). Watch mode persists on shutdown.
-    if should_persist {
-        if let Err(e) = cache.borrow().persist(&cache_path) {
-            tracing::error!(error = %e, "failed to persist transfer state cache");
-        }
+    if should_persist && let Err(e) = cache.borrow().persist(&cache_path) {
+        tracing::error!(error = %e, "failed to persist transfer state cache");
     }
 
     write_output(&report, args.json)?;
@@ -166,14 +163,14 @@ pub(crate) async fn run(
 /// Parse a human-readable duration string into a [`Duration`].
 ///
 /// Accepts:
-/// - `"0"` — [`Duration::ZERO`]
-/// - `"<N>s"` — N seconds
-/// - `"<N>m"` — N minutes
-/// - `"<N>h"` — N hours
-/// - `"<N>d"` — N days
-/// - `"<N>"` (no suffix) — N seconds
+/// - `"0"` - [`Duration::ZERO`]
+/// - `"<N>s"` - N seconds
+/// - `"<N>m"` - N minutes
+/// - `"<N>h"` - N hours
+/// - `"<N>d"` - N days
+/// - `"<N>"` (no suffix) - N seconds
 ///
-/// Returns `None` for unrecognised strings — callers must decide how to
+/// Returns `None` for unrecognised strings - callers must decide how to
 /// handle invalid input rather than silently receiving a default.
 fn parse_duration(s: &str) -> Option<Duration> {
     if s == "0" {
@@ -236,7 +233,7 @@ pub(crate) async fn build_clients(
 ///
 /// Automatically creates a [`BatchChecker`] for every registry detected
 /// as ECR (via explicit `auth_type: ecr` or hostname auto-detection). No
-/// user configuration is needed — if we know it's ECR, we use the batch API.
+/// user configuration is needed - if we know it's ECR, we use the batch API.
 async fn build_batch_checkers(
     config: &Config,
 ) -> Result<HashMap<String, Rc<dyn BatchBlobChecker>>, CliError> {
@@ -569,7 +566,7 @@ mod tests {
         assert_eq!(glob_or_list_to_vec(Some(&g)), vec!["a", "b"]);
     }
 
-    // -- parse_size -----------------------------------------------------------
+    // - parse_size -----------------------------------------------------------
 
     #[test]
     fn parse_size_zero() {

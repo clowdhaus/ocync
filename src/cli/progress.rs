@@ -141,7 +141,7 @@ impl TextProgress {
 /// the spinner is replaced with a final status line (failures always shown,
 /// synced/skipped shown at verbosity >= 1, silently cleared at verbosity 0).
 ///
-/// Falls back to [`TextProgress`] when stderr is not a terminal — the
+/// Falls back to [`TextProgress`] when stderr is not a terminal - the
 /// selection is made in `main.rs`, not here.
 pub(crate) struct TtyProgress {
     multi: MultiProgress,
@@ -221,14 +221,14 @@ impl ProgressReporter for TtyProgress {
 
 impl ProgressReporter for TextProgress {
     fn image_started(&self, _source: &str, _target: &str) {
-        // No-op for text output — only progress bar implementations need this.
+        // No-op for text output - only progress bar implementations need this.
     }
 
     fn image_completed(&self, result: &ImageResult) {
-        if let Some(line) = format_image_line(result, self.verbosity) {
-            if let Err(e) = writeln!(self.stderr.borrow_mut(), "{line}") {
-                tracing::warn!(error = %e, "failed to write progress to stderr");
-            }
+        if let Some(line) = format_image_line(result, self.verbosity)
+            && let Err(e) = writeln!(self.stderr.borrow_mut(), "{line}")
+        {
+            tracing::warn!(error = %e, "failed to write progress to stderr");
         }
     }
 
@@ -291,7 +291,7 @@ mod tests {
         }
     }
 
-    // -- format_image_line tests (shared formatting logic) --
+    // - format_image_line tests (shared formatting logic) --
 
     #[test]
     fn image_line_failed_always_returns_some() {
@@ -458,7 +458,7 @@ mod tests {
         );
     }
 
-    // -- write_run_summary tests --
+    // - write_run_summary tests --
 
     #[test]
     fn summary_exact_format() {
@@ -598,7 +598,7 @@ mod tests {
         assert!(buf.borrow().is_empty());
     }
 
-    // -- TextProgress tests (wiring: writes to correct streams) --
+    // - TextProgress tests (wiring: writes to correct streams) --
 
     fn test_text_progress(verbosity: u8) -> (TextProgress, Buf, Buf) {
         test_text_progress_with_suppress(verbosity, false)
@@ -773,7 +773,7 @@ mod tests {
         );
     }
 
-    // -- TtyProgress tests (wiring: spinner lifecycle and summary output) --
+    // - TtyProgress tests (wiring: spinner lifecycle and summary output) --
 
     fn test_tty_progress(verbosity: u8) -> (TtyProgress, Buf) {
         let stdout_buf = Rc::new(RefCell::new(Vec::new()));
@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn tty_completed_without_started_does_not_panic() {
         let (progress, _stdout) = test_tty_progress(0);
-        // No image_started — should warn and return, not panic.
+        // No image_started - should warn and return, not panic.
         progress.image_completed(&make_result(ImageStatus::Synced, 1024));
         assert!(progress.spinners.borrow().is_empty());
     }
@@ -880,7 +880,7 @@ mod tests {
     #[test]
     fn tty_suppress_summary_still_runs_spinners() {
         // Spinner lifecycle must work even when summary is suppressed
-        // (e.g., --json mode). Spinners go to stderr, summary to stdout —
+        // (e.g., --json mode). Spinners go to stderr, summary to stdout --
         // suppressing stdout must not interfere with spinner create/remove.
         let stdout_buf = Rc::new(RefCell::new(Vec::new()));
         let progress =

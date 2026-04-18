@@ -1,4 +1,4 @@
-//! Integration tests for `blob_push_stream` — streaming PUT uploads.
+//! Integration tests for `blob_push_stream` -- streaming PUT uploads.
 
 use bytes::Bytes;
 use futures_util::stream;
@@ -355,7 +355,7 @@ async fn stream_error_propagates() {
     // Build a stream that yields one chunk then an error.
     let error_stream = stream::iter(vec![
         Ok(Bytes::from_static(b"ok")),
-        Err(reqwest::Client::new()
+        Err(ocync_distribution::test_http_client()
             .get("http://[::0]:1") // unreachable address
             .send()
             .await
@@ -382,7 +382,7 @@ async fn post_returns_200_is_rejected() {
     let data = b"data";
     let digest = test_digest(data);
 
-    // POST returns 200 OK instead of 202 Accepted — some registries do this.
+    // POST returns 200 OK instead of 202 Accepted -- some registries do this.
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
         .respond_with(

@@ -1,4 +1,4 @@
-//! Blob operations — existence checks, pull, push, mount, and upload management.
+//! Blob operations - existence checks, pull, push, mount, and upload management.
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -24,7 +24,7 @@ pub enum MountResult {
     /// Registry fulfilled the mount (201 Created). The blob is now
     /// referenced from the target repo without a data transfer.
     Mounted,
-    /// Mount did not happen — the registry returned 202 without
+    /// Mount did not happen - the registry returned 202 without
     /// fulfilling the mount. Callers fall through to push.
     NotMounted,
 }
@@ -204,12 +204,12 @@ impl RegistryClient {
     ///
     /// Default path (2 requests, zero buffering):
     /// 1. POST `/v2/{repository}/blobs/uploads/` to initiate.
-    /// 2. PUT with the stream as request body — the blob flows from source
+    /// 2. PUT with the stream as request body - the blob flows from source
     ///    to target without buffering in memory. The registry verifies the
     ///    digest provided in the `?digest=` query param.
     ///
     /// **GHCR fallback**: GitHub Container Registry's multi-PATCH chunked
-    /// upload is broken — each PATCH overwrites all previous chunks. Blobs
+    /// upload is broken - each PATCH overwrites all previous chunks. Blobs
     /// pushed to `ghcr.io` use a single PATCH with no `Content-Range` header.
     ///
     /// **GAR fallback**: Google Artifact Registry does not support chunked
@@ -271,7 +271,7 @@ impl RegistryClient {
         let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
         let upload_url = extract_location(&resp, &self.base_url)?;
 
-        // Streaming PUT — send the blob body through a single HTTP request.
+        // Streaming PUT - send the blob body through a single HTTP request.
         // Uses Transfer-Encoding: chunked (no Content-Length), so the body
         // flows from source to registry without buffering in memory.
         //
@@ -366,7 +366,7 @@ impl RegistryClient {
         let body = Bytes::from(buffer_stream(stream, known_size).await?);
         let body_len = body.len();
 
-        // Single PATCH — no Content-Range header.
+        // Single PATCH - no Content-Range header.
         let resp = self
             .send_with_aimd(
                 RegistryAction::BlobUploadChunk,
@@ -690,7 +690,7 @@ mod tests {
 
         let client = build_test_client("ghcr.io", port);
 
-        // No known_size — GHCR path still taken based on hostname alone.
+        // No known_size - GHCR path still taken based on hostname alone.
         let repo = RepositoryName::new("repo");
         let result = client
             .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
@@ -784,7 +784,7 @@ mod tests {
     }
 
     /// Default upload path uses streaming PUT (POST + PUT). PATCH must
-    /// never be called — the entire blob flows through a single PUT request.
+    /// never be called - the entire blob flows through a single PUT request.
     #[tokio::test]
     async fn blob_push_stream_uses_streaming_put() {
         let server = wiremock::MockServer::start().await;

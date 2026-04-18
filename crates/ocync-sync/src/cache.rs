@@ -121,7 +121,7 @@ type SourceSnapshotMap = HashMap<SnapshotKey, SourceSnapshot>;
 /// and [`BlobStatus::Completed`] entries are persisted; transient states are
 /// dropped on write.
 ///
-/// `load` never returns an error — a missing, corrupt, or expired file simply
+/// `load` never returns an error - a missing, corrupt, or expired file simply
 /// yields an empty cache, and the next sync run will repopulate it.
 #[derive(Debug, Default)]
 pub struct TransferStateCache {
@@ -130,7 +130,7 @@ pub struct TransferStateCache {
     /// Runtime-only: per-(target, digest) [`Notify`] used to wake waiters when
     /// an in-progress blob upload completes or fails. Concurrent transfers of
     /// the same blob from different source repos wait on this to avoid
-    /// redundant uploads — the winner pushes, losers mount from it.
+    /// redundant uploads - the winner pushes, losers mount from it.
     ///
     /// Lives outside `BlobDedupMap` so it's not part of the persisted cache
     /// format. Entries are cleaned up on persist via `reset_transient_state`.
@@ -296,18 +296,17 @@ impl TransferStateCache {
 
         std::fs::rename(&tmp_path, path)?;
 
-        // Best-effort directory fsync — the rename succeeded, so the data is
+        // Best-effort directory fsync - the rename succeeded, so the data is
         // reachable; only crash-before-journal-flush can lose it.
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                if let Err(e) = dir.sync_all() {
-                    warn!(
-                        path = %parent.display(),
-                        error = %e,
-                        "directory fsync failed after cache rename"
-                    );
-                }
-            }
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+            && let Err(e) = dir.sync_all()
+        {
+            warn!(
+                path = %parent.display(),
+                error = %e,
+                "directory fsync failed after cache rename"
+            );
         }
 
         Ok(())

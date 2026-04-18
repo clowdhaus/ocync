@@ -1,4 +1,4 @@
-//! AWS ECR batch operations — bulk blob existence checks.
+//! AWS ECR batch operations - bulk blob existence checks.
 //!
 //! Provides [`BatchBlobChecker`] for bulk blob existence checking via ECR's
 //! `BatchCheckLayerAvailability` API. These complement the per-request OCI
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn registry_id_too_short() {
-        // 11 digits — too short
+        // 11 digits - too short
         assert_eq!(
             ecr_registry_id("12345678901.dkr.ecr.us-east-1.amazonaws.com"),
             None
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn registry_id_too_long() {
-        // 13 digits — too long
+        // 13 digits - too long
         assert_eq!(
             ecr_registry_id("1234567890123.dkr.ecr.us-east-1.amazonaws.com"),
             None
@@ -438,7 +438,7 @@ mod tests {
     /// Verifies that the caller passes the expected repository name and that
     /// digest strings match the expected set (per mock contract fidelity).
     struct MockEcrBatchApi {
-        /// Expected repository name — panics if caller passes a different repo.
+        /// Expected repository name - panics if caller passes a different repo.
         expected_repo: String,
         check_responses: Mutex<VecDeque<Result<BatchCheckResponse, Error>>>,
         counts: CallCounts,
@@ -550,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_splits_batches_at_100() {
-        // Create 250 digests — should result in 3 API calls (100, 100, 50).
+        // Create 250 digests - should result in 3 API calls (100, 100, 50).
         let digests: Vec<Digest> = (0..250u16)
             .map(|n| {
                 let hex = format!("{:0>64x}", n);

@@ -103,7 +103,7 @@ mod tests {
             max_backoff: Duration::from_secs(300),
             ..RetryConfig::default()
         };
-        // 3^30 overflows u32 — saturating_pow caps at u32::MAX,
+        // 3^30 overflows u32 - saturating_pow caps at u32::MAX,
         // saturating_mul caps Duration, then min caps at max_backoff
         let result = cfg.backoff_for(30);
         assert_eq!(result, Duration::from_secs(300));

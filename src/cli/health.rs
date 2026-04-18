@@ -1,6 +1,6 @@
 //! Health and readiness endpoints for watch mode.
 //!
-//! Exposes `/healthz` (liveness — always 200) and `/readyz` (readiness —
+//! Exposes `/healthz` (liveness - always 200) and `/readyz` (readiness --
 //! 200 if last sync within `2 * interval`, 503 otherwise) for Kubernetes
 //! probes.
 
@@ -54,8 +54,8 @@ fn format_response(status: StatusCode, body: &str) -> String {
 
 /// Route a request path to a formatted HTTP response based on health state.
 ///
-/// - `/healthz` — liveness: always 200 (process is running).
-/// - `/readyz`  — readiness: 200 if last sync within `2 * interval`, 503 otherwise.
+/// - `/healthz` - liveness: always 200 (process is running).
+/// - `/readyz`  - readiness: 200 if last sync within `2 * interval`, 503 otherwise.
 fn handle_request(path: &str, state: &HealthState) -> String {
     match path {
         "/healthz" => format_response(StatusCode::OK, "ok\n"),
@@ -109,7 +109,7 @@ pub(crate) async fn serve(listener: TcpListener, state: Rc<RefCell<HealthState>>
 mod tests {
     use super::*;
 
-    // -- handler unit tests (no TCP, no port) --
+    // - handler unit tests (no TCP, no port) --
 
     #[test]
     fn healthz_returns_200_before_first_sync() {
@@ -197,7 +197,7 @@ mod tests {
         );
     }
 
-    // -- state logic unit tests --
+    // - state logic unit tests --
 
     #[test]
     fn health_state_no_success_is_not_ready() {
@@ -238,7 +238,7 @@ mod tests {
         assert!(!state.is_ready());
     }
 
-    // -- response formatting --
+    // - response formatting --
 
     #[test]
     fn format_response_200() {
@@ -264,7 +264,7 @@ mod tests {
         );
     }
 
-    // -- TCP integration tests (exercises the real `serve()` code path) --
+    // - TCP integration tests (exercises the real `serve()` code path) --
 
     /// Send a raw HTTP request to the health server and return the response.
     ///
@@ -300,7 +300,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // No record_success — /healthz should still return 200.
+                // No record_success - /healthz should still return 200.
                 let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
 
                 let resp =

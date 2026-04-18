@@ -9,7 +9,7 @@ use regex_lite::Regex;
 /// Not all variants have a corresponding [`AuthProvider`](super::AuthProvider)
 /// implementation. Currently only [`Ecr`](Self::Ecr) has a full auth provider.
 /// Hostnames that don't match any known provider return `None` from
-/// [`detect_provider_kind`] — these registries (e.g. Quay, Harbor, private
+/// [`detect_provider_kind`] -- these registries (e.g. Quay, Harbor, private
 /// registries) use the standard OCI token-exchange flow via
 /// [`AnonymousAuth`](super::anonymous::AnonymousAuth) or Docker config
 /// credentials.
@@ -46,7 +46,7 @@ impl ProviderKind {
     /// is disabled by default; when disabled, mount POSTs return 202 (the
     /// fallback path pushes normally). We always attempt mount on ECR because
     /// the 202 fallback is cheap (~100ms) and successful mounts save entire
-    /// blob uploads. See `docs/specs/findings.md` for evidence.
+    /// blob uploads. See `docs/findings.md` for evidence.
     ///
     /// Uses an exhaustive `match` so adding a new [`ProviderKind`] variant
     /// forces a compile-time decision here.
@@ -104,7 +104,7 @@ static ACR_RE: LazyLock<Regex> =
 ///
 /// Normalizes the hostname to lowercase, strips any port number and trailing
 /// dot before matching. Returns `None` for unrecognized hostnames (e.g. Quay,
-/// Harbor, private registries) — these should fall through to the standard OCI
+/// Harbor, private registries) -- these should fall through to the standard OCI
 /// token-exchange flow or Docker config credential resolution.
 pub fn detect_provider_kind(hostname: &str) -> Option<ProviderKind> {
     let hostname = hostname.to_ascii_lowercase();

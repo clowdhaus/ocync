@@ -14,7 +14,7 @@ use crate::error::Error;
 /// that doesn't require a token-exchange flow.
 ///
 /// `invalidate()` is a no-op because there is no cached exchange
-/// to clear — the token is the source of truth.
+/// to clear -- the token is the source of truth.
 pub struct StaticTokenAuth {
     /// The bearer token value.
     token: String,

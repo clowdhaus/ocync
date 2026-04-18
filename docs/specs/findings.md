@@ -38,12 +38,12 @@ These are the axes we measure efficiency against:
 3. **Wall-clock speed.** Downstream of (1) and (2). If we transfer fewer
    bytes with fewer API calls, we're faster. Reports that prioritize
    wall-clock without showing the underlying byte/request counts are
-   misleading — a proxy-bound benchmark can't tell you whether your
+   misleading - a proxy-bound benchmark can't tell you whether your
    tool is actually efficient, only that *something* is slow.
 
 # Findings
 
-## 2026-04-16 — ECR does not fulfill OCI cross-repo blob mount
+## 2026-04-16 - ECR does not fulfill OCI cross-repo blob mount
 
 ### Observation
 
@@ -62,7 +62,7 @@ Created` (the spec-compliant mount-success response).
 
 The ad-hoc probe deliberately varied the interval between source blob
 commit and mount attempt (0s / 10s / 60s) to test the hypothesis that
-ECR requires settling time before fulfilling mount. It does not — all
+ECR requires settling time before fulfilling mount. It does not - all
 three delays produced the same result. The probe tool was subsequently
 removed from the tree; see the re-validate section below for the
 manual procedure if the observation needs to be re-run.
@@ -99,7 +99,7 @@ target.
   future observation shows ECR Public does fulfill mount, flip the arm
   and add a re-validate entry.
 - `blob_mount` short-circuits when the target hostname resolves to a
-  provider that does not fulfill mount — returns `MountResult::NotMounted`
+  provider that does not fulfill mount - returns `MountResult::NotMounted`
   without issuing the POST, saving one round-trip per shared blob per
   target.
 - `MountResult` is two-variant (`Mounted` / `NotMounted`). A mid-review
@@ -130,7 +130,7 @@ manually against a throwaway ECR account:
 
 One `201` across multiple accounts/regions is sufficient grounds to
 re-evaluate. AWS may fulfill mount only under specific conditions (same
-account, specific regions, specific IAM scopes) — analyze the response
+account, specific regions, specific IAM scopes) - analyze the response
 body and `Location` header before flipping the short-circuit globally.
 
 ### Cost of this particular finding (measured)
@@ -146,7 +146,7 @@ body and `Location` header before flipping the short-circuit globally.
 
 Savings vs baseline: **148 avoided POSTs, identical bytes.** The
 short-circuit is a rate-limit / request-count optimization, not a bytes
-optimization — which matches the theoretical analysis.
+optimization - which matches the theoretical analysis.
 
 The two-variant and three-variant fixes were observationally identical
 on every axis (requests, bytes, mount counts), confirming the
@@ -158,7 +158,7 @@ undetected until a proxy log made it visible.
 
 ---
 
-## 2026-04-16 — 3-tool cold/warm comparison and upload strategy analysis
+## 2026-04-16 - 3-tool cold/warm comparison and upload strategy analysis
 
 ### Observation
 
@@ -169,7 +169,7 @@ All three tools exited 0 (no partial failures). Branch: `benchmark-comparison`.
 Pre-optimization, ocync used 3,249 requests (chunked PATCH upload,
 broken auth cache, redundant blob HEADs) vs regsync's 1,302 for the
 same 11.5 GB multi-arch transfer. dregsy's 1,538 requests / 5.9 GB
-were not comparable — it synced only 1 platform. No tool deduplicated
+were not comparable - it synced only 1 platform. No tool deduplicated
 cross-image blob downloads from source (168 redundant GETs / 5.6 GB
 on this corpus).
 
@@ -228,7 +228,7 @@ cross-registry syncs). dregsy hit 49 rate-limit 429s from Docker Hub
 despite authenticated pulls.
 
 **Memory:** regsync's lower RSS (27 MB) reflects its sequential
-architecture -- one image, one blob at a time, with Go's ~10-15 MB
+architecture - one image, one blob at a time, with Go's ~10-15 MB
 baseline. ocync's 58 MB comes from concurrent blob transfers
 (BLOB_CONCURRENCY=6), the staging claim/wait maps, transfer state
 cache, and blob frequency map held in memory simultaneously. dregsy's
@@ -239,13 +239,13 @@ Historical data: `bench-results/runs/*.json` (gitignored, on instance)
 
 ---
 
-## 2026-04-16 — Research findings: ECR, OCI upload, Docker Hub
+## 2026-04-16 - Research findings: ECR, OCI upload, Docker Hub
 
 Three parallel research agents surveyed ECR optimization, OCI upload
 best practices across tools, and Docker Hub rate limiting. Actionable
-findings only — full reports in session artifacts.
+findings only - full reports in session artifacts.
 
-### ECR blob mounting -- works, with conditions (tested 2026-04-17)
+### ECR blob mounting - works, with conditions (tested 2026-04-17)
 
 AWS launched opt-in `BLOB_MOUNTING` account setting (January 2026).
 Enable: `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`
@@ -258,12 +258,12 @@ Enable: `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`
 4. Both repos have identical encryption config (AES256 default works)
 
 **Standalone blobs without manifests return 202 (mount fails).** This
-is why our initial curl tests failed -- we pushed raw blobs without
+is why our initial curl tests failed - we pushed raw blobs without
 committing a manifest. dregsy's benchmark confirmed 172/172 mounts
 succeeded because it pushes complete images sequentially.
 
 regsync's mounts all failed (0/247) because it omits the `from=`
-parameter entirely -- it sends `?mount=<digest>` without telling ECR
+parameter entirely - it sends `?mount=<digest>` without telling ECR
 which repo to mount from.
 
 Our `ProviderKind::fulfills_cross_repo_mount` returning `false` for
@@ -275,7 +275,7 @@ Requirements: same account + region, identical encryption config,
 pusher needs `ecr:GetDownloadUrlForLayer` on source repo. Not
 supported for pull-through cache repos.
 
-ECR uses content-addressable storage at the S3 layer — blobs
+ECR uses content-addressable storage at the S3 layer - blobs
 uploaded to one repo are stored in a shared bucket
 (`prod-<region>-starport-layer-bucket`). HEAD for a blob digest
 returns 200 from any repo where the blob was previously referenced.
@@ -336,7 +336,7 @@ fallback to chunked PATCH for larger blobs.
 | skopeo | No | No | BoltDB BlobInfoCache (mount hints) |
 
 No tool deduplicates cross-image blob downloads from source. This is
-the #1 remaining optimization opportunity — 168 redundant source GETs
+the #1 remaining optimization opportunity - 168 redundant source GETs
 (5.6 GB) on the Jupyter corpus.
 
 **Multi-arch handling:**
@@ -383,7 +383,7 @@ calls). Returns full manifest bodies, not just existence.
 
 ---
 
-## 2026-04-17 -- Leader-follower mount optimization
+## 2026-04-17 - Leader-follower mount optimization
 
 ### Observation
 
@@ -401,9 +401,9 @@ us-east-1. Branch: `feat/leader-follower-mount`.
 | Mount attempts | 0 (short-circuited) | 192 |
 | Mount success | 0 | **192 (100%)** |
 
-**591 requests vs 1,049** -- 44% fewer API calls. **4.9 GB vs 11.5 GB** --
+**591 requests vs 1,049** - 44% fewer API calls. **4.9 GB vs 11.5 GB** --
 57% fewer bytes via cross-image staging dedup and 100% mount success.
-**56.8s vs 217.9s** -- 3.8x faster wall clock via 6-concurrent blob
+**56.8s vs 217.9s** - 3.8x faster wall clock via 6-concurrent blob
 transfers within each image (matching skopeo's default parallelism).
 
 Preferred mount sources (leader repos with committed manifests) are tried
@@ -455,13 +455,13 @@ understanding. Each entry ships as its own PR.
 | # | Optimization | Impact | Complexity | Status |
 |---|-------------|--------|------------|--------|
 | 1 | ~~**ECR blob mounting**~~ | ~~Saves blob transfer for every shared layer~~ | ~~Medium~~ | **Done.** Leader-follower + blob concurrency: 192/192 mounts, 44% fewer requests, 57% fewer bytes, 3.8x faster. |
-| 2 | **Cross-image blob download dedup** — download each unique blob from source once, push to N target repos | ~168 source GETs, ~5.6 GB on Jupyter corpus | High | Not started |
-| 3 | **Docker Hub authentication** — always authenticate pulls, add credential support for source registries | 10× more pull quota (100/hr vs 10/hr) | Low | Not started |
-| 4 | **ACR streaming PUT fallback** — `ProviderKind::Acr` with chunked PATCH for blobs > 20 MB | Correctness on ACR (currently broken for large blobs) | Low | Not started |
-| 5 | **BatchGetImage for warm sync** — replace per-manifest HEAD with SDK batch call | ~79 requests → ~1 call on warm sync | Medium | Not started |
-| 6 | **Multi-scope Docker Hub tokens** — batch N repo scopes into 1 token exchange | 5 auth exchanges → 1 (Docker Hub only, cgr.dev incompatible) | Low | Not started |
-| 7 | **Rate limit header parsing** — read `ratelimit-remaining` from Docker Hub and throttle proactively | Avoid 429s before they happen | Low | Not started |
-| 8 | **Verify HTTP/2 on ECR** — check ALPN negotiation, enable multiplexing | Connection reuse for 50 concurrent requests | Trivial | Not started |
+| 2 | **Cross-image blob download dedup** - download each unique blob from source once, push to N target repos | ~168 source GETs, ~5.6 GB on Jupyter corpus | High | Not started |
+| 3 | **Docker Hub authentication** - always authenticate pulls, add credential support for source registries | 10× more pull quota (100/hr vs 10/hr) | Low | Not started |
+| 4 | **ACR streaming PUT fallback** - `ProviderKind::Acr` with chunked PATCH for blobs > 20 MB | Correctness on ACR (currently broken for large blobs) | Low | Not started |
+| 5 | **BatchGetImage for warm sync** - replace per-manifest HEAD with SDK batch call | ~79 requests → ~1 call on warm sync | Medium | Not started |
+| 6 | **Multi-scope Docker Hub tokens** - batch N repo scopes into 1 token exchange | 5 auth exchanges → 1 (Docker Hub only, cgr.dev incompatible) | Low | Not started |
+| 7 | **Rate limit header parsing** - read `ratelimit-remaining` from Docker Hub and throttle proactively | Avoid 429s before they happen | Low | Not started |
+| 8 | **Verify HTTP/2 on ECR** - check ALPN negotiation, enable multiplexing | Connection reuse for 50 concurrent requests | Trivial | Not started |
 
 ### Completed optimizations
 
@@ -476,9 +476,9 @@ understanding. Each entry ships as its own PR.
 ---
 
 <!--
-Entry template for future findings — copy and fill in.
+Entry template for future findings - copy and fill in.
 
-## YYYY-MM-DD — Short summary of the observation
+## YYYY-MM-DD - Short summary of the observation
 
 ### Observation
 

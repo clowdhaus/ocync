@@ -98,10 +98,10 @@ impl fmt::Display for Action {
 /// HTTP authentication scheme for a token.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AuthScheme {
-    /// `Authorization: Bearer <token>` — used by Docker v2 token exchange.
+    /// `Authorization: Bearer <token>` -- used by Docker v2 token exchange.
     #[default]
     Bearer,
-    /// `Authorization: Basic <base64>` — used by ECR (value is pre-encoded).
+    /// `Authorization: Basic <base64>` -- used by ECR (value is pre-encoded).
     Basic,
 }
 
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn token_within_refresh_threshold() {
-        // 20 seconds remaining — less than the 30-second threshold
+        // 20 seconds remaining -- less than the 30-second threshold
         let token = Token::with_ttl("abc123", Duration::from_secs(20));
         assert!(!token.is_expired());
         assert!(token.should_refresh());
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn token_beyond_refresh_threshold() {
-        // 60 seconds remaining — above the 30-second threshold
+        // 60 seconds remaining -- above the 30-second threshold
         let token = Token::with_ttl("abc123", Duration::from_secs(60));
         assert!(!token.is_expired());
         assert!(!token.should_refresh());

@@ -1,4 +1,4 @@
-//! OCI registry sync orchestration — tag filtering, transfer planning, and execution.
+//! OCI registry sync orchestration - tag filtering, transfer planning, and execution.
 
 /// Persistent transfer state cache wrapping [`plan::BlobDedupMap`].
 pub mod cache;
@@ -14,7 +14,7 @@ pub mod progress;
 /// Retry configuration and backoff logic.
 pub mod retry;
 
-/// Sync engine -- pipelined concurrent orchestration of image transfers.
+/// Sync engine - pipelined concurrent orchestration of image transfers.
 pub mod engine;
 /// Cooperative shutdown signal for the sync engine.
 pub mod shutdown;

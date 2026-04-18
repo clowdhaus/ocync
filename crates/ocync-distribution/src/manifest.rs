@@ -1,4 +1,4 @@
-//! Manifest operations — pull, push, head checks, and referrers queries.
+//! Manifest operations - pull, push, head checks, and referrers queries.
 
 use http::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};

@@ -1,4 +1,4 @@
-//! The `watch` subcommand -- daemon mode for periodic sync with graceful shutdown.
+//! The `watch` subcommand - daemon mode for periodic sync with graceful shutdown.
 
 use std::cell::RefCell;
 use std::rc::Rc;

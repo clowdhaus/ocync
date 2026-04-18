@@ -178,18 +178,17 @@ impl BlobStage {
         std::fs::rename(&tmp_path, &dest)?;
 
         // fsync parent directory so the rename is durable. Log on failure
-        // but don't propagate — the rename itself succeeded, so the data is
+        // but don't propagate - the rename itself succeeded, so the data is
         // reachable; only crash-before-journal-flush can lose it.
-        if let Some(parent) = dest.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                if let Err(e) = dir.sync_all() {
-                    tracing::warn!(
-                        path = %parent.display(),
-                        error = %e,
-                        "directory fsync failed after staging rename"
-                    );
-                }
-            }
+        if let Some(parent) = dest.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+            && let Err(e) = dir.sync_all()
+        {
+            tracing::warn!(
+                path = %parent.display(),
+                error = %e,
+                "directory fsync failed after staging rename"
+            );
         }
 
         Ok(())
@@ -223,14 +222,14 @@ impl BlobStage {
 
         for algo_entry in read_dir_entries(&blobs_dir)? {
             for file_entry in read_dir_entries(&algo_entry)? {
-                if is_tmp_file(&file_entry) {
-                    if let Err(e) = std::fs::remove_file(&file_entry) {
-                        tracing::warn!(
-                            path = %file_entry.display(),
-                            error = %e,
-                            "failed to remove orphaned staging tmp file, skipping"
-                        );
-                    }
+                if is_tmp_file(&file_entry)
+                    && let Err(e) = std::fs::remove_file(&file_entry)
+                {
+                    tracing::warn!(
+                        path = %file_entry.display(),
+                        error = %e,
+                        "failed to remove orphaned staging tmp file, skipping"
+                    );
                 }
             }
         }
@@ -376,18 +375,17 @@ impl StagedWriter {
     pub fn finish(self) -> Result<(), io::Error> {
         self.file.sync_all()?;
         std::fs::rename(&self.tmp_path, &self.dest)?;
-        // Best-effort directory fsync — the rename succeeded, so the data is
+        // Best-effort directory fsync - the rename succeeded, so the data is
         // reachable; only crash-before-journal-flush can lose it.
-        if let Some(parent) = self.dest.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                if let Err(e) = dir.sync_all() {
-                    tracing::warn!(
-                        path = %parent.display(),
-                        error = %e,
-                        "directory fsync failed after staging rename"
-                    );
-                }
-            }
+        if let Some(parent) = self.dest.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+            && let Err(e) = dir.sync_all()
+        {
+            tracing::warn!(
+                path = %parent.display(),
+                error = %e,
+                "directory fsync failed after staging rename"
+            );
         }
         Ok(())
     }

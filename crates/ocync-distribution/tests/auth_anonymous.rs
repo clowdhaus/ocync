@@ -63,7 +63,7 @@ async fn token_exchange_basic_flow() {
     let server = setup_auth_server().await;
     mount_token_endpoint(&server, "test-token-123", 3600).await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
     let scopes = [Scope::pull("library/nginx")];
     let token = auth.get_token(&scopes).await.unwrap();
 
@@ -83,7 +83,7 @@ async fn cached_token_reused_for_same_scope() {
         .mount(&server)
         .await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
     let scopes = [Scope::pull("library/nginx")];
 
     let t1 = auth.get_token(&scopes).await.unwrap();
@@ -111,7 +111,7 @@ async fn different_scopes_get_different_tokens() {
     )
     .await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
 
     let t1 = auth
         .get_token(&[Scope::pull("library/nginx")])
@@ -133,7 +133,7 @@ async fn scope_upgrade_fetches_new_token() {
     mount_scoped_token_endpoint(&server, "repository:myrepo:pull", "pull-token", 3600).await;
     mount_scoped_token_endpoint(&server, "repository:myrepo:pull,push", "push-token", 3600).await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
 
     let t1 = auth.get_token(&[Scope::pull("myrepo")]).await.unwrap();
     let t2 = auth.get_token(&[Scope::pull_push("myrepo")]).await.unwrap();
@@ -154,7 +154,7 @@ async fn invalidate_clears_cache() {
         .mount(&server)
         .await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
     let scopes = [Scope::pull("library/nginx")];
 
     let _ = auth.get_token(&scopes).await.unwrap();
@@ -180,7 +180,7 @@ async fn concurrent_requests_coalesce() {
 
     let auth = Arc::new(AnonymousAuth::with_base_url(
         server.uri(),
-        reqwest::Client::new(),
+        ocync_distribution::test_http_client(),
     ));
     let scopes = vec![Scope::pull("library/nginx")];
 
@@ -209,7 +209,7 @@ async fn no_auth_required_returns_empty_token() {
         .mount(&server)
         .await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
     let token = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
 
     assert_eq!(token.value(), "");
@@ -225,7 +225,7 @@ async fn missing_www_authenticate_header_errors() {
         .mount(&server)
         .await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
     let result = auth.get_token(&[Scope::pull("repo")]).await;
 
     assert!(result.is_err());
@@ -243,7 +243,7 @@ async fn token_response_missing_both_fields_errors() {
         .mount(&server)
         .await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
     let result = auth.get_token(&[Scope::pull("repo")]).await;
 
     assert!(result.is_err());
@@ -260,7 +260,7 @@ async fn token_with_access_token_field() {
         .mount(&server)
         .await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
     let token = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
 
     assert_eq!(token.value(), "alt-token");
@@ -276,7 +276,7 @@ async fn token_endpoint_error_propagates() {
         .mount(&server)
         .await;
 
-    let auth = AnonymousAuth::with_base_url(server.uri(), reqwest::Client::new());
+    let auth = AnonymousAuth::with_base_url(server.uri(), ocync_distribution::test_http_client());
     let result = auth.get_token(&[Scope::pull("repo")]).await;
 
     assert!(result.is_err());

@@ -1,4 +1,4 @@
-//! The `copy` subcommand -- copies a single image between registries.
+//! The `copy` subcommand - copies a single image between registries.
 
 use std::cell::RefCell;
 use std::rc::Rc;

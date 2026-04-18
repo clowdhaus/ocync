@@ -112,7 +112,7 @@ impl EcrApi for AwsEcrApi {
 /// Validate an ECR authorization token.
 ///
 /// ECR tokens are base64-encoded strings in the format `AWS:<token>`.
-/// Validates the format and returns the original encoded string unchanged —
+/// Validates the format and returns the original encoded string unchanged --
 /// ECR expects it sent as `Authorization: Basic <encoded>`.
 pub(crate) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Error> {
     let decoded = BASE64.decode(encoded).map_err(|e| Error::AuthFailed {
@@ -214,22 +214,22 @@ impl EcrAuth {
         // Fast path: read-lock cache check allows concurrent readers.
         {
             let cached = self.cached_token.read().await;
-            if let Some(ref token) = *cached {
-                if !token.should_refresh() {
-                    return Ok(token.clone());
-                }
+            if let Some(ref token) = *cached
+                && !token.should_refresh()
+            {
+                return Ok(token.clone());
             }
         }
 
         // Slow path: write-lock for fetch + update.
         let mut cached = self.cached_token.write().await;
 
-        // Double-check after acquiring write lock — another task may have
+        // Double-check after acquiring write lock -- another task may have
         // already refreshed the token while we waited.
-        if let Some(ref token) = *cached {
-            if !token.should_refresh() {
-                return Ok(token.clone());
-            }
+        if let Some(ref token) = *cached
+            && !token.should_refresh()
+        {
+            return Ok(token.clone());
         }
 
         let response = self.api.get_authorization_token().await?;
@@ -478,7 +478,7 @@ mod tests {
         let t1 = auth.get_token(&[]).await.unwrap();
         assert_eq!(t1.value(), expired_encoded);
 
-        // Token has Duration::ZERO TTL — next call must refresh.
+        // Token has Duration::ZERO TTL -- next call must refresh.
         let t2 = auth.get_token(&[]).await.unwrap();
         assert_eq!(t2.value(), fresh_encoded);
     }
