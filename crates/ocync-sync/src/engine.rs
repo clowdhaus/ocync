@@ -17,7 +17,7 @@
 //! state (`TransferStateCache`) is accessed via `Rc<RefCell<>>` with borrows
 //! never held across `.await` points.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
@@ -249,6 +249,20 @@ struct TargetBlobOutcome {
     error: Option<crate::Error>,
 }
 
+/// Outcome of transferring a single blob to one target.
+enum BlobResult {
+    /// Cache hit -- blob already exists at target repo.
+    Skipped,
+    /// Cross-repo mount succeeded.
+    Mounted,
+    /// Pulled from source and pushed to target.
+    Transferred { bytes: u64 },
+    /// Another blob failed; this one was cancelled before starting I/O.
+    Cancelled,
+    /// Transfer failed.
+    Failed(crate::Error),
+}
+
 /// An image ready for execution (one per target that needs sync).
 struct TransferTask {
     /// Shared source data (pulled once per tag).
@@ -298,6 +312,135 @@ enum DiscoveryRoute {
     TargetStale,
 }
 
+/// Elect leader images for mount optimization via greedy set-cover.
+///
+/// Groups pending tasks by source image (tasks sharing the same
+/// [`PulledManifest`] via `Rc` target different registries for the same
+/// tag). Repeatedly picks the image that covers the most shared blob
+/// digests not already covered by previously elected leaders. Stops when
+/// no candidate provides marginal coverage.
+///
+/// All leader tasks are promoted to the front of the deque. The existing
+/// `ClaimAction::Wait` mechanism in [`transfer_image_blobs`] handles
+/// inter-leader blob deduplication: if two leaders share a blob, the
+/// second waits for the first's upload then mounts rather than
+/// re-uploading.
+///
+/// Returns the number of tasks promoted to the front of the deque as leaders
+/// (0 if no election benefit exists).
+fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
+    if pending.len() <= 1 {
+        return 0;
+    }
+
+    // Group tasks by source image. Tasks sharing an Rc<PulledManifest>
+    // represent the same source image bound to different target registries.
+    let mut group_ptrs: Vec<usize> = Vec::new();
+    let mut group_blobs: Vec<HashSet<Digest>> = Vec::new();
+    let mut task_group: Vec<usize> = Vec::with_capacity(pending.len());
+
+    for task in pending.iter() {
+        let ptr = Rc::as_ptr(&task.source_data) as usize;
+        let idx = if let Some(pos) = group_ptrs.iter().position(|&p| p == ptr) {
+            pos
+        } else {
+            let blobs: HashSet<Digest> = blobs_from_manifest(&task.source_data)
+                .into_iter()
+                .map(|d| d.digest.clone())
+                .collect();
+            let idx = group_ptrs.len();
+            group_ptrs.push(ptr);
+            group_blobs.push(blobs);
+            idx
+        };
+        task_group.push(idx);
+    }
+
+    let num_groups = group_ptrs.len();
+    if num_groups <= 1 {
+        // All tasks are the same source image; no election needed.
+        return 0;
+    }
+
+    // Greedy multi-leader election. Each round picks the image that
+    // maximizes marginal shared-blob coverage: for each remaining
+    // (non-leader) image, count blobs shared with the candidate that are
+    // not already in a previous leader's blob set.
+    let mut leader_set: Vec<usize> = Vec::new();
+    let mut leader_blob_union: HashSet<Digest> = HashSet::new();
+    let mut remaining: Vec<usize> = (0..num_groups).collect();
+
+    loop {
+        if remaining.len() <= 1 {
+            break;
+        }
+
+        let best = remaining
+            .iter()
+            .map(|&i| {
+                let marginal: usize = remaining
+                    .iter()
+                    .filter(|&&j| j != i)
+                    .map(|&j| {
+                        group_blobs[i]
+                            .intersection(&group_blobs[j])
+                            .filter(|b| !leader_blob_union.contains(*b))
+                            .count()
+                    })
+                    .sum();
+                (i, marginal)
+            })
+            .max_by_key(|&(_, m)| m);
+
+        match best {
+            Some((idx, marginal)) if marginal > 0 => {
+                leader_blob_union.extend(group_blobs[idx].iter().cloned());
+                leader_set.push(idx);
+                remaining.retain(|&i| i != idx);
+            }
+            _ => break,
+        }
+    }
+
+    if leader_set.is_empty() {
+        // No shared blobs across any images; concurrent is optimal.
+        return 0;
+    }
+
+    // Log each leader's source reference.
+    for &leader_idx in &leader_set {
+        if let Some((pos, _)) = task_group
+            .iter()
+            .enumerate()
+            .find(|&(_, &g)| g == leader_idx)
+        {
+            info!(
+                leader = %pending[pos].source,
+                leader_idx = leader_set.iter().position(|&l| l == leader_idx).unwrap() + 1,
+                total_leaders = leader_set.len(),
+                images = num_groups,
+                "elected leader for mount optimization"
+            );
+        }
+    }
+
+    // Stable partition: leader tasks first, then followers.
+    let mut leaders: VecDeque<TransferTask> = VecDeque::new();
+    let mut followers: VecDeque<TransferTask> = VecDeque::new();
+    for (task, &group) in pending.drain(..).zip(task_group.iter()) {
+        if leader_set.contains(&group) {
+            leaders.push_back(task);
+        } else {
+            followers.push_back(task);
+        }
+    }
+
+    let leader_count = leaders.len();
+    pending.extend(leaders);
+    pending.extend(followers);
+    leader_count
+}
+
 /// Blob frequency tracker for ordering blobs by popularity.
 ///
 /// Blobs shared across many images should be transferred first so the cache
@@ -325,17 +468,61 @@ impl BlobFrequencyMap {
     }
 }
 
+/// Pipeline phase for leader-follower mount optimization.
+///
+/// Tracks which group of tasks is currently being promoted into execution
+/// futures. The phase advances monotonically:
+/// `Discovering -> Leaders -> Done`.
+///
+/// The leader/follower split is essential for correctness: leaders must
+/// commit manifests before followers attempt cross-repo mounts. The greedy
+/// election algorithm guarantees that every shared blob is covered by at
+/// least one leader's blob set, so no further wave partitioning is needed
+/// among followers.
+enum PromotionPhase {
+    /// Discovery futures still in flight; tasks accumulate in `pending`.
+    Discovering,
+    /// Leader tasks promoted; waiting for them to complete before followers.
+    Leaders,
+    /// All tasks promoted (followers promoted after leaders drained); no
+    /// further phase transitions.
+    Done,
+}
+
+/// Borrowed references shared by the `promote` closure at each call site.
+///
+/// Groups the invariant engine state that every promoted task needs, keeping
+/// the closure signature to `(TransferTask, &PromoteContext, &[RepositoryName])`.
+///
+/// Created after discovery completes (once `freq_map` is frozen).
+struct PromoteContext<'a> {
+    sem: &'a Rc<Semaphore>,
+    cache: &'a Rc<RefCell<TransferStateCache>>,
+    staging: &'a Rc<BlobStage>,
+    freq_map: &'a BlobFrequencyMap,
+    retry: &'a RetryConfig,
+}
+
 /// Default cap for concurrent image transfers (Level 1: global image semaphore).
 pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 50;
+
+/// Maximum concurrent blob transfers within a single image.
+///
+/// Matches skopeo's default (6). Higher values risk approaching ECR's
+/// `InitiateLayerUpload` limit (100 TPS shared across all images).
+/// Candidate for `SyncEngine` builder configuration if workloads need tuning.
+const BLOB_CONCURRENCY: usize = 6;
 
 /// Default shutdown drain deadline in seconds.
 const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 25;
 
 /// Sync engine -- orchestrates concurrent image transfers across registries.
 ///
-/// Uses a pipelined architecture where discovery and execution overlap via
-/// `tokio::select!`. The plan phase is eliminated entirely -- progressive
-/// cache population replaces upfront batch HEAD checks.
+/// Discovery futures drain first via `tokio::select!`, then leader-follower
+/// election reorders pending tasks so images sharing the most blobs execute
+/// first (enabling cross-repo mounts for followers). The plan phase is
+/// eliminated entirely -- progressive cache population replaces upfront
+/// batch HEAD checks.
 #[derive(Debug)]
 pub struct SyncEngine {
     retry: RetryConfig,
@@ -415,6 +602,19 @@ impl SyncEngine {
         let mut discovery_head_failures: u64 = 0;
         let mut discovery_target_stale: u64 = 0;
 
+        // Leader-follower mount optimization state.
+        //
+        // `promotion_phase` tracks which stage of the pipeline we are in.
+        // `phase_inflight` tracks in-flight tasks for the current phase.
+        // When a phase drains to zero and `pending` is non-empty, the next
+        // wave is promoted.
+        let mut promotion_phase = PromotionPhase::Discovering;
+        let mut phase_inflight: usize = 0;
+        // Repos whose manifests are already committed at the target. Followers
+        // prefer these as cross-repo mount sources because ECR requires a
+        // committed manifest for mount to succeed.
+        let mut preferred_mount_sources: Vec<RepositoryName> = Vec::new();
+
         // Seed discovery with all (mapping, tag) pairs.
         for mapping in &mappings {
             for tag_pair in &mapping.tags {
@@ -441,38 +641,111 @@ impl SyncEngine {
             }
         }
 
+        // Helper closure: promote a task from `pending` into an execution future.
+        let promote = |item: TransferTask,
+                       ctx: &PromoteContext<'_>,
+                       preferred_mount_sources: &[RepositoryName]|
+         -> std::pin::Pin<Box<dyn Future<Output = ImageResult>>> {
+            let sem = Rc::clone(ctx.sem);
+            let cache_ref = Rc::clone(ctx.cache);
+            let retry = ctx.retry.clone();
+            let freq_counts: HashMap<Digest, usize> = {
+                let blobs = blobs_from_manifest(&item.source_data);
+                blobs
+                    .iter()
+                    .map(|d| (d.digest.clone(), ctx.freq_map.count(&d.digest)))
+                    .collect()
+            };
+            let staging_ref = Rc::clone(ctx.staging);
+            let source_str = item.source.to_string();
+            let target_str = item.target.to_string();
+            let preferred_mount_sources = preferred_mount_sources.to_vec();
+            Box::pin(async move {
+                let _permit = sem.acquire().await.unwrap();
+                progress.image_started(&source_str, &target_str);
+                execute_item(
+                    item,
+                    &cache_ref,
+                    &staging_ref,
+                    &freq_counts,
+                    &retry,
+                    &preferred_mount_sources,
+                )
+                .await
+            })
+        };
+
         loop {
-            // Promote pending items to execution futures only when not shutting down.
-            // Each future acquires a semaphore permit at the start (blocking if at
-            // capacity), preserving the discovery-order benefit of the frequency map.
+            // Phased promotion: accumulate during discovery, then leader-first.
             if !shutting_down {
-                while let Some(item) = pending.pop_front() {
-                    let sem = Rc::clone(&global_sem);
-                    let cache_ref = Rc::clone(&cache);
-                    let retry = self.retry.clone();
-                    let freq_counts: HashMap<Digest, usize> = {
-                        let blobs = blobs_from_manifest(&item.source_data);
-                        blobs
+                if matches!(promotion_phase, PromotionPhase::Discovering)
+                    && discovery_futures.is_empty()
+                {
+                    // All discovery complete -- elect leaders and promote.
+                    // `freq_map` is frozen from this point (no more discovery
+                    // mutations), so `PromoteContext` can borrow it.
+                    let n = elect_leaders(&mut pending);
+                    phase_inflight = n;
+                    // Collect leader target repos for follower mount preference.
+                    if n > 0 {
+                        preferred_mount_sources = pending
                             .iter()
-                            .map(|d| (d.digest.clone(), freq_map.count(&d.digest)))
-                            .collect()
+                            .take(n)
+                            .map(|t| t.target.repo.clone())
+                            .collect();
+                    }
+                    // When n > 0, promote only leader tasks (followers wait).
+                    // When n == 0 (no election benefit), promote everything.
+                    let to_promote = if n > 0 { n } else { pending.len() };
+                    promotion_phase = if n > 0 {
+                        PromotionPhase::Leaders
+                    } else {
+                        PromotionPhase::Done
                     };
-
-                    let staging_ref = Rc::clone(&staging);
-                    let source_str = item.source.to_string();
-                    let target_str = item.target.to_string();
-
-                    execution_futures.push(Box::pin(async move {
-                        let _permit = sem.acquire().await.unwrap();
-                        progress.image_started(&source_str, &target_str);
-                        execute_item(item, &cache_ref, &staging_ref, &freq_counts, &retry).await
-                    }));
+                    let ctx = PromoteContext {
+                        sem: &global_sem,
+                        cache: &cache,
+                        staging: &staging,
+                        freq_map: &freq_map,
+                        retry: &self.retry,
+                    };
+                    for _ in 0..to_promote {
+                        if let Some(item) = pending.pop_front() {
+                            execution_futures.push(promote(item, &ctx, &preferred_mount_sources));
+                        }
+                    }
+                } else if matches!(promotion_phase, PromotionPhase::Leaders)
+                    && phase_inflight == 0
+                    && !pending.is_empty()
+                {
+                    // Leaders drained -- promote all remaining followers.
+                    let ctx = PromoteContext {
+                        sem: &global_sem,
+                        cache: &cache,
+                        staging: &staging,
+                        freq_map: &freq_map,
+                        retry: &self.retry,
+                    };
+                    let to_promote = pending.len();
+                    promotion_phase = PromotionPhase::Done;
+                    info!(
+                        tasks = to_promote,
+                        elapsed_ms = run_start.elapsed().as_millis() as u64,
+                        "promoting followers"
+                    );
+                    phase_inflight = to_promote;
+                    for _ in 0..to_promote {
+                        if let Some(item) = pending.pop_front() {
+                            execution_futures.push(promote(item, &ctx, &preferred_mount_sources));
+                        }
+                    }
                 }
             }
 
             tokio::select! {
                 biased;
                 Some(result) = execution_futures.next(), if !execution_futures.is_empty() => {
+                    phase_inflight = phase_inflight.saturating_sub(1);
                     progress.image_completed(&result);
                     results.push(result);
                 }
@@ -986,6 +1259,7 @@ async fn execute_item(
     staging: &Rc<BlobStage>,
     freq_counts: &HashMap<Digest, usize>,
     retry: &RetryConfig,
+    preferred_mount_sources: &[RepositoryName],
 ) -> ImageResult {
     let start = Instant::now();
 
@@ -999,6 +1273,7 @@ async fn execute_item(
         target_name: &item.target_name,
         target_repo: &item.target.repo,
         batch_checker: item.batch_checker.as_ref(),
+        preferred_mount_sources,
     };
     let outcome = transfer_image_blobs(&ctx, &item.source_data, freq_counts).await;
 
@@ -1278,6 +1553,8 @@ struct TransferContext<'a> {
     target_repo: &'a RepositoryName,
     /// Optional batch blob checker for pre-populating the cache.
     batch_checker: Option<&'a Rc<dyn BatchBlobChecker>>,
+    /// Leader repos whose manifests are committed. Preferred as mount sources.
+    preferred_mount_sources: &'a [RepositoryName],
 }
 
 /// Transfer all blobs for a single image to one target.
@@ -1352,248 +1629,274 @@ async fn transfer_image_blobs(
         HashSet::new()
     };
 
-    let mut outcome = TargetBlobOutcome::default();
+    // Transfer blobs concurrently, capped by BLOB_CONCURRENCY.
+    let blob_sem = Semaphore::new(BLOB_CONCURRENCY);
+    let cancel = Cell::new(false);
+    let mut blob_futures = FuturesUnordered::new();
 
     for blob in &blobs {
-        let digest = &blob.digest;
+        let digest = blob.digest.clone();
         let size = blob.size;
-
-        // Step 1: Check cache -- known at this repo -> skip (0 API calls).
-        // OCI blobs are repo-scoped: a blob at repo-a is NOT accessible from
-        // repo-b without a mount. So we must check the specific repo.
-        let skip = {
-            let c = ctx.cache.borrow();
-            c.blob_known_at_repo(ctx.target_name, digest, ctx.target_repo)
-        };
-
-        if skip {
-            tracing::debug!(target: "ocync::metrics", tier = "hot", "cache_hit");
-            outcome.stats.skipped += 1;
-            continue;
-        }
-
-        // Step 2a: Atomic check-and-claim. If another concurrent transfer is
-        // already uploading this blob to a different repo at the same target,
-        // wait for it to finish so we can mount from its repo rather than
-        // redundantly uploading. Otherwise, claim the upload ourselves by
-        // setting in-progress state BEFORE the HEAD check — the HEAD awaits
-        // on network I/O, and without the claim, other tasks would race past
-        // the check and duplicate the upload. Critical for multi-image syncs
-        // with shared layers (e.g. Chainguard images share wolfi-base).
-        loop {
-            let action: ClaimAction = {
-                let mut c = ctx.cache.borrow_mut();
-                match c
-                    .blob_in_progress_uploader(ctx.target_name, digest, ctx.target_repo)
-                    .cloned()
-                {
-                    Some(uploader) => ClaimAction::Wait {
-                        uploader,
-                        notify: c.blob_notify(ctx.target_name, digest),
-                    },
-                    None => {
-                        // Claim the upload atomically before yielding.
-                        c.set_blob_in_progress(
-                            ctx.target_name,
-                            digest.clone(),
-                            ctx.target_repo.to_owned(),
-                        );
-                        ClaimAction::Claimed
-                    }
-                }
-            };
-            match action {
-                ClaimAction::Wait { uploader, notify } => {
-                    debug!(
-                        %digest,
-                        %uploader,
-                        target = %ctx.target_name,
-                        "waiting for in-flight upload to complete before mounting",
-                    );
-                    notify.notified().await;
-                    // Loop: the upload completed (mount_source now populated)
-                    // or failed (another task may have taken over). Re-check.
-                    continue;
-                }
-                ClaimAction::Claimed => break,
+        // Reborrow shared state as Copy references for `async move`.
+        let sem = &blob_sem;
+        let cancel = &cancel;
+        let batch = &batch_checked;
+        blob_futures.push(async move {
+            let _permit = sem.acquire().await.unwrap();
+            if cancel.get() {
+                return BlobResult::Cancelled;
             }
-        }
+            transfer_single_blob(ctx, &digest, size, batch).await
+        });
+    }
 
-        // Step 2b: Check cache for cross-repo mount source.
-        let mount_source = {
-            let c = ctx.cache.borrow();
-            c.blob_mount_source(ctx.target_name, digest, ctx.target_repo)
-                .cloned()
-        };
-
-        if let Some(from_repo) = mount_source {
-            debug!(%digest, %from_repo, target = %ctx.target_name, "attempting mount");
-            match ctx
-                .target_client
-                .blob_mount(ctx.target_repo, digest, &from_repo)
-                .await
-            {
-                Ok(MountResult::Mounted) => {
-                    ctx.cache.borrow_mut().set_blob_completed(
-                        ctx.target_name,
-                        digest.clone(),
-                        ctx.target_repo.to_owned(),
-                    );
-                    outcome.stats.mounted += 1;
-                    tracing::debug!(target: "ocync::metrics", result = "success", "mount");
-                    continue;
-                }
-                Ok(MountResult::NotMounted) | Err(_) => {
-                    debug!(%digest, target = %ctx.target_name, "mount not fulfilled, falling back to HEAD+push");
-                    ctx.cache
-                        .borrow_mut()
-                        .invalidate_blob(ctx.target_name, digest);
-                    tracing::debug!(target: "ocync::metrics", result = "fallback", "mount");
-                    tracing::debug!(target: "ocync::metrics", "cache_invalidation");
-                }
-            }
-        }
-
-        // Step 3: HEAD check at target (1 API call), record in cache if exists.
-        // Skip when batch-check already confirmed this blob is absent — the
-        // HEAD would return 404 redundantly. On a 5-image Jupyter cold sync
-        // this eliminates 247 wasted HEAD requests (7.6% of total).
-        if !batch_checked.contains(digest) {
-            let head_result = ctx.target_client.blob_exists(ctx.target_repo, digest).await;
-            match head_result {
-                Ok(Some(_)) => {
-                    ctx.cache.borrow_mut().set_blob_exists(
-                        ctx.target_name,
-                        digest.clone(),
-                        ctx.target_repo.to_owned(),
-                    );
-                    outcome.stats.skipped += 1;
-                    continue;
-                }
-                Ok(None) => {
-                    // Blob doesn't exist, proceed to pull+push.
-                }
-                Err(e) => {
-                    debug!(
-                        %digest,
-                        target = %ctx.target_name,
-                        error = %e,
-                        "blob HEAD failed, proceeding with push"
-                    );
-                }
-            }
-        }
-
-        // Step 4: Pull from source + push to target, record in cache.
-        // When staging is enabled, pull-once semantics apply: if the blob is
-        // already staged from a previous target, push from the local file
-        // instead of re-pulling from source. Otherwise pull from source and
-        // write to staging so subsequent targets can reuse it.
-        //
-        // Note: in-progress state was already claimed in Step 2a.
-
-        let transfer_result: Result<(), crate::Error> = if ctx.staging.is_enabled() {
-            if !ctx.staging.exists(digest) {
-                // Pull from source, stream to staging file chunk-by-chunk.
-                // This avoids buffering the entire blob in memory during pull.
-                if let Err(e) = with_retry(ctx.retry, "blob pull (to stage)", || async {
-                    let mut writer = ctx.staging.begin_write(digest).map_err(|e| {
-                        ocync_distribution::Error::Other(format!("staging create: {e}"))
-                    })?;
-                    let stream = ctx.source_client.blob_pull(ctx.source_repo, digest).await?;
-                    futures_util::pin_mut!(stream);
-                    while let Some(chunk) = stream.next().await {
-                        let chunk =
-                            chunk.map_err(|e| ocync_distribution::Error::Other(e.to_string()))?;
-                        writer.write_chunk(&chunk).map_err(|e| {
-                            ocync_distribution::Error::Other(format!("staging write: {e}"))
-                        })?;
-                    }
-                    writer.finish().map_err(|e| {
-                        ocync_distribution::Error::Other(format!("staging finalize: {e}"))
-                    })?;
-                    Ok::<(), ocync_distribution::Error>(())
-                })
-                .await
-                {
-                    let err = crate::Error::BlobTransfer {
-                        digest: digest.clone(),
-                        source: e,
-                    };
-                    ctx.cache.borrow_mut().set_blob_failed(
-                        ctx.target_name,
-                        digest.clone(),
-                        err.to_string(),
-                    );
-                    outcome.error = Some(err);
-                    return outcome;
-                }
-            }
-
-            // Push from staged file, streaming from disk.
-            with_retry(ctx.retry, "blob push (staged)", || async {
-                let file = ctx
-                    .staging
-                    .open_read(digest)
-                    .map_err(|e| ocync_distribution::Error::Other(format!("staging read: {e}")))?;
-                let file_size = file.metadata().map(|m| m.len()).ok();
-                let stream = file_read_stream(file).map(|r| {
-                    r.map_err(|e| ocync_distribution::Error::Other(format!("staging read: {e}")))
-                });
-                ctx.target_client
-                    .blob_push_stream(ctx.target_repo, digest, file_size, stream)
-                    .await
-            })
-            .await
-            .map(|_| ())
-            .map_err(|e| crate::Error::BlobTransfer {
-                digest: digest.clone(),
-                source: e,
-            })
-        } else {
-            with_retry(ctx.retry, "blob transfer", || async {
-                let stream = ctx.source_client.blob_pull(ctx.source_repo, digest).await?;
-                ctx.target_client
-                    .blob_push_stream(ctx.target_repo, digest, Some(size), stream)
-                    .await
-            })
-            .await
-            .map(|_| ())
-            .map_err(|e| crate::Error::BlobTransfer {
-                digest: digest.clone(),
-                source: e,
-            })
-        };
-
-        match transfer_result {
-            Ok(()) => {
-                outcome.bytes_transferred += size;
+    let mut outcome = TargetBlobOutcome::default();
+    while let Some(result) = blob_futures.next().await {
+        match result {
+            BlobResult::Skipped => outcome.stats.skipped += 1,
+            BlobResult::Mounted => outcome.stats.mounted += 1,
+            BlobResult::Transferred { bytes } => {
+                outcome.bytes_transferred += bytes;
                 outcome.stats.transferred += 1;
-                {
-                    let mut c = ctx.cache.borrow_mut();
-                    c.set_blob_completed(
-                        ctx.target_name,
-                        digest.clone(),
-                        ctx.target_repo.to_owned(),
-                    );
-                    c.notify_blob(ctx.target_name, digest);
-                }
             }
-            Err(err) => {
-                {
-                    let mut c = ctx.cache.borrow_mut();
-                    c.set_blob_failed(ctx.target_name, digest.clone(), err.to_string());
-                    // Wake concurrent transfers waiting on our upload so they
-                    // can retry instead of hanging forever.
-                    c.notify_blob(ctx.target_name, digest);
-                }
+            BlobResult::Cancelled => {}
+            BlobResult::Failed(err) => {
+                cancel.set(true);
                 outcome.error = Some(err);
-                return outcome; // Stop transferring blobs for this target on first failure.
+                // Don't break -- drain remaining futures so permits are
+                // released and cancel flag takes effect.
             }
         }
     }
 
     outcome
+}
+
+/// Transfer a single blob to one target: cache check, claim, mount, HEAD, pull+push.
+///
+/// All `RefCell` borrows are dropped before `await` points, preserving the
+/// single-threaded cooperative scheduling invariant.
+async fn transfer_single_blob(
+    ctx: &TransferContext<'_>,
+    digest: &Digest,
+    size: u64,
+    batch_checked: &HashSet<Digest>,
+) -> BlobResult {
+    // Step 1: Check cache -- known at this repo -> skip (0 API calls).
+    let skip = {
+        let c = ctx.cache.borrow();
+        c.blob_known_at_repo(ctx.target_name, digest, ctx.target_repo)
+    };
+
+    if skip {
+        tracing::debug!(target: "ocync::metrics", tier = "hot", "cache_hit");
+        return BlobResult::Skipped;
+    }
+
+    // Step 2a: Atomic check-and-claim.
+    loop {
+        let action: ClaimAction = {
+            let mut c = ctx.cache.borrow_mut();
+            match c
+                .blob_in_progress_uploader(ctx.target_name, digest, ctx.target_repo)
+                .cloned()
+            {
+                Some(uploader) => ClaimAction::Wait {
+                    uploader,
+                    notify: c.blob_notify(ctx.target_name, digest),
+                },
+                None => {
+                    c.set_blob_in_progress(
+                        ctx.target_name,
+                        digest.clone(),
+                        ctx.target_repo.to_owned(),
+                    );
+                    ClaimAction::Claimed
+                }
+            }
+        };
+        match action {
+            ClaimAction::Wait { uploader, notify } => {
+                debug!(
+                    %digest,
+                    %uploader,
+                    target = %ctx.target_name,
+                    "waiting for in-flight upload to complete before mounting",
+                );
+                notify.notified().await;
+                continue;
+            }
+            ClaimAction::Claimed => break,
+        }
+    }
+
+    // Step 2b: Cross-repo mount. Prefer leader repos (committed manifests)
+    // over other followers (whose manifests may not be committed yet).
+    let mut mount_attempted = false;
+    let mount_source = {
+        let c = ctx.cache.borrow();
+        c.blob_mount_source(
+            ctx.target_name,
+            digest,
+            ctx.target_repo,
+            ctx.preferred_mount_sources,
+        )
+        .cloned()
+    };
+
+    if let Some(from_repo) = mount_source {
+        debug!(%digest, %from_repo, target = %ctx.target_name, "attempting mount");
+        match ctx
+            .target_client
+            .blob_mount(ctx.target_repo, digest, &from_repo)
+            .await
+        {
+            Ok(MountResult::Mounted) => {
+                let mut c = ctx.cache.borrow_mut();
+                c.set_blob_completed(ctx.target_name, digest.clone(), ctx.target_repo.to_owned());
+                c.notify_blob(ctx.target_name, digest);
+                drop(c);
+                tracing::debug!(target: "ocync::metrics", result = "success", "mount");
+                return BlobResult::Mounted;
+            }
+            Ok(MountResult::NotMounted) | Err(_) => {
+                debug!(%digest, target = %ctx.target_name, "mount not fulfilled, falling back to HEAD+push");
+                let mut c = ctx.cache.borrow_mut();
+                c.invalidate_blob(ctx.target_name, digest);
+                c.notify_blob(ctx.target_name, digest);
+                drop(c);
+                mount_attempted = true;
+                tracing::debug!(target: "ocync::metrics", result = "fallback", "mount");
+                tracing::debug!(target: "ocync::metrics", "cache_invalidation");
+            }
+        }
+    }
+
+    // Step 3: HEAD check at target.
+    if !batch_checked.contains(digest) && !mount_attempted {
+        let head_result = ctx.target_client.blob_exists(ctx.target_repo, digest).await;
+        match head_result {
+            Ok(Some(_)) => {
+                let mut c = ctx.cache.borrow_mut();
+                c.set_blob_exists(ctx.target_name, digest.clone(), ctx.target_repo.to_owned());
+                c.notify_blob(ctx.target_name, digest);
+                drop(c);
+                return BlobResult::Skipped;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                debug!(
+                    %digest,
+                    target = %ctx.target_name,
+                    error = %e,
+                    "blob HEAD failed, proceeding with push"
+                );
+            }
+        }
+    }
+
+    // Step 4: Pull from source + push to target.
+    let transfer_result: Result<(), crate::Error> = if ctx.staging.is_enabled() {
+        // Source-pull dedup: claim the pull or wait for another task that is
+        // already pulling this digest. Prevents redundant source GETs when
+        // multiple images share the same blob.
+        loop {
+            match ctx.staging.claim_or_check(digest) {
+                crate::staging::StagePullAction::Exists => break,
+                crate::staging::StagePullAction::Pull => {
+                    if let Err(e) = with_retry(ctx.retry, "blob pull (to stage)", || async {
+                        let mut writer = ctx.staging.begin_write(digest).map_err(|e| {
+                            ocync_distribution::Error::Other(format!("staging create: {e}"))
+                        })?;
+                        let stream = ctx.source_client.blob_pull(ctx.source_repo, digest).await?;
+                        futures_util::pin_mut!(stream);
+                        while let Some(chunk) = stream.next().await {
+                            let chunk = chunk
+                                .map_err(|e| ocync_distribution::Error::Other(e.to_string()))?;
+                            writer.write_chunk(&chunk).map_err(|e| {
+                                ocync_distribution::Error::Other(format!("staging write: {e}"))
+                            })?;
+                        }
+                        writer.finish().map_err(|e| {
+                            ocync_distribution::Error::Other(format!("staging finalize: {e}"))
+                        })?;
+                        Ok::<(), ocync_distribution::Error>(())
+                    })
+                    .await
+                    {
+                        ctx.staging.notify_failed(digest);
+                        let err = crate::Error::BlobTransfer {
+                            digest: digest.clone(),
+                            source: e,
+                        };
+                        let mut c = ctx.cache.borrow_mut();
+                        c.set_blob_failed(ctx.target_name, digest.clone(), err.to_string());
+                        c.notify_blob(ctx.target_name, digest);
+                        drop(c);
+                        return BlobResult::Failed(err);
+                    }
+                    ctx.staging.notify_staged(digest);
+                    break;
+                }
+                crate::staging::StagePullAction::Wait(notify) => {
+                    notify.notified().await;
+                    continue;
+                }
+            }
+        }
+
+        with_retry(ctx.retry, "blob push (staged)", || async {
+            let file = ctx
+                .staging
+                .open_read(digest)
+                .map_err(|e| ocync_distribution::Error::Other(format!("staging read: {e}")))?;
+            let file_size = file.metadata().map(|m| m.len()).ok();
+            let stream = file_read_stream(file).map(|r| {
+                r.map_err(|e| ocync_distribution::Error::Other(format!("staging read: {e}")))
+            });
+            ctx.target_client
+                .blob_push_stream(ctx.target_repo, digest, file_size, stream)
+                .await
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::Error::BlobTransfer {
+            digest: digest.clone(),
+            source: e,
+        })
+    } else {
+        with_retry(ctx.retry, "blob transfer", || async {
+            let stream = ctx.source_client.blob_pull(ctx.source_repo, digest).await?;
+            ctx.target_client
+                .blob_push_stream(ctx.target_repo, digest, Some(size), stream)
+                .await
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::Error::BlobTransfer {
+            digest: digest.clone(),
+            source: e,
+        })
+    };
+
+    match transfer_result {
+        Ok(()) => {
+            {
+                let mut c = ctx.cache.borrow_mut();
+                c.set_blob_completed(ctx.target_name, digest.clone(), ctx.target_repo.to_owned());
+                c.notify_blob(ctx.target_name, digest);
+            }
+            BlobResult::Transferred { bytes: size }
+        }
+        Err(err) => {
+            {
+                let mut c = ctx.cache.borrow_mut();
+                c.set_blob_failed(ctx.target_name, digest.clone(), err.to_string());
+                c.notify_blob(ctx.target_name, digest);
+            }
+            BlobResult::Failed(err)
+        }
+    }
 }
 
 /// Push all manifests (children for indexes, then top-level) to one target.
@@ -1941,5 +2244,352 @@ mod tests {
             },
         };
         assert!(!is_immutable_tag_error(&err));
+    }
+
+    // --- elect_leaders tests ---
+
+    /// Build a `PulledManifest` with the given blob digests (first = config, rest = layers).
+    fn test_pulled_manifest(blob_suffixes: &[&str]) -> PulledManifest {
+        assert!(!blob_suffixes.is_empty(), "need at least a config blob");
+        let config = Descriptor {
+            size: 100,
+            ..test_descriptor(test_digest(blob_suffixes[0]), MediaType::OciConfig)
+        };
+        let layers: Vec<Descriptor> = blob_suffixes[1..]
+            .iter()
+            .map(|s| Descriptor {
+                size: 1000,
+                ..test_descriptor(test_digest(s), MediaType::OciLayerGzip)
+            })
+            .collect();
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config,
+            layers,
+            subject: None,
+            artifact_type: None,
+            annotations: None,
+        };
+        let raw = serde_json::to_vec(&manifest).unwrap();
+        let digest = Digest::from_sha256(Sha256::digest(&raw));
+        PulledManifest {
+            pull: ManifestPull {
+                manifest: ManifestKind::Image(Box::new(manifest)),
+                raw_bytes: raw,
+                media_type: MediaType::OciManifest,
+                digest,
+            },
+            children: Vec::new(),
+        }
+    }
+
+    fn test_client() -> Arc<RegistryClient> {
+        Arc::new(
+            RegistryClient::builder("https://test.example.com".parse().unwrap())
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn test_task(source_data: Rc<PulledManifest>, tag: &str) -> TransferTask {
+        let client = test_client();
+        TransferTask {
+            source_data,
+            source_client: Arc::clone(&client),
+            target_name: RegistryAlias::new("test-target"),
+            target_client: client,
+            source: ImageRef {
+                repo: RepositoryName::new(format!("source/{tag}")),
+                tag: tag.to_owned(),
+            },
+            target: ImageRef {
+                repo: RepositoryName::new(format!("target/{tag}")),
+                tag: tag.to_owned(),
+            },
+            batch_checker: None,
+        }
+    }
+
+    /// Collect blob digests from leader tasks at the front of the deque.
+    fn leader_blob_digests(pending: &VecDeque<TransferTask>, n: usize) -> HashSet<Digest> {
+        pending
+            .iter()
+            .take(n)
+            .flat_map(|t| {
+                blobs_from_manifest(&t.source_data)
+                    .into_iter()
+                    .map(|d| d.digest.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn elect_leaders_empty_deque() {
+        let mut pending = VecDeque::new();
+        let n = elect_leaders(&mut pending);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn elect_leaders_single_task() {
+        let data = Rc::new(test_pulled_manifest(&["c1", "a1"]));
+        let mut pending = VecDeque::new();
+        pending.push_back(test_task(data, "img1"));
+        let n = elect_leaders(&mut pending);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn elect_leaders_picks_most_shared() {
+        // base:    blobs {c0, a1, a2, a3} -- 4 blobs, base layer image
+        // child_a: blobs {c0, a1, a2, d1} -- shares 3 with base, 2 with child_b
+        // child_b: blobs {c0, a1, a3, e1} -- shares 3 with base, 2 with child_a
+        //
+        // Scoring (sum of |intersection| with each other image):
+        //   base:    |base^child_a|=3 + |base^child_b|=3 = 6
+        //   child_a: |child_a^base|=3 + |child_a^child_b|=2 = 5
+        //   child_b: |child_b^base|=3 + |child_b^child_a|=2 = 5
+        // base wins.
+        let data_base = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "a3"]));
+        let data_ca = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "d1"]));
+        let data_cb = Rc::new(test_pulled_manifest(&["c0", "a1", "a3", "e1"]));
+
+        let mut pending = VecDeque::new();
+        pending.push_back(test_task(Rc::clone(&data_base), "base"));
+        pending.push_back(test_task(Rc::clone(&data_ca), "child_a"));
+        pending.push_back(test_task(Rc::clone(&data_cb), "child_b"));
+
+        let n = elect_leaders(&mut pending);
+
+        // base is the sole leader (score 6 > 5).
+        assert_eq!(n, 1);
+        assert_eq!(pending[0].source.tag, "base");
+        // Leader blobs are base's: {c0, a1, a2, a3}.
+        let leader_blobs = leader_blob_digests(&pending, n);
+        assert_eq!(leader_blobs.len(), 4);
+        assert!(leader_blobs.contains(&test_digest("c0")));
+        assert!(leader_blobs.contains(&test_digest("a3")));
+        // Followers preserve original order.
+        assert_eq!(pending[1].source.tag, "child_a");
+        assert_eq!(pending[2].source.tag, "child_b");
+    }
+
+    #[test]
+    fn elect_leaders_no_shared_blobs() {
+        // Three images with completely disjoint blob sets.
+        let data_a = Rc::new(test_pulled_manifest(&["c1", "aa"]));
+        let data_b = Rc::new(test_pulled_manifest(&["c2", "bb"]));
+        let data_c = Rc::new(test_pulled_manifest(&["c3", "cc"]));
+
+        let mut pending = VecDeque::new();
+        pending.push_back(test_task(data_a, "imgA"));
+        pending.push_back(test_task(data_b, "imgB"));
+        pending.push_back(test_task(data_c, "imgC"));
+
+        // No shared blobs -> 0 leaders.
+        let n = elect_leaders(&mut pending);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn elect_leaders_multi_target_groups_by_rc() {
+        // "base" image targets 2 registries (2 tasks, same Rc).
+        // "child_a" and "child_b" derive from base.
+        //
+        // base:    blobs {c0, a1, a2, a3} -- shares 3 with each child
+        // child_a: blobs {c0, a1, a2, d1} -- shares 3 with base, 2 with child_b
+        // child_b: blobs {c0, a1, a3, e1} -- shares 3 with base, 2 with child_a
+        //
+        // base scores 6, children score 5 each. base elected.
+        // base has 2 tasks -> n = 2.
+        let base = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "a3"]));
+        let child_a = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "d1"]));
+        let child_b = Rc::new(test_pulled_manifest(&["c0", "a1", "a3", "e1"]));
+
+        let client_a = test_client();
+        let client_b = test_client();
+
+        let mut pending = VecDeque::new();
+        // Two tasks sharing the same Rc (same source image, two targets).
+        pending.push_back(TransferTask {
+            source_data: Rc::clone(&base),
+            source_client: Arc::clone(&client_a),
+            target_name: RegistryAlias::new("target-1"),
+            target_client: Arc::clone(&client_a),
+            source: ImageRef {
+                repo: RepositoryName::new("src/base"),
+                tag: "v1".into(),
+            },
+            target: ImageRef {
+                repo: RepositoryName::new("tgt/base"),
+                tag: "v1".into(),
+            },
+            batch_checker: None,
+        });
+        pending.push_back(TransferTask {
+            source_data: Rc::clone(&base),
+            source_client: Arc::clone(&client_b),
+            target_name: RegistryAlias::new("target-2"),
+            target_client: Arc::clone(&client_b),
+            source: ImageRef {
+                repo: RepositoryName::new("src/base"),
+                tag: "v1".into(),
+            },
+            target: ImageRef {
+                repo: RepositoryName::new("tgt/base"),
+                tag: "v1".into(),
+            },
+            batch_checker: None,
+        });
+        pending.push_back(test_task(child_a, "child_a"));
+        pending.push_back(test_task(child_b, "child_b"));
+
+        let n = elect_leaders(&mut pending);
+
+        // base wins (score 6 vs 5). Both base tasks are leaders.
+        assert_eq!(n, 2);
+        let leader_blobs = leader_blob_digests(&pending, n);
+        assert_eq!(leader_blobs.len(), 4); // {c0, a1, a2, a3}
+        assert_eq!(pending[0].source.tag, "v1");
+        assert_eq!(pending[1].source.tag, "v1");
+        assert_eq!(pending[2].source.tag, "child_a");
+        assert_eq!(pending[3].source.tag, "child_b");
+    }
+
+    #[test]
+    fn elect_leaders_two_clusters() {
+        // Cluster 1: images A and B share blobs {c0, f1}
+        // Cluster 2: images C and D share blobs {c9, f2}
+        // No overlap between clusters.
+        let data_a = Rc::new(test_pulled_manifest(&["c0", "f1", "a1"]));
+        let data_b = Rc::new(test_pulled_manifest(&["c0", "f1", "b1"]));
+        let data_c = Rc::new(test_pulled_manifest(&["c9", "f2", "d1"]));
+        let data_d = Rc::new(test_pulled_manifest(&["c9", "f2", "e1"]));
+
+        let mut pending = VecDeque::new();
+        pending.push_back(test_task(Rc::clone(&data_a), "imgA"));
+        pending.push_back(test_task(Rc::clone(&data_b), "imgB"));
+        pending.push_back(test_task(Rc::clone(&data_c), "imgC"));
+        pending.push_back(test_task(Rc::clone(&data_d), "imgD"));
+
+        let n = elect_leaders(&mut pending);
+
+        // Two leaders (one per cluster), two followers.
+        assert_eq!(n, 2);
+        // Leader blobs span both clusters.
+        let leader_blobs = leader_blob_digests(&pending, n);
+        assert!(
+            leader_blobs.len() >= 4,
+            "leader blobs should span both clusters"
+        );
+
+        // Leaders are at the front.
+        let leader_tags: Vec<&str> = pending
+            .iter()
+            .take(n)
+            .map(|t| t.source.tag.as_str())
+            .collect();
+        let follower_tags: Vec<&str> = pending
+            .iter()
+            .skip(n)
+            .map(|t| t.source.tag.as_str())
+            .collect();
+
+        // Each cluster contributes one leader: A or B from cluster 1, C or D from cluster 2.
+        // The follower from each cluster is the other member.
+        assert_eq!(leader_tags.len(), 2);
+        assert_eq!(follower_tags.len(), 2);
+
+        // Verify leaders come from different clusters.
+        let cluster1 = ["imgA", "imgB"];
+        let cluster2 = ["imgC", "imgD"];
+        assert!(
+            leader_tags.iter().any(|t| cluster1.contains(t))
+                && leader_tags.iter().any(|t| cluster2.contains(t)),
+            "leaders should cover both clusters: {leader_tags:?}"
+        );
+    }
+
+    #[test]
+    fn elect_leaders_marginal_coverage_across_rounds() {
+        // A spans both clusters via blob c0. Round 1 elects A. Round 2
+        // must deduct A's blobs from marginal scores: C and D share
+        // {c0, d0}, but c0 is already covered -- only d0 is marginal.
+        //
+        // A: {a0, b0, c0}  B: {a0, b0, e0}  C: {c0, d0, f0}  D: {c0, d0, fa}
+        //
+        // Round 1 scores:
+        //   A: |A^B|=2 + |A^C|=1 + |A^D|=1 = 4  (wins)
+        //   B: 2, C: 3, D: 3
+        //
+        // Round 2 (covered = {a0,b0,c0}):
+        //   B: |B^C\covered|=0 + |B^D\covered|=0 = 0
+        //   C: |C^B\covered|=0 + |C^D\covered|=|{d0}|=1 = 1
+        //   D: |D^B\covered|=0 + |D^C\covered|=|{d0}|=1 = 1
+        //   C or D elected (tie on d0). B stays follower.
+        let data_a = Rc::new(test_pulled_manifest(&["a0", "b0", "c0"]));
+        let data_b = Rc::new(test_pulled_manifest(&["a0", "b0", "e0"]));
+        let data_c = Rc::new(test_pulled_manifest(&["c0", "d0", "f0"]));
+        let data_d = Rc::new(test_pulled_manifest(&["c0", "d0", "fa"]));
+
+        let mut pending = VecDeque::new();
+        pending.push_back(test_task(Rc::clone(&data_a), "imgA"));
+        pending.push_back(test_task(Rc::clone(&data_b), "imgB"));
+        pending.push_back(test_task(Rc::clone(&data_c), "imgC"));
+        pending.push_back(test_task(Rc::clone(&data_d), "imgD"));
+
+        let n = elect_leaders(&mut pending);
+
+        // Two leaders: A (round 1) + one of C/D (round 2, marginal on d0).
+        assert_eq!(n, 2);
+        // Leader blobs include A's {a0,b0,c0} + winner's {c0,d0,f0 or fa}.
+        let leader_blobs = leader_blob_digests(&pending, n);
+        assert!(leader_blobs.contains(&test_digest("a0")));
+        assert!(leader_blobs.contains(&test_digest("d0")));
+
+        let leader_tags: Vec<&str> = pending
+            .iter()
+            .take(n)
+            .map(|t| t.source.tag.as_str())
+            .collect();
+
+        // A is always first leader.
+        assert_eq!(leader_tags[0], "imgA");
+        // Second leader is from cluster 2 (C or D), not B -- because B
+        // shares no marginal blobs after A's {a0,b0,c0} are deducted.
+        assert!(
+            leader_tags[1] == "imgC" || leader_tags[1] == "imgD",
+            "second leader should be from cluster 2, got: {leader_tags:?}"
+        );
+    }
+
+    #[test]
+    fn elect_leaders_tie_breaks_deterministically() {
+        // A and B have identical sharing with C. max_by_key returns the
+        // last maximum in iteration order, so B (higher index) wins.
+        //
+        // A: {a0, b0}  B: {a0, b0}  C: {a0, c0}
+        // A: |A^B|=2 + |A^C|=1 = 3
+        // B: |B^A|=2 + |B^C|=1 = 3   (tie with A)
+        // C: |C^A|=1 + |C^B|=1 = 2
+        let data_a = Rc::new(test_pulled_manifest(&["a0", "b0"]));
+        let data_b = Rc::new(test_pulled_manifest(&["a0", "b0"]));
+        let data_c = Rc::new(test_pulled_manifest(&["a0", "c0"]));
+
+        for _ in 0..5 {
+            let mut pending = VecDeque::new();
+            pending.push_back(test_task(Rc::clone(&data_a), "imgA"));
+            pending.push_back(test_task(Rc::clone(&data_b), "imgB"));
+            pending.push_back(test_task(Rc::clone(&data_c), "imgC"));
+
+            let n = elect_leaders(&mut pending);
+            assert_eq!(n, 1);
+            // max_by_key picks last maximum: B (index 1) over A (index 0).
+            assert_eq!(
+                pending[0].source.tag, "imgB",
+                "tie should break deterministically in favor of later candidate"
+            );
+        }
     }
 }

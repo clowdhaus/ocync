@@ -155,15 +155,17 @@ impl TransferStateCache {
 
     /// Find a cross-repo mount source for a blob at a target.
     ///
-    /// Returns the alphabetically first repo at `target` that has `digest`
-    /// and is not `current_repo`, or `None` if no candidate exists.
+    /// Prefers repos in `preferred` (leader repos with committed manifests),
+    /// then falls back to the alphabetically first candidate.
     pub fn blob_mount_source<'a>(
         &'a self,
         target: &str,
         digest: &Digest,
         current_repo: &RepositoryName,
+        preferred: &[RepositoryName],
     ) -> Option<&'a RepositoryName> {
-        self.dedup.mount_source(target, digest, current_repo)
+        self.dedup
+            .mount_source(target, digest, current_repo, preferred)
     }
 
     /// Mark a blob as already existing at the target in the given repo.
@@ -504,7 +506,7 @@ mod tests {
         cache.set_blob_completed("reg.io", digest(), "repo/a".into());
         cache.set_blob_completed("reg.io", digest(), "repo/b".into());
         assert_eq!(
-            cache.blob_mount_source("reg.io", &digest(), &repo("repo/b")),
+            cache.blob_mount_source("reg.io", &digest(), &repo("repo/b"), &[]),
             Some(&repo("repo/a"))
         );
     }

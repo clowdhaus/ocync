@@ -187,14 +187,23 @@ impl BlobDedupMap {
     /// Find a repo that already has this blob at the target which differs from
     /// `target_repo`, suitable as a cross-repo mount source.
     ///
-    /// Returns the alphabetically first candidate (deterministic via `BTreeSet`).
+    /// When `preferred` is non-empty, tries those repos first (in order).
+    /// Falls back to the alphabetically first candidate via `BTreeSet`.
+    /// Preferred repos are typically leader images whose manifests are
+    /// committed, making mount more likely to succeed on ECR.
     pub(crate) fn mount_source<'a>(
         &'a self,
         target: &str,
         digest: &Digest,
         target_repo: &RepositoryName,
+        preferred: &[RepositoryName],
     ) -> Option<&'a RepositoryName> {
         let info = self.inner.get(target)?.get(digest)?;
+        for pref in preferred {
+            if pref != target_repo && info.repos.contains(pref) {
+                return info.repos.get(pref);
+            }
+        }
         info.repos.iter().find(|r| *r != target_repo)
     }
 
@@ -305,7 +314,7 @@ mod tests {
         map.set_completed("reg.io", &d, &repo("library/alpine"));
         map.set_completed("reg.io", &d, &repo("library/nginx"));
 
-        let source = map.mount_source("reg.io", &d, &repo("library/nginx"));
+        let source = map.mount_source("reg.io", &d, &repo("library/nginx"), &[]);
         assert_eq!(source, Some(&repo("library/alpine")));
     }
 
@@ -316,7 +325,7 @@ mod tests {
 
         map.set_completed("reg.io", &d, &repo("library/alpine"));
 
-        let source = map.mount_source("reg.io", &d, &repo("library/alpine"));
+        let source = map.mount_source("reg.io", &d, &repo("library/alpine"), &[]);
         assert!(source.is_none());
     }
 
@@ -331,11 +340,41 @@ mod tests {
         map.set_completed("reg.io", &d, &repo("library/alpine"));
 
         // BTreeSet iterates alphabetically: alpine, nginx, redis
-        let source = map.mount_source("reg.io", &d, &repo("library/redis"));
+        let source = map.mount_source("reg.io", &d, &repo("library/redis"), &[]);
         assert_eq!(source, Some(&repo("library/alpine")));
 
-        let source = map.mount_source("reg.io", &d, &repo("library/alpine"));
+        let source = map.mount_source("reg.io", &d, &repo("library/alpine"), &[]);
         assert_eq!(source, Some(&repo("library/nginx")));
+    }
+
+    #[test]
+    fn mount_source_prefers_leader_repos() {
+        let mut map = BlobDedupMap::new();
+        let d = test_digest();
+
+        // Three repos: alpine (alphabetically first), nginx, redis.
+        map.set_completed("reg.io", &d, &repo("library/alpine"));
+        map.set_completed("reg.io", &d, &repo("library/nginx"));
+        map.set_completed("reg.io", &d, &repo("library/redis"));
+
+        // Without preferred, alphabetically first (alpine) wins.
+        let source = map.mount_source("reg.io", &d, &repo("library/redis"), &[]);
+        assert_eq!(source, Some(&repo("library/alpine")));
+
+        // With preferred=[nginx], nginx wins over alphabetical alpine.
+        let preferred = [repo("library/nginx")];
+        let source = map.mount_source("reg.io", &d, &repo("library/redis"), &preferred);
+        assert_eq!(source, Some(&repo("library/nginx")));
+
+        // Preferred repo that IS target_repo is skipped; falls to next preferred.
+        let preferred = [repo("library/redis"), repo("library/nginx")];
+        let source = map.mount_source("reg.io", &d, &repo("library/redis"), &preferred);
+        assert_eq!(source, Some(&repo("library/nginx")));
+
+        // Preferred repo not in the set falls back to alphabetical.
+        let preferred = [repo("library/unknown")];
+        let source = map.mount_source("reg.io", &d, &repo("library/redis"), &preferred);
+        assert_eq!(source, Some(&repo("library/alpine")));
     }
 
     #[test]

@@ -105,9 +105,17 @@ pub(crate) async fn run(
         }
     };
 
-    // Enable disk staging only when at least one mapping has multiple targets.
-    let has_multi_target = mappings.iter().any(|m| m.targets.len() > 1);
-    let staging = if has_multi_target {
+    // Enable disk staging when multiple targets OR multiple images share blobs.
+    // Multi-target: pull once from source, push to N targets from disk.
+    // Multi-image: pull once, push from staging when the same blob appears in
+    // another image (cross-image source dedup).
+    //
+    // Trade-off: this is a conservative heuristic -- disjoint mappings pay a
+    // disk round-trip per blob for zero benefit. Tighter detection would
+    // require manifest data (unavailable pre-discovery). The overhead is
+    // small (local I/O) relative to the network savings when blobs overlap.
+    let needs_staging = mappings.iter().any(|m| m.targets.len() > 1) || mappings.len() > 1;
+    let staging = if needs_staging {
         let stage = BlobStage::new(cache_dir.join("blobs"));
         if let Err(e) = stage.cleanup_tmp_files() {
             tracing::warn!(error = %e, "failed to clean staging tmp files");
