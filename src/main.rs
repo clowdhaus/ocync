@@ -29,7 +29,7 @@ const MAIN_LONG_ABOUT: &str = "\
 Sync OCI container images across registries
 
 ocync copies container images between OCI-compliant registries with blob
-deduplication, cross-repo mounts, and streaming transfers — no local disk
+deduplication, cross-repo mounts, and streaming transfers -- no local disk
 required.
 
 Examples:
@@ -293,6 +293,8 @@ pub(crate) struct WatchArgs {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
+    ocync_distribution::install_crypto_provider();
+
     let cli = Cli::parse();
     cli::setup_logging(&cli);
 
@@ -311,7 +313,7 @@ async fn main() -> std::process::ExitCode {
     };
 
     let effective_verbosity = match &cli.command {
-        // Copy always shows per-image output — users expect to see what was copied.
+        // Copy always shows per-image output -- users expect to see what was copied.
         Commands::Copy(_) => cli.verbose.max(1),
         _ => cli.verbose,
     };

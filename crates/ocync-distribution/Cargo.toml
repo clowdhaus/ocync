@@ -7,12 +7,17 @@ license.workspace = true
 repository.workspace = true
 description = "OCI Distribution client library"
 
+[features]
+default = ["fips"]
+fips = ["aws-lc-rs/fips"]
+non-fips = ["aws-lc-rs/aws-lc-sys"]
+
 [lints]
 workspace = true
 
 [dependencies]
 aws-config.workspace = true
-aws-lc-rs.workspace = true
+aws-lc-rs = { workspace = true }
 aws-sdk-ecr = { version = "1", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 bytes.workspace = true
@@ -20,7 +25,8 @@ futures-util = { version = "0.3", default-features = false }
 http.workspace = true
 hex.workspace = true
 regex-lite = { version = "0.1", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "json", "system-proxy"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots-no-provider", "stream", "json", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
