@@ -1,0 +1,49 @@
+{
+  "timestamp": "2026-04-18-031724",
+  "instance": {
+    "instance_type": "c6in.4xlarge",
+    "arch": "x86_64",
+    "cpu_model": "Intel",
+    "vcpus": 16,
+    "memory_mib": 32768,
+    "network_performance": "Up to 50 Gigabit",
+    "region": "us-east-1"
+  },
+  "corpus_size": 42,
+  "total_tags": 55,
+  "tool_versions": {
+    "ocync": "ocync 0.1.0\nFIPS 140-3: compiled=no"
+  },
+  "scenarios": [
+    {
+      "scenario": "Cold sync (median)",
+      "runs": [
+        {
+          "tool": "ocync",
+          "wall_clock_secs": 273.419506426,
+          "exit_code": 1,
+          "peak_rss_kb": 56716,
+          "proxy_metrics": {
+            "total_requests": 4131,
+            "requests_by_method": {
+              "GET": 2221,
+              "HEAD": 110,
+              "POST": 1081,
+              "PUT": 719
+            },
+            "status_429_count": 0,
+            "total_request_bytes": 15838463804,
+            "total_response_bytes": 16875480111,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 379,
+            "mount_successes": 362,
+            "source_blob_gets": 726,
+            "source_blob_bytes": 77161
+          },
+          "ocync_json": null
+        }
+      ]
+    }
+  ],
+  "scale": []
+}

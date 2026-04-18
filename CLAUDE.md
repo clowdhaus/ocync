@@ -61,7 +61,8 @@ Empirical observations that inform design live in `docs/specs/findings.md`. When
 
 - `docs/specs/ocync-design.md` — full design document (engine architecture, concurrency, cache)
 - `docs/specs/transfer-optimization-design.md` — pipeline, transfer state cache, AIMD, multi-target reuse
-- `docs/specs/benchmark-design-v2.md` — layered benchmark plan (protocol / throughput / cross-tool)
+- `docs/specs/benchmark-design.md` — layered benchmark plan (protocol / throughput / cross-tool)
+- `docs/specs/watch-discovery-design.md` — watch mode, discovery optimization, platform filtering
 - `docs/specs/findings.md` — empirical evidence log
 - `docs/superpowers/plans/` (gitignored) — in-flight implementation plans
 

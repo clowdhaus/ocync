@@ -1,0 +1,49 @@
+{
+  "timestamp": "2026-04-15-100000",
+  "instance": {
+    "instance_type": "c7g.xlarge",
+    "arch": "arm64",
+    "cpu_model": "AWS",
+    "vcpus": 4,
+    "memory_mib": 8192,
+    "network_performance": "Up to 12.5 Gigabit",
+    "region": "us-east-1"
+  },
+  "corpus_size": 28,
+  "total_tags": 40,
+  "tool_versions": {
+    "dregsy": "0.5.0",
+    "ocync": "0.1.0"
+  },
+  "scenarios": [
+    {
+      "scenario": "Cold sync (median)",
+      "runs": [
+        {
+          "tool": "ocync",
+          "wall_clock_secs": 47.0,
+          "exit_code": 0,
+          "peak_rss_kb": 65536,
+          "proxy_metrics": null,
+          "ocync_json": null
+        },
+        {
+          "tool": "dregsy",
+          "wall_clock_secs": 521.0,
+          "exit_code": 0,
+          "peak_rss_kb": 131072,
+          "proxy_metrics": null,
+          "ocync_json": null
+        }
+      ]
+    }
+  ],
+  "scale": [
+    {
+      "images": 10,
+      "results": {
+        "ocync": 8.5
+      }
+    }
+  ]
+}

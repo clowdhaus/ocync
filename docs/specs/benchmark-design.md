@@ -1,4 +1,4 @@
-# Benchmark design v2
+# Benchmark design
 
 Status: proposal. Supersedes the implicit design currently encoded in
 `xtask/src/bench/`.
