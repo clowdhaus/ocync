@@ -12,6 +12,8 @@ use clap::Parser;
 enum Cli {
     /// Run benchmark suite comparing ocync against dregsy and regsync.
     Bench(bench::BenchArgs),
+    /// Run benchmarks on the remote EC2 bench instance via SSM.
+    BenchRemote(bench::remote::BenchRemoteArgs),
 }
 
 fn main() -> ExitCode {
@@ -23,6 +25,7 @@ fn main() -> ExitCode {
 
     let result = match cli {
         Cli::Bench(args) => rt.block_on(bench::run(args)),
+        Cli::BenchRemote(args) => rt.block_on(bench::remote::run(args)),
     };
 
     match result {
