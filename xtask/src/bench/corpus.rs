@@ -41,7 +41,7 @@ pub(crate) struct ImageEntry {
     pub(crate) tags: Vec<String>,
 }
 
-/// Partial sync overrides — tag replacements applied to a base corpus.
+/// Partial sync overrides -- tag replacements applied to a base corpus.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PartialOverrides {
     /// Image entries whose tags replace the matching base corpus entry.
@@ -172,7 +172,7 @@ fn expand_env_vars(input: &str) -> Result<String, String> {
                     .map_err(|_| format!("environment variable {var_name} is not set"))?;
                 result.push_str(&val);
             } else {
-                // Unclosed brace — emit literally.
+                // Unclosed brace -- emit literally.
                 result.push_str("${");
                 result.push_str(&var_name);
             }

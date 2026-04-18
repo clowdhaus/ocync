@@ -141,6 +141,46 @@ fn progress(msg: &str) {
     let _ = std::fs::write(PROGRESS_FILE, format!("{msg}\n"));
 }
 
+/// Derives the registry key from a target registry hostname.
+///
+/// Used to choose the JSON archive filename (`ecr.json`, `gcr.json`, etc.).
+fn registry_key(target_registry: &str) -> &'static str {
+    if target_registry.contains(".ecr.") && target_registry.contains(".amazonaws.com") {
+        "ecr"
+    } else if target_registry == "gcr.io"
+        || target_registry.ends_with(".gcr.io")
+        || target_registry.ends_with("-docker.pkg.dev")
+    {
+        "gcr"
+    } else if target_registry.ends_with(".azurecr.io") {
+        "acr"
+    } else {
+        "other"
+    }
+}
+
+/// Returns the short git commit hash of HEAD.
+fn git_ref() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Derives the cloud provider name from a registry key.
+fn provider_for_registry(key: &str) -> &'static str {
+    match key {
+        "ecr" => "aws",
+        "gcr" => "gcp",
+        "acr" => "azure",
+        _ => "other",
+    }
+}
+
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Parse corpus (apply limit if set).
@@ -197,7 +237,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let timestamp = utc_timestamp();
     let output_dir = match &args.output {
         Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(format!("bench-results/{timestamp}")),
+        None => PathBuf::from(format!("bench/results/{timestamp}")),
     };
 
     // 5. Create report.
@@ -280,9 +320,66 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // 7. Write report.
     report::write_report(&output_dir, &report)?;
-    eprintln!("bench: report written to {}", output_dir.display());
+    eprintln!("bench: summary written to {}", output_dir.display());
 
-    // 8. Handle regression mode.
+    // 8. Append compact run record to per-registry JSON archive.
+    let target_registry = &corpus.settings.target_registry;
+    let reg_key = registry_key(target_registry);
+    let git_ref = git_ref();
+    let record = report::RunRecord {
+        timestamp: report.timestamp.clone(),
+        git_ref,
+        machine: report::MachineInfo {
+            provider: provider_for_registry(reg_key).into(),
+            instance_type: report.instance.instance_type.clone(),
+            arch: report.instance.arch.clone(),
+            vcpus: report.instance.vcpus,
+            memory_gib: report.instance.memory_mib / 1024,
+            network: report.instance.network_performance.clone(),
+            region: report.instance.region.clone(),
+        },
+        corpus: report::CorpusInfo {
+            images: report.corpus_size,
+            tags: report.total_tags,
+        },
+        scenarios: report
+            .scenarios
+            .iter()
+            .map(|s| report::ScenarioRecord {
+                name: s.scenario.clone(),
+                tools: s
+                    .runs
+                    .iter()
+                    .map(|r| {
+                        let metrics = r.proxy_metrics.as_ref();
+                        report::ToolRecord {
+                            tool: r.tool.clone(),
+                            version: report
+                                .tool_versions
+                                .get(&r.tool)
+                                .cloned()
+                                .unwrap_or_default(),
+                            wall_clock_secs: r.wall_clock_secs,
+                            peak_rss_kb: r.peak_rss_kb,
+                            requests: metrics.map_or(0, |m| m.total_requests),
+                            response_bytes: metrics.map_or(0, |m| m.total_response_bytes),
+                            source_blob_gets: metrics.map_or(0, |m| m.source_blob_gets),
+                            source_blob_bytes: metrics.map_or(0, |m| m.source_blob_bytes),
+                            mount_successes: metrics.map_or(0, |m| m.mount_successes),
+                            mount_attempts: metrics.map_or(0, |m| m.mount_attempts),
+                            duplicate_blob_gets: metrics.map_or(0, |m| m.duplicate_blob_gets),
+                            rate_limit_429s: metrics.map_or(0, |m| m.status_429_count),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    let results_dir = Path::new("bench/results");
+    report::append_record(results_dir, reg_key, record)?;
+    eprintln!("bench: run record appended to bench/results/{reg_key}.json");
+
+    // 9. Handle regression mode.
     if args.regression {
         check_regression(&report, args.threshold_pct)?;
     }
@@ -298,7 +395,7 @@ fn check_regression(
     report: &BenchReport,
     threshold: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let baseline_path = PathBuf::from("bench-results/baseline.json");
+    let baseline_path = PathBuf::from("bench/results/baseline.json");
 
     // Find the ocync cold-sync run for regression comparison.
     let ocync_run = report
@@ -640,14 +737,14 @@ fn utc_timestamp() -> String {
         .unwrap_or_default()
         .as_secs();
 
-    // Manual UTC formatting — avoids a chrono/time dependency for one call site.
+    // Manual UTC formatting -- avoids a chrono/time dependency for one call site.
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
 
-    // Days since Unix epoch to (year, month, day) — civil calendar algorithm.
+    // Days since Unix epoch to (year, month, day) -- civil calendar algorithm.
     let (year, month, day) = days_to_civil(days);
 
     format!("{year:04}-{month:02}-{day:02}-{hours:02}{minutes:02}{seconds:02}")
@@ -734,5 +831,36 @@ mod tests {
         assert_eq!(Scenario::Partial.to_string(), "partial");
         assert_eq!(Scenario::Scale.to_string(), "scale");
         assert_eq!(Scenario::All.to_string(), "all");
+    }
+
+    #[test]
+    fn registry_key_ecr() {
+        assert_eq!(
+            registry_key("123456789012.dkr.ecr.us-east-1.amazonaws.com"),
+            "ecr"
+        );
+        assert_eq!(
+            registry_key("111111111111.dkr.ecr.eu-west-1.amazonaws.com"),
+            "ecr"
+        );
+    }
+
+    #[test]
+    fn registry_key_gcr() {
+        assert_eq!(registry_key("gcr.io"), "gcr");
+        assert_eq!(registry_key("us-docker.pkg.dev"), "gcr");
+        assert_eq!(registry_key("europe-west1-docker.pkg.dev"), "gcr");
+    }
+
+    #[test]
+    fn registry_key_acr() {
+        assert_eq!(registry_key("myregistry.azurecr.io"), "acr");
+    }
+
+    #[test]
+    fn registry_key_other() {
+        assert_eq!(registry_key("ghcr.io"), "other");
+        assert_eq!(registry_key("docker.io"), "other");
+        assert_eq!(registry_key("quay.io"), "other");
     }
 }

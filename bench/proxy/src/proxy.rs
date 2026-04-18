@@ -1,4 +1,4 @@
-//! MITM proxy core — TCP accept, HTTP/1.1 CONNECT handling, TLS
+//! MITM proxy core - TCP accept, HTTP/1.1 CONNECT handling, TLS
 //! termination, upstream forwarding, and per-request JSONL logging.
 //!
 //! Each accepted TCP connection is driven by a single tokio task. After
@@ -68,7 +68,7 @@ struct ProxyEntry<'a> {
 ///
 /// Serializes all writes through a `Mutex` so concurrent requests don't
 /// interleave partial JSON objects on disk. The mutex is held only for
-/// the final serialize+write+newline — entries are built without the
+/// the final serialize+write+newline - entries are built without the
 /// lock held.
 #[derive(Debug)]
 pub(crate) struct LogWriter {
@@ -119,7 +119,7 @@ pub(crate) async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Build a reqwest client once and share it. Native roots (via the
     // `rustls-tls-native-roots` feature in Cargo.toml) so origin certs
-    // validate against the same trust store as the tools under test —
+    // validate against the same trust store as the tools under test --
     // the proxy's own CA cert goes *in* the client's trust store, but
     // the proxy itself validates origin certs normally.
     //
@@ -231,7 +231,7 @@ async fn handle_connection(
         .await?;
 
     // Reclaim the inner TcpStream; there may be leftover bytes in the
-    // BufReader from the client already sending ClientHello — they must
+    // BufReader from the client already sending ClientHello - they must
     // be preserved across the BufReader→TlsAcceptor boundary. We always
     // wrap in `PrefixedStream` (even when empty) so the outer type is
     // uniform regardless of whether we prefetched bytes.
@@ -484,7 +484,7 @@ use futures_util::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A `Stream` wrapper that fires `on_drop` when the inner stream ends
-/// (yields `None`) or the value is dropped — whichever comes first.
+/// (yields `None`) or the value is dropped - whichever comes first.
 /// Used to log a proxy entry exactly once after the response body has
 /// fully drained.
 struct LogOnDrop<S> {
@@ -495,10 +495,10 @@ struct LogOnDrop<S> {
 
 impl<S> Drop for LogOnDrop<S> {
     fn drop(&mut self) {
-        if !self.logged {
-            if let Some(f) = self.on_drop.take() {
-                f();
-            }
+        if !self.logged
+            && let Some(f) = self.on_drop.take()
+        {
+            f();
         }
     }
 }

@@ -5,7 +5,7 @@
 # bench/ prefix.
 #
 # Ordering: mount-exercising images first (Jupyter family shares GB-sized base
-# layers across distinct source names and therefore distinct target repos —
+# layers across distinct source names and therefore distinct target repos --
 # the canonical cross-repo mount scenario). Use `--limit N` to scope the
 # benchmark to the first N entries for fast iteration.
 
@@ -36,7 +36,7 @@ images:
   # NGC's nvcr.io requires auth; the docker.io/nvidia/cuda mirror is
   # anonymously pullable. 12.6.2 runtime/devel share ~1.5 GB across tags
   # (same target repo, so this exercises intra-repo dedup, not cross-repo
-  # mount — included for large-blob chunked-upload throughput).
+  # mount -- included for large-blob chunked-upload throughput).
   - source: "docker.io/nvidia/cuda"
     tags:
       - "12.6.2-base-ubuntu22.04"         # ~92 MB
@@ -114,7 +114,7 @@ images:
     tags: ["latest"]
 
   # ── SOCI workshop images ──────────────────────────────────────────────────
-  # Large multi-layer images from public.ecr.aws — useful for chunked upload
+  # Large multi-layer images from public.ecr.aws -- useful for chunked upload
   # and large-blob throughput; limited cross-repo mount potential (each image
   # is an independent build).
   - source: "public.ecr.aws/soci-workshop-examples/ffmpeg"

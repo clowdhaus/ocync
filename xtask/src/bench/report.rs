@@ -8,6 +8,90 @@ use serde::{Deserialize, Serialize};
 
 use crate::bench::proxy::ProxyMetrics;
 
+/// Compact run record for the per-registry JSON archive.
+///
+/// One record per benchmark execution. Designed for source control:
+/// small enough to accumulate, rich enough to cite in docs/findings.md.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RunRecord {
+    /// UTC timestamp when the run started (`YYYY-MM-DD-HHMMSS`).
+    pub(crate) timestamp: String,
+    /// Short git commit hash at the time of the run.
+    pub(crate) git_ref: String,
+    /// Machine and cloud provider metadata.
+    pub(crate) machine: MachineInfo,
+    /// Corpus size context.
+    pub(crate) corpus: CorpusInfo,
+    /// Per-scenario results.
+    pub(crate) scenarios: Vec<ScenarioRecord>,
+}
+
+/// Machine metadata for a benchmark run.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct MachineInfo {
+    /// Cloud provider: `"aws"`, `"gcp"`, `"azure"`, or `"other"`.
+    pub(crate) provider: String,
+    /// Instance type (e.g. `c6in.4xlarge`), or `"unknown"`.
+    pub(crate) instance_type: String,
+    /// CPU architecture (e.g. `x86_64`, `aarch64`).
+    pub(crate) arch: String,
+    /// Number of vCPUs.
+    pub(crate) vcpus: usize,
+    /// Memory in GiB (converted from MiB at write time).
+    pub(crate) memory_gib: u64,
+    /// Network performance description.
+    pub(crate) network: String,
+    /// Cloud region (e.g. `us-east-1`).
+    pub(crate) region: String,
+}
+
+/// Corpus size metadata.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct CorpusInfo {
+    /// Number of distinct images.
+    pub(crate) images: usize,
+    /// Total tags across all images.
+    pub(crate) tags: usize,
+}
+
+/// One scenario's results in the compact run record.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ScenarioRecord {
+    /// Scenario name (e.g. `"Cold sync (median)"`).
+    pub(crate) name: String,
+    /// Per-tool results.
+    pub(crate) tools: Vec<ToolRecord>,
+}
+
+/// One tool's metrics in the compact run record.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ToolRecord {
+    /// Tool name (e.g. `"ocync"`).
+    pub(crate) tool: String,
+    /// Tool version string.
+    pub(crate) version: String,
+    /// Wall-clock time in seconds.
+    pub(crate) wall_clock_secs: f64,
+    /// Peak resident set size in KB.
+    pub(crate) peak_rss_kb: Option<u64>,
+    /// Total HTTP requests.
+    pub(crate) requests: u64,
+    /// Total HTTP response bytes.
+    pub(crate) response_bytes: u64,
+    /// Blob GETs to source (non-target) registries.
+    pub(crate) source_blob_gets: u64,
+    /// Bytes from source blob GETs.
+    pub(crate) source_blob_bytes: u64,
+    /// Successful cross-repo mounts.
+    pub(crate) mount_successes: u64,
+    /// Total mount attempts.
+    pub(crate) mount_attempts: u64,
+    /// Duplicate blob GET requests.
+    pub(crate) duplicate_blob_gets: u64,
+    /// HTTP 429 rate-limit responses.
+    pub(crate) rate_limit_429s: u64,
+}
+
 /// Results for one tool in one scenario.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ToolRun {
@@ -471,14 +555,11 @@ fn tool_columns(report: &BenchReport) -> Vec<String> {
     columns
 }
 
-/// Writes the benchmark report to `output_dir`.
+/// Writes the benchmark summary to `output_dir`.
 ///
-/// Creates the following files:
-/// - `summary.md` -- Markdown summary with per-scenario metric tables
-/// - `{scenario_name}.json` -- per-scenario JSON (one file per scenario)
-/// - `scale.json` -- scaling curve data (only when `report.scale` is non-empty)
-/// - `bench-results/runs/{timestamp}.json` -- full report archive for
-///   historical comparison across benchmark runs
+/// Creates `summary.md` -- the human-readable comparison table with
+/// per-scenario metrics and winners bolded. The compact per-registry
+/// JSON archive is written separately by `append_record()`.
 pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<(), String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
@@ -488,39 +569,39 @@ pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<()
     let md_path = output_dir.join("summary.md");
     std::fs::write(&md_path, md).map_err(|e| format!("write {}: {e}", md_path.display()))?;
 
-    // Per-scenario JSON files.
-    for scenario in &report.scenarios {
-        let filename = scenario
-            .scenario
-            .to_lowercase()
-            .replace(|c: char| !c.is_alphanumeric(), "_")
-            + ".json";
-        let path = output_dir.join(&filename);
-        let json = serde_json::to_string_pretty(scenario)
-            .map_err(|e| format!("serialize scenario {}: {e}", scenario.scenario))?;
-        std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
-    }
+    Ok(())
+}
 
-    // scale.json (only when data is present).
-    if !report.scale.is_empty() {
-        let scale_path = output_dir.join("scale.json");
-        let json = serde_json::to_string_pretty(&report.scale)
-            .map_err(|e| format!("serialize scale data: {e}"))?;
-        std::fs::write(&scale_path, json)
-            .map_err(|e| format!("write {}: {e}", scale_path.display()))?;
-    }
+/// Appends a compact run record to the per-registry JSON archive.
+///
+/// The file at `results_dir/{registry_key}.json` is a JSON array of
+/// `RunRecord` values. If the file does not exist, it is created with
+/// `[record]`. If it exists, the record is appended. If the file
+/// contains invalid JSON, an error is returned (never silently
+/// overwrite corrupt data).
+pub(crate) fn append_record(
+    results_dir: &Path,
+    registry_key: &str,
+    record: RunRecord,
+) -> Result<(), String> {
+    std::fs::create_dir_all(results_dir)
+        .map_err(|e| format!("create results dir {}: {e}", results_dir.display()))?;
 
-    // Historical archive: full report as a single JSON file keyed by timestamp.
-    // Lives under `bench-results/runs/` so all runs accumulate in one directory
-    // regardless of per-run output_dir.
-    let runs_dir = Path::new("bench-results/runs");
-    std::fs::create_dir_all(runs_dir)
-        .map_err(|e| format!("create runs dir {}: {e}", runs_dir.display()))?;
-    let archive_path = runs_dir.join(format!("{}.json", report.timestamp));
-    let archive_json = serde_json::to_string_pretty(report)
-        .map_err(|e| format!("serialize report archive: {e}"))?;
-    std::fs::write(&archive_path, &archive_json)
-        .map_err(|e| format!("write {}: {e}", archive_path.display()))?;
+    let path = results_dir.join(format!("{registry_key}.json"));
+
+    let mut records: Vec<RunRecord> = if path.exists() {
+        let contents =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        serde_json::from_str(&contents).map_err(|e| format!("parse {}: {e}", path.display()))?
+    } else {
+        Vec::new()
+    };
+
+    records.push(record);
+
+    let json = serde_json::to_string_pretty(&records)
+        .map_err(|e| format!("serialize run records: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
 
     Ok(())
 }
@@ -656,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn write_report_creates_files() {
+    fn write_report_creates_summary() {
         let report = sample_report();
         let dir = tempfile::tempdir().unwrap();
         write_report(dir.path(), &report).unwrap();
@@ -665,74 +746,8 @@ mod tests {
         let md_content = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
         assert_eq!(md_content, summary_markdown(&report));
 
-        // Per-scenario JSON file exists and is valid JSON.
-        let json_path = dir.path().join("cold_sync__median_.json");
-        let json_content = std::fs::read_to_string(&json_path).unwrap();
-        let parsed: ScenarioResult = serde_json::from_str(&json_content).unwrap();
-        assert_eq!(parsed.scenario, "Cold sync (median)");
-        assert_eq!(parsed.runs.len(), 2);
-    }
-
-    #[test]
-    fn write_report_writes_scale_json_when_present() {
-        let mut report = sample_report();
-        report.scale = vec![ScalePoint {
-            images: 10,
-            results: BTreeMap::from([("ocync".to_string(), 8.5)]),
-        }];
-
-        let dir = tempfile::tempdir().unwrap();
-        write_report(dir.path(), &report).unwrap();
-
-        let scale_content = std::fs::read_to_string(dir.path().join("scale.json")).unwrap();
-        let parsed: Vec<ScalePoint> = serde_json::from_str(&scale_content).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].images, 10);
-    }
-
-    #[test]
-    fn write_report_roundtrips_tool_run_with_proxy_metrics() {
-        use crate::bench::proxy::ProxyMetrics;
-
-        let mut report = sample_report();
-        report.scenarios[0].runs[0].proxy_metrics = Some(ProxyMetrics {
-            total_requests: 847,
-            requests_by_method: BTreeMap::from([
-                ("GET".to_string(), 400),
-                ("HEAD".to_string(), 200),
-                ("PUT".to_string(), 247),
-            ]),
-            status_429_count: 3,
-            total_request_bytes: 50_000,
-            total_response_bytes: 2_100_000_000,
-            duplicate_blob_gets: 0,
-            mount_attempts: 0,
-            mount_successes: 0,
-            source_blob_gets: 200,
-            source_blob_bytes: 4_000_000_000,
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        write_report(dir.path(), &report).unwrap();
-
-        let json_path = dir.path().join("cold_sync__median_.json");
-        let json_content = std::fs::read_to_string(&json_path).unwrap();
-        let parsed: ScenarioResult = serde_json::from_str(&json_content).unwrap();
-
-        let metrics = parsed.runs[0].proxy_metrics.as_ref().unwrap();
-        assert_eq!(metrics.total_requests, 847);
-        assert_eq!(metrics.status_429_count, 3);
-        assert_eq!(metrics.total_response_bytes, 2_100_000_000);
-        assert_eq!(metrics.duplicate_blob_gets, 0);
-    }
-
-    #[test]
-    fn write_report_omits_scale_json_when_empty() {
-        let report = sample_report();
-        let dir = tempfile::tempdir().unwrap();
-        write_report(dir.path(), &report).unwrap();
-
-        assert!(!dir.path().join("scale.json").exists());
+        // Per-scenario JSON files are no longer generated.
+        assert!(!dir.path().join("cold_sync__median_.json").exists());
     }
 
     #[test]
@@ -778,5 +793,135 @@ mod tests {
         let md = summary_markdown(&report);
         // dregsy column shows "--", ocync is bolded as only tool with data.
         assert!(md.contains("| Wall clock | **47s** | -- |"), "md:\n{md}");
+    }
+
+    #[test]
+    fn run_record_roundtrip() {
+        let record = RunRecord {
+            timestamp: "2026-04-18-021040".into(),
+            git_ref: "d121864".into(),
+            machine: MachineInfo {
+                provider: "aws".into(),
+                instance_type: "c6in.4xlarge".into(),
+                arch: "x86_64".into(),
+                vcpus: 16,
+                memory_gib: 32,
+                network: "Up to 50 Gigabit".into(),
+                region: "us-east-1".into(),
+            },
+            corpus: CorpusInfo {
+                images: 42,
+                tags: 55,
+            },
+            scenarios: vec![ScenarioRecord {
+                name: "Cold sync (median)".into(),
+                tools: vec![ToolRecord {
+                    tool: "ocync".into(),
+                    version: "0.1.0".into(),
+                    wall_clock_secs: 273.0,
+                    peak_rss_kb: Some(59468),
+                    requests: 4131,
+                    response_bytes: 16_900_000_000,
+                    source_blob_gets: 726,
+                    source_blob_bytes: 77200,
+                    mount_successes: 362,
+                    mount_attempts: 379,
+                    duplicate_blob_gets: 0,
+                    rate_limit_429s: 0,
+                }],
+            }],
+        };
+        let json = serde_json::to_string_pretty(&record).unwrap();
+        let parsed: RunRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.timestamp, "2026-04-18-021040");
+        assert_eq!(parsed.git_ref, "d121864");
+        assert_eq!(parsed.machine.provider, "aws");
+        assert_eq!(parsed.machine.memory_gib, 32);
+        assert_eq!(parsed.corpus.images, 42);
+        assert_eq!(parsed.scenarios[0].tools[0].requests, 4131);
+    }
+
+    #[test]
+    fn append_record_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = RunRecord {
+            timestamp: "2026-04-18-100000".into(),
+            git_ref: "abc1234".into(),
+            machine: MachineInfo {
+                provider: "aws".into(),
+                instance_type: "c6in.4xlarge".into(),
+                arch: "x86_64".into(),
+                vcpus: 16,
+                memory_gib: 32,
+                network: "Up to 50 Gigabit".into(),
+                region: "us-east-1".into(),
+            },
+            corpus: CorpusInfo {
+                images: 10,
+                tags: 15,
+            },
+            scenarios: vec![],
+        };
+        append_record(dir.path(), "ecr", record).unwrap();
+
+        let path = dir.path().join("ecr.json");
+        assert!(path.exists());
+        let records: Vec<RunRecord> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].timestamp, "2026-04-18-100000");
+    }
+
+    #[test]
+    fn append_record_appends_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecr.json");
+        std::fs::write(&path, "[]").unwrap();
+
+        let record = RunRecord {
+            timestamp: "2026-04-18-110000".into(),
+            git_ref: "def5678".into(),
+            machine: MachineInfo {
+                provider: "aws".into(),
+                instance_type: "c7g.xlarge".into(),
+                arch: "aarch64".into(),
+                vcpus: 4,
+                memory_gib: 8,
+                network: "Up to 12.5 Gigabit".into(),
+                region: "us-east-1".into(),
+            },
+            corpus: CorpusInfo { images: 5, tags: 8 },
+            scenarios: vec![],
+        };
+        append_record(dir.path(), "ecr", record).unwrap();
+
+        let records: Vec<RunRecord> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].git_ref, "def5678");
+    }
+
+    #[test]
+    fn append_record_rejects_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecr.json");
+        std::fs::write(&path, "not json").unwrap();
+
+        let record = RunRecord {
+            timestamp: "2026-04-18-120000".into(),
+            git_ref: "aaa1111".into(),
+            machine: MachineInfo {
+                provider: "aws".into(),
+                instance_type: "unknown".into(),
+                arch: "unknown".into(),
+                vcpus: 0,
+                memory_gib: 0,
+                network: "unknown".into(),
+                region: "unknown".into(),
+            },
+            corpus: CorpusInfo { images: 0, tags: 0 },
+            scenarios: vec![],
+        };
+        assert!(append_record(dir.path(), "ecr", record).is_err());
     }
 }

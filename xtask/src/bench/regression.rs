@@ -251,8 +251,8 @@ mod tests {
             total_bytes: 1_000_000,
         };
         let current = Baseline {
-            wall_clock_secs: 105.0, // 5% — within threshold
-            total_requests: 1250,   // 25% — exceeds threshold
+            wall_clock_secs: 105.0, // 5% -- within threshold
+            total_requests: 1250,   // 25% -- exceeds threshold
             total_bytes: 1_000_000,
         };
         let result = compare(&current, &baseline, 20);

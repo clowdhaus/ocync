@@ -2,7 +2,7 @@
 //!
 //! A single long-lived CA signs leaf certs generated on demand, one per
 //! SNI hostname observed. Leaf certs are cached in-memory (`Arc<Cache>`)
-//! so repeated connections to the same origin reuse the same cert — this
+//! so repeated connections to the same origin reuse the same cert - this
 //! keeps TLS handshakes fast and lets tokio-rustls's session resumption
 //! do its job.
 
@@ -62,7 +62,7 @@ impl CaSigner {
     /// Look up or generate a leaf certificate for `sni_host`.
     ///
     /// Synchronous because rustls's `ResolvesServerCert::resolve` is
-    /// itself sync — it's invoked on the connection-driving task and
+    /// itself sync - it's invoked on the connection-driving task and
     /// cannot call `.await`. Using a synchronous `std::sync::RwLock`
     /// avoids the "runtime-in-runtime" panic from `block_on`-ing a
     /// `tokio::sync::RwLock` from within the executor. Leaf generation
@@ -107,7 +107,7 @@ pub(crate) fn generate_ca(common_name: &str) -> Result<(String, String), Error> 
         KeyUsagePurpose::CrlSign,
         KeyUsagePurpose::DigitalSignature,
     ];
-    // Long validity — benchmark instances are short-lived.
+    // Long validity - benchmark instances are short-lived.
     let (not_before, not_after) = validity_one_decade();
     params.not_before = not_before;
     params.not_after = not_after;

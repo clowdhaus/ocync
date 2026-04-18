@@ -1,4 +1,4 @@
-# Partial sync overrides — applied on top of corpus.yaml.
+# Partial sync overrides -- applied on top of corpus.yaml.
 #
 # Each entry replaces the tags for the matching source image.
 # Used by the "partial" benchmark scenario to measure incremental sync.
