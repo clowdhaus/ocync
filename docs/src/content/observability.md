@@ -16,7 +16,7 @@ Reports include per-image results and aggregate statistics: blobs transferred, b
 
 ## Progress indicators
 
-ocync auto-detects the output environment:
+`ocync` auto-detects the output environment:
 
 - **TTY**: real-time progress bars with per-image and aggregate stats
 - **Non-TTY / CI**: periodic heartbeat lines with summary counts
@@ -46,11 +46,11 @@ ocync sync -c config.yaml -vv --log-format json
 
 JSON log format is auto-detected when running inside Kubernetes (via `KUBERNETES_SERVICE_HOST` environment variable).
 
-Override with the `OCYNC_LOG` environment variable for fine-grained filter directives.
+Override with the `RUST_LOG` environment variable for fine-grained filter directives.
 
 ## Health endpoints (watch mode)
 
-When running in watch mode, ocync exposes HTTP health endpoints:
+When running in watch mode, `ocync` exposes HTTP health endpoints:
 
 | Endpoint | Purpose | Healthy |
 |---|---|---|

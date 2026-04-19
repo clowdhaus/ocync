@@ -6,7 +6,7 @@ order: 1
 
 ## Auth
 
-ECR uses IAM credentials via the AWS SDK. ocync auto-detects ECR from the hostname pattern (`*.dkr.ecr.*.amazonaws.com`) and uses your ambient AWS credentials:
+ECR uses IAM credentials via the AWS SDK. `ocync` auto-detects ECR from the hostname pattern (`*.dkr.ecr.*.amazonaws.com`) and uses your ambient AWS credentials:
 
 - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
 - AWS config file (`~/.aws/config`)
@@ -30,7 +30,7 @@ See the [FIPS guide](../../fips) for crypto details.
 
 ## Cross-repo blob mounting
 
-ECR supports cross-repo blob mounting when `BLOB_MOUNTING=ENABLED` on the repository. When a blob exists in another repo on the same registry with a committed manifest, ocync mounts it server-side instead of uploading.
+ECR supports cross-repo blob mounting when `BLOB_MOUNTING=ENABLED` on the account. When a blob exists in another repo on the same registry with a committed manifest, `ocync` mounts it server-side instead of uploading.
 
 To enable:
 
@@ -38,15 +38,15 @@ To enable:
 aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED
 ```
 
-ocync's leader-follower algorithm ensures shared blobs are uploaded exactly once. One image is elected leader for each shared blob and performs the actual upload; all other images (followers) wait and then mount from the leader's repository.
+`ocync`'s leader-follower algorithm ensures shared blobs are uploaded exactly once. One image is elected leader for each shared blob and performs the actual upload; all other images (followers) wait and then mount from the leader's repository.
 
 ## Batch blob existence checks
 
-ocync uses ECR's `BatchCheckLayerAvailability` API to check multiple blobs in a single request (up to 100 digests per call), reducing API call volume.
+`ocync` uses ECR's `BatchCheckLayerAvailability` API to check multiple blobs in a single request (up to 100 digests per call), reducing API call volume.
 
 ## Rate limits
 
-ECR has per-action rate limits. ocync tracks 9 independent AIMD (additive increase, multiplicative decrease) concurrency windows, using the same algorithm TCP uses for congestion control:
+ECR has per-action rate limits. `ocync` tracks 9 independent [AIMD](../../design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency windows, using the same algorithm TCP uses for congestion control:
 
 - Manifest GET/PUT/HEAD
 - Blob GET/HEAD/POST/PUT/PATCH
@@ -56,7 +56,7 @@ Each window adapts independently, so a 429 on blob uploads does not throttle man
 
 ## ECR Public
 
-ECR Public (`public.ecr.aws`) is detected separately. It does not support blob mounting.
+ECR Public (`public.ecr.aws`) is detected separately via `ProviderKind::EcrPublic`. Anonymous pulls work, but authenticated pulls via IAM get higher rate limits. The `docker-credential-ecr-login` helper supports public ECR -- it calls `ecr-public:GetAuthorizationToken` + `sts:GetServiceBearerToken`. The managed policy `AmazonElasticContainerRegistryPublicReadOnly` grants these permissions.
 
 ## Example config
 

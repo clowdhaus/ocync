@@ -87,8 +87,9 @@ const registries = [
         <h2 id="efficiency-heading">Pull once.<br>Push everywhere.</h2>
         <p class="feature-copy">
           Global blob deduplication means shared layers transfer exactly once
-          from source, then mount across all targets. AIMD concurrency adapts
-          to each registry independently: no manual tuning, no throttling.
+          from source, then mount across all targets. <a href={`${base}design/overview#adaptive-concurrency-aimd`}>AIMD</a> (additive
+          increase, multiplicative decrease) concurrency adapts to each
+          registry independently: no manual tuning, no throttling.
         </p>
         <div class="stat-row">
           {stats.map((stat) => (

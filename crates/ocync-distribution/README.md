@@ -16,7 +16,7 @@ Standalone client for the [OCI Distribution Spec](https://github.com/opencontain
 - Manifest pull, push, HEAD with OCI and Docker v2 content negotiation
 - Tag listing with automatic pagination
 - SHA-256 digest computation and verification (FIPS 140-3 via aws-lc-rs)
-- AIMD adaptive concurrency per registry action
+- [AIMD](https://clowdhaus.github.io/ocync/design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) adaptive concurrency per registry action
 - ECR batch blob existence checks
 
 ## Feature flags
@@ -24,11 +24,11 @@ Standalone client for the [OCI Distribution Spec](https://github.com/opencontain
 | Flag | Default | Description |
 |------|---------|-------------|
 | `fips` | Yes | FIPS 140-3 validated cryptography via aws-lc-rs |
-| `aws-lc` | No | aws-lc-rs without FIPS mode |
+| `non-fips` | No | aws-lc-rs without FIPS mode |
 
 ## Minimum Rust version
 
-1.85 (edition 2024)
+1.94 (edition 2024)
 
 ## Example
 

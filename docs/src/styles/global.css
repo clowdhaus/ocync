@@ -93,7 +93,7 @@
     --radius-pill: 9999px;
 
     /* Brand palette -- each hex appears exactly once */
-    --pink: #F736F6;
+    --pink: #fa4af9;
     --purple: #a855f7;
     --aqua: #06b6d4;
     --violet: #7c3aed;
@@ -105,7 +105,7 @@
 
     /* Fixed-background semantic tokens */
     --color-text-on-dark: #bcc6ec;
-    --color-text-on-dark-muted: #8b84c8;
+    --color-text-on-dark-muted: #9f9ad6;
     --color-text-on-dark-bright: #eef0ff;
     --color-text-on-pink: #120a6e;
     --color-text-on-pink-muted: #1a1080;

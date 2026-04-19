@@ -20,7 +20,7 @@ registries:
 
 ## Upload behavior
 
-GHCR has a known issue with multi-PATCH chunked uploads: the last PATCH overwrites previous chunks. ocync automatically falls back to single-PATCH upload for GHCR.
+GHCR has a known issue with multi-PATCH chunked uploads: the last PATCH overwrites previous chunks. `ocync` automatically falls back to single-PATCH upload for GHCR.
 
 ## Blob mounting
 

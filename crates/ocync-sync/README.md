@@ -25,7 +25,7 @@ None. All functionality is always enabled.
 
 ## Minimum Rust version
 
-1.85 (edition 2024)
+1.94 (edition 2024)
 
 ## Example
 

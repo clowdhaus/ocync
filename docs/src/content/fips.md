@@ -6,7 +6,7 @@ order: 7
 
 ## Overview
 
-ocync uses [aws-lc-rs](https://github.com/aws/aws-lc-rs) as its sole TLS crypto provider. On Linux, binaries ship with FIPS 140-3 validated cryptography (NIST Certificate #4816) enabled by default.
+`ocync` uses [aws-lc-rs](https://github.com/aws/aws-lc-rs) as its sole TLS crypto provider. On Linux, binaries ship with FIPS 140-3 validated cryptography (NIST Certificate #4816) enabled by default.
 
 ## Build variants
 
@@ -21,7 +21,7 @@ FIPS mode is a compile-time decision. The `fips` feature flag links against the 
 
 ## FIPS endpoints for ECR
 
-When `AWS_USE_FIPS_ENDPOINT=true`, ocync rewrites ECR hostnames to use FIPS endpoints:
+When `AWS_USE_FIPS_ENDPOINT=true`, `ocync` rewrites ECR hostnames to use FIPS endpoints:
 
 ```
 123456789012.dkr.ecr.us-east-1.amazonaws.com

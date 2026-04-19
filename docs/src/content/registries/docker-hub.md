@@ -25,11 +25,11 @@ As of 2025, Docker Hub enforces these limits:
 - Blob GET requests do **not** count
 - HEAD requests are **free**
 
-ocync uses HEAD checks wherever possible to minimize rate-limit consumption.
+`ocync` uses HEAD checks wherever possible to minimize rate-limit consumption.
 
 ## Blob mounting
 
-Docker Hub supports cross-repo blob mounting. ocync automatically uses this when blobs exist in another repository under the same account.
+Docker Hub supports cross-repo blob mounting. `ocync` automatically uses this when blobs exist in another repository under the same account.
 
 ## Example config
 

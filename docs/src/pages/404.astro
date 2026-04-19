@@ -5,7 +5,7 @@ const rawBase = import.meta.env.BASE_URL;
 const base = rawBase.endsWith("/") ? rawBase : `${rawBase}/`;
 ---
 
-<BaseLayout title="Page not found" description="The page you are looking for does not exist.">
+<BaseLayout title="Page not found" description="The page you are looking for does not exist." noindex>
   <main id="main-content" class="not-found">
     <h1>Page not found</h1>
     <p>The page you are looking for does not exist or has been moved.</p>

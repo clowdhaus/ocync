@@ -4,13 +4,13 @@ description: User-facing design overview explaining how ocync works and why each
 order: 1
 ---
 
-ocync is a Rust-based OCI registry sync tool that copies container images between registries. It is designed around a single insight: the fastest sync is the one that transfers the fewest bytes and issues the fewest API calls. Wall-clock speed is a consequence of efficiency, not a goal separate from it.
+`ocync` is a Rust-based OCI registry sync tool that copies container images between registries. It is designed around a single insight: the fastest sync is the one that transfers the fewest bytes and issues the fewest API calls. Wall-clock speed is a consequence of efficiency, not a goal separate from it.
 
-This document explains how ocync works, why each design choice was made, and what the measurable impact is.
+This document explains how `ocync` works, why each design choice was made, and what the measurable impact is.
 
 ## Design philosophy
 
-ocync optimizes along four axes, in strict priority order:
+`ocync` optimizes along four axes, in strict priority order:
 
 1. **Efficiency** - bytes transferred and API calls issued. Every blob we avoid pulling, every HEAD we avoid issuing, is the real win.
 2. **Correctness** - staleness handling, auth invalidation, protocol conformance. Efficiency optimizations must degrade safely, not silently.
@@ -21,7 +21,7 @@ When these conflict, the higher-priority axis wins. A mount that saves bytes but
 
 ## Runtime model
 
-ocync runs on a single-threaded tokio runtime (`current_thread`). The workload is ~100% network I/O - hundreds of concurrent futures spend >99% of wall-clock time awaiting HTTP responses from registries. A single OS thread handles all of them without context-switch overhead, lock contention, or `Send`/`Sync` bound infection.
+`ocync` runs on a single-threaded tokio runtime (`current_thread`). The workload is ~100% network I/O - hundreds of concurrent futures spend >99% of wall-clock time awaiting HTTP responses from registries. A single OS thread handles all of them without context-switch overhead, lock contention, or `Send`/`Sync` bound infection.
 
 Shared mutable state uses `Rc<RefCell<>>` instead of `Arc<Mutex<>>`. This is a deliberate choice:
 
@@ -42,7 +42,7 @@ The naive approach to sync is three sequential phases: discover all images, plan
 1. **Discovery latency is hidden.** For Chainguard (no rate limits), discovery of 200+ multi-arch images takes ~10-20 seconds. For Docker Hub (200 manifest GETs per 6 hours), discovery can take hours. In plan-then-execute, execution waits for all of this.
 2. **The cache starts empty.** In plan-then-execute, all blob HEAD checks happen before any transfers, so the transfer state cache is empty during planning. Shared base layers are checked N times instead of once.
 
-ocync uses a pipelined architecture where discovery and execution overlap:
+`ocync` uses a pipelined architecture where discovery and execution overlap:
 
 ```
                      +-------------------------------------------------+
@@ -81,7 +81,7 @@ This is the Nix store's closure-ordered transfer strategy applied to OCI blobs. 
 
 ## Adaptive concurrency (AIMD)
 
-Static concurrency limits force operators to guess at registry capacity. Too low wastes throughput. Too high triggers rate-limit storms. ocync discovers actual capacity through feedback.
+Static concurrency limits force operators to guess at registry capacity. Too low wastes throughput. Too high triggers rate-limit storms. `ocync` discovers actual capacity through feedback.
 
 ### Per-(registry, action) windows
 
@@ -138,7 +138,7 @@ When a blob already exists in another repository on the same target registry, OC
 
 ### Leader-follower election
 
-Multiple images in a sync run often share base layers. If all images push independently, shared blobs are uploaded N times. ocync uses leader-follower election to ensure shared blobs are uploaded once and mounted everywhere else.
+Multiple images in a sync run often share base layers. If all images push independently, shared blobs are uploaded N times. `ocync` uses leader-follower election to ensure shared blobs are uploaded once and mounted everywhere else.
 
 The `elect_leaders()` function uses a greedy set-cover algorithm over shared blob digests:
 
@@ -164,7 +164,7 @@ ECR requires an opt-in account setting (`BLOB_MOUNTING=ENABLED`, launched Januar
 2. Both repos use identical encryption configuration
 3. Same account and same region
 
-Without `BLOB_MOUNTING` enabled (or for standalone blobs without manifests), ECR returns 202 and starts a regular upload session. ocync detects this and falls through to the standard upload path.
+Without `BLOB_MOUNTING` enabled (or for standalone blobs without manifests), ECR returns 202 and starts a regular upload session. `ocync` detects this and falls through to the standard upload path.
 
 ### Measured impact
 
@@ -226,7 +226,7 @@ Memory usage is bounded by chunk size per active upload stream. The default uplo
 
 When a mapping has multiple targets (e.g., us-ecr + eu-ecr + ap-ecr), re-pulling each blob from source for each target wastes bandwidth. For a 2 GB ML layer across 3 regions: 6 GB source bandwidth instead of 2 GB.
 
-ocync pulls each source blob once and writes it to a content-addressable disk file:
+`ocync` pulls each source blob once and writes it to a content-addressable disk file:
 
 ```
 source GET -> {cache_dir}/blobs/sha256/{hex_digest}
@@ -242,7 +242,7 @@ Single-target deployments pay zero overhead - `BlobStage::disabled()` is a no-op
 
 ### Upload strategy per registry
 
-Registries vary in upload protocol support. ocync adapts automatically:
+Registries vary in upload protocol support. `ocync` adapts automatically:
 
 | Registry | Strategy | Requests/blob | Notes |
 |---|---|:---:|---|
@@ -285,29 +285,17 @@ The 50:1 ratio between `UploadLayerPart` (500 TPS) and `PutImage` (10 TPS) means
 
 ## Competitive position
 
-Benchmarked on c6in.4xlarge (Intel, 16 vCPUs, 32 GiB, up to 50 Gbps). Full corpus: 42 images, 55 tags across Docker Hub, cgr.dev, public ECR, nvcr.io. Cold sync to ECR us-east-1.
+See [Performance](../performance) for the full benchmark table. Summary (39 images, 51 tags, cold sync to ECR on c6in.4xlarge):
 
-| Metric | ocync | dregsy | regsync |
-|---|---:|---:|---:|
-| Wall clock | **4m 33s** | 36m 22s | 16m 6s |
-| Peak RSS | 58 MB | 305 MB | **27 MB** |
-| Requests | **4,131** | 11,190 | 7,719 |
-| Response bytes | **16.9 GB** | 43.4 GB | 35.4 GB |
-| Source blob GETs | **726** | 1,324 | 1,381 |
-| Mounts (success/attempt) | **362/379** | 293/293 | 0/1,380 |
-| Rate-limit 429s | **0** | 49 | **0** |
-
-Key differentiators:
-
-- **8x faster** than dregsy, **3.5x faster** than regsync
-- **2.6x fewer bytes** than dregsy, **2.1x fewer** than regsync
-- **Zero rate-limit 429s** (AIMD congestion control adapts before hitting limits)
-- **95.5% mount success** vs regsync's 0% (regclient omits `from=` parameter for cross-registry syncs)
+- **3.6-4.5x faster** wall clock than comparable tools
+- **25-38% fewer API requests** through global blob dedup and mount-first strategy
+- **Cross-repo blob mounting** avoids re-pulling shared layers from source (95.6% mount success rate)
 - **Zero duplicate blob GETs** (source-pull dedup via staging)
+- **Zero rate-limit 429s** (AIMD congestion control adapts before hitting limits)
 
-regsync's lower peak RSS (27 MB vs 58 MB) reflects its sequential architecture: one image, one blob at a time, with Go's ~10-15 MB baseline. ocync's 58 MB comes from concurrent blob transfers, staging maps, and the transfer state cache. The 58 MB vs 27 MB trade-off buys 3.5x faster wall clock.
+The lower peak RSS of sequential tools reflects their one-image-at-a-time architecture. `ocync`'s ~51 MB comes from concurrent blob transfers, staging maps, and the transfer state cache -- the memory trade-off buys the wall-clock advantage.
 
-Methodology: all traffic routed through bench-proxy (pure-Rust MITM) for byte-accurate request/response counting. Instance metadata captured from `ec2:DescribeInstanceTypes` (authoritative CPU/memory/network). Full results archived to `bench-results/runs/*.json`.
+Methodology: all traffic routed through bench-proxy (pure-Rust MITM) for byte-accurate request/response counting. Instance metadata captured from `ec2:DescribeInstanceTypes`. Run records archived to `bench/results/ecr.json`.
 
 ## Deployment model
 
@@ -355,7 +343,7 @@ OCI 1.1 introduced the referrers API for attaching artifacts (signatures, SBOMs,
 
 ### Discovery
 
-After syncing an image manifest, ocync queries the source registry's referrers API:
+After syncing an image manifest, `ocync` queries the source registry's referrers API:
 
 ```
 GET /v2/{repo}/referrers/{digest}
@@ -379,13 +367,13 @@ defaults:
 
 ### `require_artifacts` flag
 
-When `require_artifacts: true` is set, ocync enforces that every synced image has at least one referrer (signature, SBOM, or attestation). If a source image has no referrers, the sync fails with an error rather than silently producing an unsigned image at the target.
+When `require_artifacts: true` is set, `ocync` enforces that every synced image has at least one referrer (signature, SBOM, or attestation). If a source image has no referrers, the sync fails with an error rather than silently producing an unsigned image at the target.
 
 Setting `require_artifacts: true` with `artifacts.enabled: false` in the same scope is a CONFIG_ERROR (exit 3) because it is contradictory to require artifacts while disabling their transfer.
 
 ### Signature stripping warning
 
-When `artifacts.enabled: false` is configured, ocync emits a WARNING at config validation time. Disabling artifact sync strips signatures and SBOMs from synced images, which means targets receive images without the provenance metadata that downstream consumers may depend on for verification. The `--dry-run` flag queries referrers for each image and reports exactly what would be stripped, so operators can make an informed decision before committing to this configuration.
+When `artifacts.enabled: false` is configured, `ocync` emits a WARNING at config validation time. Disabling artifact sync strips signatures and SBOMs from synced images, which means targets receive images without the provenance metadata that downstream consumers may depend on for verification. The `--dry-run` flag queries referrers for each image and reports exactly what would be stripped, so operators can make an informed decision before committing to this configuration.
 
 ### Transfer order
 
@@ -400,7 +388,7 @@ Pushing artifacts before their subject manifest exists would produce a dangling 
 
 ### Fallback for older registries
 
-Not all registries support the OCI 1.1 referrers API. Some older registries use the "tag fallback" scheme, where referrers are stored as tags named `sha256-{digest}`. ocync handles both:
+Not all registries support the OCI 1.1 referrers API. Some older registries use the "tag fallback" scheme, where referrers are stored as tags named `sha256-{digest}`. `ocync` handles both:
 
 1. Try the referrers API first (`GET /v2/{repo}/referrers/{digest}`)
 2. If 404, try tag fallback (`GET /v2/{repo}/manifests/sha256-{digest}`)
@@ -437,7 +425,7 @@ registries:
 
 ### ECR immutable tag handling
 
-When pushing to an ECR repository with `image_tag_mutability: IMMUTABLE`, pushing an existing tag returns `ImageTagAlreadyExistsException`. ocync treats this as **success** because the image is already there with that tag. The exception is logged at DEBUG level (not an error, not even a warning) and the image is marked as skipped with reason `tag_immutable_exists`.
+When pushing to an ECR repository with `image_tag_mutability: IMMUTABLE`, pushing an existing tag returns `ImageTagAlreadyExistsException`. `ocync` treats this as **success** because the image is already there with that tag. The exception is logged at DEBUG level (not an error, not even a warning) and the image is marked as skipped with reason `tag_immutable_exists`.
 
 This makes re-runs fully idempotent without requiring `skip_existing: true`. A sync that is interrupted and restarted will pick up where it left off, and tags that were already pushed in the previous partial run are silently accepted.
 
@@ -449,7 +437,7 @@ When `platforms` is omitted from the config, the full image index (all platforms
 
 ### Subset: trimmed index
 
-When `platforms` is specified, ocync builds a new image index containing only the requested platforms:
+When `platforms` is specified, `ocync` builds a new image index containing only the requested platforms:
 
 ```yaml
 mappings:
@@ -462,13 +450,13 @@ The source image index is pulled in full, filtered to the requested platforms, a
 
 ### Missing platforms
 
-If a requested platform is not available in the source image index, ocync logs a WARNING and continues with the platforms that are available. A source image that offers `linux/amd64` but not `linux/arm64` will sync the amd64 platform and warn about the missing arm64 entry.
+If a requested platform is not available in the source image index, `ocync` logs a WARNING and continues with the platforms that are available. A source image that offers `linux/amd64` but not `linux/arm64` will sync the amd64 platform and warn about the missing arm64 entry.
 
-If **zero** requested platforms match any manifest in the source index, ocync returns an error with actionable context: the configured platform filter, the platforms actually available in the source index, and the source reference. An empty filtered index is never pushed to targets because it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading into an unusable state.
+If **zero** requested platforms match any manifest in the source index, `ocync` returns an error with actionable context: the configured platform filter, the platforms actually available in the source index, and the source reference. An empty filtered index is never pushed to targets because it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading into an unusable state.
 
 ## Skip optimization hierarchy
 
-When deciding whether to sync a tag, ocync evaluates three tiers in order. The first match wins.
+When deciding whether to sync a tag, `ocync` evaluates three tiers in order. The first match wins.
 
 ### Tier 1: immutable_tags pattern match (0 API calls)
 
@@ -511,8 +499,8 @@ The difference is 300x fewer API calls and ~30 seconds saved per repository per 
 These are explicit non-goals, listed with rationale for each.
 
 - **No deletion/pruning.** Registries handle lifecycle (ECR lifecycle policies, Harbor retention). A sync tool that deletes is a sync tool that can destroy production images on misconfiguration.
-- **No image building.** ocync syncs existing images. Building is a separate concern with separate tooling.
-- **No signature verification.** ocync transfers signatures faithfully but does NOT verify them. Verification is the consumer's responsibility. A sync tool that verifies signatures would need to manage trust roots, which is out of scope.
+- **No image building.** `ocync` syncs existing images. Building is a separate concern with separate tooling.
+- **No signature verification.** `ocync` transfers signatures faithfully but does NOT verify them. Verification is the consumer's responsibility. A sync tool that verifies signatures would need to manage trust roots, which is out of scope.
 - **No Docker daemon integration.** Pure OCI Distribution API only. The Docker daemon is a local concern; registry sync is a remote-to-remote operation.
 - **No skopeo dependency.** Everything is native Rust over HTTPS. No subprocess calls, no shell-out, no binary dependency to version-match.
 - **No local disk buffering.** Blobs stream source to target without touching disk (single-target mode). Multi-target mode uses content-addressable staging, but single-target deployments pay zero disk I/O.
@@ -527,10 +515,10 @@ These are explicit non-goals, listed with rationale for each.
 Existing tools get this catastrophically wrong:
 
 - **skopeo** dumps walls of "existing blob" messages. Every blob that already exists at the target produces a line of output. A sync of 50 images where 47 are unchanged produces hundreds of lines that communicate nothing actionable.
-- **regsync** floods with repeated status noise, emitting progress updates for every operation regardless of whether the operator needs to act on them.
-- **dregsy** swallows errors while being verbose about everything else. The one category of output that demands attention is the one it suppresses.
+- **`regsync`** floods with repeated status noise, emitting progress updates for every operation regardless of whether the operator needs to act on them.
+- **`dregsy`** swallows errors while being verbose about everything else. The one category of output that demands attention is the one it suppresses.
 
-A successful ocync sync of 50 images where 47 are unchanged produces the summary only, not 500 lines of noise:
+A successful `ocync` sync of 50 images where 47 are unchanged produces the summary only, not 500 lines of noise:
 
 ```
 synced   chainguard/nginx:1.27 -> mirror/nginx:1.27       (187 MB, 14s)

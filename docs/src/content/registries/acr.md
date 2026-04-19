@@ -10,7 +10,7 @@ ACR uses credentials from your Docker config file, typically configured via `az 
 
 ## Upload behavior
 
-ACR requires chunked PATCH upload for blobs larger than ~20 MB (streaming PUT body limit). ocync automatically switches to chunked upload with `Content-Range` headers for large blobs.
+ACR requires chunked PATCH upload for blobs larger than ~20 MB (streaming PUT body limit). `ocync` automatically switches to chunked upload with `Content-Range` headers for large blobs.
 
 ## Blob mounting
 

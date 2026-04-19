@@ -10,7 +10,7 @@
       <stop offset="100%" stop-color="#6d28d9"/>
     </linearGradient>
   </defs>
-  <rect class="bg" width="32" height="32" fill="url(#bg-dark)"/>
+  <rect class="bg" width="32" height="32" rx="7" fill="url(#bg-dark)"/>
   <path d="M20 2L7 18h8L11 30L25 13h-8L20 2z" fill="#ff44ee"/>
   <style>
     @media (prefers-color-scheme: light) {

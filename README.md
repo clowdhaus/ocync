@@ -5,7 +5,7 @@ Sync OCI container images across registries - efficiently.
 [![CI](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml/badge.svg)](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. It is 8x faster than dregsy and 3.5x faster than regsync on real-world workloads while using 2-2.6x fewer bytes and zero rate-limit 429s.
+ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. On real-world workloads, ocync completes cold syncs 3.6-4.5x faster than comparable tools with up to 38% fewer API requests.
 
 ## Features
 
@@ -15,7 +15,7 @@ ocync copies container images between OCI registries with blob deduplication, cr
 - **Global blob deduplication** - shared layers across all images are transferred once per sync run
 - **Cross-repo blob mounting** - leader-follower election ensures shared layers mount instead of re-upload
 - **Streaming transfers** - bytes flow source to target with no intermediate disk (single-target mode)
-- **Adaptive rate limiting** - per-(registry, action) AIMD concurrency adapts to each registry's limits
+- **Adaptive rate limiting** - per-(registry, action) [AIMD](https://clowdhaus.github.io/ocync/design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency adapts to each registry's limits
 - **Transfer state cache** - persistent cache skips already-synced blobs across runs
 - **FIPS 140-3 by default** - aws-lc-rs with NIST Certificate #4816
 - **Tag filtering** - glob patterns, semver ranges, exclude patterns, sort, latest-N
@@ -92,10 +92,10 @@ Supports Deployment (watch), CronJob, and Job modes. See the [Helm chart docs](h
 cargo install --locked ocync
 
 # Non-FIPS build (no extra dependencies)
-cargo install --locked ocync --no-default-features --features aws-lc
+cargo install --locked ocync --no-default-features --features non-fips
 ```
 
-Minimum Rust version: 1.85 (edition 2024).
+Minimum Rust version: 1.94 (edition 2024).
 
 </details>
 
@@ -116,11 +116,11 @@ Full documentation at [clowdhaus.github.io/ocync](https://clowdhaus.github.io/oc
 | Registry | Auth | Blob mount | Notes |
 |---|---|---|---|
 | Amazon ECR (private) | IAM (automatic) | Yes (opt-in) | Batch APIs, per-action rate limits |
-| Amazon ECR Public | IAM (automatic) | No | Separate from private ECR |
+| Amazon ECR Public | IAM (automatic) | Yes | Separate auth from private ECR |
 | Chainguard | Token exchange | N/A (source) | No rate limits |
 | Docker Hub | Docker config / static | Yes | 100/hr authenticated manifest GETs; HEADs free |
 | GitHub Container Registry | Docker config | Yes | Single-PATCH upload fallback |
-| Google Artifact Registry | Docker config | No | Monolithic upload only |
+| Google Artifact Registry | Docker config | Yes | Monolithic upload only |
 | Azure Container Registry | Docker config | Yes | Chunked upload for blobs >20 MB |
 | Any OCI-compliant registry | Basic / token / anonymous | Varies | Auto-detected |
 

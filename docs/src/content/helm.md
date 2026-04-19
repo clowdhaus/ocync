@@ -4,7 +4,7 @@ description: Deploy ocync on Kubernetes with Deployment, CronJob, or Job mode us
 order: 4
 ---
 
-The ocync Helm chart supports three deployment modes, selected via the `mode` value.
+The `ocync` Helm chart supports three deployment modes, selected via the `mode` value.
 
 ## Installation
 
@@ -99,7 +99,7 @@ serviceAccount:
     eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ocync
 ```
 
-The ocync container uses ambient AWS credentials, so there are no secrets to manage.
+The `ocync` container uses ambient AWS credentials, so there are no secrets to manage.
 
 ## Values reference
 

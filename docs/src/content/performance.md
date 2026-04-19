@@ -1,38 +1,45 @@
 ---
 title: Performance
-description: How ocync achieves 8x faster sync than alternatives with fewer bytes transferred and zero rate-limit errors.
+description: How ocync achieves 3.6-4.5x faster sync than comparable tools with fewer requests and cross-repo blob mounting.
 order: 6
 ---
 
 ## Benchmark results
 
-On a 42-image / 55-tag cold sync to ECR (c6in.4xlarge):
+<!-- Auto-updated by `cargo xtask bench`; shows first scenario (cold sync) only. -->
+<!-- BENCH:START -->
+Measured 2026-04-19 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps). Full corpus: 39 images, 51 tags across quay.io, Docker Hub, cgr.dev, public ECR. Cold sync to ECR us-east-1. All traffic routed through bench-proxy for byte-accurate measurement.
 
-| Tool | Wall time | Requests | Bytes | 429s |
-|---|---|---|---|---|
-| ocync | **4m 33s** | **4,131** | **16.9 GB** | **0** |
-| regsync | 16m 06s | 7,719 | 35.4 GB | **0** |
-| dregsy | 36m 22s | 11,190 | 43.4 GB | 49 |
+| Metric | `ocync` | `dregsy` | `regsync` |
+|---|---:|---:|---:|
+| Wall clock | **7m 9s** | 32m 15s | 25m 35s |
+| Peak RSS | 50.6 MB | 293.5 MB | **28.0 MB** |
+| Requests | **7,140** | 11,604 | 9,532 |
+| Response bytes | **55.3 GB** | **55.3 GB** | 65.3 GB |
+| Source blob GETs | **1,370** | **1,370** | 1,694 |
+| Source blob bytes | **55.3 GB** | **55.3 GB** | 65.3 GB |
+| Mounts (success/attempt) | **349/365** | 324/324 | 0/0 |
+| Duplicate blob GETs | **0** | **0** | **0** |
+| Rate-limit 429s | **0** | **0** | **0** |
+<!-- BENCH:END -->
 
-ocync is 8x faster than dregsy and 3.5x faster than regsync, with 2-2.6x fewer bytes transferred and zero rate-limit errors.
-
-## Why ocync is fast
+## Why `ocync` is fast
 
 ### Pipelined architecture
 
-Discovery and execution overlap. While images are being transferred, ocync is already discovering the next batch of work. There is no idle time between phases.
+Discovery and execution overlap. While images are being transferred, `ocync` is already discovering the next batch of work. There is no idle time between phases.
 
 ### Global blob deduplication
 
-Container images share layers heavily. A sync run touching 42 images may reference only a fraction as many unique blobs. ocync tracks every blob globally and transfers each unique blob exactly once.
+Container images share layers heavily. A sync run touching 42 images may reference only a fraction as many unique blobs. `ocync` tracks every blob globally and transfers each unique blob exactly once.
 
 ### Cross-repo blob mounting
 
-When a blob already exists in another repository on the same registry, ocync mounts it (a server-side copy) instead of uploading. A leader-follower election algorithm ensures exactly one image uploads each shared blob while all others mount from the leader. One image is elected leader for each shared blob and performs the actual upload; followers wait and then mount from the leader's repository.
+When a blob already exists in another repository on the same registry, `ocync` mounts it (a server-side copy) instead of uploading. A leader-follower election algorithm ensures exactly one image uploads each shared blob while all others mount from the leader. One image is elected leader for each shared blob and performs the actual upload; followers wait and then mount from the leader's repository.
 
 ### Adaptive rate limiting
 
-Per-(registry, action) AIMD (additive increase, multiplicative decrease) concurrency windows discover actual registry capacity through feedback, using the same algorithm TCP uses for congestion control. ECR has 9 independent rate limits (one per API action), and ocync tracks each independently. This avoids both under-utilization and 429 errors.
+Per-(registry, action) [AIMD](../design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency windows discover actual registry capacity through feedback, using the same algorithm TCP uses for congestion control. ECR has 9 independent rate limits (one per API action), and `ocync` tracks each independently. This avoids both under-utilization and 429 errors.
 
 ### Transfer state cache
 
@@ -44,7 +51,7 @@ In single-target mode, bytes flow directly from source to target with no interme
 
 ## Tuning
 
-ocync auto-discovers registry capacity through AIMD feedback. Manual tuning is rarely needed. The key settings (see [configuration](../configuration) for full reference):
+`ocync` auto-discovers registry capacity through [AIMD](../design/overview#adaptive-concurrency-aimd) feedback. Manual tuning is rarely needed. The key settings (see [configuration](../configuration) for full reference):
 
 - **Concurrency**: starts conservatively and ramps up. Each registry action has its own window. Override with `global.max_concurrent_transfers` or per-registry `max_concurrent`.
 - **Platform filter**: sync only the architectures you deploy. `linux/amd64` alone halves transfer volume for multi-arch images.
