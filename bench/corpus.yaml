@@ -1,8 +1,17 @@
 # Benchmark image corpus.
 #
-# Sources: Docker Hub (Jupyter + nvidia/cuda + tensorflow), Chainguard free
-# images, AWS Public ECR, SOCI workshop. Each image syncs to ECR under the
-# bench/ prefix.
+# Sources: Quay.io, Docker Hub, Chainguard (cgr.dev), AWS Public ECR, SOCI workshop.
+# Each image syncs to ECR under the bench/ prefix.
+#
+# Quay.io images (quay.io): Jupyter docker-stacks (canonical source since late 2023).
+# Public, no auth required.
+#
+# Docker Hub images (docker.io): nvidia/cuda, pytorch/pytorch.
+# These require authenticated pulls (100/hr free tier). Credentials
+# are injected via DOCKERHUB_USERNAME and DOCKERHUB_ACCESS_TOKEN env vars.
+# The remaining Docker Hub official images (alpine, nginx, redis, postgres,
+# golang) are pulled from their public ECR mirrors instead to avoid
+# unnecessary rate limit consumption.
 #
 # Ordering: mount-exercising images first (Jupyter family shares GB-sized base
 # layers across distinct source names and therefore distinct target repos --
@@ -15,21 +24,22 @@ corpus:
 
 images:
   # ── Jupyter docker-stacks (cross-repo mount exercise) ──────────────────────
-  # Multi-stage lineage: base-notebook → minimal-notebook → scipy-notebook →
-  # (datascience|pyspark|tensorflow)-notebook. Each image is ~1.5–4 GB with
-  # large shared base layers. Distinct source names → distinct target repos →
+  # Canonical source is quay.io (moved from Docker Hub in late 2023).
+  # Multi-stage lineage: base-notebook -> minimal-notebook -> scipy-notebook ->
+  # (datascience|pyspark|tensorflow)-notebook. Each image is ~0.3-2.2 GB with
+  # large shared base layers. Distinct source names -> distinct target repos ->
   # cross-repo mount candidates for the shared layers.
-  - source: "docker.io/jupyter/base-notebook"
+  - source: "quay.io/jupyter/base-notebook"
     tags: ["latest"]
-  - source: "docker.io/jupyter/minimal-notebook"
+  - source: "quay.io/jupyter/minimal-notebook"
     tags: ["latest"]
-  - source: "docker.io/jupyter/scipy-notebook"
+  - source: "quay.io/jupyter/scipy-notebook"
     tags: ["latest"]
-  - source: "docker.io/jupyter/datascience-notebook"
+  - source: "quay.io/jupyter/datascience-notebook"
     tags: ["latest"]
-  - source: "docker.io/jupyter/pyspark-notebook"
+  - source: "quay.io/jupyter/pyspark-notebook"
     tags: ["latest"]
-  - source: "docker.io/jupyter/tensorflow-notebook"
+  - source: "quay.io/jupyter/tensorflow-notebook"
     tags: ["latest"]
 
   # ── NVIDIA CUDA (chunked-upload stress + intra-repo blob sharing) ─────────
@@ -43,11 +53,13 @@ images:
       - "12.6.2-cudnn-runtime-ubuntu22.04" # ~2.1 GB
       - "12.6.2-cudnn-devel-ubuntu22.04"  # ~4.6 GB
 
-  # ── TensorFlow GPU (large single-tag throughput + minor-version dedup) ────
-  - source: "docker.io/tensorflow/tensorflow"
+  # ── PyTorch GPU (large single-tag throughput + minor-version dedup) ────────
+  # Two runtime tags on the same CUDA version: heavy layer sharing between
+  # PyTorch versions exercises minor-version dedup.
+  - source: "docker.io/pytorch/pytorch"
     tags:
-      - "2.18.0-gpu"  # ~3.86 GB
-      - "2.17.0-gpu"  # ~3.83 GB
+      - "2.11.0-cuda12.6-cudnn9-runtime"  # ~3.6 GB
+      - "2.10.0-cuda12.6-cudnn9-runtime"  # ~3.6 GB
 
   # ── Chainguard free tier images (cgr.dev) ──────────────────────────────────
   # Small; useful for cross-repo mount stress when concurrency windows overlap
@@ -104,14 +116,6 @@ images:
     tags: ["1.27", "1.26"]
   - source: "public.ecr.aws/docker/library/golang"
     tags: ["1.22", "1.21"]
-
-  # ── Docker Hub library images ──────────────────────────────────────────────
-  - source: "docker.io/library/alpine"
-    tags: ["3.20", "latest"]
-  - source: "docker.io/library/nginx"
-    tags: ["latest"]
-  - source: "docker.io/library/redis"
-    tags: ["latest"]
 
   # ── SOCI workshop images ──────────────────────────────────────────────────
   # Large multi-layer images from public.ecr.aws -- useful for chunked upload

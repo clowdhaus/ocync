@@ -81,6 +81,26 @@ impl Corpus {
         )
     }
 
+    /// Return a corpus with images from the given source registries removed.
+    ///
+    /// Registry matching uses the first path component of the source
+    /// (e.g. `docker.io` from `docker.io/nvidia/cuda`).
+    pub(crate) fn skip_registries(&self, registries: &[String]) -> Corpus {
+        Corpus {
+            settings: self.settings.clone(),
+            images: self
+                .images
+                .iter()
+                .filter(|img| {
+                    let registry = img.source.split('/').next().unwrap_or("");
+                    !registries.iter().any(|r| r == registry)
+                })
+                .cloned()
+                .collect(),
+            dockerhub_auth: self.dockerhub_auth.clone(),
+        }
+    }
+
     /// Total number of (image, tag) pairs in the corpus.
     pub(crate) fn total_tags(&self) -> usize {
         self.images.iter().map(|img| img.tags.len()).sum()
@@ -384,6 +404,46 @@ images:
             std::env::remove_var("OCYNC_TEST_A");
             std::env::remove_var("OCYNC_TEST_B");
         }
+    }
+
+    // -- Skip registries tests --
+
+    #[test]
+    fn skip_registries_removes_matching_sources() {
+        let corpus: Corpus = serde_yaml::from_str(sample_yaml()).unwrap();
+        let filtered = corpus.skip_registries(&["docker.io".to_string()]);
+        assert_eq!(filtered.images.len(), 3);
+        assert!(
+            filtered
+                .images
+                .iter()
+                .all(|img| !img.source.starts_with("docker.io"))
+        );
+    }
+
+    #[test]
+    fn skip_registries_multiple() {
+        let corpus: Corpus = serde_yaml::from_str(sample_yaml()).unwrap();
+        let filtered = corpus.skip_registries(&["docker.io".to_string(), "cgr.dev".to_string()]);
+        assert_eq!(filtered.images.len(), 1);
+        assert_eq!(
+            filtered.images[0].source,
+            "public.ecr.aws/amazonlinux/amazonlinux"
+        );
+    }
+
+    #[test]
+    fn skip_registries_empty_keeps_all() {
+        let corpus: Corpus = serde_yaml::from_str(sample_yaml()).unwrap();
+        let filtered = corpus.skip_registries(&[]);
+        assert_eq!(filtered.images.len(), corpus.images.len());
+    }
+
+    #[test]
+    fn skip_registries_unmatched_keeps_all() {
+        let corpus: Corpus = serde_yaml::from_str(sample_yaml()).unwrap();
+        let filtered = corpus.skip_registries(&["quay.io".to_string()]);
+        assert_eq!(filtered.images.len(), corpus.images.len());
     }
 
     // -- Partial overrides tests --

@@ -1,30 +1,48 @@
-//! Remote benchmark orchestration via SSM Session Manager.
+//! Remote benchmark orchestration via SSH.
 //!
-//! Prerequisites: `session-manager-plugin` installed locally, AWS credentials,
-//! a running bench instance.
+//! Prerequisites: `~/.ssh/id_ed25519` exists and its public key is on GitHub,
+//! Terraform applied for the target provider (`bench/terraform/<provider>/`).
 //!
-//! `cargo xtask bench-remote` pushes the current branch, then opens an
-//! interactive SSM session that builds and runs benchmarks with live output.
-//! `cargo xtask bench-remote --fetch` pulls results back from the instance.
+//! `cargo xtask bench-remote --provider aws` pushes the current branch, SSHs
+//! into the bench instance, builds and runs benchmarks with live streamed output,
+//! then pulls results back via SCP.
 
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use clap::Args;
+use serde::Deserialize;
+
+/// Common SSH options for all remote connections.
+///
+/// `accept-new` trusts the host key on first connect (the instance is
+/// ephemeral; re-created on every `terraform apply`). `BatchMode`
+/// prevents interactive prompts from hanging the automation.
+const SSH_OPTS: &[&str] = &[
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=30",
+];
 
 /// Arguments for the `bench-remote` subcommand.
 #[derive(Args)]
 pub(crate) struct BenchRemoteArgs {
-    /// EC2 instance ID of the bench instance.
-    #[arg(long, env = "BENCH_INSTANCE_ID")]
-    pub(crate) instance_id: String,
-
-    /// AWS region.
-    #[arg(long, default_value = "us-east-1")]
-    pub(crate) region: String,
+    /// Cloud provider (aws, gcp, azure). Reads connection details from
+    /// `bench/terraform/<provider>/bench.json`.
+    #[arg(long)]
+    pub(crate) provider: String,
 
     /// Fetch results from the last run instead of starting a new one.
     #[arg(long)]
     pub(crate) fetch: bool,
+
+    /// Kill any running benchmark and start fresh.
+    #[arg(long)]
+    pub(crate) force: bool,
 
     /// Git ref to checkout on the instance (default: current branch).
     #[arg(long)]
@@ -46,241 +64,372 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long)]
     pub(crate) limit: Option<usize>,
 
+    /// Comma-separated list of source registries to skip (passed through
+    /// to `cargo xtask bench`).
+    #[arg(long)]
+    pub(crate) skip_registries: Option<String>,
+
     /// Local directory to save fetched results.
     #[arg(long, default_value = "bench/results")]
     pub(crate) output: String,
 }
 
-/// Run the remote benchmark workflow.
-pub(crate) async fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Verify session-manager-plugin is installed.
-    if std::process::Command::new("session-manager-plugin")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        return Err(
-            "session-manager-plugin not found. Install it: \
-             https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
-                .into(),
-        );
+/// Connection details written by Terraform.
+#[derive(Debug, Deserialize)]
+struct BenchConfig {
+    provider: String,
+    host: String,
+    user: String,
+}
+
+/// Returns the path to bench.json for a given provider.
+fn config_path(provider: &str) -> PathBuf {
+    PathBuf::from(format!("bench/terraform/{provider}/bench.json"))
+}
+
+/// Read and parse bench.json for the given provider.
+fn read_config(provider: &str) -> Result<BenchConfig, Box<dyn std::error::Error>> {
+    // Validate the provider directory exists before reading config.
+    let provider_dir = PathBuf::from(format!("bench/terraform/{provider}"));
+    if !provider_dir.is_dir() {
+        let available = std::fs::read_dir("bench/terraform")
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return Err(format!("unknown provider '{provider}'. Available: {available}").into());
     }
+
+    let path = config_path(provider);
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "failed to read {}: {e}. Did you run `terraform apply` in bench/terraform/{provider}/?",
+            path.display()
+        )
+    })?;
+    let config: BenchConfig = serde_json::from_str(&content)?;
+    Ok(config)
+}
+
+/// Run the remote benchmark workflow.
+pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let config = read_config(&args.provider)?;
 
     if args.fetch {
-        return fetch_results(&args).await;
+        return fetch_results(&config, &args.output);
     }
-
-    let instance_id = &args.instance_id;
-    let region = &args.region;
 
     let git_ref = match &args.git_ref {
         Some(r) => r.clone(),
         None => current_branch()?,
     };
 
-    // Step 1: Push current branch so the instance can pull it.
+    // Push current branch so the instance can pull it.
     eprintln!("bench-remote: pushing {git_ref}...");
-    let push = std::process::Command::new("git")
+    let push = Command::new("git")
         .args(["push", "origin", &git_ref])
         .status()?;
     if !push.success() {
         return Err("git push failed".into());
     }
 
-    // Step 2: Build the bench command.
+    // Build the bench command args.
     let mut bench_args = format!("--tools {} --iterations {}", args.tools, args.iterations);
     if let Some(limit) = args.limit {
         bench_args.push_str(&format!(" --limit {limit}"));
     }
+    if let Some(ref skip) = args.skip_registries {
+        bench_args.push_str(&format!(" --skip-registries {skip}"));
+    }
     bench_args.push_str(&format!(" {}", args.scenario));
 
-    // Step 3: Upload the bench script via send-command (fast, no quoting
-    // issues), then run it interactively via start-session for live output.
-    let script_content = format!(
+    // Determine the target registry from the provider.
+    let registry_env = match config.provider.as_str() {
+        "aws" => {
+            "ACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com".to_string()
+        }
+        _ => {
+            return Err(format!(
+                "provider '{}' not yet supported. Add registry env setup for this provider.",
+                config.provider
+            )
+            .into());
+        }
+    };
+
+    let force_clause = if args.force {
+        r#"
+# --force: kill any running bench and clean up.
+if [ -f "$PID_FILE" ]; then
+  echo "bench-remote: --force killing PID $(cat "$PID_FILE")"
+  kill -9 $(cat "$PID_FILE") 2>/dev/null || true
+  rm -f "$PID_FILE"
+fi
+pkill -9 -f "bench-proxy serve" 2>/dev/null || true
+sleep 1
+"#
+    } else {
+        ""
+    };
+
+    let script = format!(
         r#"#!/bin/bash
-set -e
+set -euo pipefail
+exec 2>&1
 
-echo '=== pulling {git_ref} ==='
+# Wait for cloud-init to finish (repo clone, tool install, etc.).
+if command -v cloud-init &>/dev/null; then
+  STATUS=$(cloud-init status 2>/dev/null | awk '{{print $2}}' || echo "unknown")
+  if [ "$STATUS" = "running" ]; then
+    echo "bench-remote: waiting for cloud-init to finish..."
+    cloud-init status --wait >/dev/null 2>&1 || true
+    echo "bench-remote: cloud-init complete"
+  fi
+fi
+
+if [ ! -d ~/ocync ]; then
+  echo "bench-remote: error: ~/ocync not found after cloud-init. Check user-data logs:"
+  echo "  ssh $USER@$(hostname -I | awk '{{print $1}}') 'sudo cat /var/log/cloud-init-output.log | tail -50'"
+  exit 1
+fi
+
 cd ~/ocync
-TOKEN=$(aws ssm get-parameter --name /ocync/bench/github-token --with-decryption --query Parameter.Value --output text --region {region})
-git remote set-url origin "https://${{TOKEN}}@github.com/clowdhaus/ocync.git"
-git fetch origin {git_ref} && git checkout {git_ref} && git reset --hard origin/{git_ref}
-git remote set-url origin https://github.com/clowdhaus/ocync.git
+PID_FILE=bench/.bench-run.pid
+LOG_FILE=bench/.bench-run.log
+{force_clause}
+# Check for existing run.
+if [ -f "$PID_FILE" ]; then
+  OLD_PID=$(cat "$PID_FILE")
+  if kill -0 "$OLD_PID" 2>/dev/null; then
+    if [ -f "$LOG_FILE" ]; then
+      echo "bench-remote: attaching to run in progress (PID $OLD_PID)"
+      tail -n+1 -f "$LOG_FILE" --pid="$OLD_PID"
+      exit 0
+    else
+      echo "bench-remote: PID $OLD_PID alive but log missing, cleaning up"
+      kill -9 "$OLD_PID" 2>/dev/null || true
+      pkill -9 -f "bench-proxy serve" 2>/dev/null || true
+      rm -f "$PID_FILE"
+      sleep 1
+    fi
+  else
+    echo "bench-remote: cleaning up stale PID file (PID $OLD_PID)"
+    rm -f "$PID_FILE"
+  fi
+fi
 
-echo '=== building ocync + bench-proxy ==='
+# Pull code and build.
+echo '[1/4] Pulling {git_ref}...'
+git fetch origin '{git_ref}' && git checkout '{git_ref}' && git reset --hard 'origin/{git_ref}'
+
+echo '[2/4] Building ocync + bench-proxy...'
+source ~/.bench-env 2>/dev/null || true
+source ~/.cargo/env
 cargo build --release --package ocync --package bench-proxy
+cp target/release/ocync ~/.cargo/bin/ocync
+cp target/release/bench-proxy ~/.cargo/bin/bench-proxy
 
-echo '=== starting benchmarks ==='
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export BENCH_TARGET_REGISTRY=${{ACCOUNT}}.dkr.ecr.{region}.amazonaws.com
-cargo xtask bench {bench_args}
+echo '[3/4] Starting benchmarks...'
+# Use real disk for temp files, not tmpfs (/tmp is RAM-backed on AL2023
+# and fills up with multi-GB blob staging data).
+export TMPDIR=$HOME/ocync/bench/.tmp
+rm -rf "$TMPDIR"
+mkdir -p "$TMPDIR"
+{registry_env}
 
-echo '=== benchmarks complete ==='
-echo 'fetch results: cargo xtask bench-remote --fetch --instance-id {instance_id}'
+# Launch detached with output to log file.
+EXIT_FILE=bench/.bench-run.exit
+> "$LOG_FILE"
+rm -f "$EXIT_FILE"
+(
+  cargo xtask bench {bench_args} 2>&1
+  BENCH_EXIT=$?
+  echo "$BENCH_EXIT" > "$EXIT_FILE"
+  echo "[bench-remote] exit code: $BENCH_EXIT"
+  rm -f "$PID_FILE"
+  exit $BENCH_EXIT
+) >> "$LOG_FILE" 2>&1 &
+BENCH_PID=$!
+echo "$BENCH_PID" > "$PID_FILE"
+echo "bench-remote: started (PID $BENCH_PID), streaming log..."
+
+# Stream log until bench exits. --pid= makes tail exit when process dies.
+tail -n+1 -f "$LOG_FILE" --pid="$BENCH_PID"
+
+# Read exit code from file (reliable, not subject to wait race).
+if [ -f "$EXIT_FILE" ]; then
+  EXIT=$(cat "$EXIT_FILE")
+  rm -f "$EXIT_FILE"
+else
+  EXIT=1
+fi
+echo '[4/4] Benchmarks complete.'
+exit $EXIT
 "#
     );
 
-    // Upload script to instance, then execute via send-command with a
-    // high timeout (7200s = 2 hours). Poll /tmp/bench-progress.txt every
-    // 30 seconds for live progress updates.
-    use crate::bench::config_gen::base64_encode;
-    let encoded = base64_encode(&script_content);
-    let run_cmd = format!(
-        "echo {encoded} | base64 -d > /tmp/bench-run.sh && chmod +x /tmp/bench-run.sh && runuser -l ec2-user -c 'bash /tmp/bench-run.sh'"
+    eprintln!(
+        "bench-remote: connecting to {}@{}...",
+        config.user, config.host
     );
 
-    eprintln!("bench-remote: starting benchmarks on {instance_id}...");
+    let exit_code = ssh_stream(&config, &script)?;
 
-    let params = serde_json::json!({ "commands": [run_cmd] });
-    let output = tokio::process::Command::new("aws")
-        .args([
-            "ssm",
-            "send-command",
-            "--instance-ids",
-            instance_id,
-            "--region",
-            region,
-            "--document-name",
-            "AWS-RunShellScript",
-            "--timeout-seconds",
-            "7200",
-            "--parameters",
-            &params.to_string(),
-            "--query",
-            "Command.CommandId",
-            "--output",
-            "text",
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ssm send-command failed: {stderr}").into());
+    if exit_code != 0 {
+        eprintln!("bench-remote: remote script exited with code {exit_code}");
+        eprintln!("bench-remote: fetching partial results...");
+    } else {
+        eprintln!("bench-remote: fetching results...");
     }
 
-    let command_id = String::from_utf8(output.stdout)?.trim().to_string();
-    eprintln!("bench-remote: command={command_id}");
-    let mut last_progress = String::new();
-
-    // Poll until completion, printing progress updates.
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-
-        // Check progress file.
-        if let Ok(prog) = ssm_exec(
-            instance_id,
-            region,
-            "cat /tmp/bench-progress.txt 2>/dev/null || true",
-        )
-        .await
-        {
-            let prog = prog.trim().to_string();
-            if prog != last_progress && !prog.is_empty() {
-                eprintln!("bench-remote: {prog}");
-                last_progress = prog;
-            }
-        }
-
-        // Check command status.
-        let poll = tokio::process::Command::new("aws")
-            .args([
-                "ssm",
-                "get-command-invocation",
-                "--command-id",
-                &command_id,
-                "--instance-id",
-                instance_id,
-                "--region",
-                region,
-                "--query",
-                "[Status]",
-                "--output",
-                "json",
-            ])
-            .output()
-            .await?;
-
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&poll.stdout) {
-            match json[0].as_str() {
-                Some("Success") => {
-                    eprintln!("bench-remote: benchmarks complete. Fetching results...");
-                    return fetch_results(&args).await;
-                }
-                Some("Failed") => {
-                    eprintln!("bench-remote: benchmarks failed. Try --fetch for partial results.");
-                    return fetch_results(&args).await;
-                }
-                Some("TimedOut") => {
-                    return Err("benchmark timed out (>2 hours)".into());
-                }
-                _ => continue,
-            }
-        }
-    }
+    fetch_results(&config, &args.output)?;
+    Ok(())
 }
 
-/// Fetch results from the instance via SSM send-command (short, reliable).
-async fn fetch_results(args: &BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let instance_id = &args.instance_id;
-    let region = &args.region;
+/// Pipe a script to the remote instance via SSH and stream stdout.
+///
+/// Returns the exit code of the remote script.
+fn ssh_stream(config: &BenchConfig, script: &str) -> Result<i32, Box<dyn std::error::Error>> {
+    let mut child = Command::new("ssh")
+        .args(SSH_OPTS)
+        .args(["-o", "ServerAliveInterval=30"])
+        .args(["-o", "ServerAliveCountMax=120"])
+        .arg(format!("{}@{}", config.user, config.host))
+        .arg("bash -s")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
 
-    eprintln!("bench-remote: fetching results from {instance_id}...");
+    // Write script to stdin, then close to signal EOF.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes())?;
+    }
 
-    let ls_output = ssm_exec(
-        instance_id,
-        region,
-        "ls -td /home/ec2-user/ocync/bench/results/2* 2>/dev/null | head -1",
-    )
-    .await?;
+    // Stream stdout line by line for real-time progress.
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = line?;
+            eprintln!("{line}");
+        }
+    }
+
+    let status = child.wait()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Fetch results from the instance via SCP.
+fn fetch_results(
+    config: &BenchConfig,
+    local_output: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Find the most recent results directory.
+    let ls_output = ssh_run(
+        config,
+        "ls -td ~/ocync/bench/results/2* 2>/dev/null | head -1",
+    )?;
     let remote_dir = ls_output.trim();
 
     if remote_dir.is_empty() {
         return Err("no results directory found on instance".into());
     }
 
-    let summary = ssm_exec(instance_id, region, &format!("cat {remote_dir}/summary.md")).await?;
-
-    let registry_json = ssm_exec(
-        instance_id,
-        region,
-        "ls -t /home/ec2-user/ocync/bench/results/*.json 2>/dev/null | grep -v baseline | head -1 | xargs cat",
-    )
-    .await?;
-
-    // Write results locally.
     let remote_basename = Path::new(remote_dir)
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-    let local_dir = Path::new(&args.output).join(remote_basename.as_ref());
-    std::fs::create_dir_all(&local_dir)?;
+    let local_dir = Path::new(local_output).join(remote_basename.as_ref());
 
-    let summary_path = local_dir.join("summary.md");
-    std::fs::write(&summary_path, &summary)?;
-    eprintln!("bench-remote: wrote {}", summary_path.display());
-
-    if !registry_json.trim().is_empty() {
-        // Derive the filename from the remote instance.
-        let registry_filename = ssm_exec(
-            instance_id,
-            region,
-            "ls -t /home/ec2-user/ocync/bench/results/*.json 2>/dev/null | grep -v baseline | head -1 | xargs basename",
-        )
-        .await
-        .unwrap_or_else(|_| "ecr.json".into());
-        let registry_path = Path::new(&args.output).join(registry_filename.trim());
-        std::fs::write(&registry_path, &registry_json)?;
-        eprintln!("bench-remote: wrote {}", registry_path.display());
+    // Ensure the parent exists but NOT local_dir itself. OpenSSH >= 9.0
+    // uses SFTP by default, which copies the source directory INTO an
+    // existing target -- creating a nested duplicate (dir/dir/files).
+    // Let SCP create the final directory.
+    std::fs::create_dir_all(local_output)?;
+    if local_dir.exists() {
+        std::fs::remove_dir_all(&local_dir)?;
     }
 
-    eprintln!("\n{summary}");
+    // SCP the results directory (no trailing slash on source).
+    eprintln!(
+        "bench-remote: copying {remote_dir} to {}",
+        local_dir.display()
+    );
+    let status = Command::new("scp")
+        .args(["-r"])
+        .args(SSH_OPTS)
+        .arg(format!("{}@{}:{}", config.user, config.host, remote_dir))
+        .arg(local_output)
+        .status()?;
+
+    if !status.success() {
+        return Err("scp failed".into());
+    }
+
+    // Also fetch the per-registry JSON archive.
+    let json_file = ssh_run(
+        config,
+        "ls -t ~/ocync/bench/results/*.json 2>/dev/null | grep -v baseline | head -1",
+    )?;
+    let json_file = json_file.trim();
+
+    if !json_file.is_empty() {
+        let json_basename = Path::new(json_file)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let local_json = Path::new(local_output).join(json_basename.as_ref());
+        eprintln!(
+            "bench-remote: copying {json_file} to {}",
+            local_json.display()
+        );
+        let status = Command::new("scp")
+            .args(SSH_OPTS)
+            .arg(format!("{}@{}:{}", config.user, config.host, json_file))
+            .arg(local_json.to_str().unwrap_or("."))
+            .status()?;
+        if !status.success() {
+            eprintln!("bench-remote: warning: failed to copy {json_file}");
+        }
+    }
+
+    // Print the summary.
+    let summary = ssh_run(
+        config,
+        &format!("cat {remote_dir}/summary.md 2>/dev/null || true"),
+    )?;
+    if !summary.trim().is_empty() {
+        eprintln!("\n{summary}");
+    }
+
     Ok(())
+}
+
+/// Run a single command on the remote instance and capture its stdout.
+fn ssh_run(config: &BenchConfig, command: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("ssh")
+        .args(SSH_OPTS)
+        .arg(format!("{}@{}", config.user, config.host))
+        .arg(command)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ssh command failed: {stderr}").into());
+    }
+
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 /// Get the current local git branch name.
 fn current_branch() -> Result<String, Box<dyn std::error::Error>> {
-    let output = std::process::Command::new("git")
+    let output = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()?;
     if !output.status.success() {
@@ -289,76 +438,40 @@ fn current_branch() -> Result<String, Box<dyn std::error::Error>> {
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-/// Run a short command on the instance via SSM send-command and return stdout.
-///
-/// Only for quick, non-interactive commands (file reads, ls). The benchmark
-/// itself runs through an interactive SSM session with live output.
-async fn ssm_exec(
-    instance_id: &str,
-    region: &str,
-    command: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let params = serde_json::json!({ "commands": [command] });
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let output = tokio::process::Command::new("aws")
-        .args([
-            "ssm",
-            "send-command",
-            "--instance-ids",
-            instance_id,
-            "--region",
-            region,
-            "--document-name",
-            "AWS-RunShellScript",
-            "--timeout-seconds",
-            "30",
-            "--parameters",
-            &params.to_string(),
-            "--query",
-            "Command.CommandId",
-            "--output",
-            "text",
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ssm send-command failed: {stderr}").into());
+    #[test]
+    fn parse_bench_config() {
+        let json = r#"{"provider":"aws","host":"54.123.45.67","user":"ec2-user"}"#;
+        let config: BenchConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.provider, "aws");
+        assert_eq!(config.host, "54.123.45.67");
+        assert_eq!(config.user, "ec2-user");
     }
 
-    let command_id = String::from_utf8(output.stdout)?.trim().to_string();
-
-    // Poll for completion (short commands only).
-    for _ in 0..6 {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-        let poll = tokio::process::Command::new("aws")
-            .args([
-                "ssm",
-                "get-command-invocation",
-                "--command-id",
-                &command_id,
-                "--instance-id",
-                instance_id,
-                "--region",
-                region,
-                "--query",
-                "[Status,StandardOutputContent]",
-                "--output",
-                "json",
-            ])
-            .output()
-            .await?;
-
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&poll.stdout) {
-            match json[0].as_str() {
-                Some("Success") => return Ok(json[1].as_str().unwrap_or("").to_string()),
-                Some("Failed") => return Err("ssm command failed".into()),
-                _ => continue,
-            }
-        }
+    #[test]
+    fn read_config_missing_provider_dir() {
+        // A provider with no terraform directory should produce a
+        // helpful error listing available providers.
+        let err = read_config("nonexistent").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown provider 'nonexistent'"),
+            "expected provider error, got: {msg}"
+        );
     }
 
-    Err("ssm command timed out".into())
+    #[test]
+    fn config_path_uses_provider() {
+        assert_eq!(
+            config_path("aws"),
+            PathBuf::from("bench/terraform/aws/bench.json")
+        );
+        assert_eq!(
+            config_path("gcp"),
+            PathBuf::from("bench/terraform/gcp/bench.json")
+        );
+    }
 }

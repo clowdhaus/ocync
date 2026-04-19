@@ -15,10 +15,20 @@ target
 
 # Claude Code
 .claude/
+.remember/
 .worktrees/
 docs/superpowers/
 
 # Benchmark ephemeral per-run directories (summary.md, proxy logs)
 bench/results/*/
+bench/.bench-run.pid
+bench/.bench-run.log
+bench/.tmp/
 .superpowers/
 .playwright-mcp/
+
+# Benchmark Terraform (per-provider)
+bench/terraform/*/.terraform/
+bench/terraform/*/.terraform.lock.hcl
+bench/terraform/*/terraform.tfstate*
+bench/terraform/*/bench.json

@@ -74,6 +74,11 @@ pub(crate) struct BenchArgs {
     /// Regression threshold as a percentage (default: 20).
     #[arg(long, default_value = "20")]
     pub(crate) threshold_pct: u32,
+
+    /// Comma-separated list of source registries to skip (e.g. `docker.io`).
+    /// Images from these registries are excluded from the corpus.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) skip_registries: Vec<String>,
 }
 
 /// Benchmark scenario to run (CLI subcommand).
@@ -89,15 +94,6 @@ pub(crate) enum Scenario {
     Scale,
     /// Run all scenarios in sequence.
     All,
-}
-
-/// A single runnable scenario (excludes the `All` meta-variant).
-#[derive(Clone, Copy)]
-enum RunnableScenario {
-    Cold,
-    Warm,
-    Partial,
-    Scale,
 }
 
 /// Read an SSM parameter by name, returning `None` on any failure.
@@ -129,16 +125,23 @@ fn read_ssm_parameter(name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Progress file path for remote monitoring.
-const PROGRESS_FILE: &str = "/tmp/bench-progress.txt";
-
-/// Write a progress line to both stderr and the progress file.
+/// Read Docker Hub credentials from environment variables.
 ///
-/// The progress file is polled by `bench-remote` for real-time status.
+/// Set by cloud-init on bench instances. Returns `None` if either
+/// variable is missing or empty.
+fn docker_hub_auth_from_env() -> Option<(String, String)> {
+    let username = std::env::var("DOCKERHUB_USERNAME")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let token = std::env::var("DOCKERHUB_ACCESS_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    Some((username, token))
+}
+
+/// Write a progress line to stderr.
 fn progress(msg: &str) {
     eprintln!("{msg}");
-    // Best-effort write; don't fail the benchmark if the file can't be written.
-    let _ = std::fs::write(PROGRESS_FILE, format!("{msg}\n"));
 }
 
 /// Derives the registry key from a target registry hostname.
@@ -183,18 +186,35 @@ fn provider_for_registry(key: &str) -> &'static str {
 
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Parse corpus (apply limit if set).
+    // 1. Parse corpus (apply skip-registries filter, then limit).
     let loaded = corpus::load(&args.corpus)?;
+    let filtered = if args.skip_registries.is_empty() {
+        loaded
+    } else {
+        let skipped = loaded.skip_registries(&args.skip_registries);
+        let removed = loaded.images.len() - skipped.images.len();
+        eprintln!(
+            "bench: skipping {} images from registries: {}",
+            removed,
+            args.skip_registries.join(", ")
+        );
+        skipped
+    };
     let mut corpus = match args.limit {
-        Some(n) => loaded.limit(n),
-        None => loaded,
+        Some(n) => filtered.limit(n),
+        None => filtered,
     };
 
-    // Inject Docker Hub auth from SSM if available.
-    if let Some(token) = read_ssm_parameter("/ocync/bench/dockerhub-access-token") {
+    // Inject Docker Hub auth from env vars (cloud-init) or SSM (local dev).
+    // Note: SSM fallback requires IAM permissions not in the current Terraform
+    // (removed when migrating to SSH). Kept for local dev with personal creds.
+    if let Some((username, token)) = docker_hub_auth_from_env() {
+        eprintln!("bench: Docker Hub auth configured (username={username})");
+        corpus.dockerhub_auth = Some(corpus::DockerHubAuth { username, token });
+    } else if let Some(token) = read_ssm_parameter("/ocync/bench/dockerhub-access-token") {
         let username = read_ssm_parameter("/ocync/bench/dockerhub-username")
             .unwrap_or_else(|| "ocync-bench".into());
-        eprintln!("bench: Docker Hub auth configured (username={username})");
+        eprintln!("bench: Docker Hub auth configured via SSM (username={username})");
         corpus.dockerhub_auth = Some(corpus::DockerHubAuth { username, token });
     } else {
         eprintln!("bench: Docker Hub auth not available, using anonymous pulls");
@@ -263,30 +283,27 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
 
     // 6. Expand All into individual scenarios, then dispatch each.
-    let scenarios: Vec<RunnableScenario> = match args.scenario {
+    let scenarios: Vec<Scenario> = match args.scenario {
         Scenario::All => vec![
-            RunnableScenario::Cold,
-            RunnableScenario::Warm,
-            RunnableScenario::Partial,
-            RunnableScenario::Scale,
+            Scenario::Cold,
+            Scenario::Warm,
+            Scenario::Partial,
+            Scenario::Scale,
         ],
-        Scenario::Cold => vec![RunnableScenario::Cold],
-        Scenario::Warm => vec![RunnableScenario::Warm],
-        Scenario::Partial => vec![RunnableScenario::Partial],
-        Scenario::Scale => vec![RunnableScenario::Scale],
+        other => vec![other],
     };
 
     for scenario in scenarios {
         match scenario {
-            RunnableScenario::Cold => {
+            Scenario::Cold => {
                 let result = run_cold(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
                 report.scenarios.push(result);
             }
-            RunnableScenario::Warm => {
+            Scenario::Warm => {
                 let result = run_warm(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
                 report.scenarios.push(result);
             }
-            RunnableScenario::Partial => {
+            Scenario::Partial => {
                 let overrides = corpus::load_overrides(&args.partial_overrides)?;
                 let partial_corpus = corpus.with_overrides(&overrides.overrides);
                 let partial_corpus = match args.limit {
@@ -304,7 +321,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                 .await?;
                 report.scenarios.push(result);
             }
-            RunnableScenario::Scale => {
+            Scenario::Scale => {
                 // Scale scenario uses ocync only per spec.
                 if tools.contains(&Tool::Ocync) {
                     let ocync_only = vec![Tool::Ocync];
@@ -315,6 +332,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     eprintln!("bench: scale scenario requires ocync (skipping)");
                 }
             }
+            Scenario::All => unreachable!("expanded above"),
         }
     }
 
@@ -334,7 +352,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             instance_type: report.instance.instance_type.clone(),
             arch: report.instance.arch.clone(),
             vcpus: report.instance.vcpus,
-            memory_gib: report.instance.memory_mib / 1024,
+            memory_gib: report.instance.memory_mib as f64 / 1024.0,
             network: report.instance.network_performance.clone(),
             region: report.instance.region.clone(),
         },
@@ -494,6 +512,26 @@ async fn run_single_tool(
     let entries = proxy::stop(handle).await?;
     let metrics = proxy::aggregate(&entries, &corpus.settings.target_registry);
 
+    // Abort on source registry 429s. These are unrecoverable within the
+    // rate limit window (unlike ECR 429s which AIMD handles). Continuing
+    // would produce tainted data for every subsequent tool/iteration.
+    let source_429s: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.status == 429 && e.host != corpus.settings.target_registry)
+        .map(|e| e.host.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !source_429s.is_empty() {
+        return Err(format!(
+            "aborting: source registry rate limit hit (429) from: {}. \
+             Use --skip-registries {} to exclude, or wait for the rate limit window to reset.",
+            source_429s.join(", "),
+            source_429s.join(","),
+        )
+        .into());
+    }
+
     let rss_display = result
         .peak_rss_kb
         .map(|kb| report::format_bytes(kb * 1024))
@@ -514,20 +552,12 @@ async fn run_single_tool(
         report::format_bytes(metrics.source_blob_bytes),
     );
 
-    // 7. Parse ocync JSON if applicable.
-    let ocync_json = if tool == Tool::Ocync && !result.stdout.trim().is_empty() {
-        serde_json::from_str(&result.stdout).ok()
-    } else {
-        None
-    };
-
     Ok(ToolRun {
         tool: tool.to_string(),
         wall_clock_secs: result.wall_clock.as_secs_f64(),
         exit_code: result.exit_code,
         peak_rss_kb: result.peak_rss_kb,
         proxy_metrics: Some(metrics),
-        ocync_json,
     })
 }
 
@@ -545,7 +575,7 @@ async fn run_cold(
     ));
     let mut runs = Vec::new();
 
-    for &tool in tools {
+    for (tool_idx, &tool) in tools.iter().enumerate() {
         let mut iteration_runs = Vec::new();
 
         for i in 0..args.iterations {
@@ -583,7 +613,9 @@ async fn run_cold(
         let median = iteration_runs.swap_remove(median_idx);
         runs.push(median);
 
-        cooldown().await;
+        if tool_idx + 1 < tools.len() {
+            cooldown().await;
+        }
     }
 
     Ok(ScenarioResult {
@@ -603,7 +635,7 @@ async fn run_warm(
     progress("bench: running warm scenario");
     let mut runs = Vec::new();
 
-    for &tool in tools {
+    for (tool_idx, &tool) in tools.iter().enumerate() {
         progress(&format!("  warm: {} (priming)", tool));
 
         ecr::create_repos(ecr_client, corpus).await?;
@@ -624,7 +656,9 @@ async fn run_warm(
 
         ecr::delete_repos(ecr_client, corpus).await?;
 
-        cooldown().await;
+        if tool_idx + 1 < tools.len() {
+            cooldown().await;
+        }
     }
 
     Ok(ScenarioResult {
@@ -645,7 +679,7 @@ async fn run_partial(
     progress("bench: running partial scenario");
     let mut runs = Vec::new();
 
-    for &tool in tools {
+    for (tool_idx, &tool) in tools.iter().enumerate() {
         progress(&format!("  partial: {} (priming)", tool));
 
         ecr::create_repos(ecr_client, base_corpus).await?;
@@ -668,7 +702,9 @@ async fn run_partial(
 
         ecr::delete_repos(ecr_client, base_corpus).await?;
 
-        cooldown().await;
+        if tool_idx + 1 < tools.len() {
+            cooldown().await;
+        }
     }
 
     Ok(ScenarioResult {
@@ -701,7 +737,7 @@ async fn run_scale(
         let subset = corpus.limit(size);
         let mut results: BTreeMap<String, f64> = BTreeMap::new();
 
-        for &tool in tools {
+        for (tool_idx, &tool) in tools.iter().enumerate() {
             progress(&format!("  scale: {} @ {size} images", tool));
 
             ecr::create_repos(ecr_client, &subset).await?;
@@ -712,7 +748,9 @@ async fn run_scale(
 
             ecr::delete_repos(ecr_client, &subset).await?;
 
-            cooldown().await;
+            if tool_idx + 1 < tools.len() {
+                cooldown().await;
+            }
         }
 
         points.push(ScalePoint {
@@ -834,6 +872,15 @@ mod tests {
     }
 
     #[test]
+    fn provider_for_registry_mapping() {
+        assert_eq!(provider_for_registry("ecr"), "aws");
+        assert_eq!(provider_for_registry("gcr"), "gcp");
+        assert_eq!(provider_for_registry("acr"), "azure");
+        assert_eq!(provider_for_registry("other"), "other");
+        assert_eq!(provider_for_registry("unknown"), "other");
+    }
+
+    #[test]
     fn registry_key_ecr() {
         assert_eq!(
             registry_key("123456789012.dkr.ecr.us-east-1.amazonaws.com"),
@@ -862,5 +909,45 @@ mod tests {
         assert_eq!(registry_key("ghcr.io"), "other");
         assert_eq!(registry_key("docker.io"), "other");
         assert_eq!(registry_key("quay.io"), "other");
+    }
+
+    #[test]
+    fn docker_hub_auth_from_env_both_set() {
+        // SAFETY: test-only; env var mutation is safe in single-threaded
+        // test runs (cargo test runs each #[test] in its own thread, but
+        // these env var names are unique to this test suite).
+        unsafe {
+            std::env::set_var("DOCKERHUB_USERNAME", "testuser");
+            std::env::set_var("DOCKERHUB_ACCESS_TOKEN", "testtoken");
+        }
+        let result = docker_hub_auth_from_env();
+        unsafe {
+            std::env::remove_var("DOCKERHUB_USERNAME");
+            std::env::remove_var("DOCKERHUB_ACCESS_TOKEN");
+        }
+        assert_eq!(result, Some(("testuser".into(), "testtoken".into())));
+    }
+
+    #[test]
+    fn docker_hub_auth_from_env_empty_returns_none() {
+        unsafe {
+            std::env::set_var("DOCKERHUB_USERNAME", "");
+            std::env::set_var("DOCKERHUB_ACCESS_TOKEN", "sometoken");
+        }
+        let result = docker_hub_auth_from_env();
+        unsafe {
+            std::env::remove_var("DOCKERHUB_USERNAME");
+            std::env::remove_var("DOCKERHUB_ACCESS_TOKEN");
+        }
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn docker_hub_auth_from_env_missing_returns_none() {
+        unsafe {
+            std::env::remove_var("DOCKERHUB_USERNAME");
+            std::env::remove_var("DOCKERHUB_ACCESS_TOKEN");
+        }
+        assert_eq!(docker_hub_auth_from_env(), None);
     }
 }
