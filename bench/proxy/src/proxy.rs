@@ -324,12 +324,18 @@ async fn handle_request(
 
     // Collect request headers, skipping hop-by-hop entries we must not
     // forward per RFC 7230  section6.1.
+    //
+    // `append` (not `insert`) preserves multiple values for the same
+    // header name. Go's net/http sends each Accept media type as a
+    // separate header line; `insert` would keep only the last one,
+    // which for regclient/regsync is `v1+prettyjws` -- causing quay.io
+    // to return Docker v1 manifests instead of OCI.
     let mut headers = http::HeaderMap::new();
     for (name, value) in req.headers() {
         if is_hop_by_hop(name) {
             continue;
         }
-        headers.insert(name.clone(), value.clone());
+        headers.append(name.clone(), value.clone());
     }
     // Inbound Host is usually the CONNECT authority already, but force
     // it to match the origin to avoid any chance of leaking the
@@ -377,13 +383,14 @@ async fn handle_request(
     };
 
     let status = upstream_resp.status();
-    // Snapshot headers before consuming the body.
+    // Snapshot headers before consuming the body. Use `append` to
+    // preserve multi-value headers (same rationale as request headers).
     let mut resp_headers = http::HeaderMap::new();
     for (name, value) in upstream_resp.headers() {
         if is_hop_by_hop(name) {
             continue;
         }
-        resp_headers.insert(name.clone(), value.clone());
+        resp_headers.append(name.clone(), value.clone());
     }
 
     // Stream the body back to the client, counting bytes, then log once

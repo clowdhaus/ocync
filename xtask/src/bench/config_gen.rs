@@ -231,15 +231,27 @@ pub(crate) fn regsync_config(corpus: &Corpus) -> String {
     out.push('\n');
     out.push_str("sync:\n");
 
+    // Emit one entry per (image, tag) pair with `type: image` and the tag
+    // embedded in both source and target references. `type: repository`
+    // enumerates ALL tags (1900+ pages on quay.io/jupyter) and then filters,
+    // which is extremely slow and can skip images due to Docker v1 manifest
+    // filtering. `type: image` with an explicit tag avoids both problems.
+    //
+    // Explicit `mediaTypes` is required for quay.io: without it, regclient
+    // receives Docker v1 manifests (quay.io's default when no Accept header
+    // specifies v2) and skips the image entirely.
     for img in &corpus.images {
-        let target = corpus.target_ref(&img.source);
-        out.push_str(&format!("  - source: \"{}\"\n", img.source));
-        out.push_str(&format!("    target: \"{target}\"\n"));
-        out.push_str("    type: image\n");
-        out.push_str("    tags:\n");
-        out.push_str("      allow:\n");
         for tag in &img.tags {
-            out.push_str(&format!("        - \"{tag}\"\n"));
+            let source_ref = format!("{}:{}", img.source, tag);
+            let target_ref = format!("{}:{}", corpus.target_ref(&img.source), tag);
+            out.push_str(&format!("  - source: \"{source_ref}\"\n"));
+            out.push_str(&format!("    target: \"{target_ref}\"\n"));
+            out.push_str("    type: image\n");
+            out.push_str("    mediaTypes:\n");
+            out.push_str("      - \"application/vnd.docker.distribution.manifest.v2+json\"\n");
+            out.push_str("      - \"application/vnd.docker.distribution.manifest.list.v2+json\"\n");
+            out.push_str("      - \"application/vnd.oci.image.manifest.v1+json\"\n");
+            out.push_str("      - \"application/vnd.oci.image.index.v1+json\"\n");
         }
     }
 
@@ -350,19 +362,30 @@ creds:
     credHelper: docker-credential-ecr-login
 
 sync:
-  - source: \"cgr.dev/chainguard/static\"
-    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/chainguard-static\"
+  - source: \"cgr.dev/chainguard/static:latest\"
+    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/chainguard-static:latest\"
     type: image
-    tags:
-      allow:
-        - \"latest\"
-  - source: \"docker.io/library/alpine\"
-    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine\"
+    mediaTypes:
+      - \"application/vnd.docker.distribution.manifest.v2+json\"
+      - \"application/vnd.docker.distribution.manifest.list.v2+json\"
+      - \"application/vnd.oci.image.manifest.v1+json\"
+      - \"application/vnd.oci.image.index.v1+json\"
+  - source: \"docker.io/library/alpine:3.20\"
+    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:3.20\"
     type: image
-    tags:
-      allow:
-        - \"3.20\"
-        - \"latest\"
+    mediaTypes:
+      - \"application/vnd.docker.distribution.manifest.v2+json\"
+      - \"application/vnd.docker.distribution.manifest.list.v2+json\"
+      - \"application/vnd.oci.image.manifest.v1+json\"
+      - \"application/vnd.oci.image.index.v1+json\"
+  - source: \"docker.io/library/alpine:latest\"
+    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:latest\"
+    type: image
+    mediaTypes:
+      - \"application/vnd.docker.distribution.manifest.v2+json\"
+      - \"application/vnd.docker.distribution.manifest.list.v2+json\"
+      - \"application/vnd.oci.image.manifest.v1+json\"
+      - \"application/vnd.oci.image.index.v1+json\"
 ";
         assert_eq!(config, expected);
     }
@@ -468,19 +491,30 @@ creds:
     credHelper: docker-credential-ecr-login
 
 sync:
-  - source: \"cgr.dev/chainguard/static\"
-    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/chainguard-static\"
+  - source: \"cgr.dev/chainguard/static:latest\"
+    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/chainguard-static:latest\"
     type: image
-    tags:
-      allow:
-        - \"latest\"
-  - source: \"docker.io/library/alpine\"
-    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine\"
+    mediaTypes:
+      - \"application/vnd.docker.distribution.manifest.v2+json\"
+      - \"application/vnd.docker.distribution.manifest.list.v2+json\"
+      - \"application/vnd.oci.image.manifest.v1+json\"
+      - \"application/vnd.oci.image.index.v1+json\"
+  - source: \"docker.io/library/alpine:3.20\"
+    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:3.20\"
     type: image
-    tags:
-      allow:
-        - \"3.20\"
-        - \"latest\"
+    mediaTypes:
+      - \"application/vnd.docker.distribution.manifest.v2+json\"
+      - \"application/vnd.docker.distribution.manifest.list.v2+json\"
+      - \"application/vnd.oci.image.manifest.v1+json\"
+      - \"application/vnd.oci.image.index.v1+json\"
+  - source: \"docker.io/library/alpine:latest\"
+    target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:latest\"
+    type: image
+    mediaTypes:
+      - \"application/vnd.docker.distribution.manifest.v2+json\"
+      - \"application/vnd.docker.distribution.manifest.list.v2+json\"
+      - \"application/vnd.oci.image.manifest.v1+json\"
+      - \"application/vnd.oci.image.index.v1+json\"
 ";
         assert_eq!(config, expected);
     }

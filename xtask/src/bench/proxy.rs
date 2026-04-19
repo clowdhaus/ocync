@@ -62,16 +62,22 @@ pub(crate) struct ProxyMetrics {
     pub(crate) total_response_bytes: u64,
     /// Number of blob GET requests made to a URL that was already fetched.
     pub(crate) duplicate_blob_gets: u64,
-    /// Cross-repo mount POST requests attempted (URLs containing
-    /// `?mount=<digest>&from=<repo>`).
+    /// Cross-repo mount POST requests (URLs containing `mount=` AND `from=`).
+    /// These are genuine attempts to mount a blob from another repository.
     pub(crate) mount_attempts: u64,
-    /// Mount attempts that the target registry fulfilled (201 Created).
-    /// The rest either produced a 202 "upload session started" fallback
-    /// or an explicit error status.
+    /// Cross-repo mount attempts fulfilled by the registry (201 Created).
     pub(crate) mount_successes: u64,
-    /// Blob GET requests to source (non-target) registries.
+    /// Anonymous mount POSTs (URLs containing `mount=` but NO `from=`).
+    /// Used by some tools (e.g. regclient/regsync) as a blob existence check
+    /// that also initializes an upload session. NOT cross-repo mounts.
+    pub(crate) existence_check_posts: u64,
+    /// Blob GET requests to source (non-target) registries. Counts logical
+    /// blob fetches (registry URLs containing `/blobs/sha256:`), not CDN
+    /// follow-up requests from redirect responses.
     pub(crate) source_blob_gets: u64,
-    /// Total response bytes from source blob GETs.
+    /// Total response bytes from ALL GET requests to non-target hosts.
+    /// Includes both registry redirect responses and CDN follow-up responses
+    /// where the actual blob data flows (`CloudFront`, S3, R2, etc.).
     pub(crate) source_blob_bytes: u64,
 }
 
@@ -93,6 +99,12 @@ pub(crate) async fn start(
     log_path: &Path,
     port: u16,
 ) -> Result<ProxyHandle, Box<dyn std::error::Error>> {
+    // Kill any stale bench-proxy from a previous crashed run.
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "bench-proxy serve"])
+        .status();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
     let log_path = log_path.to_path_buf();
 
     let child = tokio::process::Command::new(binary)
@@ -120,8 +132,8 @@ pub(crate) async fn start(
     })
 }
 
-/// Kills the mitmdump process, waits for it to exit, then parses and returns
-/// all log entries written during its lifetime.
+/// Kills the bench-proxy process, waits for it to exit, then parses and
+/// returns all log entries written during its lifetime.
 pub(crate) async fn stop(
     mut handle: ProxyHandle,
 ) -> Result<Vec<ProxyEntry>, Box<dyn std::error::Error>> {
@@ -156,6 +168,7 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
     let mut total_response_bytes = 0u64;
     let mut mount_attempts = 0u64;
     let mut mount_successes = 0u64;
+    let mut existence_check_posts = 0u64;
     let mut source_blob_gets = 0u64;
     let mut source_blob_bytes = 0u64;
 
@@ -174,23 +187,39 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
 
         if entry.method == "GET" && entry.url.contains("/blobs/sha256:") {
             *blob_get_counts.entry(entry.url.clone()).or_insert(0) += 1;
-            // Track source pulls (non-target registry).
+            // Count logical source blob fetches (registry GETs, not CDN).
             if entry.host != target_registry {
                 source_blob_gets += 1;
-                source_blob_bytes += entry.response_bytes;
             }
+        }
+
+        // Source blob bytes: sum ALL GET response bytes from non-target hosts.
+        // Registry blob GETs return 302/307 redirects (0-1KB), and the actual
+        // blob data is served from CDN hosts (CloudFront, S3, R2) with different
+        // URL patterns that don't match `/blobs/sha256:`. Summing all non-target
+        // GET responses captures both the redirect and CDN responses.
+        if entry.method == "GET" && entry.host != target_registry {
+            source_blob_bytes += entry.response_bytes;
         }
 
         // OCI cross-repo blob mount: `POST /v2/.../blobs/uploads/?mount=<digest>&from=<repo>`.
         // A successful mount returns 201 Created and skips the data upload entirely; a
         // 202 means the registry started a new upload session (mount fallback).
+        //
+        // Anonymous mount (mount= without from=) is a different operation:
+        // an existence check that also initializes an upload session. Used by
+        // regclient/regsync. We count these separately.
         if entry.method == "POST"
             && entry.url.contains("/blobs/uploads/")
             && entry.url.contains("mount=")
         {
-            mount_attempts += 1;
-            if entry.status == 201 {
-                mount_successes += 1;
+            if entry.url.contains("from=") {
+                mount_attempts += 1;
+                if entry.status == 201 {
+                    mount_successes += 1;
+                }
+            } else {
+                existence_check_posts += 1;
             }
         }
     }
@@ -211,6 +240,7 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
         duplicate_blob_gets,
         mount_attempts,
         mount_successes,
+        existence_check_posts,
         source_blob_gets,
         source_blob_bytes,
     }
@@ -419,7 +449,9 @@ mod tests {
                 status: 200,
                 duration_ms: 80,
             },
-            // Source non-blob GET (not /blobs/sha256:) -- should NOT count.
+            // Source non-blob GET (manifest, not /blobs/sha256:).
+            // Does NOT count as a source_blob_get, but its response bytes
+            // ARE included in source_blob_bytes (all non-target GET bytes).
             ProxyEntry {
                 method: "GET".into(),
                 host: "docker.io".into(),
@@ -432,7 +464,9 @@ mod tests {
         ];
         let metrics = aggregate(&entries, "ecr.aws");
         assert_eq!(metrics.source_blob_gets, 1);
-        assert_eq!(metrics.source_blob_bytes, 9000);
+        // source_blob_bytes includes ALL non-target GET responses:
+        // source blob (9000) + source manifest (1000) = 10000.
+        assert_eq!(metrics.source_blob_bytes, 10000);
     }
 
     #[test]

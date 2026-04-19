@@ -12,6 +12,9 @@ use crate::bench::proxy::ProxyMetrics;
 ///
 /// One record per benchmark execution. Designed for source control:
 /// small enough to accumulate, rich enough to cite in docs/findings.md.
+///
+/// When adding new fields, use `#[serde(default)]` so that old records
+/// (which lack the field) still deserialize.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RunRecord {
     /// UTC timestamp when the run started (`YYYY-MM-DD-HHMMSS`).
@@ -38,7 +41,7 @@ pub(crate) struct MachineInfo {
     /// Number of vCPUs.
     pub(crate) vcpus: usize,
     /// Memory in GiB (converted from MiB at write time).
-    pub(crate) memory_gib: u64,
+    pub(crate) memory_gib: f64,
     /// Network performance description.
     pub(crate) network: String,
     /// Cloud region (e.g. `us-east-1`).
@@ -105,8 +108,6 @@ pub(crate) struct ToolRun {
     pub(crate) peak_rss_kb: Option<u64>,
     /// HTTP proxy metrics, if a proxy was attached.
     pub(crate) proxy_metrics: Option<ProxyMetrics>,
-    /// Parsed JSON from ocync's `--json` output, if available.
-    pub(crate) ocync_json: Option<serde_json::Value>,
 }
 
 /// One scenario across all tools.
@@ -374,148 +375,7 @@ fn summary_markdown(report: &BenchReport) -> String {
         let by_tool: BTreeMap<&str, &ToolRun> =
             scenario.runs.iter().map(|r| (r.tool.as_str(), r)).collect();
 
-        out.push_str("| Metric |");
-        for col in &columns {
-            out.push_str(&format!(" {col} |"));
-        }
-        out.push('\n');
-        out.push_str("|---|");
-        for _ in &columns {
-            out.push_str("---:|");
-        }
-        out.push('\n');
-
-        // Metric rows with winner highlighting.
-        // Each row: (label, extract sortable value, format display, lower_is_better).
-        type RankFn = Box<dyn Fn(&ToolRun) -> Option<u64>>;
-        type DisplayFn = Box<dyn Fn(&ToolRun) -> Option<String>>;
-        struct MetricRow {
-            label: &'static str,
-            /// Extract a comparable value for ranking (None = no data).
-            rank: RankFn,
-            /// Format the display string.
-            display: DisplayFn,
-            /// When true, lowest value wins; when false, highest wins.
-            lower_is_better: bool,
-        }
-
-        let rows: Vec<MetricRow> = vec![
-            MetricRow {
-                label: "Wall clock",
-                rank: Box::new(|r| Some((r.wall_clock_secs * 1000.0) as u64)),
-                display: Box::new(|r| {
-                    Some(format_duration(Duration::from_secs_f64(r.wall_clock_secs)))
-                }),
-                lower_is_better: true,
-            },
-            MetricRow {
-                label: "Peak RSS",
-                rank: Box::new(|r| r.peak_rss_kb),
-                display: Box::new(|r| r.peak_rss_kb.map(|kb| format_bytes(kb * 1024))),
-                lower_is_better: true,
-            },
-            MetricRow {
-                label: "Requests",
-                rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.total_requests)),
-                display: Box::new(|r| {
-                    r.proxy_metrics
-                        .as_ref()
-                        .map(|m| m.total_requests.to_string())
-                }),
-                lower_is_better: true,
-            },
-            MetricRow {
-                label: "Response bytes",
-                rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.total_response_bytes)),
-                display: Box::new(|r| {
-                    r.proxy_metrics
-                        .as_ref()
-                        .map(|m| format_bytes(m.total_response_bytes))
-                }),
-                lower_is_better: true,
-            },
-            MetricRow {
-                label: "Source blob GETs",
-                rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.source_blob_gets)),
-                display: Box::new(|r| {
-                    r.proxy_metrics
-                        .as_ref()
-                        .map(|m| m.source_blob_gets.to_string())
-                }),
-                lower_is_better: true,
-            },
-            MetricRow {
-                label: "Source blob bytes",
-                rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.source_blob_bytes)),
-                display: Box::new(|r| {
-                    r.proxy_metrics
-                        .as_ref()
-                        .map(|m| format_bytes(m.source_blob_bytes))
-                }),
-                lower_is_better: true,
-            },
-            MetricRow {
-                label: "Mounts (success/attempt)",
-                rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.mount_successes)),
-                display: Box::new(|r| {
-                    r.proxy_metrics
-                        .as_ref()
-                        .map(|m| format!("{}/{}", m.mount_successes, m.mount_attempts))
-                }),
-                lower_is_better: false,
-            },
-            MetricRow {
-                label: "Duplicate blob GETs",
-                rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.duplicate_blob_gets)),
-                display: Box::new(|r| {
-                    r.proxy_metrics
-                        .as_ref()
-                        .map(|m| m.duplicate_blob_gets.to_string())
-                }),
-                lower_is_better: true,
-            },
-            MetricRow {
-                label: "Rate-limit 429s",
-                rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.status_429_count)),
-                display: Box::new(|r| {
-                    r.proxy_metrics
-                        .as_ref()
-                        .map(|m| m.status_429_count.to_string())
-                }),
-                lower_is_better: true,
-            },
-        ];
-
-        for row in &rows {
-            // Find the winning value across all tools for this metric.
-            let values: Vec<Option<u64>> = columns
-                .iter()
-                .map(|col| by_tool.get(col.as_str()).and_then(|r| (row.rank)(r)))
-                .collect();
-            let winner = if row.lower_is_better {
-                values.iter().filter_map(|v| *v).min()
-            } else {
-                values.iter().filter_map(|v| *v).max()
-            };
-
-            out.push_str(&format!("| {} |", row.label));
-            for (i, col) in columns.iter().enumerate() {
-                let display = by_tool.get(col.as_str()).and_then(|r| (row.display)(r));
-                match display {
-                    Some(text) => {
-                        let is_winner = winner.is_some() && values[i] == winner && values.len() > 1;
-                        if is_winner {
-                            out.push_str(&format!(" **{text}** |"));
-                        } else {
-                            out.push_str(&format!(" {text} |"));
-                        }
-                    }
-                    None => out.push_str(" -- |"),
-                }
-            }
-            out.push('\n');
-        }
-
+        render_metric_table(&columns, &by_tool, &mut out);
         out.push('\n');
     }
 
@@ -555,11 +415,164 @@ fn tool_columns(report: &BenchReport) -> Vec<String> {
     columns
 }
 
+/// Rank function: extracts a comparable u64 for sorting.
+type RankFn = Box<dyn Fn(&ToolRun) -> Option<u64>>;
+
+/// Display function: formats the metric value as a human-readable string.
+type DisplayFn = Box<dyn Fn(&ToolRun) -> Option<String>>;
+
+/// A single row in a benchmark comparison table.
+struct MetricRow {
+    label: &'static str,
+    rank: RankFn,
+    display: DisplayFn,
+    lower_is_better: bool,
+}
+
+/// The standard set of metric rows for benchmark comparison tables.
+fn metric_rows() -> Vec<MetricRow> {
+    vec![
+        MetricRow {
+            label: "Wall clock",
+            rank: Box::new(|r| Some((r.wall_clock_secs * 1000.0) as u64)),
+            display: Box::new(|r| {
+                Some(format_duration(Duration::from_secs_f64(r.wall_clock_secs)))
+            }),
+            lower_is_better: true,
+        },
+        MetricRow {
+            label: "Peak RSS",
+            rank: Box::new(|r| r.peak_rss_kb),
+            display: Box::new(|r| r.peak_rss_kb.map(|kb| format_bytes(kb * 1024))),
+            lower_is_better: true,
+        },
+        MetricRow {
+            label: "Requests",
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.total_requests)),
+            display: Box::new(|r| {
+                r.proxy_metrics
+                    .as_ref()
+                    .map(|m| m.total_requests.to_string())
+            }),
+            lower_is_better: true,
+        },
+        MetricRow {
+            label: "Response bytes",
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.total_response_bytes)),
+            display: Box::new(|r| {
+                r.proxy_metrics
+                    .as_ref()
+                    .map(|m| format_bytes(m.total_response_bytes))
+            }),
+            lower_is_better: true,
+        },
+        MetricRow {
+            label: "Source blob GETs",
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.source_blob_gets)),
+            display: Box::new(|r| {
+                r.proxy_metrics
+                    .as_ref()
+                    .map(|m| m.source_blob_gets.to_string())
+            }),
+            lower_is_better: true,
+        },
+        MetricRow {
+            label: "Source blob bytes",
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.source_blob_bytes)),
+            display: Box::new(|r| {
+                r.proxy_metrics
+                    .as_ref()
+                    .map(|m| format_bytes(m.source_blob_bytes))
+            }),
+            lower_is_better: true,
+        },
+        MetricRow {
+            label: "Mounts (success/attempt)",
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.mount_successes)),
+            display: Box::new(|r| {
+                r.proxy_metrics
+                    .as_ref()
+                    .map(|m| format!("{}/{}", m.mount_successes, m.mount_attempts))
+            }),
+            lower_is_better: false,
+        },
+        MetricRow {
+            label: "Duplicate blob GETs",
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.duplicate_blob_gets)),
+            display: Box::new(|r| {
+                r.proxy_metrics
+                    .as_ref()
+                    .map(|m| m.duplicate_blob_gets.to_string())
+            }),
+            lower_is_better: true,
+        },
+        MetricRow {
+            label: "Rate-limit 429s",
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.status_429_count)),
+            display: Box::new(|r| {
+                r.proxy_metrics
+                    .as_ref()
+                    .map(|m| m.status_429_count.to_string())
+            }),
+            lower_is_better: true,
+        },
+    ]
+}
+
+/// Renders a metric comparison table into `out`.
+///
+/// Columns are tool names, rows are metrics. The best value per row
+/// is bolded when more than one tool has data for that metric.
+fn render_metric_table(columns: &[String], by_tool: &BTreeMap<&str, &ToolRun>, out: &mut String) {
+    out.push_str("| Metric |");
+    for col in columns {
+        out.push_str(&format!(" {col} |"));
+    }
+    out.push('\n');
+    out.push_str("|---|");
+    for _ in columns {
+        out.push_str("---:|");
+    }
+    out.push('\n');
+
+    for row in &metric_rows() {
+        let values: Vec<Option<u64>> = columns
+            .iter()
+            .map(|col| by_tool.get(col.as_str()).and_then(|r| (row.rank)(r)))
+            .collect();
+        let winner = if row.lower_is_better {
+            values.iter().filter_map(|v| *v).min()
+        } else {
+            values.iter().filter_map(|v| *v).max()
+        };
+
+        out.push_str(&format!("| {} |", row.label));
+        for (i, col) in columns.iter().enumerate() {
+            let display = by_tool.get(col.as_str()).and_then(|r| (row.display)(r));
+            match display {
+                Some(text) => {
+                    let competing = values.iter().filter(|v| v.is_some()).count() > 1;
+                    let is_winner = winner.is_some() && values[i] == winner && competing;
+                    if is_winner {
+                        out.push_str(&format!(" **{text}** |"));
+                    } else {
+                        out.push_str(&format!(" {text} |"));
+                    }
+                }
+                None => out.push_str(" -- |"),
+            }
+        }
+        out.push('\n');
+    }
+}
+
 /// Writes the benchmark summary to `output_dir`.
 ///
 /// Creates `summary.md` -- the human-readable comparison table with
-/// per-scenario metrics and winners bolded. The compact per-registry
-/// JSON archive is written separately by `append_record()`.
+/// per-scenario metrics and winners bolded. Also updates the docs
+/// performance page (`docs/src/content/performance.md`) between
+/// `<!-- BENCH:START -->` / `<!-- BENCH:END -->` markers. The compact
+/// per-registry JSON archive is written separately by `append_record()`.
 pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<(), String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
@@ -568,6 +581,87 @@ pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<()
     let md = summary_markdown(report);
     let md_path = output_dir.join("summary.md");
     std::fs::write(&md_path, md).map_err(|e| format!("write {}: {e}", md_path.display()))?;
+
+    // Update docs performance page (best-effort; missing file is not fatal).
+    let perf_page = Path::new("docs/src/content/performance.md");
+    if perf_page.exists() {
+        if let Err(e) = update_performance_page(perf_page, report) {
+            eprintln!("WARNING: failed to update {}: {e}", perf_page.display());
+        }
+    }
+
+    Ok(())
+}
+
+/// Generates the benchmark results snippet for the docs performance page.
+///
+/// Produces a context header and the **first** scenario's comparison table.
+/// Only the first scenario (typically "Cold sync") appears on the docs page;
+/// the full multi-scenario breakdown lives in `summary.md`.
+fn performance_markdown(report: &BenchReport) -> Option<String> {
+    let scenario = report.scenarios.first()?;
+    let inst = &report.instance;
+
+    let mut out = String::new();
+
+    let memory_gib = inst.memory_mib as f64 / 1024.0;
+    out.push_str(&format!(
+        "Measured {date} on {inst_type} ({arch}, {vcpus} vCPUs, {mem:.0} GiB, {net}). \
+         Full corpus: {images} images, {tags} tags. Cold sync to ECR {region}.\n\n",
+        date = report.timestamp.get(..10).unwrap_or(&report.timestamp),
+        inst_type = inst.instance_type,
+        arch = inst.arch,
+        vcpus = inst.vcpus,
+        mem = memory_gib,
+        net = inst.network_performance,
+        images = report.corpus_size,
+        tags = report.total_tags,
+        region = inst.region,
+    ));
+
+    let columns = tool_columns(report);
+    let by_tool: BTreeMap<&str, &ToolRun> =
+        scenario.runs.iter().map(|r| (r.tool.as_str(), r)).collect();
+
+    render_metric_table(&columns, &by_tool, &mut out);
+
+    Some(out)
+}
+
+const BENCH_START: &str = "<!-- BENCH:START -->";
+const BENCH_END: &str = "<!-- BENCH:END -->";
+
+/// Replaces content between `<!-- BENCH:START -->` and `<!-- BENCH:END -->`
+/// markers in the docs performance page with fresh benchmark results.
+fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+
+    let start = content
+        .find(BENCH_START)
+        .ok_or_else(|| format!("{} marker not found in {}", BENCH_START, path.display()))?;
+    let end = content
+        .find(BENCH_END)
+        .ok_or_else(|| format!("{} marker not found in {}", BENCH_END, path.display()))?;
+    if start >= end {
+        return Err(format!(
+            "{} must appear before {} in {}",
+            BENCH_START,
+            BENCH_END,
+            path.display()
+        ));
+    }
+
+    let snippet =
+        performance_markdown(report).ok_or_else(|| "no scenario data to write".to_string())?;
+
+    let mut updated = String::with_capacity(content.len());
+    updated.push_str(&content[..start + BENCH_START.len()]);
+    updated.push('\n');
+    updated.push_str(&snippet);
+    updated.push_str(&content[end..]);
+
+    std::fs::write(path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
 
     Ok(())
 }
@@ -641,7 +735,6 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(65536),
                         proxy_metrics: None,
-                        ocync_json: None,
                     },
                     ToolRun {
                         tool: "dregsy".to_string(),
@@ -649,7 +742,6 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(131072),
                         proxy_metrics: None,
-                        ocync_json: None,
                     },
                 ],
             }],
@@ -734,6 +826,11 @@ mod tests {
         assert!(md.contains("## Cold sync (median)\n"));
         assert!(md.contains("| Metric | ocync | dregsy |"));
         assert!(md.contains("| Wall clock | **47s** | 8m 41s |"));
+
+        // Both tools have proxy_metrics: None, so proxy rows show "--" for
+        // both columns (no bolding since neither has data).
+        assert!(md.contains("| Requests | -- | -- |"), "md:\n{md}");
+        assert!(md.contains("| Source blob GETs | -- | -- |"), "md:\n{md}");
     }
 
     #[test]
@@ -785,14 +882,14 @@ mod tests {
                     exit_code: Some(0),
                     peak_rss_kb: Some(65536),
                     proxy_metrics: None,
-                    ocync_json: None,
                 }],
             }],
             scale: vec![],
         };
         let md = summary_markdown(&report);
-        // dregsy column shows "--", ocync is bolded as only tool with data.
-        assert!(md.contains("| Wall clock | **47s** | -- |"), "md:\n{md}");
+        // dregsy column shows "--"; ocync is NOT bolded because there's
+        // no competing tool with data for this metric.
+        assert!(md.contains("| Wall clock | 47s | -- |"), "md:\n{md}");
     }
 
     #[test]
@@ -805,7 +902,7 @@ mod tests {
                 instance_type: "c6in.4xlarge".into(),
                 arch: "x86_64".into(),
                 vcpus: 16,
-                memory_gib: 32,
+                memory_gib: 32.0,
                 network: "Up to 50 Gigabit".into(),
                 region: "us-east-1".into(),
             },
@@ -836,7 +933,7 @@ mod tests {
         assert_eq!(parsed.timestamp, "2026-04-18-021040");
         assert_eq!(parsed.git_ref, "d121864");
         assert_eq!(parsed.machine.provider, "aws");
-        assert_eq!(parsed.machine.memory_gib, 32);
+        assert_eq!(parsed.machine.memory_gib, 32.0);
         assert_eq!(parsed.corpus.images, 42);
         assert_eq!(parsed.scenarios[0].tools[0].requests, 4131);
     }
@@ -852,7 +949,7 @@ mod tests {
                 instance_type: "c6in.4xlarge".into(),
                 arch: "x86_64".into(),
                 vcpus: 16,
-                memory_gib: 32,
+                memory_gib: 32.0,
                 network: "Up to 50 Gigabit".into(),
                 region: "us-east-1".into(),
             },
@@ -886,7 +983,7 @@ mod tests {
                 instance_type: "c7g.xlarge".into(),
                 arch: "aarch64".into(),
                 vcpus: 4,
-                memory_gib: 8,
+                memory_gib: 8.0,
                 network: "Up to 12.5 Gigabit".into(),
                 region: "us-east-1".into(),
             },
@@ -915,7 +1012,7 @@ mod tests {
                 instance_type: "unknown".into(),
                 arch: "unknown".into(),
                 vcpus: 0,
-                memory_gib: 0,
+                memory_gib: 0.0,
                 network: "unknown".into(),
                 region: "unknown".into(),
             },
@@ -923,5 +1020,328 @@ mod tests {
             scenarios: vec![],
         };
         assert!(append_record(dir.path(), "ecr", record).is_err());
+    }
+
+    #[test]
+    fn summary_markdown_single_tool_no_bold() {
+        let report = BenchReport {
+            timestamp: "2026-04-15-100000".to_string(),
+            instance: test_instance(),
+            corpus_size: 28,
+            total_tags: 40,
+            tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
+            scenarios: vec![ScenarioResult {
+                scenario: "Cold sync".to_string(),
+                runs: vec![ToolRun {
+                    tool: "ocync".to_string(),
+                    wall_clock_secs: 47.0,
+                    exit_code: Some(0),
+                    peak_rss_kb: Some(65536),
+                    proxy_metrics: None,
+                }],
+            }],
+            scale: vec![],
+        };
+        let md = summary_markdown(&report);
+        // Single tool -- nothing should be bolded.
+        assert!(md.contains("| Wall clock | 47s |"), "md:\n{md}");
+        assert!(!md.contains("**47s**"));
+    }
+
+    #[test]
+    fn performance_markdown_context_line() {
+        let report = sample_report();
+        let md = performance_markdown(&report).unwrap();
+        assert!(md.contains("Measured 2026-04-15"));
+        assert!(md.contains("c7g.xlarge"));
+        assert!(md.contains("28 images, 40 tags"));
+        // Contains the metric table.
+        assert!(md.contains("| Metric | ocync | dregsy |"));
+        assert!(md.contains("| Wall clock |"));
+    }
+
+    #[test]
+    fn performance_markdown_empty_scenarios_returns_none() {
+        let report = BenchReport {
+            timestamp: "2026-04-15-100000".to_string(),
+            instance: test_instance(),
+            corpus_size: 28,
+            total_tags: 40,
+            tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
+            scenarios: vec![],
+            scale: vec![],
+        };
+        assert!(performance_markdown(&report).is_none());
+    }
+
+    #[test]
+    fn update_performance_page_replaces_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("performance.md");
+        std::fs::write(
+            &path,
+            "# Performance\n\n<!-- BENCH:START -->\nold content\n<!-- BENCH:END -->\n\nFooter\n",
+        )
+        .unwrap();
+
+        let report = sample_report();
+        update_performance_page(&path, &report).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("<!-- BENCH:START -->"));
+        assert!(content.contains("<!-- BENCH:END -->"));
+        assert!(!content.contains("old content"));
+        assert!(content.contains("Measured 2026-04-15"));
+        assert!(content.contains("Footer"));
+    }
+
+    #[test]
+    fn update_performance_page_missing_markers_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("performance.md");
+        std::fs::write(&path, "# Performance\n\nNo markers here.\n").unwrap();
+
+        let report = sample_report();
+        assert!(update_performance_page(&path, &report).is_err());
+    }
+
+    /// Report with populated proxy metrics for full table coverage.
+    fn sample_report_with_metrics() -> BenchReport {
+        BenchReport {
+            timestamp: "2026-04-18-100000".to_string(),
+            instance: test_instance(),
+            corpus_size: 42,
+            total_tags: 55,
+            tool_versions: BTreeMap::from([
+                ("ocync".to_string(), "0.1.0".to_string()),
+                ("dregsy".to_string(), "0.5.0".to_string()),
+            ]),
+            scenarios: vec![ScenarioResult {
+                scenario: "Cold sync (median)".to_string(),
+                runs: vec![
+                    ToolRun {
+                        tool: "ocync".to_string(),
+                        wall_clock_secs: 273.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(59468),
+                        proxy_metrics: Some(ProxyMetrics {
+                            total_requests: 4131,
+                            requests_by_method: BTreeMap::new(),
+                            status_429_count: 0,
+                            total_request_bytes: 0,
+                            total_response_bytes: 16_900_000_000,
+                            duplicate_blob_gets: 0,
+                            mount_attempts: 379,
+                            mount_successes: 362,
+                            existence_check_posts: 0,
+                            source_blob_gets: 726,
+                            source_blob_bytes: 77_200,
+                        }),
+                    },
+                    ToolRun {
+                        tool: "dregsy".to_string(),
+                        wall_clock_secs: 2182.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(304500),
+                        proxy_metrics: Some(ProxyMetrics {
+                            total_requests: 11190,
+                            requests_by_method: BTreeMap::new(),
+                            status_429_count: 49,
+                            total_request_bytes: 0,
+                            total_response_bytes: 43_400_000_000,
+                            duplicate_blob_gets: 1,
+                            mount_attempts: 293,
+                            mount_successes: 293,
+                            existence_check_posts: 0,
+                            source_blob_gets: 1324,
+                            source_blob_bytes: 120_100,
+                        }),
+                    },
+                ],
+            }],
+            scale: vec![],
+        }
+    }
+
+    #[test]
+    fn summary_with_proxy_metrics_bold_winners() {
+        let report = sample_report_with_metrics();
+        let md = summary_markdown(&report);
+
+        // ocync wins wall clock (4m 33s vs 36m 22s).
+        assert!(
+            md.contains("| Wall clock | **4m 33s** | 36m 22s |"),
+            "md:\n{md}"
+        );
+        // ocync wins requests.
+        assert!(md.contains("| Requests | **4131** | 11190 |"), "md:\n{md}");
+        // ocync wins response bytes.
+        assert!(
+            md.contains("| Response bytes | **16.9 GB** | 43.4 GB |"),
+            "md:\n{md}"
+        );
+        // ocync wins source blob GETs.
+        assert!(
+            md.contains("| Source blob GETs | **726** | 1324 |"),
+            "md:\n{md}"
+        );
+        // Mounts: higher is better -- dregsy wins (293/293 vs 362/379).
+        // dregsy has 293 successes, ocync has 362. 362 > 293, so ocync wins.
+        assert!(
+            md.contains("| Mounts (success/attempt) | **362/379** | 293/293 |"),
+            "md:\n{md}"
+        );
+        // ocync wins duplicate blob GETs (0 vs 1).
+        assert!(
+            md.contains("| Duplicate blob GETs | **0** | 1 |"),
+            "md:\n{md}"
+        );
+        // ocync wins rate-limit 429s (0 vs 49).
+        assert!(md.contains("| Rate-limit 429s | **0** | 49 |"), "md:\n{md}");
+    }
+
+    #[test]
+    fn winner_bold_requires_competing_data() {
+        // When only one tool has proxy metrics, that tool's values should
+        // NOT be bolded -- there's no competition.
+        let report = BenchReport {
+            timestamp: "2026-04-18-100000".to_string(),
+            instance: test_instance(),
+            corpus_size: 42,
+            total_tags: 55,
+            tool_versions: BTreeMap::from([
+                ("ocync".to_string(), "0.1.0".to_string()),
+                ("dregsy".to_string(), "0.5.0".to_string()),
+            ]),
+            scenarios: vec![ScenarioResult {
+                scenario: "Cold sync".to_string(),
+                runs: vec![
+                    ToolRun {
+                        tool: "ocync".to_string(),
+                        wall_clock_secs: 273.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(59468),
+                        proxy_metrics: Some(ProxyMetrics {
+                            total_requests: 4131,
+                            requests_by_method: BTreeMap::new(),
+                            status_429_count: 0,
+                            total_request_bytes: 0,
+                            total_response_bytes: 16_900_000_000,
+                            duplicate_blob_gets: 0,
+                            mount_attempts: 379,
+                            mount_successes: 362,
+                            existence_check_posts: 0,
+                            source_blob_gets: 726,
+                            source_blob_bytes: 77_200,
+                        }),
+                    },
+                    ToolRun {
+                        tool: "dregsy".to_string(),
+                        wall_clock_secs: 2182.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(304500),
+                        // dregsy has no proxy metrics in this test.
+                        proxy_metrics: None,
+                    },
+                ],
+            }],
+            scale: vec![],
+        };
+        let md = summary_markdown(&report);
+
+        // Wall clock: both have data, so winner is bolded.
+        assert!(
+            md.contains("| Wall clock | **4m 33s** | 36m 22s |"),
+            "md:\n{md}"
+        );
+        // Requests: only ocync has data, so it should NOT be bolded.
+        assert!(md.contains("| Requests | 4131 | -- |"), "md:\n{md}");
+        // Source blob GETs: only ocync, no bold.
+        assert!(md.contains("| Source blob GETs | 726 | -- |"), "md:\n{md}");
+    }
+
+    #[test]
+    fn winner_bold_tied_values_bold_both() {
+        // When two tools tie on a metric, both should be bolded.
+        let report = BenchReport {
+            timestamp: "2026-04-18-100000".to_string(),
+            instance: test_instance(),
+            corpus_size: 42,
+            total_tags: 55,
+            tool_versions: BTreeMap::from([
+                ("ocync".to_string(), "0.1.0".to_string()),
+                ("dregsy".to_string(), "0.5.0".to_string()),
+            ]),
+            scenarios: vec![ScenarioResult {
+                scenario: "Cold sync".to_string(),
+                runs: vec![
+                    ToolRun {
+                        tool: "ocync".to_string(),
+                        wall_clock_secs: 120.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(65536),
+                        proxy_metrics: Some(ProxyMetrics {
+                            total_requests: 1000,
+                            requests_by_method: BTreeMap::new(),
+                            status_429_count: 0,
+                            total_request_bytes: 0,
+                            total_response_bytes: 0,
+                            duplicate_blob_gets: 0,
+                            mount_attempts: 0,
+                            mount_successes: 0,
+                            existence_check_posts: 0,
+                            source_blob_gets: 0,
+                            source_blob_bytes: 0,
+                        }),
+                    },
+                    ToolRun {
+                        tool: "dregsy".to_string(),
+                        wall_clock_secs: 120.0, // same wall clock
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(65536), // same RSS
+                        proxy_metrics: Some(ProxyMetrics {
+                            total_requests: 2000, // different requests
+                            requests_by_method: BTreeMap::new(),
+                            status_429_count: 0,
+                            total_request_bytes: 0,
+                            total_response_bytes: 0,
+                            duplicate_blob_gets: 0,
+                            mount_attempts: 0,
+                            mount_successes: 0,
+                            existence_check_posts: 0,
+                            source_blob_gets: 0,
+                            source_blob_bytes: 0,
+                        }),
+                    },
+                ],
+            }],
+            scale: vec![],
+        };
+        let md = summary_markdown(&report);
+
+        // Wall clock tied at 2m -- both should be bolded.
+        assert!(md.contains("| Wall clock | **2m** | **2m** |"), "md:\n{md}");
+        // Peak RSS tied -- both bolded.
+        assert!(
+            md.contains("| Peak RSS | **67.1 MB** | **67.1 MB** |"),
+            "md:\n{md}"
+        );
+        // Requests differ -- only ocync (1000 < 2000) is bolded.
+        assert!(md.contains("| Requests | **1000** | 2000 |"), "md:\n{md}");
+    }
+
+    #[test]
+    fn update_performance_page_reversed_markers_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("performance.md");
+        std::fs::write(
+            &path,
+            "# Performance\n\n<!-- BENCH:END -->\nold\n<!-- BENCH:START -->\n",
+        )
+        .unwrap();
+
+        let report = sample_report();
+        let err = update_performance_page(&path, &report).unwrap_err();
+        assert!(err.contains("must appear before"), "err: {err}");
     }
 }
