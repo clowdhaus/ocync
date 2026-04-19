@@ -1,7 +1,7 @@
 [
   {
     "timestamp": "2026-04-19-194331",
-    "git_ref": "4035fa8",
+    "git_ref": "8ed9619",
     "machine": {
       "provider": "aws",
       "instance_type": "c6in.4xlarge",
