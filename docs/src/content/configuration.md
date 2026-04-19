@@ -4,7 +4,7 @@ description: Config file reference for ocync with registry definitions, target g
 order: 2
 ---
 
-ocync uses a YAML config file to define registries, target groups, defaults, and image mappings.
+`ocync` uses a YAML config file to define registries, target groups, defaults, and image mappings.
 
 ## Minimal example
 
@@ -126,7 +126,7 @@ target_groups:
     - ecr-staging
 ```
 
-When syncing to multiple targets, ocync pulls from source once and pushes to all targets in parallel.
+When syncing to multiple targets, `ocync` pulls from source once and pushes to all targets in parallel.
 
 ## Defaults
 
@@ -144,7 +144,7 @@ defaults:
     semver: ">=1.0"            # Semver range
     exclude:                   # Exclude patterns
       - "*-debug"
-    sort: semver               # Sort order: semver, alphabetical, time
+    sort: semver               # Sort order: semver, alpha
     latest: 10                 # Keep only N most recent after sort
 ```
 
@@ -171,7 +171,7 @@ Tags are filtered through a pipeline in order:
 1. **glob**: include tags matching the glob pattern
 2. **semver**: include tags satisfying the semver range
 3. **exclude**: remove tags matching any exclude pattern
-4. **sort**: order remaining tags (`semver`, `alphabetical`, `time`)
+4. **sort**: order remaining tags (`semver`, `alpha`)
 5. **latest**: keep only the N most recent after sorting
 
 All filters are optional. Without any filters, all tags are synced.
@@ -192,7 +192,7 @@ registries:
     url: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
 ```
 
-The `DOCKER_CONFIG` environment variable controls the Docker config file location. If set, ocync reads `$DOCKER_CONFIG/config.json`. Otherwise, it defaults to `~/.docker/config.json`.
+The `DOCKER_CONFIG` environment variable controls the Docker config file location. If set, `ocync` reads `$DOCKER_CONFIG/config.json`. Otherwise, it defaults to `~/.docker/config.json`.
 
 ## Validation
 

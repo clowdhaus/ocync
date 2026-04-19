@@ -13,7 +13,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 ## Engine architecture
 
 - Pipelined: discovery and execution overlap via `tokio::select!` over two `FuturesUnordered` pools.
-- `VecDeque<ActiveItem>` pending queue between pools.
+- `VecDeque<TransferTask>` pending queue between pools.
 - `select!` uses `biased;` (prefer execution completions to free permits).
 - Emptiness guards (`if !pool.is_empty()`) on every branch prevent busy-looping.
 - Shutdown branch must check work-remaining or it blocks the else exit.

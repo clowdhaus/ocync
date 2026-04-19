@@ -54,7 +54,7 @@ ocync copy cgr.dev/chainguard/nginx:latest \
     123456789012.dkr.ecr.us-east-1.amazonaws.com/nginx:latest
 ```
 
-ocync auto-detects the registry type from the hostname and handles authentication automatically. For ECR, it uses your ambient AWS credentials (environment variables, config file, or instance role).
+`ocync` auto-detects the registry type from the hostname and handles authentication automatically. For ECR, it uses your ambient AWS credentials (environment variables, config file, or instance role).
 
 ## Config-driven sync
 
@@ -100,11 +100,11 @@ ocync sync -c config.yaml --dry-run
 
 ## Key concepts
 
-**Additive sync**: ocync never deletes images or tags from the target registry. Registries handle lifecycle and retention through their own policies.
+**Additive sync**: `ocync` never deletes images or tags from the target registry. Registries handle lifecycle and retention through their own policies.
 
-**Blob deduplication**: container images share layers. ocync tracks every blob it has seen in a sync run and transfers each unique blob exactly once, regardless of how many images reference it.
+**Blob deduplication**: container images share layers. `ocync` tracks every blob it has seen in a sync run and transfers each unique blob exactly once, regardless of how many images reference it.
 
-**Cross-repo mounting**: when a blob already exists in another repository on the same registry, ocync mounts it instead of uploading again. This is a registry-side operation with zero data transfer.
+**Cross-repo mounting**: when a blob already exists in another repository on the same registry, `ocync` mounts it instead of uploading again. This is a registry-side operation with zero data transfer.
 
 **Transfer state cache**: a persistent cache records which blobs already exist at each target. Subsequent runs skip HEAD checks for known-good blobs, reducing API calls.
 

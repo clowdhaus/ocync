@@ -119,5 +119,5 @@ The JSON output includes per-image results, aggregate statistics (blobs transfer
 | `AWS_REGION` | AWS region for ECR auth |
 | `AWS_USE_FIPS_ENDPOINT` | Use FIPS endpoints for ECR |
 | `DOCKER_CONFIG` | Docker config directory (default: `~/.docker`) |
-| `OCYNC_LOG` | Log filter directive (overrides `-v` flags) |
+| `RUST_LOG` | Log filter directive (overrides `-v` flags) |
 | `NO_COLOR` | Disable colored output |

@@ -55,14 +55,14 @@ Every PR ships the smallest correct change + one test that catches regression. D
 
 ## Plans and specs
 
-- `docs/specs/ocync-design.md` - full design document (engine architecture, concurrency, cache)
-- `docs/specs/transfer-optimization-design.md` - pipeline, transfer state cache, AIMD, multi-target reuse
-- `docs/specs/benchmark-design.md` - layered benchmark plan (protocol / throughput / cross-tool)
-- `docs/specs/watch-discovery-design.md` - watch mode, discovery optimization, platform filtering
-- `docs/specs/findings.md` - empirical evidence log
+- `docs/src/content/design/overview.md` - full design document (engine architecture, concurrency, cache)
+- `docs/src/content/design/engine.md` - pipeline, transfer state cache, AIMD, multi-target reuse
+- `docs/src/content/design/benchmark.md` - layered benchmark plan (protocol / throughput / cross-tool)
+- `docs/src/content/design/watch-mode.md` - watch mode, discovery optimization, platform filtering
+- `docs/src/content/design/findings.md` - empirical evidence log
 - `docs/superpowers/plans/` (gitignored) - in-flight implementation plans
 
-When a benchmark or probe run changes our understanding of a registry's behavior, add an entry to `docs/specs/findings.md` in the same PR as the behavior change.
+When a benchmark or probe run changes our understanding of a registry's behavior, add an entry to `docs/src/content/design/findings.md` in the same PR as the behavior change.
 
 ## Commands
 
@@ -80,13 +80,14 @@ cargo test --package ocync-distribution --test registry2_mount
 
 ## Benchmarks
 
-Prerequisites: Terraform, AWS credentials with ECR access, SSM parameter `/ocync/bench/github-token` populated.
+Prerequisites: Terraform, AWS credentials with ECR access, SSM parameters populated:
+- `/ocync/bench/dockerhub-username` - Docker Hub account name
+- `/ocync/bench/dockerhub-access-token` - Docker Hub PAT for authenticated pulls
 
 ```bash
-cd bench/terraform && terraform init && terraform apply
-cargo xtask bench --limit 3 --tools ocync --iterations 1 cold
-cargo xtask bench --tools ocync,dregsy,regsync all
-cd bench/terraform && terraform destroy
+cd bench/terraform/aws && terraform init && terraform apply
+cargo xtask bench-remote --provider aws --scenario cold
+cd bench/terraform/aws && terraform destroy
 ```
 
 See `bench/CLAUDE.md` for full benchmark infrastructure details including bench-remote, competitor config gotchas, instance ops, and proxy log analysis.

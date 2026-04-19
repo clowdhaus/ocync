@@ -8,7 +8,7 @@ order: 6
 
 Chainguard (`cgr.dev`) uses OCI token exchange with per-repository scope. Each repository requires its own token. A token scoped to `chainguard/nginx` will 403 when used against `chainguard/python`.
 
-ocync handles this with a scope-keyed token cache that maintains separate tokens per repository.
+`ocync` handles this with a scope-keyed token cache that maintains separate tokens per repository.
 
 ## Rate limits
 

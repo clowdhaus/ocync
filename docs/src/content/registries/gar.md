@@ -10,7 +10,7 @@ GAR uses credentials from your Docker config file, typically configured via `gcl
 
 ## Upload behavior
 
-GAR does not support chunked uploads. ocync automatically buffers the full blob and performs a monolithic PUT upload.
+GAR does not support chunked uploads. `ocync` automatically buffers the full blob and performs a monolithic PUT upload.
 
 ## Blob mounting
 

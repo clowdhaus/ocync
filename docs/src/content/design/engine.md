@@ -121,7 +121,7 @@ Actions are fine-grained, matching the actual API action granularity of each reg
 | ACR | 1 (all shared) | Similar shared quota model |
 | Unknown | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as a safe default |
 
-The mapping function is ~20 lines. The window key is derived from HTTP method + URL pattern, which ocync already tracks in request labels.
+The mapping function is ~20 lines. The window key is derived from HTTP method + URL pattern, which `ocync` already tracks in request labels.
 
 ### Budget circuit breaker
 
@@ -149,7 +149,7 @@ The greedy set-cover provably covers every shared blob. No "uncovered follower" 
 
 AWS launched opt-in `BLOB_MOUNTING` account setting in January 2026. Enable via `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`. Mount POST returns 201 when all conditions are met: BLOB_MOUNTING is ENABLED on the account, the source blob is referenced by a committed manifest (standalone blobs without manifests return 202), the `from` parameter specifies the source repo name, and both repos have identical encryption config (AES256 default works). Requirements: same account + region, identical encryption config, pusher needs `ecr:GetDownloadUrlForLayer` on source repo. Not supported for pull-through cache repos.
 
-`ProviderKind::fulfills_cross_repo_mount()` uses an exhaustive `match` so adding a new provider forces a compile-time decision. When blob mounting is not enabled for a provider, `blob_mount` short-circuits without issuing the POST, saving one round-trip per shared blob per target.
+`ProviderKind::fulfills_cross_repo_mount()` uses an exhaustive `match` so adding a new provider forces a compile-time decision. Currently all providers return `true` (mount is always attempted); the 202 fallback is cheap (~100ms) and successful mounts save entire blob uploads.
 
 ### Measured impact
 
@@ -374,7 +374,7 @@ No existing OCI transfer tool implements the combination of pipelining, adaptive
 |---|---|---|
 | skopeo | Persistent `BlobInfoCache` in BoltDB | Validates persistent cache tier. Only tool with cross-run blob knowledge. No cross-image dedup within a run, no pipelining |
 | Nydus | Persistent content-addressable blob cache | Second validation of persistent cache, more sophisticated than skopeo. Confirms content-addressable staging is a proven pattern |
-| regsync | Proactive `reqPerSec` pacing, `ratelimit-remaining` header parsing | Validates rate pacing. Nobody does adaptive/AIMD. regsync pauses proactively but does not adapt window size |
+| `regsync` | Proactive `reqPerSec` pacing, `ratelimit-remaining` header parsing | Validates rate pacing. Nobody does adaptive/AIMD. `regsync` pauses proactively but does not adapt window size |
 | containerd | Mandatory local content-addressable store, `StatusTracker` for cross-image push dedup | Validates local caching model and within-run dedup. Our approach is selective (multi-target only), not mandatory |
 | crane | `MultiWrite` with in-memory `sync.Map` cross-image blob dedup | Validates within-run dedup. No persistence, no pipelining, no adaptive concurrency |
 | Buildkit | Intra-image layer push pipelining | Only tool with any form of pipelining, but within a single image, not across images. Confirms pipelining is valuable even at the single-image scale |
