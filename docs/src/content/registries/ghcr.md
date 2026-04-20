@@ -26,6 +26,10 @@ GHCR has a known issue with multi-PATCH chunked uploads: the last PATCH overwrit
 
 GHCR supports cross-repo blob mounting within the same organization/user namespace.
 
+## Rate limits
+
+GHCR rate limits are tied to your GitHub account's API rate limit and Actions minutes/storage quotas. `ocync` tracks GHCR rate limits via the `X-RateLimit-Remaining` response header.
+
 ## Example config
 
 ```yaml

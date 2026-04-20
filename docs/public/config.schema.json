@@ -1,0 +1,486 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Config",
+  "type": "object",
+  "required": [
+    "mappings"
+  ],
+  "properties": {
+    "defaults": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DefaultsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "global": {
+      "description": "Global engine settings applied across all syncs.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/GlobalConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "mappings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/MappingConfig"
+      }
+    },
+    "registries": {
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/RegistryConfig"
+      }
+    },
+    "target_groups": {
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "definitions": {
+    "AuthType": {
+      "description": "Authentication method for a registry.",
+      "oneOf": [
+        {
+          "description": "AWS ECR token exchange.",
+          "type": "string",
+          "enum": [
+            "ecr"
+          ]
+        },
+        {
+          "description": "Google Cloud artifact/container registry.",
+          "type": "string",
+          "enum": [
+            "gcr"
+          ]
+        },
+        {
+          "description": "Azure Container Registry.",
+          "type": "string",
+          "enum": [
+            "acr"
+          ]
+        },
+        {
+          "description": "GitHub Container Registry (`GITHUB_TOKEN`).",
+          "type": "string",
+          "enum": [
+            "ghcr"
+          ]
+        },
+        {
+          "description": "Anonymous (token exchange only).",
+          "type": "string",
+          "enum": [
+            "anonymous"
+          ]
+        },
+        {
+          "description": "HTTP basic auth.",
+          "type": "string",
+          "enum": [
+            "basic"
+          ]
+        },
+        {
+          "description": "Pre-obtained bearer token (PAT, CI token).",
+          "type": "string",
+          "enum": [
+            "static_token"
+          ]
+        },
+        {
+          "description": "Docker config.json credential store.",
+          "type": "string",
+          "enum": [
+            "docker_config"
+          ]
+        }
+      ]
+    },
+    "BasicCredentials": {
+      "description": "Credentials for HTTP Basic authentication.",
+      "type": "object",
+      "required": [
+        "password",
+        "username"
+      ],
+      "properties": {
+        "password": {
+          "description": "Password or access token.",
+          "type": "string"
+        },
+        "username": {
+          "description": "Username for authentication.",
+          "type": "string"
+        }
+      }
+    },
+    "DefaultsConfig": {
+      "type": "object",
+      "properties": {
+        "platforms": {
+          "description": "Platform filter applied to all mappings unless overridden.\n\nEach entry must be `os/arch` or `os/arch/variant` (e.g. `linux/amd64`, `linux/arm/v7`).",
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "skip_existing": {
+          "description": "When `true`, mappings that already exist at the target are skipped without re-syncing.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "source": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tags": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TagsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targets": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TargetsValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GlobOrList": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "GlobalConfig": {
+      "description": "Global engine settings that apply across all sync operations.",
+      "type": "object",
+      "properties": {
+        "cache_dir": {
+          "description": "Cache directory for persistent cache and blob staging.\n\nDefaults to a directory next to the config file when not specified.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cache_ttl": {
+          "description": "Warm cache TTL as a human-readable duration (e.g. \"12h\", \"30m\").\n\n`\"0\"` disables TTL-based expiry (cache never expires by age; lazy invalidation only). Defaults to `\"12h\"` when not specified.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_concurrent_transfers": {
+          "description": "Maximum concurrent image syncs (default: 50).",
+          "default": 50,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "staging_size_limit": {
+          "description": "Disk staging size limit as a human-readable size (e.g. \"2GB\", \"500MB\").\n\nUses SI decimal prefixes: 1 GB = 1,000,000,000 bytes. `0` disables disk staging. When absent, no eviction is performed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "MappingConfig": {
+      "type": "object",
+      "required": [
+        "from"
+      ],
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "platforms": {
+          "description": "Platform filter for this mapping, overriding any value in `defaults`.\n\nEach entry must be `os/arch` or `os/arch/variant` (e.g. `linux/amd64`, `linux/arm/v7`).",
+          "default": null,
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "skip_existing": {
+          "description": "When `true`, this mapping is skipped if the image already exists at the target, overriding any value in `defaults`.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "source": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tags": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TagsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targets": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TargetsValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "to": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "RegistryConfig": {
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "auth_type": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AuthType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "credentials": {
+          "description": "Credentials for Basic auth (`auth_type: basic`).",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BasicCredentials"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_concurrent": {
+          "description": "Per-registry aggregate concurrency cap (default: 50).\n\nLimits the total number of simultaneous in-flight HTTP requests to this registry across all action types. This is independent of the global `max_concurrent_transfers` (which caps image-level parallelism).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "token": {
+          "description": "Bearer token for static token auth (`auth_type: static_token`).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "SemverPrerelease": {
+      "description": "How to handle semver pre-release tags.",
+      "oneOf": [
+        {
+          "description": "Include pre-release tags in results.",
+          "type": "string",
+          "enum": [
+            "include"
+          ]
+        },
+        {
+          "description": "Exclude pre-release tags from results.",
+          "type": "string",
+          "enum": [
+            "exclude"
+          ]
+        },
+        {
+          "description": "Return only pre-release tags.",
+          "type": "string",
+          "enum": [
+            "only"
+          ]
+        }
+      ]
+    },
+    "SortOrder": {
+      "description": "Sort order for the final tag list.",
+      "oneOf": [
+        {
+          "description": "Sort by semantic version (highest first).",
+          "type": "string",
+          "enum": [
+            "semver"
+          ]
+        },
+        {
+          "description": "Sort alphabetically (highest first).",
+          "type": "string",
+          "enum": [
+            "alpha"
+          ]
+        }
+      ]
+    },
+    "TagsConfig": {
+      "type": "object",
+      "properties": {
+        "exclude": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GlobOrList"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "glob": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GlobOrList"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "latest": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "min_tags": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "semver": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "semver_prerelease": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SemverPrerelease"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sort": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SortOrder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TargetsValue": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -52,7 +52,7 @@ The naive approach to sync is three sequential phases: discover all images, plan
                      |   Source manifest pull + target HEAD per tag    |
                      |            |                                    |
                      |            v                                    |
-                     |   Pending queue (VecDeque<ActiveItem>)          |
+                     |   Pending queue (VecDeque<TransferTask>)         |
                      |            |                                    |
                      |            v                                    |
                      | Execution pool (FuturesUnordered):              |
@@ -249,7 +249,7 @@ Registries vary in upload protocol support. `ocync` adapts automatically:
 | ECR, Docker Hub, Harbor, Quay | POST + streaming PUT | 2 | Default path |
 | GHCR | POST + single PATCH + PUT | 3 | Multi-PATCH broken (last chunk overwrites all previous) |
 | GAR | POST + buffered monolithic PUT | 2 | No PATCH support at all |
-| ACR | POST + chunked PATCH + PUT | 3 | Streaming PUT body limit ~20 MB; chunked for larger blobs |
+| ACR | POST + streaming PUT | 2 | Known ~20 MB body limit; chunked PATCH not yet implemented |
 
 ## Registry behavior
 
@@ -325,7 +325,7 @@ Default drain deadline: 25 seconds, chosen to fit within Kubernetes' default 30-
 | **Watch** | `Deployment` + `ocync watch` | Continuous sync with health endpoints and config reload |
 | **One-shot** | `Job` | CI-triggered, manual, or initial seeding |
 
-Watch mode exposes `/healthz` (liveness) and `/readyz` (readiness) endpoints. Readiness reports 503 if the last sync cycle did not complete within `2 * interval`. SIGHUP triggers config reload without restart.
+Watch mode exposes `/healthz` (liveness) and `/readyz` (readiness) endpoints.
 
 ### FIPS 140-3
 
@@ -336,6 +336,8 @@ Linux binaries use `x86_64-unknown-linux-gnu` (not musl) because FIPS certificat
 At startup, `install_crypto_provider()` registers `aws-lc-rs` as the process-wide rustls crypto provider. The call is idempotent; subsequent calls are silently ignored. When built with `--features fips`, the provider uses the FIPS-validated aws-lc module; with `--features non-fips`, it uses the standard aws-lc backend.
 
 macOS and Windows builds use `--no-default-features --features non-fips` (standard aws-lc-rs without FIPS mode) since FIPS certification is only relevant for Linux server deployments.
+
+> **Status: Planned.** The features in this section are designed but not yet implemented.
 
 ## OCI artifacts and referrers
 
@@ -453,6 +455,8 @@ The source image index is pulled in full, filtered to the requested platforms, a
 If a requested platform is not available in the source image index, `ocync` logs a WARNING and continues with the platforms that are available. A source image that offers `linux/amd64` but not `linux/arm64` will sync the amd64 platform and warn about the missing arm64 entry.
 
 If **zero** requested platforms match any manifest in the source index, `ocync` returns an error with actionable context: the configured platform filter, the platforms actually available in the source index, and the source reference. An empty filtered index is never pushed to targets because it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading into an unusable state.
+
+> **Status: Planned.** The `immutable_tags` optimization described below is designed but not yet implemented. `skip_existing` and default HEAD + digest compare are implemented.
 
 ## Skip optimization hierarchy
 

@@ -17,7 +17,7 @@ As of 2025, Docker Hub enforces these limits:
 | Access | Limit |
 |---|---|
 | Anonymous | 10 manifest pulls/hour |
-| Authenticated (free) | 100 manifest pulls/hour |
+| Authenticated (free) | 100 manifest pulls/6 hours |
 | Paid plans | Higher limits |
 
 **What counts:**
@@ -36,7 +36,8 @@ Docker Hub supports cross-repo blob mounting. `ocync` automatically uses this wh
 ```yaml
 registries:
   dockerhub:
-    url: registry-1.docker.io
+    url: docker.io
+    auth_type: basic
     credentials:
       username: ${DOCKER_USERNAME}
       password: ${DOCKER_PASSWORD}

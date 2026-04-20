@@ -24,9 +24,41 @@ ocync version                           Print version and build info
 
 | Flag | Description |
 |---|---|
-| `-v`, `-vv`, `-vvv` | Increase log verbosity |
+| `-v` / `--verbose` | Increase log verbosity (`-v` debug, `-vv` trace) |
 | `-q`, `--quiet` | Suppress all output except errors |
 | `--log-format` | Set log format: `text` (default) or `json` (auto-detected in Kubernetes) |
+
+## sync
+
+Sync images defined in a config file:
+
+```bash
+ocync sync -c config.yaml
+ocync sync -c config.yaml --dry-run
+ocync sync -c config.yaml --json
+```
+
+| Flag | Description |
+|---|---|
+| `-c`, `--config` | Path to sync config file (required) |
+| `--dry-run` | Preview what would sync without making changes |
+| `--json` | Output sync report as JSON to stdout |
+
+## copy
+
+Copy a single image between registries:
+
+```bash
+ocync copy cgr.dev/chainguard/nginx:latest \
+    123456789012.dkr.ecr.us-east-1.amazonaws.com/nginx:latest
+```
+
+| Argument | Description |
+|---|---|
+| `<source>` | Source image reference with tag (required) |
+| `<destination>` | Destination image reference (required) |
+
+The source reference must include a tag. The destination tag defaults to the source tag if omitted.
 
 ## tags
 
@@ -91,6 +123,19 @@ ocync expand config.yaml --show-secrets
 | Flag | Description |
 |---|---|
 | `--show-secrets` | Show credential values instead of redacting them. Do not use when stdout is piped to a file or logging system |
+
+## auth check
+
+Verify registry credentials for all registries in a config:
+
+```bash
+ocync auth check -c config.yaml
+ocync auth check -c config.yaml -c config2.yaml
+```
+
+| Flag | Description |
+|---|---|
+| `-c`, `--config` | Path to config file (required, repeatable for multiple configs) |
 
 ## Exit codes
 

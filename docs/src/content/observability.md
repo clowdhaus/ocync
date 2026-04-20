@@ -29,10 +29,10 @@ Control verbosity with `-v` flags:
 
 | Level | Flag | Output |
 |---|---|---|
-| Error | (default) | Errors only |
-| Warn | `-v` | Warnings and errors |
-| Info | `-vv` | Sync progress, auth events |
-| Debug | `-vvv` | HTTP requests, cache decisions |
+| Info | (default) | Sync progress and results |
+| Debug | `-v` | Auth events, cache decisions, per-image detail |
+| Trace | `-vv` | HTTP requests, detailed internals |
+| Error | `-q` / `--quiet` | Errors only |
 
 ### Log format
 

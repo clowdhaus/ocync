@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -89,7 +90,7 @@ pub(crate) enum ConfigError {
 // Top-level config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct Config {
     /// Global engine settings applied across all syncs.
     #[serde(default)]
@@ -112,7 +113,7 @@ pub(crate) struct Config {
 // ---------------------------------------------------------------------------
 
 /// Global engine settings that apply across all sync operations.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct GlobalConfig {
     /// Maximum concurrent image syncs (default: 50).
     #[serde(default = "default_max_concurrent_transfers")]
@@ -156,7 +157,7 @@ impl Default for GlobalConfig {
 // ---------------------------------------------------------------------------
 
 /// Authentication method for a registry.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AuthType {
     /// AWS ECR token exchange.
@@ -178,7 +179,7 @@ pub(crate) enum AuthType {
     DockerConfig,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 pub(crate) struct RegistryConfig {
     pub url: String,
 
@@ -214,7 +215,7 @@ impl std::fmt::Debug for RegistryConfig {
 }
 
 /// Credentials for HTTP Basic authentication.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 pub(crate) struct BasicCredentials {
     /// Username for authentication.
     pub username: String,
@@ -235,7 +236,7 @@ impl std::fmt::Debug for BasicCredentials {
 // Defaults
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct DefaultsConfig {
     #[serde(default)]
     pub source: Option<String>,
@@ -263,7 +264,7 @@ pub(crate) struct DefaultsConfig {
 // Mappings
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct MappingConfig {
     pub from: String,
 
@@ -296,7 +297,7 @@ pub(crate) struct MappingConfig {
 // TargetsValue - single group name or inline list
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub(crate) enum TargetsValue {
     Group(String),
@@ -307,7 +308,7 @@ pub(crate) enum TargetsValue {
 // Tags
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct TagsConfig {
     #[serde(default)]
     pub glob: Option<GlobOrList>,
@@ -331,7 +332,7 @@ pub(crate) struct TagsConfig {
     pub min_tags: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub(crate) enum GlobOrList {
     Single(String),
@@ -676,6 +677,73 @@ fn validate_references(config: &Config) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SCHEMA_JSON_PATH: &str = "docs/public/config.schema.json";
+    const SCHEMA_MD_PATH: &str = "docs/src/content/configuration.md";
+    const SCHEMA_MD_START: &str = "<!-- BEGIN GENERATED SCHEMA -->";
+    const SCHEMA_MD_END: &str = "<!-- END GENERATED SCHEMA -->";
+
+    fn generate_schema_json() -> String {
+        let schema = schemars::schema_for!(Config);
+        serde_json::to_string_pretty(&schema).unwrap()
+    }
+
+    /// Verify the committed JSON schema matches the current config types.
+    ///
+    /// If this test fails, regenerate with:
+    /// ```bash
+    /// cargo test --package ocync -- update_json_schema --ignored
+    /// ```
+    #[test]
+    fn json_schema_up_to_date() {
+        let expected = generate_schema_json();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // Check static JSON file.
+        let json_path = root.join(SCHEMA_JSON_PATH);
+        let committed_json = std::fs::read_to_string(&json_path).unwrap_or_default();
+        assert_eq!(
+            committed_json.trim(),
+            expected.trim(),
+            "config.schema.json is out of date. Run: cargo test --package ocync -- update_json_schema --ignored"
+        );
+
+        // Check embedded schema in configuration.md.
+        let md_path = root.join(SCHEMA_MD_PATH);
+        let md = std::fs::read_to_string(&md_path).unwrap();
+        let embedded = md
+            .split(SCHEMA_MD_START)
+            .nth(1)
+            .and_then(|s| s.split(SCHEMA_MD_END).next())
+            .unwrap_or("");
+        assert!(
+            embedded.contains(&expected),
+            "configuration.md schema is out of date. Run: cargo test --package ocync -- update_json_schema --ignored"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn update_json_schema() {
+        let json = generate_schema_json();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        // Write static JSON file.
+        let json_path = root.join(SCHEMA_JSON_PATH);
+        std::fs::write(&json_path, format!("{json}\n")).unwrap();
+
+        // Update embedded schema in configuration.md.
+        let md_path = root.join(SCHEMA_MD_PATH);
+        let md = std::fs::read_to_string(&md_path).unwrap();
+        let before = md.split(SCHEMA_MD_START).next().unwrap();
+        let after = md.split(SCHEMA_MD_END).nth(1).unwrap();
+        let updated = format!(
+            "{before}{start}\n\n```json\n{json}\n```\n\n{end}{after}",
+            start = SCHEMA_MD_START,
+            end = SCHEMA_MD_END,
+        );
+        std::fs::write(&md_path, updated).unwrap();
+    }
 
     // - Deserialization ----------------------------------------------------
 

@@ -2,10 +2,16 @@
 
 Sync OCI container images across registries - efficiently.
 
+<p align="center">
+  <img src="docs/public/ecr-banner.svg" alt="ocync - 4x faster, 40% fewer requests, 0 rate-limit errors" width="900">
+</p>
+
 [![CI](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml/badge.svg)](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2025/06/26/Rust-1.94.0.html)
+[![ECR Public](https://img.shields.io/badge/ECR_Public-clowdhaus%2Focync-ff9900.svg?logo=amazonecs)](https://gallery.ecr.aws/clowdhaus/ocync)
 
-ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. On real-world workloads, ocync completes cold syncs 3.6-4.5x faster than comparable tools with up to 38% fewer API requests.
+ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. On real-world workloads, ocync completes cold syncs 3.6-4.5x faster than comparable tools with up to 40% fewer API requests.
 
 ## Features
 
@@ -118,10 +124,10 @@ Full documentation at [clowdhaus.github.io/ocync](https://clowdhaus.github.io/oc
 | Amazon ECR (private) | IAM (automatic) | Yes (opt-in) | Batch APIs, per-action rate limits |
 | Amazon ECR Public | IAM (automatic) | Yes | Separate auth from private ECR |
 | Chainguard | Token exchange | N/A (source) | No rate limits |
-| Docker Hub | Docker config / static | Yes | 100/hr authenticated manifest GETs; HEADs free |
+| Docker Hub | Docker config / static | Yes | 100/6hr authenticated manifest GETs; HEADs free |
 | GitHub Container Registry | Docker config | Yes | Single-PATCH upload fallback |
 | Google Artifact Registry | Docker config | Yes | Monolithic upload only |
-| Azure Container Registry | Docker config | Yes | Chunked upload for blobs >20 MB |
+| Azure Container Registry | Docker config | Yes | Streaming PUT (chunked upload planned) |
 | Any OCI-compliant registry | Basic / token / anonymous | Varies | Auto-detected |
 
 ## License

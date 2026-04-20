@@ -11,7 +11,7 @@ use crate::bench::proxy::ProxyMetrics;
 /// Compact run record for the per-registry JSON archive.
 ///
 /// One record per benchmark execution. Designed for source control:
-/// small enough to accumulate, rich enough to cite in docs/findings.md.
+/// small enough to accumulate, rich enough to cite in docs/performance.md.
 ///
 /// When adding new fields, use `#[serde(default)]` so that old records
 /// (which lack the field) still deserialize.

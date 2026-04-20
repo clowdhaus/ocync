@@ -11,7 +11,7 @@ ECR uses IAM credentials via the AWS SDK. `ocync` auto-detects ECR from the host
 - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
 - AWS config file (`~/.aws/config`)
 - Instance/task role (EC2, ECS, Lambda)
-- IRSA (EKS service account)
+- EKS Pod Identity or IRSA (EKS service account)
 
 No Docker config or static credentials needed.
 

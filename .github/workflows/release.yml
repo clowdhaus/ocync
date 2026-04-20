@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   id-token: write
+  attestations: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -19,9 +20,26 @@ env:
   IMAGE_NAME: ocync
 
 jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check tag matches Cargo.toml
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          CARGO_VERSION="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)"
+          TAG_VERSION="${TAG_VERSION#v}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag v${TAG_VERSION} does not match Cargo.toml version ${CARGO_VERSION}"
+            exit 1
+          fi
+
   build-linux:
     name: Build Linux (${{ matrix.artifact }})
     runs-on: ${{ matrix.runner }}
+    needs: validate
     strategy:
       matrix:
         include:
@@ -32,7 +50,7 @@ jobs:
             runner: ubuntu-24.04-arm
             artifact: ocync-fips-linux-arm64
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-rust
       - name: Build
         env:
@@ -43,7 +61,7 @@ jobs:
         run: "! readelf -d target/${{ matrix.target }}/release/ocync | grep -q NEEDED"
       - name: Rename binary
         run: mv target/${{ matrix.target }}/release/ocync ${{ matrix.artifact }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -51,14 +69,15 @@ jobs:
   build-macos:
     name: Build macOS (arm64)
     runs-on: macos-latest
+    needs: validate
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-rust
       - name: Build
         run: cargo build --release --locked --no-default-features --features non-fips
       - name: Rename binary
         run: mv target/release/ocync ocync-macos-arm64
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ocync-macos-arm64
           path: ocync-macos-arm64
@@ -66,15 +85,16 @@ jobs:
   build-windows:
     name: Build Windows (amd64)
     runs-on: windows-latest
+    needs: validate
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-rust
       - name: Build
         run: cargo build --release --locked --no-default-features --features non-fips
       - name: Rename binary
         shell: bash
         run: mv target/release/ocync.exe ocync-windows-amd64.exe
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ocync-windows-amd64
           path: ocync-windows-amd64.exe
@@ -82,6 +102,7 @@ jobs:
   docker:
     name: Docker (${{ matrix.suffix }})
     runs-on: ${{ matrix.runner }}
+    needs: validate
     strategy:
       matrix:
         include:
@@ -92,9 +113,9 @@ jobs:
             runner: ubuntu-24.04-arm
             suffix: arm64
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
         with:
           role-to-assume: ${{ secrets.ECR_PUBLIC_ROLE_ARN }}
           aws-region: us-east-1
@@ -115,8 +136,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: docker
     steps:
+      - uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
         with:
           role-to-assume: ${{ secrets.ECR_PUBLIC_ROLE_ARN }}
           aws-region: us-east-1
@@ -145,15 +167,22 @@ jobs:
             "$REGISTRY:$VERSION-fips-amd64" \
             "$REGISTRY:$VERSION-fips-arm64"
           docker manifest push "$REGISTRY:latest-fips"
+      - name: Sign container images
+        env:
+          REGISTRY: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          cosign sign --yes "$REGISTRY:$VERSION-fips"
+          cosign sign --yes "$REGISTRY:latest-fips"
 
   helm:
     name: Helm
     runs-on: ubuntu-24.04
     needs: docker-manifest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
         with:
           role-to-assume: ${{ secrets.ECR_PUBLIC_ROLE_ARN }}
           aws-region: us-east-1
@@ -179,8 +208,10 @@ jobs:
       - docker-manifest
       - helm
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
@@ -188,10 +219,20 @@ jobs:
         run: |
           cd artifacts
           sha256sum ocync-* > sha256sums.txt
-      - name: Create release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          generate_release_notes: true
+          subject-path: artifacts/ocync-*
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@c93ef52f3d0ddcdcc9bd5447d98d458a11cd4f72 # v4.7.1
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+      - name: Create release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          body: ${{ steps.cliff.outputs.content }}
           files: |
             artifacts/ocync-*
             artifacts/sha256sums.txt

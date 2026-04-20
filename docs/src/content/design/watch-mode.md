@@ -91,6 +91,8 @@ The discovery cache hit/miss decision is orthogonal to the image skip reason. A 
 
 ### SIGHUP cache clearing
 
+> **Status: Planned.** SIGHUP handling is designed but not yet implemented. The tag digest cache and discovery optimization described in this document are implemented.
+
 On SIGHUP config reload, the tag digest cache is cleared to force full source re-verification. Platform filter changes are detected by the platform_filter_key, but other config changes (source registry URL, repository mappings) could make cached entries stale. The blob dedup map is preserved across SIGHUP since blob existence is independent of config.
 
 End-of-cycle pruning evicts entries for tags no longer present in the resolved mapping, preventing unbounded cache growth when source tags are deleted or tag filters change.
@@ -142,6 +144,8 @@ Optimization HEADs participate in the AIMD congestion window for the ManifestHea
 
 ### Relationship to head_first
 
+> **Status: Planned.** The `head_first` per-registry option is designed but not yet implemented. The discovery HEAD optimization described above is implemented.
+
 The transfer optimization spec defines a per-registry `head_first` option to conserve rate-limit tokens. The discovery HEAD serves a different purpose: detecting source changes cheaply. These are independent features that happen to use the same HTTP method. When both are active, the discovery HEAD result is reused to avoid a redundant second HEAD.
 
 ## Steady-state savings
@@ -180,7 +184,7 @@ For CronJob + PVC deployments, the pod mounts a ReadWriteOnce PVC and the cache 
 
 ### Cache format versioning
 
-The tag digest cache extends the existing transfer state cache format. The cache version increments from v1 to v2, with the new source snapshot map appended after the existing blob dedup map. Reads accept both v1 and v2: a v1 cache loads with an empty snapshot map, preserving blob dedup data across the version transition. An older binary encountering a v2 cache falls back to empty cache, which is the existing behavior for version mismatches. The same TTL and atomic write (tmp + rename + fsync) apply to both sections.
+The tag digest cache extends the existing transfer state cache format. The cache version will increment from v1 to v2 when the source snapshot map is added, with the new source snapshot map appended after the existing blob dedup map. Reads accept both v1 and v2: a v1 cache loads with an empty snapshot map, preserving blob dedup data across the version transition. An older binary encountering a v2 cache falls back to empty cache, which is the existing behavior for version mismatches. The same TTL and atomic write (tmp + rename + fsync) apply to both sections.
 
 ### Observability
 

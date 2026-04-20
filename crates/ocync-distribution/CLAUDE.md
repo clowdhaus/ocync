@@ -28,7 +28,7 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 - Default: POST + streaming PUT with `Transfer-Encoding: chunked` (2 requests/blob).
 - GHCR: multi-PATCH chunked broken (last PATCH overwrites previous). Client falls back to single PATCH + PUT.
 - GAR: no chunked uploads. Client buffers full blob, monolithic PUT.
-- ACR: requires chunked PATCH for blobs > 20 MB (streaming PUT body limit ~20 MB).
+- ACR: known ~20 MB streaming PUT body limit. Chunked PATCH fallback not yet implemented.
 
 ## Cross-repo mount
 
@@ -39,7 +39,7 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 ## Dependencies
 
 - `default-features = false` everywhere; justify every new dep.
-- `reqwest` needs `system-proxy` + `rustls-tls-native-roots` or proxy/trust-store is silently disabled.
+- `reqwest` needs `system-proxy` + `rustls-tls-native-roots-no-provider` or proxy/trust-store is silently disabled.
 - Crypto backend: `fips` vs `non-fips` feature flags (unavoidable platform linking).
 
 ## Testing

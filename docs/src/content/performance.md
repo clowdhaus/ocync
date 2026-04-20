@@ -23,6 +23,48 @@ Measured 2026-04-19 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps). F
 | Rate-limit 429s | **0** | **0** | **0** |
 <!-- BENCH:END -->
 
+## How tools compare
+
+### Upload strategy
+
+| Tool | Strategy | Requests/blob | Buffering |
+|------|---------|:---:|-----------|
+| `ocync` | POST + streaming PUT | **2** | None (streamed) |
+| containerd | POST + streaming PUT | 2 | None (io.Pipe) |
+| regsync (regclient) | POST + PUT | 2 | Full blob in memory |
+| crane (go-containerregistry) | POST + streaming PATCH + PUT | 3 | None (streamed) |
+| skopeo (containers/image) | POST + PATCH + PUT | 3 | None (streamed) |
+
+### Concurrency and rate limiting
+
+| Tool | Default concurrency | Adaptive backoff | Rate limit strategy |
+|------|:---:|:---:|-----|
+| `ocync` | 50 ([AIMD](../design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](../design/overview#adaptive-concurrency-aimd) congestion control on 429 |
+| containerd | 5 layers | No | Lock-based dedup, no 429 handling |
+| regsync | 3 per registry | No | Reads `ratelimit-remaining` header, pauses proactively |
+| crane | 4 jobs | Retry with backoff (1s, 3s) | Retry on 408/429/5xx, 3 attempts |
+| skopeo | per-image flag | No | No retry, aborts on 429 |
+
+### Blob deduplication
+
+| Tool | Cross-image push dedup | Cross-image pull dedup | Persistent cache |
+|------|:---:|:---:|:---:|
+| `ocync` | Yes (TransferStateCache) | Yes (BlobStage) | Yes (postcard binary) |
+| containerd | Yes (StatusTracker) | No | No |
+| regsync | No | No | No (in-memory only) |
+| crane | Yes (sync.Map by digest) | No | No |
+| skopeo | No | No | BoltDB BlobInfoCache (mount hints) |
+
+### Warm sync efficiency
+
+| Tool | Requests | Bytes | Wall clock | How |
+|------|:---:|:---:|:---:|-----|
+| `ocync` | 81 | 371 KB | **2.5s** | Persistent cache skips blob I/O |
+| regsync | **27** | **27 KB** | 4s | Manifest digest comparison only |
+| dregsy | 200 | 163 KB | 5.2s | Re-HEADs all blobs |
+
+Measured 2026-03 on a 5-image Jupyter corpus to ECR, before source-pull deduplication.
+
 ## Why `ocync` is fast
 
 ### Pipelined architecture
@@ -31,7 +73,7 @@ Discovery and execution overlap. While images are being transferred, `ocync` is 
 
 ### Global blob deduplication
 
-Container images share layers heavily. A sync run touching 42 images may reference only a fraction as many unique blobs. `ocync` tracks every blob globally and transfers each unique blob exactly once.
+Container images share layers heavily. A sync run touching 39 images may reference only a fraction as many unique blobs. `ocync` tracks every blob globally and transfers each unique blob exactly once.
 
 ### Cross-repo blob mounting
 
