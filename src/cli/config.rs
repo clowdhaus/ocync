@@ -90,21 +90,26 @@ pub(crate) enum ConfigError {
 // Top-level config
 // ---------------------------------------------------------------------------
 
+/// Top-level configuration defining registries, mappings, and sync behavior.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct Config {
     /// Global engine settings applied across all syncs.
     #[serde(default)]
     pub global: Option<GlobalConfig>,
 
+    /// Named registry definitions keyed by alias.
     #[serde(default)]
     pub registries: HashMap<String, RegistryConfig>,
 
+    /// Named groups of registry aliases for multi-target fanout.
     #[serde(default)]
     pub target_groups: HashMap<String, Vec<String>>,
 
+    /// Default source, targets, tags, and platforms inherited by all mappings.
     #[serde(default)]
     pub defaults: Option<DefaultsConfig>,
 
+    /// Image mapping rules defining what to sync and where.
     pub mappings: Vec<MappingConfig>,
 }
 
@@ -179,10 +184,13 @@ pub(crate) enum AuthType {
     DockerConfig,
 }
 
+/// Per-registry settings: URL, auth method, concurrency, and credentials.
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub(crate) struct RegistryConfig {
+    /// Registry base URL (e.g. `registry-1.docker.io`, `123456789012.dkr.ecr.us-east-1.amazonaws.com`).
     pub url: String,
 
+    /// Authentication method to use for this registry.
     #[serde(default)]
     pub auth_type: Option<AuthType>,
 
@@ -236,14 +244,18 @@ impl std::fmt::Debug for BasicCredentials {
 // Defaults
 // ---------------------------------------------------------------------------
 
+/// Default values inherited by all mappings unless individually overridden.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct DefaultsConfig {
+    /// Default source registry alias for all mappings.
     #[serde(default)]
     pub source: Option<String>,
 
+    /// Default target registry alias or group for all mappings.
     #[serde(default)]
     pub targets: Option<TargetsValue>,
 
+    /// Default tag filter rules inherited by mappings without their own.
     #[serde(default)]
     pub tags: Option<TagsConfig>,
 
@@ -259,19 +271,25 @@ pub(crate) struct DefaultsConfig {
 // Mappings
 // ---------------------------------------------------------------------------
 
+/// A single image mapping rule: source repo, target registries, and tag filters.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct MappingConfig {
+    /// Source repository path (e.g. `library/nginx`).
     pub from: String,
 
+    /// Destination repository path; defaults to `from` when absent.
     #[serde(default)]
     pub to: Option<String>,
 
+    /// Source registry alias, overriding `defaults.source`.
     #[serde(default)]
     pub source: Option<String>,
 
+    /// Target registry alias or group, overriding `defaults.targets`.
     #[serde(default)]
     pub targets: Option<TargetsValue>,
 
+    /// Tag filter rules for this mapping, overriding `defaults.tags`.
     #[serde(default)]
     pub tags: Option<TagsConfig>,
 
@@ -287,10 +305,13 @@ pub(crate) struct MappingConfig {
 // TargetsValue - single group name or inline list
 // ---------------------------------------------------------------------------
 
+/// Target specification: either a named group or an inline list of registry aliases.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub(crate) enum TargetsValue {
+    /// A single target group name defined in `target_groups`.
     Group(String),
+    /// An inline list of registry aliases.
     List(Vec<String>),
 }
 
@@ -298,34 +319,45 @@ pub(crate) enum TargetsValue {
 // Tags
 // ---------------------------------------------------------------------------
 
+/// Tag filter and selection rules for a mapping.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct TagsConfig {
+    /// Include tags matching one or more glob patterns.
     #[serde(default)]
     pub glob: Option<GlobOrList>,
 
+    /// Include tags matching a semver range (e.g. `>=1.0, <2.0`).
     #[serde(default)]
     pub semver: Option<String>,
 
+    /// Whether to include or exclude semver pre-release tags.
     #[serde(default)]
     pub semver_prerelease: Option<SemverPrerelease>,
 
+    /// Exclude tags matching one or more glob patterns.
     #[serde(default)]
     pub exclude: Option<GlobOrList>,
 
+    /// Sort order applied before `latest` truncation.
     #[serde(default)]
     pub sort: Option<SortOrder>,
 
+    /// Keep only the N most recent tags after sorting.
     #[serde(default)]
     pub latest: Option<usize>,
 
+    /// Minimum number of tags to retain regardless of filters.
     #[serde(default)]
     pub min_tags: Option<usize>,
 }
 
+/// A glob pattern: either a single string or a list of patterns.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub(crate) enum GlobOrList {
+    /// A single glob pattern string.
     Single(String),
+    /// Multiple glob pattern strings.
     List(Vec<String>),
 }
 

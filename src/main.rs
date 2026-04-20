@@ -198,6 +198,12 @@ pub(crate) struct CopyArgs {
     pub(crate) source: Reference,
     /// Destination image reference (e.g., `ghcr.io/myorg/nginx:latest`).
     pub(crate) destination: Reference,
+    /// Config file for registry credentials.
+    ///
+    /// When provided, auth settings are looked up by matching the source
+    /// and destination hostnames against registry URLs in the config.
+    #[arg(short, long)]
+    pub(crate) config: Option<PathBuf>,
 }
 
 /// Arguments for the `tags` subcommand.
@@ -286,6 +292,12 @@ pub(crate) struct WatchArgs {
     /// Output sync reports as JSON instead of text summaries.
     #[arg(long)]
     pub(crate) json: bool,
+    /// IP address for the health endpoint to bind on.
+    ///
+    /// Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` for
+    /// container/Kubernetes deployments where probes originate externally.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub(crate) health_bind: std::net::IpAddr,
     /// Port for the health endpoint (default: 8080).
     #[arg(long, default_value = "8080")]
     pub(crate) health_port: u16,
@@ -336,7 +348,7 @@ async fn main() -> std::process::ExitCode {
         Commands::Sync(args) => {
             cli::commands::synchronize::run(&args, &*progress, Some(&shutdown), None).await
         }
-        Commands::Copy(args) => cli::commands::copy::run(&args, &*progress).await,
+        Commands::Copy(args) => cli::commands::copy::run(&args, &*progress, Some(&shutdown)).await,
         Commands::Tags(args) => cli::commands::tags::run(&args).await,
         Commands::Auth { action } => match action {
             AuthAction::Check { config } => cli::commands::auth::run_check(&config).await,
@@ -346,7 +358,7 @@ async fn main() -> std::process::ExitCode {
         Commands::Watch(args) => {
             cli::commands::watch::run(&args, &*progress, shutdown.clone()).await
         }
-        Commands::Analyze(args) => cli::commands::analyze::run(&args).await,
+        Commands::Analyze(args) => cli::commands::analyze::run(&args, &shutdown).await,
         Commands::Version => Ok(cli::commands::version::run()),
     };
 
