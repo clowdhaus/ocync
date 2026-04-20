@@ -640,13 +640,14 @@ async fn run_warm(
 
         ecr::create_repos(ecr_client, corpus).await?;
 
-        // Prime run (unmeasured).
+        // Prime run (unmeasured). Reuse the same config_dir for both
+        // runs so that ocync's TransferStateCache (keyed off config
+        // file path) persists into the measured run.
         let config_dir = tempfile::tempdir()?;
         let _prime = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
         progress(&format!("  warm: {} measuring", tool));
 
-        // Measured run.
-        let config_dir = tempfile::tempdir()?;
+        // Measured run (same config_dir -- cache is warm).
         let run = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
         progress(&format!(
             "  warm: {} complete ({:.1}s)",
@@ -684,14 +685,14 @@ async fn run_partial(
 
         ecr::create_repos(ecr_client, base_corpus).await?;
 
-        // Prime with base corpus (unmeasured).
+        // Prime with base corpus (unmeasured). Reuse the same
+        // config_dir so ocync's TransferStateCache persists.
         let config_dir = tempfile::tempdir()?;
         let _prime =
             run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
         progress(&format!("  partial: {} measuring", tool));
 
-        // Measured run with partial corpus.
-        let config_dir = tempfile::tempdir()?;
+        // Measured run with partial corpus (same config_dir).
         let run =
             run_single_tool(args, tool, partial_corpus, config_dir.path(), output_dir).await?;
         progress(&format!(
