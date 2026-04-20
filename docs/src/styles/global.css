@@ -226,8 +226,7 @@
     font-weight: 600;
     color: var(--color-text-muted);
     cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.15s, background-color 0.15s, color 0.15s;
+    transition: background-color 0.15s, color 0.15s;
 
     &:hover {
       background-color: color-mix(in srgb, var(--color-text) 20%, transparent);
@@ -239,8 +238,15 @@
     }
   }
 
-  pre:hover .copy-btn {
-    opacity: 1;
+  @media (hover: hover) {
+    .copy-btn {
+      opacity: 0;
+      transition: opacity 0.15s, background-color 0.15s, color 0.15s;
+    }
+
+    pre:hover .copy-btn {
+      opacity: 1;
+    }
   }
 
   /* Shiki dual-theme: switch dark vars when data-theme="dark" */
