@@ -54,6 +54,22 @@ pub enum Error {
         /// The underlying distribution error.
         source: ocync_distribution::Error,
     },
+
+    /// Artifact sync required but no referrers found.
+    #[error("no artifacts found for {reference} (require_artifacts is enabled)")]
+    RequiredArtifactsMissing {
+        /// The manifest reference that has no referrers.
+        reference: String,
+    },
+
+    /// Artifact discovery or transfer failed.
+    #[error("artifact sync failed for {reference}: {reason}")]
+    ArtifactSync {
+        /// The parent manifest reference.
+        reference: String,
+        /// Why the artifact sync failed.
+        reason: String,
+    },
 }
 
 impl Error {
@@ -65,6 +81,11 @@ impl Error {
             }
             _ => None,
         }
+    }
+
+    /// Whether this error represents a required-artifacts-missing condition.
+    pub fn is_required_artifacts_missing(&self) -> bool {
+        matches!(self, Self::RequiredArtifactsMissing { .. })
     }
 }
 
@@ -162,6 +183,55 @@ mod tests {
     #[test]
     fn status_code_none_for_filter_errors() {
         let err = Error::LatestWithoutSort;
+        assert_eq!(err.status_code(), None);
+    }
+
+    #[test]
+    fn display_required_artifacts_missing() {
+        let err = Error::RequiredArtifactsMissing {
+            reference: "sha256:abc123".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("sha256:abc123"));
+        assert!(msg.contains("require_artifacts"));
+    }
+
+    #[test]
+    fn display_artifact_sync_error() {
+        let err = Error::ArtifactSync {
+            reference: "sha256:def456".into(),
+            reason: "manifest pull failed".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("sha256:def456"));
+        assert!(msg.contains("manifest pull failed"));
+    }
+
+    #[test]
+    fn is_required_artifacts_missing() {
+        let err = Error::RequiredArtifactsMissing {
+            reference: "sha256:abc".into(),
+        };
+        assert!(err.is_required_artifacts_missing());
+
+        let err = Error::LatestWithoutSort;
+        assert!(
+            !err.is_required_artifacts_missing(),
+            "non-artifact error should not match"
+        );
+    }
+
+    #[test]
+    fn status_code_none_for_artifact_errors() {
+        let err = Error::RequiredArtifactsMissing {
+            reference: "sha256:abc".into(),
+        };
+        assert_eq!(err.status_code(), None);
+
+        let err = Error::ArtifactSync {
+            reference: "sha256:def".into(),
+            reason: "failed".into(),
+        };
         assert_eq!(err.status_code(), None);
     }
 }

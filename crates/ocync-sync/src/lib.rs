@@ -150,6 +150,10 @@ pub enum ErrorKind {
     ManifestPush,
     /// Blob transfer (pull, push, or mount) failed.
     BlobTransfer,
+    /// Artifact (referrer) discovery or transfer failed.
+    ArtifactSync,
+    /// Required artifacts are missing (policy enforcement).
+    RequiredArtifactsMissing,
 }
 
 impl std::fmt::Display for ErrorKind {
@@ -158,6 +162,8 @@ impl std::fmt::Display for ErrorKind {
             Self::ManifestPull => f.write_str("manifest pull"),
             Self::ManifestPush => f.write_str("manifest push"),
             Self::BlobTransfer => f.write_str("blob transfer"),
+            Self::ArtifactSync => f.write_str("artifact sync"),
+            Self::RequiredArtifactsMissing => f.write_str("required artifacts missing"),
         }
     }
 }
@@ -322,6 +328,19 @@ mod tests {
     }
 
     #[test]
+    fn error_kind_display_artifact_sync() {
+        assert_eq!(ErrorKind::ArtifactSync.to_string(), "artifact sync");
+    }
+
+    #[test]
+    fn error_kind_display_required_artifacts_missing() {
+        assert_eq!(
+            ErrorKind::RequiredArtifactsMissing.to_string(),
+            "required artifacts missing"
+        );
+    }
+
+    #[test]
     fn blob_transfer_stats_default_is_zeroed() {
         let stats = BlobTransferStats::default();
         assert_eq!(stats.transferred, 0);
@@ -342,6 +361,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ErrorKind::BlobTransfer).unwrap(),
             serde_json::Value::String("blob_transfer".into()),
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorKind::ArtifactSync).unwrap(),
+            serde_json::Value::String("artifact_sync".into()),
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorKind::RequiredArtifactsMissing).unwrap(),
+            serde_json::Value::String("required_artifacts_missing".into()),
         );
     }
 

@@ -46,6 +46,18 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
         if let Some(ref platforms) = defaults.platforms {
             validate_platforms("defaults", platforms)?;
         }
+        if let Some(ref artifacts) = defaults.artifacts {
+            validate_artifacts("defaults", artifacts)?;
+        }
+    }
+    for mapping in &config.mappings {
+        let effective = mapping
+            .artifacts
+            .as_ref()
+            .or(config.defaults.as_ref().and_then(|d| d.artifacts.as_ref()));
+        if let Some(artifacts) = effective {
+            validate_artifacts(&mapping.from, artifacts)?;
+        }
     }
     validate_references(&config)?;
 
@@ -276,6 +288,10 @@ pub(crate) struct DefaultsConfig {
     /// `linux/arm/v7`).
     #[serde(default)]
     pub platforms: Option<Vec<String>>,
+
+    /// Artifact sync configuration applied to all mappings unless overridden.
+    #[serde(default)]
+    pub artifacts: Option<ArtifactsConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +326,43 @@ pub(crate) struct MappingConfig {
     /// `linux/arm/v7`).
     #[serde(default)]
     pub platforms: Option<Vec<String>>,
+
+    /// Artifact sync configuration for this mapping, overriding `defaults.artifacts`.
+    #[serde(default)]
+    pub artifacts: Option<ArtifactsConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Artifacts
+// ---------------------------------------------------------------------------
+
+/// Configuration for OCI artifact (signatures, SBOMs, attestations) sync.
+///
+/// Controls whether referrers are discovered and transferred alongside their
+/// parent image manifests.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+pub(crate) struct ArtifactsConfig {
+    /// Whether artifact sync is enabled (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Only sync artifacts whose artifact type matches one of these MIME types.
+    #[serde(default)]
+    pub include: Vec<String>,
+
+    /// Exclude artifacts whose artifact type matches one of these MIME types.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+
+    /// When true, every synced image must have at least one referrer.
+    /// Images without referrers cause a sync failure instead of silently
+    /// producing unsigned images at the target.
+    #[serde(default)]
+    pub require_artifacts: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +634,26 @@ fn is_valid_size(s: &str) -> bool {
         }
     }
     false
+}
+
+/// Validate artifact sync configuration.
+///
+/// `require_artifacts: true` with `enabled: false` is contradictory - you
+/// cannot require artifacts while disabling their transfer.
+fn validate_artifacts(context: &str, artifacts: &ArtifactsConfig) -> Result<(), ConfigError> {
+    if artifacts.require_artifacts && !artifacts.enabled {
+        return Err(ConfigError::Validation(format!(
+            "{context}: require_artifacts is true but artifacts.enabled is false \
+             (cannot require artifacts while disabling their transfer)"
+        )));
+    }
+    if !artifacts.enabled {
+        tracing::warn!(
+            context,
+            "artifacts.enabled is false: signatures and SBOMs will be stripped from synced images"
+        );
+    }
+    Ok(())
 }
 
 fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
@@ -1072,6 +1145,7 @@ mappings:
             targets: None,
             tags: None,
             platforms: None,
+            artifacts: None,
         };
         let err = validate_mapping(&mapping, false).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
@@ -1086,6 +1160,7 @@ mappings:
             targets: None,
             tags: None,
             platforms: None,
+            artifacts: None,
         };
         validate_mapping(&mapping, true).unwrap();
     }
@@ -1102,6 +1177,7 @@ mappings:
                 ..Default::default()
             }),
             platforms: Some(vec!["linux-amd64".to_string()]),
+            artifacts: None,
         };
         let err = validate_mapping(&mapping, false).unwrap_err();
         match err {
@@ -1128,6 +1204,7 @@ mappings:
                     ..Default::default()
                 }),
                 platforms: Some(vec![platform.to_string()]),
+                artifacts: None,
             };
             validate_mapping(&mapping, false)
                 .unwrap_or_else(|e| panic!("expected valid platform '{platform}': {e}"));
@@ -1665,5 +1742,92 @@ mappings:
         let debug_output = format!("{registry:?}");
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("secret-bearer-token"));
+    }
+
+    // - ArtifactsConfig -------------------------------------------------------
+
+    #[test]
+    fn deserialize_artifacts_config() {
+        let yaml = r#"
+defaults:
+  artifacts:
+    enabled: true
+    include:
+      - "application/vnd.dev.cosign.artifact.sig.v1+json"
+    exclude:
+      - "application/spdx+json"
+    require_artifacts: false
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let artifacts = config
+            .defaults
+            .as_ref()
+            .unwrap()
+            .artifacts
+            .as_ref()
+            .unwrap();
+        assert!(artifacts.enabled);
+        assert_eq!(artifacts.include.len(), 1);
+        assert_eq!(artifacts.exclude.len(), 1);
+        assert!(!artifacts.require_artifacts);
+    }
+
+    #[test]
+    fn require_artifacts_with_disabled_is_error() {
+        let artifacts = ArtifactsConfig {
+            enabled: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            require_artifacts: true,
+        };
+        let err = validate_artifacts("test-mapping", &artifacts).unwrap_err();
+        match err {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("require_artifacts"), "msg: {msg}");
+                assert!(msg.contains("enabled"), "msg: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_artifacts_with_enabled_is_ok() {
+        let artifacts = ArtifactsConfig {
+            enabled: true,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            require_artifacts: true,
+        };
+        validate_artifacts("test-mapping", &artifacts).unwrap();
+    }
+
+    #[test]
+    fn disabled_artifacts_without_require_is_ok() {
+        let artifacts = ArtifactsConfig {
+            enabled: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            require_artifacts: false,
+        };
+        validate_artifacts("test-mapping", &artifacts).unwrap();
+    }
+
+    #[test]
+    fn artifacts_defaults_enabled() {
+        let yaml = r#"
+mappings:
+  - from: nginx
+    artifacts:
+      require_artifacts: false
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let artifacts = config.mappings[0].artifacts.as_ref().unwrap();
+        assert!(artifacts.enabled, "enabled should default to true");
     }
 }

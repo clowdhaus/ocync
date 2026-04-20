@@ -36,8 +36,8 @@ use ocync_distribution::blob::MountResult;
 use ocync_distribution::manifest::ManifestPull;
 use ocync_distribution::sha256::Sha256;
 use ocync_distribution::spec::{
-    Descriptor, ImageIndex, ImageManifest, ManifestKind, PlatformFilter, RegistryAuthority,
-    RepositoryName,
+    Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, PlatformFilter,
+    RegistryAuthority, RepositoryName,
 };
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -100,6 +100,65 @@ impl fmt::Display for RegistryAlias {
     }
 }
 
+/// Resolved artifact sync configuration.
+///
+/// Controls whether the engine discovers and transfers OCI referrers
+/// (signatures, SBOMs, attestations) after syncing each image manifest.
+#[derive(Debug, Clone)]
+pub struct ResolvedArtifacts {
+    /// Whether artifact discovery and transfer is enabled.
+    pub enabled: bool,
+    /// Only sync artifacts whose artifact type matches one of these MIME types.
+    /// Empty means all types pass.
+    pub include: Vec<String>,
+    /// Exclude artifacts whose artifact type matches one of these MIME types.
+    pub exclude: Vec<String>,
+    /// When true, images with no referrers cause a sync failure.
+    pub require_artifacts: bool,
+}
+
+impl Default for ResolvedArtifacts {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            require_artifacts: false,
+        }
+    }
+}
+
+impl ResolvedArtifacts {
+    /// Check whether a given artifact type passes the include/exclude filters.
+    pub fn type_matches(&self, artifact_type: &str) -> bool {
+        if !self.include.is_empty() && !self.include.iter().any(|t| t == artifact_type) {
+            return false;
+        }
+        if self.exclude.iter().any(|t| t == artifact_type) {
+            return false;
+        }
+        true
+    }
+}
+
+/// Cached result of referrer discovery for a (`source_repo`, `parent_digest`) pair.
+///
+/// Avoids redundant referrers API calls when the same source manifest is synced
+/// to multiple targets.
+#[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
+enum CachedReferrers {
+    /// Successfully discovered referrers (index may have zero entries).
+    Found(ImageIndex),
+    /// No referrers exist (API 404 + tag fallback 404).
+    NotFound,
+    /// Discovery failed due to a transient error.
+    Failed,
+}
+
+/// Per-run cache of referrer discovery results, keyed by (`source_repo`, `parent_digest`).
+type ReferrersCache = Rc<RefCell<HashMap<(RepositoryName, Digest), CachedReferrers>>>;
+
 /// A fully resolved mapping ready for the sync engine.
 ///
 /// All config resolution (registry lookup, tag filtering) is done
@@ -143,6 +202,8 @@ pub struct ResolvedMapping {
     /// [`existing_tags`](TargetEntry::existing_tags), the tag is skipped with
     /// zero API calls. See the skip optimization hierarchy in the design docs.
     pub immutable_glob: Option<globset::GlobSet>,
+    /// Artifact sync configuration (shared across all tasks for this mapping).
+    pub artifacts_config: Rc<ResolvedArtifacts>,
 }
 
 impl ResolvedMapping {
@@ -320,6 +381,8 @@ struct TransferTask {
     target: ImageRef,
     /// Optional batch blob checker for pre-populating the cache.
     batch_checker: Option<Rc<dyn BatchBlobChecker>>,
+    /// Artifact sync configuration (Rc-shared with mapping).
+    artifacts_config: Rc<ResolvedArtifacts>,
 }
 
 /// Discovery outcome for one (mapping, tag) pair.
@@ -545,6 +608,7 @@ struct PromoteContext<'a> {
     staging: &'a Rc<BlobStage>,
     freq_map: &'a BlobFrequencyMap,
     retry: &'a RetryConfig,
+    referrers_cache: &'a ReferrersCache,
 }
 
 /// Default cap for concurrent image transfers (Level 1: global image semaphore).
@@ -643,6 +707,7 @@ impl SyncEngine {
         let mut freq_map = BlobFrequencyMap::new();
         let global_sem = Rc::new(Semaphore::new(self.max_concurrent));
         let staging = Rc::new(staging);
+        let referrers_cache: ReferrersCache = Rc::new(RefCell::new(HashMap::new()));
         let mut results: Vec<ImageResult> = Vec::new();
         let mut shutting_down = false;
         let mut drain_deadline: Option<tokio::time::Instant> = None;
@@ -737,6 +802,7 @@ impl SyncEngine {
                     cache: Rc::clone(&cache),
                     source_head_timeout: self.source_head_timeout,
                     head_first: mapping.head_first,
+                    artifacts_config: mapping.artifacts_config.clone(),
                 };
 
                 discovery_futures.push(async move { discover_tag(params).await });
@@ -759,6 +825,7 @@ impl SyncEngine {
                     .collect()
             };
             let staging_ref = Rc::clone(ctx.staging);
+            let referrers_ref = Rc::clone(ctx.referrers_cache);
             let source_str = item.source.to_string();
             let target_str = item.target.to_string();
             let preferred_mount_sources = preferred_mount_sources.to_vec();
@@ -772,6 +839,7 @@ impl SyncEngine {
                     &freq_counts,
                     &retry,
                     &preferred_mount_sources,
+                    &referrers_ref,
                 )
                 .await
             })
@@ -839,6 +907,7 @@ impl SyncEngine {
                         staging: &staging,
                         freq_map: &freq_map,
                         retry: &self.retry,
+                        referrers_cache: &referrers_cache,
                     };
                     for _ in 0..to_promote {
                         if let Some(item) = pending.pop_front() {
@@ -856,6 +925,7 @@ impl SyncEngine {
                         staging: &staging,
                         freq_map: &freq_map,
                         retry: &self.retry,
+                        referrers_cache: &referrers_cache,
                     };
                     let to_promote = pending.len();
                     promotion_phase = PromotionPhase::Done;
@@ -1047,6 +1117,8 @@ struct DiscoveryParams {
     source_head_timeout: Duration,
     /// When true, HEAD-check targets on cache miss before the full source GET.
     head_first: bool,
+    /// Artifact sync configuration (Rc-shared with mapping).
+    artifacts_config: Rc<ResolvedArtifacts>,
 }
 
 /// Discover a single (mapping, tag) pair: HEAD source, check cache, pull if needed.
@@ -1074,6 +1146,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         source,
         target,
         targets,
+        artifacts_config,
         retry,
         platforms,
         cache,
@@ -1158,6 +1231,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                     snapshot_key: &snapshot_key,
                     head_digest: Some(head_digest),
                     platform_key: &platform_key,
+                    artifacts_config: &artifacts_config,
                 })
                 .await;
 
@@ -1220,6 +1294,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                 snapshot_key: &snapshot_key,
                 head_digest: Some(head_digest),
                 platform_key: &platform_key,
+                artifacts_config: &artifacts_config,
             })
             .await;
 
@@ -1246,6 +1321,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         snapshot_key: &snapshot_key,
         head_digest: source_head_digest.as_ref(),
         platform_key: &platform_key,
+        artifacts_config: &artifacts_config,
     })
     .await;
 
@@ -1351,6 +1427,7 @@ struct FullPullParams<'a> {
     snapshot_key: &'a SnapshotKey,
     head_digest: Option<&'a Digest>,
     platform_key: &'a PlatformFilterKey,
+    artifacts_config: &'a Rc<ResolvedArtifacts>,
 }
 
 /// Full discovery: pull source manifest, HEAD-check targets, build transfer tasks.
@@ -1370,6 +1447,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
         snapshot_key,
         head_digest,
         platform_key,
+        artifacts_config,
     } = params;
     // Pull source manifest (shared across all targets for this tag).
     let source_data = match pull_source_manifest(
@@ -1472,6 +1550,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                     source: source.clone(),
                     target: target.clone(),
                     batch_checker,
+                    artifacts_config: Rc::clone(artifacts_config),
                 });
             }
         }
@@ -1495,6 +1574,7 @@ async fn execute_item(
     freq_counts: &HashMap<Digest, usize>,
     retry: &RetryConfig,
     preferred_mount_sources: &[RepositoryName],
+    referrers_cache: &ReferrersCache,
 ) -> ImageResult {
     let start = Instant::now();
 
@@ -1541,6 +1621,46 @@ async fn execute_item(
     .await
     {
         Ok(()) => {
+            // Discover and sync artifacts (signatures, SBOMs, attestations).
+            if let Err(err) = discover_and_sync_artifacts(
+                &item.source_client,
+                &item.target_client,
+                &item.source.repo,
+                &item.target.repo,
+                &item.source_data.pull.digest,
+                &item.artifacts_config,
+                retry,
+                referrers_cache,
+            )
+            .await
+            {
+                let (kind, retries) = if err.is_required_artifacts_missing() {
+                    (ErrorKind::RequiredArtifactsMissing, 0)
+                } else {
+                    (ErrorKind::ArtifactSync, retry.max_retries)
+                };
+                warn!(
+                    source_repo = %item.source.repo,
+                    target_repo = %item.target.repo,
+                    error = %err,
+                    "artifact sync failed"
+                );
+                return ImageResult {
+                    image_id: Uuid::now_v7(),
+                    source: item.source.to_string(),
+                    target: item.target.to_string(),
+                    status: ImageStatus::Failed {
+                        kind,
+                        error: err.to_string(),
+                        retries,
+                        status_code: None,
+                    },
+                    bytes_transferred: outcome.bytes_transferred,
+                    blob_stats: outcome.stats,
+                    duration: start.elapsed(),
+                };
+            }
+
             info!(
                 source_repo = %item.source.repo,
                 source_tag = %item.source.tag,
@@ -2181,6 +2301,264 @@ async fn push_manifests(
     Ok(())
 }
 
+/// Discover referrers for a synced manifest and transfer matching artifacts.
+///
+/// Implements the two-step fallback described in the design doc:
+/// 1. Try the referrers API (`GET /v2/{repo}/referrers/{digest}`)
+/// 2. If 404, try tag fallback (`GET /v2/{repo}/manifests/{algo}-{hex}`)
+/// 3. If neither works, log INFO and continue (no artifacts available)
+///
+/// For each matching artifact: push blobs, then push manifest (preserving
+/// the `subject` reference to the parent).
+#[allow(clippy::too_many_arguments)]
+async fn discover_and_sync_artifacts(
+    source_client: &RegistryClient,
+    target_client: &RegistryClient,
+    source_repo: &RepositoryName,
+    target_repo: &RepositoryName,
+    parent_digest: &Digest,
+    artifacts_config: &ResolvedArtifacts,
+    retry: &RetryConfig,
+    referrers_cache: &ReferrersCache,
+) -> Result<(), crate::Error> {
+    if !artifacts_config.enabled {
+        return Ok(());
+    }
+
+    // Check the per-run referrers cache to avoid redundant discovery when
+    // the same source manifest is synced to multiple targets.
+    let cache_key = (source_repo.clone(), parent_digest.clone());
+    let cached = referrers_cache.borrow().get(&cache_key).cloned();
+
+    let (referrers_index, discovery_succeeded) = if let Some(cached_entry) = cached {
+        debug!(
+            repo = %source_repo,
+            digest = %parent_digest,
+            "using cached referrers discovery result"
+        );
+        match cached_entry {
+            CachedReferrers::Found(index) => (Some(index), true),
+            CachedReferrers::NotFound => (None, true),
+            CachedReferrers::Failed => (None, false),
+        }
+    } else {
+        let (index, succeeded) =
+            discover_referrers(source_client, source_repo, parent_digest).await;
+        // Cache the result for subsequent targets.
+        let to_cache = match &index {
+            Some(idx) => CachedReferrers::Found(idx.clone()),
+            None if succeeded => CachedReferrers::NotFound,
+            None => CachedReferrers::Failed,
+        };
+        referrers_cache.borrow_mut().insert(cache_key, to_cache);
+        (index, succeeded)
+    };
+
+    // Filter matching descriptors. When `artifact_type` is None (e.g. for
+    // tag-fallback single-manifest referrers), falls back to media_type per
+    // OCI 1.1 artifact guidance.
+    let matching: Vec<&Descriptor> = match referrers_index {
+        Some(ref index) => index
+            .manifests
+            .iter()
+            .filter(|desc| {
+                let artifact_type = desc
+                    .artifact_type
+                    .as_deref()
+                    .unwrap_or(desc.media_type.as_str());
+                artifacts_config.type_matches(artifact_type)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    // require_artifacts enforcement: only fire when we successfully confirmed
+    // zero referrers, not when discovery itself failed (transient error).
+    if artifacts_config.require_artifacts && matching.is_empty() && discovery_succeeded {
+        return Err(crate::Error::RequiredArtifactsMissing {
+            reference: parent_digest.to_string(),
+        });
+    }
+
+    if matching.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        repo = %source_repo,
+        digest = %parent_digest,
+        count = matching.len(),
+        "syncing artifacts"
+    );
+
+    // Transfer each matching artifact: pull manifest, push blobs, push manifest.
+    for desc in &matching {
+        let artifact_digest_str = desc.digest.to_string();
+
+        // Pull the artifact manifest from source.
+        let artifact_pull = with_retry(retry, "artifact manifest pull", || {
+            source_client.manifest_pull(source_repo, &artifact_digest_str)
+        })
+        .await
+        .map_err(|e| crate::Error::ArtifactSync {
+            reference: artifact_digest_str.clone(),
+            reason: format!("manifest pull failed: {e}"),
+        })?;
+
+        // Push artifact blobs.
+        if let ManifestKind::Image(ref manifest) = artifact_pull.manifest {
+            let blobs = collect_image_blobs(manifest);
+            for blob in blobs {
+                // HEAD check target first.
+                let exists = target_client
+                    .blob_exists(target_repo, &blob.digest)
+                    .await
+                    .unwrap_or(None);
+
+                if exists.is_some() {
+                    continue;
+                }
+
+                // Pull from source, push to target.
+                let blob_digest = blob.digest.clone();
+                let blob_size = blob.size;
+                let stream = with_retry(retry, "artifact blob pull", || {
+                    source_client.blob_pull(source_repo, &blob_digest)
+                })
+                .await
+                .map_err(|e| crate::Error::ArtifactSync {
+                    reference: artifact_digest_str.clone(),
+                    reason: format!("blob pull failed for {blob_digest}: {e}"),
+                })?;
+
+                target_client
+                    .blob_push_stream(target_repo, &blob_digest, Some(blob_size), stream)
+                    .await
+                    .map_err(|e| crate::Error::ArtifactSync {
+                        reference: artifact_digest_str.clone(),
+                        reason: format!("blob push failed for {blob_digest}: {e}"),
+                    })?;
+            }
+        }
+
+        // Push artifact manifest by digest (not by tag).
+        with_retry(retry, "artifact manifest push", || {
+            target_client.manifest_push(
+                target_repo,
+                &artifact_digest_str,
+                &artifact_pull.media_type,
+                &artifact_pull.raw_bytes,
+            )
+        })
+        .await
+        .map_err(|e| crate::Error::ArtifactSync {
+            reference: artifact_digest_str.clone(),
+            reason: format!("manifest push failed: {e}"),
+        })?;
+
+        debug!(
+            repo = %source_repo,
+            artifact_digest = %artifact_digest_str,
+            "artifact synced"
+        );
+    }
+
+    Ok(())
+}
+
+/// Discover referrers for a manifest from the source registry.
+///
+/// Tries the referrers API first, falls back to the tag-based lookup.
+/// Returns `(Option<ImageIndex>, discovery_succeeded)`.
+async fn discover_referrers(
+    source_client: &RegistryClient,
+    source_repo: &RepositoryName,
+    parent_digest: &Digest,
+) -> (Option<ImageIndex>, bool) {
+    let mut discovery_succeeded = true;
+
+    // Step 1: Try referrers API.
+    let index = match source_client
+        .referrers(source_repo, parent_digest, None)
+        .await
+    {
+        Ok(Some(index)) => Some(index),
+        Ok(None) => {
+            // 404 - try tag fallback (step 2).
+            let fallback_tag = parent_digest.tag_fallback();
+            debug!(
+                repo = %source_repo,
+                digest = %parent_digest,
+                fallback_tag = %fallback_tag,
+                "referrers API returned 404, trying tag fallback"
+            );
+            match source_client
+                .manifest_pull(source_repo, &fallback_tag)
+                .await
+            {
+                Ok(pull) => match pull.manifest {
+                    ManifestKind::Index(index) => Some(*index),
+                    ManifestKind::Image(_) => {
+                        // A single image manifest at the fallback tag is
+                        // itself an artifact referrer. Wrap in a synthetic
+                        // single-entry index so the filter + transfer loop
+                        // handles it uniformly.
+                        let desc = Descriptor {
+                            media_type: pull.media_type.clone(),
+                            digest: pull.digest.clone(),
+                            size: pull.raw_bytes.len() as u64,
+                            platform: None,
+                            artifact_type: None,
+                            annotations: None,
+                        };
+                        Some(ImageIndex {
+                            schema_version: 2,
+                            media_type: Some(MediaType::OciIndex),
+                            manifests: vec![desc],
+                            subject: None,
+                            artifact_type: None,
+                            annotations: None,
+                        })
+                    }
+                },
+                Err(e) if e.is_not_found() => {
+                    info!(
+                        repo = %source_repo,
+                        digest = %parent_digest,
+                        "no referrers found (API 404, tag fallback 404)"
+                    );
+                    None
+                }
+                Err(e) => {
+                    // Non-404 error on fallback is not fatal; log and continue.
+                    info!(
+                        repo = %source_repo,
+                        digest = %parent_digest,
+                        error = %e,
+                        "tag fallback failed, skipping artifact sync"
+                    );
+                    discovery_succeeded = false;
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            // Non-404 error from referrers API. Log and continue rather
+            // than failing the entire image sync for an artifact query.
+            info!(
+                repo = %source_repo,
+                digest = %parent_digest,
+                error = %e,
+                "referrers API failed, skipping artifact sync"
+            );
+            discovery_succeeded = false;
+            None
+        }
+    };
+
+    (index, discovery_succeeded)
+}
+
 /// Read a file in 256 KB chunks, yielding a stream of `Bytes`.
 ///
 /// Uses synchronous `std::fs::Read` internally. On a single-threaded tokio
@@ -2562,6 +2940,7 @@ mod tests {
                 tag: tag.to_owned(),
             },
             batch_checker: None,
+            artifacts_config: Rc::new(ResolvedArtifacts::default()),
         }
     }
 
@@ -2680,6 +3059,7 @@ mod tests {
                 tag: "v1".into(),
             },
             batch_checker: None,
+            artifacts_config: Rc::new(ResolvedArtifacts::default()),
         });
         pending.push_back(TransferTask {
             source_data: Rc::clone(&base),
@@ -2695,6 +3075,7 @@ mod tests {
                 tag: "v1".into(),
             },
             batch_checker: None,
+            artifacts_config: Rc::new(ResolvedArtifacts::default()),
         });
         pending.push_back(test_task(child_a, "child_a"));
         pending.push_back(test_task(child_b, "child_b"));
@@ -2920,5 +3301,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- ResolvedArtifacts::type_matches tests ---
+
+    #[test]
+    fn type_matches_no_filters_passes_everything() {
+        let config = ResolvedArtifacts::default();
+        assert!(config.type_matches("application/vnd.dev.cosign.artifact.sig.v1+json"));
+        assert!(config.type_matches("application/spdx+json"));
+        assert!(config.type_matches("anything"));
+    }
+
+    #[test]
+    fn type_matches_include_filters() {
+        let config = ResolvedArtifacts {
+            enabled: true,
+            include: vec!["application/spdx+json".to_string()],
+            exclude: Vec::new(),
+            require_artifacts: false,
+        };
+        assert!(config.type_matches("application/spdx+json"));
+        assert!(
+            !config.type_matches("application/vnd.dev.cosign.artifact.sig.v1+json"),
+            "type not in include list should be rejected"
+        );
+    }
+
+    #[test]
+    fn type_matches_exclude_filters() {
+        let config = ResolvedArtifacts {
+            enabled: true,
+            include: Vec::new(),
+            exclude: vec!["application/spdx+json".to_string()],
+            require_artifacts: false,
+        };
+        assert!(
+            !config.type_matches("application/spdx+json"),
+            "excluded type should be rejected"
+        );
+        assert!(config.type_matches("application/vnd.dev.cosign.artifact.sig.v1+json"));
+    }
+
+    #[test]
+    fn type_matches_include_and_exclude() {
+        let config = ResolvedArtifacts {
+            enabled: true,
+            include: vec![
+                "application/spdx+json".to_string(),
+                "application/vnd.dev.cosign.artifact.sig.v1+json".to_string(),
+            ],
+            exclude: vec!["application/spdx+json".to_string()],
+            require_artifacts: false,
+        };
+        // spdx is in both include and exclude - exclude wins.
+        assert!(
+            !config.type_matches("application/spdx+json"),
+            "exclude should take priority over include"
+        );
+        assert!(config.type_matches("application/vnd.dev.cosign.artifact.sig.v1+json"));
     }
 }
