@@ -36,15 +36,27 @@ fn blob_path(digest: &Digest) -> String {
 
 /// Check an HTTP response status, returning an error with the response body
 /// if the status does not match `expected`.
+///
+/// Error messages include `registry/repository` context so operators can
+/// identify which endpoint failed, matching the format used by
+/// [`classify_response`](crate::client) for GET/HEAD errors.
 async fn expect_status(
     resp: reqwest::Response,
     expected: StatusCode,
+    base_url: &url::Url,
+    repository: &str,
 ) -> Result<reqwest::Response, Error> {
     let status = resp.status();
     if status == expected {
         Ok(resp)
     } else {
-        let message = resp.text().await.unwrap_or_default();
+        let registry = base_url.host_str().unwrap_or("unknown");
+        let body = resp.text().await.unwrap_or_default();
+        let message = if body.is_empty() {
+            format!("{registry}/{repository}")
+        } else {
+            format!("{registry}/{repository}: {body}")
+        };
         Err(Error::RegistryError { status, message })
     }
 }
@@ -74,6 +86,12 @@ impl RegistryClient {
     ///
     /// Issues a HEAD request to `/v2/{repository}/blobs/{digest}`.
     /// Returns `Some(size)` if the blob exists, `None` if not found.
+    ///
+    /// The size is extracted from the `Content-Length` header. If the header
+    /// is missing or unparseable, size defaults to `0`. Callers that only
+    /// need an existence check should use `is_some()`; callers that need the
+    /// actual byte count should treat `0` as "unknown" and fall back to a
+    /// GET-based size discovery if needed.
     pub async fn blob_exists(
         &self,
         repository: &RepositoryName,
@@ -147,7 +165,7 @@ impl RegistryClient {
             )
             .await?;
 
-        classify_mount_response(resp).await
+        classify_mount_response(resp, &self.base_url, repository).await
     }
 
     /// Push a blob to the given repository using a monolithic upload.
@@ -175,7 +193,7 @@ impl RegistryClient {
                 |headers| self.http.post(url.clone()).headers(headers),
             )
             .await?;
-        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
+        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
         let put_url = extract_location(&resp, &self.base_url)?;
 
         let digest_str = digest.to_string();
@@ -195,7 +213,7 @@ impl RegistryClient {
                 },
             )
             .await?;
-        expect_status(resp, StatusCode::CREATED).await?;
+        expect_status(resp, StatusCode::CREATED, &self.base_url, repository).await?;
 
         Ok(digest)
     }
@@ -246,7 +264,7 @@ impl RegistryClient {
         // gcr.io hosts support it fine, so only Gar triggers this path.
         if provider == Some(ProviderKind::Gar) {
             return self
-                .blob_push_stream_gar_fallback(repository, expected_digest, stream)
+                .blob_push_stream_gar_fallback(repository, expected_digest, known_size, stream)
                 .await;
         }
 
@@ -268,7 +286,7 @@ impl RegistryClient {
                 |headers| self.http.post(url.clone()).headers(headers),
             )
             .await?;
-        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
+        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
         let upload_url = extract_location(&resp, &self.base_url)?;
 
         // Streaming PUT - send the blob body through a single HTTP request.
@@ -295,7 +313,7 @@ impl RegistryClient {
             .map_err(Error::from);
         report_permit(permit, &result);
         let resp = result?;
-        expect_status(resp, StatusCode::CREATED).await?;
+        expect_status(resp, StatusCode::CREATED, &self.base_url, repository).await?;
 
         Ok(expected_digest.clone())
     }
@@ -310,6 +328,7 @@ impl RegistryClient {
         &self,
         repository: &RepositoryName,
         expected_digest: &Digest,
+        known_size: Option<u64>,
         stream: impl Stream<Item = Result<Bytes, Error>>,
     ) -> Result<Digest, Error> {
         warn!(
@@ -317,7 +336,7 @@ impl RegistryClient {
             host = self.base_url.host_str().unwrap_or("unknown"),
             "GAR does not support chunked uploads; buffering entire blob in memory"
         );
-        let body = buffer_stream(stream, None).await?;
+        let body = buffer_stream(stream, known_size).await?;
         let actual_digest = self.blob_push(repository, &body).await?;
 
         if &actual_digest != expected_digest {
@@ -359,11 +378,18 @@ impl RegistryClient {
                 |headers| self.http.post(url.clone()).headers(headers),
             )
             .await?;
-        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
+        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
         let upload_url = extract_location(&resp, &self.base_url)?;
 
-        // Buffer entire stream.
-        let body = Bytes::from(buffer_stream(stream, known_size).await?);
+        // Buffer entire stream and verify digest before uploading.
+        let raw = buffer_stream(stream, known_size).await?;
+        let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
+        if &actual_digest != expected_digest {
+            return Err(Error::Other(format!(
+                "GHCR fallback: local digest {actual_digest} != expected {expected_digest}"
+            )));
+        }
+        let body = Bytes::from(raw);
         let body_len = body.len();
 
         // Single PATCH - no Content-Range header.
@@ -382,7 +408,7 @@ impl RegistryClient {
                 },
             )
             .await?;
-        let resp = expect_status(resp, StatusCode::ACCEPTED).await?;
+        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
         let finalize_url = extract_location(&resp, &self.base_url)?;
 
         // PUT to finalize with digest query param.
@@ -402,7 +428,7 @@ impl RegistryClient {
                 },
             )
             .await?;
-        expect_status(resp, StatusCode::CREATED).await?;
+        expect_status(resp, StatusCode::CREATED, &self.base_url, repository).await?;
 
         Ok(expected_digest.clone())
     }
@@ -432,13 +458,23 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Str
 /// in principle chain on; in practice it falls through to a fresh
 /// HEAD + push, so the URL is discarded and only the binary outcome
 /// is surfaced.
-async fn classify_mount_response(resp: reqwest::Response) -> Result<MountResult, Error> {
+async fn classify_mount_response(
+    resp: reqwest::Response,
+    base_url: &url::Url,
+    repository: &str,
+) -> Result<MountResult, Error> {
     let status = resp.status();
     match status {
         StatusCode::CREATED => Ok(MountResult::Mounted),
         StatusCode::ACCEPTED => Ok(MountResult::NotMounted),
         _ => {
-            let message = resp.text().await.unwrap_or_default();
+            let registry = base_url.host_str().unwrap_or("unknown");
+            let body = resp.text().await.unwrap_or_default();
+            let message = if body.is_empty() {
+                format!("{registry}/{repository}")
+            } else {
+                format!("{registry}/{repository}: {body}")
+            };
             Err(Error::RegistryError { status, message })
         }
     }
@@ -458,6 +494,38 @@ mod tests {
             blob_path(&digest),
             "blobs/sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[tokio::test]
+    async fn expect_status_error_includes_registry_and_repo() {
+        let resp = http::Response::builder()
+            .status(500)
+            .body("internal error")
+            .unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        let base = url::Url::parse("https://ghcr.io").unwrap();
+        let err = expect_status(reqwest_resp, StatusCode::CREATED, &base, "myorg/myrepo")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ghcr.io"), "missing registry in error: {msg}");
+        assert!(msg.contains("myorg/myrepo"), "missing repo in error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn classify_mount_error_includes_registry_and_repo() {
+        let resp = http::Response::builder()
+            .status(403)
+            .body("forbidden")
+            .unwrap();
+        let reqwest_resp = reqwest::Response::from(resp);
+        let base = url::Url::parse("https://ghcr.io").unwrap();
+        let err = classify_mount_response(reqwest_resp, &base, "myorg/myrepo")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ghcr.io"), "missing registry in error: {msg}");
+        assert!(msg.contains("myorg/myrepo"), "missing repo in error: {msg}");
     }
 
     #[test]
@@ -582,7 +650,7 @@ mod tests {
 
         let client = build_test_client("us-docker.pkg.dev", port);
 
-        let repo = RepositoryName::new("my-project/my-repo");
+        let repo = RepositoryName::new("my-project/my-repo").unwrap();
         let result = client
             .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
             .await
@@ -640,7 +708,7 @@ mod tests {
 
         // Pass None so the monolithic threshold does not intercept the call;
         // we are verifying the GHCR-specific single-PATCH path directly.
-        let repo = RepositoryName::new("my-org/my-image");
+        let repo = RepositoryName::new("my-org/my-image").unwrap();
         let result = client
             .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
             .await
@@ -691,7 +759,7 @@ mod tests {
         let client = build_test_client("ghcr.io", port);
 
         // No known_size - GHCR path still taken based on hostname alone.
-        let repo = RepositoryName::new("repo");
+        let repo = RepositoryName::new("repo").unwrap();
         let result = client
             .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
             .await
@@ -764,9 +832,9 @@ mod tests {
             let client = build_test_client(case.host, port);
             let result = client
                 .blob_mount(
-                    &RepositoryName::new("tgt/repo"),
+                    &RepositoryName::new("tgt/repo").unwrap(),
                     &test_digest(case.host.as_bytes()),
-                    &RepositoryName::new("src/repo"),
+                    &RepositoryName::new("src/repo").unwrap(),
                 )
                 .await
                 .unwrap();
@@ -823,7 +891,7 @@ mod tests {
 
         let client = build_test_client("registry.example.com", port);
 
-        let repo = RepositoryName::new("stream/repo");
+        let repo = RepositoryName::new("stream/repo").unwrap();
         let result = client
             .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
             .await

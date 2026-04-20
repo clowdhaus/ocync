@@ -65,6 +65,10 @@ impl RegistryClient {
     /// Check whether a manifest exists and retrieve its metadata.
     ///
     /// Returns `None` if the manifest is not found (404).
+    ///
+    /// The `size` field in [`ManifestHead`] is extracted from `Content-Length`.
+    /// If the header is missing or unparseable, size defaults to `0`. Callers
+    /// that need the exact manifest size should treat `0` as "unknown".
     pub async fn manifest_head(
         &self,
         repository: &RepositoryName,
@@ -86,7 +90,11 @@ impl RegistryClient {
                 let digest_str = headers
                     .get(DOCKER_CONTENT_DIGEST)
                     .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default();
+                    .ok_or_else(|| {
+                        Error::Other(
+                            "manifest HEAD response missing Docker-Content-Digest header".into(),
+                        )
+                    })?;
                 let digest: Digest = digest_str.parse().map_err(|_| {
                     Error::Other(format!(
                         "invalid digest in Docker-Content-Digest header: {digest_str}"

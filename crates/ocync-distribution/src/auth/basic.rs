@@ -62,8 +62,7 @@ impl BasicAuth {
     /// Create a new Basic auth provider with an explicit base URL.
     ///
     /// Use this for registries that don't use HTTPS (e.g. `http://localhost:5000`).
-    #[cfg(test)]
-    fn with_base_url(
+    pub fn with_base_url(
         base_url: impl Into<String>,
         http: reqwest::Client,
         credentials: Credentials,
@@ -94,16 +93,22 @@ impl AuthProvider for BasicAuth {
             let mut cache = self.cache.lock().await;
 
             if let Some(token) = cache.get(&key).filter(|t| t.is_valid()) {
+                tracing::debug!(base_url = %self.base_url, scope = %key, "token cache hit");
                 return Ok(token.clone());
             }
 
+            tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
             let token = token_exchange::exchange(
                 &self.http,
                 &self.base_url,
                 &scopes,
                 Some(&self.credentials),
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                e
+            })?;
             cache.insert(key, token.clone());
 
             Ok(token)
@@ -113,6 +118,7 @@ impl AuthProvider for BasicAuth {
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let mut cache = self.cache.lock().await;
+            tracing::debug!(base_url = %self.base_url, entries = cache.len(), "invalidating token cache");
             cache.clear();
         })
     }

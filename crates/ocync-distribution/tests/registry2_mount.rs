@@ -12,52 +12,16 @@
 //! - Docker must be running
 //! - Run with: `cargo test --package ocync-distribution --test registry2_mount`
 
+#[allow(unreachable_pub)]
+mod common;
+
 use bytes::Bytes;
 use futures_util::StreamExt;
 use ocync_distribution::blob::MountResult;
-use ocync_distribution::client::RegistryClientBuilder;
 use ocync_distribution::spec::RepositoryName;
 use ocync_distribution::{Digest, RegistryClient};
-use url::Url;
 
-/// Compute the SHA-256 digest for test data.
-fn test_digest(data: &[u8]) -> Digest {
-    let hash = ocync_distribution::sha256::Sha256::digest(data);
-    Digest::from_sha256(hash)
-}
-
-/// Start a local registry container and return its HTTP base URL.
-async fn start_registry() -> (
-    testcontainers::ContainerAsync<testcontainers::GenericImage>,
-    Url,
-) {
-    use testcontainers::GenericImage;
-    use testcontainers::runners::AsyncRunner;
-
-    let container = GenericImage::new("registry", "2")
-        .with_exposed_port(5000.into())
-        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
-            "listening on",
-        ))
-        .start()
-        .await
-        .expect("failed to start registry container");
-
-    let port = container
-        .get_host_port_ipv4(5000)
-        .await
-        .expect("failed to get mapped port");
-
-    let url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
-    (container, url)
-}
-
-/// Build a `RegistryClient` for a local registry (no auth, no TLS).
-fn local_client(url: Url) -> RegistryClient {
-    RegistryClientBuilder::new(url)
-        .build()
-        .expect("failed to build RegistryClient")
-}
+use common::{local_client, start_registry, test_digest};
 
 /// Push a blob to `repo` via the monolithic path; returns its digest.
 async fn push_blob(client: &RegistryClient, repo: &RepositoryName, data: &[u8]) -> Digest {
@@ -99,8 +63,8 @@ async fn mount_committed_blob_returns_mounted() {
     // also covers the "cross-prefix" mount case -- the OCI spec allows
     // mount between any two repos on the same registry, and the client's
     // `from=` query parameter must accept arbitrary repo paths.
-    let source_repo = RepositoryName::new("org-a/service-x");
-    let target_repo = RepositoryName::new("org-b/mirror/service-x");
+    let source_repo = RepositoryName::new("org-a/service-x").unwrap();
+    let target_repo = RepositoryName::new("org-b/mirror/service-x").unwrap();
     let data = b"registry2 mount test blob";
     let digest = push_blob(&client, &source_repo, data).await;
 
@@ -126,8 +90,8 @@ async fn mount_missing_source_returns_not_fulfilled() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
 
-    let source_repo = RepositoryName::new("missing/source");
-    let target_repo = RepositoryName::new("missing/target");
+    let source_repo = RepositoryName::new("missing/source").unwrap();
+    let target_repo = RepositoryName::new("missing/target").unwrap();
     // Digest of data that was never pushed anywhere.
     let digest = test_digest(b"blob that does not exist in any repo");
 
@@ -150,8 +114,8 @@ async fn mount_preserves_source_blob() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
 
-    let source_repo = RepositoryName::new("preserve/source");
-    let target_repo = RepositoryName::new("preserve/target");
+    let source_repo = RepositoryName::new("preserve/source").unwrap();
+    let target_repo = RepositoryName::new("preserve/target").unwrap();
     let data = b"preserve-after-mount test data";
     let digest = push_blob(&client, &source_repo, data).await;
 

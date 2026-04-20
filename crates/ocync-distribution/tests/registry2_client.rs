@@ -11,51 +11,15 @@
 //! - Docker must be running
 //! - Run with: `cargo test --package ocync-distribution --test registry2_client`
 
+#[allow(unreachable_pub)]
+mod common;
+
 use bytes::Bytes;
 use futures_util::stream;
-use ocync_distribution::client::RegistryClientBuilder;
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
-use ocync_distribution::{Digest, Error, RegistryClient};
-use url::Url;
+use ocync_distribution::{Digest, Error};
 
-/// Compute the SHA-256 digest for test data.
-fn test_digest(data: &[u8]) -> Digest {
-    let hash = ocync_distribution::sha256::Sha256::digest(data);
-    Digest::from_sha256(hash)
-}
-
-/// Start a local registry container and return its HTTP base URL.
-async fn start_registry() -> (
-    testcontainers::ContainerAsync<testcontainers::GenericImage>,
-    Url,
-) {
-    use testcontainers::GenericImage;
-    use testcontainers::runners::AsyncRunner;
-
-    let container = GenericImage::new("registry", "2")
-        .with_exposed_port(5000.into())
-        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
-            "listening on",
-        ))
-        .start()
-        .await
-        .expect("failed to start registry container");
-
-    let port = container
-        .get_host_port_ipv4(5000)
-        .await
-        .expect("failed to get mapped port");
-
-    let url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
-    (container, url)
-}
-
-/// Build a `RegistryClient` for a local registry (no auth, no TLS).
-fn local_client(url: Url) -> RegistryClient {
-    RegistryClientBuilder::new(url)
-        .build()
-        .expect("failed to build RegistryClient")
-}
+use common::{local_client, start_registry, test_digest};
 
 /// Build a minimal valid OCI image manifest.
 fn build_manifest(
@@ -107,7 +71,7 @@ async fn ping() {
 async fn blob_push_monolithic_and_exists() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
-    let repo = RepositoryName::new("test/monolithic");
+    let repo = RepositoryName::new("test/monolithic").unwrap();
 
     let data = b"hello from ocync integration test";
     let digest = client
@@ -131,7 +95,7 @@ async fn blob_push_monolithic_and_exists() {
 async fn blob_push_stream_chunked() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
-    let repo = RepositoryName::new("test/streamed");
+    let repo = RepositoryName::new("test/streamed").unwrap();
 
     let data = vec![0xABu8; 2 * 1024 * 1024];
     let expected_digest = test_digest(&data);
@@ -159,7 +123,7 @@ async fn blob_push_stream_chunked() {
 async fn blob_exists_returns_none_for_missing() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
-    let repo = RepositoryName::new("test/missing");
+    let repo = RepositoryName::new("test/missing").unwrap();
 
     let fake_digest: Digest =
         "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -180,7 +144,7 @@ async fn blob_exists_returns_none_for_missing() {
 async fn full_image_roundtrip() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
-    let repo = RepositoryName::new("test/roundtrip");
+    let repo = RepositoryName::new("test/roundtrip").unwrap();
     let tag = "v1";
 
     // 1. Push config blob.
@@ -232,7 +196,7 @@ async fn full_image_roundtrip() {
 async fn manifest_head_returns_none_for_missing_tag() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
-    let repo = RepositoryName::new("test/notfound");
+    let repo = RepositoryName::new("test/notfound").unwrap();
 
     let result = client
         .manifest_head(&repo, "nonexistent-tag")
@@ -247,7 +211,7 @@ async fn manifest_head_returns_none_for_missing_tag() {
 async fn blob_push_idempotent() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
-    let repo = RepositoryName::new("test/idempotent");
+    let repo = RepositoryName::new("test/idempotent").unwrap();
 
     let data = b"push me twice";
     let d1 = client.blob_push(&repo, data).await.expect("first push");
@@ -260,7 +224,7 @@ async fn blob_push_idempotent() {
 async fn blob_pull_roundtrip() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
-    let repo = RepositoryName::new("test/blobpull");
+    let repo = RepositoryName::new("test/blobpull").unwrap();
 
     let data = b"blob-pull-roundtrip-data";
     let digest = client.blob_push(&repo, data).await.expect("push failed");

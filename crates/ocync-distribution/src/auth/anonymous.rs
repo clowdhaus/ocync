@@ -77,10 +77,17 @@ impl AuthProvider for AnonymousAuth {
             let mut cache = self.cache.lock().await;
 
             if let Some(token) = cache.get(&key).filter(|t| t.is_valid()) {
+                tracing::debug!(base_url = %self.base_url, scope = %key, "token cache hit");
                 return Ok(token.clone());
             }
 
-            let token = token_exchange::exchange(&self.http, &self.base_url, &scopes, None).await?;
+            tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
+            let token = token_exchange::exchange(&self.http, &self.base_url, &scopes, None)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                    e
+                })?;
             cache.insert(key, token.clone());
 
             Ok(token)
@@ -90,6 +97,7 @@ impl AuthProvider for AnonymousAuth {
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let mut cache = self.cache.lock().await;
+            tracing::debug!(base_url = %self.base_url, entries = cache.len(), "invalidating token cache");
             cache.clear();
         })
     }

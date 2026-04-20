@@ -75,18 +75,30 @@ impl FromStr for Digest {
             });
         }
 
-        // SHA-256 must be exactly 64 hex chars
-        if algorithm == SHA256_ALGO && hex_part.len() != 64 {
+        // SHA-256 must be exactly 64 hex chars (case-insensitive algorithm match).
+        if algorithm.eq_ignore_ascii_case(SHA256_ALGO) && hex_part.len() != 64 {
             return Err(Error::InvalidDigest {
                 digest: s.into(),
                 reason: format!("sha256 hex must be 64 characters, got {}", hex_part.len()),
             });
         }
 
-        Ok(Self {
-            raw: s.to_owned(),
-            algo_len,
-        })
+        // Normalize to lowercase so equality and hashing are case-insensitive.
+        // Fast path: skip allocation when already lowercase (common case).
+        let already_lower = !s.bytes().any(|b| b.is_ascii_uppercase());
+        if already_lower {
+            Ok(Self {
+                raw: s.to_owned(),
+                algo_len: algorithm.len(),
+            })
+        } else {
+            let algo_lower = algorithm.to_ascii_lowercase();
+            let raw = format!("{}:{}", algo_lower, hex_part.to_ascii_lowercase());
+            Ok(Self {
+                raw,
+                algo_len: algo_lower.len(),
+            })
+        }
     }
 }
 
@@ -212,7 +224,27 @@ mod tests {
         let hex = "A".repeat(64);
         let input = format!("sha256:{hex}");
         let d: Digest = input.parse().unwrap();
-        assert_eq!(d.hex(), hex);
+        // Parsing normalizes to lowercase.
+        assert_eq!(d.hex(), hex.to_ascii_lowercase());
+        // Upper and lower parse to the same value.
+        let lower_input = format!("sha256:{}", "a".repeat(64));
+        let d_lower: Digest = lower_input.parse().unwrap();
+        assert_eq!(d, d_lower);
+    }
+
+    #[test]
+    fn mixed_case_digests_are_equal() {
+        let lower: Digest =
+            "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                .parse()
+                .unwrap();
+        let upper: Digest =
+            "sha256:ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890"
+                .parse()
+                .unwrap();
+        assert_eq!(lower, upper);
+        // Also verify the stored representation is lowercase.
+        assert!(upper.to_string().chars().all(|c| !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -222,15 +254,40 @@ mod tests {
     }
 
     #[test]
-    fn display_preserves_original() {
-        let input = TEST_DIGEST;
-        let d: Digest = input.parse().unwrap();
-        assert_eq!(d.to_string(), input);
+    fn display_is_normalized_lowercase() {
+        let d: Digest = TEST_DIGEST.parse().unwrap();
+        assert_eq!(d.to_string(), TEST_DIGEST);
+        // Uppercase input is normalized to lowercase on display.
+        let upper = format!("sha256:{}", "A".repeat(64));
+        let d2: Digest = upper.parse().unwrap();
+        assert_eq!(d2.to_string(), format!("sha256:{}", "a".repeat(64)));
     }
 
     #[test]
     fn deserialize_non_string_errors() {
         let result: Result<Digest, _> = serde_json::from_str("123");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn uppercase_algorithm_normalized() {
+        let hex = "a".repeat(64);
+        let input = format!("SHA256:{hex}");
+        let d: Digest = input.parse().unwrap();
+        assert_eq!(d.algorithm(), "sha256");
+        assert_eq!(d.to_string(), format!("sha256:{hex}"));
+
+        // Uppercase algorithm + lowercase hex matches lowercase algorithm + lowercase hex.
+        let lower_input = format!("sha256:{hex}");
+        let d_lower: Digest = lower_input.parse().unwrap();
+        assert_eq!(d, d_lower);
+    }
+
+    #[test]
+    fn mixed_case_algorithm_normalized() {
+        let hex = "b".repeat(64);
+        let input = format!("Sha256:{hex}");
+        let d: Digest = input.parse().unwrap();
+        assert_eq!(d.algorithm(), "sha256");
     }
 }

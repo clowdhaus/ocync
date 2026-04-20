@@ -46,7 +46,7 @@ let client = RegistryClient::builder(
     .build()
     .unwrap();
 
-let repo = ocync_distribution::spec::RepositoryName::new("library/nginx");
+let repo = ocync_distribution::spec::RepositoryName::new("library/nginx").unwrap();
 let manifest = client
     .manifest_pull(&repo, "latest")
     .await

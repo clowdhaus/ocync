@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use http::StatusCode;
 use http::header::WWW_AUTHENTICATE;
 use serde::Deserialize;
 
@@ -36,8 +37,20 @@ pub(crate) async fn exchange(
     let resp = http.get(&v2_url).send().await?;
 
     if resp.status().is_success() {
-        // No auth required -- return a dummy token.
+        tracing::debug!(base_url, "registry requires no auth, returning empty token");
         return Ok(Token::new(""));
+    }
+
+    // Only 401 carries a WWW-Authenticate challenge. Any other non-success
+    // status (403, 500, etc.) is a hard error -- don't fall through to header
+    // parsing with a misleading "missing WWW-Authenticate" message.
+    if resp.status() != StatusCode::UNAUTHORIZED {
+        let status = resp.status();
+        tracing::warn!(base_url, %status, "registry ping returned unexpected status");
+        return Err(Error::AuthFailed {
+            registry: base_url.to_owned(),
+            reason: format!("registry ping returned {status} (expected 401 challenge)"),
+        });
     }
 
     let www_auth = resp
@@ -75,24 +88,40 @@ pub(crate) async fn exchange(
         request = request.header("Authorization", basic_header_value(creds));
     }
 
-    let token_resp = request
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<TokenResponse>()
-        .await?;
+    let resp = request.send().await?;
+    if resp.status().is_client_error() || resp.status().is_server_error() {
+        let status = resp.status();
+        tracing::warn!(base_url, %status, "token endpoint returned error");
+        return Err(Error::AuthFailed {
+            registry: base_url.to_owned(),
+            reason: format!("token endpoint returned {status}"),
+        });
+    }
+    let token_resp = resp.json::<TokenResponse>().await?;
 
     let token_value = token_resp
         .token
         .or(token_resp.access_token)
-        .ok_or_else(|| Error::AuthFailed {
-            registry: base_url.to_owned(),
-            reason: "token response missing both 'token' and 'access_token' fields".into(),
+        .ok_or_else(|| {
+            tracing::warn!(
+                base_url,
+                "token response missing both 'token' and 'access_token' fields"
+            );
+            Error::AuthFailed {
+                registry: base_url.to_owned(),
+                reason: "token response missing both 'token' and 'access_token' fields".into(),
+            }
         })?;
 
     let token = match token_resp.expires_in {
-        Some(secs) if secs > 0 => Token::with_ttl(token_value, Duration::from_secs(secs)),
-        _ => Token::new(token_value),
+        Some(secs) if secs > 0 => {
+            tracing::debug!(base_url, expires_in_secs = secs, "token exchange succeeded");
+            Token::with_ttl(token_value, Duration::from_secs(secs))
+        }
+        _ => {
+            tracing::debug!(base_url, "token exchange succeeded (no expiry)");
+            Token::new(token_value)
+        }
     };
 
     Ok(token)
@@ -157,20 +186,26 @@ impl WwwAuthenticate {
 }
 
 /// Split parameter string on commas, respecting quoted strings.
+///
+/// Handles backslash-escaped quotes (`\"`) inside quoted values so that
+/// a realm URL containing an escaped quote does not prematurely end the
+/// quoted region.
 fn split_params(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut in_quotes = false;
+    let mut prev_backslash = false;
 
     for (i, ch) in s.char_indices() {
         match ch {
-            '"' => in_quotes = !in_quotes,
+            '"' if !prev_backslash => in_quotes = !in_quotes,
             ',' if !in_quotes => {
                 parts.push(&s[start..i]);
                 start = i + 1;
             }
             _ => {}
         }
+        prev_backslash = ch == '\\' && !prev_backslash;
     }
     if start < s.len() {
         parts.push(&s[start..]);
@@ -254,6 +289,20 @@ mod tests {
         let parts = split_params(r#"realm="https://example.com/a,b",service="test""#);
         assert_eq!(parts.len(), 2);
         assert!(parts[0].contains("a,b"));
+    }
+
+    #[test]
+    fn split_params_with_escaped_quote() {
+        // A realm URL containing a backslash-escaped quote should not
+        // terminate the quoted region prematurely.
+        let input = r#"realm="https://example.com/path?q=\"val\"",service="test""#;
+        let parts = split_params(input);
+        assert_eq!(parts.len(), 2, "got parts: {parts:?}");
+        assert!(
+            parts[0].contains(r#"\"val\""#),
+            "escaped quotes missing: {}",
+            parts[0]
+        );
     }
 
     #[test]
@@ -413,7 +462,12 @@ mod tests {
         let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Http(_)));
+        assert!(
+            matches!(err, Error::AuthFailed { .. }),
+            "expected AuthFailed, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("403"), "expected 403 in error: {msg}");
     }
 
     #[tokio::test]
@@ -558,5 +612,56 @@ mod tests {
         assert_eq!(scope_params.len(), 2, "expected 2 scope params");
         assert!(scope_params.contains(&"repository:repo-a:pull".to_string()));
         assert!(scope_params.contains(&"repository:repo-b:pull,push".to_string()));
+    }
+
+    #[tokio::test]
+    async fn exchange_non_401_returns_clear_error() {
+        let mock = wiremock::MockServer::start().await;
+
+        // Return 403 instead of 401 -- should NOT produce a misleading
+        // "missing WWW-Authenticate" message.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let http = crate::test_http_client();
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("403") && msg.contains("expected 401 challenge"),
+            "unexpected error message: {msg}"
+        );
+        // Must NOT mention WWW-Authenticate.
+        assert!(
+            !msg.contains("WWW-Authenticate"),
+            "should not mention WWW-Authenticate for non-401: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_500_returns_clear_error() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let http = crate::test_http_client();
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("500") && msg.contains("expected 401 challenge"),
+            "unexpected error message: {msg}"
+        );
     }
 }

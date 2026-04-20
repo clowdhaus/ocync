@@ -162,7 +162,7 @@ async fn invalidate_clears_cache() {
     let _ = auth.get_token(&scopes).await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn concurrent_requests_coalesce() {
     let server = setup_auth_server().await;
 
