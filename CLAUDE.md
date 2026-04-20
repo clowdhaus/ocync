@@ -49,6 +49,7 @@ Every PR ships the smallest correct change + one test that catches regression. D
 ## Git workflow
 
 - One PR at a time, merge to main, then next. No stacked PRs ever.
+- When dispatching parallel worktree agents, each MUST create its own branch from `main` (`git checkout -b feat/xxx main`). Never push to an existing branch from a worktree agent.
 - Never include `Co-Authored-By: Claude` or Anthropic attribution
 - Run the CI gate locally before push: `cargo fmt --check && cargo clippy -- -D warnings && cargo test && cargo deny check`
 - During rebase conflicts on `Cargo.lock`, regenerate with `git checkout --theirs Cargo.lock && cargo generate-lockfile`
@@ -60,6 +61,7 @@ Every PR ships the smallest correct change + one test that catches regression. D
 - `docs/src/content/design/benchmark.md` - layered benchmark plan (protocol / throughput / cross-tool)
 - `docs/src/content/design/watch-mode.md` - watch mode, discovery optimization, platform filtering
 - `docs/superpowers/plans/` (gitignored) - in-flight implementation plans
+- Unimplemented features are marked with `> **Status: Planned.**` or `> **Status: Partially implemented.**` in design docs. Update these markers when implementing.
 
 When a benchmark or probe run changes our understanding of a registry's behavior, update the relevant per-registry doc in `docs/src/content/registries/` in the same PR as the behavior change.
 

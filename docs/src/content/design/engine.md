@@ -57,7 +57,7 @@ The primary bottleneck for Chainguard -> multi-region ECR is the target side: EC
 
 **PutImage pipeline smoothing.** As early images complete blob transfers and push manifests (consuming PutImage tokens at 10 TPS), later images' blob transfers proceed unblocked. The pipeline naturally spreads PutImage load across the full sync duration rather than concentrating it at the end.
 
-**Immediate execution start.** Execution begins after ~1 second of discovery instead of waiting 10-20 seconds for all discovery to complete. For a minutes-long sync this is a small but free improvement. For Docker Hub as a secondary source (100 manifest GETs / hour authenticated), the pipeline is even more valuable: discovery can take hours, and execution proceeds on already-discovered images while discovery is rate-limited.
+**Immediate execution start.** Execution begins after ~1 second of discovery instead of waiting 10-20 seconds for all discovery to complete. For a minutes-long sync this is a small but free improvement. For Docker Hub as a secondary source (100 manifest GETs / 6 hours authenticated), the pipeline is even more valuable: discovery can take hours, and execution proceeds on already-discovered images while discovery is rate-limited.
 
 ### Select loop discipline
 
@@ -116,7 +116,7 @@ Actions are fine-grained, matching the actual API action granularity of each reg
 | Registry | Windows | Rationale |
 |---|---|---|
 | ECR | 9 (one per action) | Critical: `InitiateLayerUpload` (100 TPS) and `UploadLayerPart` (500 TPS) have a 5x rate disparity, so a 429 on session initiation must not throttle chunk uploads |
-| Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 200-pull/6h quota). Other actions share one window |
+| Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 100-pull/6h quota). Other actions share one window |
 | GAR | 1 (all shared) | GAR uses a shared per-project quota across all operation types; initial window of 5, grows adaptively to `max_concurrent` |
 | ACR, GHCR, others | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as safe default for registries without documented per-action limits |
 
@@ -150,7 +150,7 @@ The greedy set-cover provably covers every shared blob. No "uncovered follower" 
 
 AWS launched opt-in `BLOB_MOUNTING` account setting in January 2026. Enable via `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`. Mount POST returns 201 when all conditions are met: BLOB_MOUNTING is ENABLED on the account, the source blob is referenced by a committed manifest (standalone blobs without manifests return 202), the `from` parameter specifies the source repo name, and both repos have identical encryption config (AES256 default works). Requirements: same account + region, identical encryption config, pusher needs `ecr:GetDownloadUrlForLayer` on source repo. Not supported for pull-through cache repos.
 
-Mount attempts are made unconditionally regardless of provider; the 202 fallback is cheap (~100ms) and successful mounts save entire blob uploads. `ProviderKind::fulfills_cross_repo_mount()` exists as a compile-time exhaustiveness guard (exhaustive `match` forces a decision when adding a new provider) but currently returns `true` for all variants and has zero callers.
+Mount attempts are made unconditionally regardless of provider; the 202 fallback is cheap (~100ms) and successful mounts save entire blob uploads.
 
 ### Measured impact
 

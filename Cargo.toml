@@ -29,7 +29,7 @@ reqwest = { version = "0.12", default-features = false, features = ["system-prox
 url = { version = "2", default-features = false }
 uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
 ocync-distribution = { path = "crates/ocync-distribution", default-features = false }
-ocync-sync = { path = "crates/ocync-sync" }
+ocync-sync = { path = "crates/ocync-sync", default-features = false }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

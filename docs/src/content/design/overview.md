@@ -122,7 +122,7 @@ For single-target mappings, bytes stream directly from source to target with no 
 |---|---|---|---|
 | ECR (private) | Yes (opt-in, same account/region) | Yes (BatchCheck, BatchGet, ListImages) | Per-action TPS (10-3000) |
 | ECR Public | No | Partial (BatchCheck only) | Separate from private |
-| Docker Hub | Yes (implicit global dedup) | No | 200-pull/6h authed manifest GETs; HEADs free |
+| Docker Hub | Yes (implicit global dedup) | No | 100-pull/6h authed manifest GETs; HEADs free |
 | GAR | No | No | Per-project shared quota |
 | GHCR | Yes (implicit global dedup) | No | GitHub API rate limit |
 | ACR | Yes | No | Per-registry |
@@ -130,7 +130,7 @@ For single-target mappings, bytes stream directly from source to target with no 
 
 ### Docker Hub rate limits
 
-Docker Hub tightened limits in April 2025: 10 pulls/hour anonymous, 200 pulls/6 hours authenticated free, unlimited for paid tiers. Only manifest GETs count; blob GETs are free (CDN-served) and manifest HEADs are free (subject to a separate abuse limit). Authentication is mandatory for any serious sync workload.
+Docker Hub tightened limits in April 2025: 10 pulls/hour anonymous, 100 pulls/6 hours authenticated free, unlimited for paid tiers. Only manifest GETs count; blob GETs are free (CDN-served) and manifest HEADs are free (subject to a separate abuse limit). Authentication is mandatory for any serious sync workload.
 
 ### ECR rate limits
 

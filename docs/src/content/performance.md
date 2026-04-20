@@ -73,6 +73,8 @@ Measured 2026-04-20 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit)
 | Rate-limit 429s | **0** | **0** | **0** |
 <!-- BENCH-WARM:END -->
 
+> **Note:** `ocync` performs full target HEAD verification on every warm cycle to detect out-of-band changes (e.g., images deleted by lifecycle policies or modified by other tools), ensuring correctness at the cost of additional requests. Alternatives that achieve faster warm sync times typically use tag list caching, which is faster but can miss changes made outside the tool.
+
 ## Why `ocync` is fast
 
 ### Pipelined architecture
