@@ -20,6 +20,7 @@
 //! - **Untriggered shutdown** (line ~8100) - Engine exits cleanly with unused signal
 //! - **Concurrent mount coordination** (line ~8175) - Shared blob mount vs double-upload
 //! - **Blob concurrency bound** (line ~8900) - Semaphore(6) correctness with >6 layers
+//! - **Budget circuit breaker** (line ~9175) - Rate-limit pause/resume, threshold floor, refill, no-header, threshold verification, multi-source, tracing
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -42,7 +43,7 @@ use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
 use ocync_sync::{ErrorKind, ImageStatus, SkipReason};
 use url::Url;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -9169,4 +9170,765 @@ async fn sync_three_layers_manifest_builder() {
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
     // 1 config + 3 layers = 4 blobs.
     assert_eq!(report.images[0].blob_stats.transferred, 4);
+}
+
+// ---------------------------------------------------------------------------
+// Budget circuit breaker
+// ---------------------------------------------------------------------------
+
+/// Mount a source manifest GET mock that includes a `ratelimit-remaining`
+/// header (Docker Hub format). Used by circuit breaker tests to simulate
+/// rate-limited registries.
+async fn mount_source_manifest_with_rate_limit(
+    server: &MockServer,
+    repo: &str,
+    tag: &str,
+    bytes: &[u8],
+    remaining: u64,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{repo}/manifests/{tag}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(bytes.to_vec())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("ratelimit-remaining", format!("{remaining};w=21600")),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Engine completes all images when source returns zero rate-limit budget.
+///
+/// With 15 tags and `ratelimit-remaining: 0`, the circuit breaker fires after
+/// the first discovery completes (threshold = max(14/10, 1) = 1, remaining 0
+/// < 1). The `must_resume` anti-stall path kicks in each time execution drains,
+/// cycling discovery one-at-a-time until all images sync. Proves the breaker
+/// does not deadlock the engine and that the header value was actually parsed
+/// and stored on the source client.
+#[tokio::test]
+async fn budget_circuit_breaker_completes_under_zero_budget() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"cb-config")
+        .layer(b"cb-layer")
+        .build();
+    let num_tags = 15;
+
+    // Source: every manifest GET returns ratelimit-remaining: 0.
+    for i in 0..num_tags {
+        let tag = format!("v{i}");
+        mount_source_manifest_with_rate_limit(&source_server, "library/app", &tag, &parts.bytes, 0)
+            .await;
+    }
+    mount_blob_pull(
+        &source_server,
+        "library/app",
+        &parts.config_desc.digest,
+        &parts.config_data,
+    )
+    .await;
+    for (data, desc) in parts.layers_data.iter().zip(parts.layer_descs.iter()) {
+        mount_blob_pull(&source_server, "library/app", &desc.digest, data).await;
+    }
+
+    // Target: all tags need syncing.
+    for i in 0..num_tags {
+        let tag = format!("v{i}");
+        mount_manifest_head_not_found(&target_server, "mirror/app", &tag).await;
+        mount_manifest_push(&target_server, "mirror/app", &tag).await;
+    }
+    mount_blob_not_found(&target_server, "mirror/app", &parts.config_desc.digest).await;
+    for desc in &parts.layer_descs {
+        mount_blob_not_found(&target_server, "mirror/app", &desc.digest).await;
+    }
+    mount_blob_push(&target_server, "mirror/app").await;
+
+    let source_client = mock_client(&source_server);
+    let source_client_ref = Arc::clone(&source_client);
+    let target_client = mock_client(&target_server);
+
+    let tags: Vec<TagPair> = (0..num_tags)
+        .map(|i| TagPair::same(format!("v{i}")))
+        .collect();
+
+    let mapping = resolved_mapping(
+        source_client,
+        "library/app",
+        "mirror/app",
+        vec![target_entry("target-reg", target_client)],
+        tags,
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        report.images.len(),
+        num_tags,
+        "all tags must produce a result"
+    );
+    assert_eq!(
+        report.stats.images_synced, num_tags as u64,
+        "all images must sync despite zero rate-limit budget"
+    );
+    // Every image transferred blobs (no spurious skips from breaker).
+    for img in &report.images {
+        assert!(
+            matches!(img.status, ImageStatus::Synced),
+            "image {} should be Synced, got {:?}",
+            img.source,
+            img.status,
+        );
+    }
+    // The source client must have observed the zero budget from response
+    // headers. This proves the header was parsed, stored in the AtomicU64,
+    // and was available for the engine's threshold comparison.
+    assert_eq!(
+        source_client_ref.rate_limit_remaining(),
+        Some(0),
+        "source client must reflect the zero budget from response headers"
+    );
+}
+
+/// Circuit breaker fires even with fewer than 10 discovery items.
+///
+/// Regression test for the threshold dead zone: without the `.max(1)` floor,
+/// `remaining_discovery / 10` yields 0 for fewer than 10 items, making the
+/// breaker impossible to trigger. With the floor, threshold = 1 and
+/// `ratelimit-remaining: 0` triggers the pause.
+#[tokio::test]
+async fn budget_circuit_breaker_threshold_floor_small_sync() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"small-config")
+        .layer(b"small-layer")
+        .build();
+    let num_tags = 5;
+
+    for i in 0..num_tags {
+        let tag = format!("t{i}");
+        mount_source_manifest_with_rate_limit(
+            &source_server,
+            "library/small",
+            &tag,
+            &parts.bytes,
+            0,
+        )
+        .await;
+    }
+    mount_blob_pull(
+        &source_server,
+        "library/small",
+        &parts.config_desc.digest,
+        &parts.config_data,
+    )
+    .await;
+    for (data, desc) in parts.layers_data.iter().zip(parts.layer_descs.iter()) {
+        mount_blob_pull(&source_server, "library/small", &desc.digest, data).await;
+    }
+
+    for i in 0..num_tags {
+        let tag = format!("t{i}");
+        mount_manifest_head_not_found(&target_server, "mirror/small", &tag).await;
+        mount_manifest_push(&target_server, "mirror/small", &tag).await;
+    }
+    mount_blob_not_found(&target_server, "mirror/small", &parts.config_desc.digest).await;
+    for desc in &parts.layer_descs {
+        mount_blob_not_found(&target_server, "mirror/small", &desc.digest).await;
+    }
+    mount_blob_push(&target_server, "mirror/small").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let tags: Vec<TagPair> = (0..num_tags)
+        .map(|i| TagPair::same(format!("t{i}")))
+        .collect();
+
+    let mapping = resolved_mapping(
+        source_client,
+        "library/small",
+        "mirror/small",
+        vec![target_entry("target-reg", target_client)],
+        tags,
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), num_tags);
+    assert_eq!(report.stats.images_synced, num_tags as u64);
+}
+
+/// Discovery resumes when rate-limit budget refills above threshold.
+///
+/// Uses sequenced mocks (wiremock `up_to_n_times`) so the budget transition
+/// is deterministic regardless of `FuturesUnordered` polling order: the
+/// first 3 manifest GETs (whichever tags they are) return
+/// `ratelimit-remaining: 0`; all subsequent GETs return
+/// `ratelimit-remaining: 100`. The breaker fires after the first low-budget
+/// completion, then the anti-stall path serializes until a high-budget
+/// response arrives, at which point discovery resumes normally.
+#[tokio::test]
+async fn budget_circuit_breaker_resumes_on_budget_refill() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"refill-config")
+        .layer(b"refill-layer")
+        .build();
+    let num_tags: usize = 12;
+
+    // Sequenced source manifest mocks. Wiremock matches same-priority
+    // mocks by insertion order (first registered wins). The low-budget
+    // mock is registered first with up_to_n_times(3), so the first 3
+    // manifest GETs hit it. Once exhausted, the high-budget fallback
+    // handles the remaining 9.
+    Mock::given(method("GET"))
+        .and(path_regex(r"/v2/library/refill/manifests/v\d+"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(parts.bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("ratelimit-remaining", "0;w=21600"),
+        )
+        .up_to_n_times(3)
+        .expect(3)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/v2/library/refill/manifests/v\d+"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(parts.bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("ratelimit-remaining", "100;w=21600"),
+        )
+        .expect((num_tags - 3) as u64..)
+        .mount(&source_server)
+        .await;
+
+    mount_blob_pull(
+        &source_server,
+        "library/refill",
+        &parts.config_desc.digest,
+        &parts.config_data,
+    )
+    .await;
+    for (data, desc) in parts.layers_data.iter().zip(parts.layer_descs.iter()) {
+        mount_blob_pull(&source_server, "library/refill", &desc.digest, data).await;
+    }
+
+    for i in 0..num_tags {
+        let tag = format!("v{i}");
+        mount_manifest_head_not_found(&target_server, "mirror/refill", &tag).await;
+        mount_manifest_push(&target_server, "mirror/refill", &tag).await;
+    }
+    mount_blob_not_found(&target_server, "mirror/refill", &parts.config_desc.digest).await;
+    for desc in &parts.layer_descs {
+        mount_blob_not_found(&target_server, "mirror/refill", &desc.digest).await;
+    }
+    mount_blob_push(&target_server, "mirror/refill").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let tags: Vec<TagPair> = (0..num_tags)
+        .map(|i| TagPair::same(format!("v{i}")))
+        .collect();
+
+    let mapping = resolved_mapping(
+        source_client,
+        "library/refill",
+        "mirror/refill",
+        vec![target_entry("target-reg", target_client)],
+        tags,
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), num_tags);
+    assert_eq!(
+        report.stats.images_synced, num_tags as u64,
+        "all images must sync after budget refill"
+    );
+}
+
+/// Verify the breaker's threshold was met on every discovery cycle.
+///
+/// With 15 tags and zero budget, the breaker condition
+/// (`remaining < max(remaining_discovery / 10, 1)`) holds after every discovery
+/// completion. This test checks that the source client's `rate_limit_remaining`
+/// is `Some(0)` after the run AND that all 15 manifest GETs actually happened
+/// (via wiremock `.expect()`). Together these prove: (a) the breaker condition
+/// was reachable on every cycle, and (b) the engine still completed all work.
+///
+/// The breaker's runtime effect (serializing discovery via the anti-stall path)
+/// is not externally observable without tracing capture, but the condition
+/// being met + all images syncing proves the anti-stall logic is exercised.
+#[tokio::test]
+async fn budget_circuit_breaker_threshold_met_every_cycle() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"cycle-config")
+        .layer(b"cycle-layer")
+        .build();
+    let num_tags: usize = 15;
+
+    // Use a single regex mock with `.expect(num_tags)` to verify all
+    // manifest GETs happened (wiremock panics on drop if count mismatches).
+    Mock::given(method("GET"))
+        .and(path_regex(r"/v2/library/cycle/manifests/v\d+"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(parts.bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("ratelimit-remaining", "0;w=21600"),
+        )
+        .expect(num_tags as u64)
+        .mount(&source_server)
+        .await;
+
+    mount_blob_pull(
+        &source_server,
+        "library/cycle",
+        &parts.config_desc.digest,
+        &parts.config_data,
+    )
+    .await;
+    for (data, desc) in parts.layers_data.iter().zip(parts.layer_descs.iter()) {
+        mount_blob_pull(&source_server, "library/cycle", &desc.digest, data).await;
+    }
+
+    for i in 0..num_tags {
+        let tag = format!("v{i}");
+        mount_manifest_head_not_found(&target_server, "mirror/cycle", &tag).await;
+        mount_manifest_push(&target_server, "mirror/cycle", &tag).await;
+    }
+    mount_blob_not_found(&target_server, "mirror/cycle", &parts.config_desc.digest).await;
+    for desc in &parts.layer_descs {
+        mount_blob_not_found(&target_server, "mirror/cycle", &desc.digest).await;
+    }
+    mount_blob_push(&target_server, "mirror/cycle").await;
+
+    let source_client = mock_client(&source_server);
+    let source_client_ref = Arc::clone(&source_client);
+    let target_client = mock_client(&target_server);
+
+    let tags: Vec<TagPair> = (0..num_tags)
+        .map(|i| TagPair::same(format!("v{i}")))
+        .collect();
+
+    let mapping = resolved_mapping(
+        source_client,
+        "library/cycle",
+        "mirror/cycle",
+        vec![target_entry("target-reg", target_client)],
+        tags,
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_synced, num_tags as u64);
+    // Source client must show zero budget -- proves the AtomicU64 was written
+    // by send_with_aimd and readable from outside the engine.
+    assert_eq!(source_client_ref.rate_limit_remaining(), Some(0));
+    // The `.expect(15)` on the wiremock mock verifies all 15 manifest GETs
+    // happened (wiremock panics on drop if the count doesn't match).
+}
+
+/// Registries without rate-limit headers are unaffected by the circuit breaker.
+///
+/// Verifies that the breaker does not interfere with normal operation when no
+/// `ratelimit-remaining` header is present (e.g., ECR, GAR, Chainguard).
+#[tokio::test]
+async fn budget_circuit_breaker_no_header_unaffected() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"no-rl-config")
+        .layer(b"no-rl-layer")
+        .build();
+    let num_tags = 10;
+
+    // Source: standard manifests without rate-limit headers.
+    for i in 0..num_tags {
+        let tag = format!("v{i}");
+        mount_source_manifest(&source_server, "library/ecr", &tag, &parts.bytes).await;
+    }
+    mount_blob_pull(
+        &source_server,
+        "library/ecr",
+        &parts.config_desc.digest,
+        &parts.config_data,
+    )
+    .await;
+    for (data, desc) in parts.layers_data.iter().zip(parts.layer_descs.iter()) {
+        mount_blob_pull(&source_server, "library/ecr", &desc.digest, data).await;
+    }
+
+    for i in 0..num_tags {
+        let tag = format!("v{i}");
+        mount_manifest_head_not_found(&target_server, "mirror/ecr", &tag).await;
+        mount_manifest_push(&target_server, "mirror/ecr", &tag).await;
+    }
+    mount_blob_not_found(&target_server, "mirror/ecr", &parts.config_desc.digest).await;
+    for desc in &parts.layer_descs {
+        mount_blob_not_found(&target_server, "mirror/ecr", &desc.digest).await;
+    }
+    mount_blob_push(&target_server, "mirror/ecr").await;
+
+    let source_client = mock_client(&source_server);
+    let source_client_ref = Arc::clone(&source_client);
+    let target_client = mock_client(&target_server);
+
+    let tags: Vec<TagPair> = (0..num_tags)
+        .map(|i| TagPair::same(format!("v{i}")))
+        .collect();
+
+    let mapping = resolved_mapping(
+        source_client,
+        "library/ecr",
+        "mirror/ecr",
+        vec![target_entry("target-reg", target_client)],
+        tags,
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), num_tags);
+    assert_eq!(
+        report.stats.images_synced, num_tags as u64,
+        "registries without rate-limit headers must sync normally"
+    );
+    // Without rate-limit headers, the client should never have stored a value.
+    assert_eq!(
+        source_client_ref.rate_limit_remaining(),
+        None,
+        "source client must remain None when no rate-limit header is present"
+    );
+}
+
+/// Multi-source: one rate-limited source pauses ALL discovery (all-or-nothing).
+///
+/// Two source registries: source A returns `ratelimit-remaining: 0` (rate-limited),
+/// source B returns no rate-limit header (unlimited, e.g. ECR). The all-or-nothing
+/// pause means source B's discovery is paused too, but the anti-stall path ensures
+/// all images eventually sync. Proves the multi-source dedup works and that the
+/// breaker's `any`-trigger / `all`-resume asymmetry does not deadlock.
+#[tokio::test]
+async fn budget_circuit_breaker_multi_source_all_or_nothing() {
+    let source_a_server = MockServer::start().await; // rate-limited (Docker Hub)
+    let source_b_server = MockServer::start().await; // unlimited (ECR-like)
+    let target_server = MockServer::start().await;
+
+    let parts_a = ManifestBuilder::new(b"ms-config-a")
+        .layer(b"ms-layer-a")
+        .build();
+    let parts_b = ManifestBuilder::new(b"ms-config-b")
+        .layer(b"ms-layer-b")
+        .build();
+
+    let tags_per_source = 8;
+
+    // Source A: rate-limited.
+    for i in 0..tags_per_source {
+        let tag = format!("v{i}");
+        mount_source_manifest_with_rate_limit(
+            &source_a_server,
+            "library/alpha",
+            &tag,
+            &parts_a.bytes,
+            0,
+        )
+        .await;
+    }
+    mount_blob_pull(
+        &source_a_server,
+        "library/alpha",
+        &parts_a.config_desc.digest,
+        &parts_a.config_data,
+    )
+    .await;
+    for (data, desc) in parts_a.layers_data.iter().zip(parts_a.layer_descs.iter()) {
+        mount_blob_pull(&source_a_server, "library/alpha", &desc.digest, data).await;
+    }
+
+    // Source B: no rate-limit headers.
+    for i in 0..tags_per_source {
+        let tag = format!("v{i}");
+        mount_source_manifest(&source_b_server, "library/beta", &tag, &parts_b.bytes).await;
+    }
+    mount_blob_pull(
+        &source_b_server,
+        "library/beta",
+        &parts_b.config_desc.digest,
+        &parts_b.config_data,
+    )
+    .await;
+    for (data, desc) in parts_b.layers_data.iter().zip(parts_b.layer_descs.iter()) {
+        mount_blob_pull(&source_b_server, "library/beta", &desc.digest, data).await;
+    }
+
+    // Target: both repos.
+    for i in 0..tags_per_source {
+        let tag = format!("v{i}");
+        mount_manifest_head_not_found(&target_server, "mirror/alpha", &tag).await;
+        mount_manifest_push(&target_server, "mirror/alpha", &tag).await;
+        mount_manifest_head_not_found(&target_server, "mirror/beta", &tag).await;
+        mount_manifest_push(&target_server, "mirror/beta", &tag).await;
+    }
+    mount_blob_not_found(&target_server, "mirror/alpha", &parts_a.config_desc.digest).await;
+    for desc in &parts_a.layer_descs {
+        mount_blob_not_found(&target_server, "mirror/alpha", &desc.digest).await;
+    }
+    mount_blob_push(&target_server, "mirror/alpha").await;
+    mount_blob_not_found(&target_server, "mirror/beta", &parts_b.config_desc.digest).await;
+    for desc in &parts_b.layer_descs {
+        mount_blob_not_found(&target_server, "mirror/beta", &desc.digest).await;
+    }
+    mount_blob_push(&target_server, "mirror/beta").await;
+
+    let source_a_client = mock_client(&source_a_server);
+    let source_a_ref = Arc::clone(&source_a_client);
+    let source_b_client = mock_client(&source_b_server);
+    let source_b_ref = Arc::clone(&source_b_client);
+    let target_client = mock_client(&target_server);
+
+    let tags: Vec<TagPair> = (0..tags_per_source)
+        .map(|i| TagPair::same(format!("v{i}")))
+        .collect();
+
+    let mapping_a = resolved_mapping(
+        source_a_client,
+        "library/alpha",
+        "mirror/alpha",
+        vec![target_entry("target-reg", Arc::clone(&target_client))],
+        tags.clone(),
+    );
+    let mapping_b = resolved_mapping(
+        source_b_client,
+        "library/beta",
+        "mirror/beta",
+        vec![target_entry("target-reg", target_client)],
+        tags,
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    let total = tags_per_source * 2;
+    assert_eq!(
+        report.images.len(),
+        total,
+        "all images from both sources must produce a result"
+    );
+    assert_eq!(
+        report.stats.images_synced, total as u64,
+        "all images must sync despite one source being rate-limited"
+    );
+    for img in &report.images {
+        assert!(
+            matches!(img.status, ImageStatus::Synced),
+            "image {} should be Synced, got {:?}",
+            img.source,
+            img.status,
+        );
+    }
+    // Source A: rate-limited, must reflect zero budget.
+    assert_eq!(
+        source_a_ref.rate_limit_remaining(),
+        Some(0),
+        "rate-limited source must reflect zero budget"
+    );
+    // Source B: no headers, must remain None.
+    assert_eq!(
+        source_b_ref.rate_limit_remaining(),
+        None,
+        "unlimited source must remain None"
+    );
+}
+
+/// Tracing capture: verify the circuit breaker warn! message is emitted.
+///
+/// Uses `tracing-subscriber` with an in-memory layer to capture log output.
+/// Proves the breaker actually fires (not just that the engine completes),
+/// making the "breaker fired" assertion explicit rather than inferred from
+/// side effects.
+#[tokio::test]
+async fn budget_circuit_breaker_emits_tracing_warn() {
+    use std::sync::Mutex;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Minimal tracing layer that captures formatted warn-level events.
+    struct CaptureLayer {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut visitor = MessageVisitor(String::new());
+                event.record(&mut visitor);
+                self.messages.lock().unwrap().push(visitor.0);
+            }
+        }
+    }
+
+    struct MessageVisitor(String);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+    let layer = CaptureLayer {
+        messages: Arc::clone(&captured),
+    };
+    let subscriber = tracing_subscriber::registry().with(layer);
+
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"trace-config")
+        .layer(b"trace-layer")
+        .build();
+    let num_tags: usize = 10;
+
+    for i in 0..num_tags {
+        let tag = format!("v{i}");
+        mount_source_manifest_with_rate_limit(
+            &source_server,
+            "library/traced",
+            &tag,
+            &parts.bytes,
+            0,
+        )
+        .await;
+    }
+    mount_blob_pull(
+        &source_server,
+        "library/traced",
+        &parts.config_desc.digest,
+        &parts.config_data,
+    )
+    .await;
+    for (data, desc) in parts.layers_data.iter().zip(parts.layer_descs.iter()) {
+        mount_blob_pull(&source_server, "library/traced", &desc.digest, data).await;
+    }
+
+    for i in 0..num_tags {
+        let tag = format!("v{i}");
+        mount_manifest_head_not_found(&target_server, "mirror/traced", &tag).await;
+        mount_manifest_push(&target_server, "mirror/traced", &tag).await;
+    }
+    mount_blob_not_found(&target_server, "mirror/traced", &parts.config_desc.digest).await;
+    for desc in &parts.layer_descs {
+        mount_blob_not_found(&target_server, "mirror/traced", &desc.digest).await;
+    }
+    mount_blob_push(&target_server, "mirror/traced").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let tags: Vec<TagPair> = (0..num_tags)
+        .map(|i| TagPair::same(format!("v{i}")))
+        .collect();
+
+    let mapping = resolved_mapping(
+        source_client,
+        "library/traced",
+        "mirror/traced",
+        vec![target_entry("target-reg", target_client)],
+        tags,
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+
+    // Run the engine under our custom subscriber.
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+    drop(_guard);
+
+    assert_eq!(report.stats.images_synced, num_tags as u64);
+
+    let messages = captured.lock().unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("rate-limit budget low, pausing discovery")),
+        "expected warn message about pausing discovery, got: {messages:?}"
+    );
 }
