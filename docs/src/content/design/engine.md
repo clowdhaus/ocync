@@ -124,9 +124,9 @@ The mapping function is ~20 lines. The window key is derived from HTTP method + 
 
 ### Budget circuit breaker
 
-> **Status: Planned.** The circuit breaker described below is designed but not yet implemented.
+Parse `ratelimit-remaining` from Docker Hub manifest responses (and `x-ratelimit-remaining` from GHCR). Single decision point: if `remaining < max(remaining_discovery_count / 10, 1)`, log warning and pause discovery. The floor of 1 ensures the breaker can fire even for small syncs (fewer than 10 images). Discovery items already in `pending` wait for promotion (which requires all discovery to complete). Resume when a subsequent response shows budget has refilled, or when the execution pool is empty (preventing stall). The resume condition checks execution emptiness alone, not `pending`, because pending items cannot be promoted until all discovery completes -- requiring both to be empty would deadlock when the breaker pauses discovery with items already queued. In practice, the anti-stall path serializes remaining discovery one-at-a-time, preventing burst consumption of the rate-limit budget.
 
-Parse `ratelimit-remaining` from Docker Hub manifest responses (and `X-RateLimit-Remaining` from GHCR). Single decision point: if `remaining < 0.1 * planned_discovery_count`, log warning and pause discovery. Execution continues for already-discovered images. Resume when a subsequent response shows budget has refilled.
+The header is extracted in `RegistryClient::send_with_aimd` on every successful response and stored in an `AtomicU64` on the client. The engine reads this value on source clients after each discovery completion and compares against the threshold. The `discovery_paused` guard disables the discovery `select!` branch, which on `current_thread` prevents paused futures from being polled.
 
 This is not a dynamic priority scheduler. It is a circuit breaker with one threshold. For registries without rate-limit headers (ECR, GAR, Chainguard): AIMD handles capacity discovery automatically through 429 feedback.
 

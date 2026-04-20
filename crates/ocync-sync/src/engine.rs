@@ -614,6 +614,31 @@ impl SyncEngine {
         // committed manifest for mount to succeed.
         let mut preferred_mount_sources: Vec<RepositoryName> = Vec::new();
 
+        // Budget circuit breaker: pause discovery when a source registry's
+        // rate-limit remaining drops below 10% of the remaining discovery count.
+        // Execution continues for already-discovered images. Discovery resumes
+        // when a subsequent response shows the budget has refilled.
+        //
+        // Pause is all-or-nothing: ANY source below threshold pauses ALL
+        // discovery (not just that source's mappings). This is a structural
+        // constraint -- `FuturesUnordered` doesn't support selective polling,
+        // so per-source pausing would require a different architecture.
+        // In practice, multi-source syncs with mixed rate-limited / unlimited
+        // registries are uncommon, and the anti-stall path prevents deadlock.
+        let mut discovery_paused = false;
+        // Collect unique source clients for rate-limit checking. Deduped by
+        // Arc pointer identity (same source registry = same client).
+        let source_clients: Vec<Arc<RegistryClient>> = {
+            let mut seen = HashSet::new();
+            let mut clients = Vec::new();
+            for m in &mappings {
+                if seen.insert(Arc::as_ptr(&m.source_client)) {
+                    clients.push(Arc::clone(&m.source_client));
+                }
+            }
+            clients
+        };
+
         // Seed discovery with all (mapping, tag) pairs.
         for mapping in &mappings {
             for tag_pair in &mapping.tags {
@@ -674,6 +699,35 @@ impl SyncEngine {
         };
 
         loop {
+            // Budget circuit breaker: check if discovery should resume.
+            // Resume when (a) budget has refilled above the threshold, or
+            // (b) nothing is executing - pending items cannot be promoted until
+            // all discovery completes, so execution draining means no progress
+            // is possible without resuming discovery.
+            if discovery_paused && !discovery_futures.is_empty() {
+                let remaining_discovery = discovery_futures.len() as u64;
+                let threshold = (remaining_discovery / 10).max(1);
+                let budget_ok = source_clients
+                    .iter()
+                    .all(|c| c.rate_limit_remaining().is_none_or(|r| r >= threshold));
+                let must_resume = execution_futures.is_empty();
+                if budget_ok || must_resume {
+                    discovery_paused = false;
+                    if must_resume && !budget_ok {
+                        info!(
+                            remaining_discovery,
+                            pending = pending.len(),
+                            "no active execution, resuming discovery despite low budget"
+                        );
+                    } else {
+                        info!(
+                            remaining_discovery,
+                            "rate-limit budget refilled, resuming discovery"
+                        );
+                    }
+                }
+            }
+
             // Phased promotion: accumulate during discovery, then leader-first.
             if !shutting_down {
                 if matches!(promotion_phase, PromotionPhase::Discovering)
@@ -778,7 +832,7 @@ impl SyncEngine {
                     break;
                 }
                 Some((outcome, route)) = discovery_futures.next(),
-                    if !shutting_down && !discovery_futures.is_empty() =>
+                    if !shutting_down && !discovery_paused && !discovery_futures.is_empty() =>
                 {
                     // Accumulate discovery route counters.
                     match route {
@@ -819,6 +873,31 @@ impl SyncEngine {
                                 progress.image_completed(r);
                             }
                             results.extend(fail_results);
+                        }
+                    }
+
+                    // Budget circuit breaker: check if we should pause discovery.
+                    if !discovery_paused && !discovery_futures.is_empty() {
+                        let remaining_discovery = discovery_futures.len() as u64;
+                        let threshold = (remaining_discovery / 10).max(1);
+                        for client in &source_clients {
+                            if let Some(remaining) = client.rate_limit_remaining() {
+                                if remaining < threshold {
+                                    discovery_paused = true;
+                                    let registry = client
+                                        .registry_authority()
+                                        .map(|a| a.to_string())
+                                        .unwrap_or_else(|_| "unknown".into());
+                                    warn!(
+                                        rate_limit_remaining = remaining,
+                                        remaining_discovery,
+                                        threshold,
+                                        %registry,
+                                        "rate-limit budget low, pausing discovery"
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
