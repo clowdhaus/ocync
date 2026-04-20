@@ -10592,7 +10592,7 @@ async fn head_first_target_head_error_degrades_to_sync() {
 
 /// `head_first`: when the discovery cache is warm (source snapshot exists),
 /// the standard cache-hit path fires and `head_first` has no effect --
-/// no target HEADs are issued for the head_first check.
+/// no target HEADs are issued for the `head_first` check.
 #[tokio::test]
 async fn head_first_warm_cache_uses_standard_cache_hit() {
     let source_server = MockServer::start().await;
