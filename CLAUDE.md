@@ -85,7 +85,7 @@ Prerequisites: Terraform, AWS credentials with ECR access, SSM parameters popula
 
 ```bash
 cd bench/terraform/aws && terraform init && terraform apply
-cargo xtask bench-remote --provider aws --scenario cold
+cargo xtask bench-remote --provider aws --scenario sync
 cd bench/terraform/aws && terraform destroy
 ```
 

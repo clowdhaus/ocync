@@ -18,7 +18,7 @@ Benchmark infrastructure for comparing ocync against dregsy and regsync.
 cd bench/terraform/aws && terraform init && terraform apply
 
 # 2. Run benchmarks (reads bench.json automatically)
-cargo xtask bench-remote --provider aws --scenario cold
+cargo xtask bench-remote --provider aws --scenario sync
 
 # 3. Tear down when done
 cd bench/terraform/aws && terraform destroy
@@ -30,10 +30,10 @@ Single command for the full benchmark cycle.
 
 ```bash
 # Full 3-tool cold+warm comparison
-cargo xtask bench-remote --provider aws --scenario cold
+cargo xtask bench-remote --provider aws --scenario sync
 
 # Quick smoke test
-cargo xtask bench-remote --provider aws --scenario cold \
+cargo xtask bench-remote --provider aws --scenario sync \
   --tools ocync --limit 3
 
 # All scenarios (cold+warm + partial + scale)
@@ -79,7 +79,7 @@ ssh ec2-user@<public-ip>
 cd ~/ocync
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
-cargo xtask bench --tools ocync,dregsy,regsync cold
+cargo xtask bench --tools ocync,dregsy,regsync sync
 ```
 
 ## Instance details

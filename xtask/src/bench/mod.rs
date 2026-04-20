@@ -80,9 +80,8 @@ pub(crate) struct BenchArgs {
 /// Benchmark scenario to run (CLI subcommand).
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub(crate) enum Scenario {
-    /// Cold sync then immediate warm re-sync -- measures both raw
-    /// transfer performance and skip optimization in one pass.
-    Cold,
+    /// Full sync (cold) then immediate re-sync (warm).
+    Sync,
     /// Re-sync after ~5% of tags changed -- measures incremental sync.
     Partial,
     /// Run at increasing corpus sizes -- measures scaling behavior (ocync only).
@@ -279,15 +278,15 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // 6. Expand All into individual scenarios, then dispatch each.
     let scenarios: Vec<Scenario> = match args.scenario {
-        Scenario::All => vec![Scenario::Cold, Scenario::Partial, Scenario::Scale],
+        Scenario::All => vec![Scenario::Sync, Scenario::Partial, Scenario::Scale],
         other => vec![other],
     };
 
     for scenario in scenarios {
         match scenario {
-            Scenario::Cold => {
+            Scenario::Sync => {
                 let (cold, warm) =
-                    run_cold(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
+                    run_sync(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
                 report.scenarios.push(cold);
                 report.scenarios.push(warm);
             }
@@ -549,10 +548,10 @@ async fn run_single_tool(
     })
 }
 
-/// Cold + warm scenario: cold sync (measured), then immediate warm
-/// re-sync (measured) with the same config directory so that ocync's
+/// Sync scenario: full sync (measured), then immediate re-sync
+/// (measured) with the same config directory so that ocync's
 /// `TransferStateCache` persists between runs.
-async fn run_cold(
+async fn run_sync(
     args: &BenchArgs,
     corpus: &Corpus,
     tools: &[Tool],
@@ -748,7 +747,7 @@ fn days_to_civil(days: u64) -> (u32, u32, u32) {
 impl std::fmt::Display for Scenario {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Scenario::Cold => f.write_str("cold"),
+            Scenario::Sync => f.write_str("sync"),
             Scenario::Partial => f.write_str("partial"),
             Scenario::Scale => f.write_str("scale"),
             Scenario::All => f.write_str("all"),
@@ -803,7 +802,7 @@ mod tests {
 
     #[test]
     fn scenario_display() {
-        assert_eq!(Scenario::Cold.to_string(), "cold");
+        assert_eq!(Scenario::Sync.to_string(), "sync");
         assert_eq!(Scenario::Partial.to_string(), "partial");
         assert_eq!(Scenario::Scale.to_string(), "scale");
         assert_eq!(Scenario::All.to_string(), "all");
