@@ -97,6 +97,7 @@ registries:
     url: registry.example.com         # Required
     auth_type: ecr                    # Optional (see below)
     max_concurrent: 50                # Optional per-registry concurrency cap (>= 1)
+    head_first: true                  # Optional: HEAD-check targets before source GET
     credentials:                      # For auth_type: basic
       username: myuser
       password: ${REGISTRY_PASSWORD}
@@ -108,6 +109,7 @@ registries:
 | `url` | Yes | Registry hostname (e.g., `cgr.dev`, `123456789012.dkr.ecr.us-east-1.amazonaws.com`) |
 | `auth_type` | No | Authentication method (see below). Auto-detected from hostname when omitted |
 | `max_concurrent` | No | Per-registry aggregate concurrency cap. Limits total simultaneous HTTP requests to this registry across all mappings. Must be >= 1 |
+| `head_first` | No | HEAD-check all targets against the source HEAD digest before pulling full source manifests on cache miss. Skips the expensive source GET when all targets already match. Useful for rate-limited sources (e.g., Docker Hub). Bypassed when platform filtering is active. Default: `false` |
 | `credentials` | When `auth_type: basic` | Object with `username` and `password` fields. Both required |
 | `token` | When `auth_type: static_token` | Pre-obtained bearer token string |
 
@@ -721,6 +723,11 @@ The schema is generated from the Rust config types and verified in CI to stay in
               "type": "null"
             }
           ]
+        },
+        "head_first": {
+          "description": "HEAD-check targets before pulling full source manifests on cache miss.\n\nWhen enabled, the engine issues a manifest HEAD against all targets before performing a full source manifest GET. If every target already holds the same digest as the source HEAD, the expensive GET is skipped. This conserves rate-limit tokens on source registries with aggressive quotas (e.g., Docker Hub).",
+          "default": false,
+          "type": "boolean"
         },
         "max_concurrent": {
           "description": "Per-registry aggregate concurrency cap (default: 50).\n\nLimits the total number of simultaneous in-flight HTTP requests to this registry across all action types. This is independent of the global `max_concurrent_transfers` (which caps image-level parallelism).",

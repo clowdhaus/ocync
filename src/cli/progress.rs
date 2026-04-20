@@ -498,6 +498,7 @@ mod tests {
                 discovery_cache_misses: 10,
                 discovery_head_failures: 2,
                 discovery_target_stale: 1,
+                discovery_head_first_hits: 0,
             },
             duration: Duration::from_secs(47),
         };

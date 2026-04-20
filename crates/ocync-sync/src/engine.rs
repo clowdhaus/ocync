@@ -126,6 +126,17 @@ pub struct ResolvedMapping {
     /// [`Platform::matches()`]). Child manifests and blobs for non-matching
     /// platforms are never pulled from the source.
     pub platforms: Option<Vec<PlatformFilter>>,
+    /// When true, HEAD-check all targets against the source HEAD digest
+    /// before performing a full source manifest GET on cache miss.
+    ///
+    /// Conserves rate-limit tokens on source registries (e.g., Docker Hub)
+    /// by avoiding the expensive GET when all targets already have the
+    /// correct manifest. On cache hit the discovery optimization already
+    /// skips the GET; `head_first` extends that to the cold-cache path.
+    ///
+    /// The source HEAD from the discovery optimization is reused, so
+    /// enabling both features does not issue a redundant HEAD.
+    pub head_first: bool,
 }
 
 /// A single target registry entry.
@@ -304,6 +315,9 @@ enum DiscoveryRoute {
     HeadFailure,
     /// Source cache matched but target HEAD mismatch forced full pull.
     TargetStale,
+    /// `head_first` enabled: all targets matched the source HEAD digest on cache
+    /// miss, avoiding the full source GET.
+    HeadFirstHit,
 }
 
 /// Elect leader images for mount optimization via greedy set-cover.
@@ -600,6 +614,7 @@ impl SyncEngine {
         let mut discovery_misses: u64 = 0;
         let mut discovery_head_failures: u64 = 0;
         let mut discovery_target_stale: u64 = 0;
+        let mut discovery_head_first_hits: u64 = 0;
 
         // Leader-follower mount optimization state.
         //
@@ -658,6 +673,7 @@ impl SyncEngine {
                     platforms: mapping.platforms.clone(),
                     cache: Rc::clone(&cache),
                     source_head_timeout: self.source_head_timeout,
+                    head_first: mapping.head_first,
                 };
 
                 discovery_futures.push(async move { discover_tag(params).await });
@@ -846,6 +862,10 @@ impl SyncEngine {
                             discovery_misses += 1;
                             discovery_target_stale += 1;
                         }
+                        DiscoveryRoute::HeadFirstHit => {
+                            discovery_hits += 1;
+                            discovery_head_first_hits += 1;
+                        }
                     }
                     match outcome {
                         DiscoveryOutcome::Skip(skip_results) => {
@@ -931,6 +951,7 @@ impl SyncEngine {
         stats.discovery_cache_misses = discovery_misses;
         stats.discovery_head_failures = discovery_head_failures;
         stats.discovery_target_stale = discovery_target_stale;
+        stats.discovery_head_first_hits = discovery_head_first_hits;
         let duration = run_start.elapsed();
 
         let report = SyncReport {
@@ -961,6 +982,8 @@ struct DiscoveryParams {
     platforms: Option<Vec<PlatformFilter>>,
     cache: Rc<RefCell<TransferStateCache>>,
     source_head_timeout: Duration,
+    /// When true, HEAD-check targets on cache miss before the full source GET.
+    head_first: bool,
 }
 
 /// Discover a single (mapping, tag) pair: HEAD source, check cache, pull if needed.
@@ -992,6 +1015,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         platforms,
         cache,
         source_head_timeout,
+        head_first,
     } = params;
 
     let platform_key = PlatformFilterKey::from_filters(platforms.as_deref());
@@ -1126,6 +1150,108 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
             }
         }
         // Cache miss or source/config changed - fall through.
+    }
+
+    // --- head_first: HEAD targets on cache miss to avoid full source GET ---
+    //
+    // When head_first is enabled and the source HEAD succeeded, HEAD-check
+    // all targets against the source HEAD digest before performing the
+    // expensive full manifest GET. This conserves source rate-limit tokens
+    // on cold cache when targets are already in sync.
+    //
+    // The source HEAD digest from the discovery optimization (step 1) is
+    // reused here, avoiding a redundant second HEAD.
+    //
+    // Limitation: platform filtering can change the pushed digest relative
+    // to the source HEAD digest. When platform filtering is active, the
+    // target holds a filtered index whose digest differs from the source
+    // HEAD digest, so the comparison would always miss. We skip the
+    // head_first check in that case (fall through to full pull, which
+    // handles filtered comparisons correctly).
+    if head_first && platforms.is_none() {
+        if let Some(ref head_digest) = source_head_digest {
+            let mut head_checks = FuturesUnordered::new();
+            for entry in &targets {
+                let client = Arc::clone(&entry.client);
+                let repo = target.repo.clone();
+                let tag = target.tag.clone();
+                let name = entry.name.clone();
+                let checker = entry.batch_checker.clone();
+                head_checks.push(async move {
+                    let result = client.manifest_head(&repo, &tag).await;
+                    (name, client, checker, result)
+                });
+            }
+
+            let mut skipped_results = Vec::new();
+            let mut mismatched_targets = Vec::new();
+
+            while let Some((target_name, target_client, batch_checker, result)) =
+                head_checks.next().await
+            {
+                match result {
+                    Ok(Some(head)) if head.digest == *head_digest => {
+                        info!(
+                            source_repo = %source.repo,
+                            source_tag = %source.tag,
+                            target_repo = %target.repo,
+                            digest = %head_digest,
+                            "skipping -- digest matches at target (head_first)"
+                        );
+                        tracing::debug!(target: "ocync::metrics", "head_first_skip");
+                        skipped_results.push(skip_image_result(
+                            &source,
+                            &target,
+                            SkipReason::DigestMatch,
+                        ));
+                    }
+                    other => {
+                        if let Err(e) = &other {
+                            warn!(
+                                target_repo = %target.repo,
+                                target_tag = %target.tag,
+                                error = %e,
+                                "target manifest HEAD failed during head_first, proceeding with sync"
+                            );
+                        }
+                        mismatched_targets.push(TargetEntry {
+                            name: target_name,
+                            client: target_client,
+                            batch_checker,
+                        });
+                    }
+                }
+            }
+
+            if mismatched_targets.is_empty() {
+                // All targets match the source HEAD digest - skip entirely.
+                // No cache entry is written since we never pulled the full
+                // manifest (no filtered_digest available). The next cycle
+                // with a warm cache will use the standard discovery path.
+                return (
+                    DiscoveryOutcome::Skip(skipped_results),
+                    DiscoveryRoute::HeadFirstHit,
+                );
+            }
+
+            // Some targets stale - fall through to full pull for those targets.
+            let outcome = full_pull_and_build_tasks(FullPullParams {
+                source_client: &source_client,
+                source: &source,
+                target: &target,
+                targets: &mismatched_targets,
+                skipped_results,
+                retry: &retry,
+                platforms: platforms.as_deref(),
+                cache: &cache,
+                snapshot_key: &snapshot_key,
+                head_digest: Some(head_digest),
+                platform_key: &platform_key,
+            })
+            .await;
+
+            return (outcome, DiscoveryRoute::CacheMiss);
+        }
     }
 
     // --- Full pull path (cache miss, HEAD failed, or source changed) ---
