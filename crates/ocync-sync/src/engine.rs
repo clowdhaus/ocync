@@ -502,6 +502,11 @@ pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 50;
 
 /// Maximum concurrent blob transfers within a single image.
 ///
+/// Within a single image task, blobs are transferred via `FuturesUnordered`
+/// gated by a local `Semaphore(BLOB_CONCURRENCY)`. This bounds the number of
+/// simultaneous blob uploads/downloads per image while allowing the global
+/// semaphore to independently control total in-flight image tasks.
+///
 /// Matches skopeo's default (6). Higher values risk approaching ECR's
 /// `InitiateLayerUpload` limit (100 TPS shared across all images).
 /// Candidate for `SyncEngine` builder configuration if workloads need tuning.
@@ -821,8 +826,8 @@ impl SyncEngine {
             }
         }
 
-        // Prune snapshot entries for tags no longer in the mapping set.
-        // Prevents unbounded cache growth when source tags are deleted.
+        // Prune stale cache entries for tags/targets no longer in the mapping set.
+        // Prevents unbounded cache growth when source tags or targets are deleted.
         {
             let live_keys: HashSet<SnapshotKey> = mappings
                 .iter()
@@ -832,7 +837,14 @@ impl SyncEngine {
                         .map(|t| SnapshotKey::new(&m.source_authority, &m.source_repo, &t.source))
                 })
                 .collect();
-            cache.borrow_mut().prune_snapshots(&live_keys);
+            let live_targets: HashSet<String> = mappings
+                .iter()
+                .flat_map(|m| m.targets.iter().map(|t| t.name.to_string()))
+                .collect();
+            let mut cache_mut = cache.borrow_mut();
+            cache_mut.prune_snapshots(&live_keys);
+            cache_mut.prune_dedup(&live_targets);
+            cache_mut.clear_notifies();
         }
 
         let mut stats = compute_stats(&results);
@@ -1109,6 +1121,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
         Ok(data) => Rc::new(data),
         Err(err) => {
             let error_str = err.to_string();
+            let status_code = err.status_code().map(|s| s.as_u16());
             warn!(
                 source_repo = %source.repo,
                 source_tag = %source.tag,
@@ -1125,6 +1138,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                         kind: ErrorKind::ManifestPull,
                         error: error_str.clone(),
                         retries: retry.max_retries,
+                        status_code,
                     },
                     bytes_transferred: 0,
                     blob_stats: BlobTransferStats::default(),
@@ -1246,6 +1260,7 @@ async fn execute_item(
                 kind: ErrorKind::BlobTransfer,
                 error: err.to_string(),
                 retries: retry.max_retries,
+                status_code: err.status_code().map(|s| s.as_u16()),
             },
             bytes_transferred: outcome.bytes_transferred,
             blob_stats: outcome.stats,
@@ -1311,6 +1326,7 @@ async fn execute_item(
                         kind: ErrorKind::ManifestPush,
                         error: err.to_string(),
                         retries: retry.max_retries,
+                        status_code: err.status_code().map(|s| s.as_u16()),
                     },
                     bytes_transferred: outcome.bytes_transferred,
                     blob_stats: outcome.stats,
@@ -1719,14 +1735,18 @@ async fn transfer_single_blob(
                 return BlobResult::Mounted;
             }
             Ok(MountResult::NotMounted) | Err(_) => {
-                debug!(%digest, target = %ctx.target_name, "mount not fulfilled, falling back to HEAD+push");
-                let mut c = ctx.cache.borrow_mut();
-                c.invalidate_blob(ctx.target_name, digest);
-                c.notify_blob(ctx.target_name, digest);
-                drop(c);
+                debug!(%digest, %from_repo, target = %ctx.target_name, "mount not fulfilled, falling back to HEAD+push");
+                // Remove the stale mount source from repos, but keep the
+                // blob entry as InProgress. This task already owns the claim
+                // and will proceed with HEAD+push. Removing only the stale
+                // repo prevents future mount attempts from retrying it,
+                // while keeping the entry prevents concurrent waiters from
+                // re-claiming and starting duplicate pushes.
+                ctx.cache
+                    .borrow_mut()
+                    .remove_blob_repo(ctx.target_name, digest, &from_repo);
                 mount_attempted = true;
                 tracing::debug!(target: "ocync::metrics", result = "fallback", "mount");
-                tracing::debug!(target: "ocync::metrics", "cache_invalidation");
             }
         }
     }
@@ -1907,6 +1927,14 @@ async fn push_manifests(
 /// Uses synchronous `std::fs::Read` internally. On a single-threaded tokio
 /// runtime, each individual read call blocks for microseconds (local disk),
 /// which is negligible compared to network RTT.
+///
+/// # Assumption: local filesystem
+///
+/// This function performs blocking I/O on the tokio `current_thread` runtime.
+/// The staging directory MUST reside on local disk (tmpfs, ext4, APFS, etc.).
+/// Network filesystems (NFS, EFS, CIFS) can block for milliseconds to seconds
+/// per read, stalling the entire event loop. See [`BlobStage`] documentation
+/// for staging path requirements.
 fn file_read_stream(
     file: std::fs::File,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
@@ -1922,11 +1950,12 @@ fn file_read_stream(
     })
 }
 
-/// Retry an async operation with exponential backoff on transient HTTP errors.
+/// Retry an async operation with exponential backoff on transient errors.
 ///
-/// Calls `f()` in a loop. If the result is `Err` with a retryable HTTP status
-/// (408, 429, 5xx), waits with exponential backoff and tries again up to
-/// `config.max_retries` times. Returns the first `Ok` or the final `Err`.
+/// Calls `f()` in a loop. Retries on HTTP 408/429/5xx status codes and on
+/// transport-level errors (connection refused, DNS failure, request timeout).
+/// Waits with jittered exponential backoff up to `config.max_retries` times.
+/// Returns the first `Ok` or the final `Err`.
 async fn with_retry<T, F, Fut>(
     config: &RetryConfig,
     operation: &str,
@@ -1941,20 +1970,26 @@ where
         match f().await {
             Ok(val) => return Ok(val),
             Err(e) => {
-                if let Some(status) = e.status_code() {
-                    if retry::should_retry(status, attempt, config.max_retries) {
-                        let backoff = config.backoff_for(attempt);
-                        warn!(
-                            operation,
-                            attempt,
-                            status = %status,
-                            backoff_ms = backoff.as_millis(),
-                            "retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
-                    }
+                let retryable = if let Some(status) = e.status_code() {
+                    retry::should_retry(status, attempt, config.max_retries)
+                } else {
+                    // Transport-level errors (connection refused, DNS failure,
+                    // request timeout) are retryable when attempts remain.
+                    attempt < config.max_retries && retry::should_retry_transport(&e)
+                };
+
+                if retryable {
+                    let backoff = config.backoff_for(attempt);
+                    warn!(
+                        operation,
+                        attempt,
+                        error = %e,
+                        backoff_ms = backoff.as_millis(),
+                        "retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                    continue;
                 }
                 return Err(e);
             }
@@ -2116,6 +2151,7 @@ mod tests {
                     kind: ErrorKind::BlobTransfer,
                     error: "timeout".into(),
                     retries: 3,
+                    status_code: None,
                 },
                 0,
             ),
@@ -2259,11 +2295,11 @@ mod tests {
             target_name: RegistryAlias::new("test-target"),
             target_client: client,
             source: ImageRef {
-                repo: RepositoryName::new(format!("source/{tag}")),
+                repo: RepositoryName::new(format!("source/{tag}")).unwrap(),
                 tag: tag.to_owned(),
             },
             target: ImageRef {
-                repo: RepositoryName::new(format!("target/{tag}")),
+                repo: RepositoryName::new(format!("target/{tag}")).unwrap(),
                 tag: tag.to_owned(),
             },
             batch_checker: None,
@@ -2377,11 +2413,11 @@ mod tests {
             target_name: RegistryAlias::new("target-1"),
             target_client: Arc::clone(&client_a),
             source: ImageRef {
-                repo: RepositoryName::new("src/base"),
+                repo: RepositoryName::new("src/base").unwrap(),
                 tag: "v1".into(),
             },
             target: ImageRef {
-                repo: RepositoryName::new("tgt/base"),
+                repo: RepositoryName::new("tgt/base").unwrap(),
                 tag: "v1".into(),
             },
             batch_checker: None,
@@ -2392,11 +2428,11 @@ mod tests {
             target_name: RegistryAlias::new("target-2"),
             target_client: Arc::clone(&client_b),
             source: ImageRef {
-                repo: RepositoryName::new("src/base"),
+                repo: RepositoryName::new("src/base").unwrap(),
                 tag: "v1".into(),
             },
             target: ImageRef {
-                repo: RepositoryName::new("tgt/base"),
+                repo: RepositoryName::new("tgt/base").unwrap(),
                 tag: "v1".into(),
             },
             batch_checker: None,
@@ -2549,6 +2585,81 @@ mod tests {
                 pending[0].source.tag, "imgB",
                 "tie should break deterministically in favor of later candidate"
             );
+        }
+    }
+
+    #[test]
+    fn elect_leaders_minimal_set_covers_all_follower_shared_blobs() {
+        // Verify the greedy election picks the minimal leader set such that
+        // every shared blob of every follower is present in the leader union.
+        //
+        // Setup: 5 images with overlapping blob sets designed so that 2
+        // leaders suffice to cover all shared blobs.
+        //
+        // img1: {10, a1, a2, a3, f1}  -- shares a1,a2,a3 broadly
+        // img2: {20, a1, a2, f2}       -- shares a1,a2 with img1
+        // img3: {30, a2, a3, f3}       -- shares a2,a3 with img1
+        // img4: {40, b4, b5, f4}       -- disjoint cluster
+        // img5: {50, b4, b5, f5}       -- shares b4,b5 with img4
+        //
+        // Optimal: img1 covers {a1,a2,a3} for cluster 1, img4 or img5 covers
+        // {b4,b5} for cluster 2. Two leaders total.
+        let data1 = Rc::new(test_pulled_manifest(&["10", "a1", "a2", "a3", "f1"]));
+        let data2 = Rc::new(test_pulled_manifest(&["20", "a1", "a2", "f2"]));
+        let data3 = Rc::new(test_pulled_manifest(&["30", "a2", "a3", "f3"]));
+        let data4 = Rc::new(test_pulled_manifest(&["40", "b4", "b5", "f4"]));
+        let data5 = Rc::new(test_pulled_manifest(&["50", "b4", "b5", "f5"]));
+
+        let mut pending = VecDeque::new();
+        pending.push_back(test_task(Rc::clone(&data1), "img1"));
+        pending.push_back(test_task(Rc::clone(&data2), "img2"));
+        pending.push_back(test_task(Rc::clone(&data3), "img3"));
+        pending.push_back(test_task(Rc::clone(&data4), "img4"));
+        pending.push_back(test_task(Rc::clone(&data5), "img5"));
+
+        let n = elect_leaders(&mut pending);
+
+        // Exactly 2 leaders: one per cluster.
+        assert_eq!(
+            n, 2,
+            "should elect exactly 2 leaders for 2 disjoint clusters"
+        );
+
+        // Collect the leader blob union.
+        let leader_blobs = leader_blob_digests(&pending, n);
+
+        // Verify every shared blob of every follower is in the leader union.
+        // Shared blobs are those appearing in more than one image.
+        let all_blob_sets: Vec<HashSet<Digest>> = pending
+            .iter()
+            .map(|t| {
+                blobs_from_manifest(&t.source_data)
+                    .into_iter()
+                    .map(|d| d.digest.clone())
+                    .collect()
+            })
+            .collect();
+
+        for (i, task) in pending.iter().skip(n).enumerate() {
+            let follower_blobs: HashSet<Digest> = blobs_from_manifest(&task.source_data)
+                .into_iter()
+                .map(|d| d.digest.clone())
+                .collect();
+            // A blob is "shared" if it appears in at least one other image.
+            for blob in &follower_blobs {
+                let shared_with_others = all_blob_sets
+                    .iter()
+                    .enumerate()
+                    .any(|(j, set)| j != (i + n) && set.contains(blob));
+                if shared_with_others {
+                    assert!(
+                        leader_blobs.contains(blob),
+                        "follower {} has shared blob {} not covered by leaders",
+                        task.source.tag,
+                        blob
+                    );
+                }
+            }
         }
     }
 }

@@ -241,3 +241,210 @@ fn disabled_evict_is_noop() {
     let stage = BlobStage::disabled();
     stage.evict(0).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Source-pull dedup: claim_or_check / notify_staged / notify_failed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn claim_or_check_first_caller_returns_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = BlobStage::new(dir.path().to_path_buf());
+
+    let action = stage.claim_or_check(&digest_a());
+    assert!(
+        matches!(action, ocync_sync::staging::StagePullAction::Pull),
+        "first caller must get Pull, got: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn claim_or_check_second_caller_returns_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = BlobStage::new(dir.path().to_path_buf());
+
+    // First caller claims the pull.
+    let first = stage.claim_or_check(&digest_a());
+    assert!(matches!(first, ocync_sync::staging::StagePullAction::Pull));
+
+    // Second caller for the same digest gets Wait with a Notify.
+    let second = stage.claim_or_check(&digest_a());
+    assert!(
+        matches!(second, ocync_sync::staging::StagePullAction::Wait(_)),
+        "second caller must get Wait, got: {second:?}"
+    );
+}
+
+#[tokio::test]
+async fn notify_staged_makes_subsequent_claim_return_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = BlobStage::new(dir.path().to_path_buf());
+
+    // Claim the pull.
+    let action = stage.claim_or_check(&digest_a());
+    assert!(matches!(action, ocync_sync::staging::StagePullAction::Pull));
+
+    // Write the blob to disk and signal completion.
+    stage.write(&digest_a(), b"staged data").unwrap();
+    stage.notify_staged(&digest_a());
+
+    // A new caller should see the blob on disk.
+    let action = stage.claim_or_check(&digest_a());
+    assert!(
+        matches!(action, ocync_sync::staging::StagePullAction::Exists),
+        "after notify_staged + disk write, claim_or_check must return Exists, got: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn notify_failed_makes_subsequent_claim_return_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = BlobStage::new(dir.path().to_path_buf());
+
+    // First caller claims the pull.
+    let action = stage.claim_or_check(&digest_a());
+    assert!(matches!(action, ocync_sync::staging::StagePullAction::Pull));
+
+    // Simulate a failure (no data written to disk).
+    stage.notify_failed(&digest_a());
+
+    // Next caller should be able to retry (get Pull, not Wait).
+    let action = stage.claim_or_check(&digest_a());
+    assert!(
+        matches!(action, ocync_sync::staging::StagePullAction::Pull),
+        "after notify_failed, claim_or_check must return Pull for retry, got: {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn claim_or_check_disabled_always_returns_pull() {
+    let stage = BlobStage::disabled();
+
+    // Every call on a disabled stage returns Pull (no dedup possible).
+    let first = stage.claim_or_check(&digest_a());
+    assert!(
+        matches!(first, ocync_sync::staging::StagePullAction::Pull),
+        "disabled stage must always return Pull, got: {first:?}"
+    );
+
+    let second = stage.claim_or_check(&digest_a());
+    assert!(
+        matches!(second, ocync_sync::staging::StagePullAction::Pull),
+        "disabled stage must always return Pull on repeated calls, got: {second:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Async wakeup: claim_or_check -> Wait -> notified().await -> Exists
+// ---------------------------------------------------------------------------
+
+/// Verify the full async wakeup flow: a waiter spawned via `spawn_local`
+/// blocks on `notified().await`, is woken by `notify_staged`, and a
+/// subsequent `claim_or_check` returns `Exists`.
+#[tokio::test(flavor = "current_thread")]
+async fn blob_notify_async_wakeup_flow() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let stage = Rc::new(BlobStage::new(dir.path().to_path_buf()));
+            let digest = digest_a();
+
+            // Task 1 claims the pull.
+            let action = stage.claim_or_check(&digest);
+            assert!(
+                matches!(action, ocync_sync::staging::StagePullAction::Pull),
+                "first caller must get Pull"
+            );
+
+            // Task 2: call claim_or_check -> Wait, then await the notify.
+            let woke_up = Rc::new(Cell::new(false));
+            let woke_clone = Rc::clone(&woke_up);
+            let stage_clone = Rc::clone(&stage);
+            let digest_clone = digest.clone();
+
+            let handle = tokio::task::spawn_local(async move {
+                let action = stage_clone.claim_or_check(&digest_clone);
+                let notify = match action {
+                    ocync_sync::staging::StagePullAction::Wait(n) => n,
+                    other => panic!("expected Wait, got: {other:?}"),
+                };
+                notify.notified().await;
+                woke_clone.set(true);
+
+                // After waking, claim_or_check should return Exists.
+                let final_action = stage_clone.claim_or_check(&digest_clone);
+                assert!(
+                    matches!(final_action, ocync_sync::staging::StagePullAction::Exists),
+                    "after notify_staged, claim_or_check must return Exists, got: {final_action:?}"
+                );
+            });
+
+            // Yield to let the spawned task reach the await point.
+            tokio::task::yield_now().await;
+            assert!(!woke_up.get(), "waiter must not wake before notify_staged");
+
+            // Write the blob and signal completion.
+            stage.write(&digest, b"staged blob data").unwrap();
+            stage.notify_staged(&digest);
+
+            // Let the spawned task finish.
+            handle.await.unwrap();
+            assert!(woke_up.get(), "waiter must have woken after notify_staged");
+        })
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// StagedWriter drop cleanup
+// ---------------------------------------------------------------------------
+
+/// Verify that dropping a `StagedWriter` without calling `finish()` removes
+/// the temporary file and does NOT stage the blob.
+#[test]
+fn staged_writer_drop_removes_temp_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = BlobStage::new(dir.path().to_path_buf());
+    let digest = digest_a();
+
+    // Collect the temp file path before dropping.
+    let tmp_path = {
+        let mut writer = stage.begin_write(&digest).unwrap();
+        writer
+            .write_chunk(b"partial data that should be cleaned up")
+            .unwrap();
+        // Extract the tmp_path from the debug repr for verification.
+        // We know the tmp file exists because begin_write creates it.
+        let blobs_dir = dir.path().join("blobs").join("sha256");
+        let entries: Vec<_> = std::fs::read_dir(&blobs_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".tmp."))
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "temp file must exist before drop");
+        let tmp = entries[0].clone();
+        // Drop the writer WITHOUT calling finish().
+        drop(writer);
+        tmp
+    };
+
+    // Temp file must be removed by Drop impl.
+    assert!(
+        !tmp_path.exists(),
+        "temp file must be removed after drop without finish()"
+    );
+
+    // The blob must NOT be staged.
+    assert!(
+        !stage.exists(&digest),
+        "blob must not be staged when writer is dropped without finish()"
+    );
+}

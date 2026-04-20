@@ -110,6 +110,9 @@ pub enum ImageStatus {
         error: String,
         /// Number of retry attempts made.
         retries: u32,
+        /// HTTP status code from the failing request, if available.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status_code: Option<u16>,
     },
 }
 
@@ -246,6 +249,7 @@ mod tests {
                 kind: ErrorKind::BlobTransfer,
                 error: "timeout".into(),
                 retries: 3,
+                status_code: None,
             },
         ]);
         assert_eq!(report.exit_code(), 1);
@@ -258,11 +262,13 @@ mod tests {
                 kind: ErrorKind::ManifestPull,
                 error: "a".into(),
                 retries: 1,
+                status_code: None,
             },
             ImageStatus::Failed {
                 kind: ErrorKind::ManifestPush,
                 error: "b".into(),
                 retries: 2,
+                status_code: None,
             },
         ]);
         assert_eq!(report.exit_code(), 2);
@@ -335,11 +341,25 @@ mod tests {
             kind: ErrorKind::ManifestPull,
             error: "timeout".into(),
             retries: 3,
+            status_code: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["status"], "failed");
         assert_eq!(json["kind"], "manifest_pull");
         assert_eq!(json["error"], "timeout");
         assert_eq!(json["retries"], 3);
+        assert!(json.get("status_code").is_none(), "None should be skipped");
+    }
+
+    #[test]
+    fn image_status_failed_json_includes_status_code() {
+        let status = ImageStatus::Failed {
+            kind: ErrorKind::ManifestPull,
+            error: "unauthorized".into(),
+            retries: 1,
+            status_code: Some(401),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["status_code"], 401);
     }
 }

@@ -1,5 +1,7 @@
 //! Retry configuration and backoff logic for transient failures.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::time::Duration;
 
 use http::StatusCode;
@@ -31,12 +33,14 @@ impl Default for RetryConfig {
 impl RetryConfig {
     /// Compute the backoff duration for the given attempt (0-indexed).
     ///
-    /// Uses exponential backoff capped at `max_backoff`. All arithmetic
-    /// saturates instead of overflowing.
+    /// Uses exponential backoff capped at `max_backoff`, then applies
+    /// multiplicative jitter in \[0.75, 1.25) to decorrelate concurrent
+    /// retries. All arithmetic saturates instead of overflowing.
     pub fn backoff_for(&self, attempt: u32) -> Duration {
         let multiplier = self.backoff_multiplier.saturating_pow(attempt);
         let backoff = self.initial_backoff.saturating_mul(multiplier);
-        std::cmp::min(backoff, self.max_backoff)
+        let capped = std::cmp::min(backoff, self.max_backoff);
+        jitter(capped)
     }
 }
 
@@ -53,6 +57,47 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
         || status.is_server_error()
 }
 
+/// Determine whether a transport-level (non-HTTP) error should be retried.
+///
+/// Returns `true` for connection failures and request timeouts surfaced by
+/// `reqwest` before any HTTP response is received. These are transient by
+/// nature and safe to retry idempotent OCI operations on.
+///
+/// # Known limitation
+///
+/// Only inspects `ocync_distribution::Error::Http(reqwest::Error)`. Transport
+/// errors that arrive wrapped in other variants are NOT retried:
+/// - `Error::Other(...)` -- may contain connection resets from middleware
+/// - `Error::RegistryError { source, .. }` -- may wrap a transport error
+/// - `Error::Manifest { source, .. }` -- may wrap a transport error
+///
+/// If operators observe unretrieved transient errors, the debug log below will
+/// show which variant was encountered so the match can be extended.
+pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
+    if let ocync_distribution::Error::Http(reqwest_err) = error {
+        reqwest_err.is_connect() || reqwest_err.is_timeout()
+    } else {
+        tracing::debug!(
+            error = %error,
+            "non-Http error variant not inspectable for transport retry"
+        );
+        false
+    }
+}
+
+/// Apply multiplicative jitter to a backoff duration.
+///
+/// Scales the base duration by a random factor in \[0.75, 1.25) to
+/// decorrelate concurrent retries. Uses [`RandomState`] for per-process
+/// entropy without requiring a `rand` dependency.
+fn jitter(base: Duration) -> Duration {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(base.as_nanos() as u64);
+    let hash = hasher.finish();
+    let factor = 0.75 + (hash % 500) as f64 / 1000.0;
+    base.mul_f64(factor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,13 +111,23 @@ mod tests {
         assert_eq!(cfg.backoff_multiplier, 2);
     }
 
+    /// Helper: assert a duration falls within the jitter range [base*0.75, base*1.25].
+    fn assert_in_jitter_range(actual: Duration, base: Duration) {
+        let lo = base.mul_f64(0.75);
+        let hi = base.mul_f64(1.25);
+        assert!(
+            actual >= lo && actual <= hi,
+            "expected {actual:?} in [{lo:?}, {hi:?}] (base={base:?})"
+        );
+    }
+
     #[test]
     fn backoff_exponential() {
         let cfg = RetryConfig::default();
-        assert_eq!(cfg.backoff_for(0), Duration::from_secs(1));
-        assert_eq!(cfg.backoff_for(1), Duration::from_secs(2));
-        assert_eq!(cfg.backoff_for(2), Duration::from_secs(4));
-        assert_eq!(cfg.backoff_for(3), Duration::from_secs(8));
+        assert_in_jitter_range(cfg.backoff_for(0), Duration::from_secs(1));
+        assert_in_jitter_range(cfg.backoff_for(1), Duration::from_secs(2));
+        assert_in_jitter_range(cfg.backoff_for(2), Duration::from_secs(4));
+        assert_in_jitter_range(cfg.backoff_for(3), Duration::from_secs(8));
     }
 
     #[test]
@@ -81,8 +136,8 @@ mod tests {
             max_backoff: Duration::from_secs(5),
             ..RetryConfig::default()
         };
-        // 2^10 = 1024 seconds, but capped at 5
-        assert_eq!(cfg.backoff_for(10), Duration::from_secs(5));
+        // 2^10 = 1024 seconds, but capped at 5, then jitter applied
+        assert_in_jitter_range(cfg.backoff_for(10), Duration::from_secs(5));
     }
 
     #[test]
@@ -91,9 +146,9 @@ mod tests {
             backoff_multiplier: 1,
             ..RetryConfig::default()
         };
-        assert_eq!(cfg.backoff_for(0), Duration::from_secs(1));
-        assert_eq!(cfg.backoff_for(5), Duration::from_secs(1));
-        assert_eq!(cfg.backoff_for(100), Duration::from_secs(1));
+        assert_in_jitter_range(cfg.backoff_for(0), Duration::from_secs(1));
+        assert_in_jitter_range(cfg.backoff_for(5), Duration::from_secs(1));
+        assert_in_jitter_range(cfg.backoff_for(100), Duration::from_secs(1));
     }
 
     #[test]
@@ -106,7 +161,7 @@ mod tests {
         // 3^30 overflows u32 - saturating_pow caps at u32::MAX,
         // saturating_mul caps Duration, then min caps at max_backoff
         let result = cfg.backoff_for(30);
-        assert_eq!(result, Duration::from_secs(300));
+        assert_in_jitter_range(result, Duration::from_secs(300));
     }
 
     #[test]
@@ -116,10 +171,30 @@ mod tests {
             ..RetryConfig::default()
         };
         // 0^0 = 1, so attempt 0 gives initial_backoff * 1
-        assert_eq!(cfg.backoff_for(0), Duration::from_secs(1));
+        assert_in_jitter_range(cfg.backoff_for(0), Duration::from_secs(1));
         // 0^n = 0 for n > 0, so all subsequent attempts give zero backoff
+        // jitter of zero is still zero
         assert_eq!(cfg.backoff_for(1), Duration::ZERO);
         assert_eq!(cfg.backoff_for(5), Duration::ZERO);
+    }
+
+    #[test]
+    fn jitter_stays_in_range() {
+        // Run jitter many times and verify bounds. RandomState seeds
+        // differ per call, so we get coverage of the range.
+        let base = Duration::from_secs(10);
+        for _ in 0..100 {
+            let j = jitter(base);
+            assert!(
+                j >= base.mul_f64(0.75) && j <= base.mul_f64(1.25),
+                "jitter {j:?} out of range for base {base:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_of_zero_is_zero() {
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]
@@ -155,5 +230,21 @@ mod tests {
         assert!(!should_retry(StatusCode::OK, 0, 3));
         assert!(!should_retry(StatusCode::CREATED, 0, 3));
         assert!(!should_retry(StatusCode::NO_CONTENT, 0, 3));
+    }
+
+    #[test]
+    fn should_retry_transport_on_registry_error() {
+        // RegistryError wraps HTTP responses, not transport failures.
+        let err = ocync_distribution::Error::RegistryError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "broke".into(),
+        };
+        assert!(!should_retry_transport(&err));
+    }
+
+    #[test]
+    fn should_retry_transport_on_other() {
+        let err = ocync_distribution::Error::Other("something".into());
+        assert!(!should_retry_transport(&err));
     }
 }

@@ -1,4 +1,25 @@
 //! Integration tests for `SyncEngine` using mock HTTP servers.
+//!
+//! # Table of Contents
+//!
+//! - **Helpers** (line ~35) - `make_digest`, `mock_client`, `mount_*` mocks, `ManifestBuilder`
+//! - **Tests** (line ~420) - Happy path, skip on digest match, source errors
+//! - **Transfer state cache** (line ~1860) - Progressive population, cross-repo mount, monolithic
+//! - **Shutdown integration** (line ~2410) - Graceful shutdown, drain deadline
+//! - **Concurrent execution** (line ~2565) - Non-sequential ordering, parallel transfers
+//! - **Nested index rejection** (line ~2745) - Index-in-index error handling
+//! - **Cache invalidation** (line ~2835) - State verification after invalidation
+//! - **Partial failure / concurrent dedup** (line ~2960) - Child failure, blob failure, dedup
+//! - **Staging pull-once** (line ~3295) - Staging pull-once semantics, drain deadline expiry
+//! - **Staging disk verification** (line ~3595) - Staged files exist on disk after sync
+//! - **Warm cache skip** (line ~3720) - Warm cache skips blob entirely (no HEAD)
+//! - **Batch blob checker** (line ~3795) - Batch pre-population, fallback on error
+//! - **Platform filtering** (line ~5045) - Index manifest platform selection
+//! - **Multi-target independence** (line ~5325) - Target isolation, partial target failure
+//! - **Discovery optimization** (line ~5825) - Source HEAD cache, target staleness detection
+//! - **Untriggered shutdown** (line ~8100) - Engine exits cleanly with unused signal
+//! - **Concurrent mount coordination** (line ~8175) - Shared blob mount vs double-upload
+//! - **Blob concurrency bound** (line ~8900) - Semaphore(6) correctness with >6 layers
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -81,7 +102,7 @@ fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
 fn snap_key(repo: &str, tag: &str) -> SnapshotKey {
     SnapshotKey::new(
         &RegistryAuthority::new("source.test.io:443"),
-        &RepositoryName::new(repo),
+        &RepositoryName::new(repo).unwrap(),
         tag,
     )
 }
@@ -145,6 +166,102 @@ fn simple_image_manifest(config_digest: &Digest, layer_digest: &Digest) -> Image
         subject: None,
         artifact_type: None,
         annotations: None,
+    }
+}
+
+/// Builder for constructing `ImageManifest` with sensible test defaults.
+///
+/// Simplifies the common pattern of creating test manifests with real blob
+/// data (matching digests and sizes). Call [`layer`](Self::layer) to add
+/// layers, then [`build`](Self::build) to get the manifest plus all parts
+/// needed for mock setup.
+struct ManifestBuilder {
+    config_data: Vec<u8>,
+    layers_data: Vec<Vec<u8>>,
+}
+
+impl ManifestBuilder {
+    /// Create a new builder with the given config blob data.
+    fn new(config_data: &[u8]) -> Self {
+        Self {
+            config_data: config_data.to_vec(),
+            layers_data: Vec::new(),
+        }
+    }
+
+    /// Add a layer blob to the manifest.
+    fn layer(mut self, data: &[u8]) -> Self {
+        self.layers_data.push(data.to_vec());
+        self
+    }
+
+    /// Build the manifest, returning all parts needed for mock setup.
+    fn build(self) -> ManifestParts {
+        let config_desc = blob_descriptor(&self.config_data, MediaType::OciConfig);
+        let layer_descs: Vec<Descriptor> = self
+            .layers_data
+            .iter()
+            .map(|d| blob_descriptor(d, MediaType::OciLayerGzip))
+            .collect();
+
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: config_desc.clone(),
+            layers: layer_descs.clone(),
+            subject: None,
+            artifact_type: None,
+            annotations: None,
+        };
+
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let hash = ocync_distribution::sha256::Sha256::digest(&bytes);
+        let digest = Digest::from_sha256(hash);
+
+        ManifestParts {
+            manifest,
+            bytes,
+            digest,
+            config_data: self.config_data,
+            config_desc,
+            layers_data: self.layers_data,
+            layer_descs,
+        }
+    }
+}
+
+/// Output of [`ManifestBuilder::build`] with all parts needed for mock setup.
+struct ManifestParts {
+    #[allow(dead_code)]
+    manifest: ImageManifest,
+    bytes: Vec<u8>,
+    #[allow(dead_code)]
+    digest: Digest,
+    config_data: Vec<u8>,
+    config_desc: Descriptor,
+    layers_data: Vec<Vec<u8>>,
+    layer_descs: Vec<Descriptor>,
+}
+
+impl ManifestParts {
+    /// Mount all source mocks (manifest GET + blob GETs) for this image.
+    async fn mount_source(&self, server: &MockServer, repo: &str, tag: &str) {
+        mount_source_manifest(server, repo, tag, &self.bytes).await;
+        mount_blob_pull(server, repo, &self.config_desc.digest, &self.config_data).await;
+        for (data, desc) in self.layers_data.iter().zip(self.layer_descs.iter()) {
+            mount_blob_pull(server, repo, &desc.digest, data).await;
+        }
+    }
+
+    /// Mount target mocks: HEAD 404, blob-not-found for all blobs, push endpoints.
+    async fn mount_target(&self, server: &MockServer, repo: &str, tag: &str) {
+        mount_manifest_head_not_found(server, repo, tag).await;
+        mount_blob_not_found(server, repo, &self.config_desc.digest).await;
+        for desc in &self.layer_descs {
+            mount_blob_not_found(server, repo, &desc.digest).await;
+        }
+        mount_blob_push(server, repo).await;
+        mount_manifest_push(server, repo, tag).await;
     }
 }
 
@@ -2339,7 +2456,7 @@ async fn sync_cache_persist_and_load_round_trip() {
         loaded.blob_known_at_repo(
             "target-reg",
             &config_desc.digest,
-            &RepositoryName::from("repo")
+            &RepositoryName::new("repo").unwrap()
         ),
         "config blob should be recorded as completed at repo"
     );
@@ -2347,7 +2464,7 @@ async fn sync_cache_persist_and_load_round_trip() {
         loaded.blob_known_at_repo(
             "target-reg",
             &layer_desc.digest,
-            &RepositoryName::from("repo")
+            &RepositoryName::new("repo").unwrap()
         ),
         "layer blob should be recorded as completed at repo"
     );
@@ -2355,7 +2472,7 @@ async fn sync_cache_persist_and_load_round_trip() {
         !loaded.blob_known_at_repo(
             "target-reg",
             &config_desc.digest,
-            &RepositoryName::from("other-repo")
+            &RepositoryName::new("other-repo").unwrap()
         ),
         "blob should not appear at an unrelated repo"
     );
@@ -2890,7 +3007,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         !c.blob_known_at_repo(
             "target",
             &config_desc.digest,
-            &RepositoryName::from("stale-repo")
+            &RepositoryName::new("stale-repo").unwrap()
         ),
         "stale cache entry for config at stale-repo should be invalidated"
     );
@@ -2898,16 +3015,24 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         !c.blob_known_at_repo(
             "target",
             &layer_desc.digest,
-            &RepositoryName::from("stale-repo")
+            &RepositoryName::new("stale-repo").unwrap()
         ),
         "stale cache entry for layer at stale-repo should be invalidated"
     );
     assert!(
-        c.blob_known_at_repo("target", &config_desc.digest, &RepositoryName::from("repo")),
+        c.blob_known_at_repo(
+            "target",
+            &config_desc.digest,
+            &RepositoryName::new("repo").unwrap()
+        ),
         "config blob should be recorded as completed at repo after fallback push"
     );
     assert!(
-        c.blob_known_at_repo("target", &layer_desc.digest, &RepositoryName::from("repo")),
+        c.blob_known_at_repo(
+            "target",
+            &layer_desc.digest,
+            &RepositoryName::new("repo").unwrap()
+        ),
         "layer blob should be recorded as completed at repo after fallback push"
     );
 }
@@ -8844,4 +8969,160 @@ async fn sync_source_pull_dedup_with_staging() {
         source_gets_for_shared, 1,
         "shared blob should be pulled from source exactly once (dedup), got {source_gets_for_shared}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Blob concurrency bound: Semaphore(6) correctness with >6 layers
+// ---------------------------------------------------------------------------
+
+/// An image with more layers than the per-image blob concurrency limit (6)
+/// must still sync correctly. All blobs transfer successfully even though the
+/// internal semaphore serializes some of them. This verifies the semaphore
+/// does not deadlock or drop permits when the layer count exceeds the bound.
+#[tokio::test]
+async fn sync_image_with_more_layers_than_blob_concurrency_limit() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // Build an image with 10 layers (exceeds BLOB_CONCURRENCY = 6).
+    let parts = ManifestBuilder::new(b"config-many-layers")
+        .layer(b"layer-01")
+        .layer(b"layer-02")
+        .layer(b"layer-03")
+        .layer(b"layer-04")
+        .layer(b"layer-05")
+        .layer(b"layer-06")
+        .layer(b"layer-07")
+        .layer(b"layer-08")
+        .layer(b"layer-09")
+        .layer(b"layer-10")
+        .build();
+
+    parts.mount_source(&source_server, "repo/many", "v1").await;
+    parts.mount_target(&target_server, "repo/many", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = resolved_mapping(
+        source_client,
+        "repo/many",
+        "repo/many",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(
+        matches!(report.images[0].status, ImageStatus::Synced),
+        "image with 10 layers must sync: {:?}",
+        report.images[0].status
+    );
+    // 11 blobs total: 1 config + 10 layers.
+    assert_eq!(report.images[0].blob_stats.transferred, 11);
+    assert_eq!(report.stats.blobs_transferred, 11);
+}
+
+// ---------------------------------------------------------------------------
+// ManifestBuilder demonstration: happy path rewritten
+// ---------------------------------------------------------------------------
+
+/// Same test as `sync_happy_path` but using `ManifestBuilder` to demonstrate
+/// the reduced boilerplate.
+#[tokio::test]
+async fn sync_happy_path_manifest_builder() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"config-data-mb")
+        .layer(b"layer-data-mb")
+        .build();
+
+    parts
+        .mount_source(&source_server, "library/nginx", "latest")
+        .await;
+    parts
+        .mount_target(&target_server, "mirror/nginx", "latest")
+        .await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = resolved_mapping(
+        source_client,
+        "library/nginx",
+        "mirror/nginx",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("latest")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+    assert_eq!(report.stats.images_synced, 1);
+}
+
+/// Multi-layer manifest builder: verifies 3 layers all transfer correctly.
+#[tokio::test]
+async fn sync_three_layers_manifest_builder() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"cfg-3layer")
+        .layer(b"base-layer")
+        .layer(b"app-layer")
+        .layer(b"runtime-layer")
+        .build();
+
+    parts.mount_source(&source_server, "app/svc", "v2").await;
+    parts.mount_target(&target_server, "mirror/svc", "v2").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = resolved_mapping(
+        source_client,
+        "app/svc",
+        "mirror/svc",
+        vec![target_entry("ecr", target_client)],
+        vec![TagPair::same("v2")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // 1 config + 3 layers = 4 blobs.
+    assert_eq!(report.images[0].blob_stats.transferred, 4);
 }
