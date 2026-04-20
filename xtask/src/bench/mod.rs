@@ -572,6 +572,14 @@ async fn run_sync(
         progress(&format!("  cold: {tool}"));
         ecr::create_repos(ecr_client, corpus).await?;
         let cold = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
+        if cold.exit_code != Some(0) {
+            return Err(format!(
+                "{tool} cold sync failed (exit {:?}); aborting -- \
+                 tainted data cannot be compared",
+                cold.exit_code
+            )
+            .into());
+        }
         progress(&format!(
             "  cold: {tool} complete ({:.1}s)",
             cold.wall_clock_secs
@@ -581,6 +589,14 @@ async fn run_sync(
         // Warm run: target still populated, same config_dir.
         progress(&format!("  warm: {tool}"));
         let warm = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
+        if warm.exit_code != Some(0) {
+            return Err(format!(
+                "{tool} warm sync failed (exit {:?}); aborting -- \
+                 tainted data cannot be compared",
+                warm.exit_code
+            )
+            .into());
+        }
         progress(&format!(
             "  warm: {tool} complete ({:.1}s)",
             warm.wall_clock_secs
@@ -626,13 +642,26 @@ async fn run_partial(
         // Prime with base corpus (unmeasured). Reuse the same
         // config_dir so ocync's TransferStateCache persists.
         let config_dir = tempfile::tempdir()?;
-        let _prime =
-            run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
+        let prime = run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
+        if prime.exit_code != Some(0) {
+            return Err(format!(
+                "{tool} partial prime failed (exit {:?}); aborting",
+                prime.exit_code
+            )
+            .into());
+        }
         progress(&format!("  partial: {} measuring", tool));
 
         // Measured run with partial corpus (same config_dir).
         let run =
             run_single_tool(args, tool, partial_corpus, config_dir.path(), output_dir).await?;
+        if run.exit_code != Some(0) {
+            return Err(format!(
+                "{tool} partial sync failed (exit {:?}); aborting",
+                run.exit_code
+            )
+            .into());
+        }
         progress(&format!(
             "  partial: {} complete ({:.1}s)",
             tool, run.wall_clock_secs
@@ -683,6 +712,13 @@ async fn run_scale(
 
             let config_dir = tempfile::tempdir()?;
             let run = run_single_tool(args, tool, &subset, config_dir.path(), output_dir).await?;
+            if run.exit_code != Some(0) {
+                return Err(format!(
+                    "{tool} scale sync failed at {size} images (exit {:?}); aborting",
+                    run.exit_code
+                )
+                .into());
+            }
             results.insert(tool.to_string(), run.wall_clock_secs);
 
             ecr::delete_repos(ecr_client, &subset).await?;
