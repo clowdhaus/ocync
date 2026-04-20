@@ -41,10 +41,6 @@ pub(crate) struct BenchArgs {
     #[arg(long)]
     pub(crate) limit: Option<usize>,
 
-    /// Number of iterations for the cold scenario (default: 1).
-    #[arg(long, default_value = "1")]
-    pub(crate) iterations: usize,
-
     /// Proxy listen port (default: 8080).
     #[arg(long, default_value = "8080")]
     pub(crate) proxy_port: u16,
@@ -84,10 +80,9 @@ pub(crate) struct BenchArgs {
 /// Benchmark scenario to run (CLI subcommand).
 #[derive(Subcommand, Debug, Clone, Copy)]
 pub(crate) enum Scenario {
-    /// Clean target, full sync -- measures raw transfer performance.
+    /// Cold sync then immediate warm re-sync -- measures both raw
+    /// transfer performance and skip optimization in one pass.
     Cold,
-    /// Re-sync with nothing changed -- measures skip optimization.
-    Warm,
     /// Re-sync after ~5% of tags changed -- measures incremental sync.
     Partial,
     /// Run at increasing corpus sizes -- measures scaling behavior (ocync only).
@@ -284,24 +279,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // 6. Expand All into individual scenarios, then dispatch each.
     let scenarios: Vec<Scenario> = match args.scenario {
-        Scenario::All => vec![
-            Scenario::Cold,
-            Scenario::Warm,
-            Scenario::Partial,
-            Scenario::Scale,
-        ],
+        Scenario::All => vec![Scenario::Cold, Scenario::Partial, Scenario::Scale],
         other => vec![other],
     };
 
     for scenario in scenarios {
         match scenario {
             Scenario::Cold => {
-                let result = run_cold(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
-                report.scenarios.push(result);
-            }
-            Scenario::Warm => {
-                let result = run_warm(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
-                report.scenarios.push(result);
+                let (cold, warm) =
+                    run_cold(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
+                report.scenarios.push(cold);
+                report.scenarios.push(warm);
             }
             Scenario::Partial => {
                 let overrides = corpus::load_overrides(&args.partial_overrides)?;
@@ -561,99 +549,44 @@ async fn run_single_tool(
     })
 }
 
-/// Cold scenario: N iterations per tool, pick median by wall-clock.
+/// Cold + warm scenario: cold sync (measured), then immediate warm
+/// re-sync (measured) with the same config directory so that ocync's
+/// `TransferStateCache` persists between runs.
 async fn run_cold(
     args: &BenchArgs,
     corpus: &Corpus,
     tools: &[Tool],
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
-) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
-    progress(&format!(
-        "bench: running cold scenario ({} iterations)",
-        args.iterations
-    ));
-    let mut runs = Vec::new();
+) -> Result<(ScenarioResult, ScenarioResult), Box<dyn std::error::Error>> {
+    progress("bench: running cold+warm scenario");
+    let mut cold_runs = Vec::new();
+    let mut warm_runs = Vec::new();
 
     for (tool_idx, &tool) in tools.iter().enumerate() {
-        let mut iteration_runs = Vec::new();
-
-        for i in 0..args.iterations {
-            progress(&format!(
-                "  cold: {} iteration {}/{}",
-                tool,
-                i + 1,
-                args.iterations
-            ));
-
-            ecr::create_repos(ecr_client, corpus).await?;
-
-            let config_dir = tempfile::tempdir()?;
-            let run = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
-
-            ecr::delete_repos(ecr_client, corpus).await?;
-
-            progress(&format!(
-                "  cold: {} iteration {}/{} complete ({:.1}s)",
-                tool,
-                i + 1,
-                args.iterations,
-                run.wall_clock_secs
-            ));
-            iteration_runs.push(run);
-
-            if i + 1 < args.iterations {
-                cooldown().await;
-            }
-        }
-
-        // Pick the median run by wall-clock time.
-        iteration_runs.sort_by(|a, b| a.wall_clock_secs.total_cmp(&b.wall_clock_secs));
-        let median_idx = iteration_runs.len() / 2;
-        let median = iteration_runs.swap_remove(median_idx);
-        runs.push(median);
-
-        if tool_idx + 1 < tools.len() {
-            cooldown().await;
-        }
-    }
-
-    Ok(ScenarioResult {
-        scenario: "Cold sync (median)".to_string(),
-        runs,
-    })
-}
-
-/// Warm scenario: per tool, prime run (unmeasured) then measured run.
-async fn run_warm(
-    args: &BenchArgs,
-    corpus: &Corpus,
-    tools: &[Tool],
-    ecr_client: &aws_sdk_ecr::Client,
-    output_dir: &Path,
-) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
-    progress("bench: running warm scenario");
-    let mut runs = Vec::new();
-
-    for (tool_idx, &tool) in tools.iter().enumerate() {
-        progress(&format!("  warm: {} (priming)", tool));
-
-        ecr::create_repos(ecr_client, corpus).await?;
-
-        // Prime run (unmeasured). Reuse the same config_dir for both
-        // runs so that ocync's TransferStateCache (keyed off config
-        // file path) persists into the measured run.
+        // Single config_dir for cold + warm. The cache file lives
+        // under this directory, so reusing it means the warm run
+        // sees a fully populated cache.
         let config_dir = tempfile::tempdir()?;
-        let _prime = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
-        progress(&format!("  warm: {} measuring", tool));
 
-        // Measured run (same config_dir -- cache is warm).
-        let run = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
+        // Cold run.
+        progress(&format!("  cold: {tool}"));
+        ecr::create_repos(ecr_client, corpus).await?;
+        let cold = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
         progress(&format!(
-            "  warm: {} complete ({:.1}s)",
-            tool, run.wall_clock_secs
+            "  cold: {tool} complete ({:.1}s)",
+            cold.wall_clock_secs
         ));
-        runs.push(run);
+        cold_runs.push(cold);
+
+        // Warm run: target still populated, same config_dir.
+        progress(&format!("  warm: {tool}"));
+        let warm = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
+        progress(&format!(
+            "  warm: {tool} complete ({:.1}s)",
+            warm.wall_clock_secs
+        ));
+        warm_runs.push(warm);
 
         ecr::delete_repos(ecr_client, corpus).await?;
 
@@ -662,10 +595,16 @@ async fn run_warm(
         }
     }
 
-    Ok(ScenarioResult {
-        scenario: "Warm sync (no-op)".to_string(),
-        runs,
-    })
+    Ok((
+        ScenarioResult {
+            scenario: "Cold sync".to_string(),
+            runs: cold_runs,
+        },
+        ScenarioResult {
+            scenario: "Warm sync (no-op)".to_string(),
+            runs: warm_runs,
+        },
+    ))
 }
 
 /// Partial scenario: prime with base corpus, then sync with partial corpus.
@@ -810,7 +749,6 @@ impl std::fmt::Display for Scenario {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Scenario::Cold => f.write_str("cold"),
-            Scenario::Warm => f.write_str("warm"),
             Scenario::Partial => f.write_str("partial"),
             Scenario::Scale => f.write_str("scale"),
             Scenario::All => f.write_str("all"),
@@ -866,7 +804,6 @@ mod tests {
     #[test]
     fn scenario_display() {
         assert_eq!(Scenario::Cold.to_string(), "cold");
-        assert_eq!(Scenario::Warm.to_string(), "warm");
         assert_eq!(Scenario::Partial.to_string(), "partial");
         assert_eq!(Scenario::Scale.to_string(), "scale");
         assert_eq!(Scenario::All.to_string(), "all");

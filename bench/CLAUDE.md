@@ -29,14 +29,14 @@ cd bench/terraform/aws && terraform destroy
 Single command for the full benchmark cycle.
 
 ```bash
-# Full 3-tool cold comparison (3 iterations, picks median)
-cargo xtask bench-remote --provider aws --iterations 3 --scenario cold
+# Full 3-tool cold+warm comparison
+cargo xtask bench-remote --provider aws --scenario cold
 
 # Quick smoke test
 cargo xtask bench-remote --provider aws --scenario cold \
-  --tools ocync --iterations 1 --limit 3
+  --tools ocync --limit 3
 
-# All scenarios (cold + warm + partial + scale)
+# All scenarios (cold+warm + partial + scale)
 cargo xtask bench-remote --provider aws --scenario all
 
 # Fetch results from the last run without re-running
@@ -79,7 +79,7 @@ ssh ec2-user@<public-ip>
 cd ~/ocync
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
-cargo xtask bench --tools ocync,dregsy,regsync --iterations 3 cold
+cargo xtask bench --tools ocync,dregsy,regsync cold
 ```
 
 ## Instance details

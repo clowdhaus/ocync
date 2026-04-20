@@ -56,10 +56,6 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long, default_value = "all")]
     pub(crate) scenario: String,
 
-    /// Number of cold-sync iterations (passed through to `cargo xtask bench`).
-    #[arg(long, default_value = "1")]
-    pub(crate) iterations: String,
-
     /// Use first N images only (passed through to `cargo xtask bench`).
     #[arg(long)]
     pub(crate) limit: Option<usize>,
@@ -140,7 +136,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     // Build the bench command args.
-    let mut bench_args = format!("--tools {} --iterations {}", args.tools, args.iterations);
+    let mut bench_args = format!("--tools {}", args.tools);
     if let Some(limit) = args.limit {
         bench_args.push_str(&format!(" --limit {limit}"));
     }

@@ -60,7 +60,7 @@ pub(crate) struct CorpusInfo {
 /// One scenario's results in the compact run record.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ScenarioRecord {
-    /// Scenario name (e.g. `"Cold sync (median)"`).
+    /// Scenario name (e.g. `"Cold sync"`).
     pub(crate) name: String,
     /// Per-tool results.
     pub(crate) tools: Vec<ToolRecord>,
@@ -113,7 +113,7 @@ pub(crate) struct ToolRun {
 /// One scenario across all tools.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ScenarioResult {
-    /// Human-readable scenario name (e.g. "Cold sync (median)").
+    /// Human-readable scenario name (e.g. "Cold sync").
     pub(crate) scenario: String,
     /// Per-tool run results.
     pub(crate) runs: Vec<ToolRun>,
@@ -791,7 +791,7 @@ mod tests {
                 ("dregsy".to_string(), "0.5.0".to_string()),
             ]),
             scenarios: vec![ScenarioResult {
-                scenario: "Cold sync (median)".to_string(),
+                scenario: "Cold sync".to_string(),
                 runs: vec![
                     ToolRun {
                         tool: "ocync".to_string(),
@@ -887,7 +887,7 @@ mod tests {
 
         // Per-scenario detailed table (metrics as rows, tools as columns).
         // Winner is bolded: ocync (47s) beats dregsy (8m 41s).
-        assert!(md.contains("## Cold sync (median)\n"));
+        assert!(md.contains("## Cold sync\n"));
         assert!(md.contains("| Metric | ocync | dregsy |"));
         assert!(md.contains("| Wall clock | **47s** | 8m 41s |"));
 
@@ -975,7 +975,7 @@ mod tests {
                 tags: 55,
             },
             scenarios: vec![ScenarioRecord {
-                name: "Cold sync (median)".into(),
+                name: "Cold sync".into(),
                 tools: vec![ToolRecord {
                     tool: "ocync".into(),
                     version: "0.1.0".into(),
@@ -1209,7 +1209,7 @@ mod tests {
                 ("dregsy".to_string(), "0.5.0".to_string()),
             ]),
             scenarios: vec![ScenarioResult {
-                scenario: "Cold sync (median)".to_string(),
+                scenario: "Cold sync".to_string(),
                 runs: vec![
                     ToolRun {
                         tool: "ocync".to_string(),
@@ -1459,7 +1459,7 @@ mod tests {
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
             scenarios: vec![
                 ScenarioResult {
-                    scenario: "Cold sync (median)".to_string(),
+                    scenario: "Cold sync".to_string(),
                     runs: vec![ToolRun {
                         tool: "ocync".to_string(),
                         wall_clock_secs: 429.0,
