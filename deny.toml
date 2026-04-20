@@ -31,6 +31,8 @@ private = { ignore = true }
 multiple-versions = "warn"
 deny = [
   { crate = "native-tls", wrappers = [] },
+  { crate = "openssl", wrappers = [] },
+  { crate = "openssl-sys", wrappers = [] },
   { crate = "ring", wrappers = [] },
 ]
 

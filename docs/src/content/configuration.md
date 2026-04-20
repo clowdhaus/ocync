@@ -391,12 +391,14 @@ The schema is generated from the Rust config types and verified in CI to stay in
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Config",
+  "description": "Top-level configuration defining registries, mappings, and sync behavior.",
   "type": "object",
   "required": [
     "mappings"
   ],
   "properties": {
     "defaults": {
+      "description": "Default source, targets, tags, and platforms inherited by all mappings.",
       "default": null,
       "anyOf": [
         {
@@ -420,12 +422,14 @@ The schema is generated from the Rust config types and verified in CI to stay in
       ]
     },
     "mappings": {
+      "description": "Image mapping rules defining what to sync and where.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/MappingConfig"
       }
     },
     "registries": {
+      "description": "Named registry definitions keyed by alias.",
       "default": {},
       "type": "object",
       "additionalProperties": {
@@ -433,6 +437,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
       }
     },
     "target_groups": {
+      "description": "Named groups of registry aliases for multi-target fanout.",
       "default": {},
       "type": "object",
       "additionalProperties": {
@@ -524,6 +529,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
       }
     },
     "DefaultsConfig": {
+      "description": "Default values inherited by all mappings unless individually overridden.",
       "type": "object",
       "properties": {
         "platforms": {
@@ -538,6 +544,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           }
         },
         "source": {
+          "description": "Default source registry alias for all mappings.",
           "default": null,
           "type": [
             "string",
@@ -545,6 +552,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "tags": {
+          "description": "Default tag filter rules inherited by mappings without their own.",
           "default": null,
           "anyOf": [
             {
@@ -556,6 +564,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "targets": {
+          "description": "Default target registry alias or group for all mappings.",
           "default": null,
           "anyOf": [
             {
@@ -569,11 +578,14 @@ The schema is generated from the Rust config types and verified in CI to stay in
       }
     },
     "GlobOrList": {
+      "description": "A glob pattern: either a single string or a list of patterns.",
       "anyOf": [
         {
+          "description": "A single glob pattern string.",
           "type": "string"
         },
         {
+          "description": "Multiple glob pattern strings.",
           "type": "array",
           "items": {
             "type": "string"
@@ -616,12 +628,14 @@ The schema is generated from the Rust config types and verified in CI to stay in
       }
     },
     "MappingConfig": {
+      "description": "A single image mapping rule: source repo, target registries, and tag filters.",
       "type": "object",
       "required": [
         "from"
       ],
       "properties": {
         "from": {
+          "description": "Source repository path (e.g. `library/nginx`).",
           "type": "string"
         },
         "platforms": {
@@ -636,6 +650,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           }
         },
         "source": {
+          "description": "Source registry alias, overriding `defaults.source`.",
           "default": null,
           "type": [
             "string",
@@ -643,6 +658,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "tags": {
+          "description": "Tag filter rules for this mapping, overriding `defaults.tags`.",
           "default": null,
           "anyOf": [
             {
@@ -654,6 +670,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "targets": {
+          "description": "Target registry alias or group, overriding `defaults.targets`.",
           "default": null,
           "anyOf": [
             {
@@ -665,6 +682,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "to": {
+          "description": "Destination repository path; defaults to `from` when absent.",
           "default": null,
           "type": [
             "string",
@@ -674,12 +692,14 @@ The schema is generated from the Rust config types and verified in CI to stay in
       }
     },
     "RegistryConfig": {
+      "description": "Per-registry settings: URL, auth method, concurrency, and credentials.",
       "type": "object",
       "required": [
         "url"
       ],
       "properties": {
         "auth_type": {
+          "description": "Authentication method to use for this registry.",
           "default": null,
           "anyOf": [
             {
@@ -720,6 +740,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "url": {
+          "description": "Registry base URL (e.g. `registry-1.docker.io`, `123456789012.dkr.ecr.us-east-1.amazonaws.com`).",
           "type": "string"
         }
       }
@@ -770,9 +791,11 @@ The schema is generated from the Rust config types and verified in CI to stay in
       ]
     },
     "TagsConfig": {
+      "description": "Tag filter and selection rules for a mapping.",
       "type": "object",
       "properties": {
         "exclude": {
+          "description": "Exclude tags matching one or more glob patterns.",
           "default": null,
           "anyOf": [
             {
@@ -784,6 +807,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "glob": {
+          "description": "Include tags matching one or more glob patterns.",
           "default": null,
           "anyOf": [
             {
@@ -795,6 +819,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "latest": {
+          "description": "Keep only the N most recent tags after sorting.",
           "default": null,
           "type": [
             "integer",
@@ -804,6 +829,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           "minimum": 0.0
         },
         "min_tags": {
+          "description": "Minimum number of tags to retain regardless of filters.",
           "default": null,
           "type": [
             "integer",
@@ -813,6 +839,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           "minimum": 0.0
         },
         "semver": {
+          "description": "Include tags matching a semver range (e.g. `>=1.0, <2.0`).",
           "default": null,
           "type": [
             "string",
@@ -820,6 +847,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "semver_prerelease": {
+          "description": "Whether to include or exclude semver pre-release tags.",
           "default": null,
           "anyOf": [
             {
@@ -831,6 +859,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         "sort": {
+          "description": "Sort order applied before `latest` truncation.",
           "default": null,
           "anyOf": [
             {
@@ -844,11 +873,14 @@ The schema is generated from the Rust config types and verified in CI to stay in
       }
     },
     "TargetsValue": {
+      "description": "Target specification: either a named group or an inline list of registry aliases.",
       "anyOf": [
         {
+          "description": "A single target group name defined in `target_groups`.",
           "type": "string"
         },
         {
+          "description": "An inline list of registry aliases.",
           "type": "array",
           "items": {
             "type": "string"

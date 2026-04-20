@@ -32,15 +32,18 @@ serviceAccount:
 ##   config:
 ##     registries:
 ##       source:
-##         hostname: cgr.dev
+##         url: cgr.dev
 ##       target:
-##         hostname: 123456789012.dkr.ecr.us-east-1.amazonaws.com
-##         auth: ecr
+##         url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+##     defaults:
+##       source: source
+##       targets: target
+##       tags:
+##         sort: semver
+##         latest: 5
 ##     mappings:
-##       - source: { registry: source, repository: chainguard/static }
-##         targets:
-##           - { registry: target, repository: chainguard/static }
-##         tags: { latest: 5 }
+##       - from: chainguard/static
+##         to: chainguard/static
 config: {}
 
 watch:

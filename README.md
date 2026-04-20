@@ -122,7 +122,7 @@ Full documentation at [clowdhaus.github.io/ocync](https://clowdhaus.github.io/oc
 | Registry | Auth | Blob mount | Notes |
 |---|---|---|---|
 | Amazon ECR (private) | IAM (automatic) | Yes (opt-in) | Batch APIs, per-action rate limits |
-| Amazon ECR Public | IAM (automatic) | Yes | Separate auth from private ECR |
+| Amazon ECR Public | IAM (automatic) | No | Separate auth from private ECR |
 | Chainguard | Token exchange | N/A (source) | No rate limits |
 | Docker Hub | Docker config / static | Yes | 100/6hr authenticated manifest GETs; HEADs free |
 | GitHub Container Registry | Docker config | Yes | Single-PATCH upload fallback |
