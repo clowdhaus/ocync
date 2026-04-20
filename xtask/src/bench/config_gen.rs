@@ -114,8 +114,8 @@ pub(crate) fn ocync_config(corpus: &Corpus) -> String {
         let src_key = registry_key(source_registry(&img.source));
         let path = source_path(&img.source);
         let target_repo = corpus.target_repo(&img.source);
-        out.push_str(&format!("  - from: {path}\n"));
-        out.push_str(&format!("    to: {target_repo}\n"));
+        out.push_str(&format!("  - from: \"{path}\"\n"));
+        out.push_str(&format!("    to: \"{target_repo}\"\n"));
         out.push_str(&format!("    source: {src_key}\n"));
         out.push_str(&format!("    targets: [{ecr_key}]\n"));
         out.push_str("    tags:\n");
@@ -172,8 +172,8 @@ pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
         for img in images {
             let from = source_path(&img.source);
             let to = corpus.target_repo(&img.source);
-            out.push_str(&format!("      - from: {from}\n"));
-            out.push_str(&format!("        to: {to}\n"));
+            out.push_str(&format!("      - from: \"{from}\"\n"));
+            out.push_str(&format!("        to: \"{to}\"\n"));
             // Deep-copy all platforms so dregsy syncs the full manifest
             // list, matching ocync and regsync behavior. Without this,
             // skopeo copies only the native platform (single manifest PUT)
@@ -292,15 +292,15 @@ registries:
     auth_type: ecr
 
 mappings:
-  - from: chainguard/static
-    to: bench/chainguard-static
+  - from: \"chainguard/static\"
+    to: \"bench/chainguard-static\"
     source: cgr-dev
     targets: [ecr]
     tags:
       glob:
         - \"latest\"
-  - from: library/alpine
-    to: bench/library-alpine
+  - from: \"library/alpine\"
+    to: \"bench/library-alpine\"
     source: docker-io
     targets: [ecr]
     tags:
@@ -325,8 +325,8 @@ tasks:
       registry: 111111111111.dkr.ecr.us-east-1.amazonaws.com
       auth-refresh: 12h
     mappings:
-      - from: chainguard/static
-        to: bench/chainguard-static
+      - from: \"chainguard/static\"
+        to: \"bench/chainguard-static\"
         platform: all
         tags:
           - \"latest\"
@@ -337,8 +337,8 @@ tasks:
       registry: 111111111111.dkr.ecr.us-east-1.amazonaws.com
       auth-refresh: 12h
     mappings:
-      - from: library/alpine
-        to: bench/library-alpine
+      - from: \"library/alpine\"
+        to: \"bench/library-alpine\"
         platform: all
         tags:
           - \"3.20\"
@@ -418,15 +418,15 @@ registries:
     auth_type: ecr
 
 mappings:
-  - from: chainguard/static
-    to: bench/chainguard-static
+  - from: \"chainguard/static\"
+    to: \"bench/chainguard-static\"
     source: cgr-dev
     targets: [ecr]
     tags:
       glob:
         - \"latest\"
-  - from: library/alpine
-    to: bench/library-alpine
+  - from: \"library/alpine\"
+    to: \"bench/library-alpine\"
     source: docker-io
     targets: [ecr]
     tags:
@@ -451,8 +451,8 @@ tasks:
       registry: 111111111111.dkr.ecr.us-east-1.amazonaws.com
       auth-refresh: 12h
     mappings:
-      - from: chainguard/static
-        to: bench/chainguard-static
+      - from: \"chainguard/static\"
+        to: \"bench/chainguard-static\"
         platform: all
         tags:
           - \"latest\"
@@ -464,8 +464,8 @@ tasks:
       registry: 111111111111.dkr.ecr.us-east-1.amazonaws.com
       auth-refresh: 12h
     mappings:
-      - from: library/alpine
-        to: bench/library-alpine
+      - from: \"library/alpine\"
+        to: \"bench/library-alpine\"
         platform: all
         tags:
           - \"3.20\"

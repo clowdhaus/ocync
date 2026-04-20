@@ -259,7 +259,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     eprintln!(
         "bench: instance={} cpu={} vcpus={} mem={}MiB net={} region={}",
         instance.instance_type,
-        instance.cpu_model,
+        instance.cpu_manufacturer,
         instance.vcpus,
         instance.memory_mib,
         instance.network_performance,
@@ -571,39 +571,45 @@ async fn run_sync(
         // Cold run.
         progress(&format!("  cold: {tool}"));
         ecr::create_repos(ecr_client, corpus).await?;
-        let cold = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
-        if cold.exit_code != Some(0) {
-            return Err(format!(
-                "{tool} cold sync failed (exit {:?}); aborting -- \
-                 tainted data cannot be compared",
-                cold.exit_code
-            )
-            .into());
-        }
-        progress(&format!(
-            "  cold: {tool} complete ({:.1}s)",
-            cold.wall_clock_secs
-        ));
-        cold_runs.push(cold);
+        let run_result: Result<(), Box<dyn std::error::Error>> = async {
+            let cold = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
+            if cold.exit_code != Some(0) {
+                return Err(format!(
+                    "{tool} cold sync failed (exit {:?}); aborting -- \
+                     tainted data cannot be compared",
+                    cold.exit_code
+                )
+                .into());
+            }
+            progress(&format!(
+                "  cold: {tool} complete ({:.1}s)",
+                cold.wall_clock_secs
+            ));
+            cold_runs.push(cold);
 
-        // Warm run: target still populated, same config_dir.
-        progress(&format!("  warm: {tool}"));
-        let warm = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
-        if warm.exit_code != Some(0) {
-            return Err(format!(
-                "{tool} warm sync failed (exit {:?}); aborting -- \
-                 tainted data cannot be compared",
-                warm.exit_code
-            )
-            .into());
+            // Warm run: target still populated, same config_dir.
+            progress(&format!("  warm: {tool}"));
+            let warm = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
+            if warm.exit_code != Some(0) {
+                return Err(format!(
+                    "{tool} warm sync failed (exit {:?}); aborting -- \
+                     tainted data cannot be compared",
+                    warm.exit_code
+                )
+                .into());
+            }
+            progress(&format!(
+                "  warm: {tool} complete ({:.1}s)",
+                warm.wall_clock_secs
+            ));
+            warm_runs.push(warm);
+            Ok(())
         }
-        progress(&format!(
-            "  warm: {tool} complete ({:.1}s)",
-            warm.wall_clock_secs
-        ));
-        warm_runs.push(warm);
+        .await;
 
+        // Always clean up ECR repos, even if the tool run failed.
         ecr::delete_repos(ecr_client, corpus).await?;
+        run_result?;
 
         if tool_idx + 1 < tools.len() {
             cooldown().await;
@@ -639,36 +645,43 @@ async fn run_partial(
 
         ecr::create_repos(ecr_client, base_corpus).await?;
 
-        // Prime with base corpus (unmeasured). Reuse the same
-        // config_dir so ocync's TransferStateCache persists.
-        let config_dir = tempfile::tempdir()?;
-        let prime = run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
-        if prime.exit_code != Some(0) {
-            return Err(format!(
-                "{tool} partial prime failed (exit {:?}); aborting",
-                prime.exit_code
-            )
-            .into());
-        }
-        progress(&format!("  partial: {} measuring", tool));
+        let run_result: Result<(), Box<dyn std::error::Error>> = async {
+            // Prime with base corpus (unmeasured). Reuse the same
+            // config_dir so ocync's TransferStateCache persists.
+            let config_dir = tempfile::tempdir()?;
+            let prime =
+                run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
+            if prime.exit_code != Some(0) {
+                return Err(format!(
+                    "{tool} partial prime failed (exit {:?}); aborting",
+                    prime.exit_code
+                )
+                .into());
+            }
+            progress(&format!("  partial: {} measuring", tool));
 
-        // Measured run with partial corpus (same config_dir).
-        let run =
-            run_single_tool(args, tool, partial_corpus, config_dir.path(), output_dir).await?;
-        if run.exit_code != Some(0) {
-            return Err(format!(
-                "{tool} partial sync failed (exit {:?}); aborting",
-                run.exit_code
-            )
-            .into());
+            // Measured run with partial corpus (same config_dir).
+            let run =
+                run_single_tool(args, tool, partial_corpus, config_dir.path(), output_dir).await?;
+            if run.exit_code != Some(0) {
+                return Err(format!(
+                    "{tool} partial sync failed (exit {:?}); aborting",
+                    run.exit_code
+                )
+                .into());
+            }
+            progress(&format!(
+                "  partial: {} complete ({:.1}s)",
+                tool, run.wall_clock_secs
+            ));
+            runs.push(run);
+            Ok(())
         }
-        progress(&format!(
-            "  partial: {} complete ({:.1}s)",
-            tool, run.wall_clock_secs
-        ));
-        runs.push(run);
+        .await;
 
+        // Always clean up ECR repos, even if the tool run failed.
         ecr::delete_repos(ecr_client, base_corpus).await?;
+        run_result?;
 
         if tool_idx + 1 < tools.len() {
             cooldown().await;
@@ -710,18 +723,25 @@ async fn run_scale(
 
             ecr::create_repos(ecr_client, &subset).await?;
 
-            let config_dir = tempfile::tempdir()?;
-            let run = run_single_tool(args, tool, &subset, config_dir.path(), output_dir).await?;
-            if run.exit_code != Some(0) {
-                return Err(format!(
-                    "{tool} scale sync failed at {size} images (exit {:?}); aborting",
-                    run.exit_code
-                )
-                .into());
+            let run_result: Result<(), Box<dyn std::error::Error>> = async {
+                let config_dir = tempfile::tempdir()?;
+                let run =
+                    run_single_tool(args, tool, &subset, config_dir.path(), output_dir).await?;
+                if run.exit_code != Some(0) {
+                    return Err(format!(
+                        "{tool} scale sync failed at {size} images (exit {:?}); aborting",
+                        run.exit_code
+                    )
+                    .into());
+                }
+                results.insert(tool.to_string(), run.wall_clock_secs);
+                Ok(())
             }
-            results.insert(tool.to_string(), run.wall_clock_secs);
+            .await;
 
+            // Always clean up ECR repos, even if the tool run failed.
             ecr::delete_repos(ecr_client, &subset).await?;
+            run_result?;
 
             if tool_idx + 1 < tools.len() {
                 cooldown().await;
@@ -793,7 +813,12 @@ impl std::fmt::Display for Scenario {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// Serializes tests that mutate process environment variables.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn days_to_civil_unix_epoch() {
@@ -886,9 +911,8 @@ mod tests {
 
     #[test]
     fn docker_hub_auth_from_env_both_set() {
-        // SAFETY: test-only; env var mutation is safe in single-threaded
-        // test runs (cargo test runs each #[test] in its own thread, but
-        // these env var names are unique to this test suite).
+        let _lock = ENV_MUTEX.lock().unwrap();
+        // SAFETY: env-var mutation is serialized by ENV_MUTEX above.
         unsafe {
             std::env::set_var("DOCKERHUB_USERNAME", "testuser");
             std::env::set_var("DOCKERHUB_ACCESS_TOKEN", "testtoken");
@@ -903,6 +927,8 @@ mod tests {
 
     #[test]
     fn docker_hub_auth_from_env_empty_returns_none() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        // SAFETY: env-var mutation is serialized by ENV_MUTEX above.
         unsafe {
             std::env::set_var("DOCKERHUB_USERNAME", "");
             std::env::set_var("DOCKERHUB_ACCESS_TOKEN", "sometoken");
@@ -917,6 +943,8 @@ mod tests {
 
     #[test]
     fn docker_hub_auth_from_env_missing_returns_none() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        // SAFETY: env-var mutation is serialized by ENV_MUTEX above.
         unsafe {
             std::env::remove_var("DOCKERHUB_USERNAME");
             std::env::remove_var("DOCKERHUB_ACCESS_TOKEN");

@@ -135,15 +135,17 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         return Err("git push failed".into());
     }
 
-    // Build the bench command args.
-    let mut bench_args = format!("--tools {}", args.tools);
+    // Build the bench command args. Shell-escape all user-supplied
+    // values to prevent injection via crafted tool names, registry
+    // names, or scenario strings.
+    let mut bench_args = format!("--tools '{}'", shell_escape(&args.tools));
     if let Some(limit) = args.limit {
         bench_args.push_str(&format!(" --limit {limit}"));
     }
     if let Some(ref skip) = args.skip_registries {
-        bench_args.push_str(&format!(" --skip-registries {skip}"));
+        bench_args.push_str(&format!(" --skip-registries '{}'", shell_escape(skip)));
     }
-    bench_args.push_str(&format!(" {}", args.scenario));
+    bench_args.push_str(&format!(" '{}'", shell_escape(&args.scenario)));
 
     // Determine the target registry from the provider.
     let registry_env = match config.provider.as_str() {
@@ -173,6 +175,8 @@ sleep 1
     } else {
         ""
     };
+
+    let escaped_git_ref = shell_escape(&git_ref);
 
     let script = format!(
         r#"#!/bin/bash
@@ -221,8 +225,8 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 # Pull code and build.
-echo '[1/4] Pulling {git_ref}...'
-git fetch origin '{git_ref}' && git checkout '{git_ref}' && git reset --hard 'origin/{git_ref}'
+echo '[1/4] Pulling {escaped_git_ref}...'
+git fetch origin '{escaped_git_ref}' && git checkout '{escaped_git_ref}' && git reset --hard 'origin/{escaped_git_ref}'
 
 echo '[2/4] Building ocync + bench-proxy...'
 source ~/.bench-env 2>/dev/null || true
@@ -368,14 +372,13 @@ fn fetch_results(
         return Err("scp failed".into());
     }
 
-    // Also fetch the per-registry JSON archive.
-    let json_file = ssh_run(
+    // Also fetch all per-registry JSON archives (excluding baseline.json).
+    let json_files = ssh_run(
         config,
-        "ls -t ~/ocync/bench/results/*.json 2>/dev/null | grep -v baseline | head -1",
+        "ls ~/ocync/bench/results/*.json 2>/dev/null | grep -v baseline",
     )?;
-    let json_file = json_file.trim();
 
-    if !json_file.is_empty() {
+    for json_file in json_files.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let json_basename = Path::new(json_file)
             .file_name()
             .unwrap_or_default()
@@ -423,6 +426,14 @@ fn ssh_run(config: &BenchConfig, command: &str) -> Result<String, Box<dyn std::e
     Ok(String::from_utf8(output.stdout)?)
 }
 
+/// Escapes a string for use inside single quotes in a shell command.
+///
+/// Replaces each `'` with `'\''` (end single-quote, backslash-escaped
+/// literal single-quote, restart single-quote).
+fn shell_escape(s: &str) -> String {
+    s.replace('\'', "'\\''")
+}
+
 /// Get the current local git branch name.
 fn current_branch() -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("git")
@@ -457,6 +468,21 @@ mod tests {
             msg.contains("unknown provider 'nonexistent'"),
             "expected provider error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn shell_escape_no_quotes() {
+        assert_eq!(shell_escape("main"), "main");
+    }
+
+    #[test]
+    fn shell_escape_with_single_quote() {
+        assert_eq!(shell_escape("it's"), "it'\\''s");
+    }
+
+    #[test]
+    fn shell_escape_multiple_quotes() {
+        assert_eq!(shell_escape("a'b'c"), "a'\\''b'\\''c");
     }
 
     #[test]

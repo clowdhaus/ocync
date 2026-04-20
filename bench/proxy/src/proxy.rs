@@ -144,7 +144,13 @@ pub(crate) async fn serve(
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                let (stream, peer) = accept?;
+                let (stream, peer) = match accept {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        warn!(error = %e, "accept failed, skipping connection");
+                        continue;
+                    }
+                };
                 let ca = ca.clone();
                 let log = log.clone();
                 let upstream = upstream.clone();
@@ -421,19 +427,21 @@ async fn handle_request(
             let host = host_for_log.clone();
             let url = url_for_log.clone();
             let status_code = status.as_u16();
-            tokio::spawn(async move {
-                let entry = ProxyEntry {
-                    timestamp: now_iso8601(),
-                    method: &method,
-                    host: &host,
-                    url: &url,
-                    request_bytes,
-                    response_bytes: entry_bytes,
-                    status: status_code,
-                    duration_ms: elapsed.as_millis() as u64,
-                };
-                log.write_entry(&entry).await;
-            });
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let entry = ProxyEntry {
+                        timestamp: now_iso8601(),
+                        method: &method,
+                        host: &host,
+                        url: &url,
+                        request_bytes,
+                        response_bytes: entry_bytes,
+                        status: status_code,
+                        duration_ms: elapsed.as_millis() as u64,
+                    };
+                    log.write_entry(&entry).await;
+                });
+            }
         })),
     };
     let body = StreamBody::new(logging_stream).boxed_unsync();
