@@ -50,6 +50,17 @@ pub(crate) enum ExitCode {
     AuthError,
 }
 
+impl ExitCode {
+    /// Map a [`SyncReport`](ocync_sync::SyncReport) exit code to a CLI exit code.
+    pub(crate) fn from_report(code: i32) -> Self {
+        match code {
+            0 => Self::Success,
+            1 => Self::PartialFailure,
+            _ => Self::Failure,
+        }
+    }
+}
+
 impl From<ExitCode> for std::process::ExitCode {
     fn from(code: ExitCode) -> Self {
         match code {
@@ -91,6 +102,7 @@ impl CliError {
     pub(crate) fn exit_code(&self) -> ExitCode {
         match self {
             Self::Config(_) => ExitCode::ConfigError,
+            Self::Filter(_) => ExitCode::ConfigError,
             Self::Registry(e) if e.is_auth_error() => ExitCode::AuthError,
             _ => ExitCode::Failure,
         }
@@ -189,32 +201,26 @@ pub(crate) async fn build_registry_client(
             let tok = registry_config
                 .and_then(|r| r.token.as_deref())
                 .expect("token auth requires token field (validated)");
-            let auth = StaticTokenAuth::new(tok);
+            let auth = StaticTokenAuth::new(endpoint, tok);
             RegistryClient::builder(url).auth(auth)
         }
-        Some(AuthType::Ghcr | AuthType::Gcr | AuthType::Acr) => {
-            // These registries will eventually have native providers (OAuth2, GITHUB_TOKEN).
-            // For now, resolve credentials from docker config - covers PATs and helper-stored creds.
-            tracing::debug!(
-                registry = bare_host,
-                auth_type = ?auth_type,
-                "using docker config credential resolution for registry provider"
-            );
+        Some(AuthType::Ghcr | AuthType::Gcr | AuthType::Acr | AuthType::DockerConfig) => {
+            if matches!(
+                auth_type,
+                Some(AuthType::Ghcr | AuthType::Gcr | AuthType::Acr)
+            ) {
+                tracing::debug!(
+                    registry = bare_host,
+                    auth_type = ?auth_type,
+                    "using docker config credential resolution for registry provider"
+                );
+            }
             let docker_config = DockerConfig::load_default().map_err(|e| {
                 CliError::Input(format!(
                     "failed to load docker config for '{bare_host}': {e}"
                 ))
             })?;
-            let auth = DockerConfigAuth::new(endpoint, &docker_config, http)?;
-            RegistryClient::builder(url).auth(auth)
-        }
-        Some(AuthType::DockerConfig) => {
-            let docker_config = DockerConfig::load_default().map_err(|e| {
-                CliError::Input(format!(
-                    "failed to load docker config for '{bare_host}': {e}"
-                ))
-            })?;
-            let auth = DockerConfigAuth::new(endpoint, &docker_config, http)?;
+            let auth = DockerConfigAuth::new(endpoint, &docker_config, http).await?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Anonymous) => {
@@ -235,11 +241,13 @@ pub(crate) async fn build_registry_client(
                 // Try docker config - falls back to anonymous exchange if no creds found.
                 match DockerConfig::load_default() {
                     Ok(config) => {
-                        let auth = DockerConfigAuth::new(endpoint, &config, http).map_err(|e| {
-                            CliError::Input(format!(
-                                "docker config credential resolution for '{bare_host}': {e}"
-                            ))
-                        })?;
+                        let auth = DockerConfigAuth::new(endpoint, &config, http)
+                            .await
+                            .map_err(|e| {
+                                CliError::Input(format!(
+                                    "docker config credential resolution for '{bare_host}': {e}"
+                                ))
+                            })?;
                         RegistryClient::builder(url).auth(auth)
                     }
                     Err(_) => {
@@ -427,7 +435,7 @@ mod tests {
     #[test]
     fn cli_error_exit_code_filter() {
         let err = CliError::Filter(ocync_sync::Error::LatestWithoutSort);
-        assert_eq!(err.exit_code(), ExitCode::Failure);
+        assert_eq!(err.exit_code(), ExitCode::ConfigError);
     }
 
     #[test]

@@ -300,6 +300,7 @@ mod tests {
                 kind: ErrorKind::ManifestPush,
                 error: "connection refused".into(),
                 retries: 3,
+                status_code: None,
             },
             0,
         );
@@ -316,6 +317,7 @@ mod tests {
                 kind: ErrorKind::BlobTransfer,
                 error: "timeout".into(),
                 retries: 1,
+                status_code: None,
             },
             0,
         );
@@ -335,6 +337,7 @@ mod tests {
                 kind: ErrorKind::ManifestPull,
                 error: String::new(),
                 retries: 0,
+                status_code: None,
             },
             0,
         );
@@ -421,6 +424,7 @@ mod tests {
                 kind: ErrorKind::BlobTransfer,
                 error: "network error".into(),
                 retries: 2,
+                status_code: None,
             },
             0,
         );
@@ -651,6 +655,7 @@ mod tests {
                 kind: ErrorKind::ManifestPush,
                 error: "timeout".into(),
                 retries: 2,
+                status_code: None,
             },
             0,
         );
@@ -671,6 +676,7 @@ mod tests {
                 kind: ErrorKind::ManifestPull,
                 error: "timeout".into(),
                 retries: 2,
+                status_code: None,
             },
             0,
         );
@@ -715,6 +721,7 @@ mod tests {
                 kind: ErrorKind::BlobTransfer,
                 error: "connection lost".into(),
                 retries: 1,
+                status_code: None,
             },
             0,
         ));
@@ -743,6 +750,7 @@ mod tests {
                 kind: ErrorKind::ManifestPush,
                 error: "timeout".into(),
                 retries: 2,
+                status_code: None,
             },
             0,
         );
@@ -802,6 +810,7 @@ mod tests {
                 kind: ErrorKind::ManifestPush,
                 error: "timeout".into(),
                 retries: 2,
+                status_code: None,
             },
             0,
         ));

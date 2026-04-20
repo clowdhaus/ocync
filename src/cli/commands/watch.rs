@@ -26,26 +26,24 @@ pub(crate) async fn run(
 
     let health_state = Rc::new(RefCell::new(HealthState::new(interval)));
 
-    // Load config once upfront for cache path and TTL resolution.
-    // Uses the same resolution logic as the sync command.
+    // Resolve cache path and TTL from the initial config load. These are
+    // re-resolved each cycle so that config file changes take effect.
     let config = load_config(&args.config)?;
     let (_cache_dir, cache_path) = synchronize::resolve_cache_path(&config, &args.config);
-    let cache_ttl = synchronize::resolve_cache_ttl(&config);
+    let cache_ttl = synchronize::resolve_cache_ttl(&config)?;
 
     // Bind the health listener early so bind errors surface before the
     // sync loop starts. This also avoids TOCTOU races with port allocation.
-    let health_listener = match TcpListener::bind(("0.0.0.0", args.health_port)).await {
+    let health_listener = match TcpListener::bind((args.health_bind, args.health_port)).await {
         Ok(l) => {
             tracing::info!(port = args.health_port, "health server listening");
-            Some(l)
+            l
         }
         Err(err) => {
-            tracing::error!(
-                port = args.health_port,
-                error = %err,
-                "health server failed to bind, watch mode continuing without health endpoint"
-            );
-            None
+            return Err(CliError::Input(format!(
+                "health server failed to bind on port {}: {err} (check if another process is using this port)",
+                args.health_port,
+            )));
         }
     };
 
@@ -59,16 +57,81 @@ pub(crate) async fn run(
                 &cache_path,
                 cache_ttl,
             )));
+            // Track the active cache path so we can detect config changes.
+            let mut active_cache_path = cache_path;
 
             // Spawn the health server as a background local task.
-            let health_handle = health_listener.map(|listener| {
+            let health_handle = {
                 let state = Rc::clone(&health_state);
                 tokio::task::spawn_local(async move {
-                    crate::cli::health::serve(listener, state).await;
+                    crate::cli::health::serve(health_listener, state).await;
                 })
-            });
+            };
+
+            // Track consecutive config reload failures for backoff.
+            let mut config_failures: u32 = 0;
+            const BACKOFF_THRESHOLD: u32 = 3;
+            const MAX_BACKOFF_SECS: u64 = 300; // 5 minutes
 
             let exit_code = loop {
+                // Re-resolve cache_dir and cache_ttl each cycle so that
+                // config file edits (e.g. changing cache_dir or cache_ttl)
+                // take effect without restarting watch mode.
+                if let Ok(cfg) = load_config(&args.config) {
+                    config_failures = 0;
+                    let (_dir, path) = synchronize::resolve_cache_path(&cfg, &args.config);
+                    match synchronize::resolve_cache_ttl(&cfg) {
+                        Ok(ttl) => {
+                            // If the cache path changed, persist the old
+                            // cache and reload from the new location.
+                            if path != active_cache_path {
+                                if let Err(e) = cache.borrow().persist(&active_cache_path) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "failed to persist cache before path change"
+                                    );
+                                }
+                                *cache.borrow_mut() = TransferStateCache::load(&path, ttl);
+                                active_cache_path = path;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "invalid cache_ttl in reloaded config, using previous value"
+                            );
+                        }
+                    }
+                } else {
+                    config_failures += 1;
+                    tracing::error!(
+                        consecutive_failures = config_failures,
+                        "failed to reload config for cache resolution, using previous value"
+                    );
+
+                    // After repeated failures, apply exponential backoff
+                    // before the next cycle to avoid log spam.
+                    if config_failures >= BACKOFF_THRESHOLD {
+                        let backoff_secs = interval
+                            .as_secs()
+                            .saturating_mul(1 << (config_failures - BACKOFF_THRESHOLD).min(4))
+                            .min(MAX_BACKOFF_SECS);
+                        let backoff = Duration::from_secs(backoff_secs);
+                        tracing::warn!(
+                            backoff_secs = backoff.as_secs(),
+                            "config reload failing repeatedly, applying backoff"
+                        );
+                        tokio::select! {
+                            () = tokio::time::sleep(backoff) => {}
+                            () = shutdown.notified() => {
+                                tracing::info!("shutdown signal received during backoff");
+                                break ExitCode::Success;
+                            }
+                        }
+                        continue;
+                    }
+                }
+
                 let sync_args = SyncArgs {
                     config: args.config.clone(),
                     dry_run: false,
@@ -105,13 +168,11 @@ pub(crate) async fn run(
             };
 
             // Persist cache on graceful shutdown.
-            if let Err(e) = cache.borrow().persist(&cache_path) {
+            if let Err(e) = cache.borrow().persist(&active_cache_path) {
                 tracing::warn!(error = %e, "failed to persist cache on shutdown");
             }
 
-            if let Some(h) = health_handle {
-                h.abort();
-            }
+            health_handle.abort();
             exit_code
         })
         .await;

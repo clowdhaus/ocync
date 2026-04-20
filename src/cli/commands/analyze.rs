@@ -16,8 +16,11 @@ use ocync_distribution::ecr::BatchBlobChecker;
 use ocync_distribution::spec::ManifestKind;
 use ocync_distribution::{Digest, RepositoryName};
 
+use ocync_sync::ShutdownSignal;
+
 use crate::cli::commands::synchronize::{build_clients, resolve_mapping};
 use crate::cli::config::load_config;
+use crate::cli::output::format_bytes;
 use crate::cli::{CliError, ExitCode};
 
 /// Arguments for the `analyze` subcommand.
@@ -45,7 +48,10 @@ struct BlobAggregate {
 }
 
 /// Run the analyze command.
-pub(crate) async fn run(args: &AnalyzeArgs) -> Result<ExitCode, CliError> {
+pub(crate) async fn run(
+    args: &AnalyzeArgs,
+    shutdown: &ShutdownSignal,
+) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
     let clients = build_clients(&config).await?;
     // Analyze doesn't push anything, so no batch checkers needed.
@@ -55,14 +61,25 @@ pub(crate) async fn run(args: &AnalyzeArgs) -> Result<ExitCode, CliError> {
     let mut image_count = 0usize;
 
     for mapping in &config.mappings {
+        if shutdown.is_triggered() {
+            tracing::info!("shutdown signal received, stopping analysis early");
+            break;
+        }
+
         let resolved = match resolve_mapping(mapping, &config, &clients, &no_checkers).await? {
             Some(r) => r,
             None => continue,
         };
 
         for tag_pair in &resolved.tags {
+            if shutdown.is_triggered() {
+                tracing::info!("shutdown signal received, stopping analysis early");
+                break;
+            }
+
             image_count += 1;
             let image_ref = format!("{}:{}", resolved.source_repo, tag_pair.source);
+            tracing::info!(image = %image_ref, "analyzing");
             collect_blobs(
                 &resolved.source_client,
                 &resolved.source_repo,
@@ -199,6 +216,24 @@ fn record_blob(
 // Output
 // ---------------------------------------------------------------------------
 
+/// Compute per-target-registry mount savings: count of redundant pushes and
+/// total bytes that cross-repo mount would avoid.
+fn compute_mount_savings(blobs: &HashMap<Digest, BlobAggregate>) -> BTreeMap<String, (usize, u64)> {
+    let mut savings: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+    for blob in blobs.values() {
+        for (target, repos) in &blob.target_repos {
+            if repos.len() > 1 {
+                let count = repos.len() - 1;
+                let bytes = blob.size * count as u64;
+                let entry = savings.entry(target.clone()).or_default();
+                entry.0 += count;
+                entry.1 += bytes;
+            }
+        }
+    }
+    savings
+}
+
 fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) {
     let total_blobs = blobs.len();
     let total_bytes: u64 = blobs.values().map(|b| b.size).sum();
@@ -206,22 +241,7 @@ fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) {
     let shared: Vec<&BlobAggregate> = blobs.values().filter(|b| b.images.len() > 1).collect();
     let shared_bytes: u64 = shared.iter().map(|b| b.size).sum();
 
-    // Cross-repo mount opportunity: per target registry, count blobs whose
-    // target_repos set has more than one repo - those are the mount candidates
-    // (a blob pushed once can be mounted into every other repo in the set).
-    let mut mount_savings_by_target: BTreeMap<String, (usize, u64)> = BTreeMap::new();
-    for blob in blobs.values() {
-        for (target, repos) in &blob.target_repos {
-            if repos.len() > 1 {
-                // One blob, pushed once, then mounted into (repos.len() - 1) other repos.
-                let savings_count = repos.len() - 1;
-                let savings_bytes = blob.size * savings_count as u64;
-                let entry = mount_savings_by_target.entry(target.clone()).or_default();
-                entry.0 += savings_count;
-                entry.1 += savings_bytes;
-            }
-        }
-    }
+    let mount_savings_by_target = compute_mount_savings(blobs);
 
     println!("Analyzed {image_count} image mappings");
     println!();
@@ -247,18 +267,7 @@ fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) {
 }
 
 fn print_json(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) -> Result<(), CliError> {
-    let mut mount_savings_by_target: BTreeMap<String, (usize, u64)> = BTreeMap::new();
-    for blob in blobs.values() {
-        for (target, repos) in &blob.target_repos {
-            if repos.len() > 1 {
-                let savings_count = repos.len() - 1;
-                let savings_bytes = blob.size * savings_count as u64;
-                let entry = mount_savings_by_target.entry(target.clone()).or_default();
-                entry.0 += savings_count;
-                entry.1 += savings_bytes;
-            }
-        }
-    }
+    let mount_savings_by_target = compute_mount_savings(blobs);
 
     let report = serde_json::json!({
         "images_analyzed": image_count,
@@ -278,20 +287,4 @@ fn print_json(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) -> Res
             .map_err(|e| CliError::Input(format!("serialize report: {e}")))?
     );
     Ok(())
-}
-
-/// Format bytes with SI decimal prefixes (1 KB = 1000 B).
-fn format_bytes(bytes: u64) -> String {
-    const GB: u64 = 1_000_000_000;
-    const MB: u64 = 1_000_000;
-    const KB: u64 = 1_000;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }

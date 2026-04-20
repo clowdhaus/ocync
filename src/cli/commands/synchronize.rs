@@ -54,13 +54,18 @@ pub(crate) fn resolve_cache_path(config: &Config, config_file: &Path) -> (PathBu
 }
 
 /// Parse and return the cache TTL from config, defaulting to 12 hours.
-pub(crate) fn resolve_cache_ttl(config: &Config) -> Duration {
-    config
-        .global
-        .as_ref()
-        .and_then(|g| g.cache_ttl.as_deref())
-        .and_then(parse_duration)
-        .unwrap_or(DEFAULT_CACHE_TTL)
+///
+/// Returns an error if the configured value cannot be parsed, rather than
+/// silently falling back to the default.
+pub(crate) fn resolve_cache_ttl(config: &Config) -> Result<Duration, CliError> {
+    match config.global.as_ref().and_then(|g| g.cache_ttl.as_deref()) {
+        Some(raw) => parse_duration(raw.trim()).ok_or_else(|| {
+            CliError::Input(format!(
+                "invalid cache_ttl '{raw}': accepted formats are \"0\", \"<N>s\", \"<N>m\", \"<N>h\", \"<N>d\", or \"<N>\" (seconds)"
+            ))
+        }),
+        None => Ok(DEFAULT_CACHE_TTL),
+    }
 }
 
 /// Run the sync command: load config, resolve mappings, and execute.
@@ -93,7 +98,7 @@ pub(crate) async fn run(
     }
 
     let (cache_dir, cache_path) = resolve_cache_path(&config, &args.config);
-    let cache_ttl = resolve_cache_ttl(&config);
+    let cache_ttl = resolve_cache_ttl(&config)?;
     let (cache, should_persist) = match external_cache {
         Some(ext) => (ext, false),
         None => {
@@ -121,12 +126,19 @@ pub(crate) async fn run(
             tracing::warn!(error = %e, "failed to clean staging tmp files");
         }
         // Evict stale blobs from previous runs before starting new work.
-        if let Some(limit) = config
+        let staging_limit = match config
             .global
             .as_ref()
             .and_then(|g| g.staging_size_limit.as_deref())
-            .and_then(parse_size)
         {
+            Some(raw) => Some(parse_size(raw.trim()).ok_or_else(|| {
+                CliError::Input(format!(
+                    "invalid staging_size_limit '{raw}': accepted formats are \"0\", \"<N>B\", \"<N>KB\", \"<N>MB\", \"<N>GB\", \"<N>TB\""
+                ))
+            })?),
+            None => None,
+        };
+        if let Some(limit) = staging_limit {
             if let Err(e) = stage.evict(limit) {
                 tracing::warn!(error = %e, "failed to evict staged blobs");
             }
@@ -156,11 +168,7 @@ pub(crate) async fn run(
 
     write_output(&report, args.json)?;
 
-    match report.exit_code() {
-        0 => Ok(ExitCode::Success),
-        1 => Ok(ExitCode::PartialFailure),
-        _ => Ok(ExitCode::Failure),
-    }
+    Ok(ExitCode::from_report(report.exit_code()))
 }
 
 /// Parse a human-readable duration string into a [`Duration`].
@@ -176,6 +184,7 @@ pub(crate) async fn run(
 /// Returns `None` for unrecognised strings - callers must decide how to
 /// handle invalid input rather than silently receiving a default.
 fn parse_duration(s: &str) -> Option<Duration> {
+    let s = s.trim();
     if s == "0" {
         return Some(Duration::ZERO);
     }
@@ -202,6 +211,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
 /// Accepts `"0"`, `"<N>B"`, `"<N>KB"`, `"<N>MB"`, `"<N>GB"`, `"<N>TB"`.
 /// Returns `None` for unrecognised strings.
 fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
     if s == "0" {
         return Some(0);
     }
@@ -327,7 +337,7 @@ pub(crate) async fn resolve_mapping(
         .collect::<Result<Vec<_>, CliError>>()?;
 
     // --- Fetch and filter tags ---
-    let source_repo_path = RepositoryName::new(&mapping.from);
+    let source_repo_path = RepositoryName::new(&mapping.from)?;
     let all_tags = source_client.list_tags(&source_repo_path).await?;
 
     let tags_config = mapping
@@ -370,8 +380,8 @@ pub(crate) async fn resolve_mapping(
     Ok(Some(ResolvedMapping {
         source_authority,
         source_client,
-        source_repo: mapping.from.clone().into(),
-        target_repo: target_repo.into(),
+        source_repo: RepositoryName::new(mapping.from.clone())?,
+        target_repo: RepositoryName::new(target_repo)?,
         targets,
         tags: filtered.into_iter().map(TagPair::same).collect(),
         platforms,
@@ -480,6 +490,49 @@ mod tests {
         assert_eq!(parse_duration("invalid"), None);
         assert_eq!(parse_duration(""), None);
         assert_eq!(parse_duration("12hours"), None);
+    }
+
+    #[test]
+    fn parse_duration_trims_whitespace() {
+        assert_eq!(
+            parse_duration("  12h  "),
+            Some(Duration::from_secs(12 * 3600))
+        );
+        assert_eq!(parse_duration(" 30m "), Some(Duration::from_secs(30 * 60)));
+    }
+
+    #[test]
+    fn resolve_cache_ttl_returns_error_for_invalid() {
+        use crate::cli::config::{Config, GlobalConfig};
+
+        let config = Config {
+            global: Some(GlobalConfig {
+                cache_ttl: Some("bogus".into()),
+                ..Default::default()
+            }),
+            registries: Default::default(),
+            target_groups: Default::default(),
+            defaults: None,
+            mappings: Vec::new(),
+        };
+        let result = resolve_cache_ttl(&config);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid cache_ttl"), "got: {err_msg}");
+    }
+
+    #[test]
+    fn resolve_cache_ttl_returns_default_when_absent() {
+        use crate::cli::config::Config;
+
+        let config = Config {
+            global: None,
+            registries: Default::default(),
+            target_groups: Default::default(),
+            defaults: None,
+            mappings: Vec::new(),
+        };
+        assert_eq!(resolve_cache_ttl(&config).unwrap(), DEFAULT_CACHE_TTL);
     }
 
     #[test]
@@ -600,5 +653,11 @@ mod tests {
         assert_eq!(parse_size("2gigabytes"), None);
         assert_eq!(parse_size(""), None);
         assert_eq!(parse_size("abc"), None);
+    }
+
+    #[test]
+    fn parse_size_trims_whitespace() {
+        assert_eq!(parse_size("  500MB  "), Some(500_000_000));
+        assert_eq!(parse_size(" 2GB "), Some(2_000_000_000));
     }
 }
