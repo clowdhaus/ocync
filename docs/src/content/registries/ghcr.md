@@ -28,7 +28,7 @@ GHCR supports cross-repo blob mounting within the same organization/user namespa
 
 ## Rate limits
 
-GHCR rate limits are tied to your GitHub account's API rate limit and Actions minutes/storage quotas. `ocync` tracks GHCR rate limits via the `X-RateLimit-Remaining` response header.
+GHCR rate limits are tied to your GitHub account's API rate limit and Actions minutes/storage quotas. `ocync` adapts to GHCR rate limits via AIMD 429-based feedback: concurrency starts at 5 and grows adaptively, halving on any 429 response.
 
 ## Example config
 
@@ -36,8 +36,16 @@ GHCR rate limits are tied to your GitHub account's API rate limit and Actions mi
 registries:
   ghcr:
     url: ghcr.io
+    auth_type: static_token
+    token: ${GITHUB_TOKEN}
+  ecr:
+    url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+
+defaults:
+  source: ghcr
+  targets: ecr
 
 mappings:
-  - from: source/myapp
-    to: ghcr/my-org/myapp
+  - from: my-org/myapp
+    to: myapp
 ```

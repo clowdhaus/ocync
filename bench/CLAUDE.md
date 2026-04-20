@@ -120,8 +120,8 @@ Each cloud provider gets its own directory:
 ```
 bench/terraform/
   aws/     # VPC, public subnet, VPC endpoints, EC2, SSH key pair
-  gcp/     # (future) VPC, GCE, Private Google Access, GAR
-  azure/   # (future) VNet, VM, ACR private endpoint
+  gcp/     # (planned, does not exist yet) VPC, GCE, Private Google Access, GAR
+  azure/   # (planned, does not exist yet) VNet, VM, ACR private endpoint
 ```
 
 Terraform writes `bench.json` to the provider directory with connection details. The xtask reads this file -- no manual copy-paste of IPs.

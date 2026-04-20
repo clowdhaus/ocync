@@ -161,6 +161,54 @@ In both cases, the IAM role needs permissions to pull from source and push to ta
 
 Scope the `Resource` ARNs to specific repositories in production.
 
+### Google GKE
+
+GKE uses [Workload Identity Federation](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) to bind a Kubernetes service account to a Google Cloud service account:
+
+```yaml
+serviceAccount:
+  create: true
+  annotations:
+    iam.gke.io/gcp-service-account: ocync@my-project.iam.gserviceaccount.com
+```
+
+Bind the Kubernetes service account to the GCP service account:
+
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+  ocync@my-project.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:my-project.svc.id.goog[default/ocync]"
+```
+
+The GCP service account needs `roles/artifactregistry.reader` on source repositories and `roles/artifactregistry.writer` on targets.
+
+### Azure AKS
+
+AKS uses [Workload Identity](https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview) to federate a Kubernetes service account with an Azure managed identity:
+
+```yaml
+serviceAccount:
+  create: true
+  annotations:
+    azure.workload.identity/client-id: <managed-identity-client-id>
+  labels:
+    azure.workload.identity/use: "true"
+```
+
+Create the federated credential:
+
+```bash
+az identity federated-credential create \
+  --name ocync-federated \
+  --identity-name ocync-identity \
+  --resource-group my-rg \
+  --issuer "$(az aks show -n my-cluster -g my-rg --query oidcIssuerProfile.issuerUrl -o tsv)" \
+  --subject system:serviceaccount:default:ocync
+```
+
+Grant `AcrPush` on the target ACR and `AcrPull` on source ACR instances.
+
 ## Values reference
 
 See the chart's [`values.yaml`](https://github.com/clowdhaus/ocync/blob/main/charts/ocync/values.yaml) for the full set of configurable values.

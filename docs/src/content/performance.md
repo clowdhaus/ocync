@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: How ocync achieves 3.6-4.5x faster sync than comparable tools with fewer requests and cross-repo blob mounting.
+description: How ocync achieves 4x faster sync than comparable tools with fewer requests and cross-repo blob mounting.
 order: 6
 ---
 
@@ -29,9 +29,9 @@ Measured 2026-04-19 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps). F
 
 | Tool | Strategy | Requests/blob | Buffering |
 |------|---------|:---:|-----------|
-| `ocync` | POST + streaming PUT | **2** | None (streamed) |
+| `ocync` | POST + streaming PUT | 2 | None (streamed) |
 | containerd | POST + streaming PUT | 2 | None (io.Pipe) |
-| regsync (regclient) | POST + PUT | 2 | Full blob in memory |
+| regsync (regclient) | POST + PUT | 2 | None (streamed) |
 | crane (go-containerregistry) | POST + streaming PATCH + PUT | 3 | None (streamed) |
 | skopeo (containers/image) | POST + PATCH + PUT | 3 | None (streamed) |
 
@@ -39,11 +39,11 @@ Measured 2026-04-19 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps). F
 
 | Tool | Default concurrency | Adaptive backoff | Rate limit strategy |
 |------|:---:|:---:|-----|
-| `ocync` | 50 ([AIMD](../design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](../design/overview#adaptive-concurrency-aimd) congestion control on 429 |
-| containerd | 5 layers | No | Lock-based dedup, no 429 handling |
-| regsync | 3 per registry | No | Reads `ratelimit-remaining` header, pauses proactively |
-| crane | 4 jobs | Retry with backoff (1s, 3s) | Retry on 408/429/5xx, 3 attempts |
-| skopeo | per-image flag | No | No retry, aborts on 429 |
+| `ocync` | 5 initial, 50 cap ([AIMD](../design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](../design/overview#adaptive-concurrency-aimd) congestion control on 429 |
+| containerd | 3 layers | No | Lock-based dedup, retries on 429 (no backoff) |
+| regsync | 3 per registry | No | Reads `RateLimit-Remaining` header, pauses proactively |
+| crane | 4 jobs | Retry with backoff (0.1s-0.9s transport, 1s-9s operation) | Retry on 408/5xx, 3 attempts |
+| skopeo | 6 layers | Yes (exponential, 2s-60s) | Retries 429 for GET/HEAD; uploads not retried |
 
 ### Blob deduplication
 
@@ -53,17 +53,19 @@ Measured 2026-04-19 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps). F
 | containerd | Yes (StatusTracker) | No | No |
 | regsync | No | No | No (in-memory only) |
 | crane | Yes (sync.Map by digest) | No | No |
-| skopeo | No | No | BoltDB BlobInfoCache (mount hints) |
+| skopeo | No | No | SQLite BlobInfoCache (mount hints) |
 
 ### Warm sync efficiency
 
+<!-- BENCH-WARM:START -->
 | Tool | Requests | Bytes | Wall clock | How |
 |------|:---:|:---:|:---:|-----|
 | `ocync` | 81 | 371 KB | **2.5s** | Persistent cache skips blob I/O |
 | regsync | **27** | **27 KB** | 4s | Manifest digest comparison only |
 | dregsy | 200 | 163 KB | 5.2s | Re-HEADs all blobs |
 
-Measured 2026-03 on a 5-image Jupyter corpus to ECR, before source-pull deduplication.
+Measured 2026-03 on a 5-image Jupyter corpus to ECR, before source-pull deduplication. These numbers predate source-pull dedup; current ocync warm performance may be better.
+<!-- BENCH-WARM:END -->
 
 ## Why `ocync` is fast
 

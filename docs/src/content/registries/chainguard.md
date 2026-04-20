@@ -20,10 +20,16 @@ Chainguard does not impose rate limits on authenticated pulls.
 registries:
   chainguard:
     url: cgr.dev
+  ecr:
+    url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+
+defaults:
+  source: chainguard
+  targets: ecr
 
 mappings:
   - from: chainguard/nginx
-    to: ecr/nginx
+    to: nginx
   - from: chainguard/python
-    to: ecr/python
+    to: python
 ```

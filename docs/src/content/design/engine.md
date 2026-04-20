@@ -116,14 +116,15 @@ Actions are fine-grained, matching the actual API action granularity of each reg
 | Registry | Windows | Rationale |
 |---|---|---|
 | ECR | 9 (one per action) | Critical: `InitiateLayerUpload` (100 TPS) and `UploadLayerPart` (500 TPS) have a 5x rate disparity, so a 429 on session initiation must not throttle chunk uploads |
-| Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 100/hr pull limit). Other actions share one window |
-| GAR | 1 (all shared) | GAR uses a shared per-project quota across all operation types; capped at 5 |
-| ACR | 1 (all shared) | Similar shared quota model |
-| Unknown | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as a safe default |
+| Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 200-pull/6h quota). Other actions share one window |
+| GAR | 1 (all shared) | GAR uses a shared per-project quota across all operation types; initial window of 5, grows adaptively to `max_concurrent` |
+| ACR, GHCR, others | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as safe default for registries without documented per-action limits |
 
 The mapping function is ~20 lines. The window key is derived from HTTP method + URL pattern, which `ocync` already tracks in request labels.
 
 ### Budget circuit breaker
+
+> **Status: Planned.** The circuit breaker described below is designed but not yet implemented.
 
 Parse `ratelimit-remaining` from Docker Hub manifest responses (and `X-RateLimit-Remaining` from GHCR). Single decision point: if `remaining < 0.1 * planned_discovery_count`, log warning and pause discovery. Execution continues for already-discovered images. Resume when a subsequent response shows budget has refilled.
 
@@ -149,7 +150,7 @@ The greedy set-cover provably covers every shared blob. No "uncovered follower" 
 
 AWS launched opt-in `BLOB_MOUNTING` account setting in January 2026. Enable via `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`. Mount POST returns 201 when all conditions are met: BLOB_MOUNTING is ENABLED on the account, the source blob is referenced by a committed manifest (standalone blobs without manifests return 202), the `from` parameter specifies the source repo name, and both repos have identical encryption config (AES256 default works). Requirements: same account + region, identical encryption config, pusher needs `ecr:GetDownloadUrlForLayer` on source repo. Not supported for pull-through cache repos.
 
-`ProviderKind::fulfills_cross_repo_mount()` uses an exhaustive `match` so adding a new provider forces a compile-time decision. Currently all providers return `true` (mount is always attempted); the 202 fallback is cheap (~100ms) and successful mounts save entire blob uploads.
+Mount attempts are made unconditionally regardless of provider; the 202 fallback is cheap (~100ms) and successful mounts save entire blob uploads. `ProviderKind::fulfills_cross_repo_mount()` exists as a compile-time exhaustiveness guard (exhaustive `match` forces a decision when adding a new provider) but currently returns `true` for all variants and has zero callers.
 
 ### Measured impact
 
@@ -277,7 +278,7 @@ Cache persistence is the highest-priority action during shutdown (~50-100ms). Lo
 
 No DELETE requests are issued for abandoned upload sessions. All registries auto-expire them server-side (ECR: tied to 12h auth token, others: server GC). The OCI Distribution Spec says registries "SHOULD eventually timeout unfinished uploads."
 
-The existing `ShutdownSignal` infrastructure in `crates/ocync-sync/src/shutdown.rs` (`Arc<AtomicBool>` + `Arc<Notify>`) integrates directly with the pipeline's `select!` loop.
+The existing `ShutdownSignal` infrastructure in `crates/ocync-sync/src/shutdown.rs` (`Arc<AtomicBool>` + `Arc<tokio::sync::Notify>`) integrates directly with the pipeline's `select!` loop. `Arc` is used here (rather than `Rc`) because the shutdown signal must be `Send` for signal handler registration via `tokio::spawn`, which is distinct from the engine's `Rc<RefCell<>>` shared state.
 
 ## Key invariants
 
@@ -316,7 +317,7 @@ Optimizations can amplify each other's failure modes. This matrix captures non-o
 
 ### Multi-threaded tokio runtime
 
-Rejected. Workload is ~100% network I/O. SHA-256 per-chunk cost (~2.7ms for 4MB via aws-lc-rs at ~1.5 GB/s) is within tokio's 10ms cooperative scheduling budget. `spawn_blocking` handles cache deserialization. Multi-threaded would require `Arc<RwLock<>>` everywhere, introducing lock contention, write starvation risk, and `Send` bound infection, all for a workload that does not benefit from parallelism. If layer recompression (gzip -> zstd) ships, switching is a mechanical refactor: `Rc` -> `Arc`, `RefCell` -> `RwLock`, add `Send` bounds. This is a 1-day change, not a decision that needs to be made now.
+Rejected. Workload is ~100% network I/O. SHA-256 per-chunk cost (~2.7ms for 4MB via aws-lc-rs at ~1.5 GB/s) is within tokio's 10ms cooperative scheduling budget. `spawn_blocking` handles cache deserialization. Multi-threaded would require `Arc<RwLock<>>` everywhere, introducing lock contention, write starvation risk, and `Send` bound infection, all for a workload that does not benefit from parallelism. If layer recompression (gzip -> zstd) ships, switching is a mechanical refactor: `Rc` -> `Arc`, `RefCell` -> `RwLock`, add `Send` bounds.
 
 ### Bounded channel between discovery and execution
 

@@ -111,6 +111,20 @@ ocync analyze -c config.yaml --json
 
 Use `analyze` to estimate transfer savings before running a full sync, or to verify that blob deduplication and mounting are configured correctly.
 
+## validate
+
+Validate a config file without connecting to registries:
+
+```bash
+ocync validate config.yaml
+```
+
+| Argument | Description |
+|---|---|
+| `<config>` | Path to the config file to validate (required) |
+
+Checks config syntax, structure, and references (registry names, target groups) without making any network requests. Catches errors before attempting a sync. Exits with code `0` on success or `3` on invalid configuration.
+
 ## expand
 
 Show config with all environment variables resolved:

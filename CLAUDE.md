@@ -1,6 +1,6 @@
 # ocync
 
-OCI registry sync tool. Rust workspace with 3 crates: `ocync` (CLI binary), `ocync-distribution` (OCI registry client), `ocync-sync` (sync engine).
+OCI registry sync tool. Rust workspace with 3 core crates: `ocync` (CLI binary), `ocync-distribution` (OCI registry client), `ocync-sync` (sync engine). The workspace also includes `bench/proxy` (benchmark MITM proxy) and `xtask` (build/bench automation).
 
 ## Crate-specific guidance
 

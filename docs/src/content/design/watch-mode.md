@@ -117,7 +117,7 @@ Rejected due to etcd's 1 MiB size limit, write pressure on etcd, and race condit
 
 Between the source HEAD (returning digest A) and target HEADs, the source could update to digest B. The engine sees source=A, targets=A, and skips, missing the update. This is a missed optimization, not a correctness bug: the target has valid content (A), just not the latest (B). The next cycle detects the change because the source HEAD returns B while the cache has A. This window is inherent to any polling system.
 
-A subtler variant exists: if the source updates A->B->A within a single poll interval, the cache could store a stale filtered_digest from the B-era pull. This requires two tag pushes reverting to the exact prior image within seconds, which is vanishingly rare in practice and self-correcting on the next source change.
+A subtler variant exists: if the source updates A->B->A within a single poll interval, the cache could store a stale filtered_digest from the B-era pull. This requires two tag pushes reverting to the exact prior image within seconds, which is uncommon in practice (though CI rollback scenarios could trigger it). It self-corrects on the next cycle where the source changes again.
 
 ### Broken Docker-Content-Digest headers
 
@@ -184,7 +184,7 @@ For CronJob + PVC deployments, the pod mounts a ReadWriteOnce PVC and the cache 
 
 ### Cache format versioning
 
-The tag digest cache extends the existing transfer state cache format. The cache version will increment from v1 to v2 when the source snapshot map is added, with the new source snapshot map appended after the existing blob dedup map. Reads accept both v1 and v2: a v1 cache loads with an empty snapshot map, preserving blob dedup data across the version transition. An older binary encountering a v2 cache falls back to empty cache, which is the existing behavior for version mismatches. The same TTL and atomic write (tmp + rename + fsync) apply to both sections.
+The tag digest cache extends the existing [transfer state cache](./engine#transfer-state-cache) format. The cache version will increment from v1 to v2 when the source snapshot map is added, with the new source snapshot map appended after the existing blob dedup map. Reads accept both v1 and v2: a v1 cache loads with an empty snapshot map, preserving blob dedup data across the version transition. An older binary encountering a v2 cache falls back to empty cache, which is the existing behavior for version mismatches. The same TTL and atomic write (tmp + rename + fsync) apply to both sections.
 
 ### Observability
 

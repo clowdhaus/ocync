@@ -48,24 +48,30 @@ aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED
 
 ECR has per-action rate limits. `ocync` tracks 9 independent [AIMD](../../design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency windows, using the same algorithm TCP uses for congestion control:
 
-- Manifest GET/PUT/HEAD
-- Blob GET/HEAD/POST/PUT/PATCH
-- Tag list
+- `ManifestHead`, `ManifestRead`, `ManifestWrite`
+- `BlobHead`, `BlobRead`, `BlobUploadInit`, `BlobUploadChunk`, `BlobUploadComplete`
+- `TagList`
 
-Each window adapts independently, so a 429 on blob uploads does not throttle manifest reads.
+Each window adapts independently, so a 429 on blob uploads does not throttle manifest reads. Windows start at 5 concurrent requests and grow adaptively up to `max_concurrent` (default 50).
 
 ## ECR Public
 
-ECR Public (`public.ecr.aws`) is detected separately via `ProviderKind::EcrPublic`. Anonymous pulls work, but authenticated pulls via IAM get higher rate limits. The `docker-credential-ecr-login` helper supports public ECR -- it calls `ecr-public:GetAuthorizationToken` + `sts:GetServiceBearerToken`. The managed policy `AmazonElasticContainerRegistryPublicReadOnly` grants these permissions.
+ECR Public (`public.ecr.aws`) is detected separately via `ProviderKind::EcrPublic`. Anonymous pulls work but have lower rate limits. For authenticated access, configure credentials via your Docker config file (e.g., using `docker-credential-ecr-login`) or provide a static token. `ocync` uses the standard OCI token exchange flow for ECR Public, not the IAM-based Basic auth used by ECR private.
 
 ## Example config
 
 ```yaml
 registries:
+  chainguard:
+    url: cgr.dev
   ecr:
     url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
 
+defaults:
+  source: chainguard
+  targets: ecr
+
 mappings:
-  - from: source/nginx
-    to: ecr/nginx
+  - from: chainguard/nginx
+    to: nginx
 ```

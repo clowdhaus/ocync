@@ -23,7 +23,7 @@ When these conflict, the higher-priority axis wins. A mount that saves bytes but
 
 `ocync` runs on a single-threaded tokio runtime (`current_thread`). The workload is ~100% network I/O - hundreds of concurrent futures spend >99% of wall-clock time awaiting HTTP responses from registries. A single OS thread handles all of them without context-switch overhead, lock contention, or `Send`/`Sync` bound infection.
 
-Shared mutable state uses `Rc<RefCell<>>` instead of `Arc<Mutex<>>` -- zero synchronization overhead, static prevention of threading bugs (`Rc` is `!Send`, rejecting accidental `tokio::spawn`), and direct Kubernetes resource alignment (`cpu: 100m` maps exactly to one thread). The one CPU-bound operation (SHA-256 at ~1.5 GB/s via aws-lc-rs) stays within tokio's cooperative scheduling budget. If layer recompression ships, the migration to multi-threaded is mechanical (`Rc` to `Arc`, `RefCell` to `RwLock`, add `Send` bounds).
+Engine-level shared mutable state uses `Rc<RefCell<>>` instead of `Arc<Mutex<>>` -- zero synchronization overhead, static prevention of threading bugs (`Rc` is `!Send`, rejecting accidental `tokio::spawn`), and direct Kubernetes resource alignment (`cpu: 100m` maps exactly to one thread). The distribution layer's AIMD controller uses `std::sync::Mutex` because it must be `Sync` inside `Arc<RegistryClient>`; the lock is never held across `.await` points, so contention is impossible on `current_thread`. The one CPU-bound operation (SHA-256 at ~1.5 GB/s via aws-lc-rs) stays within tokio's cooperative scheduling budget. If layer recompression ships, the migration to multi-threaded is mechanical (`Rc` to `Arc`, `RefCell` to `RwLock`, add `Send` bounds).
 
 ## Pipeline architecture
 
@@ -122,7 +122,7 @@ For single-target mappings, bytes stream directly from source to target with no 
 |---|---|---|---|
 | ECR (private) | Yes (opt-in, same account/region) | Yes (BatchCheck, BatchGet, ListImages) | Per-action TPS (10-3000) |
 | ECR Public | No | Partial (BatchCheck only) | Separate from private |
-| Docker Hub | Yes (implicit global dedup) | No | 100/hr authed manifest GETs; HEADs free |
+| Docker Hub | Yes (implicit global dedup) | No | 200-pull/6h authed manifest GETs; HEADs free |
 | GAR | No | No | Per-project shared quota |
 | GHCR | Yes (implicit global dedup) | No | GitHub API rate limit |
 | ACR | Yes | No | Per-registry |
@@ -130,7 +130,7 @@ For single-target mappings, bytes stream directly from source to target with no 
 
 ### Docker Hub rate limits
 
-Docker Hub tightened limits in April 2025: 10 pulls/hour anonymous, 100/hour authenticated free, unlimited for paid tiers. Only manifest GETs count; blob GETs are free (CDN-served) and manifest HEADs are free (subject to a separate abuse limit). Authentication is mandatory for any serious sync workload.
+Docker Hub tightened limits in April 2025: 10 pulls/hour anonymous, 200 pulls/6 hours authenticated free, unlimited for paid tiers. Only manifest GETs count; blob GETs are free (CDN-served) and manifest HEADs are free (subject to a separate abuse limit). Authentication is mandatory for any serious sync workload.
 
 ### ECR rate limits
 
@@ -140,7 +140,7 @@ The 50:1 ratio between `UploadLayerPart` (500 TPS) and `PutImage` (10 TPS) means
 
 See [Performance](../performance) for the full benchmark table. Summary (39 images, 51 tags, cold sync to ECR on c6in.4xlarge):
 
-- **3.6-4.5x faster** wall clock than comparable tools
+- **4x faster** wall clock than comparable tools
 - **25-38% fewer API requests** through global blob dedup and mount-first strategy
 - **Cross-repo blob mounting** avoids re-pulling shared layers from source (95.6% mount success rate)
 - **Zero duplicate blob GETs** (source-pull dedup via staging)
@@ -182,9 +182,9 @@ At startup, `install_crypto_provider()` registers `aws-lc-rs` as the process-wid
 
 macOS and Windows builds use `--no-default-features --features non-fips` (standard aws-lc-rs without FIPS mode) since FIPS certification is only relevant for Linux server deployments.
 
-> **Status: Planned.** The features in this section are designed but not yet implemented.
-
 ## OCI artifacts and referrers
+
+> **Status: Partially implemented.** The referrers API client (`RegistryClient::referrers()`) and OCI `subject` field types exist in the distribution crate. The artifact sync orchestration (discovery, transfer ordering, `require_artifacts`, and configuration) described below is planned.
 
 OCI 1.1 introduced the referrers API for attaching artifacts (signatures, SBOMs, attestations) to container images. Each artifact manifest includes a `subject` field referencing the parent image digest. This creates a discoverable graph of metadata without polluting the tag namespace.
 
@@ -245,6 +245,8 @@ This two-step fallback ensures artifact sync works across the widest range of re
 
 ## Manifest format preservation
 
+> **Status: Planned.** Manifest format configuration (`manifest_format` per-registry override, format conversion) is designed but not yet implemented. The engine currently preserves manifest bytes verbatim (the `preserve` default behavior).
+
 ### Problem
 
 Pushing a Docker v2 Schema 2 manifest to a registry expecting OCI format (or vice versa) changes the digest. The manifest bytes are different, so the SHA-256 is different, so the content-addressable identity of the image changes. Some registries reject manifests with unexpected media types entirely. Existing tools handle this poorly: digests change silently or copies fail with opaque errors.
@@ -301,7 +303,7 @@ If a requested platform is not available in the source image index, `ocync` logs
 
 If **zero** requested platforms match any manifest in the source index, `ocync` returns an error with actionable context: the configured platform filter, the platforms actually available in the source index, and the source reference. An empty filtered index is never pushed to targets because it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading into an unusable state.
 
-> **Status: Planned.** The `immutable_tags` optimization described below is designed but not yet implemented. `skip_existing` and default HEAD + digest compare are implemented.
+> **Status: Partially implemented.** `skip_existing` and default HEAD + digest compare are implemented. The `immutable_tags` optimization described below is designed but not yet implemented.
 
 ## Skip optimization hierarchy
 
@@ -351,21 +353,17 @@ These are explicit non-goals, listed with rationale for each.
 - **No image building.** `ocync` syncs existing images. Building is a separate concern with separate tooling.
 - **No signature verification.** `ocync` transfers signatures faithfully but does NOT verify them. Verification is the consumer's responsibility. A sync tool that verifies signatures would need to manage trust roots, which is out of scope.
 - **No Docker daemon integration.** Pure OCI Distribution API only. The Docker daemon is a local concern; registry sync is a remote-to-remote operation.
-- **No skopeo dependency.** Everything is native Rust over HTTPS. No subprocess calls, no shell-out, no binary dependency to version-match.
+- **No external tool dependencies.** Everything is native Rust over HTTPS. No subprocess calls, no shell-out, no binary dependency to version-match.
 - **No local disk buffering.** Blobs stream source to target without touching disk (single-target mode). Multi-target mode uses content-addressable staging, but single-target deployments pay zero disk I/O.
 - **No date sort.** Date-based sorting requires O(n) manifest + config fetches to retrieve creation timestamps, which is prohibitively expensive for large tag sets. A repository with 2,000 tags would need 2,000 additional API calls just to sort. Use `alpha` for date-stamped tags (YYYYMMDD sorts correctly in lexicographic order).
-- **No OTLP export (v1).** Prometheus metrics are the priority. OTLP is deferred to a future version.
+- **No OTLP or Prometheus export (v1).** Structured JSON output is the v1 observability surface. OTLP and Prometheus export are not planned for v1.
 - **No per-mapping schedules in watch mode.** One global interval for simplicity and predictability. Per-mapping schedules create complex interactions (overlapping syncs to the same target, uneven resource usage) for marginal benefit.
 
 ## Output philosophy
 
 **Silence means success.** Output means action was taken or something went wrong. Anything expected and successful is silent.
 
-Existing tools get this catastrophically wrong:
-
-- **skopeo** dumps walls of "existing blob" messages. Every blob that already exists at the target produces a line of output. A sync of 50 images where 47 are unchanged produces hundreds of lines that communicate nothing actionable.
-- **`regsync`** floods with repeated status noise, emitting progress updates for every operation regardless of whether the operator needs to act on them.
-- **`dregsy`** swallows errors while being verbose about everything else. The one category of output that demands attention is the one it suppresses.
+Existing tools get this catastrophically wrong: some dump walls of "existing blob" messages for every blob that already exists at the target, producing hundreds of lines that communicate nothing actionable. Others flood with repeated status noise regardless of whether the operator needs to act. Others swallow errors while being verbose about everything else -- the one category of output that demands attention is the one they suppress.
 
 A successful `ocync` sync of 50 images where 47 are unchanged produces the summary only, not 500 lines of noise:
 

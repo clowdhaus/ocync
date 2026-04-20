@@ -11,7 +11,7 @@ Standalone client for the [OCI Distribution Spec](https://github.com/opencontain
 ## Key features
 
 - Registry client with automatic provider detection (ECR, Docker Hub, GHCR, GAR, ACR, Chainguard, anonymous)
-- Streaming blob pull and push (zero intermediate buffering)
+- Streaming blob pull and push (provider-dependent fallback to buffered upload for GHCR/GAR)
 - Cross-repo blob mounting
 - Manifest pull, push, HEAD with OCI and Docker v2 content negotiation
 - Tag listing with automatic pagination
@@ -46,8 +46,9 @@ let client = RegistryClient::builder(
     .build()
     .unwrap();
 
+let repo = ocync_distribution::spec::RepositoryName::new("library/nginx");
 let manifest = client
-    .pull_manifest("library/nginx", "latest")
+    .manifest_pull(&repo, "latest")
     .await
     .unwrap();
 

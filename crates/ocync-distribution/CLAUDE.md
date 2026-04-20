@@ -20,13 +20,14 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 - Per-(registry, action) AIMD windows, not per-host.
 - ECR: 9 independent windows (each API action has different TPS limits).
 - Docker Hub: HEAD unmetered, manifest-read separate, others shared.
-- GAR/ACR: all actions share a single key.
-- TCP Reno congestion epochs: 100ms epoch prevents cascade collapse from burst 429s.
+- GAR: all actions share a single key (per-project quota).
+- ACR (and other unknown registries): coarse grouping with 5 distinct windows (heads, reads, uploads, manifest-write, tag-list).
+- AIMD congestion epochs: 100ms epoch prevents cascade collapse from burst 429s.
 
 ## Upload protocol quirks
 
 - Default: POST + streaming PUT with `Transfer-Encoding: chunked` (2 requests/blob).
-- GHCR: multi-PATCH chunked broken (last PATCH overwrites previous). Client falls back to single PATCH + PUT.
+- GHCR: multi-PATCH chunked broken (last PATCH overwrites previous). Client falls back to POST + single PATCH + PUT (3 requests/blob).
 - GAR: no chunked uploads. Client buffers full blob, monolithic PUT.
 - ACR: known ~20 MB streaming PUT body limit. Chunked PATCH fallback not yet implemented.
 

@@ -4,6 +4,8 @@ description: Layered benchmark plan covering protocol, throughput, and cross-too
 order: 4
 ---
 
+> This document describes both current benchmark infrastructure (Layer 2 harness in `xtask/src/bench/`, bench-proxy, Terraform-managed EC2 instances) and planned enhancements (Layer 1 protocol tests, Layer 3 cross-tool comparison, `/proc/net/dev` measurement, `pidstat` capture). Planned items are marked inline.
+
 ## Context
 
 The v1 benchmark was built to answer "is `ocync` faster than `dregsy`/`regsync` on real
@@ -81,10 +83,10 @@ scenario, one question, one headline number per run.
 **Measurement primitives:**
 
 - Wall clock: `std::time::Instant` around the `ocync` invocation.
-- Egress bytes: diff of `/proc/net/dev` `ens5` tx_bytes before and
+- Egress bytes (**planned**): diff of `/proc/net/dev` `ens5` tx_bytes before and
   after the run. Captures actual network effort, immune to
   implementation-level request counting.
-- CPU and memory: `pidstat -u -r -p <ocync pid> 1` streamed to a file;
+- CPU and memory (**planned**): `pidstat -u -r -p <ocync pid> 1` streamed to a file;
   post-processed for p50/p95/max of each.
 - Per-image completion timestamps: parsed from `ocync`'s `--json` stdout.
 - API-level counts (request method histogram, HTTP status distribution,
@@ -93,12 +95,12 @@ scenario, one question, one headline number per run.
 
 **Scenarios** (designed to isolate one question each):
 
-- `cold-throughput`: fresh ECR target, first-time sync of a
+- `cold`: fresh ECR target, first-time sync of a
   representative corpus. Measures "how fast can `ocync` actually push
   bytes?"
-- `warm-dedup`: re-sync of an already-synced corpus. Measures "how
+- `warm`: re-sync of an already-synced corpus. Measures "how
   cheap is the no-op path?"
-- `incremental`: re-sync after ~5% of tags changed at source.
+- `partial`: re-sync after ~5% of tags changed at source.
   Measures "does `ocync` reliably skip unchanged blobs while pushing
   changes?"
 - `scale`: cold throughput across corpus sizes (10, 25, 50, full).
@@ -131,7 +133,7 @@ to be split.
 **Question it answers:** positioning. "For users considering `dregsy`
 or `regsync`, what tradeoff are they making?"
 
-**Where it lives:** `bench/competitors/`, a separate directory with
+**Where it lives:** `bench/competitors/` (planned; directory does not exist yet), a separate directory with
 its own docs, harness, and runbook. Not part of `xtask bench`. Not
 part of CI. Runs are manually initiated.
 

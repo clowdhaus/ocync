@@ -41,10 +41,16 @@ registries:
     credentials:
       username: ${DOCKER_USERNAME}
       password: ${DOCKER_PASSWORD}
+  ecr:
+    url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+
+defaults:
+  source: dockerhub
+  targets: ecr
 
 mappings:
-  - from: dockerhub/library/nginx
-    to: ecr/nginx
+  - from: library/nginx
+    to: nginx
 ```
 
 For Docker config file auth (no explicit credentials needed):
@@ -52,6 +58,8 @@ For Docker config file auth (no explicit credentials needed):
 ```yaml
 registries:
   dockerhub:
-    url: registry-1.docker.io
+    url: docker.io
     auth_type: docker_config
 ```
+
+`ocync` recognizes `docker.io`, `index.docker.io`, and `registry-1.docker.io` as Docker Hub hostnames. Use `docker.io` for new configs.

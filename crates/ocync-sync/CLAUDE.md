@@ -6,6 +6,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 
 - Single-threaded tokio (`current_thread`). Workload is ~100% network I/O.
 - All shared state uses `Rc<RefCell<>>`, never `Arc<Mutex<>>`.
+- Exception: `RegistryClient` is wrapped in `Arc` (not `Rc`) because the underlying HTTP client and AIMD controller must be `Send`/`Sync`. The `AimdController` uses `std::sync::Mutex` internally for the same reason. This is intentional -- the client is a leaf dependency that does not participate in the engine's shared mutable state.
 - `RefCell` borrows MUST be dropped before any `.await` point.
 - The `!Send` constraint of `Rc<RefCell<>>` is a feature: prevents accidental `tokio::spawn`.
 - Intra-image blob concurrency: `FuturesUnordered` + local `Semaphore(6)`.
@@ -23,7 +24,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 - Greedy set-cover election in `elect_leaders()` provably covers every shared blob.
 - No "uncovered follower" path exists - all followers' shared blobs are in the leader union.
 - Do NOT add wave partitioning among followers (dead code).
-- Wave 1: blobs covered by leaders. Wave 2: inter-follower deps wait for wave 1 commit.
+- Waves: Wave 1 transfers blobs covered by leaders (the repos elected to pull-and-push shared blobs). Wave 2 handles inter-follower dependencies that wait for wave 1 manifests to commit before mounting.
 
 ## Notify contracts (critical)
 

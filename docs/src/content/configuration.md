@@ -16,12 +16,14 @@ registries:
     url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
 
 defaults:
+  source: source
+  targets: target
   tags:
     glob: "*"
 
 mappings:
-  - from: source/chainguard/nginx
-    to: target/nginx
+  - from: chainguard/nginx
+    to: nginx
 ```
 
 ## Full example
@@ -186,6 +188,7 @@ mappings:
     skip_existing: true        # Override skip_existing
     tags:                      # Override tag filters
       glob: "1.*"
+      sort: semver             # Sort order: semver, alpha
       latest: 5
     platforms:                 # Override platform filter
       - linux/amd64
@@ -193,8 +196,8 @@ mappings:
 
 | Field | Required | Description |
 |---|---|---|
-| `from` | Yes | Source repository path (e.g., `chainguard/nginx`). Prefix with registry name and `/` to override the default source |
-| `to` | No | Target repository name. When omitted, uses the last path segment of `from` |
+| `from` | Yes | Source repository path (e.g., `chainguard/nginx`) |
+| `to` | No | Target repository name. When omitted, uses the full `from` path |
 | `source` | No | Override source registry for this mapping |
 | `targets` | No | Override target group or inline list for this mapping |
 | `skip_existing` | No | Override `defaults.skip_existing` for this mapping |
@@ -288,6 +291,7 @@ Mirror Docker Hub images to multiple ECR regions with authenticated pulls and de
 registries:
   dockerhub:
     url: docker.io
+    auth_type: basic
     credentials:
       username: ${DOCKERHUB_USERNAME}
       password: ${DOCKERHUB_ACCESS_TOKEN}
@@ -325,6 +329,7 @@ mappings:
     to: postgres
     tags:
       semver: ">=15"
+      sort: semver
       latest: 3
 ```
 
@@ -336,13 +341,16 @@ Sync specific tagged releases from GitHub Container Registry:
 registries:
   ghcr:
     url: ghcr.io
+    auth_type: static_token
     token: ${GITHUB_TOKEN}
   ecr:
     url: ${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com
 
 mappings:
-  - from: ghcr/my-org/my-app
-    to: ecr/my-app
+  - from: my-org/my-app
+    to: my-app
+    source: ghcr
+    targets: ecr
     tags:
       glob: "v*"
       exclude: "*-alpha"
@@ -399,9 +407,15 @@ registries:
   target:
     url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
 
+defaults:
+  source: source
+  targets: target
+  tags:
+    glob: "*"
+
 mappings:
-  - from: source/chainguard/nginx
-    to: target/nginx
+  - from: chainguard/nginx
+    to: nginx
 ```
 
 This works with any editor that supports the [YAML Language Server](https://github.com/redhat-developer/yaml-language-server) (VS Code with the YAML extension, Neovim with `yaml-language-server`, JetBrains IDEs).

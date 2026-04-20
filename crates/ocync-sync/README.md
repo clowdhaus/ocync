@@ -34,13 +34,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ocync_sync::engine::{ResolvedMapping, SyncEngine};
+use ocync_sync::cache::TransferStateCache;
+use ocync_sync::staging::BlobStage;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::SyncReport;
 
 let engine = SyncEngine::new(RetryConfig::default(), 50);
 
-let mappings: Vec<ResolvedMapping> = vec![/* ... */];
-let cache = Rc::new(RefCell::new(cache));
+let mappings: Vec<ResolvedMapping> = vec![/* ... resolved from config ... */];
+let cache = Rc::new(RefCell::new(TransferStateCache::new()));
+let staging = BlobStage::disabled(); // single-target; use BlobStage::new(path) for multi-target
+let progress = /* impl ProgressReporter */;
 let report: SyncReport = engine
     .run(mappings, cache, staging, &progress, None)
     .await;
