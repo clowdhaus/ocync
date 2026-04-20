@@ -30,6 +30,9 @@ None. All functionality is always enabled.
 ## Example
 
 ```rust
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use ocync_sync::engine::{ResolvedMapping, SyncEngine};
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::SyncReport;
@@ -37,6 +40,7 @@ use ocync_sync::SyncReport;
 let engine = SyncEngine::new(RetryConfig::default(), 50);
 
 let mappings: Vec<ResolvedMapping> = vec![/* ... */];
+let cache = Rc::new(RefCell::new(cache));
 let report: SyncReport = engine
     .run(mappings, cache, staging, &progress, None)
     .await;

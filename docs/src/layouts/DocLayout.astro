@@ -21,8 +21,8 @@ const navSections = {
       { href: `${base}getting-started`, label: "Getting started" },
       { href: `${base}configuration`, label: "Configuration" },
       { href: `${base}cli-reference`, label: "CLI reference" },
-      { href: `${base}helm`, label: "Helm chart" },
       { href: `${base}performance`, label: "Performance" },
+      { href: `${base}helm`, label: "Helm chart" },
       { href: `${base}observability`, label: "Observability" },
       { href: `${base}fips`, label: "FIPS 140-3" },
     ],
@@ -58,11 +58,10 @@ const activeSection = (Object.keys(navSections) as SectionKey[]).find((key) =>
 );
 const sidebarLinks = activeSection ? navSections[activeSection].links : [];
 
-// Flatten all links for prev/next navigation
-const allLinks = Object.values(navSections).flatMap((s) => s.links);
-const currentIndex = allLinks.findIndex((link) => currentPath === link.href);
-const prevPage = currentIndex > 0 ? allLinks[currentIndex - 1] : null;
-const nextPage = currentIndex < allLinks.length - 1 ? allLinks[currentIndex + 1] : null;
+// Prev/next navigation scoped to current section (no cross-section jumps)
+const currentIndex = sidebarLinks.findIndex((link) => currentPath === link.href);
+const prevPage = currentIndex > 0 ? sidebarLinks[currentIndex - 1] : null;
+const nextPage = currentIndex < sidebarLinks.length - 1 ? sidebarLinks[currentIndex + 1] : null;
 
 // Table of contents from headings (h2 and h3)
 const tocItems = headings.filter((h) => h.depth === 2 || h.depth === 3);

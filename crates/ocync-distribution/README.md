@@ -33,8 +33,12 @@ Standalone client for the [OCI Distribution Spec](https://github.com/opencontain
 ## Example
 
 ```rust
-use ocync_distribution::RegistryClient;
+use ocync_distribution::{RegistryClient, install_crypto_provider};
 use url::Url;
+
+// Required before any TLS connection -- registers aws-lc-rs as the
+// process-wide rustls crypto provider.
+install_crypto_provider();
 
 let client = RegistryClient::builder(
         Url::parse("https://registry-1.docker.io").unwrap(),
