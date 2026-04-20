@@ -303,7 +303,7 @@ If a requested platform is not available in the source image index, `ocync` logs
 
 If **zero** requested platforms match any manifest in the source index, `ocync` returns an error with actionable context: the configured platform filter, the platforms actually available in the source index, and the source reference. An empty filtered index is never pushed to targets because it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading into an unusable state.
 
-> **Status: Partially implemented.** Default HEAD + digest compare is implemented. The `immutable_tags` optimization described below is designed but not yet implemented.
+> **Status: Implemented.** Both tiers are implemented: `immutable_tags` pattern match (Tier 1, zero API calls) and default HEAD + digest compare (Tier 2).
 
 ## Skip optimization hierarchy
 

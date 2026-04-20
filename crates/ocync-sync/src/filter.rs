@@ -113,7 +113,7 @@ impl FilterConfig {
 // ---------------------------------------------------------------------------
 
 /// Build a [`GlobSet`] from patterns, returning an error on invalid patterns.
-fn build_glob_set(patterns: &[String]) -> Result<GlobSet, Error> {
+pub fn build_glob_set(patterns: &[String]) -> Result<GlobSet, Error> {
     let mut builder = GlobSetBuilder::new();
     for p in patterns {
         let g = Glob::new(p).map_err(|e| Error::InvalidGlob {
@@ -677,5 +677,31 @@ mod tests {
                 minimum: 2
             }
         ));
+    }
+
+    // - build_glob_set tests -------------------------------------------------
+
+    #[test]
+    fn glob_set_semver_with_v_prefix() {
+        let gs = build_glob_set(&["v[0-9]*.[0-9]*.[0-9]*".into()]).unwrap();
+        assert!(gs.is_match("v1.2.3"));
+        assert!(gs.is_match("v10.20.30"));
+        assert!(!gs.is_match("latest"));
+        assert!(!gs.is_match("nightly"));
+    }
+
+    #[test]
+    fn glob_set_bare_semver() {
+        let gs = build_glob_set(&["[0-9]*.[0-9]*.[0-9]*".into()]).unwrap();
+        assert!(gs.is_match("1.2.3"));
+        assert!(gs.is_match("10.0.0"));
+        assert!(!gs.is_match("v1.2.3"));
+        assert!(!gs.is_match("latest"));
+    }
+
+    #[test]
+    fn glob_set_invalid_pattern() {
+        let err = build_glob_set(&["[bad".into()]).unwrap_err();
+        assert!(matches!(err, Error::InvalidGlob { .. }));
     }
 }
