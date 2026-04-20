@@ -135,9 +135,9 @@ pub(crate) struct InstanceInfo {
     pub(crate) instance_type: String,
     /// CPU architecture (e.g. `aarch64`, `x86_64`).
     pub(crate) arch: String,
-    /// CPU manufacturer and model from EC2 `DescribeInstanceTypes`
-    /// (e.g. `AWS Graviton3`, `Intel Xeon Platinum 8488C`).
-    pub(crate) cpu_model: String,
+    /// CPU manufacturer from EC2 `DescribeInstanceTypes`
+    /// (e.g. `AWS`, `Intel`).
+    pub(crate) cpu_manufacturer: String,
     /// Number of default vCPUs for this instance type.
     pub(crate) vcpus: usize,
     /// Total memory in MiB (from `DescribeInstanceTypes`).
@@ -159,7 +159,7 @@ impl InstanceInfo {
         let region = read_imds("placement/region").unwrap_or_else(|| "unknown".into());
 
         // Query DescribeInstanceTypes for authoritative hardware specs.
-        let (arch, cpu_model, vcpus, memory_mib, network_performance) =
+        let (arch, cpu_manufacturer, vcpus, memory_mib, network_performance) =
             if instance_type != "unknown" {
                 match describe_instance_type(&instance_type) {
                     Some(info) => info,
@@ -183,10 +183,10 @@ impl InstanceInfo {
             } else {
                 arch
             },
-            cpu_model: if cpu_model.is_empty() {
+            cpu_manufacturer: if cpu_manufacturer.is_empty() {
                 "unknown".into()
             } else {
-                cpu_model
+                cpu_manufacturer
             },
             vcpus,
             memory_mib,
@@ -205,7 +205,7 @@ impl InstanceInfo {
 /// Uses the AWS CLI (guaranteed on the bench instance) rather than
 /// `aws-sdk-ec2` which compiles every EC2 API and adds ~220 crates.
 ///
-/// Returns `(arch, cpu_model, vcpus, memory_mib, network_performance)`.
+/// Returns `(arch, cpu_manufacturer, vcpus, memory_mib, network_performance)`.
 fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize, u64, String)> {
     let output = std::process::Command::new("aws")
         .args([
@@ -227,12 +227,18 @@ fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize,
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
 
     let arch = json["Arch"].as_str().unwrap_or_default().to_string();
-    let cpu_model = json["Cpu"].as_str().unwrap_or_default().to_string();
+    let cpu_manufacturer = json["Cpu"].as_str().unwrap_or_default().to_string();
     let vcpus = json["Vcpus"].as_u64().unwrap_or(0) as usize;
     let memory_mib = json["Mem"].as_u64().unwrap_or(0);
     let network_performance = json["Net"].as_str().unwrap_or_default().to_string();
 
-    Some((arch, cpu_model, vcpus, memory_mib, network_performance))
+    Some((
+        arch,
+        cpu_manufacturer,
+        vcpus,
+        memory_mib,
+        network_performance,
+    ))
 }
 
 /// Read a value from the EC2 Instance Metadata Service (`IMDSv2`).
@@ -343,7 +349,7 @@ fn summary_markdown(report: &BenchReport) -> String {
     out.push_str(&format!("- **Type**: {}\n", inst.instance_type));
     out.push_str(&format!(
         "- **CPU**: {} ({}, {} vCPUs)\n",
-        inst.cpu_model, inst.arch, inst.vcpus
+        inst.cpu_manufacturer, inst.arch, inst.vcpus
     ));
     if inst.memory_mib > 0 {
         let gb = inst.memory_mib as f64 / 1024.0;
@@ -772,7 +778,7 @@ mod tests {
         InstanceInfo {
             instance_type: "c7g.xlarge".into(),
             arch: "arm64".into(),
-            cpu_model: "AWS".into(),
+            cpu_manufacturer: "AWS".into(),
             vcpus: 4,
             memory_mib: 8192,
             network_performance: "Up to 12.5 Gigabit".into(),

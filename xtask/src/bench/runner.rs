@@ -57,13 +57,25 @@ pub(crate) struct RunResult {
     pub(crate) peak_rss_kb: Option<u64>,
 }
 
-/// Runs a tool with `version` and returns a single-line version string.
+/// Returns the version argument(s) for a given tool.
+///
+/// `dregsy` uses `--version` (Go flag convention); `regsync` and `ocync`
+/// use the `version` subcommand.
+fn version_args(tool: Tool) -> &'static [&'static str] {
+    match tool {
+        Tool::Dregsy => &["--version"],
+        Tool::Regsync | Tool::Ocync => &["version"],
+    }
+}
+
+/// Runs a tool with its version flag and returns a single-line version string.
 pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
+    let args = version_args(tool);
     let output = tokio::process::Command::new(tool.binary())
-        .arg("version")
+        .args(args)
         .output()
         .await
-        .map_err(|e| format!("failed to run {} version: {}", tool.binary(), e))?;
+        .map_err(|e| format!("failed to run {} {:?}: {}", tool.binary(), args, e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -114,7 +126,7 @@ pub(crate) async fn build_ocync(workspace_root: &Path) -> Result<(), String> {
 /// Spawns a benchmark tool with timing and output capture.
 ///
 /// Sets `HTTPS_PROXY` to `proxy_url` so all HTTP traffic routes through the
-/// proxy. The mitmproxy CA must be installed in the system trust store
+/// proxy. The bench-proxy CA must be installed in the system trust store
 /// (via `update-ca-trust`) so that both rustls-native-certs (ocync) and
 /// OpenSSL (dregsy/regsync via Go) trust the MITM'd connections.
 ///
@@ -294,6 +306,13 @@ mod tests {
             Tool::parse("unknown").unwrap_err(),
             "unknown tool: \"unknown\"; expected one of: ocync, dregsy, regsync"
         );
+    }
+
+    #[test]
+    fn version_args_per_tool() {
+        assert_eq!(version_args(Tool::Dregsy), &["--version"]);
+        assert_eq!(version_args(Tool::Regsync), &["version"]);
+        assert_eq!(version_args(Tool::Ocync), &["version"]);
     }
 
     #[test]

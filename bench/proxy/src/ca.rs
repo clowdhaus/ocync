@@ -37,6 +37,15 @@ pub(crate) enum Error {
         /// Human-readable parse failure reason.
         reason: String,
     },
+    /// SNI hostname could not be parsed as a valid DNS name for leaf
+    /// certificate generation.
+    #[error("invalid SNI hostname {host}: {reason}")]
+    InvalidSni {
+        /// The SNI value that failed parsing.
+        host: String,
+        /// Human-readable parse failure reason.
+        reason: String,
+    },
     /// rustls signer construction failed (unsupported key type).
     #[error("rustls signer: {0}")]
     Signer(String),
@@ -141,12 +150,11 @@ pub(crate) async fn load_ca(cert_path: &Path, key_path: &Path) -> Result<CaSigne
 fn generate_leaf(issuer: &Issuer<'static, KeyPair>, sni_host: &str) -> Result<CertifiedKey, Error> {
     let san = match Ia5String::try_from(sni_host.to_owned()) {
         Ok(s) => SanType::DnsName(s),
-        // Fall back to IP-address SAN if the hostname isn't a valid DNS
-        // IA5 string (e.g. an IP literal). Registries almost always hit
-        // this via DNS, but the fallback keeps the code robust.
+        // IP addresses are not supported as SANs; return an error.
+        // Registries always connect via DNS hostnames in practice.
         Err(_) => {
-            return Err(Error::Pem {
-                path: sni_host.to_owned(),
+            return Err(Error::InvalidSni {
+                host: sni_host.to_owned(),
                 reason: "SNI host is not a valid IA5 DNS name".into(),
             });
         }

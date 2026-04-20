@@ -107,7 +107,7 @@ pub(crate) async fn start(
 
     let log_path = log_path.to_path_buf();
 
-    let child = tokio::process::Command::new(binary)
+    let mut child = tokio::process::Command::new(binary)
         .args([
             "serve",
             "--ca",
@@ -125,6 +125,12 @@ pub(crate) async fn start(
     // Give the proxy time to bind the port before callers configure the proxy.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
+    // Verify the proxy is still running (catches immediate crashes from
+    // bad args, missing CA files, port conflicts, etc.).
+    if let Some(status) = child.try_wait()? {
+        return Err(format!("bench-proxy exited immediately with status: {status}").into());
+    }
+
     Ok(ProxyHandle {
         child,
         log_path,
@@ -132,13 +138,30 @@ pub(crate) async fn start(
     })
 }
 
-/// Kills the bench-proxy process, waits for it to exit, then parses and
-/// returns all log entries written during its lifetime.
+/// Sends SIGTERM for graceful shutdown, waits briefly, then falls back
+/// to SIGKILL. Parses and returns all log entries written during the
+/// proxy's lifetime.
 pub(crate) async fn stop(
     mut handle: ProxyHandle,
 ) -> Result<Vec<ProxyEntry>, Box<dyn std::error::Error>> {
-    handle.child.kill().await?;
-    handle.child.wait().await?;
+    // Send SIGTERM so the proxy can flush its log and exit cleanly.
+    if let Some(pid) = handle.child.id() {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        // Give the proxy time to flush logs and exit.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // If still running after SIGTERM, fall back to SIGKILL.
+    match handle.child.try_wait()? {
+        Some(_) => {} // Exited gracefully.
+        None => {
+            handle.child.kill().await?;
+            handle.child.wait().await?;
+        }
+    }
+
     parse_log(&handle.log_path)
 }
 
@@ -186,7 +209,9 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
         total_response_bytes += entry.response_bytes;
 
         if entry.method == "GET" && entry.url.contains("/blobs/sha256:") {
-            *blob_get_counts.entry(entry.url.clone()).or_insert(0) += 1;
+            *blob_get_counts
+                .entry(format!("{}:{}", entry.host, entry.url))
+                .or_insert(0) += 1;
             // Count logical source blob fetches (registry GETs, not CDN).
             if entry.host != target_registry {
                 source_blob_gets += 1;
