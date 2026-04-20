@@ -1,7 +1,7 @@
 //! The `sync` subcommand - runs all mappings from config.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use ocync_sync::engine::{
     DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedMapping, SyncEngine, TagPair,
     TargetEntry,
 };
-use ocync_sync::filter::FilterConfig;
+use ocync_sync::filter::{FilterConfig, build_immutable_glob};
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
@@ -312,8 +312,7 @@ pub(crate) async fn resolve_mapping(
             ))
         })?;
 
-    let known: std::collections::HashSet<&str> =
-        config.registries.keys().map(String::as_str).collect();
+    let known: HashSet<&str> = config.registries.keys().map(String::as_str).collect();
     let context = format!("mapping '{}'", mapping.from);
     let target_names =
         resolve_target_names(targets_value, config, &known, &context).map_err(CliError::Config)?;
@@ -383,6 +382,28 @@ pub(crate) async fn resolve_mapping(
         .map(|r| r.head_first)
         .unwrap_or(false);
 
+    // --- Immutable tags optimization ---
+    let immutable_pattern = tags_config.and_then(|t| t.immutable_tags.as_deref());
+    let (immutable_tags, target_tag_lists) = if let Some(pattern) = immutable_pattern {
+        let glob_set = build_immutable_glob(pattern)?;
+
+        let target_repo_path = RepositoryName::new(&target_repo)?;
+        let mut tag_lists = Vec::with_capacity(targets.len());
+        for entry in &targets {
+            let tags: HashSet<String> = entry
+                .client
+                .list_tags(&target_repo_path)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            tag_lists.push(tags);
+        }
+        (Some(glob_set), tag_lists)
+    } else {
+        (None, Vec::new())
+    };
+
     Ok(Some(ResolvedMapping {
         source_authority,
         source_client,
@@ -392,6 +413,8 @@ pub(crate) async fn resolve_mapping(
         tags: filtered.into_iter().map(TagPair::same).collect(),
         platforms,
         head_first,
+        immutable_tags,
+        target_tag_lists,
     }))
 }
 
@@ -595,6 +618,7 @@ mod tests {
             sort: Some(SortOrder::Semver),
             latest: Some(5),
             min_tags: Some(1),
+            immutable_tags: None,
         };
         let filter = build_filter(Some(&tags));
         assert_eq!(filter.glob, vec!["*"]);

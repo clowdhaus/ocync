@@ -195,6 +195,8 @@ pub struct SyncStats {
     /// of `discovery_cache_hits` and `discovery_cache_misses` -- the cache had
     /// no entry, but no full pull was needed either.
     pub discovery_head_first_skips: u64,
+    /// Tags skipped via `immutable_tags` pattern match (zero API calls).
+    pub immutable_tag_skips: u64,
 }
 
 #[cfg(test)]

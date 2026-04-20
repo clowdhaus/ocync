@@ -75,6 +75,8 @@ pub(crate) async fn run(
         tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],
         platforms: None,
         head_first: false,
+        immutable_tags: None,
+        target_tag_lists: Vec::new(),
     };
 
     let engine = SyncEngine::new(RetryConfig::default(), DEFAULT_MAX_CONCURRENT_TRANSFERS);

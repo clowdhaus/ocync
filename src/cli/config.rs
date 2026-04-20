@@ -360,6 +360,14 @@ pub(crate) struct TagsConfig {
     /// Minimum number of tags to retain regardless of filters.
     #[serde(default)]
     pub min_tags: Option<usize>,
+
+    /// Glob pattern for immutable tags (e.g. `"v?[0-9]*.[0-9]*.[0-9]*"`).
+    ///
+    /// When a tag matches this pattern AND already exists in the target's tag
+    /// list, the tag is skipped with zero API calls. Semver tags are
+    /// conventionally immutable; this avoids redundant HEAD checks.
+    #[serde(default)]
+    pub immutable_tags: Option<String>,
 }
 
 /// A glob pattern: either a single string or a list of patterns.

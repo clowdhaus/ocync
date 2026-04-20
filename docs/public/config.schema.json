@@ -433,6 +433,14 @@
             }
           ]
         },
+        "immutable_tags": {
+          "description": "Glob pattern for immutable tags (e.g. `\"v?[0-9]*.[0-9]*.[0-9]*\"`).\n\nWhen a tag matches this pattern AND already exists in the target's tag list, the tag is skipped with zero API calls. Semver tags are conventionally immutable; this avoids redundant HEAD checks.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "latest": {
           "description": "Keep only the N most recent tags after sorting.",
           "default": null,

@@ -507,6 +507,7 @@ mod tests {
                 discovery_head_failures: 2,
                 discovery_target_stale: 1,
                 discovery_head_first_skips: 0,
+                immutable_tag_skips: 0,
             },
             duration: Duration::from_secs(47),
         };

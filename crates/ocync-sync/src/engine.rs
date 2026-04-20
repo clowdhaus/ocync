@@ -29,6 +29,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use globset::GlobSet;
 use ocync_distribution::BatchBlobChecker;
 use ocync_distribution::Digest;
 use ocync_distribution::RegistryClient;
@@ -137,6 +138,17 @@ pub struct ResolvedMapping {
     /// The source HEAD from the discovery optimization is reused, so
     /// enabling both features does not issue a redundant HEAD.
     pub head_first: bool,
+    /// Compiled glob pattern for immutable tags.
+    ///
+    /// When a tag matches this pattern AND exists in all target tag lists,
+    /// the tag is skipped with zero API calls. See the skip optimization
+    /// hierarchy in the design docs.
+    pub immutable_tags: Option<GlobSet>,
+    /// Per-target tag lists, indexed in the same order as [`targets`](Self::targets).
+    ///
+    /// Only populated when `immutable_tags` is `Some`. Each entry contains the
+    /// set of tags already present at the corresponding target registry.
+    pub target_tag_lists: Vec<HashSet<String>>,
 }
 
 /// A single target registry entry.
@@ -654,9 +666,49 @@ impl SyncEngine {
             clients
         };
 
+        let mut immutable_tag_skips: u64 = 0;
+
         // Seed discovery with all (mapping, tag) pairs.
         for mapping in &mappings {
             for tag_pair in &mapping.tags {
+                // Tier 1: immutable_tags pattern match (0 API calls).
+                // If the tag matches the pattern AND exists in ALL target tag
+                // lists, skip immediately without entering discovery.
+                if let Some(ref pattern) = mapping.immutable_tags {
+                    if pattern.is_match(&tag_pair.target)
+                        && !mapping.target_tag_lists.is_empty()
+                        && mapping
+                            .target_tag_lists
+                            .iter()
+                            .all(|tags| tags.contains(&tag_pair.target))
+                    {
+                        info!(
+                            source_repo = %mapping.source_repo,
+                            tag = %tag_pair.target,
+                            "skipping -- immutable tag exists at all targets"
+                        );
+                        let source_ref = ImageRef {
+                            repo: mapping.source_repo.clone(),
+                            tag: tag_pair.source.clone(),
+                        };
+                        let target_ref = ImageRef {
+                            repo: mapping.target_repo.clone(),
+                            tag: tag_pair.target.clone(),
+                        };
+                        for _entry in &mapping.targets {
+                            let r = skip_image_result(
+                                &source_ref,
+                                &target_ref,
+                                SkipReason::ImmutableTag,
+                            );
+                            progress.image_completed(&r);
+                            results.push(r);
+                        }
+                        immutable_tag_skips += mapping.targets.len() as u64;
+                        continue;
+                    }
+                }
+
                 let params = DiscoveryParams {
                     source_client: Arc::clone(&mapping.source_client),
                     source_authority: mapping.source_authority.clone(),
@@ -951,6 +1003,7 @@ impl SyncEngine {
         stats.discovery_head_failures = discovery_head_failures;
         stats.discovery_target_stale = discovery_target_stale;
         stats.discovery_head_first_skips = discovery_head_first_skips;
+        stats.immutable_tag_skips = immutable_tag_skips;
         let duration = run_start.elapsed();
 
         let report = SyncReport {
