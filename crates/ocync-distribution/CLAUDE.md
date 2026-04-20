@@ -35,7 +35,7 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 
 - ECR fulfills mount when `BLOB_MOUNTING=ENABLED` account setting + source blob has a committed manifest.
 - Mount POST returns 201 (success) or 202 (not fulfilled, upload session started).
-- Mount is attempted on all providers unconditionally. `ProviderKind::fulfills_cross_repo_mount()` exists but is currently dead code (returns `true` for all variants, zero callers).
+- Mount is attempted on all providers unconditionally; the 202 fallback is cheap (~100ms).
 
 ## Dependencies
 

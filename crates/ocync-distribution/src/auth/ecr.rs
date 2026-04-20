@@ -215,6 +215,7 @@ impl EcrAuth {
         {
             let cached = self.cached_token.read().await;
             if let Some(token) = cached.as_ref().filter(|t| t.is_valid()) {
+                tracing::debug!(registry = %self.hostname, "token cache hit (read-lock fast path)");
                 return Ok(token.clone());
             }
         }
@@ -225,12 +226,18 @@ impl EcrAuth {
         // Double-check after acquiring write lock -- another task may have
         // already refreshed the token while we waited.
         if let Some(token) = cached.as_ref().filter(|t| t.is_valid()) {
+            tracing::debug!(registry = %self.hostname, "token cache hit (write-lock recheck)");
             return Ok(token.clone());
         }
 
-        let response = self.api.get_authorization_token().await?;
+        tracing::debug!(registry = %self.hostname, "token cache miss, calling GetAuthorizationToken");
+        let response = self.api.get_authorization_token().await.map_err(|e| {
+            tracing::warn!(registry = %self.hostname, error = %e, "ECR GetAuthorizationToken failed");
+            e
+        })?;
         validate_ecr_token(&response.encoded_token, &self.hostname)?;
         let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
+        tracing::debug!(registry = %self.hostname, ttl_secs = ttl.as_secs(), "ECR token refreshed");
         // ECR expects `Authorization: Basic <base64(AWS:password)>`. The encoded
         // token from GetAuthorizationToken is already in the right format.
         let token = Token::with_ttl(response.encoded_token, ttl).with_scheme(AuthScheme::Basic);
@@ -256,6 +263,7 @@ impl AuthProvider for EcrAuth {
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let mut cached = self.cached_token.write().await;
+            tracing::debug!(registry = %self.hostname, "invalidating cached ECR token");
             *cached = None;
         })
     }

@@ -328,6 +328,14 @@ fn build_v2_url(base: &Url) -> Result<Url, Error> {
 }
 
 /// Construct a URL for `/v2/{repository}/{path}`.
+///
+/// # Safety contract
+///
+/// `repository` is interpolated directly into the URL path without
+/// percent-encoding. Callers MUST pass validated repository names
+/// (e.g. via [`RepositoryName`] or a parsed [`Reference`](crate::Reference))
+/// which reject characters like `?`, `#`, and whitespace that would
+/// corrupt the URL structure.
 pub(crate) fn build_url(base: &Url, repository: &str, path: &str) -> Result<Url, Error> {
     let full_path = format!("/v2/{repository}/{path}");
     base.join(&full_path)
@@ -499,7 +507,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let repo = RepositoryName::new("repo");
+        let repo = RepositoryName::new("repo").unwrap();
         let _ = client
             .get(
                 &repo,

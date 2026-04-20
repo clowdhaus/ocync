@@ -186,7 +186,8 @@ impl Token {
         match self.expires_at {
             Some(exp) => {
                 let now = Instant::now();
-                now >= exp || exp.duration_since(now) < EARLY_REFRESH_WINDOW
+                exp.checked_duration_since(now)
+                    .is_none_or(|remaining| remaining < EARLY_REFRESH_WINDOW)
             }
             None => false,
         }

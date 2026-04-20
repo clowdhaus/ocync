@@ -33,37 +33,6 @@ pub enum ProviderKind {
     Chainguard,
 }
 
-impl ProviderKind {
-    /// Whether this provider is known to fulfill OCI cross-repo blob mount.
-    ///
-    /// Returns `false` for providers observed to never return `201 Created`
-    /// to a mount POST. When `false`,
-    /// [`crate::blob::RegistryClient::blob_mount`] short-circuits without
-    /// issuing a network request.
-    ///
-    /// ECR fulfills mount when the `BLOB_MOUNTING` account setting is enabled
-    /// AND the source blob is referenced by a committed manifest. The setting
-    /// is disabled by default; when disabled, mount POSTs return 202 (the
-    /// fallback path pushes normally). We always attempt mount on ECR because
-    /// the 202 fallback is cheap (~100ms) and successful mounts save entire
-    /// blob uploads. See `docs/src/content/registries/ecr.md` for details.
-    ///
-    /// Uses an exhaustive `match` so adding a new [`ProviderKind`] variant
-    /// forces a compile-time decision here.
-    pub fn fulfills_cross_repo_mount(&self) -> bool {
-        match self {
-            Self::Ecr
-            | Self::EcrPublic
-            | Self::Gcr
-            | Self::Gar
-            | Self::Acr
-            | Self::Ghcr
-            | Self::DockerHub
-            | Self::Chainguard => true,
-        }
-    }
-}
-
 /// Compiled regex for ECR private registry hostnames.
 ///
 /// Pattern: `<12-digit-account>.dkr[.-]ecr[-fips].<region>.<partition-domain>`

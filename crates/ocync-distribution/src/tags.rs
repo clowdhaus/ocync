@@ -7,6 +7,10 @@ use crate::client::RegistryClient;
 use crate::error::Error;
 use crate::spec::RepositoryName;
 
+/// Maximum number of tag list pages to follow before treating the pagination
+/// as broken (e.g. a registry returning a self-referencing `Link: rel="next"`).
+const MAX_TAG_PAGES: usize = 10_000;
+
 /// Response body from the tag listing API.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TagListResponse {
@@ -30,20 +34,32 @@ where
 /// Parse a `Link` header to extract the URL for the `rel="next"` page.
 ///
 /// The OCI Distribution spec uses RFC 5988 Link headers for pagination:
-/// `<url>; rel="next"`.
+/// `<url>; rel="next"`. URLs are extracted from `<...>` delimiters first
+/// to avoid splitting on commas that may appear within the URL itself.
 pub(crate) fn parse_next_link(link_header: &str) -> Option<String> {
-    for part in link_header.split(',') {
-        let part = part.trim();
-        // Check if this link relation contains rel="next".
-        if !part.contains("rel=\"next\"") {
-            continue;
+    let mut remaining = link_header;
+    while !remaining.is_empty() {
+        // Find the next link-value: starts with '<', URL ends at '>'.
+        let Some(start) = remaining.find('<') else {
+            break;
+        };
+        let after_start = &remaining[start + 1..];
+        let Some(end) = after_start.find('>') else {
+            break;
+        };
+        let url = &after_start[..end];
+        let after_url = &after_start[end + 1..];
+
+        // Find the end of this link-value (next '<' that starts a new link).
+        let attrs_end = after_url.find('<').unwrap_or(after_url.len());
+        let attrs = &after_url[..attrs_end];
+
+        // Check if the attributes contain rel="next".
+        if attrs.contains("rel=\"next\"") {
+            return Some(url.to_owned());
         }
-        // Extract URL from angle brackets.
-        let start = part.find('<')?;
-        let end = part.find('>')?;
-        if start < end {
-            return Some(part[start + 1..end].to_owned());
-        }
+
+        remaining = &after_url[attrs_end..];
     }
     None
 }
@@ -55,8 +71,15 @@ impl RegistryClient {
     pub async fn list_tags(&self, repository: &RepositoryName) -> Result<Vec<String>, Error> {
         let mut all_tags = Vec::new();
         let mut path = "tags/list".to_owned();
+        let mut page_count: usize = 0;
 
         loop {
+            page_count += 1;
+            if page_count > MAX_TAG_PAGES {
+                return Err(Error::Other(format!(
+                    "tag listing exceeded {MAX_TAG_PAGES} pages; possible infinite loop from malformed Link headers"
+                )));
+            }
             let resp = self
                 .get(repository, &path, None, RegistryAction::TagList)
                 .await?;
@@ -180,5 +203,47 @@ mod tests {
         let header = r#"</v2/repo/tags/list?n=100&last=a>; rel="prev", </v2/repo/tags/list?n=100&last=z>; rel="next""#;
         let result = parse_next_link(header);
         assert_eq!(result, Some("/v2/repo/tags/list?n=100&last=z".to_owned()));
+    }
+
+    #[test]
+    fn parse_next_link_url_containing_comma() {
+        // A URL with a comma must not be split incorrectly.
+        let header = r#"</v2/repo/tags/list?filter=a,b&last=z>; rel="next""#;
+        let result = parse_next_link(header);
+        assert_eq!(
+            result,
+            Some("/v2/repo/tags/list?filter=a,b&last=z".to_owned())
+        );
+    }
+
+    /// A registry that always returns the same `Link: rel="next"` URL must be
+    /// stopped by the page-count guard, not loop forever.
+    #[tokio::test]
+    async fn tag_pagination_guard_fires() {
+        let server = wiremock::MockServer::start().await;
+
+        // Every request returns one tag and a self-referencing Link header.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(r"/v2/repo/tags/list.*"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "repo", "tags": ["t"]}))
+                    .append_header("link", r#"</v2/repo/tags/list?n=1&last=t>; rel="next""#),
+            )
+            .mount(&server)
+            .await;
+
+        let base_url = url::Url::parse(&server.uri()).unwrap();
+        let client = crate::client::RegistryClientBuilder::new(base_url)
+            .build()
+            .unwrap();
+
+        let repo = RepositoryName::new("repo").unwrap();
+        let err = client.list_tags(&repo).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeded") && msg.contains("pages"),
+            "unexpected error: {msg}"
+        );
     }
 }

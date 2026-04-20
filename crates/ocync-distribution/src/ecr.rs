@@ -507,7 +507,10 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence(&RepositoryName::new("my-repo"), &[d1.clone(), d2.clone()])
+            .check_blob_existence(
+                &RepositoryName::new("my-repo").unwrap(),
+                &[d1.clone(), d2.clone()],
+            )
             .await
             .unwrap();
 
@@ -535,7 +538,7 @@ mod tests {
 
         let result = checker
             .check_blob_existence(
-                &RepositoryName::new("my-repo"),
+                &RepositoryName::new("my-repo").unwrap(),
                 &[d1.clone(), d2.clone(), d3.clone()],
             )
             .await
@@ -576,7 +579,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence(&RepositoryName::new("my-repo"), &digests)
+            .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &digests)
             .await
             .unwrap();
 
@@ -600,7 +603,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence(&RepositoryName::new("my-repo"), &[])
+            .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &[])
             .await
             .unwrap();
 
@@ -616,7 +619,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence(&RepositoryName::new("my-repo"), &[test_digest(1)])
+            .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &[test_digest(1)])
             .await;
 
         assert!(result.is_err());
@@ -639,7 +642,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence(&RepositoryName::new("my-repo"), &[d1, d2])
+            .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &[d1, d2])
             .await
             .unwrap();
 
@@ -662,7 +665,10 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence(&RepositoryName::new("my-repo"), &[d1.clone(), d2.clone()])
+            .check_blob_existence(
+                &RepositoryName::new("my-repo").unwrap(),
+                &[d1.clone(), d2.clone()],
+            )
             .await
             .unwrap();
 
@@ -698,7 +704,7 @@ mod tests {
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
-            .check_blob_existence(&RepositoryName::new("my-repo"), &digests)
+            .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &digests)
             .await
             .unwrap();
 

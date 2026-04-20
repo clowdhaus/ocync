@@ -262,9 +262,31 @@ impl fmt::Display for PlatformFilter {
 pub struct RepositoryName(String);
 
 impl RepositoryName {
-    /// Create a new repository name.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+    /// Create a new repository name after validating characters.
+    ///
+    /// Repository names must be non-empty and contain only `[a-zA-Z0-9._/-]`.
+    /// This matches the validation in [`Reference::from_str`](crate::Reference).
+    pub fn new(name: impl Into<String>) -> Result<Self, Error> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(Error::InvalidReference {
+                input: name,
+                reason: "repository name must be non-empty".into(),
+            });
+        }
+        if let Some(bad) = name
+            .chars()
+            .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '/' | '-'))
+        {
+            return Err(Error::InvalidReference {
+                input: name,
+                reason: format!(
+                    "repository name contains invalid character '{bad}'; \
+                     allowed: [a-zA-Z0-9._/-]"
+                ),
+            });
+        }
+        Ok(Self(name))
     }
 
     /// Return the name as a string slice.
@@ -286,15 +308,10 @@ impl fmt::Display for RepositoryName {
     }
 }
 
-impl From<String> for RepositoryName {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for RepositoryName {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
+impl FromStr for RepositoryName {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
     }
 }
 
@@ -387,14 +404,28 @@ pub enum ManifestKind {
 
 impl ManifestKind {
     /// Deserialize a manifest from JSON bytes, using the media type to discriminate.
+    ///
+    /// Validates that `schemaVersion` is `2` as required by the OCI spec.
     pub fn from_json(media_type: &MediaType, bytes: &[u8]) -> Result<Self, Error> {
         match media_type {
             MediaType::OciManifest | MediaType::DockerManifestV2 => {
                 let m: ImageManifest = serde_json::from_slice(bytes)?;
+                if m.schema_version != 2 {
+                    return Err(Error::Other(format!(
+                        "unsupported schemaVersion {}, expected 2",
+                        m.schema_version
+                    )));
+                }
                 Ok(Self::Image(Box::new(m)))
             }
             MediaType::OciIndex | MediaType::DockerManifestList => {
                 let m: ImageIndex = serde_json::from_slice(bytes)?;
+                if m.schema_version != 2 {
+                    return Err(Error::Other(format!(
+                        "unsupported schemaVersion {}, expected 2",
+                        m.schema_version
+                    )));
+                }
                 Ok(Self::Index(Box::new(m)))
             }
             _ => Err(Error::UnsupportedMediaType {
@@ -844,5 +875,57 @@ mod tests {
             let parsed = MediaType::from(s);
             assert_eq!(&parsed, mt, "roundtrip failed for {s}");
         }
+    }
+
+    #[test]
+    fn manifest_from_json_rejects_schema_version_1() {
+        let json = serde_json::json!({
+            "schemaVersion": 1,
+            "config": test_descriptor(),
+            "layers": [test_layer_descriptor()]
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let err = ManifestKind::from_json(&MediaType::OciManifest, &bytes).unwrap_err();
+        assert!(err.to_string().contains("schemaVersion"), "error: {err}");
+    }
+
+    #[test]
+    fn index_from_json_rejects_schema_version_1() {
+        let json = serde_json::json!({
+            "schemaVersion": 1,
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": TEST_DIGEST,
+                "size": 1000
+            }]
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let err = ManifestKind::from_json(&MediaType::OciIndex, &bytes).unwrap_err();
+        assert!(err.to_string().contains("schemaVersion"), "error: {err}");
+    }
+
+    // --- RepositoryName validation tests ---
+
+    #[test]
+    fn repository_name_valid() {
+        assert!(RepositoryName::new("library/nginx").is_ok());
+        assert!(RepositoryName::new("My-Org/my_repo.v2").is_ok());
+    }
+
+    #[test]
+    fn repository_name_rejects_invalid_chars() {
+        let err = RepositoryName::new("repo?evil").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid character"), "error: {msg}");
+        assert!(msg.contains('?'), "error: {msg}");
+
+        assert!(RepositoryName::new("repo name").is_err());
+        assert!(RepositoryName::new("repo#frag").is_err());
+    }
+
+    #[test]
+    fn repository_name_rejects_empty() {
+        let err = RepositoryName::new("").unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "error: {err}");
     }
 }

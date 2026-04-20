@@ -39,6 +39,9 @@ pub fn install_crypto_provider() {
 /// Convenience for tests that need an HTTP client without going through
 /// [`RegistryClientBuilder`]. Production code should use
 /// [`install_crypto_provider`] at startup and construct clients directly.
+///
+/// This is a test utility; do not use in production code.
+#[doc(hidden)]
 pub fn test_http_client() -> reqwest::Client {
     install_crypto_provider();
     reqwest::Client::new()

@@ -129,6 +129,44 @@ impl FromStr for Reference {
             });
         }
 
+        // Reject characters that would corrupt URLs when interpolated into
+        // path segments. This is more permissive than the OCI spec (which
+        // requires lowercase) but catches the dangerous characters.
+        if let Some(bad) = repository
+            .chars()
+            .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '/' | '-'))
+        {
+            return Err(Error::InvalidReference {
+                input: s.into(),
+                reason: format!(
+                    "repository name contains invalid character '{bad}'; \
+                     allowed: [a-zA-Z0-9._/-]"
+                ),
+            });
+        }
+
+        // Validate tag: must be 1-128 chars and match [a-zA-Z0-9_.-].
+        if let Some(ref t) = tag {
+            if t.len() > 128 {
+                return Err(Error::InvalidReference {
+                    input: s.into(),
+                    reason: format!("tag exceeds 128 characters ({})", t.len()),
+                });
+            }
+            if let Some(bad) = t
+                .chars()
+                .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-'))
+            {
+                return Err(Error::InvalidReference {
+                    input: s.into(),
+                    reason: format!(
+                        "tag contains invalid character '{bad}'; \
+                         allowed: [a-zA-Z0-9_.-]"
+                    ),
+                });
+            }
+        }
+
         Ok(Self {
             registry,
             repository,
@@ -149,7 +187,8 @@ fn split_name_tag(name_tag: &str) -> (&str, Option<String>) {
         let tag_start = after_slash + colon + 1;
         let tag = &name_tag[tag_start..];
         if tag.is_empty() {
-            (name_tag, None)
+            // Trailing colon with no tag (e.g. "ghcr.io/repo:") -- strip the colon.
+            (&name_tag[..after_slash + colon], None)
         } else {
             (&name_tag[..after_slash + colon], Some(tag.to_owned()))
         }
@@ -374,5 +413,64 @@ mod tests {
         assert_eq!(r.registry(), "docker.io");
         assert_eq!(r.repository(), "myuser/myrepo");
         assert_eq!(r.tag(), Some("latest"));
+    }
+
+    #[test]
+    fn repository_rejects_question_mark() {
+        let r = "ghcr.io/repo?evil:tag".parse::<Reference>();
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("invalid character"));
+    }
+
+    #[test]
+    fn repository_rejects_hash() {
+        let r = "ghcr.io/repo#fragment:tag".parse::<Reference>();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn repository_rejects_space() {
+        let r = "ghcr.io/repo name:tag".parse::<Reference>();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn repository_rejects_control_chars() {
+        let r = "ghcr.io/repo\x01name:tag".parse::<Reference>();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn repository_allows_valid_characters() {
+        // Uppercase, dots, underscores, hyphens, slashes are all valid.
+        let r: Reference = "ghcr.io/My-Org/my_repo.v2:tag".parse().unwrap();
+        assert_eq!(r.repository(), "My-Org/my_repo.v2");
+    }
+
+    #[test]
+    fn tag_rejects_invalid_chars() {
+        let err = "ghcr.io/repo:v1.0+build".parse::<Reference>().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tag") && msg.contains("invalid character"),
+            "error: {msg}"
+        );
+    }
+
+    #[test]
+    fn tag_rejects_overlength() {
+        let long_tag = "a".repeat(129);
+        let input = format!("ghcr.io/repo:{long_tag}");
+        let err = input.parse::<Reference>().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("128"), "error: {msg}");
+    }
+
+    #[test]
+    fn tag_allows_128_chars() {
+        let tag = "a".repeat(128);
+        let input = format!("ghcr.io/repo:{tag}");
+        let r: Reference = input.parse().unwrap();
+        assert_eq!(r.tag().unwrap().len(), 128);
     }
 }

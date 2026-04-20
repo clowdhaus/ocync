@@ -70,7 +70,7 @@ async fn happy_path() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("myrepo");
+    let repo = RepositoryName::new("myrepo").unwrap();
     let result = client
         .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
@@ -117,7 +117,7 @@ async fn multi_chunk_stream() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let result = client
         .blob_push_stream(&repo, &digest, None, data_stream(data, 2))
         .await
@@ -163,7 +163,7 @@ async fn single_chunk_stream() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let result = client
         .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
@@ -208,7 +208,7 @@ async fn empty_stream() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let result = client
         .blob_push_stream(&repo, &digest, None, data_stream(data, 1))
         .await
@@ -236,7 +236,7 @@ async fn post_initiation_rejected() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let err = client
         .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
@@ -278,7 +278,7 @@ async fn put_upload_failure() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let err = client
         .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
@@ -324,7 +324,7 @@ async fn put_rejected() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let err = client
         .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
@@ -366,7 +366,7 @@ async fn stream_error_propagates() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let result = client
         .blob_push_stream(&repo, &digest, None, error_stream)
         .await;
@@ -396,7 +396,7 @@ async fn post_returns_200_is_rejected() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let err = client
         .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
@@ -449,7 +449,7 @@ async fn small_blob_with_known_size() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let result = client
         .blob_push_stream(
             &repo,
@@ -497,7 +497,7 @@ async fn unknown_size_uses_streaming_put() {
         .build()
         .unwrap();
 
-    let repo = RepositoryName::new("repo");
+    let repo = RepositoryName::new("repo").unwrap();
     let result = client
         .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
@@ -506,9 +506,12 @@ async fn unknown_size_uses_streaming_put() {
     assert_eq!(result, digest);
 }
 
-/// Verify GAR hostname detection matches the expected pattern.
+/// Verify GAR hostname detection uses the real `detect_provider_kind` function,
+/// not a hand-rolled `ends_with` check.
 #[test]
 fn gar_hostname_detection() {
+    use ocync_distribution::auth::{ProviderKind, detect_provider_kind};
+
     let gar_hosts = [
         "us-docker.pkg.dev",
         "europe-docker.pkg.dev",
@@ -516,24 +519,32 @@ fn gar_hostname_detection() {
         "us-central1-docker.pkg.dev",
     ];
     for host in gar_hosts {
-        assert!(
-            host.ends_with("-docker.pkg.dev"),
-            "{host} should match GAR pattern"
+        assert_eq!(
+            detect_provider_kind(host),
+            Some(ProviderKind::Gar),
+            "{host} should be detected as GAR"
         );
     }
+
+    // "docker.pkg.dev" without a region prefix must NOT match GAR.
+    assert_eq!(
+        detect_provider_kind("docker.pkg.dev"),
+        None,
+        "docker.pkg.dev (no region prefix) should not match GAR"
+    );
 
     let non_gar_hosts = [
         "docker.io",
         "ghcr.io",
         "registry-1.docker.io",
-        "docker.pkg.dev",
         "pkg.dev",
         "127.0.0.1",
     ];
     for host in non_gar_hosts {
-        assert!(
-            !host.ends_with("-docker.pkg.dev"),
-            "{host} should NOT match GAR pattern"
+        assert_ne!(
+            detect_provider_kind(host),
+            Some(ProviderKind::Gar),
+            "{host} should NOT be detected as GAR"
         );
     }
 }
