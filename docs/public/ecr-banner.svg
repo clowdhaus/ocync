@@ -1,0 +1,70 @@
+<svg width="900" height="250" viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f0a2e"/>
+      <stop offset="100%" stop-color="#1a0f91"/>
+    </linearGradient>
+    <linearGradient id="logobg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5b21b6"/>
+      <stop offset="100%" stop-color="#1a0f91"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="50%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#F736F6"/>
+    </linearGradient>
+    <linearGradient id="stat-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="pink-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#F736F6"/>
+      <stop offset="100%" stop-color="#ff6ef9"/>
+    </linearGradient>
+    <linearGradient id="cyan-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+    <linearGradient id="purple-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="250" fill="url(#bg)"/>
+
+  <!-- Left section: Logo + branding -->
+  <rect x="40" y="45" width="50" height="50" rx="12" fill="url(#logobg)"/>
+  <path d="M70 52L53 74h10L58 91L77 68h-10L70 52z" fill="#ff44ee"/>
+  <text x="102" y="86" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="48" font-weight="800" fill="url(#pink-grad)">ocync</text>
+
+  <!-- Tagline -->
+  <text x="40" y="135" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" fill="#bcc6ec">Sync OCI container images across registries</text>
+
+  <!-- Sub-tagline -->
+  <text x="40" y="160" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#7c86aa">Efficient. Correct. Rate-limit aware.</text>
+
+  <!-- Open source badge -->
+  <rect x="40" y="178" width="130" height="24" rx="12" fill="#ffffff" fill-opacity="0.06" stroke="#ffffff" stroke-opacity="0.12" stroke-width="1"/>
+  <text x="105" y="195" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#8b92b0">Open Source · Rust</text>
+
+  <!-- Right section: Stats row -->
+  <rect x="430" y="35" width="140" height="180" rx="12" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
+  <text x="500" y="70" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#06b6d4" letter-spacing="2">SPEED</text>
+  <text x="500" y="140" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="52" font-weight="800" fill="url(#cyan-grad)">4x</text>
+  <text x="500" y="175" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#8b92b0">faster</text>
+
+  <rect x="590" y="35" width="140" height="180" rx="12" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
+  <text x="660" y="70" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#a855f7" letter-spacing="2">EFFICIENCY</text>
+  <text x="660" y="140" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="52" font-weight="800" fill="url(#purple-grad)">40%</text>
+  <text x="660" y="175" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#8b92b0">fewer requests</text>
+
+  <rect x="750" y="35" width="140" height="180" rx="12" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
+  <text x="820" y="70" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#F736F6" letter-spacing="2">RELIABILITY</text>
+  <text x="820" y="140" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="52" font-weight="800" fill="url(#pink-grad)">0</text>
+  <text x="820" y="175" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#8b92b0">rate-limit errors</text>
+
+  <!-- Bottom gradient bar -->
+  <rect x="0" y="244" width="900" height="6" fill="url(#accent)"/>
+</svg>

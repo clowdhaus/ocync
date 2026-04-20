@@ -1,6 +1,6 @@
 # ocync
 
-OCI registry sync tool. Rust workspace with 3 crates: `ocync` (CLI binary), `ocync-distribution` (OCI registry client), `ocync-sync` (sync engine).
+OCI registry sync tool. Rust workspace with 3 core crates: `ocync` (CLI binary), `ocync-distribution` (OCI registry client), `ocync-sync` (sync engine). The workspace also includes `bench/proxy` (benchmark MITM proxy) and `xtask` (build/bench automation).
 
 ## Crate-specific guidance
 
@@ -59,10 +59,9 @@ Every PR ships the smallest correct change + one test that catches regression. D
 - `docs/src/content/design/engine.md` - pipeline, transfer state cache, AIMD, multi-target reuse
 - `docs/src/content/design/benchmark.md` - layered benchmark plan (protocol / throughput / cross-tool)
 - `docs/src/content/design/watch-mode.md` - watch mode, discovery optimization, platform filtering
-- `docs/src/content/design/findings.md` - empirical evidence log
 - `docs/superpowers/plans/` (gitignored) - in-flight implementation plans
 
-When a benchmark or probe run changes our understanding of a registry's behavior, add an entry to `docs/src/content/design/findings.md` in the same PR as the behavior change.
+When a benchmark or probe run changes our understanding of a registry's behavior, update the relevant per-registry doc in `docs/src/content/registries/` in the same PR as the behavior change.
 
 ## Commands
 
@@ -86,7 +85,7 @@ Prerequisites: Terraform, AWS credentials with ECR access, SSM parameters popula
 
 ```bash
 cd bench/terraform/aws && terraform init && terraform apply
-cargo xtask bench-remote --provider aws --scenario cold
+cargo xtask bench-remote --provider aws --scenario sync
 cd bench/terraform/aws && terraform destroy
 ```
 

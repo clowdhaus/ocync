@@ -27,7 +27,7 @@ Config
 |     3. Source GET (if HEAD-only) -> SourceData     |
 |     4. Resolve index children (full tree)         |
 |     5. Update blob frequency map                  |
-|     6. -> ActiveItem to pending queue              |
+|     6. -> TransferTask to pending queue             |
 |                                                   |
 | Execution Pool (FuturesUnordered):                |
 |   Bounded by global concurrency cap (semaphore).  |
@@ -47,7 +47,7 @@ Config
                 Persist transfer state cache
 ```
 
-A `VecDeque<ActiveItem>` holds items that discovery has resolved but execution has not started. When a discovery future resolves, its `ActiveItem` enters the pending queue and the loop attempts to promote pending items into execution (bounded by semaphore). When an execution future completes, its permit is released and the next pending item is promoted.
+A `VecDeque<TransferTask>` holds items that discovery has resolved but execution has not started. When a discovery future resolves, its `TransferTask` enters the pending queue and the loop attempts to promote pending items into execution (bounded by semaphore). When an execution future completes, its permit is released and the next pending item is promoted.
 
 ### Why pipelining beats plan-then-execute
 
@@ -111,19 +111,20 @@ fn on_throttle(&mut self) {
 
 ### Per-registry window groupings
 
-Actions are fine-grained, matching the actual API action granularity of each registry via an `OperationType` enum (ManifestHead, ManifestRead, ManifestWrite, BlobHead, BlobRead, BlobUploadInit, BlobUploadChunk, BlobUploadComplete, TagList). A per-registry mapping function groups actions into AIMD windows:
+Actions are fine-grained, matching the actual API action granularity of each registry via a `RegistryAction` enum (ManifestHead, ManifestRead, ManifestWrite, BlobHead, BlobRead, BlobUploadInit, BlobUploadChunk, BlobUploadComplete, TagList). A per-registry mapping function groups actions into AIMD windows:
 
 | Registry | Windows | Rationale |
 |---|---|---|
 | ECR | 9 (one per action) | Critical: `InitiateLayerUpload` (100 TPS) and `UploadLayerPart` (500 TPS) have a 5x rate disparity, so a 429 on session initiation must not throttle chunk uploads |
-| Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 100/hr pull limit). Other actions share one window |
-| GAR | 1 (all shared) | GAR uses a shared per-project quota across all operation types; capped at 5 |
-| ACR | 1 (all shared) | Similar shared quota model |
-| Unknown | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as a safe default |
+| Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 200-pull/6h quota). Other actions share one window |
+| GAR | 1 (all shared) | GAR uses a shared per-project quota across all operation types; initial window of 5, grows adaptively to `max_concurrent` |
+| ACR, GHCR, others | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as safe default for registries without documented per-action limits |
 
 The mapping function is ~20 lines. The window key is derived from HTTP method + URL pattern, which `ocync` already tracks in request labels.
 
 ### Budget circuit breaker
+
+> **Status: Planned.** The circuit breaker described below is designed but not yet implemented.
 
 Parse `ratelimit-remaining` from Docker Hub manifest responses (and `X-RateLimit-Remaining` from GHCR). Single decision point: if `remaining < 0.1 * planned_discovery_count`, log warning and pause discovery. Execution continues for already-discovered images. Resume when a subsequent response shows budget has refilled.
 
@@ -149,7 +150,7 @@ The greedy set-cover provably covers every shared blob. No "uncovered follower" 
 
 AWS launched opt-in `BLOB_MOUNTING` account setting in January 2026. Enable via `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`. Mount POST returns 201 when all conditions are met: BLOB_MOUNTING is ENABLED on the account, the source blob is referenced by a committed manifest (standalone blobs without manifests return 202), the `from` parameter specifies the source repo name, and both repos have identical encryption config (AES256 default works). Requirements: same account + region, identical encryption config, pusher needs `ecr:GetDownloadUrlForLayer` on source repo. Not supported for pull-through cache repos.
 
-`ProviderKind::fulfills_cross_repo_mount()` uses an exhaustive `match` so adding a new provider forces a compile-time decision. Currently all providers return `true` (mount is always attempted); the 202 fallback is cheap (~100ms) and successful mounts save entire blob uploads.
+Mount attempts are made unconditionally regardless of provider; the 202 fallback is cheap (~100ms) and successful mounts save entire blob uploads. `ProviderKind::fulfills_cross_repo_mount()` exists as a compile-time exhaustiveness guard (exhaustive `match` forces a decision when adding a new provider) but currently returns `true` for all variants and has zero callers.
 
 ### Measured impact
 
@@ -239,7 +240,7 @@ Each registry has different upload protocol requirements. The engine detects the
 | Docker Hub | POST + streaming PUT | 2 | Same streaming path as ECR |
 | GHCR | POST + single PATCH + PUT | 2 | Multi-PATCH broken (last PATCH overwrites previous chunks). Single PATCH without `Content-Range` headers. Blob size from source manifest descriptor sets `Content-Length` on the streaming body |
 | GAR | POST + buffered monolithic PUT | 2 | PATCH errors entirely. Full blob buffered in memory |
-| ACR | POST + chunked PATCH + PUT | 3 | Streaming PUT body limit ~20 MB. Chunked PATCH required for larger blobs |
+| ACR | POST + streaming PUT | 2 | Known ~20 MB body limit; chunked PATCH not yet implemented |
 
 The GHCR fallback is a correctness fix, not an optimization. GHCR's chunked upload implementation is broken: the last PATCH overwrites all previous chunks. Any blob larger than `chunk_size` pushed via multi-PATCH produces silently corrupt data because `CompleteLayerUpload` succeeds but the blob contains only the final chunk. This is a documented conformance gap.
 
@@ -277,13 +278,13 @@ Cache persistence is the highest-priority action during shutdown (~50-100ms). Lo
 
 No DELETE requests are issued for abandoned upload sessions. All registries auto-expire them server-side (ECR: tied to 12h auth token, others: server GC). The OCI Distribution Spec says registries "SHOULD eventually timeout unfinished uploads."
 
-The existing `ShutdownSignal` infrastructure in `src/cli/shutdown.rs` (`Arc<AtomicBool>` + `Arc<Notify>`) integrates directly with the pipeline's `select!` loop.
+The existing `ShutdownSignal` infrastructure in `crates/ocync-sync/src/shutdown.rs` (`Arc<AtomicBool>` + `Arc<tokio::sync::Notify>`) integrates directly with the pipeline's `select!` loop. `Arc` is used here (rather than `Rc`) because the shutdown signal must be `Send` for signal handler registration via `tokio::spawn`, which is distinct from the engine's `Rc<RefCell<>>` shared state.
 
 ## Key invariants
 
 1. **RefCell borrows never held across `.await` points.** Every read/write of the transfer state cache follows: borrow, extract value into local variable, drop borrow, then await. This prevents panics from overlapping borrows. Enforced by code review and a wrapper type that only exposes methods returning owned values.
 
-2. **Source manifests pulled once per tag.** `Rc<SourceData>` is shared across all target futures for the same tag. The pipeline preserves pull-once fan-out.
+2. **Source manifests pulled once per tag.** `Rc<PulledManifest>` is shared across all target futures for the same tag. The pipeline preserves pull-once fan-out.
 
 3. **Mount failure is always recoverable.** The transfer state cache may have stale entries. Every mount attempt must fall back to HEAD -> pull+push on failure. The cache entry is invalidated on failure (lazy invalidation). No "mount failed, image failed" paths exist.
 
@@ -316,7 +317,7 @@ Optimizations can amplify each other's failure modes. This matrix captures non-o
 
 ### Multi-threaded tokio runtime
 
-Rejected. Workload is ~100% network I/O. SHA-256 per-chunk cost (~2.7ms for 4MB via aws-lc-rs at ~1.5 GB/s) is within tokio's 10ms cooperative scheduling budget. `spawn_blocking` handles cache deserialization. Multi-threaded would require `Arc<RwLock<>>` everywhere, introducing lock contention, write starvation risk, and `Send` bound infection, all for a workload that does not benefit from parallelism. If layer recompression (gzip -> zstd) ships, switching is a mechanical refactor: `Rc` -> `Arc`, `RefCell` -> `RwLock`, add `Send` bounds. This is a 1-day change, not a decision that needs to be made now.
+Rejected. Workload is ~100% network I/O. SHA-256 per-chunk cost (~2.7ms for 4MB via aws-lc-rs at ~1.5 GB/s) is within tokio's 10ms cooperative scheduling budget. `spawn_blocking` handles cache deserialization. Multi-threaded would require `Arc<RwLock<>>` everywhere, introducing lock contention, write starvation risk, and `Send` bound infection, all for a workload that does not benefit from parallelism. If layer recompression (gzip -> zstd) ships, switching is a mechanical refactor: `Rc` -> `Arc`, `RefCell` -> `RwLock`, add `Send` bounds.
 
 ### Bounded channel between discovery and execution
 
@@ -384,11 +385,13 @@ No existing OCI transfer tool implements the combination of pipelining, adaptive
 
 ## Future directions
 
+> **Status: Planned.** The DAG scheduler and `SyncEngine` trait described below are future directions, not current architecture.
+
 ### DAG scheduler evolution
 
 The pipeline is the pragmatic v1 architecture. The natural evolution is a dependency-graph scheduler where every unit of work (check blob, transfer blob, push manifest) is a node with dependency edges, and a global scheduler handles ordering, concurrency, and priority. Optimizations like pipelining, frequency ordering, dedup, and work-stealing become emergent properties of the scheduler rather than bolt-on features.
 
-The `SyncEngine` trait is structured so the pipeline can be replaced with a DAG scheduler in a future version without changing the `RegistryClient` layer or CLI. The current `VecDeque<ActiveItem>` pending queue, `FuturesUnordered` pools, and `select!` loop map naturally to the DAG scheduler's internal state, and the refactor would add edges and topological ordering without changing the external contract.
+The `SyncEngine` trait is structured so the pipeline can be replaced with a DAG scheduler in a future version without changing the `RegistryClient` layer or CLI. The current `VecDeque<TransferTask>` pending queue, `FuturesUnordered` pools, and `select!` loop map naturally to the DAG scheduler's internal state, and the refactor would add edges and topological ordering without changing the external contract.
 
 ### io-uring via tokio-uring
 

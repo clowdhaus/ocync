@@ -1,7 +1,405 @@
 [
   {
+    "timestamp": "2026-04-19-173346",
+    "git_ref": "b581ffb",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync (median)",
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0\nFIPS 140-3: compiled=yes",
+            "wall_clock_secs": 418.251077705,
+            "peak_rss_kb": 49584,
+            "requests": 5535,
+            "response_bytes": 50767825483,
+            "source_blob_gets": 1026,
+            "source_blob_bytes": 200517,
+            "mount_successes": 243,
+            "mount_attempts": 243,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          },
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-19T17:33:46Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 1910.735022659,
+            "peak_rss_kb": 270104,
+            "requests": 11299,
+            "response_bytes": 55289298303,
+            "source_blob_gets": 1370,
+            "source_blob_bytes": 236283,
+            "mount_successes": 326,
+            "mount_attempts": 326,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3\nVCSRef:     unknown\nVCSCommit:  unknown\nVCSState:   unknown\nVCSDate:    unknown\nPlatform:   linux/amd64\nGoVer:      go1.26.2\nGoCompiler: gc",
+            "wall_clock_secs": 717.486408805,
+            "peak_rss_kb": 25904,
+            "requests": 4896,
+            "response_bytes": 22617148463,
+            "source_blob_gets": 865,
+            "source_blob_bytes": 160518,
+            "mount_successes": 0,
+            "mount_attempts": 865,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-19-184658",
+    "git_ref": "bf4b5ad",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 3,
+      "tags": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync (median)",
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 33.978324489,
+            "peak_rss_kb": 17564,
+            "requests": 483,
+            "response_bytes": 2460895791,
+            "source_blob_gets": 69,
+            "source_blob_bytes": 2460866116,
+            "mount_successes": 88,
+            "mount_attempts": 88,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-19-184814",
+    "git_ref": "bf4b5ad",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 3,
+      "tags": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync (median)",
+        "tools": [
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 3.988691772,
+            "peak_rss_kb": 19820,
+            "requests": 71,
+            "response_bytes": 122741,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 118600,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-19-185035",
+    "git_ref": "2815c4c",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 3,
+      "tags": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync (median)",
+        "tools": [
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 1.091517898,
+            "peak_rss_kb": 19324,
+            "requests": 7,
+            "response_bytes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 0,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-19-185057",
+    "git_ref": "2815c4c",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 3,
+      "tags": 6
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync (median)",
+        "tools": [
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 367.59028352,
+            "peak_rss_kb": 21496,
+            "requests": 332,
+            "response_bytes": 17767864830,
+            "source_blob_gets": 49,
+            "source_blob_bytes": 17767864830,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-19-190717",
+    "git_ref": "21cb07c",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 3,
+      "tags": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync (median)",
+        "tools": [
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 1.084732037,
+            "peak_rss_kb": 19548,
+            "requests": 7,
+            "response_bytes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 0,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-19-191234",
+    "git_ref": "21cb07c",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 3,
+      "tags": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync (median)",
+        "tools": [
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 1.177146464,
+            "peak_rss_kb": 19424,
+            "requests": 7,
+            "response_bytes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 0,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-19-192507",
+    "git_ref": "0f6bb0f",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 3,
+      "tags": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync (median)",
+        "tools": [
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 85.646323668,
+            "peak_rss_kb": 22656,
+            "requests": 788,
+            "response_bytes": 4113633726,
+            "source_blob_gets": 147,
+            "source_blob_bytes": 4113629585,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-19-193600",
+    "git_ref": "598ee4a",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 3,
+      "tags": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync (median)",
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 41.402653463,
+            "peak_rss_kb": 18052,
+            "requests": 483,
+            "response_bytes": 2460894772,
+            "source_blob_gets": 69,
+            "source_blob_bytes": 2460865097,
+            "mount_successes": 88,
+            "mount_attempts": 88,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          },
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-19T19:36:00Z\" level=info msg=\"dregsy \"",
+            "wall_clock_secs": 72.276732446,
+            "peak_rss_kb": 35148,
+            "requests": 1046,
+            "response_bytes": 2460755109,
+            "source_blob_gets": 70,
+            "source_blob_bytes": 2460749586,
+            "mount_successes": 78,
+            "mount_attempts": 78,
+            "duplicate_blob_gets": 1,
+            "rate_limit_429s": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 70.819123574,
+            "peak_rss_kb": 22420,
+            "requests": 787,
+            "response_bytes": 4113629585,
+            "source_blob_gets": 147,
+            "source_blob_bytes": 4113629585,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
     "timestamp": "2026-04-19-194331",
-    "git_ref": "4035fa8",
+    "git_ref": "6dc184e",
     "machine": {
       "provider": "aws",
       "instance_type": "c6in.4xlarge",
@@ -56,6 +454,72 @@
             "response_bytes": 65301780458,
             "source_blob_gets": 1694,
             "source_blob_bytes": 65301771009,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-20-013255",
+    "git_ref": "6dc184e",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-1"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Warm sync (no-op)",
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 152.338209138,
+            "peak_rss_kb": 21708,
+            "requests": 925,
+            "response_bytes": 23316735,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 23312683,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          },
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-20T01:32:55Z\" level=info msg=\"dregsy \"",
+            "wall_clock_secs": 103.764420814,
+            "peak_rss_kb": 33080,
+            "requests": 3145,
+            "response_bytes": 1916914,
+            "source_blob_gets": 227,
+            "source_blob_bytes": 1882452,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 12.036633352,
+            "peak_rss_kb": 20548,
+            "requests": 169,
+            "response_bytes": 119907,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 119907,
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,

@@ -83,13 +83,9 @@ This is also a correctness fix independent of the optimization, since existing t
 
 When platform filtering is active but no source platforms match the filter (e.g., source has only `linux/s390x`, filter is `[linux/amd64]`), the engine must return an error rather than silently pushing an empty manifest list. This surfaces platform config mismatches immediately.
 
-### skip_existing interaction
-
-When both the tag digest cache and `skip_existing` could apply to the same target, `skip_existing` takes priority. The source HEAD still fires even when skip_existing is true because the cache entry needs the source digest for future cycles when skip_existing might be disabled.
-
-The discovery cache hit/miss decision is orthogonal to the image skip reason. A tag with `skip_existing: true` where the cache matched still counts as a cache hit because the cache prevented the expensive source pull.
-
 ### SIGHUP cache clearing
+
+> **Status: Planned.** SIGHUP handling is designed but not yet implemented. The tag digest cache and discovery optimization described in this document are implemented.
 
 On SIGHUP config reload, the tag digest cache is cleared to force full source re-verification. Platform filter changes are detected by the platform_filter_key, but other config changes (source registry URL, repository mappings) could make cached entries stale. The blob dedup map is preserved across SIGHUP since blob existence is independent of config.
 
@@ -115,7 +111,7 @@ Rejected due to etcd's 1 MiB size limit, write pressure on etcd, and race condit
 
 Between the source HEAD (returning digest A) and target HEADs, the source could update to digest B. The engine sees source=A, targets=A, and skips, missing the update. This is a missed optimization, not a correctness bug: the target has valid content (A), just not the latest (B). The next cycle detects the change because the source HEAD returns B while the cache has A. This window is inherent to any polling system.
 
-A subtler variant exists: if the source updates A->B->A within a single poll interval, the cache could store a stale filtered_digest from the B-era pull. This requires two tag pushes reverting to the exact prior image within seconds, which is vanishingly rare in practice and self-correcting on the next source change.
+A subtler variant exists: if the source updates A->B->A within a single poll interval, the cache could store a stale filtered_digest from the B-era pull. This requires two tag pushes reverting to the exact prior image within seconds, which is uncommon in practice (though CI rollback scenarios could trigger it). It self-corrects on the next cycle where the source changes again.
 
 ### Broken Docker-Content-Digest headers
 
@@ -141,6 +137,8 @@ Any HEAD failure (network error, HTTP 4xx/5xx, timeout, missing Docker-Content-D
 Optimization HEADs participate in the AIMD congestion window for the ManifestHead action. A 429 on the optimization HEAD shrinks the ManifestHead window normally. The fallthrough to full manifest pull operates on the independent ManifestPull AIMD window, so a throttled HEAD does not delay the authoritative GET path.
 
 ### Relationship to head_first
+
+> **Status: Planned.** The `head_first` per-registry option is designed but not yet implemented. The discovery HEAD optimization described above is implemented.
 
 The transfer optimization spec defines a per-registry `head_first` option to conserve rate-limit tokens. The discovery HEAD serves a different purpose: detecting source changes cheaply. These are independent features that happen to use the same HTTP method. When both are active, the discovery HEAD result is reused to avoid a redundant second HEAD.
 
@@ -180,7 +178,7 @@ For CronJob + PVC deployments, the pod mounts a ReadWriteOnce PVC and the cache 
 
 ### Cache format versioning
 
-The tag digest cache extends the existing transfer state cache format. The cache version increments from v1 to v2, with the new source snapshot map appended after the existing blob dedup map. Reads accept both v1 and v2: a v1 cache loads with an empty snapshot map, preserving blob dedup data across the version transition. An older binary encountering a v2 cache falls back to empty cache, which is the existing behavior for version mismatches. The same TTL and atomic write (tmp + rename + fsync) apply to both sections.
+The tag digest cache extends the existing [transfer state cache](./engine#transfer-state-cache) format. The cache version will increment from v1 to v2 when the source snapshot map is added, with the new source snapshot map appended after the existing blob dedup map. Reads accept both v1 and v2: a v1 cache loads with an empty snapshot map, preserving blob dedup data across the version transition. An older binary encountering a v2 cache falls back to empty cache, which is the existing behavior for version mismatches. The same TTL and atomic write (tmp + rename + fsync) apply to both sections.
 
 ### Observability
 

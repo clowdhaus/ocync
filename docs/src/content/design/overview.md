@@ -23,26 +23,13 @@ When these conflict, the higher-priority axis wins. A mount that saves bytes but
 
 `ocync` runs on a single-threaded tokio runtime (`current_thread`). The workload is ~100% network I/O - hundreds of concurrent futures spend >99% of wall-clock time awaiting HTTP responses from registries. A single OS thread handles all of them without context-switch overhead, lock contention, or `Send`/`Sync` bound infection.
 
-Shared mutable state uses `Rc<RefCell<>>` instead of `Arc<Mutex<>>`. This is a deliberate choice:
-
-- **Zero synchronization overhead.** `RefCell` is a compile-time borrow check with a runtime flag. `Mutex` is a kernel-mediated lock. For a single-threaded program, the mutex is pure waste.
-- **Static prevention of threading bugs.** `Rc` is `!Send`, which means the compiler rejects any attempt to use `tokio::spawn` (which requires `Send`). All concurrency uses `FuturesUnordered` with async move blocks, which run cooperatively on the current thread. You cannot accidentally introduce a data race.
-- **Kubernetes resource alignment.** A single-threaded process maps directly to `resources.requests.cpu: 100m` in Kubernetes. There is no multi-core scaling to tune, no thread pool to size, and no gap between requested and utilized CPU. The process uses exactly what it asks for.
-
-The one CPU-bound operation - SHA-256 digest computation - processes ~1.5 GB/s via aws-lc-rs. A 4 MB chunk takes ~2.7 ms, well within tokio's 10 ms cooperative scheduling budget. Cache deserialization (up to 8 MB) uses `spawn_blocking` to avoid blocking the event loop on startup.
-
-If layer recompression (gzip to zstd) ships, the migration to multi-threaded is mechanical: `Rc` to `Arc`, `RefCell` to `RwLock`, add `Send` bounds. This is a one-day refactor, not a decision that needs to be made now.
+Engine-level shared mutable state uses `Rc<RefCell<>>` instead of `Arc<Mutex<>>` -- zero synchronization overhead, static prevention of threading bugs (`Rc` is `!Send`, rejecting accidental `tokio::spawn`), and direct Kubernetes resource alignment (`cpu: 100m` maps exactly to one thread). The distribution layer's AIMD controller uses `std::sync::Mutex` because it must be `Sync` inside `Arc<RegistryClient>`; the lock is never held across `.await` points, so contention is impossible on `current_thread`. The one CPU-bound operation (SHA-256 at ~1.5 GB/s via aws-lc-rs) stays within tokio's cooperative scheduling budget. If layer recompression ships, the migration to multi-threaded is mechanical (`Rc` to `Arc`, `RefCell` to `RwLock`, add `Send` bounds).
 
 ## Pipeline architecture
 
 ### Why pipelining matters
 
-The naive approach to sync is three sequential phases: discover all images, plan all transfers, execute all transfers. This wastes time in two ways:
-
-1. **Discovery latency is hidden.** For Chainguard (no rate limits), discovery of 200+ multi-arch images takes ~10-20 seconds. For Docker Hub (200 manifest GETs per 6 hours), discovery can take hours. In plan-then-execute, execution waits for all of this.
-2. **The cache starts empty.** In plan-then-execute, all blob HEAD checks happen before any transfers, so the transfer state cache is empty during planning. Shared base layers are checked N times instead of once.
-
-`ocync` uses a pipelined architecture where discovery and execution overlap:
+The naive approach -- discover all images, plan all transfers, execute all transfers -- wastes time because execution waits for all discovery to complete (10-20 seconds for Chainguard, hours for Docker Hub) and the transfer state cache is empty during planning. `ocync` uses a pipelined architecture where discovery and execution overlap:
 
 ```
                      +-------------------------------------------------+
@@ -52,7 +39,7 @@ The naive approach to sync is three sequential phases: discover all images, plan
                      |   Source manifest pull + target HEAD per tag    |
                      |            |                                    |
                      |            v                                    |
-                     |   Pending queue (VecDeque<ActiveItem>)          |
+                     |   Pending queue (VecDeque<TransferTask>)         |
                      |            |                                    |
                      |            v                                    |
                      | Execution pool (FuturesUnordered):              |
@@ -60,39 +47,25 @@ The naive approach to sync is three sequential phases: discover all images, plan
                      +-------------------------------------------------+
 ```
 
-The `select!` loop uses `biased;` to prefer execution completions (freeing semaphore permits for pending items) over new discovery results. Emptiness guards (`if !pool.is_empty()`) on every branch prevent busy-looping - an empty `FuturesUnordered` returns `Poll::Ready(None)` immediately, which without guards would spin the CPU while the other pool has legitimate work.
-
-Execution begins after ~1 second of discovery instead of waiting 10-20 seconds. For Docker Hub as a source, execution proceeds on already-discovered images while discovery is rate-limited over hours.
+The `select!` loop uses `biased;` to prefer execution completions over new discovery results, maximizing throughput. Execution begins after ~1 second of discovery instead of waiting for all images to be enumerated. See [pipeline architecture in the engine doc](./engine#pipeline-architecture) for select loop discipline and backpressure details.
 
 ### Progressive cache population
 
-Early transfers teach the cache about blob locations. Later images benefit from accumulated knowledge. Consider 100 images sharing 20 base layers across 15 repos on one target:
-
-- **Plan-then-execute:** 300 HEAD checks upfront (all blobs unknown)
-- **Pipeline:** 20 HEAD checks (first encounter per blob) + 280 direct mounts from cache (zero discovery)
-
-The pipeline saves 280 API calls because each transfer populates the cache for subsequent images.
+Early transfers teach the cache about blob locations. Later images benefit from accumulated knowledge -- the pipeline saves hundreds of API calls compared to plan-then-execute by populating the cache as work proceeds. See [progressive cache population in the engine doc](./engine#progressive-cache-population-amplified-by-pipelining) for scale examples.
 
 ### Frequency ordering
 
-Within each image, blobs are transferred in descending order of reference count across all discovered images. The Alpine base layer (referenced by 80 images) is pushed before the nginx config layer (referenced by 5) before the app binary layer (referenced by 1).
-
-This is the Nix store's closure-ordered transfer strategy applied to OCI blobs. On crash or interruption, the most-shared blobs have been pushed first, providing maximum mount opportunities for the next run.
+Within each image, blobs are transferred in descending order of reference count across all discovered images. On crash or interruption, the most-shared blobs have been pushed first, providing maximum mount opportunities for the next run. See [frequency ordering in the engine doc](./engine#frequency-ordering) for details.
 
 ## Adaptive concurrency (AIMD)
 
-Static concurrency limits force operators to guess at registry capacity. Too low wastes throughput. Too high triggers rate-limit storms. `ocync` discovers actual capacity through feedback.
+Static concurrency limits force operators to guess at registry capacity. Too low wastes throughput. Too high triggers rate-limit storms. `ocync` discovers actual capacity through feedback using per-(registry, action) AIMD windows (Additive Increase, Multiplicative Decrease):
 
-### Per-(registry, action) windows
+- **On success:** `window += 1.0 / window` (fractional increase)
+- **On 429:** `window /= 2` (multiplicative decrease, once per congestion epoch)
+- **Initial window:** 5.0, **Cap:** `max_concurrent` per registry (default 50)
 
-Each registry action type gets its own independent concurrency window using AIMD (Additive Increase, Multiplicative Decrease):
-
-- **On success:** `window += 1.0 / window` (fractional increase - one full window of successes to grow by 1)
-- **On 429:** `window /= 2` (multiplicative decrease - but only once per congestion epoch)
-- **Initial window:** 5.0 (conservative start)
-- **Cap:** `max_concurrent` per registry config (default 50)
-
-From initial 5.0, the window reaches 50 in ~1,200 successful responses. If the registry throttles at 30 concurrent, the controller oscillates between ~15 and ~30 (the classic AIMD sawtooth), settling to an effective average of ~22.5.
+If the registry throttles at 30 concurrent, the controller oscillates between ~15 and ~30 (the classic AIMD sawtooth), settling to an effective average of ~22.5. See [AIMD formula in the engine doc](./engine#aimd-formula) for the full derivation.
 
 ### Why per-action, not per-host
 
@@ -105,151 +78,41 @@ ECR rate limits vary dramatically by API action:
 | `CompleteLayerUpload` (session finish) | 100 TPS |
 | `PutImage` (manifest push) | 10 TPS |
 
-A 429 on `PutImage` (10 TPS) must not throttle `UploadLayerPart` (500 TPS). With a single per-host window, one slow action starves all fast actions. With per-action windows, each adapts independently.
+A 429 on `PutImage` must not throttle `UploadLayerPart`. Per-action windows ensure each adapts independently.
 
-The window grouping is registry-specific:
-
-| Registry | Windows | Rationale |
-|---|---|---|
-| ECR | 9 (one per OCI action) | Each action has distinct TPS limits |
-| Docker Hub | 3 (HEAD free, manifest-read metered, others shared) | HEAD is unmetered; manifest GETs count against pull quota |
-| GAR | 1 (all shared) | Per-project shared quota across all operation types |
-| Unknown | 5 (coarse groups) | HEAD, read, upload, manifest-write, tag-list |
-
-### Congestion epochs
-
-When 10 concurrent futures hit a rate limit simultaneously, each 429 arrives in a separate event loop tick. Without protection, each independently halves the window: `50 -> 25 -> 12.5 -> 6.25 -> 3.1 -> 1.0` - catastrophic collapse from a single capacity event.
-
-The fix is TCP Reno's congestion epoch: each window tracks `last_decrease: Instant`. On 429, halve only if `now - last_decrease > 100ms` (approximating one cloud API RTT). Ten simultaneous 429s cause exactly one halving (50 -> 25), not ten (50 -> 1). This adds two fields per window and a single branch in the decrease path.
-
-### Three-level concurrency hierarchy
-
-Concurrency is controlled at three levels that compose via dual permit acquisition:
-
-1. **Global image semaphore** (`max_concurrent_transfers`, default 50) - bounds in-flight `(tag, target)` pairs. Prevents memory explosion regardless of how many registries are configured.
-2. **Per-registry aggregate semaphore** (`max_concurrent` per registry, default 50) - bounds total HTTP requests to a single host. Safety ceiling for connection and memory pressure.
-3. **Per-(registry, action) AIMD windows** - each action adapts independently within the aggregate ceiling.
-
-Every HTTP request acquires permits from levels 2 and 3. Slow actions (PutImage at 10 TPS) release aggregate permits promptly, so fast actions (UploadLayerPart at 500 TPS) are never starved.
+Window grouping is registry-specific (ECR uses 9 windows matching its per-action TPS limits; Docker Hub uses 3 to separate free HEADs from metered manifest GETs; GAR uses 1 shared window). Congestion epochs prevent catastrophic window collapse when multiple 429s arrive simultaneously (TCP Reno's approach -- halve once per epoch, not once per response). Concurrency is controlled at three levels -- global image semaphore, per-registry aggregate semaphore, and per-action AIMD windows -- composing via dual permit acquisition. See [per-registry window groupings](./engine#per-registry-window-groupings), [congestion epochs](./engine#congestion-epochs), and [three-level hierarchy](./engine#three-level-hierarchy) in the engine doc.
 
 ## Cross-repo blob mounting
 
-When a blob already exists in another repository on the same target registry, OCI registries can "mount" it - creating a reference without transferring any data. Zero bytes over the wire.
+When a blob already exists in another repository on the same target registry, OCI registries can "mount" it -- zero bytes over the wire. `ocync` maximizes mount success through leader-follower election and wave-based execution. See [cross-repo blob mounting in the engine doc](./engine#cross-repo-blob-mounting) for the full implementation.
 
 ### Leader-follower election
 
-Multiple images in a sync run often share base layers. If all images push independently, shared blobs are uploaded N times. `ocync` uses leader-follower election to ensure shared blobs are uploaded once and mounted everywhere else.
-
-The `elect_leaders()` function uses a greedy set-cover algorithm over shared blob digests:
-
-1. Build a map of `blob_digest -> set of images that need it`
-2. Greedily select the image that covers the most uncovered blobs (the leader)
-3. All other images sharing those blobs become followers
-4. Repeat until all shared blobs are covered
-
-This provably covers every shared blob. There is no "uncovered follower" path - all followers' shared blobs are in the leader's blob union.
+Multiple images in a sync run often share base layers. If all images push independently, shared blobs are uploaded N times. `ocync` uses leader-follower election via a greedy set-cover algorithm (`elect_leaders()`) to ensure shared blobs are uploaded once by leaders and mounted everywhere else by followers. The algorithm provably covers every shared blob -- there is no "uncovered follower" path. See [leader-follower election in the engine doc](./engine#leader-follower-election) for the algorithm details.
 
 ### Wave promotion
 
-Followers cannot mount from a leader until the leader's manifest is committed (ECR requires a committed manifest for mount to succeed). The engine uses wave-based promotion:
-
-- **Wave 1:** Leader images execute first. Their blobs are uploaded, manifests committed.
-- **Wave 2:** Follower images execute. Shared blobs are mounted from leader repos (zero transfer). Only unique blobs need uploading.
+Followers cannot mount from a leader until the leader's manifest is committed. The engine uses two-wave execution: leaders upload and commit first, then followers mount shared blobs from leader repos at zero transfer cost. See [wave promotion in the engine doc](./engine#wave-promotion) for details.
 
 ### ECR BLOB_MOUNTING
 
-ECR requires an opt-in account setting (`BLOB_MOUNTING=ENABLED`, launched January 2026) for cross-repo mount to succeed. When enabled, mount POST returns 201 if:
+ECR requires an opt-in account setting (`BLOB_MOUNTING=ENABLED`, launched January 2026) for cross-repo mount to succeed. Mount POST returns 201 when the `from` repo has a committed manifest, both repos use identical encryption, and both are in the same account and region. Without `BLOB_MOUNTING` enabled, ECR returns 202 and starts a regular upload; `ocync` detects this and falls through to the standard upload path. See [ECR blob mounting in the engine doc](./engine#ecr-blob-mounting) for full requirements.
 
-1. The `from` repo has a committed manifest referencing the blob
-2. Both repos use identical encryption configuration
-3. Same account and same region
-
-Without `BLOB_MOUNTING` enabled (or for standalone blobs without manifests), ECR returns 202 and starts a regular upload session. `ocync` detects this and falls through to the standard upload path.
-
-### Measured impact
-
-On a 5-image Jupyter corpus (cold sync to ECR):
-
-| Metric | Before (no leader-follower) | After |
-|---|---:|---:|
-| Requests | 1,049 | **591** (44% fewer) |
-| Response bytes | 11.5 GB | **4.9 GB** (57% fewer) |
-| Wall clock | 217.9s | **56.8s** (3.8x faster) |
-| Mount success | 0/0 | **192/192** (100%) |
-
-The 57% byte reduction comes from cross-image blob dedup (source blobs pulled once via staging) and 100% mount success (followers mount from leaders). The 3.8x wall-clock improvement comes from both the byte reduction and intra-image blob concurrency (6 concurrent blobs per image).
+In testing (5-image Jupyter corpus, cold sync to ECR), leader-follower election reduced requests by 44%, response bytes by 57%, and improved wall clock by 3.8x with 100% mount success. See [measured impact in the engine doc](./engine#measured-impact) for the full breakdown.
 
 ## Transfer state cache
 
-The cache eliminates redundant API calls by recording what is known about blob locations across all targets.
+The cache eliminates redundant API calls by recording what is known about blob locations across all targets. A two-tier design provides both within-run and cross-run knowledge:
 
-### Two-tier design
+**Tier 1 - hot cache (in-memory).** Populated by every transfer, mount, and HEAD check via `Rc<RefCell<>>`. The 3-step lookup drives all blob transfer decisions: (1) known at this repo -- skip, (2) known at a different repo on the same target -- mount, (3) unknown -- HEAD check and record. Step 2 is the key optimization: the cache tracks which repositories contain each blob, enabling direct mount without a HEAD check.
 
-**Tier 1 - hot cache (in-memory, within-run).** Populated by every transfer, mount, and HEAD check. Shared across all images via `Rc<RefCell<>>`.
+**Tier 2 - warm cache (persistent disk).** Serialized on sync completion using binary format (~1 MB at typical scale). Only confirmed states are persisted. The warm cache enables CronJob deployments to skip HEAD checks for known blobs on every run.
 
-The lookup sequence for each blob:
-1. Cache says blob exists at this repo on this target -> **skip** (0 API calls)
-2. Cache says blob exists at a *different* repo on this target -> **mount** (1 API call)
-3. Unknown -> **HEAD check** at target, record result (1 API call)
-
-Step 2 is the key: the cache tracks which repositories at each target registry are known to contain each blob. When mounting, any known repo can serve as the `from` parameter.
-
-**Tier 2 - warm cache (persistent disk, cross-run).** Serialized to disk on sync completion using binary format (postcard + CRC32 integrity check). At typical scale (~50K entries), the file is ~1 MB and loads in <5 ms. At extreme scale (600K entries), ~8 MB with sub-100ms load.
-
-Only confirmed states (`ExistsAtTarget`, `Completed`) are persisted. Transient states (`InProgress`, `Failed`) are stripped before serialization. The warm cache enables CronJob deployments to skip HEAD checks for known blobs on every run.
-
-### Lazy invalidation
-
-The cache may become stale - ECR lifecycle policies can delete images, external actors can remove blobs. Rather than TTL-expiring entries proactively, stale entries self-heal:
-
-1. Mount or push fails for a blob the cache claims exists
-2. Entry is invalidated
-3. Operation falls back to fresh HEAD check and standard upload
-
-This is zero-configuration and handles all staleness scenarios (lifecycle policies, manual deletion, registry GC between runs). An optional `cache_ttl` provides an additional safety net.
+Stale entries self-heal via lazy invalidation: failed mounts or pushes invalidate the entry and fall back to fresh HEAD checks. See [transfer state cache in the engine doc](./engine#transfer-state-cache) for persistence rules, corruption detection, cold start behavior, and [lazy invalidation](./engine#lazy-invalidation).
 
 ## Streaming transfers
 
-### Single-target: zero disk
-
-Bytes flow directly from source registry to target registry with no intermediate storage:
-
-```
-source GET -> [byte stream] -> target PUT
-                  |
-            SHA-256 on-the-fly
-```
-
-Memory usage is bounded by chunk size per active upload stream. The default upload strategy is POST + streaming PUT with `Transfer-Encoding: chunked` - two HTTP requests per blob, zero buffering.
-
-### Multi-target: content-addressable staging
-
-When a mapping has multiple targets (e.g., us-ecr + eu-ecr + ap-ecr), re-pulling each blob from source for each target wastes bandwidth. For a 2 GB ML layer across 3 regions: 6 GB source bandwidth instead of 2 GB.
-
-`ocync` pulls each source blob once and writes it to a content-addressable disk file:
-
-```
-source GET -> {cache_dir}/blobs/sha256/{hex_digest}
-                      |
-        target 1 push <- read from disk
-        target 2 push <- read from disk
-        target N push <- read from disk
-```
-
-Writes use an atomic protocol (tmp file -> fsync -> rename -> dir fsync) for crash safety. Reads happen milliseconds after writes, so the data stays in OS page cache at memory speed (~4+ GB/s). The "disk penalty" is fictional for recently-written files.
-
-Single-target deployments pay zero overhead - `BlobStage::disabled()` is a no-op with no disk writes, no eviction logic, no staging paths.
-
-### Upload strategy per registry
-
-Registries vary in upload protocol support. `ocync` adapts automatically:
-
-| Registry | Strategy | Requests/blob | Notes |
-|---|---|:---:|---|
-| ECR, Docker Hub, Harbor, Quay | POST + streaming PUT | 2 | Default path |
-| GHCR | POST + single PATCH + PUT | 3 | Multi-PATCH broken (last chunk overwrites all previous) |
-| GAR | POST + buffered monolithic PUT | 2 | No PATCH support at all |
-| ACR | POST + chunked PATCH + PUT | 3 | Streaming PUT body limit ~20 MB; chunked for larger blobs |
+For single-target mappings, bytes stream directly from source to target with no disk I/O -- two HTTP requests per blob (POST + streaming PUT), memory bounded by chunk size. For multi-target mappings (e.g., us-ecr + eu-ecr + ap-ecr), `ocync` pulls each source blob once and writes it to a content-addressable disk file; all target pushes read from disk independently, with recently-written data served from OS page cache at memory speed. Single-target deployments pay zero staging overhead. See [streaming transfers and staging](./engine#streaming-transfers-and-staging) and [upload strategy per registry](./engine#upload-strategy-per-registry) in the engine doc.
 
 ## Registry behavior
 
@@ -259,7 +122,7 @@ Registries vary in upload protocol support. `ocync` adapts automatically:
 |---|---|---|---|
 | ECR (private) | Yes (opt-in, same account/region) | Yes (BatchCheck, BatchGet, ListImages) | Per-action TPS (10-3000) |
 | ECR Public | No | Partial (BatchCheck only) | Separate from private |
-| Docker Hub | Yes (implicit global dedup) | No | 100/hr authed manifest GETs; HEADs free |
+| Docker Hub | Yes (implicit global dedup) | No | 200-pull/6h authed manifest GETs; HEADs free |
 | GAR | No | No | Per-project shared quota |
 | GHCR | Yes (implicit global dedup) | No | GitHub API rate limit |
 | ACR | Yes | No | Per-registry |
@@ -267,27 +130,17 @@ Registries vary in upload protocol support. `ocync` adapts automatically:
 
 ### Docker Hub rate limits
 
-Docker Hub tightened limits in April 2025:
-
-| Tier | Limit |
-|---|---|
-| Anonymous | 10 pulls/hour/IP |
-| Authenticated free | 100 pulls/hour |
-| Pro/Team/Business | Unlimited (fair use) |
-
-What counts: manifest GET only. Blob GETs are free (CDN-served). Manifest HEADs are free but subject to a separate abuse limit (~314 in 8 minutes triggers 429). Rate limit headers (`ratelimit-remaining`) appear on both GET and HEAD responses.
-
-Authentication is mandatory for any serious sync workload.
+Docker Hub tightened limits in April 2025: 10 pulls/hour anonymous, 200 pulls/6 hours authenticated free, unlimited for paid tiers. Only manifest GETs count; blob GETs are free (CDN-served) and manifest HEADs are free (subject to a separate abuse limit). Authentication is mandatory for any serious sync workload.
 
 ### ECR rate limits
 
-The 50:1 ratio between `UploadLayerPart` (500 TPS) and `PutImage` (10 TPS) means blob uploads can saturate while manifest pushes trickle. For 50 multi-arch images (550 PutImage calls), the minimum is 55 seconds at 10 TPS per region. This is why per-action AIMD windows matter - a single per-host window would let PutImage throttling stall all blob uploads.
+The 50:1 ratio between `UploadLayerPart` (500 TPS) and `PutImage` (10 TPS) means blob uploads can saturate while manifest pushes trickle. This is why per-action AIMD windows matter -- a single per-host window would let PutImage throttling stall all blob uploads.
 
 ## Competitive position
 
 See [Performance](../performance) for the full benchmark table. Summary (39 images, 51 tags, cold sync to ECR on c6in.4xlarge):
 
-- **3.6-4.5x faster** wall clock than comparable tools
+- **4x faster** wall clock than comparable tools
 - **25-38% fewer API requests** through global blob dedup and mount-first strategy
 - **Cross-repo blob mounting** avoids re-pulling shared layers from source (95.6% mount success rate)
 - **Zero duplicate blob GETs** (source-pull dedup via staging)
@@ -307,15 +160,7 @@ For large sync runs (hundreds of images, multi-GB layers), increase memory to `5
 
 ### Graceful shutdown
 
-On SIGTERM or SIGINT:
-
-1. Stop promoting new work from the pending queue
-2. Stop polling discovery futures
-3. Drain in-flight execution futures until completion or deadline
-4. Persist transfer state cache to disk (highest-value action - losing cache costs minutes of redundant HEAD checks on next run)
-5. Exit with appropriate code
-
-Default drain deadline: 25 seconds, chosen to fit within Kubernetes' default 30-second `terminationGracePeriodSeconds` with 5 seconds of margin. The `select!` drain branch guards on `!execution_futures.is_empty()` so the engine exits immediately when all work completes rather than waiting for the full deadline.
+On SIGTERM or SIGINT, the engine stops accepting new work, drains in-flight transfers with a 25-second deadline (fitting Kubernetes' default 30s `terminationGracePeriodSeconds`), and persists the transfer state cache to disk. See [graceful shutdown in the engine doc](./engine#graceful-shutdown) for the full 5-step sequence.
 
 ### Deployment modes
 
@@ -325,7 +170,7 @@ Default drain deadline: 25 seconds, chosen to fit within Kubernetes' default 30-
 | **Watch** | `Deployment` + `ocync watch` | Continuous sync with health endpoints and config reload |
 | **One-shot** | `Job` | CI-triggered, manual, or initial seeding |
 
-Watch mode exposes `/healthz` (liveness) and `/readyz` (readiness) endpoints. Readiness reports 503 if the last sync cycle did not complete within `2 * interval`. SIGHUP triggers config reload without restart.
+Watch mode exposes `/healthz` (liveness) and `/readyz` (readiness) endpoints.
 
 ### FIPS 140-3
 
@@ -338,6 +183,8 @@ At startup, `install_crypto_provider()` registers `aws-lc-rs` as the process-wid
 macOS and Windows builds use `--no-default-features --features non-fips` (standard aws-lc-rs without FIPS mode) since FIPS certification is only relevant for Linux server deployments.
 
 ## OCI artifacts and referrers
+
+> **Status: Partially implemented.** The referrers API client (`RegistryClient::referrers()`) and OCI `subject` field types exist in the distribution crate. The artifact sync orchestration (discovery, transfer ordering, `require_artifacts`, and configuration) described below is planned.
 
 OCI 1.1 introduced the referrers API for attaching artifacts (signatures, SBOMs, attestations) to container images. Each artifact manifest includes a `subject` field referencing the parent image digest. This creates a discoverable graph of metadata without polluting the tag namespace.
 
@@ -398,6 +245,8 @@ This two-step fallback ensures artifact sync works across the widest range of re
 
 ## Manifest format preservation
 
+> **Status: Planned.** Manifest format configuration (`manifest_format` per-registry override, format conversion) is designed but not yet implemented. The engine currently preserves manifest bytes verbatim (the `preserve` default behavior).
+
 ### Problem
 
 Pushing a Docker v2 Schema 2 manifest to a registry expecting OCI format (or vice versa) changes the digest. The manifest bytes are different, so the SHA-256 is different, so the content-addressable identity of the image changes. Some registries reject manifests with unexpected media types entirely. Existing tools handle this poorly: digests change silently or copies fail with opaque errors.
@@ -427,7 +276,7 @@ registries:
 
 When pushing to an ECR repository with `image_tag_mutability: IMMUTABLE`, pushing an existing tag returns `ImageTagAlreadyExistsException`. `ocync` treats this as **success** because the image is already there with that tag. The exception is logged at DEBUG level (not an error, not even a warning) and the image is marked as skipped with reason `tag_immutable_exists`.
 
-This makes re-runs fully idempotent without requiring `skip_existing: true`. A sync that is interrupted and restarted will pick up where it left off, and tags that were already pushed in the previous partial run are silently accepted.
+This makes re-runs fully idempotent. A sync that is interrupted and restarted will pick up where it left off, and tags that were already pushed in the previous partial run are silently accepted.
 
 ## Platform subset filtering
 
@@ -454,9 +303,11 @@ If a requested platform is not available in the source image index, `ocync` logs
 
 If **zero** requested platforms match any manifest in the source index, `ocync` returns an error with actionable context: the configured platform filter, the platforms actually available in the source index, and the source reference. An empty filtered index is never pushed to targets because it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading into an unusable state.
 
+> **Status: Partially implemented.** Default HEAD + digest compare is implemented. The `immutable_tags` optimization described below is designed but not yet implemented.
+
 ## Skip optimization hierarchy
 
-When deciding whether to sync a tag, `ocync` evaluates three tiers in order. The first match wins.
+When deciding whether to sync a tag, `ocync` evaluates two tiers in order. The first match wins.
 
 ### Tier 1: immutable_tags pattern match (0 API calls)
 
@@ -470,18 +321,7 @@ When a tag matches the `immutable_tags` glob pattern AND the tag name appears in
 
 Semver tags (`v1.2.3`, `3.12.1`) are conventionally immutable. Once a version is published, changing its contents breaks every consumer that pinned to it. The convention is strong enough that checking their digest on every sync run is waste. Operators who use mutable semver tags (uncommon but not unheard of) should not configure `immutable_tags`.
 
-### Tier 2: skip_existing (1 API call, digest ignored)
-
-```yaml
-mappings:
-  - from: library/redis
-    to: mirror/redis
-    skip_existing: true
-```
-
-When `skip_existing: true` is set: send a manifest HEAD request. If the target returns 200 (tag exists), skip. The digest is NOT compared; any version of the image at that tag is considered sufficient. Use case: mirrors where initial population is the goal, not keeping tags updated with source changes.
-
-### Tier 3: default HEAD + digest compare
+### Tier 2: default HEAD + digest compare
 
 The default behavior. Send a manifest HEAD to the target. Compare the digest with the source manifest digest. Same digest means the image is unchanged, so skip. Different digest means the image was updated at source, so sync the new version. 404 means the tag does not exist at the target, so sync it.
 
@@ -502,21 +342,17 @@ These are explicit non-goals, listed with rationale for each.
 - **No image building.** `ocync` syncs existing images. Building is a separate concern with separate tooling.
 - **No signature verification.** `ocync` transfers signatures faithfully but does NOT verify them. Verification is the consumer's responsibility. A sync tool that verifies signatures would need to manage trust roots, which is out of scope.
 - **No Docker daemon integration.** Pure OCI Distribution API only. The Docker daemon is a local concern; registry sync is a remote-to-remote operation.
-- **No skopeo dependency.** Everything is native Rust over HTTPS. No subprocess calls, no shell-out, no binary dependency to version-match.
+- **No external tool dependencies.** Everything is native Rust over HTTPS. No subprocess calls, no shell-out, no binary dependency to version-match.
 - **No local disk buffering.** Blobs stream source to target without touching disk (single-target mode). Multi-target mode uses content-addressable staging, but single-target deployments pay zero disk I/O.
 - **No date sort.** Date-based sorting requires O(n) manifest + config fetches to retrieve creation timestamps, which is prohibitively expensive for large tag sets. A repository with 2,000 tags would need 2,000 additional API calls just to sort. Use `alpha` for date-stamped tags (YYYYMMDD sorts correctly in lexicographic order).
-- **No OTLP export (v1).** Prometheus metrics are the priority. OTLP is deferred to a future version.
+- **No OTLP or Prometheus export (v1).** Structured JSON output is the v1 observability surface. OTLP and Prometheus export are not planned for v1.
 - **No per-mapping schedules in watch mode.** One global interval for simplicity and predictability. Per-mapping schedules create complex interactions (overlapping syncs to the same target, uneven resource usage) for marginal benefit.
 
 ## Output philosophy
 
 **Silence means success.** Output means action was taken or something went wrong. Anything expected and successful is silent.
 
-Existing tools get this catastrophically wrong:
-
-- **skopeo** dumps walls of "existing blob" messages. Every blob that already exists at the target produces a line of output. A sync of 50 images where 47 are unchanged produces hundreds of lines that communicate nothing actionable.
-- **`regsync`** floods with repeated status noise, emitting progress updates for every operation regardless of whether the operator needs to act on them.
-- **`dregsy`** swallows errors while being verbose about everything else. The one category of output that demands attention is the one it suppresses.
+Existing tools get this catastrophically wrong: some dump walls of "existing blob" messages for every blob that already exists at the target, producing hundreds of lines that communicate nothing actionable. Others flood with repeated status noise regardless of whether the operator needs to act. Others swallow errors while being verbose about everything else -- the one category of output that demands attention is the one they suppress.
 
 A successful `ocync` sync of 50 images where 47 are unchanged produces the summary only, not 500 lines of noise:
 

@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: How ocync achieves 3.6-4.5x faster sync than comparable tools with fewer requests and cross-repo blob mounting.
+description: How ocync achieves 4x faster sync than comparable tools with fewer requests and cross-repo blob mounting.
 order: 6
 ---
 
@@ -23,6 +23,56 @@ Measured 2026-04-19 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps). F
 | Rate-limit 429s | **0** | **0** | **0** |
 <!-- BENCH:END -->
 
+## How tools compare
+
+### Upload strategy
+
+| Tool | Strategy | Requests/blob | Buffering |
+|------|---------|:---:|-----------|
+| `ocync` | POST + streaming PUT | 2 | None (streamed) |
+| containerd | POST + streaming PUT | 2 | None (io.Pipe) |
+| regsync (regclient) | POST + PUT | 2 | None (streamed) |
+| crane (go-containerregistry) | POST + streaming PATCH + PUT | 3 | None (streamed) |
+| skopeo (containers/image) | POST + PATCH + PUT | 3 | None (streamed) |
+
+### Concurrency and rate limiting
+
+| Tool | Default concurrency | Adaptive backoff | Rate limit strategy |
+|------|:---:|:---:|-----|
+| `ocync` | 5 initial, 50 cap ([AIMD](../design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](../design/overview#adaptive-concurrency-aimd) congestion control on 429 |
+| containerd | 3 layers | No | Lock-based dedup, retries on 429 (no backoff) |
+| regsync | 3 per registry | No | Reads `RateLimit-Remaining` header, pauses proactively |
+| crane | 4 jobs | Retry with backoff (0.1s-0.9s transport, 1s-9s operation) | Retry on 408/5xx, 3 attempts |
+| skopeo | 6 layers | Yes (exponential, 2s-60s) | Retries 429 for GET/HEAD; uploads not retried |
+
+### Blob deduplication
+
+| Tool | Cross-image push dedup | Cross-image pull dedup | Persistent cache |
+|------|:---:|:---:|:---:|
+| `ocync` | Yes (TransferStateCache) | Yes (BlobStage) | Yes (postcard binary) |
+| containerd | Yes (StatusTracker) | No | No |
+| regsync | No | No | No (in-memory only) |
+| crane | Yes (sync.Map by digest) | No | No |
+| skopeo | No | No | SQLite BlobInfoCache (mount hints) |
+
+### Warm sync efficiency
+
+<!-- BENCH-WARM:START -->
+Measured 2026-04-20 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 39 images, 51 tags. Warm sync (no changes) to ECR us-east-1. All traffic routed through bench-proxy for byte-accurate measurement.
+
+| Metric | `ocync` | `dregsy` | `regsync` |
+|---|---:|---:|---:|
+| Wall clock | 2m 32s | 1m 43s | **12s** |
+| Peak RSS | 22.2 MB | 33.9 MB | **21.0 MB** |
+| Requests | 925 | 3,145 | **169** |
+| Response bytes | 23.3 MB | 1.9 MB | **119.9 KB** |
+| Source blob GETs | **0** | 227 | **0** |
+| Source blob bytes | 23.3 MB | 1.9 MB | **119.9 KB** |
+| Mounts (success/attempt) | **0/0** | **0/0** | **0/0** |
+| Duplicate blob GETs | **0** | **0** | **0** |
+| Rate-limit 429s | **0** | **0** | **0** |
+<!-- BENCH-WARM:END -->
+
 ## Why `ocync` is fast
 
 ### Pipelined architecture
@@ -31,7 +81,7 @@ Discovery and execution overlap. While images are being transferred, `ocync` is 
 
 ### Global blob deduplication
 
-Container images share layers heavily. A sync run touching 42 images may reference only a fraction as many unique blobs. `ocync` tracks every blob globally and transfers each unique blob exactly once.
+Container images share layers heavily. A sync run touching 39 images may reference only a fraction as many unique blobs. `ocync` tracks every blob globally and transfers each unique blob exactly once.
 
 ### Cross-repo blob mounting
 

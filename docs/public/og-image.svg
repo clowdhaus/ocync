@@ -68,16 +68,16 @@
   <!-- Stat card 1: Speed -->
   <rect x="620" y="70" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="115" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#06b6d4" letter-spacing="2">SPEED</text>
-  <text x="660" y="170" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#cyan-grad)">8x</text>
+  <text x="660" y="170" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#cyan-grad)">4x</text>
   <text x="810" y="155" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">faster than</text>
   <text x="810" y="180" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">alternatives</text>
 
   <!-- Stat card 2: Efficiency -->
   <rect x="620" y="230" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="275" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#a855f7" letter-spacing="2">EFFICIENCY</text>
-  <text x="660" y="330" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#purple-grad)">60%</text>
-  <text x="845" y="315" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">fewer bytes</text>
-  <text x="845" y="340" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">transferred</text>
+  <text x="660" y="330" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#purple-grad)">40%</text>
+  <text x="845" y="315" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">fewer</text>
+  <text x="845" y="340" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">requests</text>
 
   <!-- Stat card 3: Reliability -->
   <rect x="620" y="390" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>

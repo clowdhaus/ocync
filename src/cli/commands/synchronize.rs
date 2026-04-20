@@ -350,7 +350,7 @@ pub(crate) async fn resolve_mapping(
     // --- Target repo ---
     let target_repo = mapping.to.as_deref().unwrap_or(&mapping.from).to_owned();
 
-    // --- Resolve platforms and skip_existing (mapping overrides defaults) ---
+    // --- Resolve platforms (mapping overrides defaults) ---
     let platform_strs = mapping
         .platforms
         .clone()
@@ -362,11 +362,6 @@ pub(crate) async fn resolve_mapping(
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;
-
-    let skip_existing = mapping
-        .skip_existing
-        .or_else(|| config.defaults.as_ref().and_then(|d| d.skip_existing))
-        .unwrap_or(false);
 
     let source_authority = source_client
         .registry_authority()
@@ -380,7 +375,6 @@ pub(crate) async fn resolve_mapping(
         targets,
         tags: filtered.into_iter().map(TagPair::same).collect(),
         platforms,
-        skip_existing,
     }))
 }
 

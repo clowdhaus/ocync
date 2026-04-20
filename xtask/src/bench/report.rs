@@ -11,7 +11,7 @@ use crate::bench::proxy::ProxyMetrics;
 /// Compact run record for the per-registry JSON archive.
 ///
 /// One record per benchmark execution. Designed for source control:
-/// small enough to accumulate, rich enough to cite in docs/findings.md.
+/// small enough to accumulate, rich enough to cite in docs/performance.md.
 ///
 /// When adding new fields, use `#[serde(default)]` so that old records
 /// (which lack the field) still deserialize.
@@ -60,7 +60,7 @@ pub(crate) struct CorpusInfo {
 /// One scenario's results in the compact run record.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ScenarioRecord {
-    /// Scenario name (e.g. `"Cold sync (median)"`).
+    /// Scenario name (e.g. `"Cold sync"`).
     pub(crate) name: String,
     /// Per-tool results.
     pub(crate) tools: Vec<ToolRecord>,
@@ -113,7 +113,7 @@ pub(crate) struct ToolRun {
 /// One scenario across all tools.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ScenarioResult {
-    /// Human-readable scenario name (e.g. "Cold sync (median)").
+    /// Human-readable scenario name (e.g. "Cold sync").
     pub(crate) scenario: String,
     /// Per-tool run results.
     pub(crate) runs: Vec<ToolRun>,
@@ -571,8 +571,12 @@ fn render_metric_table(columns: &[String], by_tool: &BTreeMap<&str, &ToolRun>, o
 /// Creates `summary.md` -- the human-readable comparison table with
 /// per-scenario metrics and winners bolded. Also updates the docs
 /// performance page (`docs/src/content/performance.md`) between
-/// `<!-- BENCH:START -->` / `<!-- BENCH:END -->` markers. The compact
-/// per-registry JSON archive is written separately by `append_record()`.
+/// scenario-specific marker pairs:
+/// - `<!-- BENCH:START -->` / `<!-- BENCH:END -->` for cold sync
+/// - `<!-- BENCH-WARM:START -->` / `<!-- BENCH-WARM:END -->` for warm sync
+///
+/// The compact per-registry JSON archive is written separately by
+/// `append_record()`.
 pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<(), String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
@@ -593,21 +597,19 @@ pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<()
     Ok(())
 }
 
-/// Generates the benchmark results snippet for the docs performance page.
+/// Generates a benchmark results snippet for one scenario.
 ///
-/// Produces a context header and the **first** scenario's comparison table.
-/// Only the first scenario (typically "Cold sync") appears on the docs page;
-/// the full multi-scenario breakdown lives in `summary.md`.
-fn performance_markdown(report: &BenchReport) -> Option<String> {
-    let scenario = report.scenarios.first()?;
+/// Produces a context header with `description` and the scenario's
+/// comparison table (metrics as rows, tools as columns, winners bolded).
+fn scenario_markdown(report: &BenchReport, scenario: &ScenarioResult, description: &str) -> String {
     let inst = &report.instance;
-
     let mut out = String::new();
 
     let memory_gib = inst.memory_mib as f64 / 1024.0;
     out.push_str(&format!(
         "Measured {date} on {inst_type} ({arch}, {vcpus} vCPUs, {mem:.0} GiB, {net}). \
-         Full corpus: {images} images, {tags} tags. Cold sync to ECR {region}.\n\n",
+         Full corpus: {images} images, {tags} tags. {description} to ECR {region}. \
+         All traffic routed through bench-proxy for byte-accurate measurement.\n\n",
         date = report.timestamp.get(..10).unwrap_or(&report.timestamp),
         inst_type = inst.instance_type,
         arch = inst.arch,
@@ -625,43 +627,105 @@ fn performance_markdown(report: &BenchReport) -> Option<String> {
 
     render_metric_table(&columns, &by_tool, &mut out);
 
-    Some(out)
+    out
 }
 
-const BENCH_START: &str = "<!-- BENCH:START -->";
-const BENCH_END: &str = "<!-- BENCH:END -->";
+/// Finds a scenario whose name starts with `prefix` (case-insensitive).
+fn find_scenario<'a>(report: &'a BenchReport, prefix: &str) -> Option<&'a ScenarioResult> {
+    let prefix_lower = prefix.to_lowercase();
+    report
+        .scenarios
+        .iter()
+        .find(|s| s.scenario.to_lowercase().starts_with(&prefix_lower))
+}
 
-/// Replaces content between `<!-- BENCH:START -->` and `<!-- BENCH:END -->`
-/// markers in the docs performance page with fresh benchmark results.
-fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+const BENCH_COLD_START: &str = "<!-- BENCH:START -->";
+const BENCH_COLD_END: &str = "<!-- BENCH:END -->";
+const BENCH_WARM_START: &str = "<!-- BENCH-WARM:START -->";
+const BENCH_WARM_END: &str = "<!-- BENCH-WARM:END -->";
 
-    let start = content
-        .find(BENCH_START)
-        .ok_or_else(|| format!("{} marker not found in {}", BENCH_START, path.display()))?;
-    let end = content
-        .find(BENCH_END)
-        .ok_or_else(|| format!("{} marker not found in {}", BENCH_END, path.display()))?;
+/// Replaces content between `start_marker` and `end_marker` with `snippet`.
+///
+/// Returns `Ok(true)` if markers were found and replaced, `Ok(false)` if
+/// the markers were not present (caller decides whether that is an error).
+fn replace_between_markers(
+    content: &str,
+    start_marker: &str,
+    end_marker: &str,
+    snippet: &str,
+) -> Result<Option<String>, String> {
+    let start = match content.find(start_marker) {
+        Some(pos) => pos,
+        None => return Ok(None),
+    };
+    let end = match content.find(end_marker) {
+        Some(pos) => pos,
+        None => {
+            return Err(format!(
+                "{end_marker} not found but {start_marker} is present"
+            ));
+        }
+    };
     if start >= end {
-        return Err(format!(
-            "{} must appear before {} in {}",
-            BENCH_START,
-            BENCH_END,
-            path.display()
-        ));
+        return Err(format!("{start_marker} must appear before {end_marker}"));
     }
 
-    let snippet =
-        performance_markdown(report).ok_or_else(|| "no scenario data to write".to_string())?;
-
     let mut updated = String::with_capacity(content.len());
-    updated.push_str(&content[..start + BENCH_START.len()]);
+    updated.push_str(&content[..start + start_marker.len()]);
     updated.push('\n');
-    updated.push_str(&snippet);
+    updated.push_str(snippet);
     updated.push_str(&content[end..]);
+    Ok(Some(updated))
+}
 
-    std::fs::write(path, updated).map_err(|e| format!("write {}: {e}", path.display()))?;
+/// Updates the docs performance page with benchmark results.
+///
+/// Replaces content between marker pairs for each scenario present:
+/// - `<!-- BENCH:START -->` / `<!-- BENCH:END -->` for the cold scenario
+/// - `<!-- BENCH-WARM:START -->` / `<!-- BENCH-WARM:END -->` for the warm scenario
+fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), String> {
+    let mut content =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+
+    let mut updated = false;
+
+    // Cold scenario.
+    if let Some(scenario) = find_scenario(report, "cold") {
+        let snippet = scenario_markdown(report, scenario, "Cold sync");
+        match replace_between_markers(&content, BENCH_COLD_START, BENCH_COLD_END, &snippet)? {
+            Some(new_content) => {
+                content = new_content;
+                updated = true;
+            }
+            None => {
+                eprintln!(
+                    "WARNING: {BENCH_COLD_START} marker not found in {}; skipping cold update",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // Warm scenario.
+    if let Some(scenario) = find_scenario(report, "warm") {
+        let snippet = scenario_markdown(report, scenario, "Warm sync (no changes)");
+        match replace_between_markers(&content, BENCH_WARM_START, BENCH_WARM_END, &snippet)? {
+            Some(new_content) => {
+                content = new_content;
+                updated = true;
+            }
+            None => {
+                eprintln!(
+                    "WARNING: {BENCH_WARM_START} marker not found in {}; skipping warm update",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    if updated {
+        std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
 
     Ok(())
 }
@@ -727,7 +791,7 @@ mod tests {
                 ("dregsy".to_string(), "0.5.0".to_string()),
             ]),
             scenarios: vec![ScenarioResult {
-                scenario: "Cold sync (median)".to_string(),
+                scenario: "Cold sync".to_string(),
                 runs: vec![
                     ToolRun {
                         tool: "ocync".to_string(),
@@ -823,7 +887,7 @@ mod tests {
 
         // Per-scenario detailed table (metrics as rows, tools as columns).
         // Winner is bolded: ocync (47s) beats dregsy (8m 41s).
-        assert!(md.contains("## Cold sync (median)\n"));
+        assert!(md.contains("## Cold sync\n"));
         assert!(md.contains("| Metric | ocync | dregsy |"));
         assert!(md.contains("| Wall clock | **47s** | 8m 41s |"));
 
@@ -911,7 +975,7 @@ mod tests {
                 tags: 55,
             },
             scenarios: vec![ScenarioRecord {
-                name: "Cold sync (median)".into(),
+                name: "Cold sync".into(),
                 tools: vec![ToolRecord {
                     tool: "ocync".into(),
                     version: "0.1.0".into(),
@@ -1049,29 +1113,53 @@ mod tests {
     }
 
     #[test]
-    fn performance_markdown_context_line() {
+    fn scenario_markdown_context_line() {
         let report = sample_report();
-        let md = performance_markdown(&report).unwrap();
+        let scenario = find_scenario(&report, "cold").unwrap();
+        let md = scenario_markdown(&report, scenario, "Cold sync");
         assert!(md.contains("Measured 2026-04-15"));
         assert!(md.contains("c7g.xlarge"));
         assert!(md.contains("28 images, 40 tags"));
+        assert!(md.contains("Cold sync to ECR"));
+        assert!(md.contains("bench-proxy"));
         // Contains the metric table.
         assert!(md.contains("| Metric | ocync | dregsy |"));
         assert!(md.contains("| Wall clock |"));
     }
 
     #[test]
-    fn performance_markdown_empty_scenarios_returns_none() {
+    fn scenario_markdown_warm_description() {
         let report = BenchReport {
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
-            scenarios: vec![],
+            scenarios: vec![ScenarioResult {
+                scenario: "Warm sync (no-op)".to_string(),
+                runs: vec![ToolRun {
+                    tool: "ocync".to_string(),
+                    wall_clock_secs: 2.5,
+                    exit_code: Some(0),
+                    peak_rss_kb: Some(51200),
+                    proxy_metrics: None,
+                }],
+            }],
             scale: vec![],
         };
-        assert!(performance_markdown(&report).is_none());
+        let scenario = find_scenario(&report, "warm").unwrap();
+        let md = scenario_markdown(&report, scenario, "Warm sync (no changes)");
+        assert!(md.contains("Warm sync (no changes) to ECR"));
+        assert!(md.contains("| Wall clock | 2s |"), "md:\n{md}");
+    }
+
+    #[test]
+    fn find_scenario_case_insensitive() {
+        let report = sample_report();
+        assert!(find_scenario(&report, "cold").is_some());
+        assert!(find_scenario(&report, "Cold").is_some());
+        assert!(find_scenario(&report, "COLD").is_some());
+        assert!(find_scenario(&report, "warm").is_none());
     }
 
     #[test]
@@ -1096,13 +1184,17 @@ mod tests {
     }
 
     #[test]
-    fn update_performance_page_missing_markers_returns_error() {
+    fn update_performance_page_missing_markers_is_ok() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("performance.md");
-        std::fs::write(&path, "# Performance\n\nNo markers here.\n").unwrap();
+        let original = "# Performance\n\nNo markers here.\n";
+        std::fs::write(&path, original).unwrap();
 
         let report = sample_report();
-        assert!(update_performance_page(&path, &report).is_err());
+        // Missing markers now warn instead of failing (both are optional).
+        update_performance_page(&path, &report).unwrap();
+        // File should be unchanged.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     /// Report with populated proxy metrics for full table coverage.
@@ -1117,7 +1209,7 @@ mod tests {
                 ("dregsy".to_string(), "0.5.0".to_string()),
             ]),
             scenarios: vec![ScenarioResult {
-                scenario: "Cold sync (median)".to_string(),
+                scenario: "Cold sync".to_string(),
                 runs: vec![
                     ToolRun {
                         tool: "ocync".to_string(),
@@ -1343,5 +1435,100 @@ mod tests {
         let report = sample_report();
         let err = update_performance_page(&path, &report).unwrap_err();
         assert!(err.contains("must appear before"), "err: {err}");
+    }
+
+    #[test]
+    fn update_performance_page_both_cold_and_warm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("performance.md");
+        std::fs::write(
+            &path,
+            "# Performance\n\n\
+             <!-- BENCH:START -->\nold cold\n<!-- BENCH:END -->\n\n\
+             ## Warm\n\n\
+             <!-- BENCH-WARM:START -->\nold warm\n<!-- BENCH-WARM:END -->\n\n\
+             Footer\n",
+        )
+        .unwrap();
+
+        let report = BenchReport {
+            timestamp: "2026-04-19-100000".to_string(),
+            instance: test_instance(),
+            corpus_size: 39,
+            total_tags: 51,
+            tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
+            scenarios: vec![
+                ScenarioResult {
+                    scenario: "Cold sync".to_string(),
+                    runs: vec![ToolRun {
+                        tool: "ocync".to_string(),
+                        wall_clock_secs: 429.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(51200),
+                        proxy_metrics: None,
+                    }],
+                },
+                ScenarioResult {
+                    scenario: "Warm sync (no-op)".to_string(),
+                    runs: vec![ToolRun {
+                        tool: "ocync".to_string(),
+                        wall_clock_secs: 2.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(40960),
+                        proxy_metrics: None,
+                    }],
+                },
+            ],
+            scale: vec![],
+        };
+        update_performance_page(&path, &report).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("old cold"));
+        assert!(!content.contains("old warm"));
+        assert!(content.contains("Cold sync to ECR"));
+        assert!(content.contains("Warm sync (no changes) to ECR"));
+        assert!(content.contains("Footer"));
+    }
+
+    #[test]
+    fn update_performance_page_warm_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("performance.md");
+        std::fs::write(
+            &path,
+            "# Performance\n\n\
+             <!-- BENCH:START -->\nexisting cold data\n<!-- BENCH:END -->\n\n\
+             <!-- BENCH-WARM:START -->\nold warm\n<!-- BENCH-WARM:END -->\n",
+        )
+        .unwrap();
+
+        // Report with only a warm scenario.
+        let report = BenchReport {
+            timestamp: "2026-04-19-100000".to_string(),
+            instance: test_instance(),
+            corpus_size: 39,
+            total_tags: 51,
+            tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
+            scenarios: vec![ScenarioResult {
+                scenario: "Warm sync (no-op)".to_string(),
+                runs: vec![ToolRun {
+                    tool: "ocync".to_string(),
+                    wall_clock_secs: 3.0,
+                    exit_code: Some(0),
+                    peak_rss_kb: Some(40960),
+                    proxy_metrics: None,
+                }],
+            }],
+            scale: vec![],
+        };
+        update_performance_page(&path, &report).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        // Cold section should be untouched.
+        assert!(content.contains("existing cold data"));
+        // Warm section should be replaced.
+        assert!(!content.contains("old warm"));
+        assert!(content.contains("Warm sync (no changes) to ECR"));
     }
 }

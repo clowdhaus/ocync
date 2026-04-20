@@ -18,7 +18,7 @@ Benchmark infrastructure for comparing ocync against dregsy and regsync.
 cd bench/terraform/aws && terraform init && terraform apply
 
 # 2. Run benchmarks (reads bench.json automatically)
-cargo xtask bench-remote --provider aws --scenario cold
+cargo xtask bench-remote --provider aws --scenario sync
 
 # 3. Tear down when done
 cd bench/terraform/aws && terraform destroy
@@ -29,14 +29,14 @@ cd bench/terraform/aws && terraform destroy
 Single command for the full benchmark cycle.
 
 ```bash
-# Full 3-tool cold comparison (3 iterations, picks median)
-cargo xtask bench-remote --provider aws --iterations 3 --scenario cold
+# Full 3-tool cold+warm comparison
+cargo xtask bench-remote --provider aws --scenario sync
 
 # Quick smoke test
-cargo xtask bench-remote --provider aws --scenario cold \
-  --tools ocync --iterations 1 --limit 3
+cargo xtask bench-remote --provider aws --scenario sync \
+  --tools ocync --limit 3
 
-# All scenarios (cold + warm + partial + scale)
+# All scenarios (cold+warm + partial + scale)
 cargo xtask bench-remote --provider aws --scenario all
 
 # Fetch results from the last run without re-running
@@ -79,7 +79,7 @@ ssh ec2-user@<public-ip>
 cd ~/ocync
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
-cargo xtask bench --tools ocync,dregsy,regsync --iterations 3 cold
+cargo xtask bench --tools ocync,dregsy,regsync sync
 ```
 
 ## Instance details
@@ -120,8 +120,8 @@ Each cloud provider gets its own directory:
 ```
 bench/terraform/
   aws/     # VPC, public subnet, VPC endpoints, EC2, SSH key pair
-  gcp/     # (future) VPC, GCE, Private Google Access, GAR
-  azure/   # (future) VNet, VM, ACR private endpoint
+  gcp/     # (planned, does not exist yet) VPC, GCE, Private Google Access, GAR
+  azure/   # (planned, does not exist yet) VNet, VM, ACR private endpoint
 ```
 
 Terraform writes `bench.json` to the provider directory with connection details. The xtask reads this file -- no manual copy-paste of IPs.

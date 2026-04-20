@@ -392,18 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn image_line_skip_existing_reason() {
-        let result = make_result(
-            ImageStatus::Skipped {
-                reason: SkipReason::SkipExisting,
-            },
-            0,
-        );
-        let line = format_image_line(&result, 1).unwrap();
-        assert!(line.contains("skip existing"), "got: {line}");
-    }
-
-    #[test]
     fn image_line_immutable_tag_reason() {
         let result = make_result(
             ImageStatus::Skipped {

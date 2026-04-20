@@ -47,6 +47,12 @@ cargo install --locked ocync --no-default-features --features non-fips
 
 Minimum Rust version: 1.94 (edition 2024).
 
+### Verify installation
+
+```bash
+ocync version
+```
+
 ## Copy your first image
 
 ```bash
@@ -112,4 +118,6 @@ ocync sync -c config.yaml --dry-run
 
 - [Configuration reference](../configuration) for full config file syntax and options
 - [CLI reference](../cli-reference) for all commands, flags, and exit codes
-- Registry guides for auth and behavior for each supported registry: [Amazon ECR](../registries/ecr), [Docker Hub](../registries/docker-hub), [GHCR](../registries/ghcr), [GAR](../registries/gar), [ACR](../registries/acr), [Chainguard](../registries/chainguard)
+- [Helm chart](../helm) for Kubernetes deployment (CronJob, Deployment, or Job)
+- [Observability](../observability) for logging, JSON output, and health endpoints
+- Registry guides: [Amazon ECR](../registries/ecr), [Docker Hub](../registries/docker-hub), [GHCR](../registries/ghcr), [GAR](../registries/gar), [ACR](../registries/acr), [Chainguard](../registries/chainguard)

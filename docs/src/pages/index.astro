@@ -30,9 +30,9 @@ const jsonLd = {
 };
 
 const stats = [
-  { value: "8x", desc: "faster cold syncs", color: "stat-pink" },
-  { value: "2.6x", desc: "fewer bytes transferred", color: "stat-purple" },
-  { value: "3x", desc: "fewer API calls", color: "stat-aqua" },
+  { value: "4x", desc: "faster cold syncs", color: "stat-pink" },
+  { value: "40%", desc: "fewer API requests", color: "stat-purple" },
+  { value: "0", desc: "rate-limit errors", color: "stat-aqua" },
 ];
 
 const securityPills = [
@@ -66,8 +66,8 @@ const registries = [
       </h1>
       <p class="hero-sub">
         ocync copies OCI images with blob deduplication, cross-repo mounting,
-        and streaming transfers. 8x faster cold syncs, 2.6x fewer bytes,
-        and zero rate-limit errors.
+        and streaming transfers. Faster syncs, fewer requests, fewer
+        bytes transferred, and zero rate-limit errors.
       </p>
       <div class="hero-actions">
         <a href={`${base}getting-started`} class="btn btn-primary"
@@ -307,6 +307,19 @@ const registries = [
   .feature-section .feature-label { color: var(--section-label); }
   .feature-section h2 { color: var(--section-heading); }
   .feature-section .feature-copy { color: var(--section-copy); }
+
+  /* Links on dark-background sections need contrasting color */
+  .feature-efficiency .feature-copy a,
+  .feature-registries .feature-copy a {
+    color: var(--cyan-bright);
+    text-decoration-color: color-mix(in srgb, var(--cyan-bright) 50%, transparent);
+  }
+
+  .feature-efficiency .feature-copy a:hover,
+  .feature-registries .feature-copy a:hover {
+    color: var(--pink);
+    text-decoration-color: var(--pink);
+  }
 
   /* Section 1: Stats */
   .stat-row {

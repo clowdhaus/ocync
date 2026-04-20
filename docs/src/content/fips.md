@@ -50,6 +50,18 @@ The `latest-fips` Docker tag includes FIPS-validated cryptography:
 docker pull public.ecr.aws/clowdhaus/ocync:latest-fips
 ```
 
+## Verifying FIPS status
+
+The `ocync version` command reports whether the binary was compiled with FIPS:
+
+```
+$ ocync version
+ocync 0.1.0
+FIPS 140-3: compiled=yes
+```
+
+Non-FIPS builds show `compiled=no`. FIPS is a compile-time selection; there is no runtime toggle.
+
 ## Banned dependencies
 
 `ring` and `native-tls` are banned via `deny.toml` to prevent accidental use of non-aws-lc-rs crypto. `reqwest` is configured with `rustls-tls-native-roots-no-provider`, and the crypto provider is installed explicitly at process startup.

@@ -11,7 +11,7 @@ Standalone client for the [OCI Distribution Spec](https://github.com/opencontain
 ## Key features
 
 - Registry client with automatic provider detection (ECR, Docker Hub, GHCR, GAR, ACR, Chainguard, anonymous)
-- Streaming blob pull and push (zero intermediate buffering)
+- Streaming blob pull and push (provider-dependent fallback to buffered upload for GHCR/GAR)
 - Cross-repo blob mounting
 - Manifest pull, push, HEAD with OCI and Docker v2 content negotiation
 - Tag listing with automatic pagination
@@ -33,8 +33,12 @@ Standalone client for the [OCI Distribution Spec](https://github.com/opencontain
 ## Example
 
 ```rust
-use ocync_distribution::RegistryClient;
+use ocync_distribution::{RegistryClient, install_crypto_provider};
 use url::Url;
+
+// Required before any TLS connection -- registers aws-lc-rs as the
+// process-wide rustls crypto provider.
+install_crypto_provider();
 
 let client = RegistryClient::builder(
         Url::parse("https://registry-1.docker.io").unwrap(),
@@ -42,8 +46,9 @@ let client = RegistryClient::builder(
     .build()
     .unwrap();
 
+let repo = ocync_distribution::spec::RepositoryName::new("library/nginx");
 let manifest = client
-    .pull_manifest("library/nginx", "latest")
+    .manifest_pull(&repo, "latest")
     .await
     .unwrap();
 
