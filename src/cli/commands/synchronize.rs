@@ -377,6 +377,12 @@ pub(crate) async fn resolve_mapping(
         .registry_authority()
         .map_err(|e| CliError::Input(format!("mapping '{}': {e}", mapping.from)))?;
 
+    let head_first = config
+        .registries
+        .get(source_name)
+        .map(|r| r.head_first)
+        .unwrap_or(false);
+
     Ok(Some(ResolvedMapping {
         source_authority,
         source_client,
@@ -385,6 +391,7 @@ pub(crate) async fn resolve_mapping(
         targets,
         tags: filtered.into_iter().map(TagPair::same).collect(),
         platforms,
+        head_first,
     }))
 }
 

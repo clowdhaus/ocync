@@ -190,6 +190,11 @@ pub struct SyncStats {
     /// because a target HEAD showed staleness. Counted toward
     /// `discovery_cache_misses` for aggregate purposes.
     pub discovery_target_stale: u64,
+    /// Tags where `head_first` avoided the full source GET by confirming all
+    /// targets already match the source HEAD digest on cache miss. Independent
+    /// of `discovery_cache_hits` and `discovery_cache_misses` -- the cache had
+    /// no entry, but no full pull was needed either.
+    pub discovery_head_first_skips: u64,
 }
 
 #[cfg(test)]

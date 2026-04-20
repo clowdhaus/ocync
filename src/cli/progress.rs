@@ -60,10 +60,18 @@ fn write_run_summary(
         return;
     }
     let s = &report.stats;
-    let discovery = if s.discovery_cache_hits > 0 || s.discovery_cache_misses > 0 {
+    let has_discovery = s.discovery_cache_hits > 0
+        || s.discovery_cache_misses > 0
+        || s.discovery_head_first_skips > 0;
+    let discovery = if has_discovery {
+        let head_first_suffix = if s.discovery_head_first_skips > 0 {
+            format!(", {} head_first", s.discovery_head_first_skips)
+        } else {
+            String::new()
+        };
         format!(
-            " | discovery: {} cached, {} pulled",
-            s.discovery_cache_hits, s.discovery_cache_misses,
+            " | discovery: {} cached, {} pulled{}",
+            s.discovery_cache_hits, s.discovery_cache_misses, head_first_suffix,
         )
     } else {
         String::new()
@@ -498,6 +506,7 @@ mod tests {
                 discovery_cache_misses: 10,
                 discovery_head_failures: 2,
                 discovery_target_stale: 1,
+                discovery_head_first_skips: 0,
             },
             duration: Duration::from_secs(47),
         };
@@ -563,6 +572,53 @@ mod tests {
         let output = String::from_utf8(buf.borrow().clone()).unwrap();
         assert!(
             output.contains("discovery: 0 cached, 3 pulled"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn summary_with_head_first_skips_includes_suffix() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 1,
+                images_skipped: 3,
+                discovery_cache_hits: 2,
+                discovery_cache_misses: 1,
+                discovery_head_first_skips: 3,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(5),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            output.contains("discovery: 2 cached, 1 pulled, 3 head_first"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn summary_with_only_head_first_skips_includes_discovery() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 1,
+                discovery_head_first_skips: 5,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(1),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            output.contains("discovery: 0 cached, 0 pulled, 5 head_first"),
             "got: {output}"
         );
     }

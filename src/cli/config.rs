@@ -208,6 +208,16 @@ pub(crate) struct RegistryConfig {
     /// Bearer token for static token auth (`auth_type: static_token`).
     #[serde(default)]
     pub token: Option<String>,
+
+    /// HEAD-check targets before pulling full source manifests on cache miss.
+    ///
+    /// When enabled, the engine issues a manifest HEAD against all targets
+    /// before performing a full source manifest GET. If every target already
+    /// holds the same digest as the source HEAD, the expensive GET is skipped.
+    /// This conserves rate-limit tokens on source registries with aggressive
+    /// quotas (e.g., Docker Hub).
+    #[serde(default)]
+    pub head_first: bool,
 }
 
 impl std::fmt::Debug for RegistryConfig {
@@ -216,6 +226,7 @@ impl std::fmt::Debug for RegistryConfig {
             .field("url", &self.url)
             .field("auth_type", &self.auth_type)
             .field("max_concurrent", &self.max_concurrent)
+            .field("head_first", &self.head_first)
             .field("credentials", &self.credentials)
             .field("token", &"[REDACTED]")
             .finish()
@@ -1482,6 +1493,7 @@ mappings:
             max_concurrent: Some(0),
             credentials: None,
             token: None,
+            head_first: false,
         };
         let err = validate_registry("example", &registry).unwrap_err();
         match err {
@@ -1501,6 +1513,7 @@ mappings:
             max_concurrent: Some(25),
             credentials: None,
             token: None,
+            head_first: false,
         };
         validate_registry("example", &registry).unwrap();
     }
@@ -1639,6 +1652,7 @@ mappings:
             max_concurrent: None,
             credentials: None,
             token: Some("secret-bearer-token".to_string()),
+            head_first: false,
         };
         let debug_output = format!("{registry:?}");
         assert!(debug_output.contains("[REDACTED]"));
