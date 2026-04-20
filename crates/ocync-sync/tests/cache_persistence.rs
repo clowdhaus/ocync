@@ -32,7 +32,7 @@ fn digest2() -> Digest {
 }
 
 fn repo(name: &str) -> RepositoryName {
-    RepositoryName::new(name)
+    RepositoryName::new(name).unwrap()
 }
 
 fn authority(s: &str) -> RegistryAuthority {
@@ -62,7 +62,7 @@ fn round_trip_exists_at_target() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_exists("reg.io", digest_a(), "repo/alpine".into());
+    cache.set_blob_exists("reg.io", digest_a(), repo("repo/alpine"));
 
     cache.persist(&path).unwrap();
 
@@ -79,7 +79,7 @@ fn round_trip_completed() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), "repo/alpine".into());
+    cache.set_blob_completed("reg.io", digest_a(), repo("repo/alpine"));
 
     cache.persist(&path).unwrap();
 
@@ -96,15 +96,20 @@ fn round_trip_mount_source_survives() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
-    cache.set_blob_completed("reg.io", digest_a(), "repo/b".into());
+    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
+    cache.set_blob_completed("reg.io", digest_a(), repo("repo/b"));
 
     cache.persist(&path).unwrap();
 
     let loaded = TransferStateCache::load(&path, long_ttl());
     assert_eq!(
-        loaded.blob_mount_source("reg.io", &digest_a(), &RepositoryName::from("repo/b"), &[]),
-        Some(&RepositoryName::from("repo/a"))
+        loaded.blob_mount_source(
+            "reg.io",
+            &digest_a(),
+            &RepositoryName::new("repo/b").unwrap(),
+            &[]
+        ),
+        Some(&RepositoryName::new("repo/a").unwrap())
     );
 }
 
@@ -114,8 +119,8 @@ fn round_trip_multiple_targets() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg-a.io", digest_a(), "repo/x".into());
-    cache.set_blob_exists("reg-b.io", digest_b(), "repo/y".into());
+    cache.set_blob_completed("reg-a.io", digest_a(), repo("repo/x"));
+    cache.set_blob_exists("reg-b.io", digest_b(), repo("repo/y"));
 
     cache.persist(&path).unwrap();
 
@@ -140,7 +145,7 @@ fn expired_cache_returns_empty() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
+    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
     cache.persist(&path).unwrap();
 
     // The cache stores timestamps at second granularity, so we need
@@ -157,7 +162,7 @@ fn zero_ttl_means_never_expire() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
+    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
     cache.persist(&path).unwrap();
 
     // Duration::ZERO disables TTL -- the cache never expires by age.
@@ -195,7 +200,7 @@ fn bad_crc_returns_empty() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
+    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
     cache.persist(&path).unwrap();
 
     // Flip a byte in the middle of the file to break the CRC.
@@ -242,7 +247,7 @@ fn in_progress_blobs_not_persisted() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_in_progress("reg.io", digest_a(), "repo/a".into());
+    cache.set_blob_in_progress("reg.io", digest_a(), repo("repo/a"));
 
     cache.persist(&path).unwrap();
 
@@ -257,7 +262,7 @@ fn only_stable_entries_survive_persist() {
 
     let mut cache = TransferStateCache::new();
     // Stable
-    cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
+    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
     // Transient -- should not appear after reload
     cache.set_blob_failed("reg.io", digest_b(), "oops".into());
 
@@ -278,7 +283,7 @@ fn only_stable_entries_survive_persist() {
 #[test]
 fn invalidate_blob_removes_entry() {
     let mut cache = TransferStateCache::new();
-    cache.set_blob_exists("reg.io", digest_a(), "repo/a".into());
+    cache.set_blob_exists("reg.io", digest_a(), repo("repo/a"));
     assert!(cache.blob_status("reg.io", &digest_a()).is_some());
 
     cache.invalidate_blob("reg.io", &digest_a());
@@ -303,7 +308,7 @@ fn persist_creates_nested_parent_dirs() {
     let path = dir.path().join("a").join("b").join("c").join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), "repo/a".into());
+    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
 
     // Parent dirs don't exist yet -- persist() must create them.
     cache.persist(&path).unwrap();

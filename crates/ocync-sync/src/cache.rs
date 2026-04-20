@@ -134,7 +134,8 @@ pub struct TransferStateCache {
     ///
     /// Lives outside `BlobDedupMap` so it's not part of the persisted cache
     /// format. Entries are cleaned up on persist via `reset_transient_state`.
-    blob_notifies: HashMap<(String, Digest), Rc<Notify>>,
+    /// Nested map avoids allocating `(String, Digest)` keys on the read path.
+    blob_notifies: HashMap<String, HashMap<Digest, Rc<Notify>>>,
 }
 
 impl TransferStateCache {
@@ -189,7 +190,9 @@ impl TransferStateCache {
     /// marking the blob completed or failed.
     pub fn blob_notify(&mut self, target: &str, digest: &Digest) -> Rc<Notify> {
         self.blob_notifies
-            .entry((target.to_owned(), digest.clone()))
+            .entry(target.to_owned())
+            .or_default()
+            .entry(digest.clone())
             .or_insert_with(|| Rc::new(Notify::new()))
             .clone()
     }
@@ -200,7 +203,7 @@ impl TransferStateCache {
     /// [`set_blob_failed`] so concurrent transfers of the same blob can
     /// proceed (either to mount from the completed repo or to retry).
     pub fn notify_blob(&self, target: &str, digest: &Digest) {
-        if let Some(n) = self.blob_notifies.get(&(target.to_owned(), digest.clone())) {
+        if let Some(n) = self.blob_notifies.get(target).and_then(|m| m.get(digest)) {
             n.notify_waiters();
         }
     }
@@ -240,6 +243,15 @@ impl TransferStateCache {
             .is_some_and(|repos| repos.contains(repo))
     }
 
+    /// Remove a specific repo from a blob's known repos set at the target.
+    ///
+    /// Used after a failed mount to discard the stale mount source without
+    /// removing the entire blob entry. The blob remains `InProgress` so
+    /// concurrent waiters do not re-claim and start duplicate pushes.
+    pub fn remove_blob_repo(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
+        self.dedup.remove_repo(target, digest, repo);
+    }
+
     /// Remove the entry for the given blob at the target.
     ///
     /// Use this for lazy invalidation when a mount or push fails so the next
@@ -264,6 +276,34 @@ impl TransferStateCache {
     /// source tags are deleted.
     pub fn prune_snapshots(&mut self, live_keys: &HashSet<SnapshotKey>) {
         self.snapshots.retain(|k, _| live_keys.contains(k));
+    }
+
+    /// Remove dedup entries for targets no longer in the active configuration.
+    ///
+    /// The dedup map accumulates `ExistsAtTarget`/`Completed` entries for every
+    /// (target, digest) pair observed. When targets are removed from config,
+    /// their entries become stale and grow unboundedly across runs. Call after
+    /// each sync cycle with the set of currently-configured target names.
+    pub fn prune_dedup(&mut self, live_targets: &HashSet<String>) {
+        let removed = self.dedup.retain_targets(live_targets);
+        if removed > 0 {
+            tracing::debug!(removed, "pruned stale dedup entries for removed targets");
+        }
+    }
+
+    /// Drop all in-flight blob notify handles.
+    ///
+    /// [`Notify`] entries are only needed during active blob coordination
+    /// within a single sync run. Once the run completes, all pending
+    /// transfers have resolved and the handles are stale. Call this at the
+    /// end of each sync run to prevent monotonic growth across repeated
+    /// runs in a long-lived process.
+    pub fn clear_notifies(&mut self) {
+        if !self.blob_notifies.is_empty() {
+            let count: usize = self.blob_notifies.values().map(|m| m.len()).sum();
+            tracing::debug!(count, "clearing stale blob notify handles");
+            self.blob_notifies.clear();
+        }
     }
 
     /// Atomically write the cache to `path`.
@@ -469,7 +509,7 @@ mod tests {
     }
 
     fn repo(name: &str) -> RepositoryName {
-        RepositoryName::new(name)
+        RepositoryName::new(name).unwrap()
     }
 
     #[test]
@@ -480,7 +520,7 @@ mod tests {
     #[test]
     fn set_and_read_status() {
         let mut cache = TransferStateCache::new();
-        cache.set_blob_exists("reg.io", digest(), "repo/a".into());
+        cache.set_blob_exists("reg.io", digest(), repo("repo/a"));
         assert_eq!(
             cache.blob_status("reg.io", &digest()),
             Some(&BlobStatus::ExistsAtTarget)
@@ -491,8 +531,8 @@ mod tests {
     #[test]
     fn mount_source_delegates_to_dedup() {
         let mut cache = TransferStateCache::new();
-        cache.set_blob_completed("reg.io", digest(), "repo/a".into());
-        cache.set_blob_completed("reg.io", digest(), "repo/b".into());
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
         assert_eq!(
             cache.blob_mount_source("reg.io", &digest(), &repo("repo/b"), &[]),
             Some(&repo("repo/a"))
@@ -502,7 +542,7 @@ mod tests {
     #[test]
     fn blob_known_at_repo_checks_specific_repo() {
         let mut cache = TransferStateCache::new();
-        cache.set_blob_completed("reg.io", digest(), "repo/a".into());
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
         assert!(cache.blob_known_at_repo("reg.io", &digest(), &repo("repo/a")));
         assert!(!cache.blob_known_at_repo("reg.io", &digest(), &repo("repo/b")));
         assert!(!cache.blob_known_at_repo("other.io", &digest(), &repo("repo/a")));
@@ -511,7 +551,7 @@ mod tests {
     #[test]
     fn invalidate_removes_entry() {
         let mut cache = TransferStateCache::new();
-        cache.set_blob_exists("reg.io", digest(), "repo/a".into());
+        cache.set_blob_exists("reg.io", digest(), repo("repo/a"));
         cache.invalidate_blob("reg.io", &digest());
         assert_eq!(cache.blob_status("reg.io", &digest()), None);
     }
@@ -531,8 +571,8 @@ mod tests {
     #[test]
     fn filter_persistable_excludes_transient() {
         let mut cache = TransferStateCache::new();
-        cache.set_blob_exists("reg.io", digest(), "repo/a".into());
-        cache.set_blob_in_progress("reg.io", digest2(), "repo/a".into());
+        cache.set_blob_exists("reg.io", digest(), repo("repo/a"));
+        cache.set_blob_in_progress("reg.io", digest2(), repo("repo/a"));
         cache.set_blob_failed("reg.io", digest2(), "oops".into());
 
         // Only ExistsAtTarget should survive

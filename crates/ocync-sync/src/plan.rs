@@ -1,6 +1,6 @@
 //! Blob deduplication map and transfer ordering for cross-repo mount support.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use ocync_distribution::Digest;
 use ocync_distribution::spec::RepositoryName;
@@ -207,6 +207,19 @@ impl BlobDedupMap {
         info.repos.iter().find(|r| *r != target_repo)
     }
 
+    /// Remove a specific repo from a blob's known repos set.
+    ///
+    /// Used after a failed mount to discard the stale mount source without
+    /// removing the entire blob entry (which would let concurrent waiters
+    /// re-claim and start duplicate pushes).
+    pub(crate) fn remove_repo(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
+        if let Some(index) = self.inner.get_mut(target) {
+            if let Some(info) = index.get_mut(digest) {
+                info.repos.remove(repo);
+            }
+        }
+    }
+
     /// Remove the entry for the given blob at the target.
     ///
     /// Used for lazy invalidation when a mount or push fails so the next sync
@@ -260,6 +273,23 @@ impl BlobDedupMap {
     pub(crate) fn is_empty(&self) -> bool {
         self.inner.values().all(|index| index.is_empty())
     }
+
+    /// Remove entries for targets not in `live_targets`.
+    ///
+    /// Returns the number of individual blob entries removed. This prevents
+    /// unbounded growth when targets are removed from configuration.
+    pub(crate) fn retain_targets(&mut self, live_targets: &HashSet<String>) -> usize {
+        let mut removed = 0usize;
+        self.inner.retain(|target, index| {
+            if live_targets.contains(target) {
+                true
+            } else {
+                removed += index.len();
+                false
+            }
+        });
+        removed
+    }
 }
 
 impl Default for BlobDedupMap {
@@ -279,7 +309,7 @@ mod tests {
     }
 
     fn repo(name: &str) -> RepositoryName {
-        RepositoryName::new(name)
+        RepositoryName::new(name).unwrap()
     }
 
     #[test]

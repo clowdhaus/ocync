@@ -29,9 +29,16 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ocync_distribution::Digest;
 use tokio::sync::Notify;
+
+/// Shared sequence counter for generating unique temporary file names across
+/// both [`BlobStage::write`] and [`BlobStage::begin_write`]. A single counter
+/// prevents temp filename collisions when both write paths are used for the
+/// same digest.
+static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Best-effort directory fsync after an atomic rename.
 ///
@@ -75,6 +82,14 @@ pub enum StagePullAction {
 /// When enabled, blobs are pulled once from source and stored locally so all
 /// target pushes can read from the local file rather than re-pulling from
 /// source. When disabled (single-target), all methods are no-ops.
+///
+/// # Staging path requirements
+///
+/// The staging directory MUST reside on local disk (tmpfs, ext4, XFS, APFS,
+/// etc.). The engine performs synchronous I/O on staged files within the
+/// single-threaded tokio runtime (see [`file_read_stream`](crate::engine)). A
+/// network filesystem (NFS, EFS, CIFS, `GlusterFS`) would block the event loop
+/// for the duration of each read call, stalling all concurrent transfers.
 ///
 /// Cross-image source-pull dedup is coordinated via [`claim_or_check`]:
 /// the first task to request a digest claims the pull, concurrent tasks wait
@@ -182,8 +197,6 @@ impl BlobStage {
             std::fs::create_dir_all(parent)?;
         }
 
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp_path = dest.with_extension(format!("tmp.{}.{seq}", std::process::id()));
 
@@ -271,9 +284,23 @@ impl BlobStage {
                     continue;
                 }
 
-                let size = std::fs::metadata(&file_entry).map(|m| m.len()).unwrap_or(0);
-                total_bytes += size;
-                entries.push((file_entry, size));
+                // Skip symlinks to prevent deletion of symlink targets.
+                // `symlink_metadata` does not follow symlinks, so `is_file()`
+                // returns false for symlinks (unlike `metadata().is_file()`).
+                match std::fs::symlink_metadata(&file_entry) {
+                    Ok(meta) if !meta.is_file() => {
+                        tracing::warn!(
+                            path = %file_entry.display(),
+                            "unexpected non-regular file in staging blobs dir, skipping"
+                        );
+                        continue;
+                    }
+                    Ok(meta) => {
+                        total_bytes += meta.len();
+                        entries.push((file_entry, meta.len()));
+                    }
+                    Err(_) => continue,
+                }
             }
         }
 
@@ -314,8 +341,6 @@ impl BlobStage {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp_path = dest.with_extension(format!("tmp.{}.{seq}", std::process::id()));
         let file = std::fs::File::create(&tmp_path)?;
@@ -323,6 +348,7 @@ impl BlobStage {
             file,
             tmp_path,
             dest,
+            finished: false,
         })
     }
 
@@ -354,12 +380,15 @@ impl BlobStage {
 /// Data is written to a temporary file via [`write_chunk`](Self::write_chunk).
 /// Call [`finish`](Self::finish) to fsync and atomically rename into the
 /// content-addressable location. If dropped without calling `finish`, the
-/// temporary file remains on disk and will be cleaned up by
-/// [`BlobStage::cleanup_tmp_files`] on the next startup.
+/// temporary file is removed immediately by the [`Drop`] impl to prevent
+/// partial files from accumulating during error paths.
 pub struct StagedWriter {
     file: std::fs::File,
     tmp_path: PathBuf,
     dest: PathBuf,
+    /// Set to `true` by [`finish`](Self::finish). When `false` at drop time,
+    /// the temporary file is removed to prevent partial files from accumulating.
+    finished: bool,
 }
 
 impl std::fmt::Debug for StagedWriter {
@@ -379,11 +408,20 @@ impl StagedWriter {
 
     /// Fsync the file and atomically rename it into the content-addressable
     /// location, followed by a directory fsync for durability.
-    pub fn finish(self) -> Result<(), io::Error> {
+    pub fn finish(mut self) -> Result<(), io::Error> {
         self.file.sync_all()?;
         std::fs::rename(&self.tmp_path, &self.dest)?;
         best_effort_dir_fsync(&self.dest);
+        self.finished = true;
         Ok(())
+    }
+}
+
+impl Drop for StagedWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
     }
 }
 
