@@ -4,7 +4,7 @@
 //! Pins the protocol-compliant baseline for `blob_mount`: a committed
 //! source blob returns [`MountResult::Mounted`], a missing source returns
 //! [`MountResult::NotMounted`]. Real-ECR behavior is deliberately not
-//! covered here (see `docs/registries/ecr.md` -- ECR requires BLOB_MOUNTING,
+//! covered here (see `docs/registries/ecr.md` -- ECR requires `BLOB_MOUNTING`,
 //! so the client short-circuits and the engine integration test pins
 //! that end-to-end).
 //!
