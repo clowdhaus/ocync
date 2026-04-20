@@ -315,9 +315,9 @@ enum DiscoveryRoute {
     HeadFailure,
     /// Source cache matched but target HEAD mismatch forced full pull.
     TargetStale,
-    /// `head_first` enabled: all targets matched the source HEAD digest on cache
-    /// miss, avoiding the full source GET.
-    HeadFirstHit,
+    /// `head_first` enabled: all targets matched the source HEAD digest (no
+    /// cache entry existed), avoiding the full source GET entirely.
+    HeadFirstSkip,
 }
 
 /// Elect leader images for mount optimization via greedy set-cover.
@@ -614,7 +614,7 @@ impl SyncEngine {
         let mut discovery_misses: u64 = 0;
         let mut discovery_head_failures: u64 = 0;
         let mut discovery_target_stale: u64 = 0;
-        let mut discovery_head_first_hits: u64 = 0;
+        let mut discovery_head_first_skips: u64 = 0;
 
         // Leader-follower mount optimization state.
         //
@@ -862,9 +862,8 @@ impl SyncEngine {
                             discovery_misses += 1;
                             discovery_target_stale += 1;
                         }
-                        DiscoveryRoute::HeadFirstHit => {
-                            discovery_hits += 1;
-                            discovery_head_first_hits += 1;
+                        DiscoveryRoute::HeadFirstSkip => {
+                            discovery_head_first_skips += 1;
                         }
                     }
                     match outcome {
@@ -951,7 +950,7 @@ impl SyncEngine {
         stats.discovery_cache_misses = discovery_misses;
         stats.discovery_head_failures = discovery_head_failures;
         stats.discovery_target_stale = discovery_target_stale;
-        stats.discovery_head_first_hits = discovery_head_first_hits;
+        stats.discovery_head_first_skips = discovery_head_first_skips;
         let duration = run_start.elapsed();
 
         let report = SyncReport {
@@ -1066,66 +1065,18 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
             {
                 // Source unchanged, config unchanged. Check targets against
                 // the cached filtered_digest.
-                let compare_digest = snapshot.filtered_digest;
+                let check = check_targets_against_digest(TargetCheckParams {
+                    targets: &targets,
+                    source: &source,
+                    target: &target,
+                    compare_digest: &snapshot.filtered_digest,
+                    label: "cache hit",
+                })
+                .await;
 
-                // HEAD-check all targets concurrently.
-                let mut head_checks = FuturesUnordered::new();
-                for entry in &targets {
-                    let client = Arc::clone(&entry.client);
-                    let repo = target.repo.clone();
-                    let tag = target.tag.clone();
-                    let name = entry.name.clone();
-                    let checker = entry.batch_checker.clone();
-                    head_checks.push(async move {
-                        let result = client.manifest_head(&repo, &tag).await;
-                        (name, client, checker, result)
-                    });
-                }
-
-                let mut skipped_results = Vec::new();
-                let mut mismatched_targets = Vec::new();
-
-                while let Some((target_name, target_client, batch_checker, result)) =
-                    head_checks.next().await
-                {
-                    match result {
-                        Ok(Some(head)) if head.digest == compare_digest => {
-                            info!(
-                                source_repo = %source.repo,
-                                source_tag = %source.tag,
-                                target_repo = %target.repo,
-                                digest = %compare_digest,
-                                "skipping -- digest matches at target (cache hit)"
-                            );
-                            tracing::debug!(target: "ocync::metrics", "unchanged_skip");
-                            skipped_results.push(skip_image_result(
-                                &source,
-                                &target,
-                                SkipReason::DigestMatch,
-                            ));
-                        }
-                        other => {
-                            if let Err(e) = &other {
-                                warn!(
-                                    target_repo = %target.repo,
-                                    target_tag = %target.tag,
-                                    error = %e,
-                                    "target manifest HEAD failed, proceeding with sync"
-                                );
-                            }
-                            mismatched_targets.push(TargetEntry {
-                                name: target_name,
-                                client: target_client,
-                                batch_checker,
-                            });
-                        }
-                    }
-                }
-
-                if mismatched_targets.is_empty() {
-                    // All targets match - skip entirely (preserve existing cache entry).
+                if check.mismatched.is_empty() {
                     return (
-                        DiscoveryOutcome::Skip(skipped_results),
+                        DiscoveryOutcome::Skip(check.skipped),
                         DiscoveryRoute::CacheHit,
                     );
                 }
@@ -1135,8 +1086,8 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                     source_client: &source_client,
                     source: &source,
                     target: &target,
-                    targets: &mismatched_targets,
-                    skipped_results,
+                    targets: &check.mismatched,
+                    skipped_results: check.skipped,
                     retry: &retry,
                     platforms: platforms.as_deref(),
                     cache: &cache,
@@ -1170,67 +1121,25 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
     // handles filtered comparisons correctly).
     if head_first && platforms.is_none() {
         if let Some(ref head_digest) = source_head_digest {
-            let mut head_checks = FuturesUnordered::new();
-            for entry in &targets {
-                let client = Arc::clone(&entry.client);
-                let repo = target.repo.clone();
-                let tag = target.tag.clone();
-                let name = entry.name.clone();
-                let checker = entry.batch_checker.clone();
-                head_checks.push(async move {
-                    let result = client.manifest_head(&repo, &tag).await;
-                    (name, client, checker, result)
-                });
-            }
+            let check = check_targets_against_digest(TargetCheckParams {
+                targets: &targets,
+                source: &source,
+                target: &target,
+                compare_digest: head_digest,
+                label: "head_first",
+            })
+            .await;
 
-            let mut skipped_results = Vec::new();
-            let mut mismatched_targets = Vec::new();
-
-            while let Some((target_name, target_client, batch_checker, result)) =
-                head_checks.next().await
-            {
-                match result {
-                    Ok(Some(head)) if head.digest == *head_digest => {
-                        info!(
-                            source_repo = %source.repo,
-                            source_tag = %source.tag,
-                            target_repo = %target.repo,
-                            digest = %head_digest,
-                            "skipping -- digest matches at target (head_first)"
-                        );
-                        tracing::debug!(target: "ocync::metrics", "head_first_skip");
-                        skipped_results.push(skip_image_result(
-                            &source,
-                            &target,
-                            SkipReason::DigestMatch,
-                        ));
-                    }
-                    other => {
-                        if let Err(e) = &other {
-                            warn!(
-                                target_repo = %target.repo,
-                                target_tag = %target.tag,
-                                error = %e,
-                                "target manifest HEAD failed during head_first, proceeding with sync"
-                            );
-                        }
-                        mismatched_targets.push(TargetEntry {
-                            name: target_name,
-                            client: target_client,
-                            batch_checker,
-                        });
-                    }
-                }
-            }
-
-            if mismatched_targets.is_empty() {
+            if check.mismatched.is_empty() {
                 // All targets match the source HEAD digest - skip entirely.
                 // No cache entry is written since we never pulled the full
-                // manifest (no filtered_digest available). The next cycle
-                // with a warm cache will use the standard discovery path.
+                // manifest (no filtered_digest available). In watch mode this
+                // means head_first fires every cycle for tags that remain in
+                // sync (1 source HEAD + N target HEADs per tag). The cache
+                // only warms when a manifest change forces a full pull.
                 return (
-                    DiscoveryOutcome::Skip(skipped_results),
-                    DiscoveryRoute::HeadFirstHit,
+                    DiscoveryOutcome::Skip(check.skipped),
+                    DiscoveryRoute::HeadFirstSkip,
                 );
             }
 
@@ -1239,8 +1148,8 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                 source_client: &source_client,
                 source: &source,
                 target: &target,
-                targets: &mismatched_targets,
-                skipped_results,
+                targets: &check.mismatched,
+                skipped_results: check.skipped,
                 retry: &retry,
                 platforms: platforms.as_deref(),
                 cache: &cache,
@@ -1281,6 +1190,90 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
 
 /// Parameters for [`full_pull_and_build_tasks`], bundled to keep the argument
 /// count under clippy's limit.
+/// Parameters for [`check_targets_against_digest`].
+struct TargetCheckParams<'a> {
+    targets: &'a [TargetEntry],
+    source: &'a ImageRef,
+    target: &'a ImageRef,
+    compare_digest: &'a Digest,
+    /// Label for log messages (e.g., `"cache hit"`, `"head_first"`).
+    label: &'static str,
+}
+
+/// Result of [`check_targets_against_digest`].
+struct TargetCheckResult {
+    /// Targets whose HEAD matched the compare digest (skipped).
+    skipped: Vec<ImageResult>,
+    /// Targets whose HEAD did not match or failed (need sync).
+    mismatched: Vec<TargetEntry>,
+}
+
+/// HEAD-check all targets concurrently against a known digest, partitioning
+/// them into matched (skipped) and mismatched (need sync).
+///
+/// Used by both the cache-hit path (comparing against the cached filtered
+/// digest) and the `head_first` path (comparing against the source HEAD digest).
+async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCheckResult {
+    let TargetCheckParams {
+        targets,
+        source,
+        target,
+        compare_digest,
+        label,
+    } = params;
+
+    let mut head_checks = FuturesUnordered::new();
+    for entry in targets {
+        let client = Arc::clone(&entry.client);
+        let repo = target.repo.clone();
+        let tag = target.tag.clone();
+        let name = entry.name.clone();
+        let checker = entry.batch_checker.clone();
+        head_checks.push(async move {
+            let result = client.manifest_head(&repo, &tag).await;
+            (name, client, checker, result)
+        });
+    }
+
+    let mut skipped = Vec::new();
+    let mut mismatched = Vec::new();
+
+    while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
+        match result {
+            Ok(Some(head)) if head.digest == *compare_digest => {
+                info!(
+                    source_repo = %source.repo,
+                    source_tag = %source.tag,
+                    target_repo = %target.repo,
+                    digest = %compare_digest,
+                    "skipping -- digest matches at target ({label})"
+                );
+                skipped.push(skip_image_result(source, target, SkipReason::DigestMatch));
+            }
+            other => {
+                if let Err(e) = &other {
+                    warn!(
+                        target_repo = %target.repo,
+                        target_tag = %target.tag,
+                        error = %e,
+                        "target manifest HEAD failed during {label}, proceeding with sync"
+                    );
+                }
+                mismatched.push(TargetEntry {
+                    name: target_name,
+                    client: target_client,
+                    batch_checker,
+                });
+            }
+        }
+    }
+
+    TargetCheckResult {
+        skipped,
+        mismatched,
+    }
+}
+
 struct FullPullParams<'a> {
     source_client: &'a Arc<RegistryClient>,
     source: &'a ImageRef,
@@ -1395,7 +1388,6 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                     digest = %source_digest,
                     "skipping -- digest matches at target"
                 );
-                tracing::debug!(target: "ocync::metrics", "unchanged_skip");
                 skipped_results.push(skip_image_result(source, target, SkipReason::DigestMatch));
             }
             other => {
@@ -1869,7 +1861,6 @@ async fn transfer_single_blob(
     };
 
     if skip {
-        tracing::debug!(target: "ocync::metrics", tier = "hot", "cache_hit");
         return BlobResult::Skipped;
     }
 
@@ -1936,7 +1927,6 @@ async fn transfer_single_blob(
                 c.set_blob_completed(ctx.target_name, digest.clone(), ctx.target_repo.to_owned());
                 c.notify_blob(ctx.target_name, digest);
                 drop(c);
-                tracing::debug!(target: "ocync::metrics", result = "success", "mount");
                 return BlobResult::Mounted;
             }
             Ok(MountResult::NotMounted) | Err(_) => {
@@ -1951,7 +1941,6 @@ async fn transfer_single_blob(
                     .borrow_mut()
                     .remove_blob_repo(ctx.target_name, digest, &from_repo);
                 mount_attempted = true;
-                tracing::debug!(target: "ocync::metrics", result = "fallback", "mount");
             }
         }
     }

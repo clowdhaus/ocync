@@ -9938,13 +9938,14 @@ async fn budget_circuit_breaker_emits_tracing_warn() {
 // head_first tests
 // ---------------------------------------------------------------------------
 
-/// Construct a `ResolvedMapping` with `head_first` enabled.
+/// Construct a `ResolvedMapping` with `head_first` enabled and optional platform filters.
 fn resolved_mapping_head_first(
     source_client: Arc<ocync_distribution::RegistryClient>,
     source_repo: &str,
     target_repo: &str,
     targets: Vec<TargetEntry>,
     tags: Vec<TagPair>,
+    platforms: Option<Vec<PlatformFilter>>,
 ) -> ResolvedMapping {
     ResolvedMapping {
         source_authority: RegistryAuthority::new("source.test.io:443"),
@@ -9953,7 +9954,7 @@ fn resolved_mapping_head_first(
         target_repo: RepositoryName::new(target_repo).unwrap(),
         targets,
         tags,
-        platforms: None,
+        platforms,
         head_first: true,
     }
 }
@@ -10010,6 +10011,7 @@ async fn head_first_all_targets_match_skips_source_get() {
         "tgt/repo",
         vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1")],
+        None,
     );
 
     // Empty cache -- no discovery cache entry.
@@ -10026,9 +10028,10 @@ async fn head_first_all_targets_match_skips_source_get() {
 
     assert_eq!(report.stats.images_skipped, 1);
     assert_eq!(report.stats.images_synced, 0);
-    assert_eq!(report.stats.discovery_head_first_hits, 1);
-    // head_first hits count as cache hits for aggregate purposes.
-    assert_eq!(report.stats.discovery_cache_hits, 1);
+    assert_eq!(report.stats.discovery_head_first_skips, 1);
+    // head_first hits are independent of cache hits/misses -- no cache entry
+    // existed, but no full pull was needed either.
+    assert_eq!(report.stats.discovery_cache_hits, 0);
     assert_eq!(report.stats.discovery_cache_misses, 0);
 }
 
@@ -10109,6 +10112,7 @@ async fn head_first_mismatch_falls_through_to_get() {
         "tgt/repo",
         vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1")],
+        None,
     );
 
     let engine = SyncEngine::new(fast_retry(), 10);
@@ -10125,7 +10129,7 @@ async fn head_first_mismatch_falls_through_to_get() {
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.images_skipped, 0);
     // head_first did not skip (mismatch) so it falls through to CacheMiss.
-    assert_eq!(report.stats.discovery_head_first_hits, 0);
+    assert_eq!(report.stats.discovery_head_first_skips, 0);
     assert_eq!(report.stats.discovery_cache_misses, 1);
 }
 
@@ -10190,6 +10194,7 @@ async fn head_first_source_head_failure_falls_through() {
         "tgt/repo",
         vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1")],
+        None,
     );
 
     let engine = SyncEngine::new(fast_retry(), 10);
@@ -10207,14 +10212,14 @@ async fn head_first_source_head_failure_falls_through() {
     assert_eq!(report.stats.images_skipped, 0);
     // head_first was enabled but source HEAD failed, so it's a HEAD failure.
     // HeadFailure increments both discovery_head_failures and discovery_cache_misses.
-    assert_eq!(report.stats.discovery_head_first_hits, 0);
+    assert_eq!(report.stats.discovery_head_first_skips, 0);
     assert_eq!(report.stats.discovery_head_failures, 1);
     assert_eq!(report.stats.discovery_cache_misses, 1);
 }
 
 /// `head_first`: with two targets, one matching and one mismatching, the
 /// matching target is skipped while the mismatching target receives the
-/// full sync. Route is `CacheMiss` (not `HeadFirstHit`) because a GET was
+/// full sync. Route is `CacheMiss` (not `HeadFirstSkip`) because a GET was
 /// still required.
 #[tokio::test]
 async fn head_first_partial_target_match_syncs_only_mismatched() {
@@ -10305,6 +10310,7 @@ async fn head_first_partial_target_match_syncs_only_mismatched() {
             target_entry("target-b", mock_client(&target_b)),
         ],
         vec![TagPair::same("v1")],
+        None,
     );
 
     let engine = SyncEngine::new(fast_retry(), 10);
@@ -10320,8 +10326,8 @@ async fn head_first_partial_target_match_syncs_only_mismatched() {
 
     // Image was synced (partial match means we still did work).
     assert_eq!(report.stats.images_synced, 1);
-    // Not a HeadFirstHit because not ALL targets matched.
-    assert_eq!(report.stats.discovery_head_first_hits, 0);
+    // Not a HeadFirstSkip because not ALL targets matched.
+    assert_eq!(report.stats.discovery_head_first_skips, 0);
     // Fell through to CacheMiss route.
     assert_eq!(report.stats.discovery_cache_misses, 1);
 }
@@ -10457,14 +10463,14 @@ async fn head_first_bypassed_with_platform_filter() {
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
 
-    let mut mapping = resolved_mapping_head_first(
+    let mapping = resolved_mapping_head_first(
         source_client,
         "src/repo",
         "tgt/repo",
         vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1")],
+        Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]),
     );
-    mapping.platforms = Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]);
 
     let engine = SyncEngine::new(fast_retry(), 10);
     let report = engine
@@ -10481,7 +10487,194 @@ async fn head_first_bypassed_with_platform_filter() {
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.images_skipped, 0);
     // head_first was bypassed, so no hits.
-    assert_eq!(report.stats.discovery_head_first_hits, 0);
+    assert_eq!(report.stats.discovery_head_first_skips, 0);
     // Took the CacheMiss route (full pull path).
     assert_eq!(report.stats.discovery_cache_misses, 1);
+}
+
+/// `head_first`: when a target HEAD request returns a server error, the
+/// target is treated as mismatched (degraded to sync) rather than failing
+/// the entire discovery.
+#[tokio::test]
+async fn head_first_target_head_error_degrades_to_sync() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"hf-terr-cfg";
+    let layer_data = b"hf-terr-lyr";
+    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
+    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: None,
+        config: config_desc.clone(),
+        layers: vec![layer_desc.clone()],
+        subject: None,
+        artifact_type: None,
+        annotations: None,
+    };
+    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
+
+    // Source HEAD: returns the real digest.
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", manifest_bytes.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Source GET: must fire (target HEAD failed, treated as mismatch).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(manifest_bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    mount_blob_pull(&source_server, "src/repo", &config_desc.digest, config_data).await;
+    mount_blob_pull(&source_server, "src/repo", &layer_desc.digest, layer_data).await;
+
+    // Target HEAD for head_first: returns 500 (server error).
+    // The head_first mock is mounted first; full_pull_and_build_tasks also
+    // issues a target HEAD which hits the same path (both return 500, the
+    // engine treats both as "needs push").
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&target_server)
+        .await;
+
+    mount_blob_not_found(&target_server, "tgt/repo", &config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/repo", &layer_desc.digest).await;
+    mount_blob_push(&target_server, "tgt/repo").await;
+    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = resolved_mapping_head_first(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1")],
+        None,
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    // Image synced successfully despite target HEAD error.
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.images_skipped, 0);
+    assert_eq!(report.stats.images_failed, 0);
+    // Not a HeadFirstSkip because the target HEAD errored (treated as mismatch).
+    assert_eq!(report.stats.discovery_head_first_skips, 0);
+    assert_eq!(report.stats.discovery_cache_misses, 1);
+}
+
+/// `head_first`: when the discovery cache is warm (source snapshot exists),
+/// the standard cache-hit path fires and `head_first` has no effect --
+/// no target HEADs are issued for the head_first check.
+#[tokio::test]
+async fn head_first_warm_cache_uses_standard_cache_hit() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let manifest_digest = make_digest("f0a1");
+
+    // Source HEAD: fires once (discovery optimization confirms cache match).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+
+    // Source GET: must NOT fire (cache hit skips full pull).
+    Mock::given(method("GET"))
+        .and(path("/v2/src/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    // Target HEAD by tag: fires once (standard cache-hit target check).
+    Mock::given(method("HEAD"))
+        .and(path("/v2/tgt/repo/manifests/v1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("docker-content-digest", manifest_digest.to_string())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .insert_header("content-length", "100"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = resolved_mapping_head_first(
+        source_client,
+        "src/repo",
+        "tgt/repo",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("v1")],
+        None,
+    );
+
+    // Pre-populate discovery cache so the standard cache-hit path fires.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        c.set_source_snapshot(
+            snap_key("src/repo", "v1"),
+            SourceSnapshot {
+                source_digest: manifest_digest.clone(),
+                filtered_digest: manifest_digest.clone(),
+                platform_filter_key: PlatformFilterKey::from_filters(None),
+            },
+        );
+    }
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping],
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_skipped, 1);
+    assert_eq!(report.stats.images_synced, 0);
+    // Standard cache hit, NOT head_first.
+    assert_eq!(report.stats.discovery_cache_hits, 1);
+    assert_eq!(report.stats.discovery_head_first_skips, 0);
+    assert_eq!(report.stats.discovery_cache_misses, 0);
 }
