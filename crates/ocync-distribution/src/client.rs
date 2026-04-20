@@ -1,5 +1,7 @@
 //! HTTP client for a single OCI registry endpoint.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use http::StatusCode;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use url::Url;
@@ -11,6 +13,10 @@ use crate::spec::{RegistryAuthority, RepositoryName};
 
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
 const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
+
+/// Sentinel value stored in [`RegistryClient::rate_limit_remaining`] when no
+/// rate-limit header has been observed yet.
+const RATE_LIMIT_UNKNOWN: u64 = u64::MAX;
 
 use crate::auth::AuthScheme;
 
@@ -92,6 +98,7 @@ impl RegistryClientBuilder {
             http,
             auth: self.auth,
             aimd,
+            rate_limit_remaining: AtomicU64::new(RATE_LIMIT_UNKNOWN),
         })
     }
 }
@@ -105,12 +112,28 @@ pub struct RegistryClient {
     pub(crate) http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
+    /// Last observed rate-limit remaining value from response headers.
+    ///
+    /// Updated atomically on every response that carries a `ratelimit-remaining`
+    /// (Docker Hub) or `x-ratelimit-remaining` (GHCR) header. Stores
+    /// [`RATE_LIMIT_UNKNOWN`] until the first such header is seen. The engine
+    /// reads this to decide whether to pause discovery (budget circuit breaker).
+    rate_limit_remaining: AtomicU64,
 }
 
 impl std::fmt::Debug for RegistryClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let remaining = self.rate_limit_remaining.load(Ordering::Relaxed);
         f.debug_struct("RegistryClient")
             .field("base_url", &self.base_url)
+            .field(
+                "rate_limit_remaining",
+                &if remaining == RATE_LIMIT_UNKNOWN {
+                    None
+                } else {
+                    Some(remaining)
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -148,6 +171,33 @@ impl RegistryClient {
             .ok_or_else(|| Error::Other(format!("registry URL has no host: {}", self.base_url)))?;
         let port = self.base_url.port_or_known_default().unwrap_or(443);
         Ok(RegistryAuthority::new(format!("{host}:{port}")))
+    }
+
+    /// Return the last observed rate-limit remaining value, or `None` if no
+    /// rate-limit header has been seen yet.
+    ///
+    /// Updated automatically by [`send_with_aimd`](Self::send_with_aimd)
+    /// from `ratelimit-remaining` (Docker Hub) or `x-ratelimit-remaining`
+    /// (GHCR) response headers. The engine reads this on source clients to
+    /// pause discovery when the budget is low (budget circuit breaker).
+    pub fn rate_limit_remaining(&self) -> Option<u64> {
+        let v = self.rate_limit_remaining.load(Ordering::Relaxed);
+        if v == RATE_LIMIT_UNKNOWN {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// Extract and store the rate-limit remaining value from response headers.
+    ///
+    /// Called by [`send_with_aimd`](Self::send_with_aimd) on every successful
+    /// response.
+    fn record_rate_limit(&self, headers: &HeaderMap) {
+        if let Some(remaining) = parse_rate_limit_remaining(headers) {
+            self.rate_limit_remaining
+                .store(remaining, Ordering::Relaxed);
+        }
     }
 
     /// Perform an authenticated GET request.
@@ -211,8 +261,8 @@ impl RegistryClient {
     /// Send a request with AIMD permit tracking and 401 retry.
     ///
     /// Combines permit acquisition, the authenticated retry loop, and AIMD
-    /// feedback reporting into a single call. Callers no longer need to
-    /// manually acquire/report permits.
+    /// feedback reporting into a single call. Also extracts rate-limit
+    /// remaining values from response headers (budget circuit breaker).
     pub(crate) async fn send_with_aimd(
         &self,
         action: RegistryAction,
@@ -222,6 +272,9 @@ impl RegistryClient {
     ) -> Result<reqwest::Response, Error> {
         let permit = self.aimd.acquire(action).await;
         let result = self.send_with_retry(scopes, context, build_request).await;
+        if let Ok(resp) = &result {
+            self.record_rate_limit(resp.headers());
+        }
         report_permit(permit, &result);
         result
     }
@@ -296,6 +349,33 @@ pub(crate) fn report_permit(
         Ok(resp) if resp.status() == StatusCode::TOO_MANY_REQUESTS => permit.throttled(),
         _ => permit.success(),
     }
+}
+
+/// Extract the rate-limit remaining value from response headers.
+///
+/// Docker Hub sends `ratelimit-remaining: N;w=21600` (N remaining in a 6-hour
+/// window). GHCR sends `x-ratelimit-remaining: N`. Returns the parsed integer
+/// from whichever header is present, preferring `ratelimit-remaining`.
+fn parse_rate_limit_remaining(headers: &HeaderMap) -> Option<u64> {
+    // Docker Hub: `ratelimit-remaining: 99;w=21600`
+    if let Some(val) = headers.get("ratelimit-remaining") {
+        if let Ok(s) = val.to_str() {
+            // Take the integer before the first semicolon.
+            let num_part = s.split(';').next().unwrap_or(s).trim();
+            if let Ok(n) = num_part.parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    // GHCR: `x-ratelimit-remaining: 99`
+    if let Some(val) = headers.get("x-ratelimit-remaining") {
+        if let Ok(s) = val.to_str() {
+            if let Ok(n) = s.trim().parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 /// Classify an HTTP response into success/error.
@@ -485,6 +565,151 @@ mod tests {
     #[test]
     fn user_agent_value() {
         assert!(USER_AGENT_VALUE.starts_with("ocync/"));
+    }
+
+    #[test]
+    fn parse_rate_limit_docker_hub() {
+        let mut headers = HeaderMap::new();
+        headers.insert("ratelimit-remaining", "99;w=21600".parse().unwrap());
+        assert_eq!(parse_rate_limit_remaining(&headers), Some(99));
+    }
+
+    #[test]
+    fn parse_rate_limit_ghcr() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "42".parse().unwrap());
+        assert_eq!(parse_rate_limit_remaining(&headers), Some(42));
+    }
+
+    #[test]
+    fn parse_rate_limit_docker_hub_preferred_over_ghcr() {
+        let mut headers = HeaderMap::new();
+        headers.insert("ratelimit-remaining", "10;w=21600".parse().unwrap());
+        headers.insert("x-ratelimit-remaining", "999".parse().unwrap());
+        // Docker Hub header takes precedence.
+        assert_eq!(parse_rate_limit_remaining(&headers), Some(10));
+    }
+
+    #[test]
+    fn parse_rate_limit_no_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(parse_rate_limit_remaining(&headers), None);
+    }
+
+    #[test]
+    fn parse_rate_limit_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert("ratelimit-remaining", "0;w=21600".parse().unwrap());
+        assert_eq!(parse_rate_limit_remaining(&headers), Some(0));
+    }
+
+    #[test]
+    fn rate_limit_remaining_none_before_any_response() {
+        let client = RegistryClient::builder(test_base_url()).build().unwrap();
+        assert_eq!(client.rate_limit_remaining(), None);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_remaining_updated_from_response_header() {
+        let server = MockServer::start().await;
+        let base_url = Url::parse(&server.uri()).unwrap();
+
+        let client = RegistryClient::builder(base_url)
+            .auth(StubAuth)
+            .max_concurrent(50)
+            .build()
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/v2/repo/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ratelimit-remaining", "42;w=21600")
+                    .set_body_string("ok"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let repo = RepositoryName::new("repo").unwrap();
+        let _ = client
+            .get(
+                &repo,
+                "manifests/latest",
+                None,
+                RegistryAction::ManifestRead,
+            )
+            .await;
+
+        assert_eq!(
+            client.rate_limit_remaining(),
+            Some(42),
+            "rate_limit_remaining should be updated from response header"
+        );
+    }
+
+    /// Negative test: `rate_limit_remaining` must NOT be updated when the
+    /// response has no rate-limit header. A missing header means the
+    /// registry does not expose budget info, so the value should stay at
+    /// whatever it was before (not be reset to None or 0).
+    #[tokio::test]
+    async fn rate_limit_remaining_not_reset_without_header() {
+        let server = MockServer::start().await;
+        let base_url = Url::parse(&server.uri()).unwrap();
+
+        let client = RegistryClient::builder(base_url)
+            .auth(StubAuth)
+            .max_concurrent(50)
+            .build()
+            .unwrap();
+
+        // First response: has rate-limit header.
+        Mock::given(method("GET"))
+            .and(path("/v2/repo/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ratelimit-remaining", "50;w=21600")
+                    .set_body_string("ok"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let repo = RepositoryName::new("repo").unwrap();
+        let _ = client
+            .get(
+                &repo,
+                "manifests/latest",
+                None,
+                RegistryAction::ManifestRead,
+            )
+            .await;
+        assert_eq!(client.rate_limit_remaining(), Some(50));
+
+        // Second response: no rate-limit header.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/repo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _ = client
+            .get(
+                &repo,
+                "manifests/latest",
+                None,
+                RegistryAction::ManifestRead,
+            )
+            .await;
+
+        // Value should still be 50, NOT reset.
+        assert_eq!(
+            client.rate_limit_remaining(),
+            Some(50),
+            "rate_limit_remaining must not be reset when header is absent"
+        );
     }
 
     #[tokio::test]
