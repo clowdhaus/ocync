@@ -46,7 +46,7 @@ impl ProviderKind {
     /// is disabled by default; when disabled, mount POSTs return 202 (the
     /// fallback path pushes normally). We always attempt mount on ECR because
     /// the 202 fallback is cheap (~100ms) and successful mounts save entire
-    /// blob uploads. See `docs/registries/ecr.md` for details.
+    /// blob uploads. See `docs/src/content/registries/ecr.md` for details.
     ///
     /// Uses an exhaustive `match` so adding a new [`ProviderKind`] variant
     /// forces a compile-time decision here.

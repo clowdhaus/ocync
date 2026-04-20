@@ -178,6 +178,7 @@ const jsonLd = {
     grid-template-columns: var(--sidebar-width) 1fr 12rem;
     max-inline-size: var(--content-max);
     margin-inline: auto;
+    padding-inline: var(--space-6);
     min-block-size: calc(100dvh - 8rem);
   }
 
@@ -325,6 +326,7 @@ const jsonLd = {
   @media (width < 48rem) {
     .doc-shell {
       grid-template-columns: 1fr;
+      padding-inline: var(--space-4);
     }
 
     .doc-sidebar {

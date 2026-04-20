@@ -57,7 +57,7 @@ against the registry we target?
   deterministic, runs in CI on every PR.
 - Registry-specific quirks that cannot be exercised against
   `registry:2` (e.g. ECR's "never fulfills mount" behavior) are
-  captured as evidence in the findings log and pinned by engine-level
+  captured as evidence in the per-registry documentation and pinned by engine-level
   integration tests asserting the adapted code path.
 
 **Hard rule:** every `ocync` optimization that claims bytes/requests
