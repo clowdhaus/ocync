@@ -127,8 +127,8 @@ fn resolved_mapping(
     ResolvedMapping {
         source_authority: RegistryAuthority::new("source.test.io:443"),
         source_client,
-        source_repo: source_repo.into(),
-        target_repo: target_repo.into(),
+        source_repo: RepositoryName::new(source_repo).unwrap(),
+        target_repo: RepositoryName::new(target_repo).unwrap(),
         targets,
         tags,
         platforms: None,
@@ -2088,8 +2088,16 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
     {
         let mut c = cache.borrow_mut();
         let target = "target";
-        c.set_blob_completed(target, config_desc.digest.clone(), "repo-a".into());
-        c.set_blob_completed(target, layer_desc.digest.clone(), "repo-a".into());
+        c.set_blob_completed(
+            target,
+            config_desc.digest.clone(),
+            RepositoryName::new("repo-a").unwrap(),
+        );
+        c.set_blob_completed(
+            target,
+            layer_desc.digest.clone(),
+            RepositoryName::new("repo-a").unwrap(),
+        );
     }
 
     let mapping = resolved_mapping(
@@ -2174,8 +2182,16 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
     let target_name = "ecr-target";
     {
         let mut c = cache.borrow_mut();
-        c.set_blob_completed(target_name, config_desc.digest.clone(), "repo-a".into());
-        c.set_blob_completed(target_name, layer_desc.digest.clone(), "repo-a".into());
+        c.set_blob_completed(
+            target_name,
+            config_desc.digest.clone(),
+            RepositoryName::new("repo-a").unwrap(),
+        );
+        c.set_blob_completed(
+            target_name,
+            layer_desc.digest.clone(),
+            RepositoryName::new("repo-a").unwrap(),
+        );
     }
 
     let mapping = resolved_mapping(
@@ -2361,8 +2377,16 @@ async fn sync_lazy_invalidation_on_mount_failure() {
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
-        c.set_blob_completed("target", config_desc.digest.clone(), "other-repo".into());
-        c.set_blob_completed("target", layer_desc.digest.clone(), "other-repo".into());
+        c.set_blob_completed(
+            "target",
+            config_desc.digest.clone(),
+            RepositoryName::new("other-repo").unwrap(),
+        );
+        c.set_blob_completed(
+            "target",
+            layer_desc.digest.clone(),
+            RepositoryName::new("other-repo").unwrap(),
+        );
     }
 
     let mapping = resolved_mapping(
@@ -2975,8 +2999,16 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
-        c.set_blob_completed("target", config_desc.digest.clone(), "stale-repo".into());
-        c.set_blob_completed("target", layer_desc.digest.clone(), "stale-repo".into());
+        c.set_blob_completed(
+            "target",
+            config_desc.digest.clone(),
+            RepositoryName::new("stale-repo").unwrap(),
+        );
+        c.set_blob_completed(
+            "target",
+            layer_desc.digest.clone(),
+            RepositoryName::new("stale-repo").unwrap(),
+        );
     }
 
     let mapping = resolved_mapping(
@@ -3836,8 +3868,16 @@ async fn sync_warm_cache_skips_blob_head_check() {
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
-        c.set_blob_completed("target", config_desc.digest.clone(), "repo".into());
-        c.set_blob_completed("target", layer_desc.digest.clone(), "repo".into());
+        c.set_blob_completed(
+            "target",
+            config_desc.digest.clone(),
+            RepositoryName::new("repo").unwrap(),
+        );
+        c.set_blob_completed(
+            "target",
+            layer_desc.digest.clone(),
+            RepositoryName::new("repo").unwrap(),
+        );
     }
 
     let mapping = resolved_mapping(
@@ -5069,7 +5109,11 @@ async fn sync_batch_checker_with_prewarmed_cache() {
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
-        c.set_blob_exists("target", config_desc.digest.clone(), "repo".into());
+        c.set_blob_exists(
+            "target",
+            config_desc.digest.clone(),
+            RepositoryName::new("repo").unwrap(),
+        );
     }
 
     // Batch checker: both blobs exist (config is redundant with cache).

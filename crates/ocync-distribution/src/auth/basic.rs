@@ -267,7 +267,7 @@ mod tests {
         let auth =
             BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
-        assert!(matches!(err, Error::Http(_)));
+        assert!(matches!(err, Error::AuthFailed { .. }));
     }
 
     #[tokio::test]
