@@ -62,16 +62,22 @@ fn write_run_summary(
     let s = &report.stats;
     let has_discovery = s.discovery_cache_hits > 0
         || s.discovery_cache_misses > 0
-        || s.discovery_head_first_skips > 0;
+        || s.discovery_head_first_skips > 0
+        || s.immutable_tag_skips > 0;
     let discovery = if has_discovery {
         let head_first_suffix = if s.discovery_head_first_skips > 0 {
             format!(", {} head_first", s.discovery_head_first_skips)
         } else {
             String::new()
         };
+        let immutable_suffix = if s.immutable_tag_skips > 0 {
+            format!(", {} immutable", s.immutable_tag_skips)
+        } else {
+            String::new()
+        };
         format!(
-            " | discovery: {} cached, {} pulled{}",
-            s.discovery_cache_hits, s.discovery_cache_misses, head_first_suffix,
+            " | discovery: {} cached, {} pulled{}{}",
+            s.discovery_cache_hits, s.discovery_cache_misses, head_first_suffix, immutable_suffix,
         )
     } else {
         String::new()
@@ -620,6 +626,53 @@ mod tests {
         let output = String::from_utf8(buf.borrow().clone()).unwrap();
         assert!(
             output.contains("discovery: 0 cached, 0 pulled, 5 head_first"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn summary_with_immutable_skips_includes_suffix() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 1,
+                images_skipped: 10,
+                discovery_cache_hits: 2,
+                discovery_cache_misses: 1,
+                immutable_tag_skips: 8,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(3),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            output.contains("discovery: 2 cached, 1 pulled, 8 immutable"),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn summary_with_only_immutable_skips_includes_discovery() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 1,
+                immutable_tag_skips: 50,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(1),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            output.contains("discovery: 0 cached, 0 pulled, 50 immutable"),
             "got: {output}"
         );
     }

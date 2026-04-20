@@ -195,7 +195,10 @@ pub struct SyncStats {
     /// of `discovery_cache_hits` and `discovery_cache_misses` -- the cache had
     /// no entry, but no full pull was needed either.
     pub discovery_head_first_skips: u64,
-    /// Tags skipped via `immutable_tags` pattern match (zero API calls).
+    /// (Tag, target) pairs skipped via immutable-glob match (zero API calls).
+    ///
+    /// Unit is per-target: 2 tags across 3 targets = 6. Consistent with
+    /// `images_skipped` which also counts per-target.
     pub immutable_tag_skips: u64,
 }
 

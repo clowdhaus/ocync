@@ -29,7 +29,6 @@ use std::time::Instant;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
-use globset::GlobSet;
 use ocync_distribution::BatchBlobChecker;
 use ocync_distribution::Digest;
 use ocync_distribution::RegistryClient;
@@ -138,17 +137,33 @@ pub struct ResolvedMapping {
     /// The source HEAD from the discovery optimization is reused, so
     /// enabling both features does not issue a redundant HEAD.
     pub head_first: bool,
-    /// Compiled glob pattern for immutable tags.
+    /// Compiled glob pattern identifying immutable tags.
     ///
-    /// When a tag matches this pattern AND exists in all target tag lists,
-    /// the tag is skipped with zero API calls. See the skip optimization
-    /// hierarchy in the design docs.
-    pub immutable_tags: Option<GlobSet>,
-    /// Per-target tag lists, indexed in the same order as [`targets`](Self::targets).
+    /// When a tag matches this pattern AND exists in every target's
+    /// [`existing_tags`](TargetEntry::existing_tags), the tag is skipped with
+    /// zero API calls. See the skip optimization hierarchy in the design docs.
+    pub immutable_glob: Option<globset::GlobSet>,
+}
+
+impl ResolvedMapping {
+    /// Returns `true` when `tag` should be skipped via the immutable-tag
+    /// optimization: the tag matches the configured glob AND already exists
+    /// at every target.
     ///
-    /// Only populated when `immutable_tags` is `Some`. Each entry contains the
-    /// set of tags already present at the corresponding target registry.
-    pub target_tag_lists: Vec<HashSet<String>>,
+    /// Returns `false` (no skip) when:
+    /// - No `immutable_glob` is configured.
+    /// - The tag does not match the pattern.
+    /// - `targets` is empty (degenerate case; `.all()` on empty is `true`).
+    /// - Any target's `existing_tags` does not contain the tag.
+    pub fn should_skip_immutable(&self, tag: &str) -> bool {
+        let Some(ref pattern) = self.immutable_glob else {
+            return false;
+        };
+        if self.targets.is_empty() {
+            return false;
+        }
+        pattern.is_match(tag) && self.targets.iter().all(|t| t.existing_tags.contains(tag))
+    }
 }
 
 /// A single target registry entry.
@@ -169,6 +184,13 @@ pub struct TargetEntry {
     /// When present, [`transfer_image_blobs`] pre-populates the cache via
     /// a single batch call instead of per-blob HEAD checks.
     pub batch_checker: Option<Rc<dyn BatchBlobChecker>>,
+    /// Tags already present at this target registry at resolution time.
+    ///
+    /// Populated when `immutable_glob` is configured on the parent
+    /// [`ResolvedMapping`]. Empty when the pattern is absent OR when
+    /// `list_tags` failed (degraded: the immutable skip is disabled
+    /// for this target, falling through to HEAD-based discovery).
+    pub existing_tags: HashSet<String>,
 }
 
 impl Clone for TargetEntry {
@@ -177,6 +199,7 @@ impl Clone for TargetEntry {
             name: self.name.clone(),
             client: Arc::clone(&self.client),
             batch_checker: self.batch_checker.clone(),
+            existing_tags: self.existing_tags.clone(),
         }
     }
 }
@@ -187,6 +210,7 @@ impl fmt::Debug for TargetEntry {
             .field("name", &self.name)
             .field("client", &self.client)
             .field("batch_checker", &self.batch_checker.as_ref().map(|_| ".."))
+            .field("existing_tags", &self.existing_tags.len())
             .finish()
     }
 }
@@ -671,42 +695,29 @@ impl SyncEngine {
         // Seed discovery with all (mapping, tag) pairs.
         for mapping in &mappings {
             for tag_pair in &mapping.tags {
-                // Tier 1: immutable_tags pattern match (0 API calls).
-                // If the tag matches the pattern AND exists in ALL target tag
-                // lists, skip immediately without entering discovery.
-                if let Some(ref pattern) = mapping.immutable_tags {
-                    if pattern.is_match(&tag_pair.target)
-                        && !mapping.target_tag_lists.is_empty()
-                        && mapping
-                            .target_tag_lists
-                            .iter()
-                            .all(|tags| tags.contains(&tag_pair.target))
-                    {
-                        info!(
-                            source_repo = %mapping.source_repo,
-                            tag = %tag_pair.target,
-                            "skipping -- immutable tag exists at all targets"
-                        );
-                        let source_ref = ImageRef {
-                            repo: mapping.source_repo.clone(),
-                            tag: tag_pair.source.clone(),
-                        };
-                        let target_ref = ImageRef {
-                            repo: mapping.target_repo.clone(),
-                            tag: tag_pair.target.clone(),
-                        };
-                        for _entry in &mapping.targets {
-                            let r = skip_image_result(
-                                &source_ref,
-                                &target_ref,
-                                SkipReason::ImmutableTag,
-                            );
-                            progress.image_completed(&r);
-                            results.push(r);
-                        }
-                        immutable_tag_skips += mapping.targets.len() as u64;
-                        continue;
+                // Tier 1: immutable tag skip (0 API calls).
+                if mapping.should_skip_immutable(&tag_pair.target) {
+                    info!(
+                        source_repo = %mapping.source_repo,
+                        tag = %tag_pair.target,
+                        "skipping -- immutable tag exists at all targets"
+                    );
+                    let source_ref = ImageRef {
+                        repo: mapping.source_repo.clone(),
+                        tag: tag_pair.source.clone(),
+                    };
+                    let target_ref = ImageRef {
+                        repo: mapping.target_repo.clone(),
+                        tag: tag_pair.target.clone(),
+                    };
+                    for _entry in &mapping.targets {
+                        let r =
+                            skip_image_result(&source_ref, &target_ref, SkipReason::ImmutableTag);
+                        progress.image_completed(&r);
+                        results.push(r);
                     }
+                    immutable_tag_skips += mapping.targets.len() as u64;
+                    continue;
                 }
 
                 let params = DiscoveryParams {
@@ -1316,6 +1327,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
                     name: target_name,
                     client: target_client,
                     batch_checker,
+                    existing_tags: HashSet::new(),
                 });
             }
         }

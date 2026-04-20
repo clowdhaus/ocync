@@ -1,6 +1,7 @@
 //! The `copy` subcommand - copies a single image between registries.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -71,12 +72,12 @@ pub(crate) async fn run(
             name: RegistryAlias::new(bare_hostname(args.destination.registry())),
             client: target_client,
             batch_checker: None,
+            existing_tags: HashSet::new(),
         }],
         tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],
         platforms: None,
         head_first: false,
-        immutable_tags: None,
-        target_tag_lists: Vec::new(),
+        immutable_glob: None,
     };
 
     let engine = SyncEngine::new(RetryConfig::default(), DEFAULT_MAX_CONCURRENT_TRANSFERS);

@@ -16,7 +16,7 @@ use ocync_sync::engine::{
     DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedMapping, SyncEngine, TagPair,
     TargetEntry,
 };
-use ocync_sync::filter::{FilterConfig, build_immutable_glob};
+use ocync_sync::filter::{FilterConfig, build_glob_set};
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
@@ -317,7 +317,7 @@ pub(crate) async fn resolve_mapping(
     let target_names =
         resolve_target_names(targets_value, config, &known, &context).map_err(CliError::Config)?;
 
-    let targets: Vec<TargetEntry> = target_names
+    let mut targets: Vec<TargetEntry> = target_names
         .into_iter()
         .map(|name| {
             let client = clients.get(&name).cloned().ok_or_else(|| {
@@ -331,6 +331,7 @@ pub(crate) async fn resolve_mapping(
                 name: RegistryAlias::new(name),
                 client,
                 batch_checker,
+                existing_tags: HashSet::new(),
             })
         })
         .collect::<Result<Vec<_>, CliError>>()?;
@@ -384,24 +385,25 @@ pub(crate) async fn resolve_mapping(
 
     // --- Immutable tags optimization ---
     let immutable_pattern = tags_config.and_then(|t| t.immutable_tags.as_deref());
-    let (immutable_tags, target_tag_lists) = if let Some(pattern) = immutable_pattern {
-        let glob_set = build_immutable_glob(pattern)?;
+    let immutable_glob = if let Some(pattern) = immutable_pattern {
+        let glob_set = build_glob_set(&[pattern.to_owned()])?;
 
         let target_repo_path = RepositoryName::new(&target_repo)?;
-        let mut tag_lists = Vec::with_capacity(targets.len());
-        for entry in &targets {
-            let tags: HashSet<String> = entry
-                .client
-                .list_tags(&target_repo_path)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            tag_lists.push(tags);
+        for entry in &mut targets {
+            match entry.client.list_tags(&target_repo_path).await {
+                Ok(tags) => entry.existing_tags = tags.into_iter().collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        registry = %entry.name,
+                        error = %e,
+                        "failed to list target tags; immutable skip disabled for this target"
+                    );
+                }
+            }
         }
-        (Some(glob_set), tag_lists)
+        Some(glob_set)
     } else {
-        (None, Vec::new())
+        None
     };
 
     Ok(Some(ResolvedMapping {
@@ -413,8 +415,7 @@ pub(crate) async fn resolve_mapping(
         tags: filtered.into_iter().map(TagPair::same).collect(),
         platforms,
         head_first,
-        immutable_tags,
-        target_tag_lists,
+        immutable_glob,
     }))
 }
 

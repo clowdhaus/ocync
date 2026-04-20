@@ -1,7 +1,6 @@
 //! Tag filtering pipeline: glob -> semver -> exclude -> sort + latest.
 
-pub use globset::GlobSet;
-use globset::{Glob, GlobSetBuilder};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -113,25 +112,8 @@ impl FilterConfig {
 // Individual stages
 // ---------------------------------------------------------------------------
 
-/// Build a single-pattern [`GlobSet`] from a glob string.
-///
-/// Used by the CLI to compile `immutable_tags` patterns before passing them
-/// to the engine via [`ResolvedMapping`](crate::engine::ResolvedMapping).
-pub fn build_immutable_glob(pattern: &str) -> Result<GlobSet, Error> {
-    let g = Glob::new(pattern).map_err(|e| Error::InvalidGlob {
-        pattern: pattern.to_owned(),
-        reason: e.to_string(),
-    })?;
-    let mut builder = GlobSetBuilder::new();
-    builder.add(g);
-    builder.build().map_err(|e| Error::InvalidGlob {
-        pattern: pattern.to_owned(),
-        reason: e.to_string(),
-    })
-}
-
 /// Build a [`GlobSet`] from patterns, returning an error on invalid patterns.
-fn build_glob_set(patterns: &[String]) -> Result<GlobSet, Error> {
+pub fn build_glob_set(patterns: &[String]) -> Result<GlobSet, Error> {
     let mut builder = GlobSetBuilder::new();
     for p in patterns {
         let g = Glob::new(p).map_err(|e| Error::InvalidGlob {
@@ -697,11 +679,11 @@ mod tests {
         ));
     }
 
-    // - build_immutable_glob tests ------------------------------------------
+    // - build_glob_set tests -------------------------------------------------
 
     #[test]
-    fn immutable_glob_matches_semver() {
-        let gs = build_immutable_glob("v[0-9]*.[0-9]*.[0-9]*").unwrap();
+    fn glob_set_semver_with_v_prefix() {
+        let gs = build_glob_set(&["v[0-9]*.[0-9]*.[0-9]*".into()]).unwrap();
         assert!(gs.is_match("v1.2.3"));
         assert!(gs.is_match("v10.20.30"));
         assert!(!gs.is_match("latest"));
@@ -709,8 +691,8 @@ mod tests {
     }
 
     #[test]
-    fn immutable_glob_bare_semver() {
-        let gs = build_immutable_glob("[0-9]*.[0-9]*.[0-9]*").unwrap();
+    fn glob_set_bare_semver() {
+        let gs = build_glob_set(&["[0-9]*.[0-9]*.[0-9]*".into()]).unwrap();
         assert!(gs.is_match("1.2.3"));
         assert!(gs.is_match("10.0.0"));
         assert!(!gs.is_match("v1.2.3"));
@@ -718,19 +700,8 @@ mod tests {
     }
 
     #[test]
-    fn immutable_glob_v_prefix_multidigit() {
-        // `v[0-9]*` matches `v` followed by a digit and any remaining chars
-        // before the first dot. Handles both `v1.2.3` and `v10.20.30`.
-        let gs = build_immutable_glob("v[0-9]*.[0-9]*.[0-9]*").unwrap();
-        assert!(gs.is_match("v1.2.3"));
-        assert!(gs.is_match("v10.20.30"));
-        assert!(!gs.is_match("1.2.3"), "bare version should not match");
-        assert!(!gs.is_match("latest"));
-    }
-
-    #[test]
-    fn immutable_glob_invalid_pattern() {
-        let err = build_immutable_glob("[bad").unwrap_err();
+    fn glob_set_invalid_pattern() {
+        let err = build_glob_set(&["[bad".into()]).unwrap_err();
         assert!(matches!(err, Error::InvalidGlob { .. }));
     }
 }
