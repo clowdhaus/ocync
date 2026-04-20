@@ -276,7 +276,7 @@ registries:
 
 When pushing to an ECR repository with `image_tag_mutability: IMMUTABLE`, pushing an existing tag returns `ImageTagAlreadyExistsException`. `ocync` treats this as **success** because the image is already there with that tag. The exception is logged at DEBUG level (not an error, not even a warning) and the image is marked as skipped with reason `tag_immutable_exists`.
 
-This makes re-runs fully idempotent without requiring `skip_existing: true`. A sync that is interrupted and restarted will pick up where it left off, and tags that were already pushed in the previous partial run are silently accepted.
+This makes re-runs fully idempotent. A sync that is interrupted and restarted will pick up where it left off, and tags that were already pushed in the previous partial run are silently accepted.
 
 ## Platform subset filtering
 
@@ -303,11 +303,11 @@ If a requested platform is not available in the source image index, `ocync` logs
 
 If **zero** requested platforms match any manifest in the source index, `ocync` returns an error with actionable context: the configured platform filter, the platforms actually available in the source index, and the source reference. An empty filtered index is never pushed to targets because it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading into an unusable state.
 
-> **Status: Partially implemented.** `skip_existing` and default HEAD + digest compare are implemented. The `immutable_tags` optimization described below is designed but not yet implemented.
+> **Status: Partially implemented.** Default HEAD + digest compare is implemented. The `immutable_tags` optimization described below is designed but not yet implemented.
 
 ## Skip optimization hierarchy
 
-When deciding whether to sync a tag, `ocync` evaluates three tiers in order. The first match wins.
+When deciding whether to sync a tag, `ocync` evaluates two tiers in order. The first match wins.
 
 ### Tier 1: immutable_tags pattern match (0 API calls)
 
@@ -321,18 +321,7 @@ When a tag matches the `immutable_tags` glob pattern AND the tag name appears in
 
 Semver tags (`v1.2.3`, `3.12.1`) are conventionally immutable. Once a version is published, changing its contents breaks every consumer that pinned to it. The convention is strong enough that checking their digest on every sync run is waste. Operators who use mutable semver tags (uncommon but not unheard of) should not configure `immutable_tags`.
 
-### Tier 2: skip_existing (1 API call, digest ignored)
-
-```yaml
-mappings:
-  - from: library/redis
-    to: mirror/redis
-    skip_existing: true
-```
-
-When `skip_existing: true` is set: send a manifest HEAD request. If the target returns 200 (tag exists), skip. The digest is NOT compared; any version of the image at that tag is considered sufficient. Use case: mirrors where initial population is the goal, not keeping tags updated with source changes.
-
-### Tier 3: default HEAD + digest compare
+### Tier 2: default HEAD + digest compare
 
 The default behavior. Send a manifest HEAD to the target. Compare the digest with the source manifest digest. Same digest means the image is unchanged, so skip. Different digest means the image was updated at source, so sync the new version. 404 means the tag does not exist at the target, so sync it.
 

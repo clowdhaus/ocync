@@ -50,7 +50,6 @@ target_groups:
 defaults:
   source: chainguard
   targets: prod
-  skip_existing: true
   platforms:
     - linux/amd64
     - linux/arm64
@@ -152,7 +151,6 @@ Applied to all mappings unless overridden at the mapping level:
 defaults:
   source: chainguard           # Default source registry
   targets: prod                # Default target group
-  skip_existing: true          # Skip images already at target
   platforms:                   # Platform filter
     - linux/amd64
     - linux/arm64
@@ -171,7 +169,6 @@ defaults:
 |---|---|---|
 | `source` | None | Default source registry name for all mappings |
 | `targets` | None | Default target group name or inline list |
-| `skip_existing` | `false` | When `true`, mappings where the image already exists at the target are skipped without re-syncing |
 | `platforms` | All platforms | Platform filter applied to all mappings. Each entry must be `os/arch` or `os/arch/variant` (e.g., `linux/amd64`, `linux/arm/v7`). List must not be empty |
 | `tags` | None | Tag filtering pipeline (see [Tag filtering](#tag-filtering)) |
 
@@ -185,7 +182,6 @@ mappings:
     to: nginx                  # Target repository name
     source: chainguard         # Override source registry
     targets: staging           # Override target group
-    skip_existing: true        # Override skip_existing
     tags:                      # Override tag filters
       glob: "1.*"
       sort: semver             # Sort order: semver, alpha
@@ -200,7 +196,6 @@ mappings:
 | `to` | No | Target repository name. When omitted, uses the full `from` path |
 | `source` | No | Override source registry for this mapping |
 | `targets` | No | Override target group or inline list for this mapping |
-| `skip_existing` | No | Override `defaults.skip_existing` for this mapping |
 | `tags` | No | Override tag filtering for this mapping |
 | `platforms` | No | Override platform filter for this mapping. List must not be empty if provided |
 
@@ -308,7 +303,6 @@ target_groups:
 defaults:
   source: dockerhub
   targets: prod
-  skip_existing: true
   platforms:
     - linux/amd64
     - linux/arm64
@@ -358,40 +352,6 @@ mappings:
       latest: 5
     platforms:
       - linux/amd64
-```
-
-### CronJob with skip_existing
-
-Optimized for repeated runs in a Kubernetes CronJob where most images are already present:
-
-```yaml
-global:
-  max_concurrent_transfers: 20
-  cache_ttl: "1h"
-
-registries:
-  source:
-    url: cgr.dev
-  target:
-    url: ${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com
-
-defaults:
-  source: source
-  targets: target
-  skip_existing: true
-  platforms:
-    - linux/amd64
-    - linux/arm64
-
-mappings:
-  - from: chainguard/nginx
-    to: nginx
-    tags:
-      glob: "latest"
-  - from: chainguard/python
-    to: python
-    tags:
-      glob: "latest"
 ```
 
 ## JSON schema
@@ -577,14 +537,6 @@ The schema is generated from the Rust config types and verified in CI to stay in
             "type": "string"
           }
         },
-        "skip_existing": {
-          "description": "When `true`, mappings that already exist at the target are skipped without re-syncing.",
-          "default": null,
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
         "source": {
           "default": null,
           "type": [
@@ -682,14 +634,6 @@ The schema is generated from the Rust config types and verified in CI to stay in
           "items": {
             "type": "string"
           }
-        },
-        "skip_existing": {
-          "description": "When `true`, this mapping is skipped if the image already exists at the target, overriding any value in `defaults`.",
-          "default": null,
-          "type": [
-            "boolean",
-            "null"
-          ]
         },
         "source": {
           "default": null,

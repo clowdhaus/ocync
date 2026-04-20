@@ -253,11 +253,6 @@ pub(crate) struct DefaultsConfig {
     /// `linux/arm/v7`).
     #[serde(default)]
     pub platforms: Option<Vec<String>>,
-
-    /// When `true`, mappings that already exist at the target are skipped
-    /// without re-syncing.
-    #[serde(default)]
-    pub skip_existing: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,11 +281,6 @@ pub(crate) struct MappingConfig {
     /// `linux/arm/v7`).
     #[serde(default)]
     pub platforms: Option<Vec<String>>,
-
-    /// When `true`, this mapping is skipped if the image already exists at the
-    /// target, overriding any value in `defaults`.
-    #[serde(default)]
-    pub skip_existing: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,7 +1021,6 @@ mappings:
             targets: None,
             tags: None,
             platforms: None,
-            skip_existing: None,
         };
         let err = validate_mapping(&mapping, false).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
@@ -1046,7 +1035,6 @@ mappings:
             targets: None,
             tags: None,
             platforms: None,
-            skip_existing: None,
         };
         validate_mapping(&mapping, true).unwrap();
     }
@@ -1063,7 +1051,6 @@ mappings:
                 ..Default::default()
             }),
             platforms: Some(vec!["linux-amd64".to_string()]),
-            skip_existing: None,
         };
         let err = validate_mapping(&mapping, false).unwrap_err();
         match err {
@@ -1090,7 +1077,6 @@ mappings:
                     ..Default::default()
                 }),
                 platforms: Some(vec![platform.to_string()]),
-                skip_existing: None,
             };
             validate_mapping(&mapping, false)
                 .unwrap_or_else(|e| panic!("expected valid platform '{platform}': {e}"));
@@ -1117,14 +1103,13 @@ mappings:
     }
 
     #[test]
-    fn deserialize_mapping_with_new_fields() {
+    fn deserialize_mapping_with_platforms() {
         let yaml = r#"
 mappings:
   - from: library/nginx
     platforms:
       - linux/amd64
       - linux/arm64
-    skip_existing: true
     tags:
       glob: "*"
 "#;
@@ -1134,16 +1119,14 @@ mappings:
             m.platforms,
             Some(vec!["linux/amd64".to_string(), "linux/arm64".to_string()])
         );
-        assert_eq!(m.skip_existing, Some(true));
     }
 
     #[test]
-    fn deserialize_defaults_with_new_fields() {
+    fn deserialize_defaults_with_platforms() {
         let yaml = r#"
 defaults:
   platforms:
     - linux/amd64
-  skip_existing: false
 mappings:
   - from: library/nginx
     tags:
@@ -1152,7 +1135,6 @@ mappings:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let d = config.defaults.as_ref().unwrap();
         assert_eq!(d.platforms, Some(vec!["linux/amd64".to_string()]));
-        assert_eq!(d.skip_existing, Some(false));
     }
 
     #[test]

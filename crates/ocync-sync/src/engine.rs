@@ -126,12 +126,6 @@ pub struct ResolvedMapping {
     /// [`Platform::matches()`]). Child manifests and blobs for non-matching
     /// platforms are never pulled from the source.
     pub platforms: Option<Vec<PlatformFilter>>,
-    /// When `true`, skip syncing when the target already has any manifest for
-    /// the tag, regardless of digest comparison.
-    ///
-    /// This avoids the overhead of full digest comparison when the user only
-    /// cares that *some* version exists at the target.
-    pub skip_existing: bool,
 }
 
 /// A single target registry entry.
@@ -632,7 +626,6 @@ impl SyncEngine {
                     targets: mapping.targets.clone(),
                     retry: self.retry.clone(),
                     platforms: mapping.platforms.clone(),
-                    skip_existing: mapping.skip_existing,
                     cache: Rc::clone(&cache),
                     source_head_timeout: self.source_head_timeout,
                 };
@@ -875,8 +868,6 @@ struct DiscoveryParams {
     retry: RetryConfig,
     /// Optional platform filter list (e.g., `["linux/amd64"]`).
     platforms: Option<Vec<PlatformFilter>>,
-    /// When `true`, skip syncing when the target already has any manifest.
-    skip_existing: bool,
     cache: Rc<RefCell<TransferStateCache>>,
     source_head_timeout: Duration,
 }
@@ -899,8 +890,6 @@ struct DiscoveryParams {
 /// When `platforms` is `Some`, index manifests are filtered to only include
 /// descriptors matching the given platform filters before pulling children.
 ///
-/// When `skip_existing` is `true`, targets that return any manifest HEAD response
-/// (regardless of digest) are skipped without further comparison.
 async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRoute) {
     let DiscoveryParams {
         source_client,
@@ -910,7 +899,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         targets,
         retry,
         platforms,
-        skip_existing,
         cache,
         source_head_timeout,
     } = params;
@@ -986,20 +974,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                     head_checks.next().await
                 {
                     match result {
-                        Ok(Some(_)) if skip_existing => {
-                            info!(
-                                source_repo = %source.repo,
-                                source_tag = %source.tag,
-                                target_repo = %target.repo,
-                                "skipping -- target manifest exists (skip_existing)"
-                            );
-                            tracing::debug!(target: "ocync::metrics", "skip_existing");
-                            skipped_results.push(skip_image_result(
-                                &source,
-                                &target,
-                                SkipReason::SkipExisting,
-                            ));
-                        }
                         Ok(Some(head)) if head.digest == compare_digest => {
                             info!(
                                 source_repo = %source.repo,
@@ -1050,7 +1024,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                     skipped_results,
                     retry: &retry,
                     platforms: platforms.as_deref(),
-                    skip_existing,
                     cache: &cache,
                     snapshot_key: &snapshot_key,
                     head_digest: Some(head_digest),
@@ -1079,7 +1052,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         skipped_results: Vec::new(),
         retry: &retry,
         platforms: platforms.as_deref(),
-        skip_existing,
         cache: &cache,
         snapshot_key: &snapshot_key,
         head_digest: source_head_digest.as_ref(),
@@ -1100,7 +1072,6 @@ struct FullPullParams<'a> {
     skipped_results: Vec<ImageResult>,
     retry: &'a RetryConfig,
     platforms: Option<&'a [PlatformFilter]>,
-    skip_existing: bool,
     cache: &'a Rc<RefCell<TransferStateCache>>,
     snapshot_key: &'a SnapshotKey,
     head_digest: Option<&'a Digest>,
@@ -1120,7 +1091,6 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
         mut skipped_results,
         retry,
         platforms,
-        skip_existing,
         cache,
         snapshot_key,
         head_digest,
@@ -1198,16 +1168,6 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
 
     while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
-            Ok(Some(_)) if skip_existing => {
-                info!(
-                    source_repo = %source.repo,
-                    source_tag = %source.tag,
-                    target_repo = %target.repo,
-                    "skipping -- target manifest exists (skip_existing)"
-                );
-                tracing::debug!(target: "ocync::metrics", "skip_existing");
-                skipped_results.push(skip_image_result(source, target, SkipReason::SkipExisting));
-            }
             Ok(Some(head)) if head.digest == *source_digest => {
                 info!(
                     source_repo = %source.repo,

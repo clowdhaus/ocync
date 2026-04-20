@@ -119,8 +119,6 @@ pub enum ImageStatus {
 pub enum SkipReason {
     /// Source and target digests already match.
     DigestMatch,
-    /// `skip_existing` is enabled and the target already has a manifest for this tag.
-    SkipExisting,
     /// Target registry has immutable tags enabled and the tag already exists.
     ImmutableTag,
 }
@@ -129,7 +127,6 @@ impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DigestMatch => f.write_str("digest match"),
-            Self::SkipExisting => f.write_str("skip existing"),
             Self::ImmutableTag => f.write_str("immutable tag"),
         }
     }
@@ -286,11 +283,6 @@ mod tests {
     #[test]
     fn skip_reason_display() {
         assert_eq!(SkipReason::DigestMatch.to_string(), "digest match");
-    }
-
-    #[test]
-    fn skip_reason_display_skip_existing() {
-        assert_eq!(SkipReason::SkipExisting.to_string(), "skip existing");
     }
 
     #[test]

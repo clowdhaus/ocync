@@ -147,14 +147,6 @@
             "type": "string"
           }
         },
-        "skip_existing": {
-          "description": "When `true`, mappings that already exist at the target are skipped without re-syncing.",
-          "default": null,
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
         "source": {
           "default": null,
           "type": [
@@ -252,14 +244,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "skip_existing": {
-          "description": "When `true`, this mapping is skipped if the image already exists at the target, overriding any value in `defaults`.",
-          "default": null,
-          "type": [
-            "boolean",
-            "null"
-          ]
         },
         "source": {
           "default": null,

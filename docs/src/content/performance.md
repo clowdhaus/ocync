@@ -58,13 +58,19 @@ Measured 2026-04-19 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps). F
 ### Warm sync efficiency
 
 <!-- BENCH-WARM:START -->
-| Tool | Requests | Bytes | Wall clock | How |
-|------|:---:|:---:|:---:|-----|
-| `ocync` | 81 | 371 KB | **2.5s** | Persistent cache skips blob I/O |
-| regsync | **27** | **27 KB** | 4s | Manifest digest comparison only |
-| dregsy | 200 | 163 KB | 5.2s | Re-HEADs all blobs |
+Measured 2026-04-20 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 39 images, 51 tags. Warm sync (no changes) to ECR us-east-1. All traffic routed through bench-proxy for byte-accurate measurement.
 
-Measured 2026-03 on a 5-image Jupyter corpus to ECR, before source-pull deduplication. These numbers predate source-pull dedup; current ocync warm performance may be better.
+| Metric | `ocync` | `dregsy` | `regsync` |
+|---|---:|---:|---:|
+| Wall clock | 2m 32s | 1m 43s | **12s** |
+| Peak RSS | 22.2 MB | 33.9 MB | **21.0 MB** |
+| Requests | 925 | 3,145 | **169** |
+| Response bytes | 23.3 MB | 1.9 MB | **119.9 KB** |
+| Source blob GETs | **0** | 227 | **0** |
+| Source blob bytes | 23.3 MB | 1.9 MB | **119.9 KB** |
+| Mounts (success/attempt) | **0/0** | **0/0** | **0/0** |
+| Duplicate blob GETs | **0** | **0** | **0** |
+| Rate-limit 429s | **0** | **0** | **0** |
 <!-- BENCH-WARM:END -->
 
 ## Why `ocync` is fast

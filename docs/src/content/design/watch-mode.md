@@ -83,12 +83,6 @@ This is also a correctness fix independent of the optimization, since existing t
 
 When platform filtering is active but no source platforms match the filter (e.g., source has only `linux/s390x`, filter is `[linux/amd64]`), the engine must return an error rather than silently pushing an empty manifest list. This surfaces platform config mismatches immediately.
 
-### skip_existing interaction
-
-When both the tag digest cache and `skip_existing` could apply to the same target, `skip_existing` takes priority. The source HEAD still fires even when skip_existing is true because the cache entry needs the source digest for future cycles when skip_existing might be disabled.
-
-The discovery cache hit/miss decision is orthogonal to the image skip reason. A tag with `skip_existing: true` where the cache matched still counts as a cache hit because the cache prevented the expensive source pull.
-
 ### SIGHUP cache clearing
 
 > **Status: Planned.** SIGHUP handling is designed but not yet implemented. The tag digest cache and discovery optimization described in this document are implemented.
