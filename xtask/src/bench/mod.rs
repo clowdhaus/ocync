@@ -642,6 +642,10 @@ async fn run_sync(
             ));
             cold_runs.push(cold);
 
+            // Verify cold sync: every expected tag must exist at target.
+            let tool_name = tool.to_string();
+            ecr::verify_sync(ecr_client, corpus, &tool_name, "cold").await?;
+
             // Warm run: target still populated, same config_dir.
             progress(&format!("  warm: {tool}"));
             let warm = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
@@ -658,6 +662,10 @@ async fn run_sync(
                 warm.wall_clock_secs
             ));
             warm_runs.push(warm);
+
+            // Verify warm sync: tags should still all be present.
+            ecr::verify_sync(ecr_client, corpus, &tool_name, "warm").await?;
+
             Ok(())
         }
         .await;
