@@ -576,6 +576,49 @@ impl BlobFrequencyMap {
     }
 }
 
+/// Accumulates discovery route counters during the pipeline loop.
+///
+/// Groups the per-route counters that were previously separate `let mut`
+/// locals in `run()`, reducing variable count and centralizing the match.
+#[derive(Default)]
+struct DiscoveryCounters {
+    /// Tags where source HEAD matched the tag-digest cache.
+    cache_hits: u64,
+    /// Tags where a full source manifest pull was required.
+    cache_misses: u64,
+    /// Tags where the source HEAD request itself failed.
+    head_failures: u64,
+    /// Tags where the cache matched but a target was stale.
+    target_stale: u64,
+    /// Tags skipped via `head_first` (all targets matched source HEAD).
+    head_first_skips: u64,
+}
+
+impl DiscoveryCounters {
+    /// Record a discovery route, incrementing the appropriate counters.
+    ///
+    /// `HeadFailure` and `TargetStale` both increment `cache_misses` in
+    /// addition to their own counter because they represent cache misses
+    /// that were further classified by failure reason.
+    fn record(&mut self, route: &DiscoveryRoute) {
+        match route {
+            DiscoveryRoute::CacheHit => self.cache_hits += 1,
+            DiscoveryRoute::CacheMiss => self.cache_misses += 1,
+            DiscoveryRoute::HeadFailure => {
+                self.cache_misses += 1;
+                self.head_failures += 1;
+            }
+            DiscoveryRoute::TargetStale => {
+                self.cache_misses += 1;
+                self.target_stale += 1;
+            }
+            DiscoveryRoute::HeadFirstSkip => {
+                self.head_first_skips += 1;
+            }
+        }
+    }
+}
+
 /// Pipeline phase for leader-follower mount optimization.
 ///
 /// Tracks which group of tasks is currently being promoted into execution
@@ -712,11 +755,7 @@ impl SyncEngine {
         let mut results: Vec<ImageResult> = Vec::new();
         let mut shutting_down = false;
         let mut drain_deadline: Option<tokio::time::Instant> = None;
-        let mut discovery_hits: u64 = 0;
-        let mut discovery_misses: u64 = 0;
-        let mut discovery_head_failures: u64 = 0;
-        let mut discovery_target_stale: u64 = 0;
-        let mut discovery_head_first_skips: u64 = 0;
+        let mut discovery_counters = DiscoveryCounters::default();
 
         // Leader-follower mount optimization state.
         //
@@ -984,22 +1023,7 @@ impl SyncEngine {
                 Some((outcome, route)) = discovery_futures.next(),
                     if !shutting_down && !discovery_paused && !discovery_futures.is_empty() =>
                 {
-                    // Accumulate discovery route counters.
-                    match route {
-                        DiscoveryRoute::CacheHit => discovery_hits += 1,
-                        DiscoveryRoute::CacheMiss => discovery_misses += 1,
-                        DiscoveryRoute::HeadFailure => {
-                            discovery_misses += 1;
-                            discovery_head_failures += 1;
-                        }
-                        DiscoveryRoute::TargetStale => {
-                            discovery_misses += 1;
-                            discovery_target_stale += 1;
-                        }
-                        DiscoveryRoute::HeadFirstSkip => {
-                            discovery_head_first_skips += 1;
-                        }
-                    }
+                    discovery_counters.record(&route);
                     match outcome {
                         DiscoveryOutcome::Skip(skip_results) => {
                             for r in &skip_results {
@@ -1080,11 +1104,11 @@ impl SyncEngine {
         }
 
         let mut stats = compute_stats(&results);
-        stats.discovery_cache_hits = discovery_hits;
-        stats.discovery_cache_misses = discovery_misses;
-        stats.discovery_head_failures = discovery_head_failures;
-        stats.discovery_target_stale = discovery_target_stale;
-        stats.discovery_head_first_skips = discovery_head_first_skips;
+        stats.discovery_cache_hits = discovery_counters.cache_hits;
+        stats.discovery_cache_misses = discovery_counters.cache_misses;
+        stats.discovery_head_failures = discovery_counters.head_failures;
+        stats.discovery_target_stale = discovery_counters.target_stale;
+        stats.discovery_head_first_skips = discovery_counters.head_first_skips;
         stats.immutable_tag_skips = immutable_tag_skips;
         let duration = run_start.elapsed();
 
@@ -3396,5 +3420,45 @@ mod tests {
             "exclude should take priority over include"
         );
         assert!(config.type_matches("application/vnd.dev.cosign.artifact.sig.v1+json"));
+    }
+
+    // -- DiscoveryCounters --
+
+    #[test]
+    fn discovery_counters_head_failure_increments_both_misses_and_failures() {
+        let mut c = DiscoveryCounters::default();
+        c.record(&DiscoveryRoute::HeadFailure);
+        assert_eq!(c.cache_misses, 1, "HeadFailure must count as a cache miss");
+        assert_eq!(c.head_failures, 1);
+        assert_eq!(c.cache_hits, 0);
+        assert_eq!(c.target_stale, 0);
+        assert_eq!(c.head_first_skips, 0);
+    }
+
+    #[test]
+    fn discovery_counters_target_stale_increments_both_misses_and_stale() {
+        let mut c = DiscoveryCounters::default();
+        c.record(&DiscoveryRoute::TargetStale);
+        assert_eq!(c.cache_misses, 1, "TargetStale must count as a cache miss");
+        assert_eq!(c.target_stale, 1);
+        assert_eq!(c.cache_hits, 0);
+        assert_eq!(c.head_failures, 0);
+        assert_eq!(c.head_first_skips, 0);
+    }
+
+    #[test]
+    fn discovery_counters_all_routes() {
+        let mut c = DiscoveryCounters::default();
+        c.record(&DiscoveryRoute::CacheHit);
+        c.record(&DiscoveryRoute::CacheMiss);
+        c.record(&DiscoveryRoute::HeadFailure);
+        c.record(&DiscoveryRoute::TargetStale);
+        c.record(&DiscoveryRoute::HeadFirstSkip);
+        assert_eq!(c.cache_hits, 1);
+        // CacheMiss + HeadFailure + TargetStale = 3 total cache_misses
+        assert_eq!(c.cache_misses, 3);
+        assert_eq!(c.head_failures, 1);
+        assert_eq!(c.target_stale, 1);
+        assert_eq!(c.head_first_skips, 1);
     }
 }
