@@ -3,7 +3,7 @@
 
 mod helpers;
 
-use ocync_distribution::spec::{ImageManifest, MediaType};
+use ocync_distribution::spec::MediaType;
 use ocync_sync::ImageStatus;
 use ocync_sync::engine::{SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
@@ -27,48 +27,40 @@ async fn sync_staging_pulls_once_pushes_twice() {
     let target_a = MockServer::start().await;
     let target_b = MockServer::start().await;
 
-    let config_data = b"staging-config-twice";
-    let layer_data = b"staging-layer-twice";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"staging-config-twice")
+        .layer(b"staging-layer-twice")
+        .build();
 
     // Source: serve manifest and blobs with expect(1) to verify pull-once.
     Mock::given(method("GET"))
         .and(path("/v2/repo/manifests/v1"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(manifest_bytes)
+                .set_body_bytes(parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(config_data.to_vec())
-                .insert_header("content-length", config_data.len().to_string()),
+                .set_body_bytes(parts.config_data.clone())
+                .insert_header("content-length", parts.config_data.len().to_string()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(layer_data.to_vec())
-                .insert_header("content-length", layer_data.len().to_string()),
+                .set_body_bytes(parts.layers_data[0].clone())
+                .insert_header("content-length", parts.layers_data[0].len().to_string()),
         )
         .expect(1)
         .mount(&source_server)
@@ -76,15 +68,15 @@ async fn sync_staging_pulls_once_pushes_twice() {
 
     // Target A: manifest HEAD 404, blobs HEAD 404, push endpoints.
     mount_manifest_head_not_found(&target_a, "repo", "v1").await;
-    mount_blob_not_found(&target_a, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_a, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_a, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_a, "repo", &parts.layer_descs[0].digest).await;
     mount_blob_push(&target_a, "repo").await;
     mount_manifest_push(&target_a, "repo", "v1").await;
 
     // Target B: manifest HEAD 404, blobs HEAD 404, push endpoints.
     mount_manifest_head_not_found(&target_b, "repo", "v1").await;
-    mount_blob_not_found(&target_b, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_b, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_b, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_b, "repo", &parts.layer_descs[0].digest).await;
     mount_blob_push(&target_b, "repo").await;
     mount_manifest_push(&target_b, "repo", "v1").await;
 
@@ -132,40 +124,32 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"stuck-config";
-    let layer_data = b"stuck-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"stuck-config")
+        .layer(b"stuck-layer")
+        .build();
 
     // Source: manifest responds immediately. Config blob has a 60-second delay
     // (far beyond the 25-second drain deadline). Layer blob also delayed.
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(config_data.to_vec())
-                .insert_header("content-length", config_data.len().to_string())
+                .set_body_bytes(parts.config_data.clone())
+                .insert_header("content-length", parts.config_data.len().to_string())
                 .set_delay(std::time::Duration::from_secs(60)),
         )
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(layer_data.to_vec())
-                .insert_header("content-length", layer_data.len().to_string())
+                .set_body_bytes(parts.layers_data[0].clone())
+                .insert_header("content-length", parts.layers_data[0].len().to_string())
                 .set_delay(std::time::Duration::from_secs(60)),
         )
         .mount(&source_server)
@@ -173,8 +157,8 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
 
     // Target: standard setup (manifest HEAD 404, blobs HEAD 404, push endpoints).
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
@@ -232,49 +216,41 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"drain-cfg";
-    let layer_data = b"drain-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"drain-cfg")
+        .layer(b"drain-layer")
+        .build();
 
     // Source: manifest responds immediately. Blob delays are 5s -- between
     // our custom 2s drain deadline and the default 25s deadline. This means
     // the transfer would succeed with the default but fails with the custom.
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(config_data.to_vec())
-                .insert_header("content-length", config_data.len().to_string())
+                .set_body_bytes(parts.config_data.clone())
+                .insert_header("content-length", parts.config_data.len().to_string())
                 .set_delay(std::time::Duration::from_secs(5)),
         )
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(layer_data.to_vec())
-                .insert_header("content-length", layer_data.len().to_string())
+                .set_body_bytes(parts.layers_data[0].clone())
+                .insert_header("content-length", parts.layers_data[0].len().to_string())
                 .set_delay(std::time::Duration::from_secs(5)),
         )
         .mount(&source_server)
         .await;
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
@@ -329,48 +305,40 @@ async fn sync_staging_writes_blobs_to_disk() {
     let target_a = MockServer::start().await;
     let target_b = MockServer::start().await;
 
-    let config_data = b"staging-disk-config";
-    let layer_data = b"staging-disk-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"staging-disk-config")
+        .layer(b"staging-disk-layer")
+        .build();
 
     // Source: serve manifest and blobs with expect(1) to verify pull-once.
     Mock::given(method("GET"))
         .and(path("/v2/repo/manifests/v1"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(manifest_bytes)
+                .set_body_bytes(parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(config_data.to_vec())
-                .insert_header("content-length", config_data.len().to_string()),
+                .set_body_bytes(parts.config_data.clone())
+                .insert_header("content-length", parts.config_data.len().to_string()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(layer_data.to_vec())
-                .insert_header("content-length", layer_data.len().to_string()),
+                .set_body_bytes(parts.layers_data[0].clone())
+                .insert_header("content-length", parts.layers_data[0].len().to_string()),
         )
         .expect(1)
         .mount(&source_server)
@@ -378,8 +346,8 @@ async fn sync_staging_writes_blobs_to_disk() {
 
     for target in [&target_a, &target_b] {
         mount_manifest_head_not_found(target, "repo", "v1").await;
-        mount_blob_not_found(target, "repo", &config_desc.digest).await;
-        mount_blob_not_found(target, "repo", &layer_desc.digest).await;
+        mount_blob_not_found(target, "repo", &parts.config_desc.digest).await;
+        mount_blob_not_found(target, "repo", &parts.layer_descs[0].digest).await;
         mount_blob_push(target, "repo").await;
         mount_manifest_push(target, "repo", "v1").await;
     }
@@ -419,13 +387,13 @@ async fn sync_staging_writes_blobs_to_disk() {
     let config_path = staging_dir
         .path()
         .join("blobs")
-        .join(config_desc.digest.algorithm())
-        .join(config_desc.digest.hex());
+        .join(parts.config_desc.digest.algorithm())
+        .join(parts.config_desc.digest.hex());
     let layer_path = staging_dir
         .path()
         .join("blobs")
-        .join(layer_desc.digest.algorithm())
-        .join(layer_desc.digest.hex());
+        .join(parts.layer_descs[0].digest.algorithm())
+        .join(parts.layer_descs[0].digest.hex());
     assert!(
         config_path.exists(),
         "config blob should be staged on disk at {config_path:?}"
@@ -436,6 +404,6 @@ async fn sync_staging_writes_blobs_to_disk() {
     );
 
     // Verify content matches what was pulled from source.
-    assert_eq!(std::fs::read(&config_path).unwrap(), config_data);
-    assert_eq!(std::fs::read(&layer_path).unwrap(), layer_data);
+    assert_eq!(std::fs::read(&config_path).unwrap(), parts.config_data);
+    assert_eq!(std::fs::read(&layer_path).unwrap(), parts.layers_data[0]);
 }

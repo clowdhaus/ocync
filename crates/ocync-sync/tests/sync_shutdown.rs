@@ -3,12 +3,9 @@
 
 mod helpers;
 
-use ocync_distribution::spec::{ImageManifest, MediaType};
 use ocync_sync::ImageStatus;
-use ocync_sync::engine::{SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
+use ocync_sync::engine::TagPair;
 use ocync_sync::shutdown::ShutdownSignal;
-use ocync_sync::staging::BlobStage;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -22,41 +19,41 @@ async fn sync_shutdown_stops_new_work() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-shutdown";
-    let layer_data = b"layer-shutdown";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-shutdown")
+        .layer(b"layer-shutdown")
+        .build();
 
     // Source: serve manifest and blobs (but add delays so shutdown can interrupt).
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_source_manifest(&source_server, "repo", "v2", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
+    mount_source_manifest(&source_server, "repo", "v2", &parts.bytes).await;
+    mount_blob_pull(
+        &source_server,
+        "repo",
+        &parts.config_desc.digest,
+        &parts.config_data,
+    )
+    .await;
+    mount_blob_pull(
+        &source_server,
+        "repo",
+        &parts.layer_descs[0].digest,
+        &parts.layers_data[0],
+    )
+    .await;
 
     // Target: everything works.
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
     mount_manifest_head_not_found(&target_server, "repo", "v2").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1"), TagPair::same("v2")],
     );
 
@@ -64,16 +61,7 @@ async fn sync_shutdown_stops_new_work() {
     // Trigger shutdown immediately before the engine even starts running.
     shutdown.trigger();
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&shutdown),
-        )
-        .await;
+    let report = run_sync_with_shutdown(vec![mapping], &shutdown).await;
 
     // With shutdown triggered before run, discovery futures may or may not
     // complete. The key invariant: the engine returns (doesn't hang) and
@@ -93,48 +81,45 @@ async fn sync_shutdown_drains_in_flight() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-drain";
-    let layer_data = b"layer-drain";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-drain")
+        .layer(b"layer-drain")
+        .build();
 
     // Source: manifest responds immediately, config blob responds immediately,
     // but layer blob has a 2-second delay (simulates a slow transfer in progress
     // when shutdown fires).
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
+    mount_blob_pull(
+        &source_server,
+        "repo",
+        &parts.config_desc.digest,
+        &parts.config_data,
+    )
+    .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(layer_data.to_vec())
-                .insert_header("content-length", layer_data.len().to_string())
+                .set_body_bytes(parts.layers_data[0].clone())
+                .insert_header("content-length", parts.layers_data[0].len().to_string())
                 .set_delay(std::time::Duration::from_secs(2)),
         )
         .mount(&source_server)
         .await;
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
@@ -149,16 +134,7 @@ async fn sync_shutdown_drains_in_flight() {
         signal.trigger();
     });
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&shutdown),
-        )
-        .await;
+    let report = run_sync_with_shutdown(vec![mapping], &shutdown).await;
 
     // The in-flight transfer should complete within the drain deadline (2s < 25s).
     assert_eq!(report.images.len(), 1);
@@ -179,35 +155,17 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-shutdown-exit";
-    let layer_data = b"layer-shutdown-exit";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-shutdown-exit")
+        .layer(b"layer-shutdown-exit")
+        .build();
 
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
-    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1").await;
+    parts.mount_source(&source_server, "repo", "v1").await;
+    parts.mount_target(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
@@ -215,16 +173,9 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
     // scenario where the user never sends SIGTERM.
     let shutdown = ShutdownSignal::new();
 
-    let engine = SyncEngine::new(fast_retry(), 50);
     let report = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        engine.run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&shutdown),
-        ),
+        run_sync_with_shutdown(vec![mapping], &shutdown),
     )
     .await
     .expect("engine hung -- did not exit within 10s after completing all work");

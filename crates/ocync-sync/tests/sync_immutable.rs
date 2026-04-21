@@ -5,11 +5,8 @@ mod helpers;
 
 use std::collections::HashSet;
 
-use ocync_distribution::spec::{ImageManifest, MediaType};
-use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
+use ocync_sync::engine::{ResolvedMapping, TagPair, TargetEntry};
 use ocync_sync::filter::build_glob_set;
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
 use ocync_sync::{ImageStatus, SkipReason};
 use wiremock::MockServer;
 
@@ -63,16 +60,7 @@ async fn immutable_tag_skip_when_present_at_target() {
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Both tags should be skipped as immutable.
     assert_eq!(report.images.len(), 2);
@@ -117,44 +105,19 @@ async fn immutable_tag_not_skipped_when_absent_from_target() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"immutable-config";
-    let layer_data = b"immutable-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"immutable-config")
+        .layer(b"immutable-layer")
+        .build();
 
     // Source: serve the manifest and blobs.
-    mount_source_manifest(&source_server, "library/nginx", "v3.0.0", &manifest_bytes).await;
-    mount_blob_pull(
-        &source_server,
-        "library/nginx",
-        &config_desc.digest,
-        config_data,
-    )
-    .await;
-    mount_blob_pull(
-        &source_server,
-        "library/nginx",
-        &layer_desc.digest,
-        layer_data,
-    )
-    .await;
+    parts
+        .mount_source(&source_server, "library/nginx", "v3.0.0")
+        .await;
 
     // Target: manifest HEAD 404, blobs not found, push endpoints.
-    mount_manifest_head_not_found(&target_server, "mirror/nginx", "v3.0.0").await;
-    mount_blob_not_found(&target_server, "mirror/nginx", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "mirror/nginx", &layer_desc.digest).await;
-    mount_blob_push(&target_server, "mirror/nginx").await;
-    mount_manifest_push(&target_server, "mirror/nginx", "v3.0.0").await;
+    parts
+        .mount_target(&target_server, "mirror/nginx", "v3.0.0")
+        .await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -178,16 +141,7 @@ async fn immutable_tag_not_skipped_when_absent_from_target() {
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Tag must be synced, not skipped.
     assert_eq!(report.images.len(), 1);
@@ -239,16 +193,7 @@ async fn non_matching_tag_falls_through_to_head_check() {
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // "latest" does not match the immutable pattern, so it falls through to
     // HEAD + digest compare. The digest matches, so it should be skipped
@@ -279,39 +224,18 @@ async fn immutable_tag_not_skipped_when_missing_from_one_target() {
     let target_a_server = MockServer::start().await;
     let target_b_server = MockServer::start().await;
 
-    let config_data = b"mt-config";
-    let layer_data = b"mt-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"mt-config")
+        .layer(b"mt-layer")
+        .build();
 
     // Source: serve manifest and blobs.
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    parts.mount_source(&source_server, "repo", "v1.0.0").await;
 
     // Target A: manifest HEAD 404, push endpoints (needs sync).
-    mount_manifest_head_not_found(&target_a_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_a_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_a_server, "repo", &layer_desc.digest).await;
-    mount_blob_push(&target_a_server, "repo").await;
-    mount_manifest_push(&target_a_server, "repo", "v1.0.0").await;
+    parts.mount_target(&target_a_server, "repo", "v1.0.0").await;
 
     // Target B: manifest HEAD 404, push endpoints (needs sync).
-    mount_manifest_head_not_found(&target_b_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_b_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_b_server, "repo", &layer_desc.digest).await;
-    mount_blob_push(&target_b_server, "repo").await;
-    mount_manifest_push(&target_b_server, "repo", "v1.0.0").await;
+    parts.mount_target(&target_b_server, "repo", "v1.0.0").await;
 
     let source_client = mock_client(&source_server);
 
@@ -337,16 +261,7 @@ async fn immutable_tag_not_skipped_when_missing_from_one_target() {
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Both targets must be synced (not skipped) since target B is missing the tag.
     assert_eq!(report.images.len(), 2);

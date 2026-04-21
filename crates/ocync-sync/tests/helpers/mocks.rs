@@ -21,6 +21,38 @@ pub async fn mount_source_manifest(server: &MockServer, repo: &str, tag: &str, b
         .await;
 }
 
+/// Mount source manifest GET with an explicit content-type (for index manifests).
+pub async fn mount_source_manifest_with_content_type(
+    server: &MockServer,
+    repo: &str,
+    reference: &str,
+    bytes: &[u8],
+    content_type: MediaType,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{repo}/manifests/{reference}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(bytes.to_vec())
+                .insert_header("content-type", content_type.as_str()),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Mount referrers API GET response for a parent digest.
+pub async fn mount_referrers(server: &MockServer, repo: &str, parent_digest: &Digest, body: &[u8]) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{repo}/referrers/{parent_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body.to_vec())
+                .insert_header("content-type", MediaType::OciIndex.as_str()),
+        )
+        .mount(server)
+        .await;
+}
+
 /// Mount mock for blob pull (GET).
 pub async fn mount_blob_pull(server: &MockServer, repo: &str, digest: &Digest, data: &[u8]) {
     Mock::given(method("GET"))
@@ -117,4 +149,21 @@ pub async fn mount_manifest_push(server: &MockServer, repo: &str, reference: &st
         .respond_with(ResponseTemplate::new(201))
         .mount(server)
         .await;
+}
+
+/// Mount a complete "fresh target" mock set: manifest HEAD 404, all blobs 404, push endpoints.
+///
+/// Use when you need custom source mocks but the target is standard (everything missing).
+pub async fn mount_target_fresh(
+    server: &MockServer,
+    repo: &str,
+    tag: &str,
+    blob_digests: &[&Digest],
+) {
+    mount_manifest_head_not_found(server, repo, tag).await;
+    for digest in blob_digests {
+        mount_blob_not_found(server, repo, digest).await;
+    }
+    mount_blob_push(server, repo).await;
+    mount_manifest_push(server, repo, tag).await;
 }
