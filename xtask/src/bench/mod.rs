@@ -822,8 +822,53 @@ async fn run_scale(
 
 /// Sleep for 30 seconds between benchmark runs to let rate limits recover.
 async fn cooldown() {
+    // Drop OS page cache so the next tool starts with a cold disk.
+    // Without this, the second tool benefits from source blobs cached in
+    // RAM by the first tool's pulls, giving it an unfair advantage on
+    // read-heavy workloads.
+    drop_page_cache();
+
+    // Clean the staging tmpdir so the next tool doesn't start with a
+    // full disk from the previous tool's staged blobs.
+    clean_staging_tmpdir();
+
     eprintln!("bench: cooling down for 30s...");
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+}
+
+/// Attempt to drop the OS page cache via `/proc/sys/vm/drop_caches`.
+///
+/// Requires root (or `CAP_SYS_ADMIN`). If it fails (e.g. running without
+/// sudo), log a warning and continue -- the benchmark is still valid, just
+/// slightly biased toward later tools.
+fn drop_page_cache() {
+    // Flush dirty pages, then drop all page/dentry/inode caches.
+    // Uses sudo because /proc/sys/vm/drop_caches requires CAP_SYS_ADMIN.
+    // ec2-user on AL2023 has passwordless sudo.
+    let result = std::process::Command::new("sudo")
+        .args(["sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches"])
+        .status();
+    match result {
+        Ok(s) if s.success() => eprintln!("bench: dropped page cache"),
+        Ok(s) => eprintln!("bench: warning: drop_caches exited {s}; later tools may benefit from cached data"),
+        Err(e) => eprintln!("bench: warning: could not drop page cache ({e}); later tools may benefit from cached data"),
+    }
+}
+
+/// Remove all files in the staging tmpdir so the next tool starts clean.
+fn clean_staging_tmpdir() {
+    let tmpdir = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&tmpdir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        eprintln!("bench: cleaned staging tmpdir ({})", tmpdir.display());
+    }
 }
 
 /// Returns a UTC timestamp string in `YYYY-MM-DD-HHMMSS` format.
