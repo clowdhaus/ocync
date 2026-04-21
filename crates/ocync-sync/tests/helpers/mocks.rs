@@ -21,6 +21,38 @@ pub async fn mount_source_manifest(server: &MockServer, repo: &str, tag: &str, b
         .await;
 }
 
+/// Mount source manifest GET with an explicit content-type (for index manifests).
+pub async fn mount_source_manifest_with_content_type(
+    server: &MockServer,
+    repo: &str,
+    reference: &str,
+    bytes: &[u8],
+    content_type: MediaType,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{repo}/manifests/{reference}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(bytes.to_vec())
+                .insert_header("content-type", content_type.as_str()),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Mount referrers API GET response for a parent digest.
+pub async fn mount_referrers(server: &MockServer, repo: &str, parent_digest: &Digest, body: &[u8]) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{repo}/referrers/{parent_digest}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body.to_vec())
+                .insert_header("content-type", MediaType::OciIndex.as_str()),
+        )
+        .mount(server)
+        .await;
+}
+
 /// Mount mock for blob pull (GET).
 pub async fn mount_blob_pull(server: &MockServer, repo: &str, digest: &Digest, data: &[u8]) {
     Mock::given(method("GET"))
