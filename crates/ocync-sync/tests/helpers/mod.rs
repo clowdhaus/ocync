@@ -61,7 +61,7 @@ pub async fn run_sync_with_cache(
     mappings: Vec<ResolvedMapping>,
     cache: Rc<RefCell<TransferStateCache>>,
 ) -> SyncReport {
-    SyncEngine::new(fast_retry(), 10)
+    SyncEngine::new(fast_retry(), 50)
         .run(mappings, cache, BlobStage::disabled(), &NullProgress, None)
         .await
 }

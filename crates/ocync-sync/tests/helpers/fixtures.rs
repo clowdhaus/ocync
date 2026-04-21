@@ -126,7 +126,7 @@ pub fn mapping_from_servers(
 }
 
 /// Build a `ResolvedMapping` with distinct source/target repos.
-pub fn mapping_from_servers_repos(
+pub fn mapping_with_distinct_repos(
     source: &MockServer,
     target: &MockServer,
     source_repo: &str,

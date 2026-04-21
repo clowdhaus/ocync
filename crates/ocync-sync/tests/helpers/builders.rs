@@ -13,6 +13,7 @@ use super::fixtures::{blob_descriptor, blob_digest};
 /// data (matching digests and sizes). Call [`layer`](Self::layer) to add
 /// layers, then [`build`](Self::build) to get the manifest plus all parts
 /// needed for mock setup.
+#[must_use = "builders do nothing until .build() is called"]
 pub struct ManifestBuilder {
     config_data: Vec<u8>,
     layers_data: Vec<Vec<u8>>,
@@ -113,6 +114,7 @@ impl ManifestParts {
 /// Artifacts differ from images in having `artifact_type` set and being
 /// referenced by digest (not tag). Each artifact has exactly one config blob
 /// and one layer blob.
+#[must_use = "builders do nothing until .build() is called"]
 pub struct ArtifactBuilder {
     config_data: Vec<u8>,
     layer_data: Vec<u8>,
@@ -219,6 +221,8 @@ impl ArtifactParts {
 // ---------------------------------------------------------------------------
 
 /// Builder for constructing OCI image index (multi-arch) manifests.
+#[must_use = "builders do nothing until .build() is called"]
+#[derive(Default)]
 pub struct IndexBuilder {
     children: Vec<(ManifestParts, Option<Platform>)>,
 }
@@ -338,6 +342,8 @@ impl IndexParts {
 // ---------------------------------------------------------------------------
 
 /// Builder for constructing OCI referrers index responses.
+#[must_use = "builders do nothing until .build() is called"]
+#[derive(Default)]
 pub struct ReferrersIndexBuilder {
     descriptors: Vec<Descriptor>,
 }
@@ -366,19 +372,6 @@ impl ReferrersIndexBuilder {
             schema_version: 2,
             media_type: Some(MediaType::OciIndex),
             manifests: self.descriptors,
-            subject: None,
-            artifact_type: None,
-            annotations: None,
-        };
-        serde_json::to_vec(&index).unwrap()
-    }
-
-    /// Build an empty referrers index (200 with no manifests).
-    pub fn build_empty() -> Vec<u8> {
-        let index = ImageIndex {
-            schema_version: 2,
-            media_type: Some(MediaType::OciIndex),
-            manifests: Vec::new(),
             subject: None,
             artifact_type: None,
             annotations: None,

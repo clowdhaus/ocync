@@ -427,7 +427,7 @@ async fn sync_non_immutable_400_still_fails() {
         .mount(&target_server)
         .await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/app",

@@ -129,7 +129,7 @@ async fn artifact_require_artifacts_fails_on_empty() {
     parent.mount_source(&source_server, "repo", "v1.0.0").await;
 
     // Referrers API returns empty index (no artifacts).
-    let referrers = ReferrersIndexBuilder::build_empty();
+    let referrers = ReferrersIndexBuilder::new().build();
     mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
 
     parent.mount_target(&target_server, "repo", "v1.0.0").await;

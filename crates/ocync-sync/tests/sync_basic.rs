@@ -27,7 +27,7 @@ async fn sync_happy_path() {
         .mount_target(&target_server, "mirror/nginx", "latest")
         .await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "library/nginx",

@@ -81,7 +81,7 @@ async fn discovery_cache_miss_first_run() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -146,7 +146,7 @@ async fn discovery_cache_hit_skips_source_get() {
         .mount(&target_server)
         .await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -226,7 +226,7 @@ async fn discovery_head_failure_falls_through() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -298,7 +298,7 @@ async fn discovery_target_stale_triggers_full_pull() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -383,7 +383,7 @@ async fn discovery_source_changed_triggers_full_pull() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -476,7 +476,7 @@ async fn discovery_head_404_falls_through() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -555,7 +555,7 @@ async fn discovery_head_timeout_falls_through() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -637,7 +637,7 @@ async fn discovery_head_failure_ignores_valid_cache() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -703,7 +703,7 @@ async fn discovery_pull_failure_does_not_populate_cache() {
         .mount(&source_server)
         .await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -797,7 +797,7 @@ async fn discovery_zero_platform_match_returns_error() {
         .await;
 
     // Request linux/amd64 but index only has linux/s390x.
-    let mut mapping = mapping_from_servers_repos(
+    let mut mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1034,7 +1034,7 @@ async fn discovery_retag_uses_correct_tags() {
         .mount(&target_server)
         .await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1218,7 +1218,7 @@ async fn discovery_concurrent_mixed_outcomes() {
     // blob_push already mounted for tgt/repo (shared across tags).
     mount_manifest_push(&target_server, "tgt/repo", "tag-c").await;
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1322,7 +1322,7 @@ async fn discovery_source_change_across_cycles() {
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
     let cache = empty_cache();
-    let mapping_1 = mapping_from_servers_repos(
+    let mapping_1 = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1402,7 +1402,7 @@ async fn discovery_source_change_across_cycles() {
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
     // Build new mapping (consumed by run()).
-    let mapping_2 = mapping_from_servers_repos(
+    let mapping_2 = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1492,7 +1492,7 @@ async fn discovery_two_cycle_cache_hit() {
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
     let cache = empty_cache();
-    let mapping_1 = mapping_from_servers_repos(
+    let mapping_1 = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1545,7 +1545,7 @@ async fn discovery_two_cycle_cache_hit() {
         .mount(&target_server)
         .await;
 
-    let mapping_2 = mapping_from_servers_repos(
+    let mapping_2 = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1684,7 +1684,7 @@ async fn discovery_platform_filter_change_triggers_cache_miss() {
         .await;
 
     let cache = empty_cache();
-    let mut mapping_1 = mapping_from_servers_repos(
+    let mut mapping_1 = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1781,7 +1781,7 @@ async fn discovery_platform_filter_change_triggers_cache_miss() {
         .mount(&target_server)
         .await;
 
-    let mut mapping_2 = mapping_from_servers_repos(
+    let mut mapping_2 = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1897,7 +1897,7 @@ async fn discovery_snapshot_pruning_removes_deleted_tags() {
     mount_blob_push(&target_server, "tgt/repo").await;
 
     let cache = empty_cache();
-    let mapping_1 = mapping_from_servers_repos(
+    let mapping_1 = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -1956,7 +1956,7 @@ async fn discovery_snapshot_pruning_removes_deleted_tags() {
         .mount(&target_server)
         .await;
 
-    let mapping_2 = mapping_from_servers_repos(
+    let mapping_2 = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "src/repo",
@@ -2155,7 +2155,7 @@ async fn budget_circuit_breaker_threshold_floor_small_sync() {
         .map(|i| TagPair::same(format!("t{i}")))
         .collect();
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "library/small",
@@ -2243,7 +2243,7 @@ async fn budget_circuit_breaker_resumes_on_budget_refill() {
         .map(|i| TagPair::same(format!("v{i}")))
         .collect();
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "library/refill",
@@ -2659,7 +2659,7 @@ async fn budget_circuit_breaker_emits_tracing_warn() {
         .map(|i| TagPair::same(format!("v{i}")))
         .collect();
 
-    let mapping = mapping_from_servers_repos(
+    let mapping = mapping_with_distinct_repos(
         &source_server,
         &target_server,
         "library/traced",

@@ -212,12 +212,17 @@ Lives in `helpers/mod.rs`. 10 lines. Eliminates the repetitive 4-line assertion-
 #### What stays explicit (never abstract away)
 
 - `MockServer::start().await` -- communicates test's server topology
-- `SyncEngine::new(...)` -- visible in every test
-- `.run(vec![mapping], cache, staging, &NullProgress, shutdown)` -- visible
-- `ShutdownSignal::new()` / `None` -- semantically meaningful choice
 - `assert_eq!(report.images.len(), N)` -- visible
 
 These are the test's contract with the engine. Hiding them behind a harness makes tests harder to debug and review.
+
+#### `run_sync()` helpers (pragmatic deviation)
+
+For the ~70% of tests that use default engine settings, thin `run_sync*` wrappers collapse the engine construction + run invocation into one call. This contradicts the original "SyncEngine must be visible" stance but is justified: these tests do not care about engine configuration -- their subject is mock topology and assertion outcomes.
+
+Tests that need custom concurrency, staging, `with_source_head_timeout`, or non-default shutdown behavior use `SyncEngine::new(...)` directly. The boundary: if the engine configuration IS the test's subject, it stays explicit.
+
+Variants: `run_sync` (50 concurrent, no cache/staging/shutdown), `run_sync_sequential` (1 concurrent), `run_sync_with_cache` (50 concurrent, caller-provided cache), `run_sync_with_shutdown` (50 concurrent, caller-provided signal).
 
 ### Example: before and after
 
@@ -290,7 +295,7 @@ Single PR. Migrate all 103 `ImageManifest` constructions and 17 `ImageIndex` con
 3. Add `assert_status!` macro to `helpers/mod.rs`
 4. Migrate `sync_basic.rs` first (validates the pattern, highest count at 17 manual constructions)
 5. Migrate remaining files in order of descending manual-construction count: `sync_cache.rs` (20), `sync_concurrent.rs` (18), `sync_artifacts.rs` (15), `sync_discovery.rs` (14), `sync_multi_target.rs` (4), `sync_staging.rs` (4), `sync_shutdown.rs` (3), `sync_platforms.rs` (3), `sync_immutable.rs` (2)
-6. Remove `simple_image_manifest`, `make_descriptor`, `serialize_manifest` from `fixtures.rs` once no callers remain
+6. `simple_image_manifest` retained (12 callers in HEAD-check/discovery tests that intentionally use fake digests). `serialize_manifest` and `make_descriptor` retained for manual-construction edge cases
 
 Verification gate per file: `cargo fmt --check && cargo clippy --tests -- -D warnings && cargo test --package ocync-sync`
 
@@ -301,7 +306,7 @@ Verification gate per file: `cargo fmt --check && cargo clippy --tests -- -D war
 | Total integration test lines | 12,232 | 13,001 | 11,154 |
 | Lines per new test (common) | 100-155 | 100-155 | 45-70 |
 | Manual ImageManifest in test code | 103 | 103 | 4 |
-| Manual ImageIndex in test code | 17 | 17 | 0 |
+| Manual ImageIndex in test code | 17 | 17 | 3 |
 | Largest file | 12,232 | 3,817 | 3,421 |
 | Test count | 99 | 99 | 96 (3 redundant removed) |
 | ManifestBuilder adoption | ~5% | ~5% | 88% |
@@ -313,10 +318,16 @@ before (45-70 lines vs 100-155). The total-line reduction is modest because the
 dominant boilerplate -- mock topology setup for non-default scenarios -- correctly
 stays explicit (it IS the test's content, not ceremony).
 
-The 4 remaining manual constructions:
+The 4 remaining manual `ImageManifest` constructions:
 - 2 in helpers (builder internals)
 - 1 in sync_artifacts (tag fallback test needs `subject` field)
 - 1 in sync_concurrent (per-blob delay test needs dynamic layer count)
+
+The 3 remaining manual `ImageIndex` constructions:
+- 1 in sync_concurrent (broken-child test needs intentionally invalid mock topology)
+- 2 in sync_platforms (nested index-of-index test; `IndexBuilder` takes `ManifestParts`, not `IndexParts`)
+
+`simple_image_manifest` (12 callers) is retained for HEAD-check tests that use fake digests where real blob content is irrelevant. These tests verify discovery/staleness logic, not transfer -- the fake-digest pattern is intentional, not incomplete migration.
 
 ## Appendix A: Why not table-driven tests
 
