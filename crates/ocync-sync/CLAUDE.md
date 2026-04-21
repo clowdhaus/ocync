@@ -49,6 +49,10 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 
 ## Testing
 
+- Integration tests live in `tests/sync_*.rs` (one file per subsystem). Shared helpers in `tests/helpers/`.
+- Each test file starts with `mod helpers; use helpers::*;` -- helpers are NOT auto-discovered.
+- Helper sub-modules use `#![allow(dead_code, unused_imports, unreachable_pub)]` (required for test module visibility).
+- `MockBatchChecker`/`FailingBatchChecker` live in `sync_cache.rs` (not in shared helpers) since only cache tests use them.
 - Engine integration tests: pass `Some(&shutdown)` (production path) unless testing termination.
 - Mount tests: symmetric mocks (both repos accept upload AND mount) since leader-follower can pick either as leader. Assert aggregate stats, not per-image ordering.
 - Concurrency tests: run at `max_concurrent > 1`. Serializing a flaky test hides a race.
@@ -58,4 +62,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 ```bash
 # Unit + integration tests
 cargo test --package ocync-sync
+
+# Run a single test file (fast iteration during development)
+cargo test --package ocync-sync --test sync_artifacts
 ```
