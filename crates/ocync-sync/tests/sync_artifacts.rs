@@ -6,7 +6,7 @@ mod helpers;
 
 use std::rc::Rc;
 
-use ocync_distribution::spec::{Descriptor, ImageIndex, ImageManifest, MediaType};
+use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType};
 use ocync_sync::engine::{ResolvedArtifacts, ResolvedMapping, SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::staging::BlobStage;
@@ -29,30 +29,9 @@ async fn artifact_sync_disabled_issues_no_referrers_requests() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"art-cfg";
-    let layer_data = b"art-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
-
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
-
-    mount_manifest_head_not_found(&target_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1.0.0").await;
+    let parent = ManifestBuilder::new(b"art-cfg").layer(b"art-layer").build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -83,7 +62,7 @@ async fn artifact_sync_disabled_issues_no_referrers_requests() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
 
     // No referrers requests should have been made.
     let source_requests = source_server.received_requests().await.unwrap();
@@ -106,108 +85,24 @@ async fn artifact_sync_transfers_referrer() {
     let target_server = MockServer::start().await;
 
     // -- Parent image --
-    let config_data = b"parent-config";
-    let layer_data = b"parent-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let parent_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (parent_bytes, parent_digest) = serialize_manifest(&parent_manifest);
+    let parent = ManifestBuilder::new(b"parent-config")
+        .layer(b"parent-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
 
     // -- Artifact (signature) --
-    let sig_config_data = b"sig-config";
-    let sig_layer_data = b"sig-payload";
-    let sig_config_desc = blob_descriptor(sig_config_data, MediaType::OciConfig);
-    let sig_layer_desc = blob_descriptor(sig_layer_data, MediaType::OciLayerGzip);
-    let sig_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: sig_config_desc.clone(),
-        layers: vec![sig_layer_desc.clone()],
-        subject: None,
-        artifact_type: Some("application/vnd.dev.cosign.artifact.sig.v1+json".to_string()),
-        annotations: None,
-    };
-    let (sig_bytes, sig_digest) = serialize_manifest(&sig_manifest);
+    let sig = ArtifactBuilder::new(b"sig-config", b"sig-payload").build();
 
     // -- Referrers index --
-    let referrers_index = ImageIndex {
-        schema_version: 2,
-        media_type: Some(MediaType::OciIndex),
-        manifests: vec![Descriptor {
-            media_type: MediaType::OciManifest,
-            digest: sig_digest.clone(),
-            size: sig_bytes.len() as u64,
-            platform: None,
-            artifact_type: Some("application/vnd.dev.cosign.artifact.sig.v1+json".to_string()),
-            annotations: None,
-        }],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let referrers_body = serde_json::to_vec(&referrers_index).unwrap();
+    let referrers = ReferrersIndexBuilder::new().artifact(&sig).build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
 
-    // -- Source mocks --
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &parent_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
-
-    // Referrers API response.
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/referrers/{parent_digest}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(referrers_body)
-                .insert_header("content-type", MediaType::OciIndex.as_str()),
-        )
-        .mount(&source_server)
-        .await;
-
-    // Artifact manifest pull.
-    let sig_digest_str = sig_digest.to_string();
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{sig_digest_str}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(sig_bytes.clone())
-                .insert_header("content-type", MediaType::OciManifest.as_str()),
-        )
-        .mount(&source_server)
-        .await;
-
-    // Artifact blob pulls.
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &sig_config_desc.digest,
-        sig_config_data,
-    )
-    .await;
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &sig_layer_desc.digest,
-        sig_layer_data,
-    )
-    .await;
+    // Artifact source mocks.
+    sig.mount_source(&source_server, "repo").await;
 
     // -- Target mocks --
-    mount_manifest_head_not_found(&target_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &sig_config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &sig_layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1.0.0").await;
-    mount_manifest_push(&target_server, "repo", &sig_digest_str).await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
+    sig.mount_target(&target_server, "repo").await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -235,13 +130,10 @@ async fn artifact_sync_transfers_referrer() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Synced),
-        "expected Synced, got {:?}",
-        report.images[0].status,
-    );
+    assert_status!(report, 0, ImageStatus::Synced);
 
     // Verify artifact manifest was pushed to target.
+    let sig_digest_str = sig.digest.to_string();
     let target_requests = target_server.received_requests().await.unwrap();
     let artifact_pushes: Vec<_> = target_requests
         .iter()
@@ -261,49 +153,14 @@ async fn artifact_require_artifacts_fails_on_empty() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"req-cfg";
-    let layer_data = b"req-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
-
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    let parent = ManifestBuilder::new(b"req-cfg").layer(b"req-layer").build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
 
     // Referrers API returns empty index (no artifacts).
-    let empty_index = ImageIndex {
-        schema_version: 2,
-        media_type: Some(MediaType::OciIndex),
-        manifests: Vec::new(),
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/referrers/{manifest_digest}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(serde_json::to_vec(&empty_index).unwrap())
-                .insert_header("content-type", MediaType::OciIndex.as_str()),
-        )
-        .mount(&source_server)
-        .await;
+    let referrers = ReferrersIndexBuilder::build_empty();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
 
-    mount_manifest_head_not_found(&target_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1.0.0").await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -336,11 +193,7 @@ async fn artifact_require_artifacts_fails_on_empty() {
 
     // Image should fail because require_artifacts is true and no referrers exist.
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Failed { .. }),
-        "expected Failed for require_artifacts with no referrers, got {:?}",
-        report.images[0].status,
-    );
+    assert_status!(report, 0, ImageStatus::Failed { .. });
 }
 
 /// When `require_artifacts = true` but the referrers API returns a non-404
@@ -351,37 +204,17 @@ async fn artifact_require_artifacts_does_not_fire_on_api_error() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"err-cfg";
-    let layer_data = b"err-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
-
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    let parent = ManifestBuilder::new(b"err-cfg").layer(b"err-layer").build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
 
     // Referrers API returns 500 (transient error).
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/referrers/{manifest_digest}")))
+        .and(path(format!("/v2/repo/referrers/{}", parent.digest)))
         .respond_with(ResponseTemplate::new(500))
         .mount(&source_server)
         .await;
 
-    mount_manifest_head_not_found(&target_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1.0.0").await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -416,11 +249,7 @@ async fn artifact_require_artifacts_does_not_fire_on_api_error() {
     // whether artifacts exist -- require_artifacts only fires on positive
     // confirmation of zero referrers.
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Synced),
-        "transient referrers error should not fail the image, got {:?}",
-        report.images[0].status,
-    );
+    assert_status!(report, 0, ImageStatus::Synced);
 }
 
 /// When the referrers API returns 404 but the tag fallback has an artifact,
@@ -431,22 +260,12 @@ async fn artifact_sync_tag_fallback_transfers_referrer() {
     let target_server = MockServer::start().await;
 
     // -- Parent image --
-    let config_data = b"fb-parent-config";
-    let layer_data = b"fb-parent-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let parent_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (parent_bytes, parent_digest) = serialize_manifest(&parent_manifest);
+    let parent = ManifestBuilder::new(b"fb-parent-config")
+        .layer(b"fb-parent-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
 
-    // -- Signature artifact --
+    // -- Signature artifact (manual: has subject field) --
     let sig_config_data = b"fb-sig-config";
     let sig_layer_data = b"fb-sig-layer";
     let sig_config_desc = blob_descriptor(sig_config_data, MediaType::OciConfig);
@@ -458,8 +277,8 @@ async fn artifact_sync_tag_fallback_transfers_referrer() {
         layers: vec![sig_layer_desc.clone()],
         subject: Some(Descriptor {
             media_type: MediaType::OciManifest,
-            digest: parent_digest.clone(),
-            size: parent_bytes.len() as u64,
+            digest: parent.digest.clone(),
+            size: parent.bytes.len() as u64,
             platform: None,
             artifact_type: None,
             annotations: None,
@@ -470,40 +289,31 @@ async fn artifact_sync_tag_fallback_transfers_referrer() {
     let (sig_bytes, sig_digest) = serialize_manifest(&sig_manifest);
 
     // -- Source mocks --
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &parent_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
 
     // Referrers API returns 404.
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/referrers/{parent_digest}")))
+        .and(path(format!("/v2/repo/referrers/{}", parent.digest)))
         .respond_with(ResponseTemplate::new(404))
         .mount(&source_server)
         .await;
 
     // Tag fallback: manifest at sha256-<hex> tag is an index with the artifact.
-    let fallback_tag = parent_digest.tag_fallback();
-    let referrers_index = ImageIndex {
-        schema_version: 2,
-        media_type: Some(MediaType::OciIndex),
-        manifests: vec![Descriptor {
+    let fallback_tag = parent.digest.tag_fallback();
+    let referrers = ReferrersIndexBuilder::new()
+        .descriptor(Descriptor {
             media_type: MediaType::OciManifest,
             digest: sig_digest.clone(),
             size: sig_bytes.len() as u64,
             platform: None,
             artifact_type: Some("application/vnd.dev.cosign.artifact.sig.v1+json".into()),
             annotations: None,
-        }],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let referrers_body = serde_json::to_vec(&referrers_index).unwrap();
+        })
+        .build();
     Mock::given(method("GET"))
         .and(path(format!("/v2/repo/manifests/{fallback_tag}")))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(referrers_body)
+                .set_body_bytes(referrers)
                 .insert_header("content-type", MediaType::OciIndex.as_str()),
         )
         .mount(&source_server)
@@ -538,13 +348,9 @@ async fn artifact_sync_tag_fallback_transfers_referrer() {
     .await;
 
     // -- Target mocks --
-    mount_manifest_head_not_found(&target_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
     mount_blob_not_found(&target_server, "repo", &sig_config_desc.digest).await;
     mount_blob_not_found(&target_server, "repo", &sig_layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1.0.0").await;
     mount_manifest_push(&target_server, "repo", &sig_digest_str).await;
 
     let source_client = mock_client(&source_server);
@@ -573,11 +379,7 @@ async fn artifact_sync_tag_fallback_transfers_referrer() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Synced),
-        "expected Synced via tag fallback, got {:?}",
-        report.images[0].status,
-    );
+    assert_status!(report, 0, ImageStatus::Synced);
 
     // Verify artifact manifest was pushed.
     let target_requests = target_server.received_requests().await.unwrap();
@@ -602,142 +404,35 @@ async fn artifact_sync_include_filter_skips_non_matching() {
     let target_server = MockServer::start().await;
 
     // -- Parent image --
-    let config_data = b"filt-parent-config";
-    let layer_data = b"filt-parent-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let parent_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (parent_bytes, parent_digest) = serialize_manifest(&parent_manifest);
+    let parent = ManifestBuilder::new(b"filt-parent-config")
+        .layer(b"filt-parent-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
 
     // -- Cosign signature artifact --
-    let sig_config_data = b"filt-sig-config";
-    let sig_layer_data = b"filt-sig-layer";
-    let sig_config_desc = blob_descriptor(sig_config_data, MediaType::OciConfig);
-    let sig_layer_desc = blob_descriptor(sig_layer_data, MediaType::OciLayerGzip);
-    let sig_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: sig_config_desc.clone(),
-        layers: vec![sig_layer_desc.clone()],
-        subject: None,
-        artifact_type: Some("application/vnd.dev.cosign.artifact.sig.v1+json".into()),
-        annotations: None,
-    };
-    let (sig_bytes, sig_digest) = serialize_manifest(&sig_manifest);
+    let sig = ArtifactBuilder::new(b"filt-sig-config", b"filt-sig-layer").build();
 
     // -- SBOM artifact (should NOT be transferred) --
-    let sbom_config_data = b"filt-sbom-config";
-    let sbom_layer_data = b"filt-sbom-layer";
-    let sbom_config_desc = blob_descriptor(sbom_config_data, MediaType::OciConfig);
-    let sbom_layer_desc = blob_descriptor(sbom_layer_data, MediaType::OciLayerGzip);
-    let sbom_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: sbom_config_desc.clone(),
-        layers: vec![sbom_layer_desc.clone()],
-        subject: None,
-        artifact_type: Some("application/spdx+json".into()),
-        annotations: None,
-    };
-    let (sbom_bytes, sbom_digest) = serialize_manifest(&sbom_manifest);
+    let sbom = ArtifactBuilder::new(b"filt-sbom-config", b"filt-sbom-layer")
+        .artifact_type("application/spdx+json")
+        .build();
 
     // -- Source mocks --
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &parent_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
 
     // Referrers API returns both artifacts.
-    let referrers_index = ImageIndex {
-        schema_version: 2,
-        media_type: Some(MediaType::OciIndex),
-        manifests: vec![
-            Descriptor {
-                media_type: MediaType::OciManifest,
-                digest: sig_digest.clone(),
-                size: sig_bytes.len() as u64,
-                platform: None,
-                artifact_type: Some("application/vnd.dev.cosign.artifact.sig.v1+json".into()),
-                annotations: None,
-            },
-            Descriptor {
-                media_type: MediaType::OciManifest,
-                digest: sbom_digest.clone(),
-                size: sbom_bytes.len() as u64,
-                platform: None,
-                artifact_type: Some("application/spdx+json".into()),
-                annotations: None,
-            },
-        ],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/referrers/{parent_digest}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(serde_json::to_vec(&referrers_index).unwrap())
-                .insert_header("content-type", MediaType::OciIndex.as_str()),
-        )
-        .mount(&source_server)
-        .await;
+    let referrers = ReferrersIndexBuilder::new()
+        .artifact(&sig)
+        .artifact(&sbom)
+        .build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
 
     // Artifact manifest pulls (both available, but only sig should be requested).
-    let sig_digest_str = sig_digest.to_string();
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{sig_digest_str}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(sig_bytes.clone())
-                .insert_header("content-type", MediaType::OciManifest.as_str()),
-        )
-        .mount(&source_server)
-        .await;
-
-    let sbom_digest_str = sbom_digest.to_string();
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{sbom_digest_str}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(sbom_bytes.clone())
-                .insert_header("content-type", MediaType::OciManifest.as_str()),
-        )
-        .mount(&source_server)
-        .await;
-
-    // Artifact blob pulls (sig only).
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &sig_config_desc.digest,
-        sig_config_data,
-    )
-    .await;
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &sig_layer_desc.digest,
-        sig_layer_data,
-    )
-    .await;
+    sig.mount_source(&source_server, "repo").await;
+    sbom.mount_source(&source_server, "repo").await;
 
     // -- Target mocks --
-    mount_manifest_head_not_found(&target_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &sig_config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &sig_layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1.0.0").await;
-    mount_manifest_push(&target_server, "repo", &sig_digest_str).await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
+    sig.mount_target(&target_server, "repo").await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -770,9 +465,11 @@ async fn artifact_sync_include_filter_skips_non_matching() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
 
     // Verify: cosign signature was pushed, SBOM was NOT.
+    let sig_digest_str = sig.digest.to_string();
+    let sbom_digest_str = sbom.digest.to_string();
     let target_requests = target_server.received_requests().await.unwrap();
     let sig_pushes: Vec<_> = target_requests
         .iter()
@@ -800,58 +497,26 @@ async fn artifact_require_fires_when_all_filtered_out() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"req-filt-cfg";
-    let layer_data = b"req-filt-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
+    let parent = ManifestBuilder::new(b"req-filt-cfg")
+        .layer(b"req-filt-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
 
     // Source has only an SBOM referrer.
     let sbom_digest = make_digest("5b0e5b0e5b0e");
-    let referrers_index = ImageIndex {
-        schema_version: 2,
-        media_type: Some(MediaType::OciIndex),
-        manifests: vec![Descriptor {
+    let referrers = ReferrersIndexBuilder::new()
+        .descriptor(Descriptor {
             media_type: MediaType::OciManifest,
             digest: sbom_digest,
             size: 100,
             platform: None,
             artifact_type: Some("application/spdx+json".into()),
             annotations: None,
-        }],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
+        })
+        .build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
 
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
-
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/referrers/{manifest_digest}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(serde_json::to_vec(&referrers_index).unwrap())
-                .insert_header("content-type", MediaType::OciIndex.as_str()),
-        )
-        .mount(&source_server)
-        .await;
-
-    mount_manifest_head_not_found(&target_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1.0.0").await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -905,90 +570,31 @@ async fn artifact_blob_dedup_skips_existing() {
     let target_server = MockServer::start().await;
 
     // -- Parent image --
-    let config_data = b"dedup-parent-config";
-    let layer_data = b"dedup-parent-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let parent_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (parent_bytes, parent_digest) = serialize_manifest(&parent_manifest);
+    let parent = ManifestBuilder::new(b"dedup-parent-config")
+        .layer(b"dedup-parent-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
 
     // -- Artifact --
-    let sig_config_data = b"dedup-sig-config";
-    let sig_layer_data = b"dedup-sig-layer";
-    let sig_config_desc = blob_descriptor(sig_config_data, MediaType::OciConfig);
-    let sig_layer_desc = blob_descriptor(sig_layer_data, MediaType::OciLayerGzip);
-    let sig_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: sig_config_desc.clone(),
-        layers: vec![sig_layer_desc.clone()],
-        subject: None,
-        artifact_type: Some("application/vnd.dev.cosign.artifact.sig.v1+json".into()),
-        annotations: None,
-    };
-    let (sig_bytes, sig_digest) = serialize_manifest(&sig_manifest);
+    let sig = ArtifactBuilder::new(b"dedup-sig-config", b"dedup-sig-layer").build();
 
     // -- Source mocks --
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &parent_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    let referrers = ReferrersIndexBuilder::new().artifact(&sig).build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
 
-    let referrers_index = ImageIndex {
-        schema_version: 2,
-        media_type: Some(MediaType::OciIndex),
-        manifests: vec![Descriptor {
-            media_type: MediaType::OciManifest,
-            digest: sig_digest.clone(),
-            size: sig_bytes.len() as u64,
-            platform: None,
-            artifact_type: Some("application/vnd.dev.cosign.artifact.sig.v1+json".into()),
-            annotations: None,
-        }],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/referrers/{parent_digest}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(serde_json::to_vec(&referrers_index).unwrap())
-                .insert_header("content-type", MediaType::OciIndex.as_str()),
-        )
-        .mount(&source_server)
-        .await;
-
-    let sig_digest_str = sig_digest.to_string();
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{sig_digest_str}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(sig_bytes.clone())
-                .insert_header("content-type", MediaType::OciManifest.as_str()),
-        )
-        .mount(&source_server)
-        .await;
+    // Artifact manifest pull (by digest).
+    let sig_digest_str = sig.digest.to_string();
+    mount_source_manifest(&source_server, "repo", &sig_digest_str, &sig.bytes).await;
 
     // Artifact blob pulls should NOT be needed since blobs exist at target.
     // (Not mounting them on source -- if engine tries to pull, it will 404.)
 
     // -- Target mocks --
-    mount_manifest_head_not_found(&target_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
     // Artifact blobs ALREADY EXIST at target (HEAD returns 200).
-    mount_blob_exists(&target_server, "repo", &sig_config_desc.digest).await;
-    mount_blob_exists(&target_server, "repo", &sig_layer_desc.digest).await;
+    mount_blob_exists(&target_server, "repo", &sig.config_desc.digest).await;
+    mount_blob_exists(&target_server, "repo", &sig.layer_desc.digest).await;
     mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1.0.0").await;
     mount_manifest_push(&target_server, "repo", &sig_digest_str).await;
 
     let source_client = mock_client(&source_server);
@@ -1017,11 +623,7 @@ async fn artifact_blob_dedup_skips_existing() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Synced),
-        "expected Synced, got {:?}",
-        report.images[0].status,
-    );
+    assert_status!(report, 0, ImageStatus::Synced);
 
     // Verify no blob upload requests for artifact blobs (no POST for upload initiation).
     // The parent blobs DO get uploaded, but artifact blobs should be skipped.
@@ -1032,8 +634,8 @@ async fn artifact_blob_dedup_skips_existing() {
         .filter(|r| {
             r.method.as_str() == "GET"
                 && r.url.path().contains("/blobs/")
-                && (r.url.path().contains(&sig_config_desc.digest.to_string())
-                    || r.url.path().contains(&sig_layer_desc.digest.to_string()))
+                && (r.url.path().contains(&sig.config_desc.digest.to_string())
+                    || r.url.path().contains(&sig.layer_desc.digest.to_string()))
         })
         .collect();
     assert_eq!(
@@ -1051,104 +653,26 @@ async fn artifact_transfer_failure_reports_artifact_sync_error() {
     let target_server = MockServer::start().await;
 
     // -- Parent image --
-    let config_data = b"fail-parent-config";
-    let layer_data = b"fail-parent-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let parent_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (parent_bytes, parent_digest) = serialize_manifest(&parent_manifest);
+    let parent = ManifestBuilder::new(b"fail-parent-config")
+        .layer(b"fail-parent-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
 
     // -- Artifact --
-    let sig_config_data = b"fail-sig-config";
-    let sig_layer_data = b"fail-sig-layer";
-    let sig_config_desc = blob_descriptor(sig_config_data, MediaType::OciConfig);
-    let sig_layer_desc = blob_descriptor(sig_layer_data, MediaType::OciLayerGzip);
-    let sig_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: sig_config_desc.clone(),
-        layers: vec![sig_layer_desc.clone()],
-        subject: None,
-        artifact_type: Some("application/vnd.dev.cosign.artifact.sig.v1+json".into()),
-        annotations: None,
-    };
-    let (sig_bytes, sig_digest) = serialize_manifest(&sig_manifest);
+    let sig = ArtifactBuilder::new(b"fail-sig-config", b"fail-sig-layer").build();
 
     // -- Source mocks --
-    mount_source_manifest(&source_server, "repo", "v1.0.0", &parent_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
-
-    let referrers_index = ImageIndex {
-        schema_version: 2,
-        media_type: Some(MediaType::OciIndex),
-        manifests: vec![Descriptor {
-            media_type: MediaType::OciManifest,
-            digest: sig_digest.clone(),
-            size: sig_bytes.len() as u64,
-            platform: None,
-            artifact_type: Some("application/vnd.dev.cosign.artifact.sig.v1+json".into()),
-            annotations: None,
-        }],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/referrers/{parent_digest}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(serde_json::to_vec(&referrers_index).unwrap())
-                .insert_header("content-type", MediaType::OciIndex.as_str()),
-        )
-        .mount(&source_server)
-        .await;
-
-    let sig_digest_str = sig_digest.to_string();
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{sig_digest_str}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(sig_bytes.clone())
-                .insert_header("content-type", MediaType::OciManifest.as_str()),
-        )
-        .mount(&source_server)
-        .await;
-
-    // Artifact blob pulls.
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &sig_config_desc.digest,
-        sig_config_data,
-    )
-    .await;
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &sig_layer_desc.digest,
-        sig_layer_data,
-    )
-    .await;
+    let referrers = ReferrersIndexBuilder::new().artifact(&sig).build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
+    sig.mount_source(&source_server, "repo").await;
 
     // -- Target mocks --
-    mount_manifest_head_not_found(&target_server, "repo", "v1.0.0").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &sig_config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &sig_layer_desc.digest).await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
+    mount_blob_not_found(&target_server, "repo", &sig.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &sig.layer_desc.digest).await;
     mount_blob_push(&target_server, "repo").await;
-    // Parent manifest push succeeds.
-    mount_manifest_push(&target_server, "repo", "v1.0.0").await;
     // Artifact manifest push FAILS with 500.
+    let sig_digest_str = sig.digest.to_string();
     Mock::given(method("PUT"))
         .and(path(format!("/v2/repo/manifests/{sig_digest_str}")))
         .respond_with(ResponseTemplate::new(500))

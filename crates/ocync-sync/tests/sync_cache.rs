@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ocync_distribution::spec::{ImageIndex, ImageManifest, MediaType, RepositoryName};
+use ocync_distribution::spec::{MediaType, RepositoryName};
 use ocync_distribution::{BatchBlobChecker, Digest};
 use ocync_sync::ImageStatus;
 use ocync_sync::cache::TransferStateCache;
@@ -139,61 +139,33 @@ async fn sync_progressive_cache_skips_shared_blob_head_check() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let base_data = b"base-layer-data";
-    let layer_a_data = b"layer-a-data";
-    let layer_b_data = b"layer-b-data";
-    let config_a_data = b"config-a";
-    let config_b_data = b"config-b";
-
-    let base_desc = blob_descriptor(base_data, MediaType::OciLayerGzip);
-    let layer_a_desc = blob_descriptor(layer_a_data, MediaType::OciLayerGzip);
-    let layer_b_desc = blob_descriptor(layer_b_data, MediaType::OciLayerGzip);
-    let config_a_desc = blob_descriptor(config_a_data, MediaType::OciConfig);
-    let config_b_desc = blob_descriptor(config_b_data, MediaType::OciConfig);
-
-    let manifest_a = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_a_desc.clone(),
-        layers: vec![base_desc.clone(), layer_a_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let manifest_b = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_b_desc.clone(),
-        layers: vec![base_desc.clone(), layer_b_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_a_bytes, _) = serialize_manifest(&manifest_a);
-    let (manifest_b_bytes, _) = serialize_manifest(&manifest_b);
+    // Two images sharing a base layer (same bytes = same digest).
+    let parts_a = ManifestBuilder::new(b"config-a")
+        .layer(b"base-layer-data")
+        .layer(b"layer-a-data")
+        .build();
+    let parts_b = ManifestBuilder::new(b"config-b")
+        .layer(b"base-layer-data")
+        .layer(b"layer-b-data")
+        .build();
 
     // Source: serve both manifests and all blobs.
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_a_bytes).await;
-    mount_source_manifest(&source_server, "repo", "v2", &manifest_b_bytes).await;
-    mount_blob_pull(&source_server, "repo", &base_desc.digest, base_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_a_desc.digest, layer_a_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_b_desc.digest, layer_b_data).await;
-    mount_blob_pull(&source_server, "repo", &config_a_desc.digest, config_a_data).await;
-    mount_blob_pull(&source_server, "repo", &config_b_desc.digest, config_b_data).await;
+    parts_a.mount_source(&source_server, "repo", "v1").await;
+    parts_b.mount_source(&source_server, "repo", "v2").await;
 
     // Target: manifest HEAD 404 for both tags.
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
     mount_manifest_head_not_found(&target_server, "repo", "v2").await;
 
     // v1 blobs: all missing at target -- base, config_a, layer_a each need HEAD + push.
-    mount_blob_not_found(&target_server, "repo", &base_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &config_a_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_a_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts_a.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts_a.layer_descs[0].digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts_a.layer_descs[1].digest).await;
 
     // v2 blobs: base was already completed by v1 -- no HEAD issued.
     // config_b and layer_b are new so HEAD + push needed.
-    mount_blob_not_found(&target_server, "repo", &config_b_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_b_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts_b.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts_b.layer_descs[1].digest).await;
 
     // The push endpoint accepts any upload (3 pushes for v1: base + config_a + layer_a;
     // 2 pushes for v2: config_b + layer_b; base is skipped entirely for v2).
@@ -222,8 +194,8 @@ async fn sync_progressive_cache_skips_shared_blob_head_check() {
         .await;
 
     assert_eq!(report.images.len(), 2);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
-    assert!(matches!(report.images[1].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_status!(report, 1, ImageStatus::Synced);
 
     // v1: 3 blobs transferred (base + config_a + layer_a).
     assert_eq!(report.images[0].blob_stats.transferred, 3);
@@ -246,23 +218,12 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-data";
-    let layer_data = b"layer-data";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-data")
+        .layer(b"layer-data")
+        .build();
 
     // Source: serve manifest (blobs will be mounted, not pulled).
-    mount_source_manifest(&source_server, "repo-b", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "repo-b", "v1", &parts.bytes).await;
 
     // Target: manifest HEAD 404, mount POST returns 201 (Mounted) for both blobs.
     mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
@@ -283,12 +244,12 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         let target = "target";
         c.set_blob_completed(
             target,
-            config_desc.digest.clone(),
+            parts.config_desc.digest.clone(),
             RepositoryName::new("repo-a").unwrap(),
         );
         c.set_blob_completed(
             target,
-            layer_desc.digest.clone(),
+            parts.layer_descs[0].digest.clone(),
             RepositoryName::new("repo-a").unwrap(),
         );
     }
@@ -313,7 +274,7 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // Both blobs mounted from repo-a; none pulled or skipped by HEAD.
     assert_eq!(report.images[0].blob_stats.mounted, 2);
     assert_eq!(report.images[0].blob_stats.transferred, 0);
@@ -332,24 +293,11 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"ecr-config-data";
-    let layer_data = b"ecr-layer-data";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"ecr-config-data")
+        .layer(b"ecr-layer-data")
+        .build();
 
-    mount_source_manifest(&source_server, "repo-b", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo-b", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo-b", &layer_desc.digest, layer_data).await;
+    parts.mount_source(&source_server, "repo-b", "v1").await;
 
     mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
 
@@ -377,12 +325,12 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
         let mut c = cache.borrow_mut();
         c.set_blob_completed(
             target_name,
-            config_desc.digest.clone(),
+            parts.config_desc.digest.clone(),
             RepositoryName::new("repo-a").unwrap(),
         );
         c.set_blob_completed(
             target_name,
-            layer_desc.digest.clone(),
+            parts.layer_descs[0].digest.clone(),
             RepositoryName::new("repo-a").unwrap(),
         );
     }
@@ -407,7 +355,7 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // Mount attempted but not fulfilled (202) -- blobs transferred instead.
     assert_eq!(report.images[0].blob_stats.mounted, 0);
     assert_eq!(report.images[0].blob_stats.transferred, 2);
@@ -423,30 +371,15 @@ async fn sync_small_blob_uses_monolithic_upload() {
     let target_server = MockServer::start().await;
 
     // Small blobs -- streaming PUT handles all sizes.
-    let config_data = b"small-config";
-    let layer_data = b"small-layer";
+    let parts = ManifestBuilder::new(b"small-config")
+        .layer(b"small-layer")
+        .build();
 
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
-
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    parts.mount_source(&source_server, "repo", "v1").await;
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
 
     // Monolithic upload: POST initiates, PUT finalizes -- no PATCH.
     // Use .expect() to assert exact counts per HTTP method.
@@ -490,7 +423,7 @@ async fn sync_small_blob_uses_monolithic_upload() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     assert_eq!(report.images[0].blob_stats.transferred, 2);
 }
 
@@ -503,24 +436,11 @@ async fn sync_lazy_invalidation_on_mount_failure() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-payload";
-    let layer_data = b"layer-payload";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-payload")
+        .layer(b"layer-payload")
+        .build();
 
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    parts.mount_source(&source_server, "repo", "v1").await;
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
 
@@ -530,20 +450,23 @@ async fn sync_lazy_invalidation_on_mount_failure() {
     // and falls back to HEAD check + full push.
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
-        .and(query_param("mount", config_desc.digest.to_string()))
+        .and(query_param("mount", parts.config_desc.digest.to_string()))
         .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
         .mount(&target_server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
-        .and(query_param("mount", layer_desc.digest.to_string()))
+        .and(query_param(
+            "mount",
+            parts.layer_descs[0].digest.to_string(),
+        ))
         .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
         .mount(&target_server)
         .await;
 
     // After invalidation the engine falls back to HEAD check (returns 404 = absent).
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
 
     // Fallback push: the blobs are small so the engine takes the monolithic
     // path (POST -> 202, then PUT -> 201; no PATCH).
@@ -572,12 +495,12 @@ async fn sync_lazy_invalidation_on_mount_failure() {
         let mut c = cache.borrow_mut();
         c.set_blob_completed(
             "target",
-            config_desc.digest.clone(),
+            parts.config_desc.digest.clone(),
             RepositoryName::new("other-repo").unwrap(),
         );
         c.set_blob_completed(
             "target",
-            layer_desc.digest.clone(),
+            parts.layer_descs[0].digest.clone(),
             RepositoryName::new("other-repo").unwrap(),
         );
     }
@@ -602,7 +525,7 @@ async fn sync_lazy_invalidation_on_mount_failure() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // After failed mounts, fallback push transferred both blobs.
     assert_eq!(report.images[0].blob_stats.transferred, 2);
     assert_eq!(report.images[0].blob_stats.mounted, 0);
@@ -615,29 +538,12 @@ async fn sync_cache_persist_and_load_round_trip() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"persist-config";
-    let layer_data = b"persist-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"persist-config")
+        .layer(b"persist-layer")
+        .build();
 
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
-    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1").await;
+    parts.mount_source(&source_server, "repo", "v1").await;
+    parts.mount_target(&target_server, "repo", "v1").await;
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
@@ -672,7 +578,7 @@ async fn sync_cache_persist_and_load_round_trip() {
     assert!(
         loaded.blob_known_at_repo(
             "target-reg",
-            &config_desc.digest,
+            &parts.config_desc.digest,
             &RepositoryName::new("repo").unwrap()
         ),
         "config blob should be recorded as completed at repo"
@@ -680,7 +586,7 @@ async fn sync_cache_persist_and_load_round_trip() {
     assert!(
         loaded.blob_known_at_repo(
             "target-reg",
-            &layer_desc.digest,
+            &parts.layer_descs[0].digest,
             &RepositoryName::new("repo").unwrap()
         ),
         "layer blob should be recorded as completed at repo"
@@ -688,7 +594,7 @@ async fn sync_cache_persist_and_load_round_trip() {
     assert!(
         !loaded.blob_known_at_repo(
             "target-reg",
-            &config_desc.digest,
+            &parts.config_desc.digest,
             &RepositoryName::new("other-repo").unwrap()
         ),
         "blob should not appear at an unrelated repo"
@@ -707,44 +613,34 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-cache-verify";
-    let layer_data = b"layer-cache-verify";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-cache-verify")
+        .layer(b"layer-cache-verify")
+        .build();
 
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    parts.mount_source(&source_server, "repo", "v1").await;
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
 
     // Mount attempts return 404 (failure).
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
-        .and(query_param("mount", config_desc.digest.to_string()))
+        .and(query_param("mount", parts.config_desc.digest.to_string()))
         .respond_with(ResponseTemplate::new(404))
         .mount(&target_server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
-        .and(query_param("mount", layer_desc.digest.to_string()))
+        .and(query_param(
+            "mount",
+            parts.layer_descs[0].digest.to_string(),
+        ))
         .respond_with(ResponseTemplate::new(404))
         .mount(&target_server)
         .await;
 
     // Fallback: HEAD 404, then push.
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
         .respond_with(
@@ -766,12 +662,12 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         let mut c = cache.borrow_mut();
         c.set_blob_completed(
             "target",
-            config_desc.digest.clone(),
+            parts.config_desc.digest.clone(),
             RepositoryName::new("stale-repo").unwrap(),
         );
         c.set_blob_completed(
             "target",
-            layer_desc.digest.clone(),
+            parts.layer_descs[0].digest.clone(),
             RepositoryName::new("stale-repo").unwrap(),
         );
     }
@@ -796,14 +692,14 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
 
     // Verify: stale mount source is gone, blobs are now recorded at "repo".
     let c = cache.borrow();
     assert!(
         !c.blob_known_at_repo(
             "target",
-            &config_desc.digest,
+            &parts.config_desc.digest,
             &RepositoryName::new("stale-repo").unwrap()
         ),
         "stale cache entry for config at stale-repo should be invalidated"
@@ -811,7 +707,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
     assert!(
         !c.blob_known_at_repo(
             "target",
-            &layer_desc.digest,
+            &parts.layer_descs[0].digest,
             &RepositoryName::new("stale-repo").unwrap()
         ),
         "stale cache entry for layer at stale-repo should be invalidated"
@@ -819,7 +715,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
     assert!(
         c.blob_known_at_repo(
             "target",
-            &config_desc.digest,
+            &parts.config_desc.digest,
             &RepositoryName::new("repo").unwrap()
         ),
         "config blob should be recorded as completed at repo after fallback push"
@@ -827,7 +723,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
     assert!(
         c.blob_known_at_repo(
             "target",
-            &layer_desc.digest,
+            &parts.layer_descs[0].digest,
             &RepositoryName::new("repo").unwrap()
         ),
         "layer blob should be recorded as completed at repo after fallback push"
@@ -846,22 +742,11 @@ async fn sync_warm_cache_skips_blob_head_check() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"cache-skip-config";
-    let layer_data = b"cache-skip-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"cache-skip-config")
+        .layer(b"cache-skip-layer")
+        .build();
 
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
     // No source blob pulls mounted -- they shouldn't be needed.
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
@@ -876,12 +761,12 @@ async fn sync_warm_cache_skips_blob_head_check() {
         let mut c = cache.borrow_mut();
         c.set_blob_completed(
             "target",
-            config_desc.digest.clone(),
+            parts.config_desc.digest.clone(),
             RepositoryName::new("repo").unwrap(),
         );
         c.set_blob_completed(
             "target",
-            layer_desc.digest.clone(),
+            parts.layer_descs[0].digest.clone(),
             RepositoryName::new("repo").unwrap(),
         );
     }
@@ -906,7 +791,7 @@ async fn sync_warm_cache_skips_blob_head_check() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // Both blobs skipped via cache -- no transfers, no HEAD checks.
     assert_eq!(report.images[0].blob_stats.skipped, 2);
     assert_eq!(report.images[0].blob_stats.transferred, 0);
@@ -933,38 +818,33 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-batch";
-    let layer_data = b"layer-batch";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-batch")
+        .layer(b"layer-batch")
+        .build();
 
     // Source: serve manifest only (no blob endpoints -- they shouldn't be needed).
     // Use different repo names to ensure the engine passes target_repo (not
     // source_repo) to the batch checker.
-    mount_source_manifest(&source_server, "src/nginx", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "src/nginx", "v1", &parts.bytes).await;
 
     // Target: manifest HEAD 404 (image needs sync), manifest PUT (for pushing).
     // Blob HEAD endpoints: expect(0) -- batch pre-population must prevent all
     // per-blob HEAD checks. This is the explicit negative assertion per CLAUDE.md.
     mount_manifest_head_not_found(&target_server, "tgt/nginx", "v1").await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/tgt/nginx/blobs/{}", config_desc.digest)))
+        .and(path(format!(
+            "/v2/tgt/nginx/blobs/{}",
+            parts.config_desc.digest
+        )))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/tgt/nginx/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/tgt/nginx/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
@@ -972,7 +852,10 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
     mount_manifest_push(&target_server, "tgt/nginx", "v1").await;
 
     // Batch checker: both blobs exist. Expected repo is target repo, not source.
-    let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
+    let existing = HashSet::from([
+        parts.config_desc.digest.clone(),
+        parts.layer_descs[0].digest.clone(),
+    ]);
     let (checker, batch_call_count) = MockBatchChecker::new("tgt/nginx", existing);
 
     let source_client = mock_client(&source_server);
@@ -1009,7 +892,7 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
         "batch checker must be called exactly once"
     );
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // Both blobs skipped via batch-populated cache (Step 1 cache hit).
     assert_eq!(report.images[0].blob_stats.skipped, 2);
     assert_eq!(report.images[0].blob_stats.transferred, 0);
@@ -1032,28 +915,20 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-partial";
     let layer1_data = b"layer1-missing";
-    let layer2_data = b"layer2-exists";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer1_desc = blob_descriptor(layer1_data, MediaType::OciLayerGzip);
-    let layer2_desc = blob_descriptor(layer2_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer1_desc.clone(), layer2_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-partial")
+        .layer(layer1_data)
+        .layer(b"layer2-exists")
+        .build();
 
     // Source: serve manifest and the missing blob (layer1).
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
     // Only layer1 should be pulled -- use expect(1) to verify.
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", layer1_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(layer1_data.to_vec())
@@ -1094,7 +969,10 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
     mount_manifest_push(&target_server, "repo", "v1").await;
 
     // Batch checker: config and layer2 exist, layer1 missing.
-    let existing = HashSet::from([config_desc.digest.clone(), layer2_desc.digest.clone()]);
+    let existing = HashSet::from([
+        parts.config_desc.digest.clone(),
+        parts.layer_descs[1].digest.clone(),
+    ]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
     let source_client = mock_client(&source_server);
@@ -1131,7 +1009,7 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
         "batch checker must be called exactly once"
     );
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // 2 blobs skipped (config + layer2), 1 transferred (layer1).
     assert_eq!(report.images[0].blob_stats.skipped, 2);
     assert_eq!(report.images[0].blob_stats.transferred, 1);
@@ -1159,44 +1037,38 @@ async fn sync_no_batch_checker_falls_back_to_per_blob_head() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-head";
-    let layer1_data = b"layer1-head";
-    let layer2_data = b"layer2-head";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer1_desc = blob_descriptor(layer1_data, MediaType::OciLayerGzip);
-    let layer2_desc = blob_descriptor(layer2_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer1_desc.clone(), layer2_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-head")
+        .layer(b"layer1-head")
+        .layer(b"layer2-head")
+        .build();
 
     // Source: serve manifest only (no blobs needed -- all exist at target).
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
 
     // Target: manifest HEAD 404, all 3 blobs return 200 on HEAD, manifest PUT.
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
 
     // Blob HEAD: use expect(1) per blob to verify exactly 1 HEAD per blob.
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
         .expect(1)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", layer1_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
         .expect(1)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", layer2_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[1].digest
+        )))
         .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
         .expect(1)
         .mount(&target_server)
@@ -1227,7 +1099,7 @@ async fn sync_no_batch_checker_falls_back_to_per_blob_head() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // All 3 blobs skipped via per-blob HEAD (Step 3).
     assert_eq!(report.images[0].blob_stats.skipped, 3);
     assert_eq!(report.images[0].blob_stats.transferred, 0);
@@ -1251,36 +1123,28 @@ async fn sync_batch_checker_failure_falls_back_to_per_blob_head() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-fail";
-    let layer_data = b"layer-fail";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-fail")
+        .layer(b"layer-fail")
+        .build();
 
     // Source: serve manifest only (no blob endpoints -- all exist at target).
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
 
     // Target: manifest HEAD 404, blob HEADs return 200 (exist), manifest PUT.
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
 
     // Blob HEAD endpoints -- these MUST be called when batch fails.
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
         .expect(1)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
         .expect(1)
         .mount(&target_server)
@@ -1325,7 +1189,7 @@ async fn sync_batch_checker_failure_falls_back_to_per_blob_head() {
         "batch checker must be attempted even though it fails"
     );
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // Both blobs discovered via per-blob HEAD fallback (Step 3).
     assert_eq!(report.images[0].blob_stats.skipped, 2);
     assert_eq!(report.images[0].blob_stats.transferred, 0);
@@ -1350,27 +1214,17 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
     let target_a_server = MockServer::start().await;
     let target_b_server = MockServer::start().await;
 
-    let config_data = b"config-multi";
     let layer_data = b"layer-multi";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-multi")
+        .layer(layer_data)
+        .build();
 
     // Source: manifest pulled exactly once (pull-once fan-out invariant).
     Mock::given(method("GET"))
         .and(path("/v2/repo/manifests/v1"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(manifest_bytes.clone())
+                .set_body_bytes(parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
@@ -1378,7 +1232,10 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
         .await;
     // Layer blob served for target B's transfer.
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(layer_data.to_vec())
@@ -1418,10 +1275,13 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
     mount_manifest_push(&target_b_server, "repo", "v1").await;
 
     // Batch checkers with different responses per target.
-    let existing_a = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
+    let existing_a = HashSet::from([
+        parts.config_desc.digest.clone(),
+        parts.layer_descs[0].digest.clone(),
+    ]);
     let (checker_a, count_a) = MockBatchChecker::new("repo", existing_a);
 
-    let existing_b = HashSet::from([config_desc.digest.clone()]);
+    let existing_b = HashSet::from([parts.config_desc.digest.clone()]);
     let (checker_b, count_b) = MockBatchChecker::new("repo", existing_b);
 
     let source_client = mock_client(&source_server);
@@ -1520,23 +1380,12 @@ async fn sync_batch_checker_empty_result_transfers_all() {
 
     let config_data = b"config-empty-batch";
     let layer_data = b"layer-empty-batch";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(config_data).layer(layer_data).build();
 
     // Source: manifest + both blobs with expect(1) to verify pull-once.
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(config_data.to_vec())
@@ -1546,7 +1395,10 @@ async fn sync_batch_checker_empty_result_transfers_all() {
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(layer_data.to_vec())
@@ -1560,13 +1412,16 @@ async fn sync_batch_checker_empty_result_transfers_all() {
     // already confirmed absent (all digests in batch_checked set skip HEAD).
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(ResponseTemplate::new(404))
         .expect(0)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(404))
         .expect(0)
         .mount(&target_server)
@@ -1608,7 +1463,7 @@ async fn sync_batch_checker_empty_result_transfers_all() {
         "batch checker must be called even when nothing exists"
     );
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // All blobs transferred (none existed).
     assert_eq!(report.images[0].blob_stats.skipped, 0);
     assert_eq!(report.images[0].blob_stats.transferred, 2);
@@ -1639,34 +1494,26 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
     let target_a_server = MockServer::start().await;
     let target_b_server = MockServer::start().await;
 
-    let config_data = b"config-mixed";
-    let layer_data = b"layer-mixed";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-mixed")
+        .layer(b"layer-mixed")
+        .build();
 
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
 
     // Target A (ECR with batch): manifest HEAD 404, explicit expect(0) on blob HEAD,
     // manifest PUT. Blob HEADs must NOT be called because batch handles it.
     mount_manifest_head_not_found(&target_a_server, "repo", "v1").await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_a_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_a_server)
@@ -1676,13 +1523,16 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
     // Target B (no batch): manifest HEAD 404, per-blob HEAD expect(1), manifest PUT.
     mount_manifest_head_not_found(&target_b_server, "repo", "v1").await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
         .expect(1)
         .mount(&target_b_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(200).insert_header("content-length", "100"))
         .expect(1)
         .mount(&target_b_server)
@@ -1690,7 +1540,10 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
     mount_manifest_push(&target_b_server, "repo", "v1").await;
 
     // Batch checker for target A only.
-    let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
+    let existing = HashSet::from([
+        parts.config_desc.digest.clone(),
+        parts.layer_descs[0].digest.clone(),
+    ]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
     let mapping = resolved_mapping(
@@ -1758,27 +1611,16 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-multitag";
-    let layer_data = b"layer-multitag";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-multitag")
+        .layer(b"layer-multitag")
+        .build();
 
     // Source: serve manifest for both tags with expect(1) per tag.
     Mock::given(method("GET"))
         .and(path("/v2/repo/manifests/v1"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(manifest_bytes.clone())
+                .set_body_bytes(parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
@@ -1788,7 +1630,7 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
         .and(path("/v2/repo/manifests/v2"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(manifest_bytes.clone())
+                .set_body_bytes(parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
@@ -1800,13 +1642,16 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
     mount_manifest_head_not_found(&target_server, "repo", "v2").await;
     // Blob HEAD expect(0): batch handles existence, HEAD must not be called.
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
@@ -1815,7 +1660,10 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
     mount_manifest_push(&target_server, "repo", "v2").await;
 
     // Batch checker: both blobs exist. Shared Rc across tags.
-    let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
+    let existing = HashSet::from([
+        parts.config_desc.digest.clone(),
+        parts.layer_descs[0].digest.clone(),
+    ]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
     let mapping = resolved_mapping(
@@ -1876,77 +1724,46 @@ async fn sync_batch_checker_index_manifest_all_exist() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    // Build two child image manifests (amd64 and arm64).
-    let amd64_config_data = b"amd64-config-batch";
-    let amd64_layer_data = b"amd64-layer-batch";
-    let amd64_config_desc = blob_descriptor(amd64_config_data, MediaType::OciConfig);
-    let amd64_layer_desc = blob_descriptor(amd64_layer_data, MediaType::OciLayerGzip);
-    let amd64_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: amd64_config_desc.clone(),
-        layers: vec![amd64_layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (amd64_bytes, amd64_digest) = serialize_manifest(&amd64_manifest);
+    // Build two child image manifests (amd64 and arm64) using ManifestBuilder.
+    let amd64_parts = ManifestBuilder::new(b"amd64-config-batch")
+        .layer(b"amd64-layer-batch")
+        .build();
+    let arm64_parts = ManifestBuilder::new(b"arm64-config-batch")
+        .layer(b"arm64-layer-batch")
+        .build();
 
-    let arm64_config_data = b"arm64-config-batch";
-    let arm64_layer_data = b"arm64-layer-batch";
-    let arm64_config_desc = blob_descriptor(arm64_config_data, MediaType::OciConfig);
-    let arm64_layer_desc = blob_descriptor(arm64_layer_data, MediaType::OciLayerGzip);
-    let arm64_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: arm64_config_desc.clone(),
-        layers: vec![arm64_layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (arm64_bytes, arm64_digest) = serialize_manifest(&arm64_manifest);
-
-    // Build the index manifest referencing both children.
-    let index = ImageIndex {
-        schema_version: 2,
-        media_type: None,
-        manifests: vec![
-            make_descriptor(amd64_digest.clone(), MediaType::OciManifest),
-            make_descriptor(arm64_digest.clone(), MediaType::OciManifest),
-        ],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let index_bytes = serde_json::to_vec(&index).unwrap();
+    // Build the index using IndexBuilder.
+    let index_parts = IndexBuilder::new()
+        .manifest(&amd64_parts, None)
+        .manifest(&arm64_parts, None)
+        .build();
 
     // Source: serve the index by tag and children by digest.
     Mock::given(method("GET"))
         .and(path("/v2/repo/manifests/latest"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(index_bytes)
+                .set_body_bytes(index_parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciIndex.as_str()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", amd64_parts.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(amd64_bytes)
+                .set_body_bytes(amd64_parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", arm64_parts.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(arm64_bytes)
+                .set_body_bytes(arm64_parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
@@ -1958,25 +1775,37 @@ async fn sync_batch_checker_index_manifest_all_exist() {
     // Target: manifest HEAD 404, blob HEAD expect(0) for all 4 blobs.
     mount_manifest_head_not_found(&target_server, "repo", "latest").await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", amd64_config_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            amd64_parts.config_desc.digest
+        )))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", amd64_layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            amd64_parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", arm64_config_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            arm64_parts.config_desc.digest
+        )))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", arm64_layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            arm64_parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
@@ -1985,13 +1814,13 @@ async fn sync_batch_checker_index_manifest_all_exist() {
     // Accept child manifest pushes (by digest) and index push (by tag).
     // Use expect(1) to verify exactly 3 manifest pushes occur.
     Mock::given(method("PUT"))
-        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", amd64_parts.digest)))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&target_server)
         .await;
     Mock::given(method("PUT"))
-        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", arm64_parts.digest)))
         .respond_with(ResponseTemplate::new(201))
         .expect(1)
         .mount(&target_server)
@@ -2005,10 +1834,10 @@ async fn sync_batch_checker_index_manifest_all_exist() {
 
     // Batch checker: all 4 blobs exist.
     let existing = HashSet::from([
-        amd64_config_desc.digest.clone(),
-        amd64_layer_desc.digest.clone(),
-        arm64_config_desc.digest.clone(),
-        arm64_layer_desc.digest.clone(),
+        amd64_parts.config_desc.digest.clone(),
+        amd64_parts.layer_descs[0].digest.clone(),
+        arm64_parts.config_desc.digest.clone(),
+        arm64_parts.layer_descs[0].digest.clone(),
     ]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
@@ -2043,7 +1872,7 @@ async fn sync_batch_checker_index_manifest_all_exist() {
         "batch checker must be called exactly once for index manifest"
     );
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // All 4 blobs skipped (2 per child manifest).
     assert_eq!(report.images[0].blob_stats.skipped, 4);
     assert_eq!(report.images[0].blob_stats.transferred, 0);
@@ -2070,20 +1899,9 @@ async fn sync_batch_checker_with_prewarmed_cache() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-warm";
-    let layer_data = b"layer-warm";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-warm")
+        .layer(b"layer-warm")
+        .build();
 
     // Source: serve manifest only (no blob endpoints needed).
     // expect(1) verifies the manifest is pulled exactly once.
@@ -2091,7 +1909,7 @@ async fn sync_batch_checker_with_prewarmed_cache() {
         .and(path("/v2/repo/manifests/v1"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(manifest_bytes)
+                .set_body_bytes(parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
@@ -2101,13 +1919,16 @@ async fn sync_batch_checker_with_prewarmed_cache() {
     // Target: manifest HEAD 404, blob HEAD expect(0), manifest PUT expect(1).
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", parts.config_desc.digest)))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
         .await;
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/repo/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(200))
         .expect(0)
         .mount(&target_server)
@@ -2126,13 +1947,16 @@ async fn sync_batch_checker_with_prewarmed_cache() {
         let mut c = cache.borrow_mut();
         c.set_blob_exists(
             "target",
-            config_desc.digest.clone(),
+            parts.config_desc.digest.clone(),
             RepositoryName::new("repo").unwrap(),
         );
     }
 
     // Batch checker: both blobs exist (config is redundant with cache).
-    let existing = HashSet::from([config_desc.digest.clone(), layer_desc.digest.clone()]);
+    let existing = HashSet::from([
+        parts.config_desc.digest.clone(),
+        parts.layer_descs[0].digest.clone(),
+    ]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
     let mapping = resolved_mapping(
@@ -2166,7 +1990,7 @@ async fn sync_batch_checker_with_prewarmed_cache() {
         "batch checker must be called even with pre-warmed cache"
     );
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // Both blobs skipped: config from cache (Step 1), layer from batch
     // pre-population (also Step 1 cache hit after batch populates it).
     assert_eq!(report.images[0].blob_stats.skipped, 2);

@@ -29,47 +29,17 @@ async fn sync_dedup_across_tags_concurrent() {
     let target_server = MockServer::start().await;
 
     let shared_layer = b"shared-layer-concurrent";
-    let config_a = b"cfg-a-concurrent";
-    let config_b = b"cfg-b-concurrent";
-    let shared_desc = blob_descriptor(shared_layer, MediaType::OciLayerGzip);
-    let config_a_desc = blob_descriptor(config_a, MediaType::OciConfig);
-    let config_b_desc = blob_descriptor(config_b, MediaType::OciConfig);
+    let parts_a = ManifestBuilder::new(b"cfg-a-concurrent")
+        .layer(shared_layer)
+        .build();
+    let parts_b = ManifestBuilder::new(b"cfg-b-concurrent")
+        .layer(shared_layer)
+        .build();
 
-    let manifest_a = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_a_desc.clone(),
-        layers: vec![shared_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let manifest_b = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_b_desc.clone(),
-        layers: vec![shared_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (ma_bytes, _) = serialize_manifest(&manifest_a);
-    let (mb_bytes, _) = serialize_manifest(&manifest_b);
-
-    mount_source_manifest(&source_server, "repo", "v1", &ma_bytes).await;
-    mount_source_manifest(&source_server, "repo", "v2", &mb_bytes).await;
-    mount_blob_pull(&source_server, "repo", &shared_desc.digest, shared_layer).await;
-    mount_blob_pull(&source_server, "repo", &config_a_desc.digest, config_a).await;
-    mount_blob_pull(&source_server, "repo", &config_b_desc.digest, config_b).await;
-
-    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_manifest_head_not_found(&target_server, "repo", "v2").await;
-    mount_blob_not_found(&target_server, "repo", &shared_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &config_a_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &config_b_desc.digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1").await;
-    mount_manifest_push(&target_server, "repo", "v2").await;
+    parts_a.mount_source(&source_server, "repo", "v1").await;
+    parts_b.mount_source(&source_server, "repo", "v2").await;
+    parts_a.mount_target(&target_server, "repo", "v1").await;
+    parts_b.mount_target(&target_server, "repo", "v2").await;
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
@@ -120,43 +90,15 @@ async fn sync_cross_repo_mount_concurrent() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"cfg-mount-concurrent";
-    let layer_data = b"layer-mount-concurrent";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"cfg-mount-concurrent")
+        .layer(b"layer-mount-concurrent")
+        .build();
 
     // Both repos share the same manifest/blobs at source.
-    mount_source_manifest(&source_server, "repo-a", "v1", &manifest_bytes).await;
-    mount_source_manifest(&source_server, "repo-b", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo-a", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo-a", &layer_desc.digest, layer_data).await;
-    mount_blob_pull(&source_server, "repo-b", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo-b", &layer_desc.digest, layer_data).await;
-
-    // Target: HEAD 404 for both repos (all blobs treated as absent).
-    mount_manifest_head_not_found(&target_server, "repo-a", "v1").await;
-    mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
-    mount_blob_not_found(&target_server, "repo-a", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo-a", &layer_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo-b", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo-b", &layer_desc.digest).await;
-
-    // Push endpoints for both repos.
-    mount_blob_push(&target_server, "repo-a").await;
-    mount_blob_push(&target_server, "repo-b").await;
-    mount_manifest_push(&target_server, "repo-a", "v1").await;
-    mount_manifest_push(&target_server, "repo-b", "v1").await;
+    parts.mount_source(&source_server, "repo-a", "v1").await;
+    parts.mount_source(&source_server, "repo-b", "v1").await;
+    parts.mount_target(&target_server, "repo-a", "v1").await;
+    parts.mount_target(&target_server, "repo-b", "v1").await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -211,43 +153,20 @@ async fn sync_index_manifest_child_pull_failure() {
     let target_server = MockServer::start().await;
 
     // Build two child image manifests (simulating amd64 and arm64).
-    let amd64_config_data = b"amd64-config-fail";
-    let amd64_layer_data = b"amd64-layer-fail";
-    let amd64_config_desc = blob_descriptor(amd64_config_data, MediaType::OciConfig);
-    let amd64_layer_desc = blob_descriptor(amd64_layer_data, MediaType::OciLayerGzip);
-    let amd64_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: amd64_config_desc.clone(),
-        layers: vec![amd64_layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (amd64_bytes, amd64_digest) = serialize_manifest(&amd64_manifest);
-
-    let arm64_config_data = b"arm64-config-fail";
-    let arm64_layer_data = b"arm64-layer-fail";
-    let arm64_config_desc = blob_descriptor(arm64_config_data, MediaType::OciConfig);
-    let arm64_layer_desc = blob_descriptor(arm64_layer_data, MediaType::OciLayerGzip);
-    let arm64_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: arm64_config_desc.clone(),
-        layers: vec![arm64_layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (_arm64_bytes, arm64_digest) = serialize_manifest(&arm64_manifest);
+    let amd64_parts = ManifestBuilder::new(b"amd64-config-fail")
+        .layer(b"amd64-layer-fail")
+        .build();
+    let arm64_parts = ManifestBuilder::new(b"arm64-config-fail")
+        .layer(b"arm64-layer-fail")
+        .build();
 
     // Build the index manifest referencing both children.
     let index = ImageIndex {
         schema_version: 2,
         media_type: None,
         manifests: vec![
-            make_descriptor(amd64_digest.clone(), MediaType::OciManifest),
-            make_descriptor(arm64_digest.clone(), MediaType::OciManifest),
+            make_descriptor(amd64_parts.digest.clone(), MediaType::OciManifest),
+            make_descriptor(arm64_parts.digest.clone(), MediaType::OciManifest),
         ],
         subject: None,
         artifact_type: None,
@@ -267,10 +186,10 @@ async fn sync_index_manifest_child_pull_failure() {
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", amd64_parts.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(amd64_bytes)
+                .set_body_bytes(amd64_parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .mount(&source_server)
@@ -278,7 +197,7 @@ async fn sync_index_manifest_child_pull_failure() {
 
     // arm64 child manifest pull returns 500 (server error).
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", arm64_parts.digest)))
         .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
         .mount(&source_server)
         .await;
@@ -306,11 +225,7 @@ async fn sync_index_manifest_child_pull_failure() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Failed { .. }),
-        "image should fail when a child manifest pull fails, got: {:?}",
-        report.images[0].status
-    );
+    assert_status!(report, 0, ImageStatus::Failed { .. });
     assert_eq!(report.stats.images_failed, 1);
     assert_eq!(report.exit_code(), 2);
 }
@@ -325,28 +240,15 @@ async fn sync_partial_blob_failure_stops_remaining() {
 
     let config_data = b"partial-config";
     let layer_data = b"partial-layer";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(config_data).layer(layer_data).build();
 
     // Source: serve manifest and both blobs.
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    parts.mount_source(&source_server, "repo", "v1").await;
 
     // Target: manifest HEAD 404, both blobs not found.
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
 
     // Config blob push succeeds (POST/PUT monolithic for small blobs).
     // Use query_param to match the config blob's finalization PUT.
@@ -361,7 +263,7 @@ async fn sync_partial_blob_failure_stops_remaining() {
         .await;
     Mock::given(method("PUT"))
         .and(path("/v2/repo/blobs/uploads/partial-id"))
-        .and(query_param("digest", config_desc.digest.to_string()))
+        .and(query_param("digest", parts.config_desc.digest.to_string()))
         .respond_with(ResponseTemplate::new(201))
         .mount(&target_server)
         .await;
@@ -397,11 +299,7 @@ async fn sync_partial_blob_failure_stops_remaining() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Failed { .. }),
-        "image should fail when a blob push fails, got: {:?}",
-        report.images[0].status
-    );
+    assert_status!(report, 0, ImageStatus::Failed { .. });
     if let ImageStatus::Failed { kind, .. } = &report.images[0].status {
         assert_eq!(kind.to_string(), "blob transfer");
     }
@@ -423,37 +321,17 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
 
     let config_data = b"dedup-config-concurrent";
     let layer_data = b"dedup-layer-concurrent";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
 
     // Two different manifests that share the same config and layer blobs.
-    let manifest_v1 = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let manifest_v2 = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (v1_bytes, _) = serialize_manifest(&manifest_v1);
-    let (v2_bytes, _) = serialize_manifest(&manifest_v2);
+    let parts_v1 = ManifestBuilder::new(config_data).layer(layer_data).build();
+    let parts_v2 = ManifestBuilder::new(config_data).layer(layer_data).build();
 
     // Source: serve each manifest with expect(1) to verify each pulled once.
     Mock::given(method("GET"))
         .and(path("/v2/repo/manifests/v1"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(v1_bytes)
+                .set_body_bytes(parts_v1.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
@@ -463,20 +341,32 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
         .and(path("/v2/repo/manifests/v2"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(v2_bytes)
+                .set_body_bytes(parts_v2.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer_desc.digest, layer_data).await;
+    mount_blob_pull(
+        &source_server,
+        "repo",
+        &parts_v1.config_desc.digest,
+        config_data,
+    )
+    .await;
+    mount_blob_pull(
+        &source_server,
+        "repo",
+        &parts_v1.layer_descs[0].digest,
+        layer_data,
+    )
+    .await;
 
     // Target: manifest HEAD 404 for both tags, blobs not found, push endpoints.
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
     mount_manifest_head_not_found(&target_server, "repo", "v2").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts_v1.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts_v1.layer_descs[0].digest).await;
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
@@ -552,37 +442,21 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"cfg-concurrent-mount";
-    let layer_data = b"layer-concurrent-mount";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"cfg-concurrent-mount")
+        .layer(b"layer-concurrent-mount")
+        .build();
 
     // Both source repos serve the same manifest and blobs (both fully pullable).
-    mount_source_manifest(&source_server, "src-a", "v1", &manifest_bytes).await;
-    mount_source_manifest(&source_server, "src-b", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "src-a", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "src-a", &layer_desc.digest, layer_data).await;
-    mount_blob_pull(&source_server, "src-b", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "src-b", &layer_desc.digest, layer_data).await;
+    parts.mount_source(&source_server, "src-a", "v1").await;
+    parts.mount_source(&source_server, "src-b", "v1").await;
 
     // Target: both repos need HEAD 404 and blobs-not-found.
     mount_manifest_head_not_found(&target_server, "tgt-a", "v1").await;
     mount_manifest_head_not_found(&target_server, "tgt-b", "v1").await;
-    mount_blob_not_found(&target_server, "tgt-a", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "tgt-a", &layer_desc.digest).await;
-    mount_blob_not_found(&target_server, "tgt-b", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "tgt-b", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt-a", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt-a", &parts.layer_descs[0].digest).await;
+    mount_blob_not_found(&target_server, "tgt-b", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt-b", &parts.layer_descs[0].digest).await;
 
     // tgt-a: accepts upload (POST + PATCH + PUT) and mount (POST with mount=).
     // Mount mocks use priority 1 so wiremock checks them before the generic
@@ -590,14 +464,17 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     mount_blob_push(&target_server, "tgt-a").await;
     Mock::given(method("POST"))
         .and(path("/v2/tgt-a/blobs/uploads/"))
-        .and(query_param("mount", config_desc.digest.to_string()))
+        .and(query_param("mount", parts.config_desc.digest.to_string()))
         .respond_with(ResponseTemplate::new(201))
         .with_priority(1)
         .mount(&target_server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v2/tgt-a/blobs/uploads/"))
-        .and(query_param("mount", layer_desc.digest.to_string()))
+        .and(query_param(
+            "mount",
+            parts.layer_descs[0].digest.to_string(),
+        ))
         .respond_with(ResponseTemplate::new(201))
         .with_priority(1)
         .mount(&target_server)
@@ -607,14 +484,17 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     mount_blob_push(&target_server, "tgt-b").await;
     Mock::given(method("POST"))
         .and(path("/v2/tgt-b/blobs/uploads/"))
-        .and(query_param("mount", config_desc.digest.to_string()))
+        .and(query_param("mount", parts.config_desc.digest.to_string()))
         .respond_with(ResponseTemplate::new(201))
         .with_priority(1)
         .mount(&target_server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v2/tgt-b/blobs/uploads/"))
-        .and(query_param("mount", layer_desc.digest.to_string()))
+        .and(query_param(
+            "mount",
+            parts.layer_descs[0].digest.to_string(),
+        ))
         .respond_with(ResponseTemplate::new(201))
         .with_priority(1)
         .mount(&target_server)
@@ -687,72 +567,39 @@ async fn sync_wave_promotion_three_images_shared_layer() {
 
     // Shared layer across all three images; config blobs are unique.
     let shared_data = b"shared-layer-wave-test";
-    let cfg_a_data = b"config-a-wave";
-    let cfg_b_data = b"config-b-wave";
-    let cfg_c_data = b"config-c-wave";
 
-    let shared_desc = blob_descriptor(shared_data, MediaType::OciLayerGzip);
-    let cfg_a_desc = blob_descriptor(cfg_a_data, MediaType::OciConfig);
-    let cfg_b_desc = blob_descriptor(cfg_b_data, MediaType::OciConfig);
-    let cfg_c_desc = blob_descriptor(cfg_c_data, MediaType::OciConfig);
-
-    let manifest_a = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: cfg_a_desc.clone(),
-        layers: vec![shared_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let manifest_b = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: cfg_b_desc.clone(),
-        layers: vec![shared_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let manifest_c = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: cfg_c_desc.clone(),
-        layers: vec![shared_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-
-    let (bytes_a, _) = serialize_manifest(&manifest_a);
-    let (bytes_b, _) = serialize_manifest(&manifest_b);
-    let (bytes_c, _) = serialize_manifest(&manifest_c);
+    let parts_a = ManifestBuilder::new(b"config-a-wave")
+        .layer(shared_data)
+        .build();
+    let parts_b = ManifestBuilder::new(b"config-b-wave")
+        .layer(shared_data)
+        .build();
+    let parts_c = ManifestBuilder::new(b"config-c-wave")
+        .layer(shared_data)
+        .build();
 
     // Source: all three repos serve their manifests and blobs.
-    mount_source_manifest(&source_server, "src-a", "v1", &bytes_a).await;
-    mount_source_manifest(&source_server, "src-b", "v1", &bytes_b).await;
-    mount_source_manifest(&source_server, "src-c", "v1", &bytes_c).await;
-    mount_blob_pull(&source_server, "src-a", &cfg_a_desc.digest, cfg_a_data).await;
-    mount_blob_pull(&source_server, "src-a", &shared_desc.digest, shared_data).await;
-    mount_blob_pull(&source_server, "src-b", &cfg_b_desc.digest, cfg_b_data).await;
-    mount_blob_pull(&source_server, "src-b", &shared_desc.digest, shared_data).await;
-    mount_blob_pull(&source_server, "src-c", &cfg_c_desc.digest, cfg_c_data).await;
-    mount_blob_pull(&source_server, "src-c", &shared_desc.digest, shared_data).await;
+    parts_a.mount_source(&source_server, "src-a", "v1").await;
+    parts_b.mount_source(&source_server, "src-b", "v1").await;
+    parts_c.mount_source(&source_server, "src-c", "v1").await;
 
     // Target: all repos get manifest HEAD 404, blob HEAD 404, upload + mount mocks.
     for repo in &["tgt-a", "tgt-b", "tgt-c"] {
         mount_manifest_head_not_found(&target_server, repo, "v1").await;
-        mount_blob_not_found(&target_server, repo, &cfg_a_desc.digest).await;
-        mount_blob_not_found(&target_server, repo, &cfg_b_desc.digest).await;
-        mount_blob_not_found(&target_server, repo, &cfg_c_desc.digest).await;
-        mount_blob_not_found(&target_server, repo, &shared_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_a.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_b.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_c.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_a.layer_descs[0].digest).await;
         mount_blob_push(&target_server, repo).await;
         mount_manifest_push(&target_server, repo, "v1").await;
 
         // Mount mock with higher priority so it matches before the upload POST.
         Mock::given(method("POST"))
             .and(path(format!("/v2/{repo}/blobs/uploads/")))
-            .and(query_param("mount", shared_desc.digest.to_string()))
+            .and(query_param(
+                "mount",
+                parts_a.layer_descs[0].digest.to_string(),
+            ))
             .respond_with(ResponseTemplate::new(201))
             .with_priority(1)
             .mount(&target_server)
@@ -897,11 +744,7 @@ async fn sync_blob_concurrency_processes_multiple_blobs() {
     let elapsed = start.elapsed();
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Synced),
-        "image should sync, got: {:?}",
-        report.images[0].status
-    );
+    assert_status!(report, 0, ImageStatus::Synced);
     assert_eq!(
         report.stats.blobs_transferred, 8,
         "all 8 blobs should be transferred"
@@ -927,43 +770,50 @@ async fn sync_blob_failure_cancels_remaining_blobs() {
     let layer2_data = b"cancel-layer-2-will-fail";
     let layer3_data = b"cancel-layer-3-never-reached";
 
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer1_desc = blob_descriptor(layer1_data, MediaType::OciLayerGzip);
-    let layer2_desc = blob_descriptor(layer2_data, MediaType::OciLayerGzip);
-    let layer3_desc = blob_descriptor(layer3_data, MediaType::OciLayerGzip);
-
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![
-            layer1_desc.clone(),
-            layer2_desc.clone(),
-            layer3_desc.clone(),
-        ],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(config_data)
+        .layer(layer1_data)
+        .layer(layer2_data)
+        .layer(layer3_data)
+        .build();
 
     // Source: manifest and blobs. Layer 2 always returns 500.
-    mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
-    mount_blob_pull(&source_server, "repo", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "repo", &layer1_desc.digest, layer1_data).await;
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
+    mount_blob_pull(
+        &source_server,
+        "repo",
+        &parts.config_desc.digest,
+        config_data,
+    )
+    .await;
+    mount_blob_pull(
+        &source_server,
+        "repo",
+        &parts.layer_descs[0].digest,
+        layer1_data,
+    )
+    .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", layer2_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[1].digest
+        )))
         .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
         .mount(&source_server)
         .await;
-    mount_blob_pull(&source_server, "repo", &layer3_desc.digest, layer3_data).await;
+    mount_blob_pull(
+        &source_server,
+        "repo",
+        &parts.layer_descs[2].digest,
+        layer3_data,
+    )
+    .await;
 
     // Target: manifest HEAD 404, all blob HEADs 404, push accepts.
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer1_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer2_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &layer3_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[1].digest).await;
+    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[2].digest).await;
     mount_blob_push(&target_server, "repo").await;
 
     let mapping = resolved_mapping(
@@ -986,11 +836,7 @@ async fn sync_blob_failure_cancels_remaining_blobs() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Failed { .. }),
-        "image should fail when a blob source returns 500, got: {:?}",
-        report.images[0].status
-    );
+    assert_status!(report, 0, ImageStatus::Failed { .. });
     // Not all blobs completed (the cancel flag stops remaining).
     assert!(
         report.images[0].blob_stats.transferred < 4,
@@ -1011,54 +857,30 @@ async fn sync_staging_concurrent_write_no_collision() {
 
     // Shared blob across both images.
     let shared_data = b"shared-staging-collision-test";
-    let shared_desc = blob_descriptor(shared_data, MediaType::OciLayerGzip);
 
     // Unique config blobs per image.
-    let cfg_a_data = b"staging-cfg-a";
-    let cfg_b_data = b"staging-cfg-b";
-    let cfg_a_desc = blob_descriptor(cfg_a_data, MediaType::OciConfig);
-    let cfg_b_desc = blob_descriptor(cfg_b_data, MediaType::OciConfig);
-
-    let manifest_a = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: cfg_a_desc.clone(),
-        layers: vec![shared_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let manifest_b = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: cfg_b_desc.clone(),
-        layers: vec![shared_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (bytes_a, _) = serialize_manifest(&manifest_a);
-    let (bytes_b, _) = serialize_manifest(&manifest_b);
+    let parts_a = ManifestBuilder::new(b"staging-cfg-a")
+        .layer(shared_data)
+        .build();
+    let parts_b = ManifestBuilder::new(b"staging-cfg-b")
+        .layer(shared_data)
+        .build();
 
     // Source: both repos serve their manifests and all blobs.
-    mount_source_manifest(&source_server, "src-a", "v1", &bytes_a).await;
-    mount_source_manifest(&source_server, "src-b", "v1", &bytes_b).await;
-    mount_blob_pull(&source_server, "src-a", &cfg_a_desc.digest, cfg_a_data).await;
-    mount_blob_pull(&source_server, "src-a", &shared_desc.digest, shared_data).await;
-    mount_blob_pull(&source_server, "src-b", &cfg_b_desc.digest, cfg_b_data).await;
-    mount_blob_pull(&source_server, "src-b", &shared_desc.digest, shared_data).await;
+    parts_a.mount_source(&source_server, "src-a", "v1").await;
+    parts_b.mount_source(&source_server, "src-b", "v1").await;
 
     // Target A: manifest HEAD 404, blobs 404, push accepts.
     mount_manifest_head_not_found(&target_a, "tgt-a", "v1").await;
-    mount_blob_not_found(&target_a, "tgt-a", &cfg_a_desc.digest).await;
-    mount_blob_not_found(&target_a, "tgt-a", &shared_desc.digest).await;
+    mount_blob_not_found(&target_a, "tgt-a", &parts_a.config_desc.digest).await;
+    mount_blob_not_found(&target_a, "tgt-a", &parts_a.layer_descs[0].digest).await;
     mount_blob_push(&target_a, "tgt-a").await;
     mount_manifest_push(&target_a, "tgt-a", "v1").await;
 
     // Target B: manifest HEAD 404, blobs 404, push accepts.
     mount_manifest_head_not_found(&target_b, "tgt-b", "v1").await;
-    mount_blob_not_found(&target_b, "tgt-b", &cfg_b_desc.digest).await;
-    mount_blob_not_found(&target_b, "tgt-b", &shared_desc.digest).await;
+    mount_blob_not_found(&target_b, "tgt-b", &parts_b.config_desc.digest).await;
+    mount_blob_not_found(&target_b, "tgt-b", &parts_b.layer_descs[0].digest).await;
     mount_blob_push(&target_b, "tgt-b").await;
     mount_manifest_push(&target_b, "tgt-b", "v1").await;
 
@@ -1121,43 +943,38 @@ async fn sync_source_pull_dedup_with_staging() {
 
     // Shared layer across both images; config blobs are unique.
     let shared_data = b"shared-source-dedup-layer";
-    let cfg_a_data = b"dedup-cfg-a";
-    let cfg_b_data = b"dedup-cfg-b";
 
-    let shared_desc = blob_descriptor(shared_data, MediaType::OciLayerGzip);
-    let cfg_a_desc = blob_descriptor(cfg_a_data, MediaType::OciConfig);
-    let cfg_b_desc = blob_descriptor(cfg_b_data, MediaType::OciConfig);
-
-    let manifest_a = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: cfg_a_desc.clone(),
-        layers: vec![shared_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let manifest_b = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: cfg_b_desc.clone(),
-        layers: vec![shared_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (bytes_a, _) = serialize_manifest(&manifest_a);
-    let (bytes_b, _) = serialize_manifest(&manifest_b);
+    let parts_a = ManifestBuilder::new(b"dedup-cfg-a")
+        .layer(shared_data)
+        .build();
+    let parts_b = ManifestBuilder::new(b"dedup-cfg-b")
+        .layer(shared_data)
+        .build();
 
     // Source: both repos serve their manifests and all blobs.
-    mount_source_manifest(&source_server, "src-a", "v1", &bytes_a).await;
-    mount_source_manifest(&source_server, "src-b", "v1", &bytes_b).await;
-    mount_blob_pull(&source_server, "src-a", &cfg_a_desc.digest, cfg_a_data).await;
-    mount_blob_pull(&source_server, "src-b", &cfg_b_desc.digest, cfg_b_data).await;
-    // Shared blob: served by both repos, but `.expect(1)` on each to verify
+    mount_source_manifest(&source_server, "src-a", "v1", &parts_a.bytes).await;
+    mount_source_manifest(&source_server, "src-b", "v1", &parts_b.bytes).await;
+    mount_blob_pull(
+        &source_server,
+        "src-a",
+        &parts_a.config_desc.digest,
+        b"dedup-cfg-a",
+    )
+    .await;
+    mount_blob_pull(
+        &source_server,
+        "src-b",
+        &parts_b.config_desc.digest,
+        b"dedup-cfg-b",
+    )
+    .await;
+    // Shared blob: served by both repos, but `.expect(0..=1)` on each to verify
     // that the source-pull dedup prevents a second GET.
     let shared_pull_a = Mock::given(method("GET"))
-        .and(path(format!("/v2/src-a/blobs/{}", shared_desc.digest)))
+        .and(path(format!(
+            "/v2/src-a/blobs/{}",
+            parts_a.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(shared_data.to_vec())
@@ -1168,7 +985,10 @@ async fn sync_source_pull_dedup_with_staging() {
         .mount_as_scoped(&source_server)
         .await;
     let shared_pull_b = Mock::given(method("GET"))
-        .and(path(format!("/v2/src-b/blobs/{}", shared_desc.digest)))
+        .and(path(format!(
+            "/v2/src-b/blobs/{}",
+            parts_b.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(shared_data.to_vec())
@@ -1182,9 +1002,9 @@ async fn sync_source_pull_dedup_with_staging() {
     // Target: manifest HEAD 404, blobs 404, push accepts.
     for repo in &["tgt-a", "tgt-b"] {
         mount_manifest_head_not_found(&target_server, repo, "v1").await;
-        mount_blob_not_found(&target_server, repo, &cfg_a_desc.digest).await;
-        mount_blob_not_found(&target_server, repo, &cfg_b_desc.digest).await;
-        mount_blob_not_found(&target_server, repo, &shared_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_a.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_b.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_a.layer_descs[0].digest).await;
         mount_blob_push(&target_server, repo).await;
         mount_manifest_push(&target_server, repo, "v1").await;
     }
@@ -1241,7 +1061,7 @@ async fn sync_source_pull_dedup_with_staging() {
     // Key assertion: the shared blob was pulled from source exactly once
     // across both repos. Without dedup this would be 2 (one per image).
     let received = source_server.received_requests().await.unwrap();
-    let shared_blob_suffix = format!("/blobs/{}", shared_desc.digest);
+    let shared_blob_suffix = format!("/blobs/{}", parts_a.layer_descs[0].digest);
     let source_gets_for_shared = received
         .iter()
         .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with(&shared_blob_suffix))
@@ -1305,11 +1125,7 @@ async fn sync_image_with_more_layers_than_blob_concurrency_limit() {
         .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Synced),
-        "image with 10 layers must sync: {:?}",
-        report.images[0].status
-    );
+    assert_status!(report, 0, ImageStatus::Synced);
     // 11 blobs total: 1 config + 10 layers.
     assert_eq!(report.images[0].blob_stats.transferred, 11);
     assert_eq!(report.stats.blobs_transferred, 11);
