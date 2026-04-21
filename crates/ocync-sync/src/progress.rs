@@ -48,6 +48,7 @@ mod tests {
             bytes_transferred: 1024,
             blob_stats: crate::BlobTransferStats::default(),
             duration: Duration::from_secs(1),
+            artifacts_skipped: false,
         };
         p.image_completed(&result);
 

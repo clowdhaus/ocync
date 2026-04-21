@@ -196,6 +196,10 @@ async fn artifact_require_artifacts_does_not_fire_on_api_error() {
     // confirmation of zero referrers.
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
+    assert!(
+        report.images[0].artifacts_skipped,
+        "artifacts_skipped must be true when referrers API returns transient error"
+    );
 }
 
 /// When the referrers API returns 404 but the tag fallback has an artifact,
@@ -536,6 +540,101 @@ async fn artifact_blob_dedup_skips_existing() {
         sig_blob_pulls.len(),
         0,
         "artifact blobs already at target must not be pulled from source"
+    );
+}
+
+/// When the referrers API returns a transient error (500) and
+/// `require_artifacts = false`, the image should be `Synced` with
+/// `artifacts_skipped = true`.
+///
+/// Negative assertion: if `artifacts_skipped` were false, the user would
+/// see no indication that artifact transfer was skipped.
+#[tokio::test]
+async fn artifact_transient_error_sets_artifacts_skipped() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parent = ManifestBuilder::new(b"skip-cfg")
+        .layer(b"skip-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
+
+    // Referrers API returns 500 (transient error).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/referrers/{}", parent.digest)))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&source_server)
+        .await;
+
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
+
+    let mapping = ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts {
+            enabled: true,
+            require_artifacts: false,
+            ..ResolvedArtifacts::default()
+        }),
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
+            "repo",
+            vec![TagPair::same("v1.0.0")],
+        )
+    };
+
+    let report = run_sync(vec![mapping]).await;
+
+    assert_eq!(report.images.len(), 1);
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert!(
+        report.images[0].artifacts_skipped,
+        "artifacts_skipped must be true when referrers API returns transient error"
+    );
+    assert_eq!(
+        report.stats.artifacts_skipped, 1,
+        "aggregate artifacts_skipped count must be incremented"
+    );
+}
+
+/// When artifact discovery succeeds with zero referrers (empty index),
+/// `artifacts_skipped` must remain false -- only transient errors set it.
+#[tokio::test]
+async fn artifact_empty_referrers_does_not_set_artifacts_skipped() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parent = ManifestBuilder::new(b"noskip-cfg")
+        .layer(b"noskip-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
+
+    // Referrers API returns empty index (success, zero referrers).
+    let referrers = ReferrersIndexBuilder::new().build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
+
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
+
+    let mapping = ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts::default()),
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
+            "repo",
+            vec![TagPair::same("v1.0.0")],
+        )
+    };
+
+    let report = run_sync(vec![mapping]).await;
+
+    assert_eq!(report.images.len(), 1);
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert!(
+        !report.images[0].artifacts_skipped,
+        "artifacts_skipped must be false when discovery confirms zero referrers"
+    );
+    assert_eq!(
+        report.stats.artifacts_skipped, 0,
+        "aggregate artifacts_skipped must remain zero"
     );
 }
 
