@@ -29,9 +29,9 @@ use uuid::Uuid;
 pub use error::Error;
 pub use shutdown::ShutdownSignal;
 
-/// Serde helper: skip serializing when value is zero.
-fn is_zero(v: &u64) -> bool {
-    *v == 0
+/// Serde helper: skip serializing when value equals its type's default.
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// Result of a complete sync run. The engine never "fails" as a whole.
@@ -89,7 +89,7 @@ pub struct ImageResult {
     /// (signatures, SBOMs, attestations) may be missing at the target. Only
     /// `true` on the transient-error path -- when discovery confirms zero
     /// referrers, this remains `false`.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub artifacts_skipped: bool,
 }
 
@@ -221,7 +221,7 @@ pub struct SyncStats {
     pub immutable_tag_skips: u64,
     /// Images where artifact discovery or transfer was skipped due to a
     /// transient error (e.g. referrers API returned 500).
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub artifacts_skipped: u64,
 }
 
