@@ -144,7 +144,7 @@ pub(crate) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Er
 /// from the API response, falling back to 12 hours if not provided.
 ///
 /// Supports all AWS credential sources via the default credential chain:
-/// environment variables, shared config/credential files, SSO, IMDS/ECS
+/// environment variables, shared config/credential files, IMDS/ECS
 /// container credentials, IRSA (IAM Roles for Service Accounts), and
 /// EKS Pod Identity.
 pub struct EcrAuth {

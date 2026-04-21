@@ -1,16 +1,11 @@
 //! Verbosity-aware progress reporters for sync output.
 //!
-//! [`TextProgress`] writes plain status lines to stderr (non-TTY).
-//! [`TtyProgress`] shows `indicatif` spinners on stderr (TTY).
-//! Both write the run summary to stdout.
+//! [`TextProgress`] writes plain status lines to stderr (non-TTY and TTY
+//! alike). The run summary always goes to stdout.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::{self, Write};
 
-#[cfg(test)]
-use indicatif::ProgressDrawTarget;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use ocync_sync::progress::ProgressReporter;
 use ocync_sync::{ImageResult, ImageStatus, SyncReport};
 
@@ -163,93 +158,9 @@ impl TextProgress {
     }
 }
 
-/// TTY progress reporter using `indicatif` spinners.
-///
-/// Shows a spinner per in-flight image on stderr. When an image completes,
-/// the spinner is replaced with a final status line (failures always shown,
-/// synced/skipped shown at verbosity >= 1, silently cleared at verbosity 0).
-///
-/// Falls back to [`TextProgress`] when stderr is not a terminal - the
-/// selection is made in `main.rs`, not here.
-pub(crate) struct TtyProgress {
-    multi: MultiProgress,
-    spinners: RefCell<HashMap<(String, String), ProgressBar>>,
-    style: ProgressStyle,
-    verbosity: u8,
-    suppress_summary: bool,
-    stdout: RefCell<Box<dyn Write>>,
-}
-
-impl TtyProgress {
-    /// Create a new TTY progress reporter writing spinners to stderr
-    /// and the run summary to stdout.
-    pub(crate) fn new(verbosity: u8, suppress_summary: bool) -> Self {
-        Self {
-            multi: MultiProgress::new(),
-            spinners: RefCell::new(HashMap::new()),
-            style: Self::spinner_style(),
-            verbosity,
-            suppress_summary,
-            stdout: RefCell::new(Box::new(io::stdout())),
-        }
-    }
-
-    /// Create a TTY progress reporter with a hidden draw target and
-    /// custom stdout writer (for testing).
-    #[cfg(test)]
-    fn with_writers(verbosity: u8, suppress_summary: bool, stdout: Box<dyn Write>) -> Self {
-        Self {
-            multi: MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
-            spinners: RefCell::new(HashMap::new()),
-            style: Self::spinner_style(),
-            verbosity,
-            suppress_summary,
-            stdout: RefCell::new(stdout),
-        }
-    }
-
-    /// Spinner style shared by all spinners.
-    fn spinner_style() -> ProgressStyle {
-        ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("hardcoded template is valid")
-    }
-}
-
-impl ProgressReporter for TtyProgress {
-    fn image_started(&self, source: &str, target: &str) {
-        let pb = self.multi.add(ProgressBar::new_spinner());
-        pb.set_style(self.style.clone());
-        pb.set_message(format!("syncing {source} -> {target}"));
-        self.spinners
-            .borrow_mut()
-            .insert((source.to_owned(), target.to_owned()), pb);
-    }
-
-    fn image_completed(&self, result: &ImageResult) {
-        let key = (result.source.clone(), result.target.clone());
-        let mut spinners = self.spinners.borrow_mut();
-        let Some(pb) = spinners.remove(&key) else {
-            tracing::warn!(
-                source = %result.source,
-                target = %result.target,
-                "image_completed called without matching image_started"
-            );
-            return;
-        };
-
-        match format_image_line(result, self.verbosity) {
-            Some(line) => pb.finish_with_message(line),
-            None => pb.finish_and_clear(),
-        }
-    }
-
-    fn run_completed(&self, report: &SyncReport) {
-        write_run_summary(&self.stdout, report, self.suppress_summary);
-    }
-}
-
 impl ProgressReporter for TextProgress {
     fn image_started(&self, _source: &str, _target: &str) {
-        // No-op for text output - only progress bar implementations need this.
+        // No-op for text output.
     }
 
     fn image_completed(&self, result: &ImageResult) {
@@ -934,152 +845,4 @@ mod tests {
             "suppress_summary should suppress stdout"
         );
     }
-
-    // - TtyProgress tests (wiring: spinner lifecycle and summary output) --
-
-    fn test_tty_progress(verbosity: u8) -> (TtyProgress, Buf) {
-        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
-        let progress =
-            TtyProgress::with_writers(verbosity, false, Box::new(RcWriter(Rc::clone(&stdout_buf))));
-        (progress, stdout_buf)
-    }
-
-    #[test]
-    fn tty_started_creates_entry() {
-        let (progress, _stdout) = test_tty_progress(0);
-        progress.image_started("source/repo:v1", "target/repo:v1");
-        assert_eq!(progress.spinners.borrow().len(), 1);
-    }
-
-    #[test]
-    fn tty_started_multiple_creates_multiple() {
-        let (progress, _stdout) = test_tty_progress(0);
-        progress.image_started("source/a:v1", "target/a:v1");
-        progress.image_started("source/b:v1", "target/b:v1");
-        assert_eq!(progress.spinners.borrow().len(), 2);
-    }
-
-    #[test]
-    fn tty_completed_removes_entry() {
-        let (progress, _stdout) = test_tty_progress(0);
-        progress.image_started("source/repo:v1", "target/repo:v1");
-        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
-        assert!(progress.spinners.borrow().is_empty());
-    }
-
-    #[test]
-    fn tty_completed_failed_removes_entry() {
-        let (progress, _stdout) = test_tty_progress(0);
-        progress.image_started("source/repo:v1", "target/repo:v1");
-        progress.image_completed(&make_result(
-            ImageStatus::Failed {
-                kind: ErrorKind::ManifestPush,
-                error: "timeout".into(),
-                retries: 2,
-                status_code: None,
-            },
-            0,
-        ));
-        assert!(progress.spinners.borrow().is_empty());
-    }
-
-    #[test]
-    fn tty_completed_without_started_does_not_panic() {
-        let (progress, _stdout) = test_tty_progress(0);
-        // No image_started - should warn and return, not panic.
-        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
-        assert!(progress.spinners.borrow().is_empty());
-    }
-
-    #[test]
-    fn tty_multiple_images_all_cleaned_up() {
-        let (progress, _stdout) = test_tty_progress(1);
-        progress.image_started("source/a:v1", "target/a:v1");
-        progress.image_started("source/b:v1", "target/b:v1");
-
-        let mut r1 = make_result(ImageStatus::Synced, 1024);
-        r1.source = "source/a:v1".into();
-        r1.target = "target/a:v1".into();
-        progress.image_completed(&r1);
-
-        let mut r2 = make_result(
-            ImageStatus::Skipped {
-                reason: SkipReason::DigestMatch,
-            },
-            0,
-        );
-        r2.source = "source/b:v1".into();
-        r2.target = "target/b:v1".into();
-        progress.image_completed(&r2);
-
-        assert!(progress.spinners.borrow().is_empty());
-    }
-
-    #[test]
-    fn tty_run_completed_writes_summary_to_stdout() {
-        let (progress, stdout) = test_tty_progress(0);
-        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
-        progress.run_completed(&report);
-        let output = String::from_utf8(stdout.borrow().clone()).unwrap();
-        assert!(
-            output.starts_with("sync complete:"),
-            "summary should go to stdout, got: {output}"
-        );
-    }
-
-    #[test]
-    fn tty_suppress_summary_produces_no_stdout() {
-        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
-        let progress =
-            TtyProgress::with_writers(0, true, Box::new(RcWriter(Rc::clone(&stdout_buf))));
-        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
-        progress.run_completed(&report);
-        assert!(
-            stdout_buf.borrow().is_empty(),
-            "suppress_summary should suppress stdout"
-        );
-    }
-
-    #[test]
-    fn tty_suppress_summary_still_runs_spinners() {
-        // Spinner lifecycle must work even when summary is suppressed
-        // (e.g., --json mode). Spinners go to stderr, summary to stdout --
-        // suppressing stdout must not interfere with spinner create/remove.
-        let stdout_buf = Rc::new(RefCell::new(Vec::new()));
-        let progress =
-            TtyProgress::with_writers(0, true, Box::new(RcWriter(Rc::clone(&stdout_buf))));
-
-        progress.image_started("source/repo:v1", "target/repo:v1");
-        assert_eq!(progress.spinners.borrow().len(), 1);
-
-        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
-        assert!(progress.spinners.borrow().is_empty());
-
-        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
-        progress.run_completed(&report);
-        assert!(
-            stdout_buf.borrow().is_empty(),
-            "suppress_summary should suppress stdout"
-        );
-    }
-
-    #[test]
-    fn tty_started_same_image_twice_overwrites() {
-        // If image_started is called twice for the same (source, target),
-        // the second spinner replaces the first. The map should still have
-        // exactly one entry, and image_completed should clean it up.
-        let (progress, _stdout) = test_tty_progress(0);
-        progress.image_started("source/repo:v1", "target/repo:v1");
-        progress.image_started("source/repo:v1", "target/repo:v1");
-        assert_eq!(progress.spinners.borrow().len(), 1);
-
-        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
-        assert!(progress.spinners.borrow().is_empty());
-    }
-
-    // Note: spinner message content (the transient "syncing ..." text shown
-    // during in-flight transfers) cannot be asserted because indicatif's
-    // ProgressDrawTarget::hidden() swallows all rendering. The final message
-    // on completion uses format_image_line(), which IS thoroughly tested above.
-    // Only the cosmetic in-flight prefix is untested.
 }
