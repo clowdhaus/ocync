@@ -383,20 +383,22 @@ No existing OCI transfer tool implements the combination of pipelining, adaptive
 | regclient | In-memory blob descriptor cache, manifest rewriting, streaming body handling | Validates streaming manifest modification and in-session dedup. POST + PUT upload strategy (2 requests/blob) matches our approach |
 | distribution/distribution | Proxy mode with conditional GET (`If-None-Match`) | Validates the conditional-fetch pattern, analogous to our source HEAD for discovery cache population |
 
-## Future directions
+### DAG scheduler
 
-> **Status: Planned.** The DAG scheduler and `SyncEngine` trait described below are future directions, not current architecture.
+Rejected. A dependency-graph scheduler where every unit of work (check blob, transfer blob, push manifest) is a DAG node with edges, replacing the `select!` loop with a topological scheduler. Analyzed by 10 independent review agents (2026-04-21); unanimous rejection.
 
-### DAG scheduler evolution
+The engine's core optimization -- progressive cache population -- is a runtime side effect of interleaved execution (early transfers teach the cache, later images mount instead of transferring, saving ~280 API calls in benchmarks). This cannot be expressed as static DAG edges. A scheduler either degenerates to runtime checks inside nodes (identical to the current code) or requires runtime graph mutation (the hardest DAG operation, with deadlock and corruption risks).
 
-The pipeline is the pragmatic v1 architecture. The natural evolution is a dependency-graph scheduler where every unit of work (check blob, transfer blob, push manifest) is a node with dependency edges, and a global scheduler handles ordering, concurrency, and priority. Optimizations like pipelining, frequency ordering, dedup, and work-stealing become emergent properties of the scheduler rather than bolt-on features.
+Leader-follower wave barriers ("all leaders' manifests committed before any follower mounts") require barrier semantics that standard topological sort does not model. Every Rust scheduler crate (`dagx`, `dagrs`, `async_dag`, `fn_graph`) requires `Send`, incompatible with `Rc<RefCell<>>` on `current_thread`. Priority inversion (scheduler picks manifest-push nodes before blobs complete) can deadlock under load. Estimated LOC: 300-900 lines of scheduler infrastructure replacing ~454 lines of loop code, for a net-zero or net-negative reduction.
 
-The `SyncEngine` trait is structured so the pipeline can be replaced with a DAG scheduler in a future version without changing the `RegistryClient` layer or CLI. The current `VecDeque<TransferTask>` pending queue, `FuturesUnordered` pools, and `select!` loop map naturally to the DAG scheduler's internal state, and the refactor would add edges and topological ordering without changing the external contract.
+The `select!` loop is 210 lines with 5 branches -- below average for its responsibility surface. The `DiscoveryCounters` extraction (2026-04-21) addressed the "unwieldy" concern by grouping counter state and centralizing the route match, without architectural change.
 
-### io-uring via tokio-uring
+### io_uring for disk staging
 
-The disk staging and blob transfer paths will migrate to `tokio-uring` for native async I/O on Linux. This replaces `spawn_blocking`-based file operations with io_uring submission queue entries and enables kernel-level splice/zero-copy paths (socket -> file -> socket without userspace buffer copies).
+Rejected. Migrating disk staging to `io_uring` via the low-level `io-uring` crate (0.7.12) for batched writes, linked operations (fsync+close+rename), concurrent fsyncs, and splice zero-copy. Benchmarked on EC2 m5.xlarge with baseline gp3 (3,000 IOPS, 125 MB/s, ~1.9ms fsync latency), kernel 6.12 (2026-04-21).
 
-Architectural compatibility with the current design is strong: `tokio-uring` runs on `current_thread` (same runtime model, `Rc<RefCell<>>` works unchanged), owned buffers are already the pattern in async move blocks (io_uring requires owned buffers for registered I/O), and the `RegistryClient` HTTP layer (reqwest) stays on standard tokio I/O initially. io_uring benefits apply to disk staging first.
+Page-cached reads (the staging read path) run at 5+ GB/s via `std::fs`. io_uring adds SQE/CQE overhead for zero benefit on data already in RAM. For writes with fsync, the bottleneck is EBS IOPS (fixed at 3,000 baseline), not syscall overhead. Submitting fsyncs via `io_uring_enter` vs `sync_all()` produces identical latency (~1.9ms) because the storage device does the same work either way.
 
-The v1 design avoids choices that prevent io-uring adoption: no `Arc<Mutex<>>` on I/O buffers, no assumptions about `spawn_blocking` availability in hot paths. The disk staging interface abstracts over the I/O backend so the swap is mechanical. macOS development uses standard tokio file I/O as a fallback via compile-time feature gate.
+Concurrent-fsync io_uring (all fds open, all fsyncs submitted simultaneously) showed a 15% improvement for 20-blob workloads but degraded at 80 blobs due to memory pressure from holding many fds open. At the Jupyter corpus scale (80 blobs, 400MB), performance was identical to `std::fs`. The network bottleneck (ECR at 24-28 MB/s) is 150x slower than page cache reads -- disk I/O is never the constraint.
+
+Additional factors: `tokio-uring` is unmaintained (last release May 2024). Container seccomp profiles in both Docker and containerd block `io_uring_setup`/`io_uring_enter` by default for security reasons (container breakout exploits); K8s pods would require custom seccomp profiles. The `io-uring` crate adds only 3 transitive dependencies and integrates cleanly via eventfd + `AsyncFd`, but the performance data does not justify the complexity.
