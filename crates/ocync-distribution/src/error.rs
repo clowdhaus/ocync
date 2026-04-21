@@ -306,7 +306,7 @@ mod tests {
             },
             Error::Io {
                 context: "test",
-                source: std::io::Error::new(std::io::ErrorKind::Other, "disk full"),
+                source: std::io::Error::other("disk full"),
             },
         ];
         for err in &variants {
@@ -382,19 +382,59 @@ mod tests {
 
     #[test]
     fn is_auth_error_false_for_non_auth_variants() {
+        // Exhaustive: every variant except AuthFailed and RegistryError
+        // (which return true). Compile error if a new variant is added
+        // without being included here.
         let variants: Vec<Error> = vec![
-            Error::RegistryProtocol {
-                reason: "bad".into(),
+            Error::InvalidReference {
+                input: "bad".into(),
+                reason: "reason".into(),
             },
-            Error::EcrApi {
-                reason: "throttled".into(),
+            Error::InvalidDigest {
+                digest: "bad".into(),
+                reason: "reason".into(),
             },
-            Error::CredentialConfig {
-                reason: "missing".into(),
+            Error::InvalidPlatformFilter {
+                input: "bad".into(),
+                reason: "reason".into(),
+            },
+            Error::UnsupportedMediaType {
+                media_type: "text/plain".into(),
+            },
+            Error::InvalidManifest {
+                reason: "bad schema".into(),
+            },
+            Error::CredentialHelperFailed {
+                helper: "docker-credential-ecr-login".into(),
+                reason: "not found".into(),
+            },
+            Error::UrlConstruction {
+                path: "/v2/".into(),
+                reason: "no base".into(),
+            },
+            Error::UploadProtocol {
+                reason: "missing header".into(),
             },
             Error::DigestMismatch {
                 expected: test_digest(1),
                 actual: test_digest(2),
+            },
+            Error::RegistryProtocol {
+                reason: "bad response".into(),
+            },
+            Error::EcrApi {
+                reason: "throttled".into(),
+            },
+            Error::InvalidHeaderValue {
+                header: "Content-Type".into(),
+                reason: "bad chars".into(),
+            },
+            Error::CredentialConfig {
+                reason: "missing".into(),
+            },
+            Error::Io {
+                context: "test",
+                source: std::io::Error::other("disk full"),
             },
         ];
         for err in &variants {

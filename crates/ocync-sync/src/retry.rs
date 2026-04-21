@@ -246,7 +246,7 @@ mod tests {
     fn should_retry_transport_on_io() {
         let err = ocync_distribution::Error::Io {
             context: "staging read",
-            source: std::io::Error::new(std::io::ErrorKind::Other, "staging read failed"),
+            source: std::io::Error::other("staging read failed"),
         };
         assert!(!should_retry_transport(&err));
     }
