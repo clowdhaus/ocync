@@ -451,6 +451,38 @@ The schema is generated from the Rust config types and verified in CI to stay in
     }
   },
   "definitions": {
+    "ArtifactsConfig": {
+      "description": "Configuration for OCI artifact (signatures, SBOMs, attestations) sync.\n\nControls whether referrers are discovered and transferred alongside their parent image manifests.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether artifact sync is enabled (default: true).",
+          "default": true,
+          "type": "boolean"
+        },
+        "exclude": {
+          "description": "Exclude artifacts whose artifact type matches one of these MIME types.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "include": {
+          "description": "Only sync artifacts whose artifact type matches one of these MIME types.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "require_artifacts": {
+          "description": "When true, every synced image must have at least one referrer. Images without referrers cause a sync failure instead of silently producing unsigned images at the target.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
     "AuthType": {
       "description": "Authentication method for a registry.",
       "oneOf": [
@@ -534,6 +566,18 @@ The schema is generated from the Rust config types and verified in CI to stay in
       "description": "Default values inherited by all mappings unless individually overridden.",
       "type": "object",
       "properties": {
+        "artifacts": {
+          "description": "Artifact sync configuration applied to all mappings unless overridden.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ArtifactsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "platforms": {
           "description": "Platform filter applied to all mappings unless overridden.\n\nEach entry must be `os/arch` or `os/arch/variant` (e.g. `linux/amd64`, `linux/arm/v7`).",
           "default": null,
@@ -636,6 +680,18 @@ The schema is generated from the Rust config types and verified in CI to stay in
         "from"
       ],
       "properties": {
+        "artifacts": {
+          "description": "Artifact sync configuration for this mapping, overriding `defaults.artifacts`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ArtifactsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "from": {
           "description": "Source repository path (e.g. `library/nginx`).",
           "type": "string"

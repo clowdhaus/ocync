@@ -13,8 +13,8 @@ use ocync_distribution::{RegistryClient, RepositoryName};
 use ocync_sync::SyncReport;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{
-    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedMapping, SyncEngine, TagPair,
-    TargetEntry,
+    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedArtifacts, ResolvedMapping,
+    SyncEngine, TagPair, TargetEntry,
 };
 use ocync_sync::filter::{FilterConfig, build_glob_set};
 use ocync_sync::retry::RetryConfig;
@@ -406,6 +406,21 @@ pub(crate) async fn resolve_mapping(
         None
     };
 
+    // Resolve artifacts config (mapping overrides defaults).
+    let artifacts = match mapping
+        .artifacts
+        .as_ref()
+        .or(config.defaults.as_ref().and_then(|d| d.artifacts.as_ref()))
+    {
+        Some(c) => ResolvedArtifacts {
+            enabled: c.enabled,
+            include: c.include.clone(),
+            exclude: c.exclude.clone(),
+            require_artifacts: c.require_artifacts,
+        },
+        None => ResolvedArtifacts::default(),
+    };
+
     Ok(Some(ResolvedMapping {
         source_authority,
         source_client,
@@ -416,6 +431,7 @@ pub(crate) async fn resolve_mapping(
         platforms,
         head_first,
         immutable_glob,
+        artifacts_config: Rc::new(artifacts),
     }))
 }
 

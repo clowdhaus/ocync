@@ -8,8 +8,8 @@ use std::sync::Arc;
 use ocync_distribution::RepositoryName;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{
-    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedMapping, SyncEngine, TagPair,
-    TargetEntry,
+    DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedArtifacts, ResolvedMapping,
+    SyncEngine, TagPair, TargetEntry,
 };
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
@@ -78,6 +78,10 @@ pub(crate) async fn run(
         platforms: None,
         head_first: false,
         immutable_glob: None,
+        artifacts_config: Rc::new(ResolvedArtifacts {
+            enabled: false,
+            ..ResolvedArtifacts::default()
+        }),
     };
 
     let engine = SyncEngine::new(RetryConfig::default(), DEFAULT_MAX_CONCURRENT_TRANSFERS);

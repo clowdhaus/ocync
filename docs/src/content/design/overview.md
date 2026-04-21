@@ -184,7 +184,7 @@ macOS and Windows builds use `--no-default-features --features non-fips` (standa
 
 ## OCI artifacts and referrers
 
-> **Status: Partially implemented.** The referrers API client (`RegistryClient::referrers()`) and OCI `subject` field types exist in the distribution crate. The artifact sync orchestration (discovery, transfer ordering, `require_artifacts`, and configuration) described below is planned.
+> **Status: Implemented.** The referrers API client, OCI `subject` field types, artifact config parsing (`ArtifactsConfig`), discovery with tag fallback, transfer ordering, include/exclude filtering, and `require_artifacts` enforcement are all implemented.
 
 OCI 1.1 introduced the referrers API for attaching artifacts (signatures, SBOMs, attestations) to container images. Each artifact manifest includes a `subject` field referencing the parent image digest. This creates a discoverable graph of metadata without polluting the tag namespace.
 

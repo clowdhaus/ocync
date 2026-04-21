@@ -40,6 +40,14 @@ impl Digest {
     pub fn hex(&self) -> &str {
         &self.raw[self.algo_len + 1..]
     }
+
+    /// Build the OCI tag fallback name for referrers discovery.
+    ///
+    /// Older registries that do not support the referrers API store artifact
+    /// references as tags named `{algorithm}-{hex}` (e.g. `sha256-abcd...`).
+    pub fn tag_fallback(&self) -> String {
+        format!("{}-{}", self.algorithm(), self.hex())
+    }
 }
 
 impl FromStr for Digest {
@@ -289,5 +297,16 @@ mod tests {
         let input = format!("Sha256:{hex}");
         let d: Digest = input.parse().unwrap();
         assert_eq!(d.algorithm(), "sha256");
+    }
+
+    #[test]
+    fn tag_fallback_replaces_colon_with_dash() {
+        let d: Digest = TEST_DIGEST.parse().unwrap();
+        let tag = d.tag_fallback();
+        assert_eq!(
+            tag,
+            "sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert!(!tag.contains(':'), "tag fallback must not contain ':'");
     }
 }
