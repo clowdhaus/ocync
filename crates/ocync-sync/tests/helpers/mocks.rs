@@ -150,3 +150,20 @@ pub async fn mount_manifest_push(server: &MockServer, repo: &str, reference: &st
         .mount(server)
         .await;
 }
+
+/// Mount a complete "fresh target" mock set: manifest HEAD 404, all blobs 404, push endpoints.
+///
+/// Use when you need custom source mocks but the target is standard (everything missing).
+pub async fn mount_target_fresh(
+    server: &MockServer,
+    repo: &str,
+    tag: &str,
+    blob_digests: &[&Digest],
+) {
+    mount_manifest_head_not_found(server, repo, tag).await;
+    for digest in blob_digests {
+        mount_blob_not_found(server, repo, digest).await;
+    }
+    mount_blob_push(server, repo).await;
+    mount_manifest_push(server, repo, tag).await;
+}
