@@ -184,8 +184,6 @@ macOS and Windows builds use `--no-default-features --features non-fips` (standa
 
 ## OCI artifacts and referrers
 
-> **Status: Implemented.** The referrers API client, OCI `subject` field types, artifact config parsing (`ArtifactsConfig`), discovery with tag fallback, transfer ordering, include/exclude filtering, and `require_artifacts` enforcement are all implemented.
-
 OCI 1.1 introduced the referrers API for attaching artifacts (signatures, SBOMs, attestations) to container images. Each artifact manifest includes a `subject` field referencing the parent image digest. This creates a discoverable graph of metadata without polluting the tag namespace.
 
 ### Discovery
@@ -245,32 +243,11 @@ This two-step fallback ensures artifact sync works across the widest range of re
 
 ## Manifest format preservation
 
-> **Status: Planned.** Manifest format configuration (`manifest_format` per-registry override, format conversion) is designed but not yet implemented. The engine currently preserves manifest bytes verbatim (the `preserve` default behavior).
+ocync preserves manifest bytes bit-for-bit. No conversion between Docker v2 and OCI formats is performed, and none is planned.
 
-### Problem
+Digest preservation is the foundation of the OCI content-addressable model. An image's digest is its identity. If a sync tool changes the digest, consumers cannot verify that the target image is byte-identical to the source. Signature verification breaks (signatures reference the original digest), and deployment pipelines that pin by digest pull a different image than intended.
 
-Pushing a Docker v2 Schema 2 manifest to a registry expecting OCI format (or vice versa) changes the digest. The manifest bytes are different, so the SHA-256 is different, so the content-addressable identity of the image changes. Some registries reject manifests with unexpected media types entirely. Existing tools handle this poorly: digests change silently or copies fail with opaque errors.
-
-Digest preservation matters because it is the foundation of the OCI content-addressable model. An image's digest is its identity. If a sync tool changes the digest, consumers cannot verify that the target image is byte-identical to the source. Signature verification breaks (signatures reference the original digest), and deployment pipelines that pin by digest pull a different image than intended.
-
-### Policy
-
-Default: **preserve the original format exactly.** The manifest bytes are transferred verbatim to maintain digest integrity.
-
-| Setting | Behavior |
-|---|---|
-| `preserve` (default) | Push manifest bytes as-is. Digest unchanged. |
-| `oci` | Convert Docker v2 Schema 2 to OCI Image Manifest before push. Digest WILL change. Log WARNING. |
-| `docker-v2` | Convert OCI to Docker v2 Schema 2 before push. Digest WILL change. Log WARNING. |
-
-Per-registry override is available for broken registries that require a specific format:
-
-```yaml
-registries:
-  legacy-harbor:
-    url: harbor.internal.io
-    manifest_format: oci
-```
+All production registries accept both Docker v2 and OCI manifests natively. Format conversion would break every digest-based optimization (skip detection, transfer state cache, immutable tag handling, head-first) with no real-world benefit.
 
 ### ECR immutable tag handling
 
@@ -302,8 +279,6 @@ The source image index is pulled in full, filtered to the requested platforms, a
 If a requested platform is not available in the source image index, `ocync` logs a WARNING and continues with the platforms that are available. A source image that offers `linux/amd64` but not `linux/arm64` will sync the amd64 platform and warn about the missing arm64 entry.
 
 If **zero** requested platforms match any manifest in the source index, `ocync` returns an error with actionable context: the configured platform filter, the platforms actually available in the source index, and the source reference. An empty filtered index is never pushed to targets because it would leave targets with an invalid manifest that appears synced but contains no usable platform entries. This surfaces platform configuration mismatches immediately rather than silently degrading into an unusable state.
-
-> **Status: Implemented.** Both tiers are implemented: `immutable_tags` pattern match (Tier 1, zero API calls) and default HEAD + digest compare (Tier 2).
 
 ## Skip optimization hierarchy
 
