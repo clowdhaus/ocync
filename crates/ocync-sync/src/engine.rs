@@ -1772,13 +1772,13 @@ async fn pull_source_manifest(
                         })
                         .collect();
                     let filter_strs: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
-                    return Err(crate::Error::Manifest {
+                    return Err(crate::Error::ManifestLogic {
                         reference: tag.to_owned(),
-                        source: ocync_distribution::Error::Other(format!(
+                        reason: format!(
                             "platform filter [{}] matched no manifests in index (source has: [{}])",
                             filter_strs.join(", "),
                             available.join(", "),
-                        )),
+                        ),
                     });
                 }
 
@@ -1813,11 +1813,9 @@ async fn pull_source_manifest(
                         children.push(child_pull);
                     }
                     ManifestKind::Index(_) => {
-                        return Err(crate::Error::Manifest {
+                        return Err(crate::Error::ManifestLogic {
                             reference: child_digest_str,
-                            source: ocync_distribution::Error::Other(
-                                "nested index manifests are not supported".into(),
-                            ),
+                            reason: "nested index manifests are not supported".into(),
                         });
                     }
                 }
@@ -1835,13 +1833,12 @@ async fn pull_source_manifest(
                     artifact_type: index.artifact_type.clone(),
                     annotations: index.annotations.clone(),
                 };
-                let new_bytes =
-                    serde_json::to_vec(&filtered_index).map_err(|e| crate::Error::Manifest {
+                let new_bytes = serde_json::to_vec(&filtered_index).map_err(|e| {
+                    crate::Error::ManifestLogic {
                         reference: tag.to_owned(),
-                        source: ocync_distribution::Error::Other(format!(
-                            "failed to serialize filtered index: {e}"
-                        )),
-                    })?;
+                        reason: format!("failed to serialize filtered index: {e}"),
+                    }
+                })?;
                 let new_digest = Digest::from_sha256(Sha256::digest(&new_bytes));
                 let filtered_pull = ManifestPull {
                     manifest: ManifestKind::Index(Box::new(filtered_index)),
@@ -2164,19 +2161,25 @@ async fn transfer_single_blob(
                 crate::staging::StagePullAction::Pull => {
                     if let Err(e) = with_retry(ctx.retry, "blob pull (to stage)", || async {
                         let mut writer = ctx.staging.begin_write(digest).map_err(|e| {
-                            ocync_distribution::Error::Other(format!("staging create: {e}"))
+                            ocync_distribution::Error::Io {
+                                context: "staging create",
+                                source: e,
+                            }
                         })?;
                         let stream = ctx.source_client.blob_pull(ctx.source_repo, digest).await?;
                         futures_util::pin_mut!(stream);
                         while let Some(chunk) = stream.next().await {
-                            let chunk = chunk
-                                .map_err(|e| ocync_distribution::Error::Other(e.to_string()))?;
+                            let chunk = chunk?;
                             writer.write_chunk(&chunk).map_err(|e| {
-                                ocync_distribution::Error::Other(format!("staging write: {e}"))
+                                ocync_distribution::Error::Io {
+                                    context: "staging write",
+                                    source: e,
+                                }
                             })?;
                         }
-                        writer.finish().map_err(|e| {
-                            ocync_distribution::Error::Other(format!("staging finalize: {e}"))
+                        writer.finish().map_err(|e| ocync_distribution::Error::Io {
+                            context: "staging finalize",
+                            source: e,
                         })?;
                         Ok::<(), ocync_distribution::Error>(())
                     })
@@ -2204,13 +2207,19 @@ async fn transfer_single_blob(
         }
 
         with_retry(ctx.retry, "blob push (staged)", || async {
-            let file = ctx
-                .staging
-                .open_read(digest)
-                .map_err(|e| ocync_distribution::Error::Other(format!("staging read: {e}")))?;
+            let file =
+                ctx.staging
+                    .open_read(digest)
+                    .map_err(|e| ocync_distribution::Error::Io {
+                        context: "staging open",
+                        source: e,
+                    })?;
             let file_size = file.metadata().map(|m| m.len()).ok();
             let stream = file_read_stream(file).map(|r| {
-                r.map_err(|e| ocync_distribution::Error::Other(format!("staging read: {e}")))
+                r.map_err(|e| ocync_distribution::Error::Io {
+                    context: "staging read",
+                    source: e,
+                })
             });
             ctx.target_client
                 .blob_push_stream(ctx.target_repo, digest, file_size, stream)

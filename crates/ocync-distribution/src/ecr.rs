@@ -61,10 +61,8 @@ fn ecr_registry_id(hostname: &str) -> Option<&str> {
 /// FIPS endpoint support is handled at the SDK level: set
 /// `AWS_USE_FIPS_ENDPOINT=true` before calling this function.
 pub(crate) async fn load_sdk_config(hostname: &str) -> Result<aws_config::SdkConfig, Error> {
-    let region = ecr_region(hostname).ok_or_else(|| {
-        Error::Other(format!(
-            "cannot extract AWS region from ECR hostname '{hostname}'"
-        ))
+    let region = ecr_region(hostname).ok_or_else(|| Error::EcrApi {
+        reason: format!("cannot extract AWS region from ECR hostname '{hostname}'"),
     })?;
 
     Ok(aws_config::defaults(BehaviorVersion::latest())
@@ -155,10 +153,8 @@ impl EcrBatchApi for AwsEcrBatchApi {
                 builder = builder.registry_id(id);
             }
 
-            let output = builder.send().await.map_err(|e| {
-                Error::Other(format!(
-                    "ECR BatchCheckLayerAvailability failed for '{repo}': {e}"
-                ))
+            let output = builder.send().await.map_err(|e| Error::EcrApi {
+                reason: format!("BatchCheckLayerAvailability failed for '{repo}': {e}"),
             })?;
 
             let layers: Vec<(String, bool)> = output
@@ -483,7 +479,9 @@ mod tests {
                 self.counts.check.fetch_add(1, Ordering::Relaxed);
                 let mut responses = self.check_responses.lock().await;
                 responses.pop_front().unwrap_or_else(|| {
-                    Err(Error::Other("mock: no check response available".into()))
+                    Err(Error::EcrApi {
+                        reason: "mock: no check response available".into(),
+                    })
                 })
             })
         }
@@ -614,8 +612,11 @@ mod tests {
     #[tokio::test]
     async fn check_propagates_api_error() {
         let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("my-repo", counts)
-            .with_check_responses(vec![Err(Error::Other("throttled".into()))]);
+        let mock = MockEcrBatchApi::new("my-repo", counts).with_check_responses(vec![Err(
+            Error::EcrApi {
+                reason: "throttled".into(),
+            },
+        )]);
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
@@ -699,7 +700,9 @@ mod tests {
         let counts = CallCounts::default();
         let mock = MockEcrBatchApi::new("my-repo", counts.clone()).with_check_responses(vec![
             Ok(batch1_response),
-            Err(Error::Other("throttled on batch 2".into())),
+            Err(Error::EcrApi {
+                reason: "throttled on batch 2".into(),
+            }),
         ]);
         let checker = BatchChecker::with_api(mock);
 

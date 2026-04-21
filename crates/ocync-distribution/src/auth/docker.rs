@@ -63,7 +63,7 @@ impl fmt::Debug for AuthEntry {
 impl DockerConfig {
     /// Load from the default Docker config path (`~/.docker/config.json`).
     pub fn load_default() -> Result<Self, Error> {
-        let path = default_config_path().ok_or_else(|| Error::DockerConfig {
+        let path = default_config_path().ok_or_else(|| Error::CredentialConfig {
             reason: "unable to determine home directory".into(),
         })?;
         Self::load_from(&path)
@@ -71,10 +71,10 @@ impl DockerConfig {
 
     /// Load from a specific file path.
     fn load_from(path: &Path) -> Result<Self, Error> {
-        let contents = std::fs::read_to_string(path).map_err(|e| Error::DockerConfig {
+        let contents = std::fs::read_to_string(path).map_err(|e| Error::CredentialConfig {
             reason: format!("failed to read config at {}: {e}", path.display()),
         })?;
-        serde_json::from_str(&contents).map_err(|e| Error::DockerConfig {
+        serde_json::from_str(&contents).map_err(|e| Error::CredentialConfig {
             reason: format!("failed to parse config at {}: {e}", path.display()),
         })
     }

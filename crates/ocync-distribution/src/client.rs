@@ -329,8 +329,13 @@ impl RegistryClient {
                     AuthScheme::Bearer => "Bearer",
                     AuthScheme::Basic => "Basic",
                 };
-                let header_value = HeaderValue::from_str(&format!("{prefix} {value}"))
-                    .map_err(|e| Error::Other(format!("invalid auth header: {e}")))?;
+                let header_value =
+                    HeaderValue::from_str(&format!("{prefix} {value}")).map_err(|e| {
+                        Error::InvalidHeaderValue {
+                            header: "Authorization".into(),
+                            reason: e.to_string(),
+                        }
+                    })?;
                 headers.insert(AUTHORIZATION, header_value);
             }
         }

@@ -340,10 +340,9 @@ impl RegistryClient {
         let actual_digest = self.blob_push(repository, &body).await?;
 
         if &actual_digest != expected_digest {
-            return Err(Error::UploadProtocol {
-                reason: format!(
-                    "GAR fallback digest mismatch: expected {expected_digest}, got {actual_digest}"
-                ),
+            return Err(Error::DigestMismatch {
+                expected: expected_digest.clone(),
+                actual: actual_digest,
             });
         }
 
@@ -387,10 +386,9 @@ impl RegistryClient {
         let raw = buffer_stream(stream, known_size).await?;
         let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
         if &actual_digest != expected_digest {
-            return Err(Error::UploadProtocol {
-                reason: format!(
-                    "GHCR fallback: local digest {actual_digest} != expected {expected_digest}"
-                ),
+            return Err(Error::DigestMismatch {
+                expected: expected_digest.clone(),
+                actual: actual_digest,
             });
         }
         let body = Bytes::from(raw);

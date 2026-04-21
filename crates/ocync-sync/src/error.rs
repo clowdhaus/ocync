@@ -46,6 +46,19 @@ pub enum Error {
         source: ocync_distribution::Error,
     },
 
+    /// Engine-level manifest processing error (not from the registry).
+    ///
+    /// Covers failures like platform filter matching, unsupported manifest
+    /// structures, and index rewriting -- cases where the engine itself
+    /// rejects or cannot process a manifest, rather than a registry error.
+    #[error("manifest {reference}: {reason}")]
+    ManifestLogic {
+        /// The manifest reference involved.
+        reference: String,
+        /// Why the manifest could not be processed.
+        reason: String,
+    },
+
     /// A blob transfer failed during sync.
     #[error("blob transfer failed for {digest}: {source}")]
     BlobTransfer {
@@ -161,11 +174,51 @@ mod tests {
                 .unwrap();
         let err = Error::BlobTransfer {
             digest: digest.clone(),
-            source: ocync_distribution::Error::Other("timeout".into()),
+            source: ocync_distribution::Error::Io {
+                context: "staging read",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "permission denied",
+                ),
+            },
         };
         let msg = err.to_string();
         assert!(msg.contains("blob transfer"));
         assert!(msg.contains(&digest.to_string()));
+    }
+
+    #[test]
+    fn display_manifest_logic() {
+        let err = Error::ManifestLogic {
+            reference: "latest".into(),
+            reason: "platform filter matched no manifests in index".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("latest"), "should contain reference: {msg}");
+        assert!(
+            msg.contains("platform filter"),
+            "should contain reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn manifest_logic_status_code_is_none() {
+        let err = Error::ManifestLogic {
+            reference: "latest".into(),
+            reason: "no match".into(),
+        };
+        // ManifestLogic is a deterministic engine decision (not a registry
+        // error), so it has no HTTP status and is never retryable.
+        assert_eq!(err.status_code(), None);
+    }
+
+    #[test]
+    fn manifest_logic_is_not_required_artifacts_missing() {
+        let err = Error::ManifestLogic {
+            reference: "v1".into(),
+            reason: "nested index manifests are not supported".into(),
+        };
+        assert!(!err.is_required_artifacts_missing());
     }
 
     #[test]

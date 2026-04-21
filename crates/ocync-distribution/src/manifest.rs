@@ -90,15 +90,12 @@ impl RegistryClient {
                 let digest_str = headers
                     .get(DOCKER_CONTENT_DIGEST)
                     .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| {
-                        Error::Other(
-                            "manifest HEAD response missing Docker-Content-Digest header".into(),
-                        )
+                    .ok_or_else(|| Error::RegistryProtocol {
+                        reason: "manifest HEAD response missing Docker-Content-Digest header"
+                            .into(),
                     })?;
-                let digest: Digest = digest_str.parse().map_err(|_| {
-                    Error::Other(format!(
-                        "invalid digest in Docker-Content-Digest header: {digest_str}"
-                    ))
+                let digest: Digest = digest_str.parse().map_err(|_| Error::RegistryProtocol {
+                    reason: format!("invalid digest in Docker-Content-Digest header: {digest_str}"),
                 })?;
 
                 let media_type: MediaType = headers
@@ -183,8 +180,11 @@ impl RegistryClient {
         let url = build_url(&self.base_url, repository, &manifest_path(reference))?;
         let scopes = [Scope::pull_push(repository.as_str())];
 
-        let content_type = HeaderValue::from_str(media_type.as_str())
-            .map_err(|e| Error::Other(format!("invalid media type header value: {e}")))?;
+        let content_type =
+            HeaderValue::from_str(media_type.as_str()).map_err(|e| Error::InvalidHeaderValue {
+                header: "Content-Type".into(),
+                reason: e.to_string(),
+            })?;
 
         let resp = self
             .send_with_aimd(

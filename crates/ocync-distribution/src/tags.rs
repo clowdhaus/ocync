@@ -76,9 +76,11 @@ impl RegistryClient {
         loop {
             page_count += 1;
             if page_count > MAX_TAG_PAGES {
-                return Err(Error::Other(format!(
-                    "tag listing exceeded {MAX_TAG_PAGES} pages; possible infinite loop from malformed Link headers"
-                )));
+                return Err(Error::RegistryProtocol {
+                    reason: format!(
+                        "tag listing exceeded {MAX_TAG_PAGES} pages; possible infinite loop from malformed Link headers"
+                    ),
+                });
             }
             let resp = self
                 .get(repository, &path, None, RegistryAction::TagList)
