@@ -67,9 +67,9 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
 ///
 /// Only inspects `ocync_distribution::Error::Http(reqwest::Error)`. Transport
 /// errors that arrive wrapped in other variants are NOT retried:
-/// - `Error::Other(...)` -- may contain connection resets from middleware
-/// - `Error::RegistryError { source, .. }` -- may wrap a transport error
-/// - `Error::Manifest { source, .. }` -- may wrap a transport error
+/// - `Error::Io { .. }` -- local filesystem errors, never transient (typed `io::Error`)
+/// - `Error::RegistryError { .. }` -- HTTP-level; retried via `should_retry()` instead
+/// - `Error::RegistryProtocol { .. }` -- deterministic spec violation, never transient
 ///
 /// If operators observe unretrieved transient errors, the debug log below will
 /// show which variant was encountered so the match can be extended.
@@ -243,8 +243,11 @@ mod tests {
     }
 
     #[test]
-    fn should_retry_transport_on_other() {
-        let err = ocync_distribution::Error::Other("something".into());
+    fn should_retry_transport_on_io() {
+        let err = ocync_distribution::Error::Io {
+            context: "staging read",
+            source: std::io::Error::other("staging read failed"),
+        };
         assert!(!should_retry_transport(&err));
     }
 }

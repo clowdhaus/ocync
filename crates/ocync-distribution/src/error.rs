@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::Digest;
+
 /// Errors returned by OCI distribution operations.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -43,6 +45,16 @@ pub enum Error {
     #[error("manifest deserialization failed: {0}")]
     ManifestParse(#[from] serde_json::Error),
 
+    /// A manifest was deserialized successfully but is semantically invalid.
+    ///
+    /// Currently raised when `schemaVersion` is not 2 (the only version
+    /// defined by the OCI Image and Docker v2 specs).
+    #[error("invalid manifest: {reason}")]
+    InvalidManifest {
+        /// Why the manifest is invalid.
+        reason: String,
+    },
+
     /// Authentication with the registry failed.
     #[error("authentication failed for registry '{registry}': {reason}")]
     AuthFailed {
@@ -74,9 +86,83 @@ pub enum Error {
         message: String,
     },
 
-    /// Catch-all for errors without a dedicated variant.
-    #[error("{0}")]
-    Other(String),
+    /// A URL could not be constructed or joined.
+    #[error("URL construction failed for '{path}': {reason}")]
+    UrlConstruction {
+        /// The path or URL fragment that failed.
+        path: String,
+        /// Why construction failed.
+        reason: String,
+    },
+
+    /// The blob upload protocol violated expectations.
+    ///
+    /// Raised during the POST/PUT/PATCH upload sequence when the registry
+    /// returns a missing `Location` header or an unresolvable upload URL.
+    /// For digest mismatches during upload verification, see
+    /// [`DigestMismatch`](Self::DigestMismatch).
+    #[error("upload protocol error: {reason}")]
+    UploadProtocol {
+        /// What went wrong during the upload sequence.
+        reason: String,
+    },
+
+    /// The computed digest does not match the expected digest during blob upload.
+    #[error("digest mismatch: expected {expected}, got {actual}")]
+    DigestMismatch {
+        /// The digest that was expected.
+        expected: Digest,
+        /// The digest that was actually computed.
+        actual: Digest,
+    },
+
+    /// The registry response violated protocol expectations outside of uploads.
+    ///
+    /// Covers missing required headers on non-upload responses (e.g.
+    /// `Docker-Content-Digest` on manifest HEAD), malformed `Link`-header
+    /// pagination, and other spec violations in tag listing or manifest
+    /// retrieval. For upload-specific protocol errors see
+    /// [`UploadProtocol`](Self::UploadProtocol).
+    #[error("registry protocol error: {reason}")]
+    RegistryProtocol {
+        /// What was unexpected in the registry response.
+        reason: String,
+    },
+
+    /// An ECR-specific operation failed (region detection, SDK API call).
+    #[error("ECR error: {reason}")]
+    EcrApi {
+        /// What went wrong with the ECR operation.
+        reason: String,
+    },
+
+    /// An HTTP header value could not be constructed.
+    #[error("invalid {header} header value: {reason}")]
+    InvalidHeaderValue {
+        /// Which header could not be constructed.
+        header: String,
+        /// Why the value is invalid.
+        reason: String,
+    },
+
+    /// Credential configuration file I/O or parse failure.
+    ///
+    /// Covers Docker (`~/.docker/config.json`) and any future credential
+    /// store formats (podman `auth.json`, etc.).
+    #[error("credential config error: {reason}")]
+    CredentialConfig {
+        /// What went wrong reading or parsing the config.
+        reason: String,
+    },
+
+    /// Filesystem I/O failed during a local operation.
+    #[error("I/O error ({context}): {source}")]
+    Io {
+        /// What operation was attempted (e.g. "staging create", "staging read").
+        context: &'static str,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
 }
 
 impl Error {
@@ -112,6 +198,20 @@ impl Error {
 mod tests {
     use super::*;
 
+    /// Create a test digest with deterministic hex from a byte value.
+    fn test_digest(n: u8) -> Digest {
+        let hex = format!("{:0>64}", format!("{n:x}"));
+        format!("sha256:{hex}").parse().unwrap()
+    }
+
+    #[test]
+    fn is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Error>();
+    }
+
+    // --- Display (pre-existing variants, guards against accidental message changes) ---
+
     #[test]
     fn display_invalid_reference() {
         let err = Error::InvalidReference {
@@ -140,17 +240,7 @@ mod tests {
         assert!(err.to_string().contains("text/plain"));
     }
 
-    #[test]
-    fn display_other() {
-        let err = Error::Other("something broke".into());
-        assert_eq!(err.to_string(), "something broke");
-    }
-
-    #[test]
-    fn is_send_and_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<Error>();
-    }
+    // --- status_code ---
 
     #[test]
     fn status_code_from_registry_error() {
@@ -163,39 +253,96 @@ mod tests {
 
     #[test]
     fn status_code_none_for_non_registry_errors() {
-        let err = Error::Other("something".into());
-        assert_eq!(err.status_code(), None);
-
-        let err = Error::InvalidReference {
-            input: "bad".into(),
-            reason: "reason".into(),
-        };
-        assert_eq!(err.status_code(), None);
-
-        let err = Error::AuthFailed {
-            registry: "example.com".into(),
-            reason: "bad creds".into(),
-        };
-        assert_eq!(err.status_code(), None);
+        let variants: Vec<Error> = vec![
+            Error::InvalidReference {
+                input: "bad".into(),
+                reason: "reason".into(),
+            },
+            Error::InvalidDigest {
+                digest: "bad".into(),
+                reason: "reason".into(),
+            },
+            Error::InvalidPlatformFilter {
+                input: "bad".into(),
+                reason: "reason".into(),
+            },
+            Error::UnsupportedMediaType {
+                media_type: "text/plain".into(),
+            },
+            Error::InvalidManifest {
+                reason: "bad schema".into(),
+            },
+            Error::AuthFailed {
+                registry: "example.com".into(),
+                reason: "bad creds".into(),
+            },
+            Error::CredentialHelperFailed {
+                helper: "docker-credential-ecr-login".into(),
+                reason: "not found".into(),
+            },
+            Error::UrlConstruction {
+                path: "/v2/".into(),
+                reason: "no base".into(),
+            },
+            Error::UploadProtocol {
+                reason: "missing header".into(),
+            },
+            Error::DigestMismatch {
+                expected: test_digest(1),
+                actual: test_digest(2),
+            },
+            Error::RegistryProtocol {
+                reason: "bad response".into(),
+            },
+            Error::EcrApi {
+                reason: "throttled".into(),
+            },
+            Error::InvalidHeaderValue {
+                header: "Content-Type".into(),
+                reason: "bad chars".into(),
+            },
+            Error::CredentialConfig {
+                reason: "not found".into(),
+            },
+            Error::Io {
+                context: "test",
+                source: std::io::Error::other("disk full"),
+            },
+        ];
+        for err in &variants {
+            assert_eq!(err.status_code(), None, "expected None for {err}, got Some");
+        }
     }
 
+    // --- is_not_found ---
+
     #[test]
-    fn is_not_found() {
+    fn is_not_found_true_for_404() {
         let err = Error::RegistryError {
             status: http::StatusCode::NOT_FOUND,
             message: "missing".into(),
         };
         assert!(err.is_not_found());
+    }
 
+    #[test]
+    fn is_not_found_false_for_other_status() {
         let err = Error::RegistryError {
             status: http::StatusCode::UNAUTHORIZED,
             message: "denied".into(),
         };
         assert!(!err.is_not_found());
+    }
 
-        let err = Error::Other("unrelated".into());
+    #[test]
+    fn is_not_found_false_for_non_registry() {
+        let err = Error::RegistryProtocol {
+            reason: "unrelated".into(),
+        };
         assert!(!err.is_not_found());
     }
+
+    // --- is_auth_error ---
 
     #[test]
     fn is_auth_error_auth_failed() {
@@ -225,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn is_auth_error_server_error() {
+    fn is_auth_error_false_for_server_error() {
         let err = Error::RegistryError {
             status: http::StatusCode::INTERNAL_SERVER_ERROR,
             message: "broke".into(),
@@ -234,8 +381,217 @@ mod tests {
     }
 
     #[test]
-    fn is_auth_error_other() {
-        let err = Error::Other("something".into());
-        assert!(!err.is_auth_error());
+    fn is_auth_error_false_for_non_auth_variants() {
+        // Exhaustive: every variant except AuthFailed and RegistryError
+        // (which return true). Compile error if a new variant is added
+        // without being included here.
+        let variants: Vec<Error> = vec![
+            Error::InvalidReference {
+                input: "bad".into(),
+                reason: "reason".into(),
+            },
+            Error::InvalidDigest {
+                digest: "bad".into(),
+                reason: "reason".into(),
+            },
+            Error::InvalidPlatformFilter {
+                input: "bad".into(),
+                reason: "reason".into(),
+            },
+            Error::UnsupportedMediaType {
+                media_type: "text/plain".into(),
+            },
+            Error::InvalidManifest {
+                reason: "bad schema".into(),
+            },
+            Error::CredentialHelperFailed {
+                helper: "docker-credential-ecr-login".into(),
+                reason: "not found".into(),
+            },
+            Error::UrlConstruction {
+                path: "/v2/".into(),
+                reason: "no base".into(),
+            },
+            Error::UploadProtocol {
+                reason: "missing header".into(),
+            },
+            Error::DigestMismatch {
+                expected: test_digest(1),
+                actual: test_digest(2),
+            },
+            Error::RegistryProtocol {
+                reason: "bad response".into(),
+            },
+            Error::EcrApi {
+                reason: "throttled".into(),
+            },
+            Error::InvalidHeaderValue {
+                header: "Content-Type".into(),
+                reason: "bad chars".into(),
+            },
+            Error::CredentialConfig {
+                reason: "missing".into(),
+            },
+            Error::Io {
+                context: "test",
+                source: std::io::Error::other("disk full"),
+            },
+        ];
+        for err in &variants {
+            assert!(!err.is_auth_error(), "expected false for {err}");
+        }
+    }
+
+    // --- Display (new variants) ---
+
+    #[test]
+    fn display_url_construction() {
+        let err = Error::UrlConstruction {
+            path: "/v2/".into(),
+            reason: "relative URL without a base".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/v2/"), "should contain path: {msg}");
+        assert!(
+            msg.contains("relative URL without a base"),
+            "should contain reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_upload_protocol() {
+        let err = Error::UploadProtocol {
+            reason: "missing Location header".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing Location header"),
+            "should contain reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_registry_protocol() {
+        let err = Error::RegistryProtocol {
+            reason: "missing Docker-Content-Digest header".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing Docker-Content-Digest header"),
+            "should contain reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_ecr_api() {
+        let err = Error::EcrApi {
+            reason: "BatchCheckLayerAvailability throttled".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BatchCheckLayerAvailability throttled"),
+            "should contain reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_invalid_header_value() {
+        let err = Error::InvalidHeaderValue {
+            header: "Authorization".into(),
+            reason: "invalid byte in header value".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Authorization"),
+            "should contain header name: {msg}"
+        );
+        assert!(
+            msg.contains("invalid byte in header value"),
+            "should contain reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_invalid_manifest() {
+        let err = Error::InvalidManifest {
+            reason: "unsupported schemaVersion 1, expected 2".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("schemaVersion"),
+            "should contain reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_credential_config() {
+        let err = Error::CredentialConfig {
+            reason: "failed to read config at ~/.docker/config.json: No such file".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("credential config error"),
+            "should contain variant prefix: {msg}"
+        );
+        assert!(
+            msg.contains("config.json"),
+            "should contain path detail: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_io() {
+        let err = Error::Io {
+            context: "staging write",
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("staging write"),
+            "should contain context: {msg}"
+        );
+        assert!(msg.contains("access denied"), "should contain cause: {msg}");
+    }
+
+    // --- Structured fields ---
+
+    #[test]
+    fn digest_mismatch_preserves_typed_digests() {
+        let expected = test_digest(1);
+        let actual = test_digest(2);
+        let err = Error::DigestMismatch {
+            expected: expected.clone(),
+            actual: actual.clone(),
+        };
+        match &err {
+            Error::DigestMismatch {
+                expected: e,
+                actual: a,
+            } => {
+                assert_eq!(e, &expected);
+                assert_eq!(a, &actual);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&expected.to_string()),
+            "missing expected: {msg}"
+        );
+        assert!(msg.contains(&actual.to_string()), "missing actual: {msg}");
+    }
+
+    #[test]
+    fn io_preserves_source_error_kind() {
+        let err = Error::Io {
+            context: "staging read",
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied"),
+        };
+        match &err {
+            Error::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

@@ -340,9 +340,10 @@ impl RegistryClient {
         let actual_digest = self.blob_push(repository, &body).await?;
 
         if &actual_digest != expected_digest {
-            return Err(Error::Other(format!(
-                "GAR fallback digest mismatch: expected {expected_digest}, got {actual_digest}"
-            )));
+            return Err(Error::DigestMismatch {
+                expected: expected_digest.clone(),
+                actual: actual_digest,
+            });
         }
 
         Ok(actual_digest)
@@ -385,9 +386,10 @@ impl RegistryClient {
         let raw = buffer_stream(stream, known_size).await?;
         let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
         if &actual_digest != expected_digest {
-            return Err(Error::Other(format!(
-                "GHCR fallback: local digest {actual_digest} != expected {expected_digest}"
-            )));
+            return Err(Error::DigestMismatch {
+                expected: expected_digest.clone(),
+                actual: actual_digest,
+            });
         }
         let body = Bytes::from(raw);
         let body_len = body.len();
@@ -440,7 +442,9 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Str
         .headers()
         .get(LOCATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Error::Other("missing Location header in upload response".into()))?;
+        .ok_or_else(|| Error::UploadProtocol {
+            reason: "missing Location header in upload response".into(),
+        })?;
 
     if raw.starts_with("http://") || raw.starts_with("https://") {
         Ok(raw.to_owned())
@@ -448,7 +452,9 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Str
         base_url
             .join(raw)
             .map(|u| u.to_string())
-            .map_err(|e| Error::Other(format!("failed to resolve upload URL: {e}")))
+            .map_err(|e| Error::UploadProtocol {
+                reason: format!("failed to resolve upload URL: {e}"),
+            })
     }
 }
 

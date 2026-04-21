@@ -411,20 +411,24 @@ impl ManifestKind {
             MediaType::OciManifest | MediaType::DockerManifestV2 => {
                 let m: ImageManifest = serde_json::from_slice(bytes)?;
                 if m.schema_version != 2 {
-                    return Err(Error::Other(format!(
-                        "unsupported schemaVersion {}, expected 2",
-                        m.schema_version
-                    )));
+                    return Err(Error::InvalidManifest {
+                        reason: format!(
+                            "unsupported schemaVersion {}, expected 2",
+                            m.schema_version
+                        ),
+                    });
                 }
                 Ok(Self::Image(Box::new(m)))
             }
             MediaType::OciIndex | MediaType::DockerManifestList => {
                 let m: ImageIndex = serde_json::from_slice(bytes)?;
                 if m.schema_version != 2 {
-                    return Err(Error::Other(format!(
-                        "unsupported schemaVersion {}, expected 2",
-                        m.schema_version
-                    )));
+                    return Err(Error::InvalidManifest {
+                        reason: format!(
+                            "unsupported schemaVersion {}, expected 2",
+                            m.schema_version
+                        ),
+                    });
                 }
                 Ok(Self::Index(Box::new(m)))
             }
@@ -886,7 +890,10 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&json).unwrap();
         let err = ManifestKind::from_json(&MediaType::OciManifest, &bytes).unwrap_err();
-        assert!(err.to_string().contains("schemaVersion"), "error: {err}");
+        assert!(
+            matches!(err, Error::InvalidManifest { .. }),
+            "expected ManifestValidation, got: {err}"
+        );
     }
 
     #[test]
@@ -901,7 +908,10 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&json).unwrap();
         let err = ManifestKind::from_json(&MediaType::OciIndex, &bytes).unwrap_err();
-        assert!(err.to_string().contains("schemaVersion"), "error: {err}");
+        assert!(
+            matches!(err, Error::InvalidManifest { .. }),
+            "expected ManifestValidation, got: {err}"
+        );
     }
 
     // --- RepositoryName validation tests ---

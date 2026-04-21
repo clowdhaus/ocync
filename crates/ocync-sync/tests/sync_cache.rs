@@ -114,9 +114,9 @@ impl BatchBlobChecker for FailingBatchChecker {
         );
         Box::pin(async {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Err(ocync_distribution::Error::Other(
-                "batch API unavailable".into(),
-            ))
+            Err(ocync_distribution::Error::EcrApi {
+                reason: "batch API unavailable".into(),
+            })
         })
     }
 }
