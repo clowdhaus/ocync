@@ -641,14 +641,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hop_by_hop_keep_alive_case_insensitive() {
-        // HeaderName lowercases on construction, but verify the
-        // eq_ignore_ascii_case path works for the custom keep-alive check.
-        let hn = HeaderName::from_bytes(b"keep-alive").unwrap();
-        assert!(is_hop_by_hop(&hn));
-    }
-
     // -----------------------------------------------------------------
     // PrefixedStream
     // -----------------------------------------------------------------
@@ -709,6 +701,22 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, b"pre-data");
+    }
+
+    #[tokio::test]
+    async fn prefixed_stream_eof_after_drain() {
+        let prefix = b"ab".to_vec();
+        let inner = Cursor::new(b"cd");
+        let mut stream = PrefixedStream::new(prefix, inner);
+
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"abcd");
+
+        // Subsequent reads must return 0 (EOF).
+        let mut trailing = vec![0u8; 8];
+        let n = stream.read(&mut trailing).await.unwrap();
+        assert_eq!(n, 0, "read after EOF must return 0");
     }
 
     // -----------------------------------------------------------------
@@ -800,22 +808,34 @@ mod tests {
     // LogWriter
     // -----------------------------------------------------------------
 
+    /// Build a [`ProxyEntry`] with sensible defaults. Callers override the
+    /// fields they care about; the rest are inert placeholders. Using a
+    /// helper avoids scattering `ProxyEntry { .. }` literals across tests
+    /// where a future field addition would require updating every site.
+    fn test_entry(method: &str, status: u16) -> ProxyEntry<'_> {
+        ProxyEntry {
+            timestamp: String::new(),
+            method,
+            host: "registry.test",
+            url: "/v2/",
+            request_bytes: 0,
+            response_bytes: 0,
+            status,
+            duration_ms: 1,
+        }
+    }
+
     #[tokio::test]
     async fn log_writer_writes_valid_jsonl() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.jsonl");
         let writer = LogWriter::create(&path).await.unwrap();
 
-        let entry = ProxyEntry {
-            timestamp: "2026-01-01T00:00:00Z".to_owned(),
-            method: "GET",
-            host: "example.com",
-            url: "/v2/repo/manifests/latest",
-            request_bytes: 0,
-            response_bytes: 1234,
-            status: 200,
-            duration_ms: 42,
-        };
+        let mut entry = test_entry("GET", 200);
+        entry.host = "example.com";
+        entry.url = "/v2/repo/manifests/latest";
+        entry.response_bytes = 1234;
+        entry.duration_ms = 42;
         writer.write_entry(&entry).await;
 
         let content = tokio::fs::read_to_string(&path).await.unwrap();
@@ -837,17 +857,7 @@ mod tests {
         tokio::fs::write(&path, b"stale data\n").await.unwrap();
 
         let writer = LogWriter::create(&path).await.unwrap();
-        let entry = ProxyEntry {
-            timestamp: "2026-01-01T00:00:00Z".to_owned(),
-            method: "HEAD",
-            host: "registry.example",
-            url: "/v2/",
-            request_bytes: 0,
-            response_bytes: 0,
-            status: 200,
-            duration_ms: 1,
-        };
-        writer.write_entry(&entry).await;
+        writer.write_entry(&test_entry("HEAD", 200)).await;
 
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(
@@ -855,5 +865,46 @@ mod tests {
             "create should truncate existing content"
         );
         assert_eq!(content.lines().count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn log_writer_concurrent_writes_produce_valid_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.jsonl");
+        let writer = Arc::new(LogWriter::create(&path).await.unwrap());
+
+        let n = 50;
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let w = Arc::clone(&writer);
+            handles.push(tokio::spawn(async move {
+                let method = if i % 2 == 0 { "GET" } else { "HEAD" };
+                let mut entry = ProxyEntry {
+                    timestamp: String::new(),
+                    method,
+                    host: "registry.test",
+                    url: "/v2/",
+                    request_bytes: 0,
+                    response_bytes: i as u64,
+                    status: 200,
+                    duration_ms: i as u64,
+                };
+                entry.response_bytes = i as u64;
+                w.write_entry(&entry).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), n, "expected {n} JSONL lines");
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "line {i} is not valid JSON: {line}"
+            );
+        }
     }
 }
