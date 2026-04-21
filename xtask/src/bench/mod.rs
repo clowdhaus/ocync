@@ -617,7 +617,18 @@ async fn run_sync(
     let mut cold_runs = Vec::new();
     let mut warm_runs = Vec::new();
 
-    for (tool_idx, &tool) in tools.iter().enumerate() {
+    for &tool in tools {
+        // Clean slate before every tool (including the first).
+        // Drop page cache so no tool benefits from a previous tool's
+        // source pulls cached in RAM. Clean staging tmpdir.
+        prepare_clean_slate();
+
+        // Delete repos first to guarantee a truly empty target, then recreate.
+        // create_repos alone skips existing repos which may contain partial
+        // data from aborted runs.
+        ecr::delete_repos(ecr_client, corpus).await?;
+        ecr::create_repos(ecr_client, corpus).await?;
+
         // Single config_dir for cold + warm. The cache file lives
         // under this directory, so reusing it means the warm run
         // sees a fully populated cache.
@@ -625,7 +636,6 @@ async fn run_sync(
 
         // Cold run.
         progress(&format!("  cold: {tool}"));
-        ecr::create_repos(ecr_client, corpus).await?;
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
             let cold = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
             if cold.exit_code != Some(0) {
@@ -674,9 +684,7 @@ async fn run_sync(
         ecr::delete_repos(ecr_client, corpus).await?;
         run_result?;
 
-        if tool_idx + 1 < tools.len() {
-            cooldown().await;
-        }
+        cooldown().await;
     }
 
     Ok((
@@ -703,10 +711,11 @@ async fn run_partial(
     progress("bench: running partial scenario");
     let mut runs = Vec::new();
 
-    for (tool_idx, &tool) in tools.iter().enumerate() {
-        progress(&format!("  partial: {} (priming)", tool));
-
+    for &tool in tools {
+        prepare_clean_slate();
+        ecr::delete_repos(ecr_client, base_corpus).await?;
         ecr::create_repos(ecr_client, base_corpus).await?;
+        progress(&format!("  partial: {} (priming)", tool));
 
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
             // Prime with base corpus (unmeasured). Reuse the same
@@ -746,9 +755,7 @@ async fn run_partial(
         ecr::delete_repos(ecr_client, base_corpus).await?;
         run_result?;
 
-        if tool_idx + 1 < tools.len() {
-            cooldown().await;
-        }
+        cooldown().await;
     }
 
     Ok(ScenarioResult {
@@ -781,10 +788,11 @@ async fn run_scale(
         let subset = corpus.limit(size);
         let mut results: BTreeMap<String, f64> = BTreeMap::new();
 
-        for (tool_idx, &tool) in tools.iter().enumerate() {
-            progress(&format!("  scale: {} @ {size} images", tool));
-
+        for &tool in tools {
+            prepare_clean_slate();
+            ecr::delete_repos(ecr_client, &subset).await?;
             ecr::create_repos(ecr_client, &subset).await?;
+            progress(&format!("  scale: {} @ {size} images", tool));
 
             let run_result: Result<(), Box<dyn std::error::Error>> = async {
                 let config_dir = tempfile::tempdir()?;
@@ -806,9 +814,7 @@ async fn run_scale(
             ecr::delete_repos(ecr_client, &subset).await?;
             run_result?;
 
-            if tool_idx + 1 < tools.len() {
-                cooldown().await;
-            }
+            cooldown().await;
         }
 
         points.push(ScalePoint {
@@ -821,17 +827,16 @@ async fn run_scale(
 }
 
 /// Sleep for 30 seconds between benchmark runs to let rate limits recover.
-async fn cooldown() {
-    // Drop OS page cache so the next tool starts with a cold disk.
-    // Without this, the second tool benefits from source blobs cached in
-    // RAM by the first tool's pulls, giving it an unfair advantage on
-    // read-heavy workloads.
+/// Ensure a verified clean slate before each tool run.
+///
+/// Runs before every tool (including the first) to guarantee no tool
+/// benefits from a previous tool's cached data or leftover state.
+fn prepare_clean_slate() {
     drop_page_cache();
-
-    // Clean the staging tmpdir so the next tool doesn't start with a
-    // full disk from the previous tool's staged blobs.
     clean_staging_tmpdir();
+}
 
+async fn cooldown() {
     eprintln!("bench: cooling down for 30s...");
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 }

@@ -69,14 +69,32 @@ cargo xtask bench-remote --provider aws --fetch
 
 Instance metadata (type, CPU, memory, network, region) is captured from `ec2:DescribeInstanceTypes`.
 
+## Benchmark fairness invariants
+
+Every tool run (including the first) must start from a verified clean slate. The harness enforces this automatically -- do not bypass it.
+
+**Before every tool run:**
+1. **Drop OS page cache** -- `sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'`. Without this, tool 2 benefits from tool 1's source blobs cached in RAM (55GB corpus = massive unfair advantage).
+2. **Clean staging tmpdir** -- remove all files in `$TMPDIR`. Prevents staged blobs from a previous tool consuming disk.
+3. **Delete + recreate ECR repos** -- not just create-if-not-exists. Repos from aborted runs or previous tools may contain partial data that makes a "cold" sync warm.
+4. **30s cooldown** -- allows TCP TIME_WAIT connections to drain and EBS burst credits to stabilize.
+
+**After every tool run (cold and warm):**
+5. **Verify sync correctness** -- list tags in every target ECR repo, confirm all expected tags are present. An unverified benchmark may report fast times for incomplete syncs.
+
+**Never run benchmarks manually via SSH.** The `bench-remote` xtask handles all of the above. Manual `cargo xtask bench` on the instance skips TMPDIR setup and other safeguards. SSH is for debugging only.
+
+**TMPDIR must be on EBS, not tmpfs.** On AL2023 `/tmp` is tmpfs (RAM-backed, ~8GB). The staging path writes 55GB+ of blobs. `bench-remote` sets `TMPDIR=$HOME/ocync/bench/.tmp` on EBS automatically. Running `cargo xtask bench` without this will hit ENOSPC (the harness detects and rejects tmpfs).
+
 ## Running on the instance directly
 
-```bash
-# Connect
-ssh ec2-user@<public-ip>
+Not recommended. Use `cargo xtask bench-remote` instead. If you must run manually (debugging only):
 
-# On the instance:
+```bash
+ssh ec2-user@<public-ip>
 cd ~/ocync
+export TMPDIR=$HOME/ocync/bench/.tmp
+rm -rf "$TMPDIR" && mkdir -p "$TMPDIR"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
 cargo xtask bench --tools ocync,dregsy,regsync sync
