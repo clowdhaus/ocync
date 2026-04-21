@@ -138,8 +138,6 @@ Optimization HEADs participate in the AIMD congestion window for the ManifestHea
 
 ### Relationship to head_first
 
-> **Status: Implemented.** The `head_first` per-registry option is available on source registries. When enabled and the discovery cache has no entry, the engine HEAD-checks all targets against the source HEAD digest before performing a full source manifest GET. If all targets match, the GET is skipped. The discovery HEAD result is reused (no redundant second HEAD). Platform-filtered mappings bypass `head_first` because the target holds a filtered digest that differs from the source HEAD digest.
-
 The transfer optimization spec defines a per-registry `head_first` option to conserve rate-limit tokens. The discovery HEAD serves a different purpose: detecting source changes cheaply. These are independent features that happen to use the same HTTP method. When both are active, the discovery HEAD result is reused to avoid a redundant second HEAD.
 
 ## Steady-state savings
