@@ -590,3 +590,270 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use futures_util::stream;
+    use http::HeaderName;
+    use tokio::io::AsyncReadExt;
+
+    use super::*;
+
+    // -----------------------------------------------------------------
+    // is_hop_by_hop
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hop_by_hop_matches_rfc7230_headers() {
+        let hop = [
+            "connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "keep-alive",
+        ];
+        for name in &hop {
+            let hn = HeaderName::from_bytes(name.as_bytes()).unwrap();
+            assert!(is_hop_by_hop(&hn), "{name} should be hop-by-hop");
+        }
+    }
+
+    #[test]
+    fn hop_by_hop_rejects_non_hop_headers() {
+        let non_hop = [
+            "content-type",
+            "accept",
+            "host",
+            "authorization",
+            "content-length",
+            "cache-control",
+        ];
+        for name in &non_hop {
+            let hn = HeaderName::from_bytes(name.as_bytes()).unwrap();
+            assert!(!is_hop_by_hop(&hn), "{name} should NOT be hop-by-hop");
+        }
+    }
+
+    #[test]
+    fn hop_by_hop_keep_alive_case_insensitive() {
+        // HeaderName lowercases on construction, but verify the
+        // eq_ignore_ascii_case path works for the custom keep-alive check.
+        let hn = HeaderName::from_bytes(b"keep-alive").unwrap();
+        assert!(is_hop_by_hop(&hn));
+    }
+
+    // -----------------------------------------------------------------
+    // PrefixedStream
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn prefixed_stream_emits_prefix_then_inner() {
+        let prefix = b"hello".to_vec();
+        let inner = Cursor::new(b" world");
+        let mut stream = PrefixedStream::new(prefix, inner);
+
+        let mut out = vec![0u8; 11];
+        let n = stream.read(&mut out).await.unwrap();
+        // First read returns the prefix.
+        assert_eq!(&out[..n], b"hello");
+
+        let n2 = stream.read(&mut out).await.unwrap();
+        // Second read returns the inner stream data.
+        assert_eq!(&out[..n2], b" world");
+    }
+
+    #[tokio::test]
+    async fn prefixed_stream_empty_prefix_reads_inner_directly() {
+        let inner = Cursor::new(b"direct");
+        let mut stream = PrefixedStream::new(vec![], inner);
+
+        let mut out = vec![0u8; 16];
+        let n = stream.read(&mut out).await.unwrap();
+        assert_eq!(&out[..n], b"direct");
+    }
+
+    #[tokio::test]
+    async fn prefixed_stream_partial_prefix_read() {
+        let prefix = b"abcdef".to_vec();
+        let inner = Cursor::new(b"ghij");
+        let mut stream = PrefixedStream::new(prefix, inner);
+
+        // Read with a small buffer that cannot hold the entire prefix.
+        let mut small = vec![0u8; 3];
+        let n1 = stream.read(&mut small).await.unwrap();
+        assert_eq!(&small[..n1], b"abc");
+
+        let n2 = stream.read(&mut small).await.unwrap();
+        assert_eq!(&small[..n2], b"def");
+
+        let n3 = stream.read(&mut small).await.unwrap();
+        assert_eq!(&small[..n3], b"ghi");
+
+        let n4 = stream.read(&mut small).await.unwrap();
+        assert_eq!(&small[..n4], b"j");
+    }
+
+    #[tokio::test]
+    async fn prefixed_stream_read_to_end() {
+        let prefix = b"pre-".to_vec();
+        let inner = Cursor::new(b"data");
+        let mut stream = PrefixedStream::new(prefix, inner);
+
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"pre-data");
+    }
+
+    // -----------------------------------------------------------------
+    // LogOnDrop
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn log_on_drop_fires_callback_when_stream_ends() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let items: Vec<Result<i32, &str>> = vec![Ok(1), Ok(2)];
+        let inner = stream::iter(items);
+
+        let mut wrapper = LogOnDrop {
+            inner,
+            logged: false,
+            on_drop: Some(Box::new(move || {
+                fired_clone.store(true, Ordering::SeqCst);
+            })),
+        };
+
+        use futures_util::StreamExt;
+        // Drain the stream.
+        assert_eq!(wrapper.next().await, Some(Ok(1)));
+        assert!(!fired.load(Ordering::SeqCst), "should not fire mid-stream");
+        assert_eq!(wrapper.next().await, Some(Ok(2)));
+        assert!(!fired.load(Ordering::SeqCst), "should not fire mid-stream");
+        // Stream ends.
+        assert_eq!(wrapper.next().await, None);
+        assert!(fired.load(Ordering::SeqCst), "should fire when stream ends");
+    }
+
+    #[tokio::test]
+    async fn log_on_drop_fires_callback_on_early_drop() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let items: Vec<Result<i32, &str>> = vec![Ok(1), Ok(2), Ok(3)];
+        let inner = stream::iter(items);
+
+        let mut wrapper = LogOnDrop {
+            inner,
+            logged: false,
+            on_drop: Some(Box::new(move || {
+                fired_clone.store(true, Ordering::SeqCst);
+            })),
+        };
+
+        use futures_util::StreamExt;
+        // Read one item then drop without draining.
+        assert_eq!(wrapper.next().await, Some(Ok(1)));
+        assert!(!fired.load(Ordering::SeqCst));
+        drop(wrapper);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "should fire on drop when stream not drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_on_drop_does_not_double_fire() {
+        let count = Arc::new(AtomicU64::new(0));
+        let count_clone = count.clone();
+        let items: Vec<Result<i32, &str>> = vec![Ok(1)];
+        let inner = stream::iter(items);
+
+        let mut wrapper = LogOnDrop {
+            inner,
+            logged: false,
+            on_drop: Some(Box::new(move || {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+            })),
+        };
+
+        use futures_util::StreamExt;
+        // Drain fully (fires on None).
+        let _ = wrapper.next().await;
+        let _ = wrapper.next().await; // None - fires callback
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // Drop after stream end should not fire again.
+        drop(wrapper);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "callback must fire exactly once"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // LogWriter
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn log_writer_writes_valid_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        let writer = LogWriter::create(&path).await.unwrap();
+
+        let entry = ProxyEntry {
+            timestamp: "2026-01-01T00:00:00Z".to_owned(),
+            method: "GET",
+            host: "example.com",
+            url: "/v2/repo/manifests/latest",
+            request_bytes: 0,
+            response_bytes: 1234,
+            status: 200,
+            duration_ms: 42,
+        };
+        writer.write_entry(&entry).await;
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "should have exactly one JSONL line");
+
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["method"], "GET");
+        assert_eq!(parsed["host"], "example.com");
+        assert_eq!(parsed["status"], 200);
+        assert_eq!(parsed["response_bytes"], 1234);
+        assert_eq!(parsed["duration_ms"], 42);
+    }
+
+    #[tokio::test]
+    async fn log_writer_truncates_on_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        tokio::fs::write(&path, b"stale data\n").await.unwrap();
+
+        let writer = LogWriter::create(&path).await.unwrap();
+        let entry = ProxyEntry {
+            timestamp: "2026-01-01T00:00:00Z".to_owned(),
+            method: "HEAD",
+            host: "registry.example",
+            url: "/v2/",
+            request_bytes: 0,
+            response_bytes: 0,
+            status: 200,
+            duration_ms: 1,
+        };
+        writer.write_entry(&entry).await;
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            !content.contains("stale data"),
+            "create should truncate existing content"
+        );
+        assert_eq!(content.lines().count(), 1);
+    }
+}
