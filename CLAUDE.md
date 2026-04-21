@@ -19,6 +19,14 @@ Ranked by weight. These override local optimization instincts when they conflict
 3. **Wall-clock speed** - a consequence of (1), not a goal separate from it. Reports that prioritize wall-clock without byte/request counts are misleading.
 4. **UX** - clear errors, structured output, sensible defaults. Must be zero-cost when disabled so it never drags on (1).
 
+## Content integrity
+
+ocync syncs content bit-for-bit from source to target(s). We do NOT convert, transform, or rewrite manifest or blob content. Digests are identity -- changing bytes changes the digest, breaks signatures, pin-by-digest workflows, and the OCI content-addressable model.
+
+- Manifest bytes are transferred verbatim. No format conversion (Docker v2 to OCI or vice versa).
+- Blob bytes are streamed directly from source to target without modification.
+- All registries in production accept both Docker v2 and OCI manifests. There is no real-world use case for format conversion, and it would break every digest-based optimization (skip detection, transfer state cache, immutable tag handling, head-first).
+
 ## Scope discipline
 
 Every PR ships the smallest correct change + one test that catches regression. Defer scaffolding to a follow-up PR justified by a second observation.
@@ -29,6 +37,7 @@ Every PR ships the smallest correct change + one test that catches regression. D
 - No Cargo feature flags except crypto backend (`fips` vs `non-fips`) - unavoidable platform linking
 - Test what can break: at least one test that would fail if the intended path is NOT taken (negative assertion)
 - If the change is ~10 LOC of real intent, aim for ~100 LOC total diff. 10x is a smell worth justifying.
+- Challenge the use case before building. If a feature breaks existing optimizations (skip detection, caching, digest comparison), the cost likely exceeds the benefit.
 
 ## Code standards
 
@@ -61,7 +70,8 @@ Every PR ships the smallest correct change + one test that catches regression. D
 - `docs/src/content/design/benchmark.md` - layered benchmark plan (protocol / throughput / cross-tool)
 - `docs/src/content/design/watch-mode.md` - watch mode, discovery optimization, platform filtering
 - `docs/superpowers/plans/` (gitignored) - in-flight implementation plans
-- Unimplemented features are marked with `> **Status: Planned.**` or `> **Status: Partially implemented.**` in design docs. Update these markers when implementing.
+- `docs/superpowers/specs/` (gitignored) - design specs; delete once fully implemented
+- Unimplemented features are marked with `> **Status: Planned.**` in design docs. Remove the marker when implementing -- implemented features are self-evident from code.
 
 When a benchmark or probe run changes our understanding of a registry's behavior, update the relevant per-registry doc in `docs/src/content/registries/` in the same PR as the behavior change.
 
