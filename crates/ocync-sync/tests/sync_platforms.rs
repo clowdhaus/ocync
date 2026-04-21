@@ -6,9 +6,7 @@ mod helpers;
 use ocync_distribution::Digest;
 use ocync_distribution::spec::{Descriptor, ImageIndex, MediaType, Platform, PlatformFilter};
 use ocync_sync::ImageStatus;
-use ocync_sync::engine::{SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
+use ocync_sync::engine::TagPair;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -214,25 +212,15 @@ async fn sync_index_manifest_platform_filter() {
     // arm64 and windows manifest pushes should NOT happen -- wiremock will
     // fail verification if unexpected requests arrive (no mock mounted).
 
-    let mut mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mut mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("latest")],
     );
     mapping.platforms = Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]);
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
@@ -311,24 +299,14 @@ async fn sync_nested_index_manifest_returns_error() {
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert!(

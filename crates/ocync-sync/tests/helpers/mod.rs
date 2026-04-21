@@ -3,7 +3,7 @@
 // During migration, not all helpers are consumed by every test binary.
 // Each test file is its own crate, so `pub` is the correct visibility for
 // cross-module access within a test binary (not `pub(crate)`).
-#![allow(dead_code, unused_imports, unreachable_pub)]
+#![allow(dead_code, unused_imports, unused_macros, unreachable_pub)]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -30,7 +30,7 @@ pub use mocks::*;
 // Engine run helpers
 // ---------------------------------------------------------------------------
 
-/// Run the sync engine with default settings (max_concurrent=50, no cache, no staging, no shutdown).
+/// Run the sync engine with default settings (`max_concurrent=50`, no cache, no staging, no shutdown).
 pub async fn run_sync(mappings: Vec<ResolvedMapping>) -> SyncReport {
     SyncEngine::new(fast_retry(), 50)
         .run(
@@ -43,7 +43,7 @@ pub async fn run_sync(mappings: Vec<ResolvedMapping>) -> SyncReport {
         .await
 }
 
-/// Run the sync engine sequentially (max_concurrent=1) for deterministic ordering tests.
+/// Run the sync engine sequentially (`max_concurrent=1`) for deterministic ordering tests.
 pub async fn run_sync_sequential(mappings: Vec<ResolvedMapping>) -> SyncReport {
     SyncEngine::new(fast_retry(), 1)
         .run(

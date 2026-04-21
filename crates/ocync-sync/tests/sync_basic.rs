@@ -4,9 +4,7 @@
 mod helpers;
 
 use ocync_distribution::spec::MediaType;
-use ocync_sync::engine::{SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
+use ocync_sync::engine::TagPair;
 use ocync_sync::{ImageStatus, SkipReason};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -29,27 +27,15 @@ async fn sync_happy_path() {
         .mount_target(&target_server, "mirror/nginx", "latest")
         .await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "library/nginx",
         "mirror/nginx",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("latest")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -83,27 +69,14 @@ async fn sync_skip_on_digest_match() {
     // Target: manifest HEAD returns matching digest -> should skip.
     mount_manifest_head_matching(&target_server, "repo", "v1", &manifest_digest).await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", target_client)],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(
@@ -138,27 +111,14 @@ async fn sync_blob_exists_at_target_skips_transfer() {
     mount_blob_exists(&target_server, "repo", &layer_digest).await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", target_client)],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -181,27 +141,14 @@ async fn sync_manifest_pull_failure() {
         .mount(&source_server)
         .await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", target_client)],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Failed { .. });
@@ -253,27 +200,14 @@ async fn sync_blob_transfer_retries_on_source_500() {
     // Target: standard setup.
     parts.mount_target(&target_server, "repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", target_client)],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -302,28 +236,15 @@ async fn sync_dedup_across_tags() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", target_client)],
         vec![TagPair::same("v1"), TagPair::same("v2")],
     );
 
     // Use max_concurrent=1 to ensure sequential execution so dedup works across tags.
-    let engine = SyncEngine::new(fast_retry(), 1);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_sequential(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 2);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -375,10 +296,8 @@ async fn sync_multiple_targets() {
         parts.mount_target(target, "repo", "v1").await;
     }
 
-    let source_client = mock_client(&source_server);
-
     let mapping = resolved_mapping(
-        source_client,
+        mock_client(&source_server),
         "repo",
         "repo",
         vec![
@@ -388,16 +307,7 @@ async fn sync_multiple_targets() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 2);
     assert!(
@@ -427,27 +337,14 @@ async fn sync_retag() {
     // Target: HEAD for target tag, blobs missing, push at target tag.
     parts.mount_target(&target_server, "repo", "stable").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", target_client)],
         vec![TagPair::retag("latest", "stable")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -455,16 +352,7 @@ async fn sync_retag() {
 
 #[tokio::test]
 async fn sync_empty_mappings() {
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![]).await;
 
     assert!(report.images.is_empty());
     assert_eq!(report.stats.images_synced, 0);
@@ -496,24 +384,14 @@ async fn sync_blob_transfer_failure() {
         .mount(&target_server)
         .await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Failed { .. });
@@ -563,24 +441,14 @@ async fn sync_index_manifest_multi_platform() {
         .mount_target(&target_server, "repo", "latest")
         .await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("latest")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -619,24 +487,14 @@ async fn sync_head_different_digest_proceeds_with_sync() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -656,24 +514,9 @@ async fn sync_empty_tags_produces_no_images() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
-        "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
-        vec![],
-    );
+    let mapping = mapping_from_servers(&source_server, &target_server, "repo", vec![]);
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert!(report.images.is_empty());
     assert_eq!(report.stats.images_synced, 0);
@@ -704,24 +547,14 @@ async fn sync_manifest_push_failure() {
         .mount(&target_server)
         .await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Failed { .. });
@@ -764,24 +597,14 @@ async fn sync_retry_exhaustion_returns_final_error() {
 
     parts.mount_target(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Failed { .. });
@@ -879,16 +702,7 @@ async fn sync_cross_repo_mount_success() {
 
     // Use max_concurrent=1 to ensure mapping_a completes before mapping_b starts,
     // so that repo-a's blobs are in the dedup map for cross-repo mount.
-    let engine = SyncEngine::new(fast_retry(), 1);
-    let report = engine
-        .run(
-            vec![mapping_a, mapping_b],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_sequential(vec![mapping_a, mapping_b]).await;
 
     assert_eq!(report.images.len(), 2);
     assert!(
@@ -977,16 +791,7 @@ async fn sync_cross_repo_mount_fallback_to_pull_push() {
 
     // Use max_concurrent=1 to ensure mapping_a completes first so mapping_b
     // has mount sources available in the dedup map.
-    let engine = SyncEngine::new(fast_retry(), 1);
-    let report = engine
-        .run(
-            vec![mapping_a, mapping_b],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_sequential(vec![mapping_a, mapping_b]).await;
 
     assert_eq!(report.images.len(), 2);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -1067,16 +872,7 @@ async fn sync_cross_repo_mount_failure_falls_back() {
 
     // Use max_concurrent=1 to ensure mapping_a completes first so mapping_b
     // has mount sources available in the dedup map.
-    let engine = SyncEngine::new(fast_retry(), 1);
-    let report = engine
-        .run(
-            vec![mapping_a, mapping_b],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_sequential(vec![mapping_a, mapping_b]).await;
 
     assert_eq!(report.images.len(), 2);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -1123,16 +919,7 @@ async fn sync_multi_target_partial_blob_failure_isolates_targets() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 2);
     // With concurrent execution, results may arrive in any order.

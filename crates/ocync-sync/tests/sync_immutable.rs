@@ -5,10 +5,8 @@ mod helpers;
 
 use std::collections::HashSet;
 
-use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair, TargetEntry};
+use ocync_sync::engine::{ResolvedMapping, TagPair, TargetEntry};
 use ocync_sync::filter::build_glob_set;
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
 use ocync_sync::{ImageStatus, SkipReason};
 use wiremock::MockServer;
 
@@ -62,16 +60,7 @@ async fn immutable_tag_skip_when_present_at_target() {
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Both tags should be skipped as immutable.
     assert_eq!(report.images.len(), 2);
@@ -152,16 +141,7 @@ async fn immutable_tag_not_skipped_when_absent_from_target() {
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Tag must be synced, not skipped.
     assert_eq!(report.images.len(), 1);
@@ -213,16 +193,7 @@ async fn non_matching_tag_falls_through_to_head_check() {
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // "latest" does not match the immutable pattern, so it falls through to
     // HEAD + digest compare. The digest matches, so it should be skipped
@@ -290,16 +261,7 @@ async fn immutable_tag_not_skipped_when_missing_from_one_target() {
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Both targets must be synced (not skipped) since target B is missing the tag.
     assert_eq!(report.images.len(), 2);

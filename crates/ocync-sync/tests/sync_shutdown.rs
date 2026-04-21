@@ -4,10 +4,8 @@
 mod helpers;
 
 use ocync_sync::ImageStatus;
-use ocync_sync::engine::{SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
+use ocync_sync::engine::TagPair;
 use ocync_sync::shutdown::ShutdownSignal;
-use ocync_sync::staging::BlobStage;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -52,11 +50,10 @@ async fn sync_shutdown_stops_new_work() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1"), TagPair::same("v2")],
     );
 
@@ -64,16 +61,7 @@ async fn sync_shutdown_stops_new_work() {
     // Trigger shutdown immediately before the engine even starts running.
     shutdown.trigger();
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&shutdown),
-        )
-        .await;
+    let report = run_sync_with_shutdown(vec![mapping], &shutdown).await;
 
     // With shutdown triggered before run, discovery futures may or may not
     // complete. The key invariant: the engine returns (doesn't hang) and
@@ -128,11 +116,10 @@ async fn sync_shutdown_drains_in_flight() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
@@ -147,16 +134,7 @@ async fn sync_shutdown_drains_in_flight() {
         signal.trigger();
     });
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&shutdown),
-        )
-        .await;
+    let report = run_sync_with_shutdown(vec![mapping], &shutdown).await;
 
     // The in-flight transfer should complete within the drain deadline (2s < 25s).
     assert_eq!(report.images.len(), 1);
@@ -184,11 +162,10 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
     parts.mount_source(&source_server, "repo", "v1").await;
     parts.mount_target(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
@@ -196,16 +173,9 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
     // scenario where the user never sends SIGTERM.
     let shutdown = ShutdownSignal::new();
 
-    let engine = SyncEngine::new(fast_retry(), 50);
     let report = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        engine.run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&shutdown),
-        ),
+        run_sync_with_shutdown(vec![mapping], &shutdown),
     )
     .await
     .expect("engine hung -- did not exit within 10s after completing all work");

@@ -15,9 +15,7 @@ use ocync_distribution::spec::{MediaType, RepositoryName};
 use ocync_distribution::{BatchBlobChecker, Digest};
 use ocync_sync::ImageStatus;
 use ocync_sync::cache::TransferStateCache;
-use ocync_sync::engine::{RegistryAlias, SyncEngine, TagPair, TargetEntry};
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
+use ocync_sync::engine::{RegistryAlias, TagPair, TargetEntry};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -173,25 +171,15 @@ async fn sync_progressive_cache_skips_shared_blob_head_check() {
     mount_manifest_push(&target_server, "repo", "v1").await;
     mount_manifest_push(&target_server, "repo", "v2").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1"), TagPair::same("v2")],
     );
 
     // Sequential execution ensures v1 completes and populates the cache before v2 starts.
-    let engine = SyncEngine::new(fast_retry(), 1);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_sequential(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 2);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -234,9 +222,6 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         .await;
     mount_manifest_push(&target_server, "repo-b", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     // Pre-warm the cache: blobs already exist at repo-a on the target.
     let cache = empty_cache();
     {
@@ -254,24 +239,14 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         );
     }
 
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo-b",
-        "repo-b",
-        vec![target_entry("target", target_client)],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -316,9 +291,6 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
     mount_blob_push(&target_server, "repo-b").await;
     mount_manifest_push(&target_server, "repo-b", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = ecr_mock_client(&target_server);
-
     let cache = empty_cache();
     let target_name = "ecr-target";
     {
@@ -336,23 +308,14 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
     }
 
     let mapping = resolved_mapping(
-        source_client,
+        mock_client(&source_server),
         "repo-b",
         "repo-b",
-        vec![target_entry(target_name, target_client)],
+        vec![target_entry(target_name, ecr_mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -403,132 +366,18 @@ async fn sync_small_blob_uses_monolithic_upload() {
 
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
     assert_eq!(report.images[0].blob_stats.transferred, 2);
-}
-
-/// A stale cache entry records a blob as completed at `other-repo`. The engine
-/// finds a mount source, issues a mount POST, which returns a non-201/non-202
-/// status (treated as an error). The engine invalidates the cache entry and
-/// falls back to HEAD check + full push, which succeeds.
-#[tokio::test]
-async fn sync_lazy_invalidation_on_mount_failure() {
-    let source_server = MockServer::start().await;
-    let target_server = MockServer::start().await;
-
-    let parts = ManifestBuilder::new(b"config-payload")
-        .layer(b"layer-payload")
-        .build();
-
-    parts.mount_source(&source_server, "repo", "v1").await;
-
-    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-
-    // Mount POSTs carry a `mount` query parameter; match on it to distinguish
-    // them from regular upload initiations.  Both mount attempts return 404
-    // (non-retryable error) so the engine invalidates the stale cache entry
-    // and falls back to HEAD check + full push.
-    Mock::given(method("POST"))
-        .and(path("/v2/repo/blobs/uploads/"))
-        .and(query_param("mount", parts.config_desc.digest.to_string()))
-        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
-        .mount(&target_server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v2/repo/blobs/uploads/"))
-        .and(query_param(
-            "mount",
-            parts.layer_descs[0].digest.to_string(),
-        ))
-        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
-        .mount(&target_server)
-        .await;
-
-    // After invalidation the engine falls back to HEAD check (returns 404 = absent).
-    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
-
-    // Fallback push: the blobs are small so the engine takes the monolithic
-    // path (POST -> 202, then PUT -> 201; no PATCH).
-    Mock::given(method("POST"))
-        .and(path("/v2/repo/blobs/uploads/"))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("location", "/v2/repo/blobs/uploads/fallback-id"),
-        )
-        .mount(&target_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path("/v2/repo/blobs/uploads/fallback-id"))
-        .respond_with(ResponseTemplate::new(201))
-        .mount(&target_server)
-        .await;
-    mount_manifest_push(&target_server, "repo", "v1").await;
-
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    // Stale cache: blobs appear completed at other-repo, so the engine will
-    // find a mount source and try a mount before falling back.
-    let cache = empty_cache();
-    {
-        let mut c = cache.borrow_mut();
-        c.set_blob_completed(
-            "target",
-            parts.config_desc.digest.clone(),
-            RepositoryName::new("other-repo").unwrap(),
-        );
-        c.set_blob_completed(
-            "target",
-            parts.layer_descs[0].digest.clone(),
-            RepositoryName::new("other-repo").unwrap(),
-        );
-    }
-
-    let mapping = resolved_mapping(
-        source_client,
-        "repo",
-        "repo",
-        vec![target_entry("target", target_client)],
-        vec![TagPair::same("v1")],
-    );
-
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
-
-    assert_eq!(report.images.len(), 1);
-    assert_status!(report, 0, ImageStatus::Synced);
-    // After failed mounts, fallback push transferred both blobs.
-    assert_eq!(report.images[0].blob_stats.transferred, 2);
-    assert_eq!(report.images[0].blob_stats.mounted, 0);
 }
 
 /// Run a sync, persist the resulting cache to disk, reload it, and verify
@@ -554,16 +403,7 @@ async fn sync_cache_persist_and_load_round_trip() {
     );
 
     let cache = empty_cache();
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            Rc::clone(&cache),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], Rc::clone(&cache)).await;
 
     assert_eq!(report.stats.blobs_transferred, 2);
 
@@ -672,24 +512,14 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         );
     }
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache.clone()).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -771,24 +601,14 @@ async fn sync_warm_cache_skips_blob_head_check() {
         );
     }
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -858,32 +678,20 @@ async fn sync_batch_checker_all_blobs_exist_skips_head() {
     ]);
     let (checker, batch_call_count) = MockBatchChecker::new("tgt/nginx", existing);
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = resolved_mapping(
-        source_client,
+        mock_client(&source_server),
         "src/nginx",
         "tgt/nginx",
         vec![TargetEntry {
             name: RegistryAlias::new("target"),
-            client: target_client,
+            client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
             existing_tags: HashSet::new(),
         }],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Exactly 1 batch call was made.
     assert_eq!(
@@ -975,32 +783,20 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
     ]);
     let (checker, batch_call_count) = MockBatchChecker::new("repo", existing);
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = resolved_mapping(
-        source_client,
+        mock_client(&source_server),
         "repo",
         "repo",
         vec![TargetEntry {
             name: RegistryAlias::new("target"),
-            client: target_client,
+            client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
             existing_tags: HashSet::new(),
         }],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Exactly 1 batch call.
     assert_eq!(
@@ -1076,27 +872,14 @@ async fn sync_no_batch_checker_falls_back_to_per_blob_head() {
 
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", target_client)],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -1155,32 +938,20 @@ async fn sync_batch_checker_failure_falls_back_to_per_blob_head() {
     // Batch checker that always fails.
     let (checker, batch_call_count) = FailingBatchChecker::new("repo");
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = resolved_mapping(
-        source_client,
+        mock_client(&source_server),
         "repo",
         "repo",
         vec![TargetEntry {
             name: RegistryAlias::new("target"),
-            client: target_client,
+            client: mock_client(&target_server),
             batch_checker: Some(Rc::new(checker)),
             existing_tags: HashSet::new(),
         }],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Batch checker was called (and failed).
     assert_eq!(
@@ -1284,10 +1055,8 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
     let existing_b = HashSet::from([parts.config_desc.digest.clone()]);
     let (checker_b, count_b) = MockBatchChecker::new("repo", existing_b);
 
-    let source_client = mock_client(&source_server);
-
     let mapping = resolved_mapping(
-        source_client,
+        mock_client(&source_server),
         "repo",
         "repo",
         vec![
@@ -1307,16 +1076,7 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Each checker called exactly once.
     assert_eq!(
@@ -1445,16 +1205,7 @@ async fn sync_batch_checker_empty_result_transfers_all() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Batch was called (and returned empty).
     assert_eq!(
@@ -1562,16 +1313,7 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Batch checker called exactly once (for target A only).
     assert_eq!(
@@ -1679,16 +1421,7 @@ async fn sync_batch_checker_multi_tag_shares_rc() {
         vec![TagPair::same("v1"), TagPair::same("v2")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Batch checker called twice (once per tag) via the cloned Rc.
     assert_eq!(
@@ -1854,16 +1587,7 @@ async fn sync_batch_checker_index_manifest_all_exist() {
         vec![TagPair::same("latest")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Exactly 1 batch call for the index image.
     assert_eq!(
@@ -1972,16 +1696,7 @@ async fn sync_batch_checker_with_prewarmed_cache() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     // Batch was called even though some blobs were in the cache.
     assert_eq!(

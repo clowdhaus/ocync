@@ -81,28 +81,16 @@ async fn discovery_cache_miss_first_run() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
     let cache = empty_cache();
-    let report = engine
-        .run(
-            vec![mapping],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache.clone()).await;
 
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.discovery_cache_hits, 0);
@@ -158,14 +146,11 @@ async fn discovery_cache_hit_skips_source_get() {
         .mount(&target_server)
         .await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
@@ -183,16 +168,7 @@ async fn discovery_cache_hit_skips_source_get() {
         );
     }
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     assert_eq!(report.stats.images_skipped, 1);
     assert_eq!(report.stats.images_synced, 0);
@@ -250,27 +226,15 @@ async fn discovery_head_failure_falls_through() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], empty_cache()).await;
 
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.discovery_cache_hits, 0);
@@ -334,14 +298,11 @@ async fn discovery_target_stale_triggers_full_pull() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
@@ -359,16 +320,7 @@ async fn discovery_target_stale_triggers_full_pull() {
         );
     }
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.discovery_cache_hits, 0);
@@ -431,14 +383,11 @@ async fn discovery_source_changed_triggers_full_pull() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
@@ -457,16 +406,7 @@ async fn discovery_source_changed_triggers_full_pull() {
         );
     }
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache.clone()).await;
 
     assert_eq!(report.stats.images_synced, 1);
     // HEAD succeeded but digest changed -- cache miss, not head failure.
@@ -536,27 +476,15 @@ async fn discovery_head_404_falls_through() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], empty_cache()).await;
 
     assert_eq!(report.stats.images_synced, 1);
     // 404 on HEAD means no usable digest -- counts as head failure.
@@ -627,14 +555,11 @@ async fn discovery_head_timeout_falls_through() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
@@ -712,14 +637,11 @@ async fn discovery_head_failure_ignores_valid_cache() {
     mount_blob_push(&target_server, "tgt/repo").await;
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
@@ -737,16 +659,7 @@ async fn discovery_head_failure_ignores_valid_cache() {
         );
     }
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     // Image must sync via the GET path, proving the cache was NOT used.
     assert_eq!(report.stats.images_synced, 1);
@@ -790,28 +703,16 @@ async fn discovery_pull_failure_does_not_populate_cache() {
         .mount(&source_server)
         .await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
     let cache = empty_cache();
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache.clone()).await;
 
     assert_eq!(report.stats.images_failed, 1);
     assert_eq!(report.stats.images_synced, 0);
@@ -895,29 +796,17 @@ async fn discovery_zero_platform_match_returns_error() {
         .mount(&source_server)
         .await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     // Request linux/amd64 but index only has linux/s390x.
-    let mut mapping = resolved_mapping(
-        source_client,
+    let mut mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
     mapping.platforms = Some(vec!["linux/amd64".parse().unwrap()]);
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], empty_cache()).await;
 
     assert_eq!(report.stats.images_failed, 1);
     assert_eq!(report.stats.images_synced, 0);
@@ -1056,16 +945,7 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
         );
     }
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     // Two image results: one skipped (Target A), one synced (Target B).
     assert_eq!(report.images.len(), 2);
@@ -1154,14 +1034,11 @@ async fn discovery_retag_uses_correct_tags() {
         .mount(&target_server)
         .await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::retag("v1.0".to_owned(), "latest".to_owned())],
     );
 
@@ -1179,16 +1056,7 @@ async fn discovery_retag_uses_correct_tags() {
         );
     }
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     // Image must be skipped (DigestMatch) via the cache hit path.
     assert_eq!(report.images.len(), 1);
@@ -1350,14 +1218,11 @@ async fn discovery_concurrent_mixed_outcomes() {
     // blob_push already mounted for tgt/repo (shared across tags).
     mount_manifest_push(&target_server, "tgt/repo", "tag-c").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![
             TagPair::same("tag-a".to_owned()),
             TagPair::same("tag-b".to_owned()),
@@ -1379,16 +1244,7 @@ async fn discovery_concurrent_mixed_outcomes() {
         );
     }
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report = engine
-        .run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync_with_cache(vec![mapping], cache).await;
 
     // Tag A: skipped (cache hit). Tag B: synced (cache miss). Tag C: synced (HEAD failure).
     assert_eq!(report.stats.images_skipped, 1, "tag-a should be skipped");
@@ -1466,27 +1322,15 @@ async fn discovery_source_change_across_cycles() {
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
     let cache = empty_cache();
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping_1 = resolved_mapping(
-        source_client,
+    let mapping_1 = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report_1 = engine
-        .run(
-            vec![mapping_1],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report_1 = run_sync_with_cache(vec![mapping_1], cache.clone()).await;
 
     // Cycle 1: cold cache, full sync.
     assert_eq!(report_1.stats.images_synced, 1);
@@ -1558,26 +1402,15 @@ async fn discovery_source_change_across_cycles() {
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
     // Build new mapping (consumed by run()).
-    let source_client_2 = mock_client(&source_server);
-    let target_client_2 = mock_client(&target_server);
-
-    let mapping_2 = resolved_mapping(
-        source_client_2,
+    let mapping_2 = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client_2)],
         vec![TagPair::same("v1".to_owned())],
     );
 
-    let report_2 = engine
-        .run(
-            vec![mapping_2],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report_2 = run_sync_with_cache(vec![mapping_2], cache.clone()).await;
 
     // Cycle 2: cache has D1, HEAD returns D2 -> cache miss, full pull.
     assert_eq!(report_2.stats.images_synced, 1);
@@ -1659,27 +1492,15 @@ async fn discovery_two_cycle_cache_hit() {
     mount_manifest_push(&target_server, "tgt/repo", "v1").await;
 
     let cache = empty_cache();
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping_1 = resolved_mapping(
-        source_client,
+    let mapping_1 = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report_1 = engine
-        .run(
-            vec![mapping_1],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report_1 = run_sync_with_cache(vec![mapping_1], cache.clone()).await;
 
     // Cycle 1: full sync, cache miss.
     assert_eq!(report_1.stats.images_synced, 1);
@@ -1724,26 +1545,15 @@ async fn discovery_two_cycle_cache_hit() {
         .mount(&target_server)
         .await;
 
-    let source_client_2 = mock_client(&source_server);
-    let target_client_2 = mock_client(&target_server);
-
-    let mapping_2 = resolved_mapping(
-        source_client_2,
+    let mapping_2 = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client_2)],
         vec![TagPair::same("v1".to_owned())],
     );
 
-    let report_2 = engine
-        .run(
-            vec![mapping_2],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report_2 = run_sync_with_cache(vec![mapping_2], cache).await;
 
     // Cycle 2: cache hit, image skipped, zero source GETs.
     assert_eq!(report_2.stats.images_skipped, 1);
@@ -1874,28 +1684,16 @@ async fn discovery_platform_filter_change_triggers_cache_miss() {
         .await;
 
     let cache = empty_cache();
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mut mapping_1 = resolved_mapping(
-        source_client,
+    let mut mapping_1 = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![TagPair::same("v1".to_owned())],
     );
     mapping_1.platforms = Some(vec!["linux/amd64".parse().unwrap()]);
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report_1 = engine
-        .run(
-            vec![mapping_1],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report_1 = run_sync_with_cache(vec![mapping_1], cache.clone()).await;
 
     assert_eq!(report_1.stats.images_synced, 1);
     assert_eq!(report_1.stats.discovery_cache_misses, 1);
@@ -1983,27 +1781,16 @@ async fn discovery_platform_filter_change_triggers_cache_miss() {
         .mount(&target_server)
         .await;
 
-    let source_client_2 = mock_client(&source_server);
-    let target_client_2 = mock_client(&target_server);
-
-    let mut mapping_2 = resolved_mapping(
-        source_client_2,
+    let mut mapping_2 = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client_2)],
         vec![TagPair::same("v1".to_owned())],
     );
     mapping_2.platforms = Some(vec!["linux/arm64".parse().unwrap()]);
 
-    let report_2 = engine
-        .run(
-            vec![mapping_2],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report_2 = run_sync_with_cache(vec![mapping_2], cache.clone()).await;
 
     // Platform filter changed → cache miss, full pull of arm64 child.
     assert_eq!(report_2.stats.images_synced, 1);
@@ -2110,30 +1897,18 @@ async fn discovery_snapshot_pruning_removes_deleted_tags() {
     mount_blob_push(&target_server, "tgt/repo").await;
 
     let cache = empty_cache();
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping_1 = resolved_mapping(
-        source_client,
+    let mapping_1 = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client)],
         vec![
             TagPair::same("v1".to_owned()),
             TagPair::same("v2".to_owned()),
         ],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
-    let report_1 = engine
-        .run(
-            vec![mapping_1],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report_1 = run_sync_with_cache(vec![mapping_1], cache.clone()).await;
 
     assert_eq!(report_1.stats.images_synced, 2);
 
@@ -2181,27 +1956,16 @@ async fn discovery_snapshot_pruning_removes_deleted_tags() {
         .mount(&target_server)
         .await;
 
-    let source_client_2 = mock_client(&source_server);
-    let target_client_2 = mock_client(&target_server);
-
-    let mapping_2 = resolved_mapping(
-        source_client_2,
+    let mapping_2 = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/repo",
         "tgt/repo",
-        vec![target_entry("target-reg", target_client_2)],
-        vec![TagPair::same("v1".to_owned())],
         // v2 is gone from the mapping set.
+        vec![TagPair::same("v1".to_owned())],
     );
 
-    let report_2 = engine
-        .run(
-            vec![mapping_2],
-            cache.clone(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report_2 = run_sync_with_cache(vec![mapping_2], cache.clone()).await;
 
     // v1 should be a cache hit (source + target match).
     assert_eq!(report_2.stats.images_skipped, 1);
@@ -2308,16 +2072,7 @@ async fn budget_circuit_breaker_completes_under_zero_budget() {
         tags,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(
         report.images.len(),
@@ -2396,31 +2151,19 @@ async fn budget_circuit_breaker_threshold_floor_small_sync() {
     }
     mount_blob_push(&target_server, "mirror/small").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let tags: Vec<TagPair> = (0..num_tags)
         .map(|i| TagPair::same(format!("t{i}")))
         .collect();
 
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "library/small",
         "mirror/small",
-        vec![target_entry("target-reg", target_client)],
         tags,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), num_tags);
     assert_eq!(report.stats.images_synced, num_tags as u64);
@@ -2496,31 +2239,19 @@ async fn budget_circuit_breaker_resumes_on_budget_refill() {
     }
     mount_blob_push(&target_server, "mirror/refill").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let tags: Vec<TagPair> = (0..num_tags)
         .map(|i| TagPair::same(format!("v{i}")))
         .collect();
 
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "library/refill",
         "mirror/refill",
-        vec![target_entry("target-reg", target_client)],
         tags,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), num_tags);
     assert_eq!(
@@ -2603,16 +2334,7 @@ async fn budget_circuit_breaker_threshold_met_every_cycle() {
         tags,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.stats.images_synced, num_tags as u64);
     // Source client must show zero budget -- proves the AtomicU64 was written
@@ -2679,16 +2401,7 @@ async fn budget_circuit_breaker_no_header_unaffected() {
         tags,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), num_tags);
     assert_eq!(
@@ -2808,16 +2521,7 @@ async fn budget_circuit_breaker_multi_source_all_or_nothing() {
         tags,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping_a, mapping_b],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping_a, mapping_b]).await;
 
     let total = tags_per_source * 2;
     assert_eq!(
@@ -2951,18 +2655,15 @@ async fn budget_circuit_breaker_emits_tracing_warn() {
     }
     mount_blob_push(&target_server, "mirror/traced").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let tags: Vec<TagPair> = (0..num_tags)
         .map(|i| TagPair::same(format!("v{i}")))
         .collect();
 
-    let mapping = resolved_mapping(
-        source_client,
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "library/traced",
         "mirror/traced",
-        vec![target_entry("target-reg", target_client)],
         tags,
     );
 
@@ -3143,21 +2844,15 @@ async fn head_first_mismatch_falls_through_to_get() {
     .await;
 
     // Target HEAD for head_first: returns 404 (not found = mismatch).
-    // Note: wiremock matches in reverse-mount order, so we need separate
-    // mocks for the two target HEAD calls. The first HEAD is from head_first
-    // (returns 404). After the full pull, the engine does another target HEAD
-    // in full_pull_and_build_tasks which also returns 404.
-    Mock::given(method("HEAD"))
-        .and(path("/v2/tgt/repo/manifests/v1"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&target_server)
-        .await;
-
-    // Target blob HEADs and push.
-    mount_blob_not_found(&target_server, "tgt/repo", &parts.config_desc.digest).await;
-    mount_blob_not_found(&target_server, "tgt/repo", &parts.layer_descs[0].digest).await;
-    mount_blob_push(&target_server, "tgt/repo").await;
-    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+    // After the full pull, the engine does another target HEAD in
+    // full_pull_and_build_tasks which also returns 404.
+    mount_target_fresh(
+        &target_server,
+        "tgt/repo",
+        "v1",
+        &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
+    )
+    .await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -3237,11 +2932,13 @@ async fn head_first_source_head_failure_falls_through() {
     .await;
 
     // Target HEAD (from full_pull_and_build_tasks).
-    mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
-    mount_blob_not_found(&target_server, "tgt/repo", &parts.config_desc.digest).await;
-    mount_blob_not_found(&target_server, "tgt/repo", &parts.layer_descs[0].digest).await;
-    mount_blob_push(&target_server, "tgt/repo").await;
-    mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+    mount_target_fresh(
+        &target_server,
+        "tgt/repo",
+        "v1",
+        &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
+    )
+    .await;
 
     let source_client = mock_client(&source_server);
     let target_client = mock_client(&target_server);
@@ -3347,18 +3044,14 @@ async fn head_first_partial_target_match_syncs_only_mismatched() {
     // (If the engine incorrectly sends to target A, wiremock will report
     // unmatched requests and the test runner will surface them.)
 
-    // Target B: HEAD returns 404 (mismatch, needs sync).
-    Mock::given(method("HEAD"))
-        .and(path("/v2/tgt/repo/manifests/v1"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&target_b)
-        .await;
-
-    // Target B: receives the full push.
-    mount_blob_not_found(&target_b, "tgt/repo", &parts.config_desc.digest).await;
-    mount_blob_not_found(&target_b, "tgt/repo", &parts.layer_descs[0].digest).await;
-    mount_blob_push(&target_b, "tgt/repo").await;
-    mount_manifest_push(&target_b, "tgt/repo", "v1").await;
+    // Target B: HEAD returns 404 (mismatch, needs sync). Receives the full push.
+    mount_target_fresh(
+        &target_b,
+        "tgt/repo",
+        "v1",
+        &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
+    )
+    .await;
 
     let source_client = mock_client(&source_server);
 

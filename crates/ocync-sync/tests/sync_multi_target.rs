@@ -4,9 +4,7 @@
 mod helpers;
 
 use ocync_distribution::spec::{MediaType, Platform, PlatformFilter};
-use ocync_sync::engine::{SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
+use ocync_sync::engine::TagPair;
 use ocync_sync::{ErrorKind, ImageStatus, SkipReason};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -185,16 +183,7 @@ async fn sync_platform_filter_multi_target() {
     );
     mapping.platforms = Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]);
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // 2 image results (1 tag x 2 targets).
     assert_eq!(report.images.len(), 2);
@@ -349,16 +338,7 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
         vec![TagPair::same("v1.0")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Per-image: skipped with ImmutableTag reason, NOT failed.
     assert_eq!(report.images.len(), 1);
@@ -447,24 +427,15 @@ async fn sync_non_immutable_400_still_fails() {
         .mount(&target_server)
         .await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers_repos(
+        &source_server,
+        &target_server,
         "src/app",
         "tgt/app",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("latest")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Must be Failed with ManifestPush kind, NOT Skipped.
     assert_eq!(report.images.len(), 1);

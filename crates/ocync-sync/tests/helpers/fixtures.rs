@@ -107,7 +107,7 @@ pub fn resolved_mapping(
     }
 }
 
-/// Build a `ResolvedMapping` directly from mock servers (inlines mock_client + target_entry).
+/// Build a `ResolvedMapping` directly from mock servers (inlines `mock_client` + `target_entry`).
 ///
 /// Convenience for the 60% of tests that have one source, one target, same repo name.
 pub fn mapping_from_servers(

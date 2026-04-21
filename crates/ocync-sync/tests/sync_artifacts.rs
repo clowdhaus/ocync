@@ -7,9 +7,7 @@ mod helpers;
 use std::rc::Rc;
 
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType};
-use ocync_sync::engine::{ResolvedArtifacts, ResolvedMapping, SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
+use ocync_sync::engine::{ResolvedArtifacts, ResolvedMapping, TagPair};
 use ocync_sync::{ErrorKind, ImageStatus};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -33,33 +31,20 @@ async fn artifact_sync_disabled_issues_no_referrers_requests() {
     parent.mount_source(&source_server, "repo", "v1.0.0").await;
     parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = ResolvedMapping {
         artifacts_config: Rc::new(ResolvedArtifacts {
             enabled: false,
             ..ResolvedArtifacts::default()
         }),
-        ..resolved_mapping(
-            source_client,
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", target_client)],
             vec![TagPair::same("v1.0.0")],
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -104,30 +89,17 @@ async fn artifact_sync_transfers_referrer() {
     parent.mount_target(&target_server, "repo", "v1.0.0").await;
     sig.mount_target(&target_server, "repo").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = ResolvedMapping {
         artifacts_config: Rc::new(ResolvedArtifacts::default()),
-        ..resolved_mapping(
-            source_client,
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", target_client)],
             vec![TagPair::same("v1.0.0")],
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -162,34 +134,21 @@ async fn artifact_require_artifacts_fails_on_empty() {
 
     parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = ResolvedMapping {
         artifacts_config: Rc::new(ResolvedArtifacts {
             enabled: true,
             require_artifacts: true,
             ..ResolvedArtifacts::default()
         }),
-        ..resolved_mapping(
-            source_client,
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", target_client)],
             vec![TagPair::same("v1.0.0")],
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Image should fail because require_artifacts is true and no referrers exist.
     assert_eq!(report.images.len(), 1);
@@ -216,34 +175,21 @@ async fn artifact_require_artifacts_does_not_fire_on_api_error() {
 
     parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = ResolvedMapping {
         artifacts_config: Rc::new(ResolvedArtifacts {
             enabled: true,
             require_artifacts: true,
             ..ResolvedArtifacts::default()
         }),
-        ..resolved_mapping(
-            source_client,
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", target_client)],
             vec![TagPair::same("v1.0.0")],
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Image should succeed (sync the image) because we couldn't confirm
     // whether artifacts exist -- require_artifacts only fires on positive
@@ -353,30 +299,17 @@ async fn artifact_sync_tag_fallback_transfers_referrer() {
     mount_blob_not_found(&target_server, "repo", &sig_layer_desc.digest).await;
     mount_manifest_push(&target_server, "repo", &sig_digest_str).await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = ResolvedMapping {
         artifacts_config: Rc::new(ResolvedArtifacts::default()),
-        ..resolved_mapping(
-            source_client,
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", target_client)],
             vec![TagPair::same("v1.0.0")],
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -434,9 +367,6 @@ async fn artifact_sync_include_filter_skips_non_matching() {
     parent.mount_target(&target_server, "repo", "v1.0.0").await;
     sig.mount_target(&target_server, "repo").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = ResolvedMapping {
         artifacts_config: Rc::new(ResolvedArtifacts {
             enabled: true,
@@ -444,25 +374,15 @@ async fn artifact_sync_include_filter_skips_non_matching() {
             exclude: Vec::new(),
             require_artifacts: false,
         }),
-        ..resolved_mapping(
-            source_client,
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", target_client)],
             vec![TagPair::same("v1.0.0")],
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -518,9 +438,6 @@ async fn artifact_require_fires_when_all_filtered_out() {
 
     parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     // require_artifacts + include only cosign (source only has SBOM).
     let mapping = ResolvedMapping {
         artifacts_config: Rc::new(ResolvedArtifacts {
@@ -529,25 +446,15 @@ async fn artifact_require_fires_when_all_filtered_out() {
             exclude: Vec::new(),
             require_artifacts: true,
         }),
-        ..resolved_mapping(
-            source_client,
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", target_client)],
             vec![TagPair::same("v1.0.0")],
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Should fail because no matching artifacts exist after filtering.
     assert_eq!(report.images.len(), 1);
@@ -597,30 +504,17 @@ async fn artifact_blob_dedup_skips_existing() {
     mount_blob_push(&target_server, "repo").await;
     mount_manifest_push(&target_server, "repo", &sig_digest_str).await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = ResolvedMapping {
         artifacts_config: Rc::new(ResolvedArtifacts::default()),
-        ..resolved_mapping(
-            source_client,
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", target_client)],
             vec![TagPair::same("v1.0.0")],
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -679,30 +573,17 @@ async fn artifact_transfer_failure_reports_artifact_sync_error() {
         .mount(&target_server)
         .await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
     let mapping = ResolvedMapping {
         artifacts_config: Rc::new(ResolvedArtifacts::default()),
-        ..resolved_mapping(
-            source_client,
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", target_client)],
             vec![TagPair::same("v1.0.0")],
         )
     };
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     match &report.images[0].status {
