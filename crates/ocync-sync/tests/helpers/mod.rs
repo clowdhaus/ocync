@@ -1,6 +1,28 @@
 //! Shared test helpers for `ocync-sync` integration tests.
+//!
+//! # Architecture
+//!
+//! - **`builders.rs`** -- Builder types that own fixture data with real digests.
+//!   Use `ManifestBuilder`, `ArtifactBuilder`, `IndexBuilder`, `ReferrersIndexBuilder`.
+//!   Output types (`*Parts`) have `.mount_source()` / `.mount_target()` for the
+//!   80% case (fresh target, all blobs missing).
+//!
+//! - **`mocks.rs`** -- Free functions for HTTP mock setup. Use directly when
+//!   mock topology IS the test subject (partial existence, rate limits, push-count
+//!   assertions with `expect(N)`).
+//!
+//! - **`fixtures.rs`** -- Mapping constructors, client helpers, retry config.
+//!   `simple_image_manifest` is for HEAD-check tests using fake digests.
+//!
+//! # When to use what
+//!
+//! | Scenario | Use |
+//! |----------|-----|
+//! | Standard transfer test | `ManifestBuilder` + `mount_source/target` + `run_sync` |
+//! | Need push-count precision | Builders for data, manual mocks with `expect(N)` |
+//! | Discovery/HEAD-check test | `simple_image_manifest` + `make_digest` |
+//! | Custom engine config | `SyncEngine::new(...)` directly |
 
-// During migration, not all helpers are consumed by every test binary.
 // Each test file is its own crate, so `pub` is the correct visibility for
 // cross-module access within a test binary (not `pub(crate)`).
 #![allow(dead_code, unused_imports, unused_macros, unreachable_pub)]
