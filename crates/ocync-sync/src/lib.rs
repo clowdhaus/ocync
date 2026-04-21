@@ -29,6 +29,11 @@ use uuid::Uuid;
 pub use error::Error;
 pub use shutdown::ShutdownSignal;
 
+/// Serde helper: skip serializing when value is zero.
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 /// Result of a complete sync run. The engine never "fails" as a whole.
 #[derive(Debug, Serialize)]
 pub struct SyncReport {
@@ -78,6 +83,14 @@ pub struct ImageResult {
     pub blob_stats: BlobTransferStats,
     /// Wall-clock duration of this image transfer.
     pub duration: Duration,
+    /// Whether artifact discovery or transfer was skipped due to a transient error.
+    ///
+    /// When `true`, the image itself synced successfully but its referrers
+    /// (signatures, SBOMs, attestations) may be missing at the target. Only
+    /// `true` on the transient-error path -- when discovery confirms zero
+    /// referrers, this remains `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub artifacts_skipped: bool,
 }
 
 /// Per-image blob transfer statistics.
@@ -206,6 +219,10 @@ pub struct SyncStats {
     /// Unit is per-target: 2 tags across 3 targets = 6. Consistent with
     /// `images_skipped` which also counts per-target.
     pub immutable_tag_skips: u64,
+    /// Images where artifact discovery or transfer was skipped due to a
+    /// transient error (e.g. referrers API returned 500).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub artifacts_skipped: u64,
 }
 
 #[cfg(test)]
@@ -225,6 +242,7 @@ mod tests {
                     bytes_transferred: 0,
                     blob_stats: BlobTransferStats::default(),
                     duration: Duration::ZERO,
+                    artifacts_skipped: false,
                 })
                 .collect(),
             stats: SyncStats::default(),
@@ -300,6 +318,7 @@ mod tests {
         assert_eq!(stats.blobs_skipped, 0);
         assert_eq!(stats.blobs_mounted, 0);
         assert_eq!(stats.bytes_transferred, 0);
+        assert_eq!(stats.artifacts_skipped, 0);
     }
 
     #[test]
@@ -398,5 +417,66 @@ mod tests {
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["status_code"], 401);
+    }
+
+    #[test]
+    fn image_result_json_omits_artifacts_skipped_when_false() {
+        let result = ImageResult {
+            image_id: Uuid::now_v7(),
+            source: "src".into(),
+            target: "tgt".into(),
+            status: ImageStatus::Synced,
+            bytes_transferred: 0,
+            blob_stats: BlobTransferStats::default(),
+            duration: Duration::ZERO,
+            artifacts_skipped: false,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(
+            json.get("artifacts_skipped").is_none(),
+            "artifacts_skipped=false should be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn image_result_json_includes_artifacts_skipped_when_true() {
+        let result = ImageResult {
+            image_id: Uuid::now_v7(),
+            source: "src".into(),
+            target: "tgt".into(),
+            status: ImageStatus::Synced,
+            bytes_transferred: 0,
+            blob_stats: BlobTransferStats::default(),
+            duration: Duration::ZERO,
+            artifacts_skipped: true,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            json["artifacts_skipped"], true,
+            "artifacts_skipped=true should appear in JSON"
+        );
+    }
+
+    #[test]
+    fn sync_stats_json_omits_artifacts_skipped_when_zero() {
+        let stats = SyncStats::default();
+        let json = serde_json::to_value(&stats).unwrap();
+        assert!(
+            json.get("artifacts_skipped").is_none(),
+            "artifacts_skipped=0 should be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn sync_stats_json_includes_artifacts_skipped_when_nonzero() {
+        let stats = SyncStats {
+            artifacts_skipped: 3,
+            ..SyncStats::default()
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(
+            json["artifacts_skipped"], 3,
+            "artifacts_skipped=3 should appear in JSON"
+        );
     }
 }

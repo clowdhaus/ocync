@@ -31,13 +31,21 @@ fn format_image_line(result: &ImageResult, verbosity: u8) -> Option<String> {
             "FAILED  {} -> {}  ({kind}: {error})",
             result.source, result.target,
         )),
-        ImageStatus::Synced if verbosity >= 1 => Some(format!(
-            "synced  {} -> {}  ({}, {})",
-            result.source,
-            result.target,
-            format_bytes(result.bytes_transferred),
-            format_duration(result.duration),
-        )),
+        ImageStatus::Synced if verbosity >= 1 => {
+            let suffix = if result.artifacts_skipped {
+                ", artifacts skipped"
+            } else {
+                ""
+            };
+            Some(format!(
+                "synced  {} -> {}  ({}, {}{})",
+                result.source,
+                result.target,
+                format_bytes(result.bytes_transferred),
+                format_duration(result.duration),
+                suffix,
+            ))
+        }
         ImageStatus::Skipped { reason } if verbosity >= 1 => Some(format!(
             "skipped {} -> {}  ({reason})",
             result.source, result.target,
@@ -82,9 +90,14 @@ fn write_run_summary(
     } else {
         String::new()
     };
+    let artifacts_warn = if s.artifacts_skipped > 0 {
+        format!(" | {} artifacts skipped", s.artifacts_skipped)
+    } else {
+        String::new()
+    };
     if let Err(e) = writeln!(
         stdout.borrow_mut(),
-        "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {}{}",
+        "sync complete: {} synced, {} skipped, {} failed | blobs: {} transferred, {} skipped, {} mounted | {} in {}{}{}",
         s.images_synced,
         s.images_skipped,
         s.images_failed,
@@ -94,6 +107,7 @@ fn write_run_summary(
         format_bytes(s.bytes_transferred),
         format_duration(report.duration),
         discovery,
+        artifacts_warn,
     ) {
         tracing::warn!(error = %e, "failed to write progress summary to stdout");
     }
@@ -284,6 +298,7 @@ mod tests {
             bytes_transferred: bytes,
             blob_stats: BlobTransferStats::default(),
             duration: Duration::from_secs(14),
+            artifacts_skipped: false,
         }
     }
 
@@ -432,6 +447,17 @@ mod tests {
     }
 
     #[test]
+    fn image_line_synced_with_artifacts_skipped() {
+        let mut result = make_result(ImageStatus::Synced, 432_000_000);
+        result.artifacts_skipped = true;
+        let line = format_image_line(&result, 1).unwrap();
+        assert_eq!(
+            line,
+            "synced  source/repo:v1 -> target/repo:v1  (432.0 MB, 14s, artifacts skipped)"
+        );
+    }
+
+    #[test]
     fn image_line_exact_format_failed() {
         let result = make_result(
             ImageStatus::Failed {
@@ -514,6 +540,7 @@ mod tests {
                 discovery_target_stale: 1,
                 discovery_head_first_skips: 0,
                 immutable_tag_skips: 0,
+                artifacts_skipped: 0,
             },
             duration: Duration::from_secs(47),
         };
@@ -675,6 +702,35 @@ mod tests {
             output.contains("discovery: 0 cached, 0 pulled, 50 immutable"),
             "got: {output}"
         );
+    }
+
+    #[test]
+    fn summary_with_artifacts_skipped() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = SyncReport {
+            run_id: Uuid::now_v7(),
+            images: vec![make_result(ImageStatus::Synced, 1024)],
+            stats: SyncStats {
+                images_synced: 5,
+                artifacts_skipped: 2,
+                ..SyncStats::default()
+            },
+            duration: Duration::from_secs(10),
+        };
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(output.contains("2 artifacts skipped"), "got: {output}");
+    }
+
+    #[test]
+    fn summary_without_artifacts_skipped_omits_suffix() {
+        let buf: Buf = Rc::new(RefCell::new(Vec::new()));
+        let stdout: RefCell<Box<dyn Write>> = RefCell::new(Box::new(RcWriter(Rc::clone(&buf))));
+        let report = make_report(vec![make_result(ImageStatus::Synced, 1024)]);
+        write_run_summary(&stdout, &report, false);
+        let output = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(!output.contains("artifacts skipped"), "got: {output}");
     }
 
     #[test]

@@ -327,6 +327,7 @@ fn skip_image_result(source: &ImageRef, target: &ImageRef, reason: SkipReason) -
         bytes_transferred: 0,
         blob_stats: BlobTransferStats::default(),
         duration: Duration::ZERO,
+        artifacts_skipped: false,
     }
 }
 
@@ -1484,6 +1485,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                     bytes_transferred: 0,
                     blob_stats: BlobTransferStats::default(),
                     duration: Duration::ZERO,
+                    artifacts_skipped: false,
                 })
                 .collect();
             // Do NOT update cache on pull failure.
@@ -1607,6 +1609,7 @@ async fn execute_item(
             bytes_transferred: outcome.bytes_transferred,
             blob_stats: outcome.stats,
             duration: start.elapsed(),
+            artifacts_skipped: false,
         };
     }
 
@@ -1622,7 +1625,7 @@ async fn execute_item(
     {
         Ok(()) => {
             // Discover and sync artifacts (signatures, SBOMs, attestations).
-            if let Err(err) = discover_and_sync_artifacts(
+            let artifacts_skipped = match discover_and_sync_artifacts(
                 &item.source_client,
                 &item.target_client,
                 &item.source.repo,
@@ -1634,31 +1637,43 @@ async fn execute_item(
             )
             .await
             {
-                let (kind, retries) = if err.is_required_artifacts_missing() {
-                    (ErrorKind::RequiredArtifactsMissing, 0)
-                } else {
-                    (ErrorKind::ArtifactSync, retry.max_retries)
-                };
+                Ok(skipped) => skipped,
+                Err(err) => {
+                    let (kind, retries) = if err.is_required_artifacts_missing() {
+                        (ErrorKind::RequiredArtifactsMissing, 0)
+                    } else {
+                        (ErrorKind::ArtifactSync, retry.max_retries)
+                    };
+                    warn!(
+                        source_repo = %item.source.repo,
+                        target_repo = %item.target.repo,
+                        error = %err,
+                        "artifact sync failed"
+                    );
+                    return ImageResult {
+                        image_id: Uuid::now_v7(),
+                        source: item.source.to_string(),
+                        target: item.target.to_string(),
+                        status: ImageStatus::Failed {
+                            kind,
+                            error: err.to_string(),
+                            retries,
+                            status_code: None,
+                        },
+                        bytes_transferred: outcome.bytes_transferred,
+                        blob_stats: outcome.stats,
+                        duration: start.elapsed(),
+                        artifacts_skipped: false,
+                    };
+                }
+            };
+
+            if artifacts_skipped {
                 warn!(
                     source_repo = %item.source.repo,
                     target_repo = %item.target.repo,
-                    error = %err,
-                    "artifact sync failed"
+                    "artifact discovery skipped due to transient error"
                 );
-                return ImageResult {
-                    image_id: Uuid::now_v7(),
-                    source: item.source.to_string(),
-                    target: item.target.to_string(),
-                    status: ImageStatus::Failed {
-                        kind,
-                        error: err.to_string(),
-                        retries,
-                        status_code: None,
-                    },
-                    bytes_transferred: outcome.bytes_transferred,
-                    blob_stats: outcome.stats,
-                    duration: start.elapsed(),
-                };
             }
 
             info!(
@@ -1677,6 +1692,7 @@ async fn execute_item(
                 bytes_transferred: outcome.bytes_transferred,
                 blob_stats: outcome.stats,
                 duration: start.elapsed(),
+                artifacts_skipped,
             }
         }
         Err(err) => {
@@ -1697,6 +1713,7 @@ async fn execute_item(
                     bytes_transferred: outcome.bytes_transferred,
                     blob_stats: outcome.stats,
                     duration: start.elapsed(),
+                    artifacts_skipped: false,
                 }
             } else {
                 warn!(target_name = %item.target_name, error = %err, "manifest push failed");
@@ -1713,6 +1730,7 @@ async fn execute_item(
                     bytes_transferred: outcome.bytes_transferred,
                     blob_stats: outcome.stats,
                     duration: start.elapsed(),
+                    artifacts_skipped: false,
                 }
             }
         }
@@ -2319,6 +2337,9 @@ async fn push_manifests(
 ///
 /// For each matching artifact: push blobs, then push manifest (preserving
 /// the `subject` reference to the parent).
+///
+/// Returns `Ok(true)` when artifact discovery was skipped due to a transient
+/// error (the image synced but artifacts may be missing at the target).
 #[allow(clippy::too_many_arguments)]
 async fn discover_and_sync_artifacts(
     source_client: &RegistryClient,
@@ -2329,9 +2350,9 @@ async fn discover_and_sync_artifacts(
     artifacts_config: &ResolvedArtifacts,
     retry: &RetryConfig,
     referrers_cache: &ReferrersCache,
-) -> Result<(), crate::Error> {
+) -> Result<bool, crate::Error> {
     if !artifacts_config.enabled {
-        return Ok(());
+        return Ok(false);
     }
 
     // Check the per-run referrers cache to avoid redundant discovery when
@@ -2390,7 +2411,9 @@ async fn discover_and_sync_artifacts(
     }
 
     if matching.is_empty() {
-        return Ok(());
+        // Transient discovery failure -> artifacts_skipped = true.
+        // Successful discovery with zero referrers -> false.
+        return Ok(!discovery_succeeded);
     }
 
     info!(
@@ -2472,7 +2495,7 @@ async fn discover_and_sync_artifacts(
         );
     }
 
-    Ok(())
+    Ok(false)
 }
 
 /// Discover referrers for a manifest from the source registry.
@@ -2662,6 +2685,9 @@ fn compute_stats(images: &[ImageResult]) -> SyncStats {
         stats.blobs_transferred += image.blob_stats.transferred;
         stats.blobs_skipped += image.blob_stats.skipped;
         stats.blobs_mounted += image.blob_stats.mounted;
+        if image.artifacts_skipped {
+            stats.artifacts_skipped += 1;
+        }
     }
     stats
 }
@@ -2779,6 +2805,7 @@ mod tests {
             bytes_transferred: bytes,
             blob_stats: BlobTransferStats::default(),
             duration: Duration::from_millis(100),
+            artifacts_skipped: false,
         }
     }
 
