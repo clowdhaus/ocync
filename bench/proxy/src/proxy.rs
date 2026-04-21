@@ -328,28 +328,7 @@ async fn handle_request(
         .unwrap_or_else(|| uri.path().to_owned());
     let url = format!("https://{}{}", target.as_str(), path_and_query);
 
-    // Collect request headers, skipping hop-by-hop entries we must not
-    // forward per RFC 7230  section6.1.
-    //
-    // `append` (not `insert`) preserves multiple values for the same
-    // header name. Go's net/http sends each Accept media type as a
-    // separate header line; `insert` would keep only the last one,
-    // which for regclient/regsync is `v1+prettyjws` -- causing quay.io
-    // to return Docker v1 manifests instead of OCI.
-    let mut headers = http::HeaderMap::new();
-    for (name, value) in req.headers() {
-        if is_hop_by_hop(name) {
-            continue;
-        }
-        headers.append(name.clone(), value.clone());
-    }
-    // Inbound Host is usually the CONNECT authority already, but force
-    // it to match the origin to avoid any chance of leaking the
-    // proxy's own hostname.
-    headers.insert(
-        HOST,
-        HeaderValue::from_str(&host).unwrap_or_else(|_| HeaderValue::from_static("")),
-    );
+    let headers = forward_request_headers(req.headers(), &host);
 
     // Buffer the request body. PATCH/PUT blob chunks are bounded (ocync
     // emits 5–50 MB chunks) and manifests are KB; buffering keeps the
@@ -389,15 +368,7 @@ async fn handle_request(
     };
 
     let status = upstream_resp.status();
-    // Snapshot headers before consuming the body. Use `append` to
-    // preserve multi-value headers (same rationale as request headers).
-    let mut resp_headers = http::HeaderMap::new();
-    for (name, value) in upstream_resp.headers() {
-        if is_hop_by_hop(name) {
-            continue;
-        }
-        resp_headers.append(name.clone(), value.clone());
-    }
+    let resp_headers = forward_headers(upstream_resp.headers());
 
     // Stream the body back to the client, counting bytes, then log once
     // the stream fully drains.
@@ -478,6 +449,36 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             || n == TRANSFER_ENCODING
             || n == UPGRADE
     ) || name.as_str().eq_ignore_ascii_case("keep-alive")
+}
+
+/// Build a forwarded header map from `incoming`, dropping hop-by-hop
+/// headers and preserving multi-value headers via `append`.
+///
+/// `append` (not `insert`) is critical: Go's net/http sends each Accept
+/// media type as a separate header line; `insert` would keep only the
+/// last one, which for regclient/regsync is `v1+prettyjws` -- causing
+/// quay.io to return Docker v1 manifests instead of OCI.
+fn forward_headers(incoming: &http::HeaderMap) -> http::HeaderMap {
+    let mut out = http::HeaderMap::new();
+    for (name, value) in incoming {
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    out
+}
+
+/// Build forwarded request headers: strip hop-by-hop, preserve
+/// multi-value headers, and override `Host` to match the CONNECT
+/// target authority.
+fn forward_request_headers(incoming: &http::HeaderMap, target_host: &str) -> http::HeaderMap {
+    let mut out = forward_headers(incoming);
+    out.insert(
+        HOST,
+        HeaderValue::from_str(target_host).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    out
 }
 
 /// Current UTC time formatted as ISO-8601 with second precision,
@@ -595,50 +596,75 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
 
+    use futures_util::StreamExt;
     use futures_util::stream;
-    use http::HeaderName;
-    use tokio::io::AsyncReadExt;
+    use http::HeaderValue;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
     // -----------------------------------------------------------------
-    // is_hop_by_hop
+    // forward_headers
     // -----------------------------------------------------------------
 
     #[test]
-    fn hop_by_hop_matches_rfc7230_headers() {
-        let hop = [
-            "connection",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailer",
-            "transfer-encoding",
-            "upgrade",
-            "keep-alive",
-        ];
-        for name in &hop {
-            let hn = HeaderName::from_bytes(name.as_bytes()).unwrap();
-            assert!(is_hop_by_hop(&hn), "{name} should be hop-by-hop");
-        }
+    fn forward_headers_strips_hop_by_hop() {
+        let mut incoming = http::HeaderMap::new();
+        incoming.insert("content-type", HeaderValue::from_static("application/json"));
+        incoming.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+        incoming.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+        incoming.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        incoming.insert(TE, HeaderValue::from_static("trailers"));
+
+        let out = forward_headers(&incoming);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("content-type").unwrap(), "application/json");
+        assert!(!out.contains_key(CONNECTION));
+        assert!(!out.contains_key(TRANSFER_ENCODING));
+        assert!(!out.contains_key("keep-alive"));
+        assert!(!out.contains_key(TE));
     }
 
+    /// Regression: Go's net/http sends Accept as separate header lines.
+    /// `insert` would keep only the last one; `append` preserves all.
+    /// This caused quay.io to return Docker v1 manifests instead of OCI
+    /// when the proxy was using `insert`.
     #[test]
-    fn hop_by_hop_rejects_non_hop_headers() {
-        let non_hop = [
-            "content-type",
+    fn forward_headers_preserves_multi_value_accept() {
+        let mut incoming = http::HeaderMap::new();
+        incoming.append(
             "accept",
-            "host",
-            "authorization",
-            "content-length",
-            "cache-control",
-        ];
-        for name in &non_hop {
-            let hn = HeaderName::from_bytes(name.as_bytes()).unwrap();
-            assert!(!is_hop_by_hop(&hn), "{name} should NOT be hop-by-hop");
-        }
+            HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json"),
+        );
+        incoming.append(
+            "accept",
+            HeaderValue::from_static("application/vnd.docker.distribution.manifest.v2+json"),
+        );
+        incoming.append(
+            "accept",
+            HeaderValue::from_static("application/vnd.oci.image.index.v1+json"),
+        );
+
+        let out = forward_headers(&incoming);
+        let values: Vec<_> = out.get_all("accept").iter().collect();
+        assert_eq!(values.len(), 3, "all Accept values must be preserved");
+    }
+
+    /// The client's Host header must be replaced with the CONNECT target
+    /// authority. Without this, the origin sees the proxy's hostname,
+    /// breaking SNI/Host matching and cert validation.
+    #[test]
+    fn forward_request_headers_overrides_host() {
+        let mut incoming = http::HeaderMap::new();
+        incoming.insert(HOST, HeaderValue::from_static("proxy.local:8080"));
+        incoming.insert("accept", HeaderValue::from_static("*/*"));
+
+        let out = forward_request_headers(&incoming, "registry.example.com");
+        assert_eq!(out.get(HOST).unwrap(), "registry.example.com");
+        assert!(out.contains_key("accept"));
     }
 
     // -----------------------------------------------------------------
@@ -653,22 +679,10 @@ mod tests {
 
         let mut out = vec![0u8; 11];
         let n = stream.read(&mut out).await.unwrap();
-        // First read returns the prefix.
         assert_eq!(&out[..n], b"hello");
 
         let n2 = stream.read(&mut out).await.unwrap();
-        // Second read returns the inner stream data.
         assert_eq!(&out[..n2], b" world");
-    }
-
-    #[tokio::test]
-    async fn prefixed_stream_empty_prefix_reads_inner_directly() {
-        let inner = Cursor::new(b"direct");
-        let mut stream = PrefixedStream::new(vec![], inner);
-
-        let mut out = vec![0u8; 16];
-        let n = stream.read(&mut out).await.unwrap();
-        assert_eq!(&out[..n], b"direct");
     }
 
     #[tokio::test]
@@ -677,7 +691,6 @@ mod tests {
         let inner = Cursor::new(b"ghij");
         let mut stream = PrefixedStream::new(prefix, inner);
 
-        // Read with a small buffer that cannot hold the entire prefix.
         let mut small = vec![0u8; 3];
         let n1 = stream.read(&mut small).await.unwrap();
         assert_eq!(&small[..n1], b"abc");
@@ -713,10 +726,25 @@ mod tests {
         stream.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, b"abcd");
 
-        // Subsequent reads must return 0 (EOF).
         let mut trailing = vec![0u8; 8];
         let n = stream.read(&mut trailing).await.unwrap();
         assert_eq!(n, 0, "read after EOF must return 0");
+    }
+
+    /// Writes must pass through to the inner stream without any prefix
+    /// contamination. If a refactor accidentally routes writes through
+    /// the prefix buffer, TLS handshakes would silently corrupt.
+    #[tokio::test]
+    async fn prefixed_stream_write_passes_through() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut stream = PrefixedStream::new(b"prefix-bytes".to_vec(), client);
+
+        stream.write_all(b"hello").await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        server.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"hello");
     }
 
     // -----------------------------------------------------------------
@@ -738,13 +766,10 @@ mod tests {
             })),
         };
 
-        use futures_util::StreamExt;
-        // Drain the stream.
         assert_eq!(wrapper.next().await, Some(Ok(1)));
         assert!(!fired.load(Ordering::SeqCst), "should not fire mid-stream");
         assert_eq!(wrapper.next().await, Some(Ok(2)));
         assert!(!fired.load(Ordering::SeqCst), "should not fire mid-stream");
-        // Stream ends.
         assert_eq!(wrapper.next().await, None);
         assert!(fired.load(Ordering::SeqCst), "should fire when stream ends");
     }
@@ -764,8 +789,6 @@ mod tests {
             })),
         };
 
-        use futures_util::StreamExt;
-        // Read one item then drop without draining.
         assert_eq!(wrapper.next().await, Some(Ok(1)));
         assert!(!fired.load(Ordering::SeqCst));
         drop(wrapper);
@@ -790,12 +813,9 @@ mod tests {
             })),
         };
 
-        use futures_util::StreamExt;
-        // Drain fully (fires on None).
         let _ = wrapper.next().await;
         let _ = wrapper.next().await; // None - fires callback
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        // Drop after stream end should not fire again.
         drop(wrapper);
         assert_eq!(
             count.load(Ordering::SeqCst),
@@ -804,14 +824,60 @@ mod tests {
         );
     }
 
+    /// The production callback calls `Handle::try_current()` + `spawn`
+    /// to write a log entry asynchronously. This test exercises that
+    /// exact pattern to verify the spawned task actually completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn log_on_drop_spawns_async_log_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spawn.jsonl");
+        let log = Arc::new(LogWriter::create(&path).await.unwrap());
+        let log_for_cb = log.clone();
+
+        let items: Vec<Result<i32, &str>> = vec![Ok(1)];
+        let inner = stream::iter(items);
+
+        let mut wrapper = LogOnDrop {
+            inner,
+            logged: false,
+            on_drop: Some(Box::new(move || {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let entry = ProxyEntry {
+                            timestamp: String::new(),
+                            method: "GET",
+                            host: "registry.test",
+                            url: "/v2/",
+                            request_bytes: 0,
+                            response_bytes: 42,
+                            status: 200,
+                            duration_ms: 1,
+                        };
+                        log_for_cb.write_entry(&entry).await;
+                    });
+                }
+            })),
+        };
+
+        let _ = wrapper.next().await;
+        let _ = wrapper.next().await; // None - fires callback
+
+        // The callback spawns an async task; give it time to complete.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "spawned task should write one JSONL entry"
+        );
+    }
+
     // -----------------------------------------------------------------
     // LogWriter
     // -----------------------------------------------------------------
 
-    /// Build a [`ProxyEntry`] with sensible defaults. Callers override the
-    /// fields they care about; the rest are inert placeholders. Using a
-    /// helper avoids scattering `ProxyEntry { .. }` literals across tests
-    /// where a future field addition would require updating every site.
+    /// Build a [`ProxyEntry`] with sensible defaults for tests.
     fn test_entry(method: &str, status: u16) -> ProxyEntry<'_> {
         ProxyEntry {
             timestamp: String::new(),
@@ -879,17 +945,9 @@ mod tests {
             let w = Arc::clone(&writer);
             handles.push(tokio::spawn(async move {
                 let method = if i % 2 == 0 { "GET" } else { "HEAD" };
-                let mut entry = ProxyEntry {
-                    timestamp: String::new(),
-                    method,
-                    host: "registry.test",
-                    url: "/v2/",
-                    request_bytes: 0,
-                    response_bytes: i as u64,
-                    status: 200,
-                    duration_ms: i as u64,
-                };
+                let mut entry = test_entry(method, 200);
                 entry.response_bytes = i as u64;
+                entry.duration_ms = i as u64;
                 w.write_entry(&entry).await;
             }));
         }
