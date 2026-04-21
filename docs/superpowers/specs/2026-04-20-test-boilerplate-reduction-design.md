@@ -294,16 +294,29 @@ Single PR. Migrate all 103 `ImageManifest` constructions and 17 `ImageIndex` con
 
 Verification gate per file: `cargo fmt --check && cargo clippy --tests -- -D warnings && cargo test --package ocync-sync`
 
-### Expected outcome
+### Delivered outcome
 
-| Metric | Before (Phase 1) | After (Phase 2) |
-|--------|-------------------|-----------------|
-| Total integration test lines | ~13,000 | ~5,500 |
-| Lines per new test | 100-150 | 25-40 |
-| Manual ImageManifest constructions | 103 | 0 |
-| Manual ImageIndex constructions | 17 | 0 |
-| Largest file | 3,817 (sync_discovery) | ~1,500 |
-| ManifestBuilder adoption | ~5% | 100% |
+| Metric | Original monolith | After Phase 1 | After Phase 2 |
+|--------|-------------------|---------------|---------------|
+| Total integration test lines | 12,232 | 13,001 | 11,154 |
+| Lines per new test (common) | 100-155 | 100-155 | 45-70 |
+| Manual ImageManifest in test code | 103 | 103 | 4 |
+| Manual ImageIndex in test code | 17 | 17 | 0 |
+| Largest file | 12,232 | 3,817 | 3,421 |
+| Test count | 99 | 99 | 96 (3 redundant removed) |
+| ManifestBuilder adoption | ~5% | ~5% | 88% |
+
+Total reduction: 12,232 (monolith) -> 11,154 (all files incl helpers) = -8.8%.
+
+Per-test authoring improvement is the primary win: new tests are ~50% shorter than
+before (45-70 lines vs 100-155). The total-line reduction is modest because the
+dominant boilerplate -- mock topology setup for non-default scenarios -- correctly
+stays explicit (it IS the test's content, not ceremony).
+
+The 4 remaining manual constructions:
+- 2 in helpers (builder internals)
+- 1 in sync_artifacts (tag fallback test needs `subject` field)
+- 1 in sync_concurrent (per-blob delay test needs dynamic layer count)
 
 ## Appendix A: Why not table-driven tests
 
