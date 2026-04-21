@@ -87,7 +87,7 @@ pub struct ImageResult {
     ///
     /// When `true`, the image itself synced successfully but its referrers
     /// (signatures, SBOMs, attestations) may be missing at the target. Only
-    /// set on the transient-error path -- when discovery confirms zero
+    /// `true` on the transient-error path -- when discovery confirms zero
     /// referrers, this remains `false`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub artifacts_skipped: bool,

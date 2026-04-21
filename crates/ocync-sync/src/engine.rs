@@ -2402,6 +2402,8 @@ async fn discover_and_sync_artifacts(
     }
 
     if matching.is_empty() {
+        // Transient discovery failure -> artifacts_skipped = true.
+        // Successful discovery with zero referrers -> false.
         return Ok(!discovery_succeeded);
     }
 

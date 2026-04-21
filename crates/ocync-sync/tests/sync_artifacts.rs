@@ -48,6 +48,10 @@ async fn artifact_sync_disabled_issues_no_referrers_requests() {
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
+    assert!(
+        !report.images[0].artifacts_skipped,
+        "artifacts_skipped must be false when artifacts are disabled (not a transient skip)"
+    );
 
     // No referrers requests should have been made.
     let source_requests = source_server.received_requests().await.unwrap();
@@ -153,6 +157,10 @@ async fn artifact_require_artifacts_fails_on_empty() {
     // Image should fail because require_artifacts is true and no referrers exist.
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Failed { .. });
+    assert!(
+        !report.images[0].artifacts_skipped,
+        "artifacts_skipped must be false on hard failure (require_artifacts enforcement, not transient)"
+    );
 }
 
 /// When `require_artifacts = true` but the referrers API returns a non-404
@@ -698,4 +706,63 @@ async fn artifact_transfer_failure_reports_artifact_sync_error() {
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+}
+
+/// When the same image is synced to two targets and the referrers API
+/// returns a transient error, both targets should report `artifacts_skipped`.
+/// The second target hits the referrers cache (`CachedReferrers::Failed`),
+/// so this validates cache-mediated propagation of the skip signal.
+///
+/// Negative assertion: if only the first target set `artifacts_skipped`,
+/// the cache would be swallowing the failure for subsequent targets.
+#[tokio::test]
+async fn artifact_transient_error_propagates_to_all_targets() {
+    let source_server = MockServer::start().await;
+    let target_a = MockServer::start().await;
+    let target_b = MockServer::start().await;
+
+    let parent = ManifestBuilder::new(b"mt-cfg").layer(b"mt-layer").build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
+
+    // Referrers API returns 500 (transient error).
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/referrers/{}", parent.digest)))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&source_server)
+        .await;
+
+    // Both targets accept the image.
+    for target in [&target_a, &target_b] {
+        parent.mount_target(target, "repo", "v1.0.0").await;
+    }
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![
+            target_entry("target-a", mock_client(&target_a)),
+            target_entry("target-b", mock_client(&target_b)),
+        ],
+        vec![TagPair::same("v1.0.0")],
+    );
+
+    let report = run_sync(vec![mapping]).await;
+
+    assert_eq!(report.images.len(), 2);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "both targets should sync successfully"
+    );
+    assert!(
+        report.images.iter().all(|r| r.artifacts_skipped),
+        "both targets must report artifacts_skipped (cache propagation)"
+    );
+    assert_eq!(
+        report.stats.artifacts_skipped, 2,
+        "aggregate count must reflect both targets"
+    );
 }
