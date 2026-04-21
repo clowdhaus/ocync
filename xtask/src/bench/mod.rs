@@ -138,6 +138,56 @@ fn progress(msg: &str) {
     eprintln!("{msg}");
 }
 
+/// Refuse to run benchmarks when `TMPDIR` (or the system default) is on tmpfs.
+///
+/// Staging writes multi-GB blobs to `$TMPDIR`. On Amazon Linux 2023, `/tmp`
+/// is a tmpfs mount (RAM-backed), causing `ENOSPC` when the corpus exceeds
+/// available memory. The `bench-remote` xtask sets `TMPDIR=$HOME/ocync/bench/.tmp`
+/// (on EBS) before invoking `cargo xtask bench`. This guard catches manual
+/// invocations that skip that setup.
+fn reject_tmpfs_tmpdir() -> Result<(), Box<dyn std::error::Error>> {
+    let tmpdir = std::env::temp_dir();
+    let tmpdir_str = tmpdir.to_string_lossy();
+
+    // Parse /proc/mounts to find the filesystem type for TMPDIR.
+    // Only exists on Linux; skip the check on other platforms.
+    let mounts = match std::fs::read_to_string("/proc/mounts") {
+        Ok(m) => m,
+        Err(_) => return Ok(()),
+    };
+
+    // Find the mount with the longest matching prefix for TMPDIR.
+    let mut best_match: Option<(&str, &str)> = None;
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let mount_point = parts[1];
+        let fs_type = parts[2];
+        if tmpdir_str.starts_with(mount_point) {
+            let is_longer = best_match
+                .map(|(prev, _)| mount_point.len() > prev.len())
+                .unwrap_or(true);
+            if is_longer {
+                best_match = Some((mount_point, fs_type));
+            }
+        }
+    }
+
+    if let Some((mount_point, "tmpfs")) = best_match {
+        return Err(format!(
+            "TMPDIR ({tmpdir_str}) is on tmpfs (mount: {mount_point}). \
+             Staging writes multi-GB blobs and will hit ENOSPC. \
+             Set TMPDIR to a path on a real filesystem, or use \
+             `cargo xtask bench-remote` which handles this automatically.",
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 /// Derives the registry key from a target registry hostname.
 ///
 /// Used to choose the JSON archive filename (`ecr.json`, `gcr.json`, etc.).
@@ -180,6 +230,11 @@ fn provider_for_registry(key: &str) -> &'static str {
 
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Guard: refuse to run if TMPDIR resolves to tmpfs. Staging writes
+    // multi-GB blobs and tmpfs is RAM-backed, causing OOM/ENOSPC.
+    // The bench-remote xtask sets TMPDIR=$HOME/ocync/bench/.tmp (on EBS).
+    reject_tmpfs_tmpdir()?;
+
     // 1. Parse corpus (apply skip-registries filter, then limit).
     let loaded = corpus::load(&args.corpus)?;
     let filtered = if args.skip_registries.is_empty() {
