@@ -74,6 +74,29 @@ pub enum Error {
         message: String,
     },
 
+    /// A URL could not be constructed or joined.
+    #[error("URL construction failed for '{path}': {reason}")]
+    UrlConstruction {
+        /// The path or URL fragment that failed.
+        path: String,
+        /// Why construction failed.
+        reason: String,
+    },
+
+    /// The upload protocol violated expectations (missing headers, unexpected status).
+    #[error("upload protocol error: {reason}")]
+    UploadProtocol {
+        /// What went wrong during the upload sequence.
+        reason: String,
+    },
+
+    /// Docker config file I/O or parse failure.
+    #[error("docker config error: {reason}")]
+    DockerConfig {
+        /// What went wrong reading or parsing the config.
+        reason: String,
+    },
+
     /// Catch-all for errors without a dedicated variant.
     #[error("{0}")]
     Other(String),
@@ -237,5 +260,50 @@ mod tests {
     fn is_auth_error_other() {
         let err = Error::Other("something".into());
         assert!(!err.is_auth_error());
+    }
+
+    #[test]
+    fn display_url_construction() {
+        let err = Error::UrlConstruction {
+            path: "/v2/".into(),
+            reason: "relative URL without a base".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/v2/"), "should contain path: {msg}");
+        assert!(
+            msg.contains("relative URL without a base"),
+            "should contain source: {msg}"
+        );
+        // Must not match auth or not-found helpers.
+        assert!(!err.is_auth_error());
+        assert!(!err.is_not_found());
+    }
+
+    #[test]
+    fn display_upload_protocol() {
+        let err = Error::UploadProtocol {
+            reason: "missing Location header".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing Location header"),
+            "should contain reason: {msg}"
+        );
+        assert!(!err.is_auth_error());
+        assert!(!err.is_not_found());
+    }
+
+    #[test]
+    fn display_docker_config() {
+        let err = Error::DockerConfig {
+            reason: "unable to determine home directory".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unable to determine home directory"),
+            "should contain reason: {msg}"
+        );
+        assert!(!err.is_auth_error());
+        assert!(!err.is_not_found());
     }
 }

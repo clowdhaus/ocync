@@ -168,7 +168,10 @@ impl RegistryClient {
         let host = self
             .base_url
             .host_str()
-            .ok_or_else(|| Error::Other(format!("registry URL has no host: {}", self.base_url)))?;
+            .ok_or_else(|| Error::UrlConstruction {
+                path: self.base_url.to_string(),
+                reason: "URL has no host".into(),
+            })?;
         let port = self.base_url.port_or_known_default().unwrap_or(443);
         Ok(RegistryAuthority::new(format!("{host}:{port}")))
     }
@@ -403,8 +406,10 @@ async fn classify_response(
 
 /// Construct a URL for the `/v2/` endpoint.
 fn build_v2_url(base: &Url) -> Result<Url, Error> {
-    base.join("/v2/")
-        .map_err(|e| Error::Other(format!("failed to build /v2/ URL: {e}")))
+    base.join("/v2/").map_err(|e| Error::UrlConstruction {
+        path: "/v2/".into(),
+        reason: e.to_string(),
+    })
 }
 
 /// Construct a URL for `/v2/{repository}/{path}`.
@@ -418,8 +423,10 @@ fn build_v2_url(base: &Url) -> Result<Url, Error> {
 /// corrupt the URL structure.
 pub(crate) fn build_url(base: &Url, repository: &str, path: &str) -> Result<Url, Error> {
     let full_path = format!("/v2/{repository}/{path}");
-    base.join(&full_path)
-        .map_err(|e| Error::Other(format!("failed to build URL '{full_path}': {e}")))
+    base.join(&full_path).map_err(|e| Error::UrlConstruction {
+        path: full_path,
+        reason: e.to_string(),
+    })
 }
 
 #[cfg(test)]
