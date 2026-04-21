@@ -4,13 +4,9 @@
 mod helpers;
 
 use ocync_distribution::Digest;
-use ocync_distribution::spec::{
-    Descriptor, ImageIndex, ImageManifest, MediaType, Platform, PlatformFilter,
-};
+use ocync_distribution::spec::{Descriptor, ImageIndex, MediaType, Platform, PlatformFilter};
 use ocync_sync::ImageStatus;
-use ocync_sync::engine::{SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
+use ocync_sync::engine::TagPair;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -30,105 +26,50 @@ async fn sync_index_manifest_platform_filter() {
 
     // --- Build three child image manifests (linux/amd64, linux/arm64, windows/amd64) ---
 
-    let amd64_config_data = b"amd64-config";
-    let amd64_layer_data = b"amd64-layer";
-    let amd64_config_desc = blob_descriptor(amd64_config_data, MediaType::OciConfig);
-    let amd64_layer_desc = blob_descriptor(amd64_layer_data, MediaType::OciLayerGzip);
-    let amd64_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: amd64_config_desc.clone(),
-        layers: vec![amd64_layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (amd64_bytes, amd64_digest) = serialize_manifest(&amd64_manifest);
-
-    let arm64_config_data = b"arm64-config";
-    let arm64_layer_data = b"arm64-layer";
-    let arm64_config_desc = blob_descriptor(arm64_config_data, MediaType::OciConfig);
-    let arm64_layer_desc = blob_descriptor(arm64_layer_data, MediaType::OciLayerGzip);
-    let arm64_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: arm64_config_desc.clone(),
-        layers: vec![arm64_layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (arm64_bytes, arm64_digest) = serialize_manifest(&arm64_manifest);
-
-    let win_config_data = b"win-config";
-    let win_layer_data = b"win-layer";
-    let win_config_desc = blob_descriptor(win_config_data, MediaType::OciConfig);
-    let win_layer_desc = blob_descriptor(win_layer_data, MediaType::OciLayerGzip);
-    let win_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: win_config_desc.clone(),
-        layers: vec![win_layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (win_bytes, win_digest) = serialize_manifest(&win_manifest);
+    let amd64 = ManifestBuilder::new(b"amd64-config")
+        .layer(b"amd64-layer")
+        .build();
+    let arm64 = ManifestBuilder::new(b"arm64-config")
+        .layer(b"arm64-layer")
+        .build();
+    let win = ManifestBuilder::new(b"win-config")
+        .layer(b"win-layer")
+        .build();
 
     // --- Build index with platform-annotated descriptors ---
 
-    let index = ImageIndex {
-        schema_version: 2,
-        media_type: None,
-        manifests: vec![
-            Descriptor {
-                media_type: MediaType::OciManifest,
-                digest: amd64_digest.clone(),
-                size: amd64_bytes.len() as u64,
-                platform: Some(Platform {
-                    architecture: "amd64".into(),
-                    os: "linux".into(),
-                    variant: None,
-                    os_version: None,
-                    os_features: None,
-                }),
-                artifact_type: None,
-                annotations: None,
-            },
-            Descriptor {
-                media_type: MediaType::OciManifest,
-                digest: arm64_digest.clone(),
-                size: arm64_bytes.len() as u64,
-                platform: Some(Platform {
-                    architecture: "arm64".into(),
-                    os: "linux".into(),
-                    variant: None,
-                    os_version: None,
-                    os_features: None,
-                }),
-                artifact_type: None,
-                annotations: None,
-            },
-            Descriptor {
-                media_type: MediaType::OciManifest,
-                digest: win_digest.clone(),
-                size: win_bytes.len() as u64,
-                platform: Some(Platform {
-                    architecture: "amd64".into(),
-                    os: "windows".into(),
-                    variant: None,
-                    os_version: None,
-                    os_features: None,
-                }),
-                artifact_type: None,
-                annotations: None,
-            },
-        ],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let index_bytes = serde_json::to_vec(&index).unwrap();
+    let index = IndexBuilder::new()
+        .manifest(
+            &amd64,
+            Some(Platform {
+                os: "linux".into(),
+                architecture: "amd64".into(),
+                variant: None,
+                os_version: None,
+                os_features: None,
+            }),
+        )
+        .manifest(
+            &arm64,
+            Some(Platform {
+                os: "linux".into(),
+                architecture: "arm64".into(),
+                variant: None,
+                os_version: None,
+                os_features: None,
+            }),
+        )
+        .manifest(
+            &win,
+            Some(Platform {
+                os: "windows".into(),
+                architecture: "amd64".into(),
+                variant: None,
+                os_version: None,
+                os_features: None,
+            }),
+        )
+        .build();
 
     // --- Source: serve index by tag, children by digest ---
 
@@ -136,7 +77,7 @@ async fn sync_index_manifest_platform_filter() {
         .and(path("/v2/repo/manifests/latest"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(index_bytes.clone())
+                .set_body_bytes(index.bytes.clone())
                 .insert_header("content-type", MediaType::OciIndex.as_str()),
         )
         .expect(1)
@@ -145,10 +86,10 @@ async fn sync_index_manifest_platform_filter() {
 
     // amd64 child: expect exactly 1 pull (matching platform).
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", amd64.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(amd64_bytes)
+                .set_body_bytes(amd64.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
@@ -157,10 +98,10 @@ async fn sync_index_manifest_platform_filter() {
 
     // arm64 child: expect 0 pulls (filtered out).
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", arm64.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(arm64_bytes)
+                .set_body_bytes(arm64.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(0)
@@ -169,10 +110,10 @@ async fn sync_index_manifest_platform_filter() {
 
     // windows child: expect 0 pulls (filtered out).
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{win_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", win.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(win_bytes)
+                .set_body_bytes(win.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(0)
@@ -181,66 +122,75 @@ async fn sync_index_manifest_platform_filter() {
 
     // Source blobs: amd64 blobs expect 1 pull each, others expect 0.
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", amd64_config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", amd64.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(amd64_config_data.to_vec())
-                .insert_header("content-length", amd64_config_data.len().to_string()),
+                .set_body_bytes(amd64.config_data.clone())
+                .insert_header("content-length", amd64.config_data.len().to_string()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", amd64_layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            amd64.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(amd64_layer_data.to_vec())
-                .insert_header("content-length", amd64_layer_data.len().to_string()),
+                .set_body_bytes(amd64.layers_data[0].clone())
+                .insert_header("content-length", amd64.layers_data[0].len().to_string()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", arm64_config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", arm64.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(arm64_config_data.to_vec())
-                .insert_header("content-length", arm64_config_data.len().to_string()),
+                .set_body_bytes(arm64.config_data.clone())
+                .insert_header("content-length", arm64.config_data.len().to_string()),
         )
         .expect(0)
         .mount(&source_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", arm64_layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            arm64.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(arm64_layer_data.to_vec())
-                .insert_header("content-length", arm64_layer_data.len().to_string()),
+                .set_body_bytes(arm64.layers_data[0].clone())
+                .insert_header("content-length", arm64.layers_data[0].len().to_string()),
         )
         .expect(0)
         .mount(&source_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", win_config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", win.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(win_config_data.to_vec())
-                .insert_header("content-length", win_config_data.len().to_string()),
+                .set_body_bytes(win.config_data.clone())
+                .insert_header("content-length", win.config_data.len().to_string()),
         )
         .expect(0)
         .mount(&source_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", win_layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            win.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(win_layer_data.to_vec())
-                .insert_header("content-length", win_layer_data.len().to_string()),
+                .set_body_bytes(win.layers_data[0].clone())
+                .insert_header("content-length", win.layers_data[0].len().to_string()),
         )
         .expect(0)
         .mount(&source_server)
@@ -249,12 +199,12 @@ async fn sync_index_manifest_platform_filter() {
     // --- Target: no existing manifest, no blobs, accept all pushes ---
 
     mount_manifest_head_not_found(&target_server, "repo", "latest").await;
-    mount_blob_not_found(&target_server, "repo", &amd64_config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &amd64_layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &amd64.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "repo", &amd64.layer_descs[0].digest).await;
     mount_blob_push(&target_server, "repo").await;
 
     // Accept amd64 child manifest push (by digest).
-    mount_manifest_push(&target_server, "repo", &amd64_digest.to_string()).await;
+    mount_manifest_push(&target_server, "repo", &amd64.digest.to_string()).await;
 
     // Accept filtered index push (by tag).
     mount_manifest_push(&target_server, "repo", "latest").await;
@@ -262,32 +212,22 @@ async fn sync_index_manifest_platform_filter() {
     // arm64 and windows manifest pushes should NOT happen -- wiremock will
     // fail verification if unexpected requests arrive (no mock mounted).
 
-    let mut mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mut mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("latest")],
     );
     mapping.platforms = Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]);
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
     // Only 2 blobs transferred: amd64 config + amd64 layer.
     assert_eq!(report.images[0].blob_stats.transferred, 2);
     assert_eq!(report.images[0].blob_stats.skipped, 0);
-    let expected_bytes = (amd64_config_data.len() + amd64_layer_data.len()) as u64;
+    let expected_bytes = (amd64.config_data.len() + amd64.layers_data[0].len()) as u64;
     assert_eq!(report.images[0].bytes_transferred, expected_bytes);
     // Aggregate stats.
     assert_eq!(report.stats.images_synced, 1);
@@ -359,24 +299,14 @@ async fn sync_nested_index_manifest_returns_error() {
 
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
     assert!(

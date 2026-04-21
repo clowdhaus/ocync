@@ -3,12 +3,8 @@
 
 mod helpers;
 
-use ocync_distribution::spec::{
-    Descriptor, ImageIndex, ImageManifest, MediaType, Platform, PlatformFilter,
-};
-use ocync_sync::engine::{SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
+use ocync_distribution::spec::{MediaType, Platform, PlatformFilter};
+use ocync_sync::engine::TagPair;
 use ocync_sync::{ErrorKind, ImageStatus, SkipReason};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -36,76 +32,37 @@ async fn sync_platform_filter_multi_target() {
 
     // --- Build two child image manifests: linux/amd64 and linux/arm64 ---
 
-    let amd64_config_data = b"amd64-config-multi";
-    let amd64_layer_data = b"amd64-layer-multi";
-    let amd64_config_desc = blob_descriptor(amd64_config_data, MediaType::OciConfig);
-    let amd64_layer_desc = blob_descriptor(amd64_layer_data, MediaType::OciLayerGzip);
-    let amd64_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: amd64_config_desc.clone(),
-        layers: vec![amd64_layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (amd64_bytes, amd64_digest) = serialize_manifest(&amd64_manifest);
-
-    let arm64_config_data = b"arm64-config-multi";
-    let arm64_layer_data = b"arm64-layer-multi";
-    let arm64_config_desc = blob_descriptor(arm64_config_data, MediaType::OciConfig);
-    let arm64_layer_desc = blob_descriptor(arm64_layer_data, MediaType::OciLayerGzip);
-    let arm64_manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: arm64_config_desc.clone(),
-        layers: vec![arm64_layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (arm64_bytes, arm64_digest) = serialize_manifest(&arm64_manifest);
+    let amd64 = ManifestBuilder::new(b"amd64-config-multi")
+        .layer(b"amd64-layer-multi")
+        .build();
+    let arm64 = ManifestBuilder::new(b"arm64-config-multi")
+        .layer(b"arm64-layer-multi")
+        .build();
 
     // --- Build index with platform-annotated descriptors ---
 
-    let index = ImageIndex {
-        schema_version: 2,
-        media_type: None,
-        manifests: vec![
-            Descriptor {
-                media_type: MediaType::OciManifest,
-                digest: amd64_digest.clone(),
-                size: amd64_bytes.len() as u64,
-                platform: Some(Platform {
-                    architecture: "amd64".into(),
-                    os: "linux".into(),
-                    variant: None,
-                    os_version: None,
-                    os_features: None,
-                }),
-                artifact_type: None,
-                annotations: None,
-            },
-            Descriptor {
-                media_type: MediaType::OciManifest,
-                digest: arm64_digest.clone(),
-                size: arm64_bytes.len() as u64,
-                platform: Some(Platform {
-                    architecture: "arm64".into(),
-                    os: "linux".into(),
-                    variant: None,
-                    os_version: None,
-                    os_features: None,
-                }),
-                artifact_type: None,
-                annotations: None,
-            },
-        ],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let index_bytes = serde_json::to_vec(&index).unwrap();
+    let index = IndexBuilder::new()
+        .manifest(
+            &amd64,
+            Some(Platform {
+                os: "linux".into(),
+                architecture: "amd64".into(),
+                variant: None,
+                os_version: None,
+                os_features: None,
+            }),
+        )
+        .manifest(
+            &arm64,
+            Some(Platform {
+                os: "linux".into(),
+                architecture: "arm64".into(),
+                variant: None,
+                os_version: None,
+                os_features: None,
+            }),
+        )
+        .build();
 
     // --- Source: serve index by tag, children by digest ---
 
@@ -114,7 +71,7 @@ async fn sync_platform_filter_multi_target() {
         .and(path("/v2/repo/manifests/latest"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(index_bytes.clone())
+                .set_body_bytes(index.bytes.clone())
                 .insert_header("content-type", MediaType::OciIndex.as_str()),
         )
         .expect(1)
@@ -124,10 +81,10 @@ async fn sync_platform_filter_multi_target() {
     // amd64 child: expect exactly 1 pull (platform matches; pulled once
     // during discovery and cached for both targets).
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{amd64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", amd64.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(amd64_bytes)
+                .set_body_bytes(amd64.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
@@ -136,10 +93,10 @@ async fn sync_platform_filter_multi_target() {
 
     // arm64 child: expect 0 pulls (filtered out).
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/manifests/{arm64_digest}")))
+        .and(path(format!("/v2/repo/manifests/{}", arm64.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(arm64_bytes)
+                .set_body_bytes(arm64.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(0)
@@ -148,22 +105,25 @@ async fn sync_platform_filter_multi_target() {
 
     // amd64 blobs: each pulled once per target (staging disabled -> 2 pulls total).
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", amd64_config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", amd64.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(amd64_config_data.to_vec())
-                .insert_header("content-length", amd64_config_data.len().to_string()),
+                .set_body_bytes(amd64.config_data.clone())
+                .insert_header("content-length", amd64.config_data.len().to_string()),
         )
         .expect(2)
         .mount(&source_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", amd64_layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            amd64.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(amd64_layer_data.to_vec())
-                .insert_header("content-length", amd64_layer_data.len().to_string()),
+                .set_body_bytes(amd64.layers_data[0].clone())
+                .insert_header("content-length", amd64.layers_data[0].len().to_string()),
         )
         .expect(2)
         .mount(&source_server)
@@ -171,22 +131,25 @@ async fn sync_platform_filter_multi_target() {
 
     // arm64 blobs: expect 0 pulls (filtered out).
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", arm64_config_desc.digest)))
+        .and(path(format!("/v2/repo/blobs/{}", arm64.config_desc.digest)))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(arm64_config_data.to_vec())
-                .insert_header("content-length", arm64_config_data.len().to_string()),
+                .set_body_bytes(arm64.config_data.clone())
+                .insert_header("content-length", arm64.config_data.len().to_string()),
         )
         .expect(0)
         .mount(&source_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/blobs/{}", arm64_layer_desc.digest)))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            arm64.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(arm64_layer_data.to_vec())
-                .insert_header("content-length", arm64_layer_data.len().to_string()),
+                .set_body_bytes(arm64.layers_data[0].clone())
+                .insert_header("content-length", arm64.layers_data[0].len().to_string()),
         )
         .expect(0)
         .mount(&source_server)
@@ -198,11 +161,11 @@ async fn sync_platform_filter_multi_target() {
         // HEAD check for index tag.
         mount_manifest_head_not_found(target, "repo", "latest").await;
         // Blob checks and pushes for amd64 only.
-        mount_blob_not_found(target, "repo", &amd64_config_desc.digest).await;
-        mount_blob_not_found(target, "repo", &amd64_layer_desc.digest).await;
+        mount_blob_not_found(target, "repo", &amd64.config_desc.digest).await;
+        mount_blob_not_found(target, "repo", &amd64.layer_descs[0].digest).await;
         mount_blob_push(target, "repo").await;
         // Accept amd64 child manifest push (by digest).
-        mount_manifest_push(target, "repo", &amd64_digest.to_string()).await;
+        mount_manifest_push(target, "repo", &amd64.digest.to_string()).await;
         // Accept filtered index push (by tag).
         mount_manifest_push(target, "repo", "latest").await;
         // arm64 manifest pushes must NOT arrive -- no mock mounted for them.
@@ -220,16 +183,7 @@ async fn sync_platform_filter_multi_target() {
     );
     mapping.platforms = Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]);
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // 2 image results (1 tag x 2 targets).
     assert_eq!(report.images.len(), 2);
@@ -242,7 +196,7 @@ async fn sync_platform_filter_multi_target() {
     );
 
     // Each target transfers 2 blobs (amd64 config + layer).
-    let expected_blob_bytes = (amd64_config_data.len() + amd64_layer_data.len()) as u64;
+    let expected_blob_bytes = (amd64.config_data.len() + amd64.layers_data[0].len()) as u64;
     for result in &report.images {
         assert_eq!(
             result.blob_stats.transferred, 2,
@@ -269,27 +223,16 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-immutable";
-    let layer_data = b"layer-immutable";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-immutable")
+        .layer(b"layer-immutable")
+        .build();
 
     // Source: serve manifest and blobs normally.
     Mock::given(method("GET"))
         .and(path("/v2/src/nginx/manifests/v1.0"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(manifest_bytes.clone())
+                .set_body_bytes(parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
@@ -297,22 +240,28 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/src/nginx/blobs/{}", config_desc.digest)))
+        .and(path(format!(
+            "/v2/src/nginx/blobs/{}",
+            parts.config_desc.digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(config_data.to_vec())
-                .insert_header("content-length", config_data.len().to_string()),
+                .set_body_bytes(parts.config_data.clone())
+                .insert_header("content-length", parts.config_data.len().to_string()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/v2/src/nginx/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/src/nginx/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(layer_data.to_vec())
-                .insert_header("content-length", layer_data.len().to_string()),
+                .set_body_bytes(parts.layers_data[0].clone())
+                .insert_header("content-length", parts.layers_data[0].len().to_string()),
         )
         .expect(1)
         .mount(&source_server)
@@ -330,14 +279,20 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
 
     // Blob HEAD checks -- one per blob.
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/tgt/nginx/blobs/{}", config_desc.digest)))
+        .and(path(format!(
+            "/v2/tgt/nginx/blobs/{}",
+            parts.config_desc.digest
+        )))
         .respond_with(ResponseTemplate::new(404))
         .expect(1)
         .mount(&target_server)
         .await;
 
     Mock::given(method("HEAD"))
-        .and(path(format!("/v2/tgt/nginx/blobs/{}", layer_desc.digest)))
+        .and(path(format!(
+            "/v2/tgt/nginx/blobs/{}",
+            parts.layer_descs[0].digest
+        )))
         .respond_with(ResponseTemplate::new(404))
         .expect(1)
         .mount(&target_server)
@@ -383,16 +338,7 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
         vec![TagPair::same("v1.0")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Per-image: skipped with ImmutableTag reason, NOT failed.
     assert_eq!(report.images.len(), 1);
@@ -411,7 +357,7 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
     assert_eq!(report.images[0].blob_stats.transferred, 2);
     assert_eq!(
         report.images[0].bytes_transferred,
-        config_data.len() as u64 + layer_data.len() as u64
+        parts.config_data.len() as u64 + parts.layers_data[0].len() as u64
     );
 
     // Aggregate stats: counted as skipped, NOT failed.
@@ -434,39 +380,40 @@ async fn sync_non_immutable_400_still_fails() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"config-400";
-    let layer_data = b"layer-400";
-    let config_desc = blob_descriptor(config_data, MediaType::OciConfig);
-    let layer_desc = blob_descriptor(layer_data, MediaType::OciLayerGzip);
-    let manifest = ImageManifest {
-        schema_version: 2,
-        media_type: None,
-        config: config_desc.clone(),
-        layers: vec![layer_desc.clone()],
-        subject: None,
-        artifact_type: None,
-        annotations: None,
-    };
-    let (manifest_bytes, _) = serialize_manifest(&manifest);
+    let parts = ManifestBuilder::new(b"config-400")
+        .layer(b"layer-400")
+        .build();
 
     // Source: expect(1) on manifest pull to verify pull-once.
     Mock::given(method("GET"))
         .and(path("/v2/src/app/manifests/latest"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(manifest_bytes.clone())
+                .set_body_bytes(parts.bytes.clone())
                 .insert_header("content-type", MediaType::OciManifest.as_str()),
         )
         .expect(1)
         .mount(&source_server)
         .await;
 
-    mount_blob_pull(&source_server, "src/app", &config_desc.digest, config_data).await;
-    mount_blob_pull(&source_server, "src/app", &layer_desc.digest, layer_data).await;
+    mount_blob_pull(
+        &source_server,
+        "src/app",
+        &parts.config_desc.digest,
+        &parts.config_data,
+    )
+    .await;
+    mount_blob_pull(
+        &source_server,
+        "src/app",
+        &parts.layer_descs[0].digest,
+        &parts.layers_data[0],
+    )
+    .await;
 
     mount_manifest_head_not_found(&target_server, "tgt/app", "latest").await;
-    mount_blob_not_found(&target_server, "tgt/app", &config_desc.digest).await;
-    mount_blob_not_found(&target_server, "tgt/app", &layer_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/app", &parts.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt/app", &parts.layer_descs[0].digest).await;
     mount_blob_push(&target_server, "tgt/app").await;
 
     // Manifest PUT returns 400 but NOT ImageTagAlreadyExistsException.
@@ -480,24 +427,15 @@ async fn sync_non_immutable_400_still_fails() {
         .mount(&target_server)
         .await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_with_distinct_repos(
+        &source_server,
+        &target_server,
         "src/app",
         "tgt/app",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("latest")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 50);
-    let report = engine
-        .run(
-            vec![mapping],
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_sync(vec![mapping]).await;
 
     // Must be Failed with ManifestPush kind, NOT Skipped.
     assert_eq!(report.images.len(), 1);

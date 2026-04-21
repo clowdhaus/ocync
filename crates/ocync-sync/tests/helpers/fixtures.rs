@@ -107,6 +107,41 @@ pub fn resolved_mapping(
     }
 }
 
+/// Build a `ResolvedMapping` directly from mock servers (inlines `mock_client` + `target_entry`).
+///
+/// Convenience for the 60% of tests that have one source, one target, same repo name.
+pub fn mapping_from_servers(
+    source: &MockServer,
+    target: &MockServer,
+    repo: &str,
+    tags: Vec<TagPair>,
+) -> ResolvedMapping {
+    resolved_mapping(
+        mock_client(source),
+        repo,
+        repo,
+        vec![target_entry("target", mock_client(target))],
+        tags,
+    )
+}
+
+/// Build a `ResolvedMapping` with distinct source/target repos.
+pub fn mapping_with_distinct_repos(
+    source: &MockServer,
+    target: &MockServer,
+    source_repo: &str,
+    target_repo: &str,
+    tags: Vec<TagPair>,
+) -> ResolvedMapping {
+    resolved_mapping(
+        mock_client(source),
+        source_repo,
+        target_repo,
+        vec![target_entry("target", mock_client(target))],
+        tags,
+    )
+}
+
 /// Serialize an `ImageManifest` to JSON bytes and compute its digest.
 pub fn serialize_manifest(manifest: &ImageManifest) -> (Vec<u8>, Digest) {
     let bytes = serde_json::to_vec(manifest).unwrap();
