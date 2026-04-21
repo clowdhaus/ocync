@@ -1452,3 +1452,95 @@ async fn sync_multi_target_partial_blob_failure_isolates_targets() {
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.images_failed, 1);
 }
+// ---------------------------------------------------------------------------
+// ManifestBuilder demonstration: happy path rewritten
+// ---------------------------------------------------------------------------
+
+/// Same test as `sync_happy_path` but using `ManifestBuilder` to demonstrate
+/// the reduced boilerplate.
+#[tokio::test]
+async fn sync_happy_path_manifest_builder() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"config-data-mb")
+        .layer(b"layer-data-mb")
+        .build();
+
+    parts
+        .mount_source(&source_server, "library/nginx", "latest")
+        .await;
+    parts
+        .mount_target(&target_server, "mirror/nginx", "latest")
+        .await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = resolved_mapping(
+        source_client,
+        "library/nginx",
+        "mirror/nginx",
+        vec![target_entry("target-reg", target_client)],
+        vec![TagPair::same("latest")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+    assert_eq!(report.stats.images_synced, 1);
+}
+
+/// Multi-layer manifest builder: verifies 3 layers all transfer correctly.
+#[tokio::test]
+async fn sync_three_layers_manifest_builder() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"cfg-3layer")
+        .layer(b"base-layer")
+        .layer(b"app-layer")
+        .layer(b"runtime-layer")
+        .build();
+
+    parts.mount_source(&source_server, "app/svc", "v2").await;
+    parts.mount_target(&target_server, "mirror/svc", "v2").await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping = resolved_mapping(
+        source_client,
+        "app/svc",
+        "mirror/svc",
+        vec![target_entry("ecr", target_client)],
+        vec![TagPair::same("v2")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 50);
+    let report = engine
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 1);
+    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    // 1 config + 3 layers = 4 blobs.
+    assert_eq!(report.images[0].blob_stats.transferred, 4);
+}
