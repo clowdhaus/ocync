@@ -54,18 +54,19 @@ pub(crate) struct ProxyEntry {
 }
 
 /// Aggregated metrics computed from a set of proxy log entries.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// Field names match the JSON archive format (`bench/results/*.json`)
+/// so this struct can be embedded directly into [`super::report::ToolRecord`]
+/// via `#[serde(flatten)]`. Adding a new metric here automatically
+/// propagates to the archive -- no manual mapping required.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct ProxyMetrics {
     /// Total number of requests captured.
-    pub(crate) total_requests: u64,
-    /// Request counts keyed by HTTP method (sorted for deterministic output).
-    pub(crate) requests_by_method: BTreeMap<String, u64>,
-    /// Number of responses with HTTP 429 status.
-    pub(crate) status_429_count: u64,
-    /// Total bytes across all request bodies.
-    pub(crate) total_request_bytes: u64,
-    /// Total bytes across all response bodies.
-    pub(crate) total_response_bytes: u64,
+    pub(crate) requests: u64,
+    /// HTTP 429 rate-limit responses.
+    pub(crate) rate_limit_429s: u64,
+    /// Total HTTP response bytes.
+    pub(crate) response_bytes: u64,
     /// Number of blob GET requests made to a URL that was already fetched.
     pub(crate) duplicate_blob_gets: u64,
     /// Cross-repo mount POST requests (URLs containing `mount=` AND `from=`).
@@ -73,10 +74,6 @@ pub(crate) struct ProxyMetrics {
     pub(crate) mount_attempts: u64,
     /// Cross-repo mount attempts fulfilled by the registry (201 Created).
     pub(crate) mount_successes: u64,
-    /// Anonymous mount POSTs (URLs containing `mount=` but NO `from=`).
-    /// Used by some tools (e.g. regclient/regsync) as a blob existence check
-    /// that also initializes an upload session. NOT cross-repo mounts.
-    pub(crate) existence_check_posts: u64,
     /// Blob GET requests to source (non-target) registries. Counts logical
     /// blob fetches (registry URLs containing `/blobs/sha256:`), not CDN
     /// follow-up requests from redirect responses.
@@ -91,6 +88,27 @@ pub(crate) struct ProxyMetrics {
     /// Source requests where `X-Cache` contained `"Miss"` (CDN cache miss).
     #[serde(default)]
     pub(crate) cdn_misses: u64,
+    /// Per-action 429 breakdown (e.g. `"BlobUploadInit"` -> 12).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) status_429_by_action: BTreeMap<String, u64>,
+    /// Manifest CDN hits (source `/manifests/` requests with X-Cache Hit).
+    #[serde(default)]
+    pub(crate) manifest_cdn_hits: u64,
+    /// Manifest CDN misses (source `/manifests/` requests with X-Cache Miss).
+    #[serde(default)]
+    pub(crate) manifest_cdn_misses: u64,
+    /// Blob CDN hits (non-manifest source requests with X-Cache Hit).
+    #[serde(default)]
+    pub(crate) blob_cdn_hits: u64,
+    /// Blob CDN misses (non-manifest source requests with X-Cache Miss).
+    #[serde(default)]
+    pub(crate) blob_cdn_misses: u64,
+    /// GET requests to `/v2/` (auth challenge pings).
+    #[serde(default)]
+    pub(crate) auth_v2_pings: u64,
+    /// GET requests to token endpoints (`/token` or `/v2/auth`).
+    #[serde(default)]
+    pub(crate) auth_token_requests: u64,
 }
 
 /// Spawns a `bench-proxy` process and waits for it to bind its port.
@@ -192,35 +210,70 @@ fn parse_log(path: &Path) -> Result<Vec<ProxyEntry>, Box<dyn std::error::Error>>
     Ok(entries)
 }
 
+// Action name constants for 429 breakdown. Names correspond to
+// `RegistryAction` variants in `ocync-distribution/src/aimd.rs` --
+// keep in sync if that enum changes.
+const ACTION_MANIFEST_HEAD: &str = "ManifestHead";
+const ACTION_MANIFEST_READ: &str = "ManifestRead";
+const ACTION_MANIFEST_WRITE: &str = "ManifestWrite";
+const ACTION_BLOB_HEAD: &str = "BlobHead";
+const ACTION_BLOB_READ: &str = "BlobRead";
+const ACTION_BLOB_UPLOAD_INIT: &str = "BlobUploadInit";
+const ACTION_BLOB_UPLOAD_CHUNK: &str = "BlobUploadChunk";
+const ACTION_BLOB_UPLOAD_COMPLETE: &str = "BlobUploadComplete";
+const ACTION_TAG_LIST: &str = "TagList";
+const ACTION_OTHER: &str = "Other";
+
+/// Classifies a registry request by ECR action from the HTTP method and URL path.
+///
+/// Used to break down 429 rate-limit responses by the operation that triggered them.
+fn classify_registry_action(method: &str, url: &str) -> &'static str {
+    match method {
+        "HEAD" if url.contains("/manifests/") => ACTION_MANIFEST_HEAD,
+        "GET" if url.contains("/manifests/") => ACTION_MANIFEST_READ,
+        "PUT" if url.contains("/manifests/") => ACTION_MANIFEST_WRITE,
+        "HEAD" if url.contains("/blobs/sha256:") => ACTION_BLOB_HEAD,
+        "GET" if url.contains("/blobs/sha256:") => ACTION_BLOB_READ,
+        "POST" if url.contains("/blobs/uploads/") => ACTION_BLOB_UPLOAD_INIT,
+        "PATCH" if url.contains("/blobs/uploads/") => ACTION_BLOB_UPLOAD_CHUNK,
+        "PUT" if url.contains("/blobs/uploads/") => ACTION_BLOB_UPLOAD_COMPLETE,
+        "GET" if url.contains("/tags/list") => ACTION_TAG_LIST,
+        _ => ACTION_OTHER,
+    }
+}
+
 /// Computes aggregated metrics from a slice of proxy log entries.
 ///
 /// `target_registry` is the ECR hostname (e.g. `111...dkr.ecr.us-east-1.amazonaws.com`).
 /// Requests to this host are target operations; all others are source pulls.
 pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyMetrics {
-    let mut requests_by_method: BTreeMap<String, u64> = BTreeMap::new();
-    let mut status_429_count = 0u64;
-    let mut total_request_bytes = 0u64;
-    let mut total_response_bytes = 0u64;
+    let mut rate_limit_429s = 0u64;
+    let mut status_429_by_action: BTreeMap<String, u64> = BTreeMap::new();
+    let mut response_bytes = 0u64;
     let mut mount_attempts = 0u64;
     let mut mount_successes = 0u64;
-    let mut existence_check_posts = 0u64;
     let mut source_blob_gets = 0u64;
     let mut source_blob_bytes = 0u64;
     let mut cdn_hits = 0u64;
     let mut cdn_misses = 0u64;
+    let mut manifest_cdn_hits = 0u64;
+    let mut manifest_cdn_misses = 0u64;
+    let mut blob_cdn_hits = 0u64;
+    let mut blob_cdn_misses = 0u64;
+    let mut auth_v2_pings = 0u64;
+    let mut auth_token_requests = 0u64;
 
     // Track GET requests to blob URLs for duplicate detection.
     let mut blob_get_counts: HashMap<String, u64> = HashMap::new();
 
     for entry in entries {
-        *requests_by_method.entry(entry.method.clone()).or_insert(0) += 1;
-
         if entry.status == 429 {
-            status_429_count += 1;
+            rate_limit_429s += 1;
+            let action = classify_registry_action(&entry.method, &entry.url);
+            *status_429_by_action.entry(action.to_owned()).or_insert(0) += 1;
         }
 
-        total_request_bytes += entry.request_bytes;
-        total_response_bytes += entry.response_bytes;
+        response_bytes += entry.response_bytes;
 
         if entry.method == "GET" && entry.url.contains("/blobs/sha256:") {
             *blob_get_counts
@@ -241,15 +294,38 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
             source_blob_bytes += entry.response_bytes;
         }
 
-        // CDN cache status from X-Cache header (source requests only).
+        // CDN cache status from X-Cache header (source requests only),
+        // split by manifest vs blob.
         if entry.host != target_registry {
             if let Some(ref xc) = entry.x_cache {
                 let lower = xc.to_ascii_lowercase();
+                let is_manifest = entry.url.contains("/manifests/");
                 if lower.contains("hit") {
                     cdn_hits += 1;
+                    if is_manifest {
+                        manifest_cdn_hits += 1;
+                    } else {
+                        blob_cdn_hits += 1;
+                    }
                 } else if lower.contains("miss") {
                     cdn_misses += 1;
+                    if is_manifest {
+                        manifest_cdn_misses += 1;
+                    } else {
+                        blob_cdn_misses += 1;
+                    }
                 }
+            }
+        }
+
+        // Auth request tracking.
+        if entry.method == "GET" {
+            if entry.url == "/v2/" {
+                auth_v2_pings += 1;
+            }
+            // Token endpoints: auth.docker.io/token, ghcr.io/token, quay.io/v2/auth, etc.
+            if entry.url.starts_with("/token") || entry.url.starts_with("/v2/auth") {
+                auth_token_requests += 1;
             }
         }
 
@@ -269,8 +345,6 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
                 if entry.status == 201 {
                     mount_successes += 1;
                 }
-            } else {
-                existence_check_posts += 1;
             }
         }
     }
@@ -283,19 +357,23 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
         .sum();
 
     ProxyMetrics {
-        total_requests: entries.len() as u64,
-        requests_by_method,
-        status_429_count,
-        total_request_bytes,
-        total_response_bytes,
+        requests: entries.len() as u64,
+        rate_limit_429s,
+        status_429_by_action,
+        response_bytes,
         duplicate_blob_gets,
         mount_attempts,
         mount_successes,
-        existence_check_posts,
         source_blob_gets,
         source_blob_bytes,
         cdn_hits,
         cdn_misses,
+        manifest_cdn_hits,
+        manifest_cdn_misses,
+        blob_cdn_hits,
+        blob_cdn_misses,
+        auth_v2_pings,
+        auth_token_requests,
     }
 }
 
@@ -368,17 +446,14 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_counts_methods() {
+    fn aggregate_counts_requests() {
         let metrics = aggregate(&sample_entries(), "ecr.aws");
-        assert_eq!(metrics.total_requests, 4);
-        assert_eq!(metrics.requests_by_method["HEAD"], 1);
-        assert_eq!(metrics.requests_by_method["GET"], 2);
-        assert_eq!(metrics.requests_by_method["PUT"], 1);
+        assert_eq!(metrics.requests, 4);
     }
 
     #[test]
     fn aggregate_counts_429s() {
-        assert_eq!(aggregate(&sample_entries(), "ecr.aws").status_429_count, 1);
+        assert_eq!(aggregate(&sample_entries(), "ecr.aws").rate_limit_429s, 1);
     }
 
     #[test]
@@ -390,18 +465,16 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_sums_bytes() {
+    fn aggregate_sums_response_bytes() {
         let metrics = aggregate(&sample_entries(), "ecr.aws");
-        assert_eq!(metrics.total_request_bytes, 2200);
-        assert_eq!(metrics.total_response_bytes, 10100);
+        assert_eq!(metrics.response_bytes, 10100);
     }
 
     #[test]
     fn aggregate_empty_entries() {
         let metrics = aggregate(&[], "ecr.aws");
-        assert_eq!(metrics.total_requests, 0);
+        assert_eq!(metrics.requests, 0);
         assert_eq!(metrics.duplicate_blob_gets, 0);
-        assert!(metrics.requests_by_method.is_empty());
     }
 
     #[test]
@@ -542,6 +615,168 @@ mod tests {
         // source_blob_bytes includes ALL non-target GET responses:
         // source blob (9000) + source manifest (1000) = 10000.
         assert_eq!(metrics.source_blob_bytes, 10000);
+    }
+
+    #[test]
+    fn classify_registry_action_all_variants() {
+        assert_eq!(
+            classify_registry_action("HEAD", "/v2/repo/manifests/sha256:abc"),
+            "ManifestHead"
+        );
+        assert_eq!(
+            classify_registry_action("GET", "/v2/repo/manifests/latest"),
+            "ManifestRead"
+        );
+        assert_eq!(
+            classify_registry_action("PUT", "/v2/repo/manifests/latest"),
+            "ManifestWrite"
+        );
+        assert_eq!(
+            classify_registry_action("HEAD", "/v2/repo/blobs/sha256:abc"),
+            "BlobHead"
+        );
+        assert_eq!(
+            classify_registry_action("GET", "/v2/repo/blobs/sha256:abc"),
+            "BlobRead"
+        );
+        assert_eq!(
+            classify_registry_action("POST", "/v2/repo/blobs/uploads/?mount=sha256:abc"),
+            "BlobUploadInit"
+        );
+        assert_eq!(
+            classify_registry_action("PATCH", "/v2/repo/blobs/uploads/uuid-123"),
+            "BlobUploadChunk"
+        );
+        assert_eq!(
+            classify_registry_action("PUT", "/v2/repo/blobs/uploads/uuid-123?digest=sha256:abc"),
+            "BlobUploadComplete"
+        );
+        assert_eq!(
+            classify_registry_action("GET", "/v2/repo/tags/list"),
+            "TagList"
+        );
+        assert_eq!(classify_registry_action("GET", "/v2/"), "Other");
+    }
+
+    #[test]
+    fn aggregate_429_by_action() {
+        let entries = vec![
+            entry(
+                "PUT",
+                "ecr.aws",
+                "/v2/bench/nginx/manifests/latest",
+                2000,
+                100,
+                429,
+                10,
+            ),
+            entry(
+                "POST",
+                "ecr.aws",
+                "/v2/bench/nginx/blobs/uploads/?mount=sha256:abc",
+                50,
+                0,
+                429,
+                5,
+            ),
+            entry(
+                "PUT",
+                "ecr.aws",
+                "/v2/bench/nginx/manifests/v2",
+                1000,
+                100,
+                429,
+                10,
+            ),
+        ];
+        let metrics = aggregate(&entries, "ecr.aws");
+        assert_eq!(metrics.rate_limit_429s, 3);
+        assert_eq!(metrics.status_429_by_action["ManifestWrite"], 2);
+        assert_eq!(metrics.status_429_by_action["BlobUploadInit"], 1);
+    }
+
+    #[test]
+    fn aggregate_cdn_manifest_blob_split() {
+        let mut manifest_hit = entry(
+            "GET",
+            "docker.io",
+            "/v2/library/nginx/manifests/latest",
+            50,
+            1000,
+            200,
+            50,
+        );
+        manifest_hit.x_cache = Some("Hit from cloudfront".into());
+
+        let mut blob_miss = entry(
+            "GET",
+            "cdn.docker.io",
+            "/v2/library/nginx/blobs/sha256:abc",
+            50,
+            9000,
+            200,
+            100,
+        );
+        blob_miss.x_cache = Some("Miss from cloudfront".into());
+
+        let mut manifest_miss = entry(
+            "HEAD",
+            "docker.io",
+            "/v2/library/nginx/manifests/v2",
+            50,
+            0,
+            200,
+            20,
+        );
+        manifest_miss.x_cache = Some("Miss from cloudfront".into());
+
+        let entries = vec![manifest_hit, blob_miss, manifest_miss];
+        let metrics = aggregate(&entries, "ecr.aws");
+        assert_eq!(metrics.cdn_hits, 1);
+        assert_eq!(metrics.cdn_misses, 2);
+        assert_eq!(metrics.manifest_cdn_hits, 1);
+        assert_eq!(metrics.manifest_cdn_misses, 1);
+        assert_eq!(metrics.blob_cdn_hits, 0);
+        assert_eq!(metrics.blob_cdn_misses, 1);
+    }
+
+    #[test]
+    fn aggregate_auth_request_tracking() {
+        let entries = vec![
+            entry("GET", "docker.io", "/v2/", 0, 0, 401, 10),
+            entry(
+                "GET",
+                "auth.docker.io",
+                "/token?service=registry.docker.io&scope=repository:nginx:pull",
+                0,
+                500,
+                200,
+                50,
+            ),
+            entry("GET", "docker.io", "/v2/", 0, 0, 401, 10),
+            entry(
+                "GET",
+                "quay.io",
+                "/v2/auth?service=quay.io",
+                0,
+                300,
+                200,
+                30,
+            ),
+            // Non-auth GET should not count.
+            entry(
+                "GET",
+                "docker.io",
+                "/v2/library/nginx/manifests/latest",
+                0,
+                1000,
+                200,
+                40,
+            ),
+        ];
+        let metrics = aggregate(&entries, "ecr.aws");
+        assert_eq!(metrics.auth_v2_pings, 2);
+        assert_eq!(metrics.auth_token_requests, 2);
     }
 
     #[test]

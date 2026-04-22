@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::bench::proxy::ProxyMetrics;
 
+/// Serde helper: returns `true` when a `u64` is zero (for `skip_serializing_if`).
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 /// Compact run record for the per-registry JSON archive.
 ///
 /// One record per benchmark execution. Designed for source control:
@@ -62,11 +67,21 @@ pub(crate) struct CorpusInfo {
 pub(crate) struct ScenarioRecord {
     /// Scenario name (e.g. `"Cold sync"`).
     pub(crate) name: String,
+    /// Shuffle seed for tool order randomization (for reproducibility).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) shuffle_seed: u64,
+    /// Tool execution order for this scenario.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tool_order: Vec<String>,
     /// Per-tool results.
     pub(crate) tools: Vec<ToolRecord>,
 }
 
 /// One tool's metrics in the compact run record.
+///
+/// Proxy metrics are embedded via `#[serde(flatten)]` so that adding a
+/// new metric to [`ProxyMetrics`](super::proxy::ProxyMetrics) automatically
+/// appears in the JSON archive -- no manual field mapping needed.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ToolRecord {
     /// Tool name (e.g. `"ocync"`).
@@ -77,28 +92,12 @@ pub(crate) struct ToolRecord {
     pub(crate) wall_clock_secs: f64,
     /// Peak resident set size in KB.
     pub(crate) peak_rss_kb: Option<u64>,
-    /// Total HTTP requests.
-    pub(crate) requests: u64,
-    /// Total HTTP response bytes.
-    pub(crate) response_bytes: u64,
-    /// Blob GETs to source (non-target) registries.
-    pub(crate) source_blob_gets: u64,
-    /// Bytes from source blob GETs.
-    pub(crate) source_blob_bytes: u64,
-    /// Successful cross-repo mounts.
-    pub(crate) mount_successes: u64,
-    /// Total mount attempts.
-    pub(crate) mount_attempts: u64,
-    /// Duplicate blob GET requests.
-    pub(crate) duplicate_blob_gets: u64,
-    /// HTTP 429 rate-limit responses.
-    pub(crate) rate_limit_429s: u64,
-    /// Source CDN cache hits (X-Cache contained "Hit").
-    #[serde(default)]
-    pub(crate) cdn_hits: u64,
-    /// Source CDN cache misses (X-Cache contained "Miss").
-    #[serde(default)]
-    pub(crate) cdn_misses: u64,
+    /// All HTTP proxy metrics (requests, bytes, mounts, CDN, auth, 429s, etc.).
+    #[serde(flatten)]
+    pub(crate) metrics: ProxyMetrics,
+    /// Phase timing from ocync's `OCYNC_TIMING_FILE` (milliseconds).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) phase_timing_ms: BTreeMap<String, u64>,
 }
 
 /// Results for one tool in one scenario.
@@ -114,6 +113,9 @@ pub(crate) struct ToolRun {
     pub(crate) peak_rss_kb: Option<u64>,
     /// HTTP proxy metrics, if a proxy was attached.
     pub(crate) proxy_metrics: Option<ProxyMetrics>,
+    /// Phase timing from ocync's `OCYNC_TIMING_FILE` (milliseconds).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) phase_timing_ms: BTreeMap<String, u64>,
 }
 
 /// One scenario across all tools.
@@ -123,6 +125,12 @@ pub(crate) struct ScenarioResult {
     pub(crate) scenario: String,
     /// Per-tool run results.
     pub(crate) runs: Vec<ToolRun>,
+    /// Shuffle seed for tool order randomization (for the JSON archive).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) shuffle_seed: u64,
+    /// Tool execution order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tool_order: Vec<String>,
 }
 
 /// A single point on the scaling curve.
@@ -458,21 +466,17 @@ fn metric_rows() -> Vec<MetricRow> {
         },
         MetricRow {
             label: "Requests",
-            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.total_requests)),
-            display: Box::new(|r| {
-                r.proxy_metrics
-                    .as_ref()
-                    .map(|m| m.total_requests.to_string())
-            }),
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.requests)),
+            display: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.requests.to_string())),
             lower_is_better: true,
         },
         MetricRow {
             label: "Response bytes",
-            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.total_response_bytes)),
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.response_bytes)),
             display: Box::new(|r| {
                 r.proxy_metrics
                     .as_ref()
-                    .map(|m| format_bytes(m.total_response_bytes))
+                    .map(|m| format_bytes(m.response_bytes))
             }),
             lower_is_better: true,
         },
@@ -528,11 +532,11 @@ fn metric_rows() -> Vec<MetricRow> {
         },
         MetricRow {
             label: "Rate-limit 429s",
-            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.status_429_count)),
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.rate_limit_429s)),
             display: Box::new(|r| {
                 r.proxy_metrics
                     .as_ref()
-                    .map(|m| m.status_429_count.to_string())
+                    .map(|m| m.rate_limit_429s.to_string())
             }),
             lower_is_better: true,
         },
@@ -819,6 +823,7 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(65536),
                         proxy_metrics: None,
+                        phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
                         tool: "dregsy".to_string(),
@@ -826,8 +831,11 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(131072),
                         proxy_metrics: None,
+                        phase_timing_ms: BTreeMap::new(),
                     },
                 ],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
             }],
             scale: vec![],
         }
@@ -966,7 +974,10 @@ mod tests {
                     exit_code: Some(0),
                     peak_rss_kb: Some(65536),
                     proxy_metrics: None,
+                    phase_timing_ms: BTreeMap::new(),
                 }],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
             }],
             scale: vec![],
         };
@@ -996,21 +1007,23 @@ mod tests {
             },
             scenarios: vec![ScenarioRecord {
                 name: "Cold sync".into(),
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
                 tools: vec![ToolRecord {
                     tool: "ocync".into(),
                     version: "0.1.0".into(),
                     wall_clock_secs: 273.0,
                     peak_rss_kb: Some(59468),
-                    requests: 4131,
-                    response_bytes: 16_900_000_000,
-                    source_blob_gets: 726,
-                    source_blob_bytes: 77200,
-                    mount_successes: 362,
-                    mount_attempts: 379,
-                    duplicate_blob_gets: 0,
-                    rate_limit_429s: 0,
-                    cdn_hits: 0,
-                    cdn_misses: 0,
+                    metrics: ProxyMetrics {
+                        requests: 4131,
+                        response_bytes: 16_900_000_000,
+                        source_blob_gets: 726,
+                        source_blob_bytes: 77200,
+                        mount_successes: 362,
+                        mount_attempts: 379,
+                        ..Default::default()
+                    },
+                    phase_timing_ms: BTreeMap::new(),
                 }],
             }],
         };
@@ -1021,7 +1034,7 @@ mod tests {
         assert_eq!(parsed.machine.provider, "aws");
         assert_eq!(parsed.machine.memory_gib, 32.0);
         assert_eq!(parsed.corpus.images, 42);
-        assert_eq!(parsed.scenarios[0].tools[0].requests, 4131);
+        assert_eq!(parsed.scenarios[0].tools[0].metrics.requests, 4131);
     }
 
     #[test]
@@ -1124,7 +1137,10 @@ mod tests {
                     exit_code: Some(0),
                     peak_rss_kb: Some(65536),
                     proxy_metrics: None,
+                    phase_timing_ms: BTreeMap::new(),
                 }],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
             }],
             scale: vec![],
         };
@@ -1165,7 +1181,10 @@ mod tests {
                     exit_code: Some(0),
                     peak_rss_kb: Some(51200),
                     proxy_metrics: None,
+                    phase_timing_ms: BTreeMap::new(),
                 }],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
             }],
             scale: vec![],
         };
@@ -1239,20 +1258,15 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(59468),
                         proxy_metrics: Some(ProxyMetrics {
-                            total_requests: 4131,
-                            requests_by_method: BTreeMap::new(),
-                            status_429_count: 0,
-                            total_request_bytes: 0,
-                            total_response_bytes: 16_900_000_000,
-                            duplicate_blob_gets: 0,
+                            requests: 4131,
+                            response_bytes: 16_900_000_000,
                             mount_attempts: 379,
                             mount_successes: 362,
-                            existence_check_posts: 0,
                             source_blob_gets: 726,
                             source_blob_bytes: 77_200,
-                            cdn_hits: 0,
-                            cdn_misses: 0,
+                            ..Default::default()
                         }),
+                        phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
                         tool: "dregsy".to_string(),
@@ -1260,22 +1274,21 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(304500),
                         proxy_metrics: Some(ProxyMetrics {
-                            total_requests: 11190,
-                            requests_by_method: BTreeMap::new(),
-                            status_429_count: 49,
-                            total_request_bytes: 0,
-                            total_response_bytes: 43_400_000_000,
+                            requests: 11190,
+                            rate_limit_429s: 49,
+                            response_bytes: 43_400_000_000,
                             duplicate_blob_gets: 1,
                             mount_attempts: 293,
                             mount_successes: 293,
-                            existence_check_posts: 0,
                             source_blob_gets: 1324,
                             source_blob_bytes: 120_100,
-                            cdn_hits: 0,
-                            cdn_misses: 0,
+                            ..Default::default()
                         }),
+                        phase_timing_ms: BTreeMap::new(),
                     },
                 ],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
             }],
             scale: vec![],
         }
@@ -1340,20 +1353,15 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(59468),
                         proxy_metrics: Some(ProxyMetrics {
-                            total_requests: 4131,
-                            requests_by_method: BTreeMap::new(),
-                            status_429_count: 0,
-                            total_request_bytes: 0,
-                            total_response_bytes: 16_900_000_000,
-                            duplicate_blob_gets: 0,
+                            requests: 4131,
+                            response_bytes: 16_900_000_000,
                             mount_attempts: 379,
                             mount_successes: 362,
-                            existence_check_posts: 0,
                             source_blob_gets: 726,
                             source_blob_bytes: 77_200,
-                            cdn_hits: 0,
-                            cdn_misses: 0,
+                            ..Default::default()
                         }),
+                        phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
                         tool: "dregsy".to_string(),
@@ -1362,8 +1370,11 @@ mod tests {
                         peak_rss_kb: Some(304500),
                         // dregsy has no proxy metrics in this test.
                         proxy_metrics: None,
+                        phase_timing_ms: BTreeMap::new(),
                     },
                 ],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
             }],
             scale: vec![],
         };
@@ -1401,20 +1412,10 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(65536),
                         proxy_metrics: Some(ProxyMetrics {
-                            total_requests: 1000,
-                            requests_by_method: BTreeMap::new(),
-                            status_429_count: 0,
-                            total_request_bytes: 0,
-                            total_response_bytes: 0,
-                            duplicate_blob_gets: 0,
-                            mount_attempts: 0,
-                            mount_successes: 0,
-                            existence_check_posts: 0,
-                            source_blob_gets: 0,
-                            source_blob_bytes: 0,
-                            cdn_hits: 0,
-                            cdn_misses: 0,
+                            requests: 1000,
+                            ..Default::default()
                         }),
+                        phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
                         tool: "dregsy".to_string(),
@@ -1422,22 +1423,14 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(65536), // same RSS
                         proxy_metrics: Some(ProxyMetrics {
-                            total_requests: 2000, // different requests
-                            requests_by_method: BTreeMap::new(),
-                            status_429_count: 0,
-                            total_request_bytes: 0,
-                            total_response_bytes: 0,
-                            duplicate_blob_gets: 0,
-                            mount_attempts: 0,
-                            mount_successes: 0,
-                            existence_check_posts: 0,
-                            source_blob_gets: 0,
-                            source_blob_bytes: 0,
-                            cdn_hits: 0,
-                            cdn_misses: 0,
+                            requests: 2000, // different requests
+                            ..Default::default()
                         }),
+                        phase_timing_ms: BTreeMap::new(),
                     },
                 ],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
             }],
             scale: vec![],
         };
@@ -1498,7 +1491,10 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(51200),
                         proxy_metrics: None,
+                        phase_timing_ms: BTreeMap::new(),
                     }],
+                    shuffle_seed: 0,
+                    tool_order: Vec::new(),
                 },
                 ScenarioResult {
                     scenario: "Warm sync (no-op)".to_string(),
@@ -1508,7 +1504,10 @@ mod tests {
                         exit_code: Some(0),
                         peak_rss_kb: Some(40960),
                         proxy_metrics: None,
+                        phase_timing_ms: BTreeMap::new(),
                     }],
+                    shuffle_seed: 0,
+                    tool_order: Vec::new(),
                 },
             ],
             scale: vec![],
@@ -1550,7 +1549,10 @@ mod tests {
                     exit_code: Some(0),
                     peak_rss_kb: Some(40960),
                     proxy_metrics: None,
+                    phase_timing_ms: BTreeMap::new(),
                 }],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
             }],
             scale: vec![],
         };
