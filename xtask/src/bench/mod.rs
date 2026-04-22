@@ -28,8 +28,8 @@ pub(crate) struct BenchArgs {
     #[command(subcommand)]
     pub(crate) scenario: Scenario,
 
-    /// Comma-separated list of tools to benchmark (default: all).
-    #[arg(long, value_delimiter = ',', default_value = "ocync,dregsy,regsync")]
+    /// Comma-separated list of tools to benchmark.
+    #[arg(long, value_delimiter = ',', default_value = "ocync")]
     pub(crate) tools: Vec<String>,
 
     /// Path to corpus YAML file.

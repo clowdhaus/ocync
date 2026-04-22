@@ -28,7 +28,7 @@ pub(crate) struct BlobInfo {
     /// Set of repositories at the target that have this blob.
     ///
     /// `BTreeSet` guarantees deterministic iteration order, which makes
-    /// [`BlobDedupMap::mount_source`] return a consistent result.
+    /// mount source selection return a consistent result.
     pub repos: BTreeSet<RepositoryName>,
     /// When [`status`] is [`BlobStatus::InProgress`], the repository whose
     /// transfer is currently uploading this blob. Other concurrent transfers

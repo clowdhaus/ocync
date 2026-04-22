@@ -49,7 +49,7 @@ pub(crate) struct BenchRemoteArgs {
     pub(crate) git_ref: Option<String>,
 
     /// Tools to benchmark (passed through to `cargo xtask bench`).
-    #[arg(long, default_value = "ocync,dregsy,regsync")]
+    #[arg(long, default_value = "ocync")]
     pub(crate) tools: String,
 
     /// Scenario to run (passed through to `cargo xtask bench`).
