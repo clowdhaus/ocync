@@ -338,16 +338,25 @@ pub(crate) async fn resolve_mapping(
 
     // --- Fetch and filter tags ---
     let source_repo_path = RepositoryName::new(&mapping.from)?;
-    let all_tags = source_client.list_tags(&source_repo_path).await?;
 
     let tags_config = mapping
         .tags
         .as_ref()
         .or(config.defaults.as_ref().and_then(|d| d.tags.as_ref()));
 
-    let filter = build_filter(tags_config);
-    let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-    let filtered = filter.apply(&tag_refs)?;
+    // Fast path: when the config specifies only exact tag names (no
+    // wildcards, semver, latest, exclude), use them directly without
+    // enumerating all tags from the source registry. This avoids
+    // hundreds of paginated tags/list requests for repos with thousands
+    // of tags.
+    let filtered = if let Some(exact) = tags_config.and_then(|t| t.exact_tags()) {
+        exact
+    } else {
+        let all_tags = source_client.list_tags(&source_repo_path).await?;
+        let filter = build_filter(tags_config);
+        let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
+        filter.apply(&tag_refs)?
+    };
 
     if filtered.is_empty() {
         tracing::warn!(

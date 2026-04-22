@@ -423,6 +423,38 @@ pub(crate) struct TagsConfig {
     pub immutable_tags: Option<String>,
 }
 
+impl TagsConfig {
+    /// Returns the exact tag names if this config requires no enumeration.
+    ///
+    /// Returns `Some` when `glob` contains only literal strings (no wildcard
+    /// characters) and no other filter fields (`semver`, `latest`, `sort`,
+    /// `min_tags`) are set. In this case the tags can be used directly
+    /// without listing all tags from the registry.
+    pub(crate) fn exact_tags(&self) -> Option<Vec<String>> {
+        // Any field that requires the full tag list forces enumeration.
+        if self.semver.is_some()
+            || self.latest.is_some()
+            || self.sort.is_some()
+            || self.min_tags.is_some()
+            || self.exclude.is_some()
+        {
+            return None;
+        }
+        let patterns = match &self.glob {
+            Some(GlobOrList::Single(s)) => vec![s.clone()],
+            Some(GlobOrList::List(v)) => v.clone(),
+            None => return None, // No glob = sync all tags = must enumerate.
+        };
+        // A pattern is "exact" if it contains no glob metacharacters.
+        let is_exact = |s: &str| !s.contains('*') && !s.contains('?') && !s.contains('[');
+        if patterns.iter().all(|p| is_exact(p)) {
+            Some(patterns)
+        } else {
+            None
+        }
+    }
+}
+
 /// A glob pattern: either a single string or a list of patterns.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
@@ -1815,6 +1847,95 @@ mappings:
         };
         validate_artifacts("test-mapping", &artifacts).unwrap();
     }
+
+    // - TagsConfig::exact_tags() -------------------------------------------
+
+    #[test]
+    fn exact_tags_plain_list() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::List(vec!["latest".into(), "3.20".into()])),
+            ..Default::default()
+        };
+        assert_eq!(
+            tags.exact_tags(),
+            Some(vec!["latest".into(), "3.20".into()])
+        );
+    }
+
+    #[test]
+    fn exact_tags_single() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::Single("v1.0.0".into())),
+            ..Default::default()
+        };
+        assert_eq!(tags.exact_tags(), Some(vec!["v1.0.0".into()]));
+    }
+
+    #[test]
+    fn exact_tags_with_wildcard_returns_none() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::Single("v1.*".into())),
+            ..Default::default()
+        };
+        assert!(tags.exact_tags().is_none());
+    }
+
+    #[test]
+    fn exact_tags_with_semver_returns_none() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::Single("latest".into())),
+            semver: Some(">=1.0".into()),
+            ..Default::default()
+        };
+        assert!(tags.exact_tags().is_none());
+    }
+
+    #[test]
+    fn exact_tags_with_latest_returns_none() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::Single("latest".into())),
+            latest: Some(5),
+            sort: Some(SortOrder::Semver),
+            ..Default::default()
+        };
+        assert!(tags.exact_tags().is_none());
+    }
+
+    #[test]
+    fn exact_tags_no_glob_returns_none() {
+        let tags = TagsConfig::default();
+        assert!(tags.exact_tags().is_none());
+    }
+
+    #[test]
+    fn exact_tags_question_mark_returns_none() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::Single("v1.?".into())),
+            ..Default::default()
+        };
+        assert!(tags.exact_tags().is_none());
+    }
+
+    #[test]
+    fn exact_tags_bracket_returns_none() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::Single("[0-9]*".into())),
+            ..Default::default()
+        };
+        assert!(tags.exact_tags().is_none());
+    }
+
+    #[test]
+    fn exact_tags_with_exclude_returns_none() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::List(vec!["v1.0".into(), "v2.0".into()])),
+            exclude: Some(GlobOrList::Single("v2.0".into())),
+            ..Default::default()
+        };
+        assert!(tags.exact_tags().is_none());
+    }
+
+    // - ArtifactsConfig -------------------------------------------------------
 
     #[test]
     fn artifacts_defaults_enabled() {
