@@ -93,6 +93,12 @@ pub(crate) struct ToolRecord {
     pub(crate) duplicate_blob_gets: u64,
     /// HTTP 429 rate-limit responses.
     pub(crate) rate_limit_429s: u64,
+    /// Source CDN cache hits (X-Cache contained "Hit").
+    #[serde(default)]
+    pub(crate) cdn_hits: u64,
+    /// Source CDN cache misses (X-Cache contained "Miss").
+    #[serde(default)]
+    pub(crate) cdn_misses: u64,
 }
 
 /// Results for one tool in one scenario.
@@ -217,8 +223,6 @@ fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize,
             "InstanceTypes[0].{Arch:ProcessorInfo.SupportedArchitectures[0],Cpu:ProcessorInfo.Manufacturer,Vcpus:VCpuInfo.DefaultVCpus,Mem:MemoryInfo.SizeInMiB,Net:NetworkInfo.NetworkPerformance}",
             "--output",
             "json",
-            "--region",
-            "us-east-1",
         ])
         .output()
         .ok()
@@ -511,6 +515,16 @@ fn metric_rows() -> Vec<MetricRow> {
                     .map(|m| m.duplicate_blob_gets.to_string())
             }),
             lower_is_better: true,
+        },
+        MetricRow {
+            label: "CDN hits/misses",
+            rank: Box::new(|r| r.proxy_metrics.as_ref().map(|m| m.cdn_hits)),
+            display: Box::new(|r| {
+                r.proxy_metrics
+                    .as_ref()
+                    .map(|m| format!("{}/{}", m.cdn_hits, m.cdn_misses))
+            }),
+            lower_is_better: false,
         },
         MetricRow {
             label: "Rate-limit 429s",
@@ -995,6 +1009,8 @@ mod tests {
                     mount_attempts: 379,
                     duplicate_blob_gets: 0,
                     rate_limit_429s: 0,
+                    cdn_hits: 0,
+                    cdn_misses: 0,
                 }],
             }],
         };
@@ -1234,6 +1250,8 @@ mod tests {
                             existence_check_posts: 0,
                             source_blob_gets: 726,
                             source_blob_bytes: 77_200,
+                            cdn_hits: 0,
+                            cdn_misses: 0,
                         }),
                     },
                     ToolRun {
@@ -1253,6 +1271,8 @@ mod tests {
                             existence_check_posts: 0,
                             source_blob_gets: 1324,
                             source_blob_bytes: 120_100,
+                            cdn_hits: 0,
+                            cdn_misses: 0,
                         }),
                     },
                 ],
@@ -1331,6 +1351,8 @@ mod tests {
                             existence_check_posts: 0,
                             source_blob_gets: 726,
                             source_blob_bytes: 77_200,
+                            cdn_hits: 0,
+                            cdn_misses: 0,
                         }),
                     },
                     ToolRun {
@@ -1390,6 +1412,8 @@ mod tests {
                             existence_check_posts: 0,
                             source_blob_gets: 0,
                             source_blob_bytes: 0,
+                            cdn_hits: 0,
+                            cdn_misses: 0,
                         }),
                     },
                     ToolRun {
@@ -1409,6 +1433,8 @@ mod tests {
                             existence_check_posts: 0,
                             source_blob_gets: 0,
                             source_blob_bytes: 0,
+                            cdn_hits: 0,
+                            cdn_misses: 0,
                         }),
                     },
                 ],

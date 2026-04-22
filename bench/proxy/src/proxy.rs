@@ -62,6 +62,13 @@ struct ProxyEntry<'a> {
     response_bytes: u64,
     status: u16,
     duration_ms: u64,
+    /// CDN cache status from the upstream `X-Cache` response header
+    /// (e.g. `"Hit from cloudfront"`, `"Miss from cloudfront"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x_cache: Option<&'a str>,
+    /// Seconds since the CDN cached this response, from the `Age` header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age: Option<u64>,
 }
 
 /// Append-only JSONL log writer, shared across all proxy tasks.
@@ -358,6 +365,8 @@ async fn handle_request(
                 response_bytes: 0,
                 status: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
+                x_cache: None,
+                age: None,
             };
             log.write_entry(&entry).await;
             return Ok(error_response(
@@ -369,6 +378,18 @@ async fn handle_request(
 
     let status = upstream_resp.status();
     let resp_headers = forward_headers(upstream_resp.headers());
+
+    // Extract CDN cache headers before consuming the response.
+    let x_cache = upstream_resp
+        .headers()
+        .get("x-cache")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    let age = upstream_resp
+        .headers()
+        .get("age")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
 
     // Stream the body back to the client, counting bytes, then log once
     // the stream fully drains.
@@ -409,6 +430,8 @@ async fn handle_request(
                         response_bytes: entry_bytes,
                         status: status_code,
                         duration_ms: elapsed.as_millis() as u64,
+                        x_cache: x_cache.as_deref(),
+                        age,
                     };
                     log.write_entry(&entry).await;
                 });
@@ -852,6 +875,8 @@ mod tests {
                             response_bytes: 42,
                             status: 200,
                             duration_ms: 1,
+                            x_cache: None,
+                            age: None,
                         };
                         log_for_cb.write_entry(&entry).await;
                     });
@@ -884,6 +909,8 @@ mod tests {
             method,
             host: "registry.test",
             url: "/v2/",
+            x_cache: None,
+            age: None,
             request_bytes: 0,
             response_bytes: 0,
             status,
