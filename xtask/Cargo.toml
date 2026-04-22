@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 aws-config.workspace = true
+futures-util.workspace = true
 aws-sdk-ecr.workspace = true
 clap.workspace = true
 serde.workspace = true
