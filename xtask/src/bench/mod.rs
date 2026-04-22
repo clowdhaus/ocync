@@ -9,10 +9,11 @@ pub(crate) mod remote;
 pub(crate) mod report;
 pub(crate) mod runner;
 
-use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
 
@@ -344,17 +345,25 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         // Randomize tool execution order to prevent systematic bias from
         // CDN warming, network burst credit depletion, etc.
         let mut shuffled = tools.clone();
-        shuffle_tools(&mut shuffled);
+        let seed = shuffle_tools(&mut shuffled);
         let tool_order: Vec<_> = shuffled.iter().map(|t| t.to_string()).collect();
         eprintln!(
-            "bench: tool order for {scenario:?}: {}",
+            "bench: tool order for {scenario:?}: {} (seed: {seed})",
             tool_order.join(", ")
         );
 
         match scenario {
             Scenario::Sync => {
-                let (cold, warm) =
-                    run_sync(&args, &corpus, &shuffled, &ecr_client, &output_dir).await?;
+                let (cold, warm) = run_sync(
+                    &args,
+                    &corpus,
+                    &shuffled,
+                    &ecr_client,
+                    &output_dir,
+                    seed,
+                    &tool_order,
+                )
+                .await?;
                 report.scenarios.push(cold);
                 report.scenarios.push(warm);
             }
@@ -372,6 +381,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     &shuffled,
                     &ecr_client,
                     &output_dir,
+                    seed,
+                    &tool_order,
                 )
                 .await?;
                 report.scenarios.push(result);
@@ -420,31 +431,22 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             .iter()
             .map(|s| report::ScenarioRecord {
                 name: s.scenario.clone(),
+                shuffle_seed: s.shuffle_seed,
+                tool_order: s.tool_order.clone(),
                 tools: s
                     .runs
                     .iter()
-                    .map(|r| {
-                        let metrics = r.proxy_metrics.as_ref();
-                        report::ToolRecord {
-                            tool: r.tool.clone(),
-                            version: report
-                                .tool_versions
-                                .get(&r.tool)
-                                .cloned()
-                                .unwrap_or_default(),
-                            wall_clock_secs: r.wall_clock_secs,
-                            peak_rss_kb: r.peak_rss_kb,
-                            requests: metrics.map_or(0, |m| m.total_requests),
-                            response_bytes: metrics.map_or(0, |m| m.total_response_bytes),
-                            source_blob_gets: metrics.map_or(0, |m| m.source_blob_gets),
-                            source_blob_bytes: metrics.map_or(0, |m| m.source_blob_bytes),
-                            mount_successes: metrics.map_or(0, |m| m.mount_successes),
-                            mount_attempts: metrics.map_or(0, |m| m.mount_attempts),
-                            duplicate_blob_gets: metrics.map_or(0, |m| m.duplicate_blob_gets),
-                            rate_limit_429s: metrics.map_or(0, |m| m.status_429_count),
-                            cdn_hits: metrics.map_or(0, |m| m.cdn_hits),
-                            cdn_misses: metrics.map_or(0, |m| m.cdn_misses),
-                        }
+                    .map(|r| report::ToolRecord {
+                        tool: r.tool.clone(),
+                        version: report
+                            .tool_versions
+                            .get(&r.tool)
+                            .cloned()
+                            .unwrap_or_default(),
+                        wall_clock_secs: r.wall_clock_secs,
+                        peak_rss_kb: r.peak_rss_kb,
+                        metrics: r.proxy_metrics.clone().unwrap_or_default(),
+                        phase_timing_ms: r.phase_timing_ms.clone(),
                     })
                     .collect(),
             })
@@ -482,11 +484,8 @@ fn check_regression(
     if let Some(run) = ocync_run {
         let current = Baseline {
             wall_clock_secs: run.wall_clock_secs,
-            total_requests: run.proxy_metrics.as_ref().map_or(0, |m| m.total_requests),
-            total_bytes: run
-                .proxy_metrics
-                .as_ref()
-                .map_or(0, |m| m.total_response_bytes),
+            requests: run.proxy_metrics.as_ref().map_or(0, |m| m.requests),
+            total_bytes: run.proxy_metrics.as_ref().map_or(0, |m| m.response_bytes),
         };
 
         if baseline_path.exists() {
@@ -570,22 +569,49 @@ async fn run_single_tool(
     let entries = proxy::stop(handle).await?;
     let metrics = proxy::aggregate(&entries, &corpus.settings.target_registry);
 
-    // Abort on source registry 429s. These are unrecoverable within the
-    // rate limit window (unlike ECR 429s which AIMD handles). Continuing
-    // would produce tainted data for every subsequent tool/iteration.
-    let source_429s: Vec<&str> = entries
+    // Abort on source registry errors (status >= 400) that indicate tainted
+    // benchmark data. Two status codes are excluded:
+    //
+    // - 401: expected as part of OCI auth. Every `/v2/` ping returns 401 with
+    //   a `WWW-Authenticate` header advertising the token endpoint. This is
+    //   how authentication *starts*, not an error.
+    // - 404: expected for blob existence checks. HEAD requests return 404 when
+    //   a blob doesn't exist at the target (mount fallback, skip detection).
+    //
+    // Everything else from a source registry means something broke: 403
+    // (auth failed), 429 (rate limited), 5xx (registry outage), etc.
+    let source_errors: BTreeMap<&str, Vec<u16>> = entries
         .iter()
-        .filter(|e| e.status == 429 && e.host != corpus.settings.target_registry)
-        .map(|e| e.host.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if !source_429s.is_empty() {
+        .filter(|e| {
+            e.host != corpus.settings.target_registry
+                && e.status >= 400
+                && e.status != 401
+                && e.status != 404
+        })
+        .fold(BTreeMap::new(), |mut acc, e| {
+            acc.entry(e.host.as_str()).or_default().push(e.status);
+            acc
+        });
+    if !source_errors.is_empty() {
+        let summary: Vec<String> = source_errors
+            .iter()
+            .map(|(host, codes)| {
+                let unique: Vec<u16> = codes
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let code_str: Vec<String> = unique.iter().map(|c| c.to_string()).collect();
+                format!("{} ({}x: {})", host, codes.len(), code_str.join("/"))
+            })
+            .collect();
+        let hosts: Vec<&str> = source_errors.keys().copied().collect();
         return Err(format!(
-            "aborting: source registry rate limit hit (429) from: {}. \
-             Use --skip-registries {} to exclude, or wait for the rate limit window to reset.",
-            source_429s.join(", "),
-            source_429s.join(","),
+            "aborting: source registry errors from: {}. \
+             Use --skip-registries {} to exclude, or retry later.",
+            summary.join(", "),
+            hosts.join(","),
         )
         .into());
     }
@@ -602,13 +628,20 @@ async fn run_single_tool(
             .exit_code
             .map_or_else(|| "signal".to_string(), |c| c.to_string()),
         rss_display,
-        metrics.total_requests,
-        report::format_bytes(metrics.total_response_bytes),
+        metrics.requests,
+        report::format_bytes(metrics.response_bytes),
         metrics.mount_successes,
         metrics.mount_attempts,
         metrics.source_blob_gets,
         report::format_bytes(metrics.source_blob_bytes),
     );
+
+    // Read phase timing from ocync's OCYNC_TIMING_FILE if present.
+    let phase_timing_ms = if let Some(ref tp) = result.timing_path {
+        parse_timing_file(tp)
+    } else {
+        BTreeMap::new()
+    };
 
     Ok(ToolRun {
         tool: tool.to_string(),
@@ -616,6 +649,7 @@ async fn run_single_tool(
         exit_code: result.exit_code,
         peak_rss_kb: result.peak_rss_kb,
         proxy_metrics: Some(metrics),
+        phase_timing_ms,
     })
 }
 
@@ -628,6 +662,8 @@ async fn run_sync(
     tools: &[Tool],
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
+    shuffle_seed: u64,
+    tool_order: &[String],
 ) -> Result<(ScenarioResult, ScenarioResult), Box<dyn std::error::Error>> {
     progress("bench: running cold+warm scenario");
     let mut cold_runs = Vec::new();
@@ -709,15 +745,20 @@ async fn run_sync(
         ScenarioResult {
             scenario: "Cold sync".to_string(),
             runs: cold_runs,
+            shuffle_seed,
+            tool_order: tool_order.to_vec(),
         },
         ScenarioResult {
             scenario: "Warm sync (no-op)".to_string(),
             runs: warm_runs,
+            shuffle_seed,
+            tool_order: tool_order.to_vec(),
         },
     ))
 }
 
 /// Partial scenario: prime with base corpus, then sync with partial corpus.
+#[allow(clippy::too_many_arguments)]
 async fn run_partial(
     args: &BenchArgs,
     base_corpus: &Corpus,
@@ -725,6 +766,8 @@ async fn run_partial(
     tools: &[Tool],
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
+    shuffle_seed: u64,
+    tool_order: &[String],
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     progress("bench: running partial scenario");
     let mut runs = Vec::new();
@@ -793,6 +836,8 @@ async fn run_partial(
     Ok(ScenarioResult {
         scenario: "Partial sync (~5% changed)".to_string(),
         runs,
+        shuffle_seed,
+        tool_order: tool_order.to_vec(),
     })
 }
 
@@ -869,6 +914,93 @@ fn prepare_clean_slate() {
     clean_staging_tmpdir();
 }
 
+/// Per-registry rate controller for CDN blob pre-warm.
+///
+/// Uses multiplicative increase / multiplicative decrease (MIMD) with
+/// congestion epoch suppression. Each registry gets its own controller
+/// so a slow registry doesn't throttle fast ones.
+struct PrewarmRateController {
+    /// Minimum delay between requests to this registry.
+    interval: Duration,
+    /// Last time a request was issued to this registry.
+    last_request: Instant,
+    /// Last time a throttle (429) was processed.
+    last_throttle: Instant,
+    /// Congestion epoch -- prevents cascade halvings from burst 429s.
+    epoch: Duration,
+}
+
+impl PrewarmRateController {
+    /// Floor: 20 req/sec max.
+    const MIN_INTERVAL: Duration = Duration::from_millis(50);
+    /// Ceiling: never wait longer than 30s between requests.
+    const MAX_INTERVAL: Duration = Duration::from_secs(30);
+    /// Congestion epoch: 100ms (matches AIMD design).
+    const DEFAULT_EPOCH: Duration = Duration::from_millis(100);
+
+    /// Create a new controller with the given initial interval.
+    fn new(initial_interval: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            interval: initial_interval,
+            last_request: now - initial_interval,
+            last_throttle: now - Self::DEFAULT_EPOCH - Duration::from_millis(1),
+            epoch: Self::DEFAULT_EPOCH,
+        }
+    }
+
+    /// Returns how long to sleep before the next request, or `None` if ready.
+    fn delay(&self) -> Option<Duration> {
+        let elapsed = self.last_request.elapsed();
+        if elapsed < self.interval {
+            Some(self.interval - elapsed)
+        } else {
+            None
+        }
+    }
+
+    /// Mark that a request was just issued.
+    fn mark_sent(&mut self) {
+        self.last_request = Instant::now();
+    }
+
+    /// Record a successful response -- multiplicative increase.
+    ///
+    /// Decreases interval by 10% (floor [`MIN_INTERVAL`]).
+    fn on_success(&mut self) {
+        self.interval = self.interval.mul_f64(0.9).max(Self::MIN_INTERVAL);
+    }
+
+    /// Record a 429 throttle -- multiplicative decrease.
+    ///
+    /// Doubles interval (cap [`MAX_INTERVAL`]). If a throttle already
+    /// occurred within the congestion epoch, this call is suppressed.
+    fn on_throttle(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_throttle) > self.epoch {
+            self.interval = (self.interval * 2).min(Self::MAX_INTERVAL);
+            self.last_throttle = now;
+        }
+    }
+}
+
+/// Normalize Docker Hub's registry hostname to its API endpoint.
+fn normalize_registry(raw: &str) -> &str {
+    if raw == "docker.io" {
+        "registry-1.docker.io"
+    } else {
+        raw
+    }
+}
+
+/// Per-registry CDN pre-warm statistics.
+#[derive(Default)]
+struct PrewarmStats {
+    hits: u64,
+    misses: u64,
+    errors: u64,
+}
+
 /// Pull every source manifest once to warm CDN edge caches.
 ///
 /// Runs before any tool so all tools see identically warm CDN. Uses
@@ -880,7 +1012,7 @@ async fn cdn_prewarm(corpus: &Corpus) {
     eprintln!("bench: pre-warming CDN ({total} manifests)...");
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
         .build()
         .unwrap();
 
@@ -894,15 +1026,7 @@ async fn cdn_prewarm(corpus: &Corpus) {
             Some(i) => (&image.source[..i], &image.source[i + 1..]),
             None => continue,
         };
-        // Docker Hub's API endpoint is registry-1.docker.io, not docker.io.
-        let registry = if raw_registry == "docker.io" {
-            "registry-1.docker.io"
-        } else {
-            raw_registry
-        };
-
-        // OCI token exchange: GET /v2/ -> 401 with WWW-Authenticate ->
-        // GET {realm}?service={service}&scope=repository:{repo}:pull -> bearer token.
+        let registry = normalize_registry(raw_registry);
         let token = match oci_token(&client, registry, repo, corpus).await {
             Some(t) => t,
             None => {
@@ -944,13 +1068,408 @@ async fn cdn_prewarm(corpus: &Corpus) {
         }
     }
 
-    eprintln!("bench: CDN pre-warm done ({hits} hits, {misses} misses, {errors} errors)");
+    eprintln!("bench: manifest CDN pre-warm done ({hits} hits, {misses} misses, {errors} errors)");
+
+    // Phase 2: Warm blob CDN by fetching unique blobs.
+    //
+    // Blob URLs are served via 302 redirects to CloudFront -- completely
+    // different cache keys from manifests. Without this pass the first
+    // tool to run pays a CDN miss penalty on every blob.
+    eprintln!("bench: pre-warming blob CDN...");
+
+    // Redirect-following client with a generous timeout for large blobs.
+    let blob_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap();
+
+    // (registry, repo, digest) triples -- deduped so shared layers are
+    // fetched exactly once.
+    let mut unique_blobs: HashSet<(String, String, String)> = HashSet::new();
+
+    // Cache tokens by (registry, repo) for the blob-discovery phase too,
+    // so we don't issue O(N_images) /v2/ pings when ~3 registries suffice.
+    let mut discovery_token_cache: HashMap<(String, String), String> = HashMap::new();
+
+    for image in &corpus.images {
+        let (raw_registry, repo) = match image.source.find('/') {
+            Some(i) => (&image.source[..i], &image.source[i + 1..]),
+            None => continue,
+        };
+        let registry = normalize_registry(raw_registry);
+
+        let cache_key = (registry.to_owned(), repo.to_owned());
+        let token = if let Some(t) = discovery_token_cache.get(&cache_key) {
+            t.clone()
+        } else {
+            match oci_token(&client, registry, repo, corpus).await {
+                Some(t) => {
+                    discovery_token_cache.insert(cache_key, t.clone());
+                    t
+                }
+                None => continue,
+            }
+        };
+
+        // GET one manifest per image to discover blob digests.
+        // All tags for the same image reference the same layers, so the
+        // first tag is sufficient.
+        if let Some(tag) = image.tags.first() {
+            let url = format!("https://{registry}/v2/{repo}/manifests/{tag}");
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header(
+                    "Accept",
+                    "application/vnd.oci.image.manifest.v1+json,\
+                     application/vnd.docker.distribution.manifest.v2+json,\
+                     application/vnd.oci.image.index.v1+json,\
+                     application/vnd.docker.distribution.manifest.list.v2+json",
+                )
+                .send()
+                .await;
+
+            if let Ok(r) = resp {
+                if let Ok(body) = r.text().await {
+                    if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&body) {
+                        extract_blob_digests(
+                            &client,
+                            &manifest,
+                            registry,
+                            repo,
+                            &token,
+                            &mut unique_blobs,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    let blob_count = unique_blobs.len();
+    eprintln!(
+        "bench: warming {blob_count} unique blobs (20 concurrent, per-registry rate limited)..."
+    );
+
+    // Warm blobs concurrently (20 at a time) to avoid waiting 15-30 minutes
+    // on a sequential 55 GB download. Uses a semaphore to bound concurrency
+    // within a single-threaded tokio runtime.
+    let blobs_vec: Vec<_> = unique_blobs.into_iter().collect();
+
+    // Pre-fetch tokens keyed by (registry, repo) so we don't issue O(N_blobs)
+    // /v2/ pings when we only need O(N_images).
+    let mut token_cache: HashMap<(String, String), String> = HashMap::new();
+    for (registry, repo, _) in &blobs_vec {
+        let key = (registry.clone(), repo.clone());
+        if let std::collections::hash_map::Entry::Vacant(e) = token_cache.entry(key) {
+            if let Some(t) = oci_token(&client, registry, repo, corpus).await {
+                e.insert(t);
+            }
+        }
+    }
+
+    // Per-registry rate controllers and stats, initialized in a single pass.
+    let rate_controllers: std::cell::RefCell<HashMap<String, PrewarmRateController>> =
+        std::cell::RefCell::new(HashMap::new());
+    let per_registry_stats: std::cell::RefCell<HashMap<String, PrewarmStats>> =
+        std::cell::RefCell::new(HashMap::new());
+    for (registry, _, _) in &blobs_vec {
+        rate_controllers
+            .borrow_mut()
+            .entry(registry.clone())
+            .or_insert_with(|| PrewarmRateController::new(Duration::from_millis(500)));
+        per_registry_stats
+            .borrow_mut()
+            .entry(registry.clone())
+            .or_default();
+    }
+
+    // Total pre-warm timeout: 8 minutes (leaves 2 min headroom in 10-min budget).
+    let prewarm_deadline = Instant::now() + Duration::from_secs(480);
+
+    let sem = tokio::sync::Semaphore::new(20);
+    const MAX_RETRIES: u32 = 3;
+
+    let futs: Vec<_> = blobs_vec
+        .iter()
+        .map(|(registry, repo, digest)| {
+            let sem = &sem;
+            let blob_client = &blob_client;
+            let per_registry_stats = &per_registry_stats;
+            let rate_controllers = &rate_controllers;
+            let token = token_cache.get(&(registry.clone(), repo.clone()));
+            let registry = registry.clone();
+            let repo = repo.clone();
+            let digest = digest.clone();
+            async move {
+                let token = match token {
+                    Some(t) => t,
+                    None => {
+                        per_registry_stats
+                            .borrow_mut()
+                            .entry(registry.clone())
+                            .or_default()
+                            .errors += 1;
+                        return;
+                    }
+                };
+
+                // Check pre-warm timeout before starting.
+                if Instant::now() > prewarm_deadline {
+                    return;
+                }
+
+                // Rate limit: compute delay, drop borrow, sleep, re-borrow.
+                let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                rate_controllers
+                    .borrow_mut()
+                    .get_mut(&registry)
+                    .unwrap()
+                    .mark_sent();
+
+                // Acquire semaphore AFTER rate-controller wait.
+                let _permit = sem.acquire().await.unwrap();
+                let url = format!("https://{registry}/v2/{repo}/blobs/{digest}");
+
+                let mut retries = 0u32;
+                loop {
+                    let resp = blob_client
+                        .get(&url)
+                        .header("Authorization", format!("Bearer {token}"))
+                        .send()
+                        .await;
+                    match resp {
+                        Ok(r) if r.status().as_u16() == 429 => {
+                            rate_controllers
+                                .borrow_mut()
+                                .get_mut(&registry)
+                                .unwrap()
+                                .on_throttle();
+                            retries += 1;
+                            if retries >= MAX_RETRIES {
+                                eprintln!(
+                                    "  blob pre-warm: {registry} {digest}: max retries on 429"
+                                );
+                                per_registry_stats
+                                    .borrow_mut()
+                                    .entry(registry.clone())
+                                    .or_default()
+                                    .errors += 1;
+                                break;
+                            }
+                            // Wait for backoff before retry.
+                            let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
+                            if let Some(d) = delay {
+                                tokio::time::sleep(d).await;
+                            }
+                            rate_controllers
+                                .borrow_mut()
+                                .get_mut(&registry)
+                                .unwrap()
+                                .mark_sent();
+                            continue;
+                        }
+                        Ok(r) if r.status().is_success() || r.status().is_redirection() => {
+                            let x_cache = r
+                                .headers()
+                                .get("x-cache")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            {
+                                let mut stats = per_registry_stats.borrow_mut();
+                                let entry = stats.entry(registry.clone()).or_default();
+                                if x_cache.to_ascii_lowercase().contains("hit") {
+                                    entry.hits += 1;
+                                } else {
+                                    entry.misses += 1;
+                                }
+                            }
+                            // Consume body to complete the transfer.
+                            let _ = r.bytes().await;
+                            rate_controllers
+                                .borrow_mut()
+                                .get_mut(&registry)
+                                .unwrap()
+                                .on_success();
+                            break;
+                        }
+                        Ok(r) => {
+                            let status = r.status();
+                            eprintln!("  blob pre-warm: {registry} {digest}: {status}");
+                            per_registry_stats
+                                .borrow_mut()
+                                .entry(registry.clone())
+                                .or_default()
+                                .errors += 1;
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("  blob pre-warm: {registry} {digest}: {e}");
+                            per_registry_stats
+                                .borrow_mut()
+                                .entry(registry.clone())
+                                .or_default()
+                                .errors += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .collect();
+    futures_util::future::join_all(futs).await;
+
+    // Log per-registry stats with discovered rates.
+    let (total_hits, total_misses, total_errors) = {
+        let stats = per_registry_stats.borrow();
+        let mut hits_sum = 0u64;
+        let mut misses_sum = 0u64;
+        let mut errors_sum = 0u64;
+        for (registry, s) in stats.iter() {
+            hits_sum += s.hits;
+            misses_sum += s.misses;
+            errors_sum += s.errors;
+            let rate_ms = rate_controllers
+                .borrow()
+                .get(registry)
+                .unwrap()
+                .interval
+                .as_millis();
+            eprintln!(
+                "  blob pre-warm: {registry}: {} hits, {} misses, {} errors, {rate_ms}ms/req",
+                s.hits, s.misses, s.errors
+            );
+        }
+        (hits_sum, misses_sum, errors_sum)
+    };
+    eprintln!(
+        "bench: blob CDN pre-warm done ({total_hits} hits, {total_misses} misses, {total_errors} errors)"
+    );
 
     // Wait for CDN propagation. CloudFront edges need time to fully
     // populate after the first request hits the origin.
     let wait_secs = 360; // 6 minutes
     eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
-    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+
+    // CDN validation: sample warmed blobs and check for cache hits.
+    let sample_indices = {
+        let total = blobs_vec.len();
+        let count = 5;
+        if total <= count {
+            (0..total).collect::<Vec<_>>()
+        } else {
+            let stride = total / count;
+            (0..count).map(|i| i * stride).collect::<Vec<_>>()
+        }
+    };
+    let mut cdn_ok = 0u64;
+    let mut cdn_check = 0u64;
+    for &idx in &sample_indices {
+        let (registry, repo, digest) = &blobs_vec[idx];
+        let token = token_cache.get(&(registry.clone(), repo.clone()));
+        if let Some(token) = token {
+            let url = format!("https://{registry}/v2/{repo}/blobs/{digest}");
+            let resp = client
+                .head(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await;
+            if let Ok(r) = resp {
+                cdn_check += 1;
+                let x_cache = r
+                    .headers()
+                    .get("x-cache")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if x_cache.to_ascii_lowercase().contains("hit") {
+                    cdn_ok += 1;
+                }
+            }
+        }
+    }
+    eprintln!("bench: CDN validation sample: {cdn_ok}/{cdn_check} hits");
+    if cdn_check > 0 && cdn_ok * 100 / cdn_check < 80 {
+        eprintln!("bench: WARNING: CDN hit rate below 80% after propagation wait");
+    }
+}
+
+/// Collect layer and config blob digests from a manifest JSON value.
+///
+/// Works for both image manifests (`layers` + `config`) and index manifests
+/// (`manifests` array -- fetches each child to discover its layers).
+async fn extract_blob_digests(
+    client: &reqwest::Client,
+    manifest: &serde_json::Value,
+    registry: &str,
+    repo: &str,
+    token: &str,
+    blobs: &mut HashSet<(String, String, String)>,
+) {
+    // Image manifest: has `layers` array.
+    if collect_image_blobs(manifest, registry, repo, blobs) {
+        return;
+    }
+
+    // Index manifest: has `manifests` array. Fetch each child to discover
+    // its layers.
+    if let Some(children) = manifest.get("manifests").and_then(|m| m.as_array()) {
+        for child in children {
+            let digest = match child.get("digest").and_then(|d| d.as_str()) {
+                Some(d) => d,
+                None => continue,
+            };
+            let url = format!("https://{registry}/v2/{repo}/manifests/{digest}");
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header(
+                    "Accept",
+                    "application/vnd.oci.image.manifest.v1+json,\
+                     application/vnd.docker.distribution.manifest.v2+json",
+                )
+                .send()
+                .await;
+            if let Ok(r) = resp {
+                if let Ok(body) = r.text().await {
+                    if let Ok(child_manifest) = serde_json::from_str::<serde_json::Value>(&body) {
+                        collect_image_blobs(&child_manifest, registry, repo, blobs);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract layer and config digests from an image manifest JSON.
+///
+/// Returns `true` if this is an image manifest (has `layers`), `false`
+/// otherwise (caller should try index parsing).
+fn collect_image_blobs(
+    manifest: &serde_json::Value,
+    registry: &str,
+    repo: &str,
+    blobs: &mut HashSet<(String, String, String)>,
+) -> bool {
+    let layers = match manifest.get("layers").and_then(|l| l.as_array()) {
+        Some(l) => l,
+        None => return false,
+    };
+    for layer in layers {
+        if let Some(digest) = layer.get("digest").and_then(|d| d.as_str()) {
+            blobs.insert((registry.to_owned(), repo.to_owned(), digest.to_owned()));
+        }
+    }
+    if let Some(config) = manifest.get("config") {
+        if let Some(digest) = config.get("digest").and_then(|d| d.as_str()) {
+            blobs.insert((registry.to_owned(), repo.to_owned(), digest.to_owned()));
+        }
+    }
+    true
 }
 
 /// OCI token exchange for a single repository scope.
@@ -1014,16 +1533,35 @@ fn parse_auth_param(header: &str, key: &str) -> Option<String> {
     Some(header[start..end].to_owned())
 }
 
+/// Parses an ocync timing JSONL file into a phase-name to milliseconds map.
+///
+/// Each line is `{"phase":"...","elapsed_ms":NNN}`. Malformed lines are
+/// silently skipped (the timing file is best-effort telemetry, not critical data).
+fn parse_timing_file(path: &Path) -> BTreeMap<String, u64> {
+    let mut map = BTreeMap::new();
+    if let Ok(content) = std::fs::read_to_string(path) {
+        for line in content.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let (Some(phase), Some(ms)) = (v["phase"].as_str(), v["elapsed_ms"].as_u64()) {
+                    map.insert(phase.to_owned(), ms);
+                }
+            }
+        }
+    }
+    map
+}
+
 async fn cooldown() {
     eprintln!("bench: cooling down for 10s...");
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 }
 
 /// Shuffle a tool list in-place using Fisher-Yates with a timestamp seed.
 /// Not cryptographic -- just enough to randomize execution order across runs.
-fn shuffle_tools(tools: &mut [Tool]) {
+/// Returns the seed used for reproducibility.
+fn shuffle_tools(tools: &mut [Tool]) -> u64 {
     if tools.len() <= 1 {
-        return;
+        return 0;
     }
     let mut hasher = DefaultHasher::new();
     std::time::SystemTime::now()
@@ -1031,7 +1569,8 @@ fn shuffle_tools(tools: &mut [Tool]) {
         .unwrap_or_default()
         .as_nanos()
         .hash(&mut hasher);
-    let mut state = hasher.finish();
+    let seed = hasher.finish();
+    let mut state = seed;
     for i in (1..tools.len()).rev() {
         // xorshift64 step for cheap pseudo-randomness.
         state ^= state << 13;
@@ -1040,6 +1579,7 @@ fn shuffle_tools(tools: &mut [Tool]) {
         let j = (state as usize) % (i + 1);
         tools.swap(i, j);
     }
+    seed
 }
 
 /// Attempt to drop the OS page cache via `/proc/sys/vm/drop_caches`.
@@ -1268,5 +1808,114 @@ mod tests {
             std::env::remove_var("DOCKERHUB_ACCESS_TOKEN");
         }
         assert_eq!(docker_hub_auth_from_env(), None);
+    }
+
+    #[test]
+    fn parse_timing_file_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timing.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"phase":"discovery_start","elapsed_ms":0}
+{"phase":"discovery_complete","elapsed_ms":1234}
+{"phase":"execution_complete","elapsed_ms":5678}
+"#,
+        )
+        .unwrap();
+        let map = parse_timing_file(&path);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["discovery_start"], 0);
+        assert_eq!(map["discovery_complete"], 1234);
+        assert_eq!(map["execution_complete"], 5678);
+    }
+
+    #[test]
+    fn parse_timing_file_missing() {
+        let map = parse_timing_file(Path::new("/nonexistent/timing.jsonl"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_timing_file_malformed_lines_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timing.jsonl");
+        std::fs::write(
+            &path,
+            "not json\n{\"phase\":\"ok\",\"elapsed_ms\":42}\n{\"bad\":true}\n",
+        )
+        .unwrap();
+        let map = parse_timing_file(&path);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["ok"], 42);
+    }
+
+    #[test]
+    fn shuffle_tools_returns_seed() {
+        let mut tools = vec![Tool::Ocync, Tool::Dregsy, Tool::Regsync];
+        let seed = shuffle_tools(&mut tools);
+        // Seed should be non-zero (timestamp-based).
+        assert_ne!(seed, 0);
+    }
+
+    #[test]
+    fn shuffle_tools_single_tool_returns_zero_seed() {
+        let mut tools = vec![Tool::Ocync];
+        let seed = shuffle_tools(&mut tools);
+        assert_eq!(seed, 0, "single-tool list needs no shuffle");
+        assert_eq!(tools[0], Tool::Ocync);
+    }
+
+    #[test]
+    fn prewarm_rate_controller_ramps_up() {
+        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
+        let initial = ctrl.interval;
+        for _ in 0..10 {
+            ctrl.on_success();
+        }
+        // 10 successes: 500 * 0.9^10 ~= 174ms
+        assert!(ctrl.interval < initial);
+        assert!(ctrl.interval > PrewarmRateController::MIN_INTERVAL);
+    }
+
+    #[test]
+    fn prewarm_rate_controller_backs_off() {
+        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
+        let before = ctrl.interval;
+        ctrl.on_throttle();
+        assert_eq!(ctrl.interval, before * 2);
+    }
+
+    #[test]
+    fn prewarm_rate_controller_caps_backoff() {
+        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
+        // Throttle repeatedly to hit the cap.
+        for _ in 0..20 {
+            ctrl.on_throttle();
+            // Reset epoch so each throttle fires.
+            ctrl.last_throttle = Instant::now() - ctrl.epoch - Duration::from_millis(1);
+        }
+        assert_eq!(ctrl.interval, PrewarmRateController::MAX_INTERVAL);
+    }
+
+    #[test]
+    fn prewarm_rate_controller_epoch_suppresses_burst() {
+        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
+        ctrl.on_throttle();
+        let after_first = ctrl.interval;
+        // Second throttle within epoch -- should be suppressed.
+        ctrl.on_throttle();
+        assert_eq!(
+            ctrl.interval, after_first,
+            "second throttle within epoch should be suppressed"
+        );
+    }
+
+    #[test]
+    fn prewarm_rate_controller_floor() {
+        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
+        for _ in 0..200 {
+            ctrl.on_success();
+        }
+        assert_eq!(ctrl.interval, PrewarmRateController::MIN_INTERVAL);
     }
 }
