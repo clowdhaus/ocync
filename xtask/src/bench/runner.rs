@@ -142,7 +142,7 @@ pub(crate) async fn run_tool(
 ) -> Result<RunResult, String> {
     let config_str = config_path.to_string_lossy();
     let args: Vec<&str> = match tool {
-        Tool::Ocync => vec!["sync", "--config", &config_str, "--json"],
+        Tool::Ocync => vec!["sync", "--config", &config_str, "--json", "-v"],
         Tool::Dregsy => vec!["-config", &config_str],
         Tool::Regsync => vec!["once", "-c", &config_str],
     };

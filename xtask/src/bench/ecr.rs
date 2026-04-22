@@ -72,19 +72,15 @@ pub(crate) async fn verify_sync(
         total_tags += expected_tags.len() as u64;
 
         // List all tags at target.
-        let mut actual_tags: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut actual_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut next_token: Option<String> = None;
 
         loop {
-            let mut req = client
-                .list_images()
-                .repository_name(&repo_name)
-                .filter(
-                    aws_sdk_ecr::types::ListImagesFilter::builder()
-                        .tag_status(aws_sdk_ecr::types::TagStatus::Tagged)
-                        .build(),
-                );
+            let mut req = client.list_images().repository_name(&repo_name).filter(
+                aws_sdk_ecr::types::ListImagesFilter::builder()
+                    .tag_status(aws_sdk_ecr::types::TagStatus::Tagged)
+                    .build(),
+            );
             if let Some(token) = &next_token {
                 req = req.next_token(token);
             }
@@ -107,10 +103,19 @@ pub(crate) async fn verify_sync(
             }
         }
 
+        let mut repo_missing = 0u64;
         for tag in &expected_tags {
             if !actual_tags.contains(*tag) {
                 missing.push(format!("{repo_name}:{tag}"));
+                repo_missing += 1;
             }
+        }
+        if repo_missing == 0 {
+            eprintln!(
+                "  verify: {repo_name} OK ({}/{} tags)",
+                actual_tags.len(),
+                expected_tags.len()
+            );
         }
     }
 
