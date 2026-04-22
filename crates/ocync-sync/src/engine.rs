@@ -51,6 +51,32 @@ use crate::{
     BlobTransferStats, ErrorKind, ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats,
 };
 
+/// Writes a JSONL timing event to the optional timing file.
+///
+/// Used for benchmark instrumentation via `OCYNC_TIMING_FILE`. Each line is
+/// `{"phase":"<name>","elapsed_ms":<N>}`. No-ops when `file` is `None`.
+///
+/// Safety: `phase` must be an ASCII identifier (no quotes or backslashes).
+/// All call sites pass string literals, so this invariant is enforced at
+/// compile time. We avoid adding a `serde_json` dependency to this crate
+/// for a two-field diagnostic line.
+fn write_timing(file: &mut Option<std::fs::File>, phase: &str, start: &Instant) {
+    if let Some(f) = file {
+        use std::io::Write;
+        debug_assert!(
+            phase
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "timing phase name must be ASCII alphanumeric: {phase}"
+        );
+        let _ = writeln!(
+            f,
+            r#"{{"phase":"{phase}","elapsed_ms":{}}}"#,
+            start.elapsed().as_millis()
+        );
+    }
+}
+
 /// An image reference within a single registry (repository name + tag).
 ///
 /// Bundles the two fields that always travel together in discovery and
@@ -622,21 +648,19 @@ impl DiscoveryCounters {
 /// Pipeline phase for leader-follower mount optimization.
 ///
 /// Tracks which group of tasks is currently being promoted into execution
-/// futures. The phase advances monotonically:
-/// `Discovering -> Leaders -> Done`.
+/// futures. The phase advances monotonically: `Discovering -> Done`.
 ///
-/// The leader/follower split is essential for correctness: leaders must
-/// commit manifests before followers attempt cross-repo mounts. The greedy
-/// election algorithm guarantees that every shared blob is covered by at
-/// least one leader's blob set, so no further wave partitioning is needed
-/// among followers.
+/// Leaders are ordered first by `elect_leaders` so they acquire semaphore
+/// permits and claim blob uploads before followers. Followers that need a
+/// blob still in-flight wait on the per-blob `Notify` via `ClaimAction::Wait`
+/// in `transfer_single_blob`, providing fine-grained synchronization.
 enum PromotionPhase {
     /// Discovery futures still in flight; tasks accumulate in `pending`.
     Discovering,
-    /// Leader tasks promoted; waiting for them to complete before followers.
-    Leaders,
-    /// All tasks promoted (followers promoted after leaders drained); no
-    /// further phase transitions.
+    /// All tasks promoted (leaders and followers together); no further
+    /// phase transitions. Per-blob `Notify` synchronization in
+    /// `transfer_single_blob` ensures followers wait for their specific
+    /// leader blobs without a coarse gate.
     Done,
 }
 
@@ -743,6 +767,12 @@ impl SyncEngine {
         let run_start = Instant::now();
         let run_id = Uuid::now_v7();
 
+        // Synchronous writes are fine: current_thread runtime, file is tiny.
+        let mut timing_file = std::env::var("OCYNC_TIMING_FILE")
+            .ok()
+            .and_then(|path| std::fs::File::create(&path).ok());
+        write_timing(&mut timing_file, "discovery_start", &run_start);
+
         let mut discovery_futures = FuturesUnordered::new();
         let mut execution_futures: FuturesUnordered<
             std::pin::Pin<Box<dyn Future<Output = ImageResult>>>,
@@ -760,11 +790,9 @@ impl SyncEngine {
         // Leader-follower mount optimization state.
         //
         // `promotion_phase` tracks which stage of the pipeline we are in.
-        // `phase_inflight` tracks in-flight tasks for the current phase.
-        // When a phase drains to zero and `pending` is non-empty, the next
-        // wave is promoted.
+        // After discovery completes, all tasks are promoted at once (leaders
+        // ordered first). Per-blob `Notify` handles synchronization.
         let mut promotion_phase = PromotionPhase::Discovering;
-        let mut phase_inflight: usize = 0;
         // Repos whose manifests are already committed at the target. Followers
         // prefer these as cross-repo mount sources because ECR requires a
         // committed manifest for mount to succeed.
@@ -915,70 +943,42 @@ impl SyncEngine {
                 }
             }
 
-            // Phased promotion: accumulate during discovery, then leader-first.
-            if !shutting_down {
-                if matches!(promotion_phase, PromotionPhase::Discovering)
-                    && discovery_futures.is_empty()
-                {
-                    // All discovery complete - elect leaders and promote.
-                    // `freq_map` is frozen from this point (no more discovery
-                    // mutations), so `PromoteContext` can borrow it.
-                    let n = elect_leaders(&mut pending);
-                    phase_inflight = n;
-                    // Collect leader target repos for follower mount preference.
-                    if n > 0 {
-                        preferred_mount_sources = pending
-                            .iter()
-                            .take(n)
-                            .map(|t| t.target.repo.clone())
-                            .collect();
-                    }
-                    // When n > 0, promote only leader tasks (followers wait).
-                    // When n == 0 (no election benefit), promote everything.
-                    let to_promote = if n > 0 { n } else { pending.len() };
-                    promotion_phase = if n > 0 {
-                        PromotionPhase::Leaders
-                    } else {
-                        PromotionPhase::Done
-                    };
-                    let ctx = PromoteContext {
-                        sem: &global_sem,
-                        cache: &cache,
-                        staging: &staging,
-                        freq_map: &freq_map,
-                        retry: &self.retry,
-                        referrers_cache: &referrers_cache,
-                    };
-                    for _ in 0..to_promote {
-                        if let Some(item) = pending.pop_front() {
-                            execution_futures.push(promote(item, &ctx, &preferred_mount_sources));
-                        }
-                    }
-                } else if matches!(promotion_phase, PromotionPhase::Leaders)
-                    && phase_inflight == 0
-                    && !pending.is_empty()
-                {
-                    // Leaders drained - promote all remaining followers.
-                    let ctx = PromoteContext {
-                        sem: &global_sem,
-                        cache: &cache,
-                        staging: &staging,
-                        freq_map: &freq_map,
-                        retry: &self.retry,
-                        referrers_cache: &referrers_cache,
-                    };
-                    let to_promote = pending.len();
-                    promotion_phase = PromotionPhase::Done;
-                    info!(
-                        tasks = to_promote,
-                        elapsed_ms = run_start.elapsed().as_millis() as u64,
-                        "promoting followers"
-                    );
-                    phase_inflight = to_promote;
-                    for _ in 0..to_promote {
-                        if let Some(item) = pending.pop_front() {
-                            execution_futures.push(promote(item, &ctx, &preferred_mount_sources));
-                        }
+            // Promotion: accumulate during discovery, then promote all at once.
+            // Leaders are ordered first by `elect_leaders` so they acquire
+            // semaphore permits and claim blob uploads before followers.
+            // Followers that need a blob still in-flight will wait on the
+            // per-blob `Notify` via `ClaimAction::Wait` in `transfer_single_blob`,
+            // providing fine-grained synchronization without a coarse gate.
+            if !shutting_down
+                && matches!(promotion_phase, PromotionPhase::Discovering)
+                && discovery_futures.is_empty()
+            {
+                // All discovery complete - elect leaders and promote.
+                // `freq_map` is frozen from this point (no more discovery
+                // mutations), so `PromoteContext` can borrow it.
+                let n = elect_leaders(&mut pending);
+                // Collect leader target repos for follower mount preference.
+                if n > 0 {
+                    preferred_mount_sources = pending
+                        .iter()
+                        .take(n)
+                        .map(|t| t.target.repo.clone())
+                        .collect();
+                }
+                promotion_phase = PromotionPhase::Done;
+                write_timing(&mut timing_file, "discovery_complete", &run_start);
+                let ctx = PromoteContext {
+                    sem: &global_sem,
+                    cache: &cache,
+                    staging: &staging,
+                    freq_map: &freq_map,
+                    retry: &self.retry,
+                    referrers_cache: &referrers_cache,
+                };
+                let to_promote = pending.len();
+                for _ in 0..to_promote {
+                    if let Some(item) = pending.pop_front() {
+                        execution_futures.push(promote(item, &ctx, &preferred_mount_sources));
                     }
                 }
             }
@@ -986,7 +986,6 @@ impl SyncEngine {
             tokio::select! {
                 biased;
                 Some(result) = execution_futures.next(), if !execution_futures.is_empty() => {
-                    phase_inflight = phase_inflight.saturating_sub(1);
                     progress.image_completed(&result);
                     results.push(result);
                 }
@@ -1081,6 +1080,8 @@ impl SyncEngine {
                 else => break,
             }
         }
+
+        write_timing(&mut timing_file, "execution_complete", &run_start);
 
         // Prune stale cache entries for tags/targets no longer in the mapping set.
         // Prevents unbounded cache growth when source tags or targets are deleted.
@@ -1648,6 +1649,13 @@ async fn execute_item(
     .await
     {
         Ok(()) => {
+            // Mark this repo as having a committed manifest so it becomes
+            // a valid cross-repo mount source. ECR requires a committed
+            // manifest in the source repo for mount to succeed.
+            cache
+                .borrow_mut()
+                .mark_repo_committed(&item.target_name, &item.target.repo);
+
             // Discover and sync artifacts (signatures, SBOMs, attestations).
             let artifacts_skipped = match discover_and_sync_artifacts(
                 &item.source_client,
@@ -1838,30 +1846,33 @@ async fn pull_source_manifest(
                 index.manifests.iter().collect()
             };
 
-            let mut children = Vec::with_capacity(descriptors.len());
-            for child_desc in &descriptors {
-                let child_digest_str = child_desc.digest.to_string();
-                let child_pull = with_retry(retry, "manifest pull", || {
-                    client.manifest_pull(repo, &child_digest_str)
+            // Pull all child manifests concurrently. On single-threaded
+            // tokio these share the same event loop, so the registry's AIMD
+            // controller naturally limits concurrency.
+            let child_futures: Vec<_> = descriptors
+                .iter()
+                .map(|child_desc| {
+                    let child_digest_str = child_desc.digest.to_string();
+                    async move {
+                        let child_pull = with_retry(retry, "manifest pull", || {
+                            client.manifest_pull(repo, &child_digest_str)
+                        })
+                        .await
+                        .map_err(|e| crate::Error::Manifest {
+                            reference: child_digest_str.clone(),
+                            source: e,
+                        })?;
+                        match &child_pull.manifest {
+                            ManifestKind::Image(_) => Ok(child_pull),
+                            ManifestKind::Index(_) => Err(crate::Error::ManifestLogic {
+                                reference: child_digest_str,
+                                reason: "nested index manifests are not supported".into(),
+                            }),
+                        }
+                    }
                 })
-                .await
-                .map_err(|e| crate::Error::Manifest {
-                    reference: child_digest_str.clone(),
-                    source: e,
-                })?;
-
-                match &child_pull.manifest {
-                    ManifestKind::Image(_) => {
-                        children.push(child_pull);
-                    }
-                    ManifestKind::Index(_) => {
-                        return Err(crate::Error::ManifestLogic {
-                            reference: child_digest_str,
-                            reason: "nested index manifests are not supported".into(),
-                        });
-                    }
-                }
-            }
+                .collect();
+            let children = futures_util::future::try_join_all(child_futures).await?;
 
             // When platform filtering is active, rebuild the index manifest with
             // only the matching descriptors. The raw_bytes and digest must be
@@ -2316,22 +2327,36 @@ async fn push_manifests(
     target_tag: &str,
     source_data: &PulledManifest,
 ) -> Result<(), crate::Error> {
-    // For index manifests, push each child by digest first.
-    for child in &source_data.children {
-        let child_digest_str = child.digest.to_string();
-        with_retry(retry, "manifest push", || {
-            target_client.manifest_push(
-                target_repo,
-                &child_digest_str,
-                &child.media_type,
-                &child.raw_bytes,
-            )
+    // For index manifests, push all children concurrently by digest.
+    // The target registry's AIMD controller gates concurrency naturally.
+    // Uses join_all (not try_join_all) so that a transient failure on one
+    // child does not cancel in-flight pushes for the other children.
+    let child_push_futures: Vec<_> = source_data
+        .children
+        .iter()
+        .map(|child| {
+            let child_digest_str = child.digest.to_string();
+            async move {
+                with_retry(retry, "manifest push", || {
+                    target_client.manifest_push(
+                        target_repo,
+                        &child_digest_str,
+                        &child.media_type,
+                        &child.raw_bytes,
+                    )
+                })
+                .await
+                .map_err(|e| crate::Error::Manifest {
+                    reference: child_digest_str.clone(),
+                    source: e,
+                })
+            }
         })
-        .await
-        .map_err(|e| crate::Error::Manifest {
-            reference: child_digest_str.clone(),
-            source: e,
-        })?;
+        .collect();
+    let push_results = futures_util::future::join_all(child_push_futures).await;
+    // Return the first error after all futures have completed.
+    for result in push_results {
+        result?;
     }
 
     // Push top-level manifest by tag.

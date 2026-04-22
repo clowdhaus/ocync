@@ -133,9 +133,14 @@ pub struct TransferStateCache {
     /// redundant uploads - the winner pushes, losers mount from it.
     ///
     /// Lives outside `BlobDedupMap` so it's not part of the persisted cache
-    /// format. Entries are cleaned up on persist via `reset_transient_state`.
+    /// format. Not serialized; fresh each engine run.
     /// Nested map avoids allocating `(String, Digest)` keys on the read path.
     blob_notifies: HashMap<String, HashMap<Digest, Rc<Notify>>>,
+    /// Runtime-only: tracks which (target, repo) pairs have had their manifests
+    /// committed (pushed successfully). Only repos with committed manifests are
+    /// valid mount sources on ECR, which requires a committed manifest in the
+    /// source repo for mount to succeed. Not serialized; fresh each engine run.
+    committed_repos: HashMap<String, HashSet<RepositoryName>>,
 }
 
 impl TransferStateCache {
@@ -156,17 +161,46 @@ impl TransferStateCache {
 
     /// Find a cross-repo mount source for a blob at a target.
     ///
-    /// Prefers repos in `preferred` (leader repos with committed manifests),
-    /// then falls back to the alphabetically first candidate.
-    pub fn blob_mount_source<'a>(
-        &'a self,
+    /// Priority order:
+    /// 1. Preferred repos (leaders) with committed manifests
+    /// 2. Any repo with a committed manifest
+    /// 3. Any repo that has the blob (intra-run mounts where the blob was
+    ///    just uploaded but the manifest is not yet committed)
+    ///
+    /// ECR requires a committed manifest for mount to return 201. Tier 3
+    /// mounts may get 202 (not fulfilled) on ECR, which the engine handles
+    /// by falling through to HEAD+push. This is acceptable because intra-run
+    /// mounts from a leader whose blobs are uploaded but manifest not yet
+    /// committed are rare (only during the brief window between blob upload
+    /// completion and manifest push).
+    pub fn blob_mount_source(
+        &self,
         target: &str,
         digest: &Digest,
         current_repo: &RepositoryName,
         preferred: &[RepositoryName],
-    ) -> Option<&'a RepositoryName> {
-        self.dedup
-            .mount_source(target, digest, current_repo, preferred)
+    ) -> Option<&RepositoryName> {
+        let info = self.dedup.known_repos(target, digest)?;
+
+        if let Some(committed) = self.committed_repos.get(target) {
+            // Tier 1: preferred repos with committed manifests.
+            for pref in preferred {
+                if pref != current_repo && info.contains(pref) && committed.contains(pref) {
+                    return info.get(pref);
+                }
+            }
+
+            // Tier 2: any committed repo.
+            if let Some(r) = info
+                .iter()
+                .find(|r| *r != current_repo && committed.contains(r))
+            {
+                return Some(r);
+            }
+        }
+
+        // Tier 3: any repo with the blob (intra-run fallback).
+        info.iter().find(|r| *r != current_repo)
     }
 
     /// Mark a blob as already existing at the target in the given repo.
@@ -229,6 +263,26 @@ impl TransferStateCache {
     /// Mark a blob as failed at the target.
     pub fn set_blob_failed(&mut self, target: &str, digest: Digest, error: String) {
         self.dedup.set_failed(target, &digest, error);
+    }
+
+    /// Record that a repo has had its manifest committed (pushed successfully).
+    ///
+    /// Only repos tracked here are eligible as cross-repo mount sources via
+    /// [`blob_mount_source`]. ECR requires a committed manifest in the source
+    /// repo for mount to succeed.
+    pub fn mark_repo_committed(&mut self, target: &str, repo: &RepositoryName) {
+        self.committed_repos
+            .entry(target.to_owned())
+            .or_default()
+            .insert(repo.clone());
+    }
+
+    /// Check whether a repo has a committed manifest at the target.
+    #[cfg(test)]
+    pub(crate) fn is_repo_committed(&self, target: &str, repo: &RepositoryName) -> bool {
+        self.committed_repos
+            .get(target)
+            .is_some_and(|repos| repos.contains(repo))
     }
 
     /// Check whether a blob is known to exist at a specific repo on the target.
@@ -437,6 +491,7 @@ impl TransferStateCache {
             dedup,
             snapshots,
             blob_notifies: HashMap::new(),
+            committed_repos: HashMap::new(),
         })
     }
 }
@@ -529,14 +584,50 @@ mod tests {
     }
 
     #[test]
-    fn mount_source_delegates_to_dedup() {
+    fn mount_source_prefers_committed_repo() {
         let mut cache = TransferStateCache::new();
         cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
         cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
+
+        // Without committed repos, tier 3 returns alphabetically first.
         assert_eq!(
             cache.blob_mount_source("reg.io", &digest(), &repo("repo/b"), &[]),
-            Some(&repo("repo/a"))
+            Some(&repo("repo/a")),
         );
+
+        // After committing repo/a, tier 2 returns it (same result, higher confidence).
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+        assert_eq!(
+            cache.blob_mount_source("reg.io", &digest(), &repo("repo/b"), &[]),
+            Some(&repo("repo/a")),
+        );
+    }
+
+    #[test]
+    fn mount_source_prefers_committed_over_uncommitted() {
+        let mut cache = TransferStateCache::new();
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/c"));
+
+        // repo/a is preferred but not committed; repo/b is committed.
+        // Tier 1 skips repo/a (not committed). Tier 2 returns repo/b.
+        cache.mark_repo_committed("reg.io", &repo("repo/b"));
+
+        let preferred = [repo("repo/a")];
+        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/c"), &preferred);
+        assert_eq!(source, Some(&repo("repo/b")));
+    }
+
+    #[test]
+    fn is_repo_committed_tracks_state() {
+        let mut cache = TransferStateCache::new();
+        assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
+
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+        assert!(cache.is_repo_committed("reg.io", &repo("repo/a")));
+        assert!(!cache.is_repo_committed("reg.io", &repo("repo/b")));
+        assert!(!cache.is_repo_committed("other.io", &repo("repo/a")));
     }
 
     #[test]
