@@ -124,7 +124,7 @@ scenario, one question, one headline number per run.
 
 **Headline number per scenario:** one sentence. "`ocync` syncs 15 GB of
 images in X seconds (p50, N=5) on c6in.4xlarge, Docker Hub to
-us-east-1 ECR, from commit `<sha>`." If a scenario cannot be
+us-east-2 ECR, from commit `<sha>`." If a scenario cannot be
 summarized in one sentence, it's measuring too many things and needs
 to be split.
 

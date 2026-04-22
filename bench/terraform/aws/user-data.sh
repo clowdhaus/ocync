@@ -120,7 +120,7 @@ cp /root/go/bin/docker-credential-ecr-login /usr/local/bin/
 
 mkdir -p /home/ec2-user/.docker
 cat > /home/ec2-user/.docker/config.json <<'DCEOF'
-{"credHelpers":{"${account_id}.dkr.ecr.us-east-1.amazonaws.com":"ecr-login","public.ecr.aws":"ecr-login"}}
+{"credHelpers":{"${account_id}.dkr.ecr.${region}.amazonaws.com":"ecr-login","public.ecr.aws":"ecr-login"}}
 DCEOF
 chown -R ec2-user:ec2-user /home/ec2-user/.docker
 

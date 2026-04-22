@@ -22,7 +22,7 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = "us-east-2"
 }
 
 locals {
@@ -221,9 +221,9 @@ module "ec2" {
   # IAM instance profile with ECR full access and instance metadata
   create_iam_instance_profile = true
   iam_role_policies = {
-    AmazonEC2ContainerRegistryFullAccess           = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess"
-    AmazonElasticContainerRegistryPublicReadOnly    = "arn:aws:iam::aws:policy/AmazonElasticContainerRegistryPublicReadOnly"
-    Bench                                          = aws_iam_policy.bench.arn
+    AmazonEC2ContainerRegistryFullAccess         = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess"
+    AmazonElasticContainerRegistryPublicReadOnly = "arn:aws:iam::aws:policy/AmazonElasticContainerRegistryPublicReadOnly"
+    Bench                                        = aws_iam_policy.bench.arn
   }
 
   # Security group -- SSH from operator IP, all egress
@@ -265,6 +265,7 @@ module "ec2" {
     dockerhub_username = data.aws_ssm_parameter.dockerhub_username.value
     dockerhub_token    = data.aws_ssm_parameter.dockerhub_token.value
     account_id         = data.aws_caller_identity.current.account_id
+    region             = "us-east-2"
   })
   user_data_replace_on_change = true
 

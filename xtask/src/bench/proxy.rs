@@ -45,6 +45,12 @@ pub(crate) struct ProxyEntry {
     pub(crate) status: u16,
     /// Request duration in milliseconds (preserved from log for latency analysis).
     pub(crate) duration_ms: u64,
+    /// CDN cache status from `X-Cache` header (e.g. `"Hit from cloudfront"`).
+    #[serde(default)]
+    pub(crate) x_cache: Option<String>,
+    /// Seconds since CDN cached the response, from `Age` header.
+    #[serde(default)]
+    pub(crate) age: Option<u64>,
 }
 
 /// Aggregated metrics computed from a set of proxy log entries.
@@ -79,6 +85,12 @@ pub(crate) struct ProxyMetrics {
     /// Includes both registry redirect responses and CDN follow-up responses
     /// where the actual blob data flows (`CloudFront`, S3, R2, etc.).
     pub(crate) source_blob_bytes: u64,
+    /// Source requests where `X-Cache` contained `"Hit"` (CDN cache hit).
+    #[serde(default)]
+    pub(crate) cdn_hits: u64,
+    /// Source requests where `X-Cache` contained `"Miss"` (CDN cache miss).
+    #[serde(default)]
+    pub(crate) cdn_misses: u64,
 }
 
 /// Spawns a `bench-proxy` process and waits for it to bind its port.
@@ -194,6 +206,8 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
     let mut existence_check_posts = 0u64;
     let mut source_blob_gets = 0u64;
     let mut source_blob_bytes = 0u64;
+    let mut cdn_hits = 0u64;
+    let mut cdn_misses = 0u64;
 
     // Track GET requests to blob URLs for duplicate detection.
     let mut blob_get_counts: HashMap<String, u64> = HashMap::new();
@@ -225,6 +239,18 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
         // GET responses captures both the redirect and CDN responses.
         if entry.method == "GET" && entry.host != target_registry {
             source_blob_bytes += entry.response_bytes;
+        }
+
+        // CDN cache status from X-Cache header (source requests only).
+        if entry.host != target_registry {
+            if let Some(ref xc) = entry.x_cache {
+                let lower = xc.to_ascii_lowercase();
+                if lower.contains("hit") {
+                    cdn_hits += 1;
+                } else if lower.contains("miss") {
+                    cdn_misses += 1;
+                }
+            }
         }
 
         // OCI cross-repo blob mount: `POST /v2/.../blobs/uploads/?mount=<digest>&from=<repo>`.
@@ -268,6 +294,8 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
         existence_check_posts,
         source_blob_gets,
         source_blob_bytes,
+        cdn_hits,
+        cdn_misses,
     }
 }
 
@@ -276,44 +304,66 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn entry(
+        method: &str,
+        host: &str,
+        url: &str,
+        request_bytes: u64,
+        response_bytes: u64,
+        status: u16,
+        duration_ms: u64,
+    ) -> ProxyEntry {
+        ProxyEntry {
+            method: method.into(),
+            host: host.into(),
+            url: url.into(),
+            request_bytes,
+            response_bytes,
+            status,
+            duration_ms,
+            x_cache: None,
+            age: None,
+        }
+    }
+
     fn sample_entries() -> Vec<ProxyEntry> {
         vec![
-            ProxyEntry {
-                method: "HEAD".into(),
-                host: "ecr.aws".into(),
-                url: "/v2/bench/nginx/manifests/latest".into(),
-                request_bytes: 100,
-                response_bytes: 0,
-                status: 200,
-                duration_ms: 30,
-            },
-            ProxyEntry {
-                method: "GET".into(),
-                host: "ecr.aws".into(),
-                url: "/v2/bench/nginx/blobs/sha256:abc123".into(),
-                request_bytes: 50,
-                response_bytes: 5000,
-                status: 200,
-                duration_ms: 120,
-            },
-            ProxyEntry {
-                method: "GET".into(),
-                host: "ecr.aws".into(),
-                url: "/v2/bench/nginx/blobs/sha256:abc123".into(),
-                request_bytes: 50,
-                response_bytes: 5000,
-                status: 200,
-                duration_ms: 115,
-            },
-            ProxyEntry {
-                method: "PUT".into(),
-                host: "ecr.aws".into(),
-                url: "/v2/bench/nginx/manifests/latest".into(),
-                request_bytes: 2000,
-                response_bytes: 100,
-                status: 429,
-                duration_ms: 10,
-            },
+            entry(
+                "HEAD",
+                "ecr.aws",
+                "/v2/bench/nginx/manifests/latest",
+                100,
+                0,
+                200,
+                30,
+            ),
+            entry(
+                "GET",
+                "ecr.aws",
+                "/v2/bench/nginx/blobs/sha256:abc123",
+                50,
+                5000,
+                200,
+                120,
+            ),
+            entry(
+                "GET",
+                "ecr.aws",
+                "/v2/bench/nginx/blobs/sha256:abc123",
+                50,
+                5000,
+                200,
+                115,
+            ),
+            entry(
+                "PUT",
+                "ecr.aws",
+                "/v2/bench/nginx/manifests/latest",
+                2000,
+                100,
+                429,
+                10,
+            ),
         ]
     }
 
@@ -402,24 +452,24 @@ mod tests {
     #[test]
     fn aggregate_head_on_blob_url_not_counted_as_duplicate() {
         let entries = vec![
-            ProxyEntry {
-                method: "GET".into(),
-                host: "ecr.aws".into(),
-                url: "/v2/bench/nginx/blobs/sha256:abc123".into(),
-                request_bytes: 50,
-                response_bytes: 5000,
-                status: 200,
-                duration_ms: 100,
-            },
-            ProxyEntry {
-                method: "HEAD".into(),
-                host: "ecr.aws".into(),
-                url: "/v2/bench/nginx/blobs/sha256:abc123".into(),
-                request_bytes: 50,
-                response_bytes: 0,
-                status: 200,
-                duration_ms: 10,
-            },
+            entry(
+                "GET",
+                "ecr.aws",
+                "/v2/bench/nginx/blobs/sha256:abc123",
+                50,
+                5000,
+                200,
+                100,
+            ),
+            entry(
+                "HEAD",
+                "ecr.aws",
+                "/v2/bench/nginx/blobs/sha256:abc123",
+                50,
+                0,
+                200,
+                10,
+            ),
         ];
         let metrics = aggregate(&entries, "ecr.aws");
         assert_eq!(metrics.duplicate_blob_gets, 0);
@@ -428,24 +478,24 @@ mod tests {
     #[test]
     fn aggregate_no_duplicates_with_unique_blobs() {
         let entries = vec![
-            ProxyEntry {
-                method: "GET".into(),
-                host: "ecr.aws".into(),
-                url: "/v2/bench/nginx/blobs/sha256:aaa".into(),
-                request_bytes: 50,
-                response_bytes: 5000,
-                status: 200,
-                duration_ms: 100,
-            },
-            ProxyEntry {
-                method: "GET".into(),
-                host: "ecr.aws".into(),
-                url: "/v2/bench/nginx/blobs/sha256:bbb".into(),
-                request_bytes: 50,
-                response_bytes: 3000,
-                status: 200,
-                duration_ms: 80,
-            },
+            entry(
+                "GET",
+                "ecr.aws",
+                "/v2/bench/nginx/blobs/sha256:aaa",
+                50,
+                5000,
+                200,
+                100,
+            ),
+            entry(
+                "GET",
+                "ecr.aws",
+                "/v2/bench/nginx/blobs/sha256:bbb",
+                50,
+                3000,
+                200,
+                80,
+            ),
         ];
         let metrics = aggregate(&entries, "ecr.aws");
         assert_eq!(metrics.duplicate_blob_gets, 0);
@@ -455,37 +505,37 @@ mod tests {
     fn aggregate_source_blob_gets() {
         let entries = vec![
             // Source blob GET (host != target).
-            ProxyEntry {
-                method: "GET".into(),
-                host: "docker.io".into(),
-                url: "/v2/library/nginx/blobs/sha256:abc".into(),
-                request_bytes: 50,
-                response_bytes: 9000,
-                status: 200,
-                duration_ms: 100,
-            },
+            entry(
+                "GET",
+                "docker.io",
+                "/v2/library/nginx/blobs/sha256:abc",
+                50,
+                9000,
+                200,
+                100,
+            ),
             // Target blob GET (host == target).
-            ProxyEntry {
-                method: "GET".into(),
-                host: "ecr.aws".into(),
-                url: "/v2/bench/nginx/blobs/sha256:abc".into(),
-                request_bytes: 50,
-                response_bytes: 9000,
-                status: 200,
-                duration_ms: 80,
-            },
+            entry(
+                "GET",
+                "ecr.aws",
+                "/v2/bench/nginx/blobs/sha256:abc",
+                50,
+                9000,
+                200,
+                80,
+            ),
             // Source non-blob GET (manifest, not /blobs/sha256:).
             // Does NOT count as a source_blob_get, but its response bytes
             // ARE included in source_blob_bytes (all non-target GET bytes).
-            ProxyEntry {
-                method: "GET".into(),
-                host: "docker.io".into(),
-                url: "/v2/library/nginx/manifests/latest".into(),
-                request_bytes: 50,
-                response_bytes: 1000,
-                status: 200,
-                duration_ms: 50,
-            },
+            entry(
+                "GET",
+                "docker.io",
+                "/v2/library/nginx/manifests/latest",
+                50,
+                1000,
+                200,
+                50,
+            ),
         ];
         let metrics = aggregate(&entries, "ecr.aws");
         assert_eq!(metrics.source_blob_gets, 1);

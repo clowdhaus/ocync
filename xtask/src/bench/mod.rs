@@ -10,6 +10,8 @@ pub(crate) mod report;
 pub(crate) mod runner;
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
@@ -103,8 +105,6 @@ fn read_ssm_parameter(name: &str) -> Option<String> {
             "Parameter.Value",
             "--output",
             "text",
-            "--region",
-            "us-east-1",
         ])
         .output()
         .ok()
@@ -337,11 +337,24 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         other => vec![other],
     };
 
+    // Pre-warm CDN so all tools see identically cached source manifests.
+    cdn_prewarm(&corpus).await;
+
     for scenario in scenarios {
+        // Randomize tool execution order to prevent systematic bias from
+        // CDN warming, network burst credit depletion, etc.
+        let mut shuffled = tools.clone();
+        shuffle_tools(&mut shuffled);
+        let tool_order: Vec<_> = shuffled.iter().map(|t| t.to_string()).collect();
+        eprintln!(
+            "bench: tool order for {scenario:?}: {}",
+            tool_order.join(", ")
+        );
+
         match scenario {
             Scenario::Sync => {
                 let (cold, warm) =
-                    run_sync(&args, &corpus, &tools, &ecr_client, &output_dir).await?;
+                    run_sync(&args, &corpus, &shuffled, &ecr_client, &output_dir).await?;
                 report.scenarios.push(cold);
                 report.scenarios.push(warm);
             }
@@ -356,7 +369,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     &args,
                     &corpus,
                     &partial_corpus,
-                    &tools,
+                    &shuffled,
                     &ecr_client,
                     &output_dir,
                 )
@@ -429,6 +442,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                             mount_attempts: metrics.map_or(0, |m| m.mount_attempts),
                             duplicate_blob_gets: metrics.map_or(0, |m| m.duplicate_blob_gets),
                             rate_limit_429s: metrics.map_or(0, |m| m.status_429_count),
+                            cdn_hits: metrics.map_or(0, |m| m.cdn_hits),
+                            cdn_misses: metrics.map_or(0, |m| m.cdn_misses),
                         }
                     })
                     .collect(),
@@ -507,6 +522,7 @@ async fn run_single_tool(
     corpus: &Corpus,
     config_dir: &Path,
     output_dir: &Path,
+    phase: &str,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
     // 1. Generate config.
     let config_content = match tool {
@@ -531,7 +547,7 @@ async fn run_single_tool(
     // which API calls the tool issued.
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
-    let log_path = output_dir.join(format!("{tool}-proxy.jsonl"));
+    let log_path = output_dir.join(format!("{tool}-{phase}-proxy.jsonl"));
     let handle = proxy::start(
         &args.proxy_binary,
         &args.proxy_ca,
@@ -637,7 +653,8 @@ async fn run_sync(
         // Cold run.
         progress(&format!("  cold: {tool}"));
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
-            let cold = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
+            let cold =
+                run_single_tool(args, tool, corpus, config_dir.path(), output_dir, "cold").await?;
             if cold.exit_code != Some(0) {
                 return Err(format!(
                     "{tool} cold sync failed (exit {:?}); aborting -- \
@@ -658,7 +675,8 @@ async fn run_sync(
 
             // Warm run: target still populated, same config_dir.
             progress(&format!("  warm: {tool}"));
-            let warm = run_single_tool(args, tool, corpus, config_dir.path(), output_dir).await?;
+            let warm =
+                run_single_tool(args, tool, corpus, config_dir.path(), output_dir, "warm").await?;
             if warm.exit_code != Some(0) {
                 return Err(format!(
                     "{tool} warm sync failed (exit {:?}); aborting -- \
@@ -721,8 +739,15 @@ async fn run_partial(
             // Prime with base corpus (unmeasured). Reuse the same
             // config_dir so ocync's TransferStateCache persists.
             let config_dir = tempfile::tempdir()?;
-            let prime =
-                run_single_tool(args, tool, base_corpus, config_dir.path(), output_dir).await?;
+            let prime = run_single_tool(
+                args,
+                tool,
+                base_corpus,
+                config_dir.path(),
+                output_dir,
+                "prime",
+            )
+            .await?;
             if prime.exit_code != Some(0) {
                 return Err(format!(
                     "{tool} partial prime failed (exit {:?}); aborting",
@@ -733,8 +758,15 @@ async fn run_partial(
             progress(&format!("  partial: {} measuring", tool));
 
             // Measured run with partial corpus (same config_dir).
-            let run =
-                run_single_tool(args, tool, partial_corpus, config_dir.path(), output_dir).await?;
+            let run = run_single_tool(
+                args,
+                tool,
+                partial_corpus,
+                config_dir.path(),
+                output_dir,
+                "partial",
+            )
+            .await?;
             if run.exit_code != Some(0) {
                 return Err(format!(
                     "{tool} partial sync failed (exit {:?}); aborting",
@@ -797,7 +829,8 @@ async fn run_scale(
             let run_result: Result<(), Box<dyn std::error::Error>> = async {
                 let config_dir = tempfile::tempdir()?;
                 let run =
-                    run_single_tool(args, tool, &subset, config_dir.path(), output_dir).await?;
+                    run_single_tool(args, tool, &subset, config_dir.path(), output_dir, "scale")
+                        .await?;
                 if run.exit_code != Some(0) {
                     return Err(format!(
                         "{tool} scale sync failed at {size} images (exit {:?}); aborting",
@@ -836,9 +869,177 @@ fn prepare_clean_slate() {
     clean_staging_tmpdir();
 }
 
+/// Pull every source manifest once to warm CDN edge caches.
+///
+/// Runs before any tool so all tools see identically warm CDN. Uses
+/// OCI token exchange for authentication so requests succeed (2xx) and
+/// `CloudFront` actually caches the responses. Unauthenticated 401s are
+/// NOT cached by CDN and would warm nothing.
+async fn cdn_prewarm(corpus: &Corpus) {
+    let total = corpus.total_tags();
+    eprintln!("bench: pre-warming CDN ({total} manifests)...");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    // Group images by registry so we can reuse tokens per scope.
+    let mut hits = 0u64;
+    let mut misses = 0u64;
+    let mut errors = 0u64;
+
+    for image in &corpus.images {
+        let (raw_registry, repo) = match image.source.find('/') {
+            Some(i) => (&image.source[..i], &image.source[i + 1..]),
+            None => continue,
+        };
+        // Docker Hub's API endpoint is registry-1.docker.io, not docker.io.
+        let registry = if raw_registry == "docker.io" {
+            "registry-1.docker.io"
+        } else {
+            raw_registry
+        };
+
+        // OCI token exchange: GET /v2/ -> 401 with WWW-Authenticate ->
+        // GET {realm}?service={service}&scope=repository:{repo}:pull -> bearer token.
+        let token = match oci_token(&client, registry, repo, corpus).await {
+            Some(t) => t,
+            None => {
+                errors += image.tags.len() as u64;
+                eprintln!("  CDN pre-warm: {registry}/{repo}: auth failed, skipping");
+                continue;
+            }
+        };
+
+        for tag in &image.tags {
+            let url = format!("https://{registry}/v2/{repo}/manifests/{tag}");
+            let resp = client
+                .head(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() || r.status().is_redirection() => {
+                    let x_cache = r
+                        .headers()
+                        .get("x-cache")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if x_cache.to_ascii_lowercase().contains("hit") {
+                        hits += 1;
+                    } else {
+                        misses += 1;
+                    }
+                }
+                Ok(r) => {
+                    errors += 1;
+                    eprintln!("  CDN pre-warm: {registry}/{repo}:{tag} -> {}", r.status());
+                }
+                Err(e) => {
+                    errors += 1;
+                    eprintln!("  CDN pre-warm: {registry}/{repo}:{tag} -> {e}");
+                }
+            }
+        }
+    }
+
+    eprintln!("bench: CDN pre-warm done ({hits} hits, {misses} misses, {errors} errors)");
+
+    // Wait for CDN propagation. CloudFront edges need time to fully
+    // populate after the first request hits the origin.
+    let wait_secs = 360; // 6 minutes
+    eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
+    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+}
+
+/// OCI token exchange for a single repository scope.
+///
+/// Follows the standard flow: challenge /v2/, parse `WWW-Authenticate`,
+/// request a bearer token from the auth realm. For Docker Hub, includes
+/// basic auth credentials if available in the corpus.
+async fn oci_token(
+    client: &reqwest::Client,
+    registry: &str,
+    repo: &str,
+    corpus: &Corpus,
+) -> Option<String> {
+    // Step 1: challenge the registry to get the auth parameters.
+    let challenge = client
+        .get(format!("https://{registry}/v2/"))
+        .send()
+        .await
+        .ok()?;
+
+    let www_auth = challenge
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())?;
+
+    // Parse: Bearer realm="https://...",service="...",scope="..."
+    let realm = parse_auth_param(www_auth, "realm")?;
+    let service = parse_auth_param(www_auth, "service").unwrap_or_default();
+
+    // Step 2: exchange for a bearer token.
+    let scope = format!("repository:{repo}:pull");
+    let mut token_req = client
+        .get(&realm)
+        .query(&[("service", &service), ("scope", &scope)]);
+
+    // Docker Hub: include basic auth for authenticated pull rates.
+    if registry.contains("docker.io") {
+        if let Some(ref auth) = corpus.dockerhub_auth {
+            token_req = token_req.basic_auth(&auth.username, Some(&auth.token));
+        }
+    }
+
+    let token_resp = token_req.send().await.ok()?;
+    if !token_resp.status().is_success() {
+        return None;
+    }
+
+    let text = token_resp.text().await.ok()?;
+    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
+    body.get("token")
+        .or_else(|| body.get("access_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned())
+}
+
+/// Extract a parameter value from a `WWW-Authenticate: Bearer ...` header.
+fn parse_auth_param(header: &str, key: &str) -> Option<String> {
+    let pattern = format!("{key}=\"");
+    let start = header.find(&pattern)? + pattern.len();
+    let end = header[start..].find('"')? + start;
+    Some(header[start..end].to_owned())
+}
+
 async fn cooldown() {
-    eprintln!("bench: cooling down for 30s...");
-    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    eprintln!("bench: cooling down for 10s...");
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+}
+
+/// Shuffle a tool list in-place using Fisher-Yates with a timestamp seed.
+/// Not cryptographic -- just enough to randomize execution order across runs.
+fn shuffle_tools(tools: &mut [Tool]) {
+    if tools.len() <= 1 {
+        return;
+    }
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    let mut state = hasher.finish();
+    for i in (1..tools.len()).rev() {
+        // xorshift64 step for cheap pseudo-randomness.
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state as usize) % (i + 1);
+        tools.swap(i, j);
+    }
 }
 
 /// Attempt to drop the OS page cache via `/proc/sys/vm/drop_caches`.
@@ -855,8 +1056,12 @@ fn drop_page_cache() {
         .status();
     match result {
         Ok(s) if s.success() => eprintln!("bench: dropped page cache"),
-        Ok(s) => eprintln!("bench: warning: drop_caches exited {s}; later tools may benefit from cached data"),
-        Err(e) => eprintln!("bench: warning: could not drop page cache ({e}); later tools may benefit from cached data"),
+        Ok(s) => eprintln!(
+            "bench: warning: drop_caches exited {s}; later tools may benefit from cached data"
+        ),
+        Err(e) => eprintln!(
+            "bench: warning: could not drop page cache ({e}); later tools may benefit from cached data"
+        ),
     }
 }
 

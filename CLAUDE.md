@@ -60,7 +60,7 @@ Every PR ships the smallest correct change + one test that catches regression. D
 - One PR at a time, merge to main, then next. No stacked PRs ever.
 - When dispatching parallel worktree agents, each MUST create its own branch from `main` (`git checkout -b feat/xxx main`). Never push to an existing branch from a worktree agent.
 - Never include `Co-Authored-By: Claude` or Anthropic attribution
-- Run the CI gate locally before push: `cargo fmt --check && cargo clippy -- -D warnings && cargo test && cargo deny check`
+- Run the CI gate locally before push: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test && cargo deny check`
 - During rebase conflicts on `Cargo.lock`, regenerate with `git checkout --theirs Cargo.lock && cargo generate-lockfile`
 
 ## Plans and specs
@@ -79,7 +79,7 @@ When a benchmark or probe run changes our understanding of a registry's behavior
 
 ```bash
 # CI gate (run before every push)
-cargo fmt --check && cargo clippy -- -D warnings && cargo test && cargo deny check
+cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test && cargo deny check
 
 # Run all tests
 cargo test
@@ -91,7 +91,7 @@ cargo test --package ocync-distribution --test registry2_mount
 
 ## Benchmarks
 
-Prerequisites: Terraform, AWS credentials with ECR access, SSM parameters populated:
+Prerequisites: Terraform, AWS credentials with ECR access, SSM parameters populated in us-east-2:
 - `/ocync/bench/dockerhub-username` - Docker Hub account name
 - `/ocync/bench/dockerhub-access-token` - Docker Hub PAT for authenticated pulls
 
