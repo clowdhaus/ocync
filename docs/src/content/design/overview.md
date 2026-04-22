@@ -84,15 +84,15 @@ Window grouping is registry-specific (ECR uses 9 windows matching its per-action
 
 ## Cross-repo blob mounting
 
-When a blob already exists in another repository on the same target registry, OCI registries can "mount" it -- zero bytes over the wire. `ocync` maximizes mount success through leader-follower election and wave-based execution. See [cross-repo blob mounting in the engine doc](./engine#cross-repo-blob-mounting) for the full implementation.
+When a blob already exists in another repository on the same target registry, OCI registries can "mount" it -- zero bytes over the wire. `ocync` maximizes mount success through leader-follower election and per-blob synchronization. See [cross-repo blob mounting in the engine doc](./engine#cross-repo-blob-mounting) for the full implementation.
 
 ### Leader-follower election
 
 Multiple images in a sync run often share base layers. If all images push independently, shared blobs are uploaded N times. `ocync` uses leader-follower election via a greedy set-cover algorithm (`elect_leaders()`) to ensure shared blobs are uploaded once by leaders and mounted everywhere else by followers. The algorithm provably covers every shared blob -- there is no "uncovered follower" path. See [leader-follower election in the engine doc](./engine#leader-follower-election) for the algorithm details.
 
-### Wave promotion
+### Progressive promotion
 
-Followers cannot mount from a leader until the leader's manifest is committed. The engine uses two-wave execution: leaders upload and commit first, then followers mount shared blobs from leader repos at zero transfer cost. See [wave promotion in the engine doc](./engine#wave-promotion) for details.
+Followers cannot mount from a leader until the leader's manifest is committed. All tasks are promoted simultaneously after discovery, with leaders ordered first so they acquire semaphore permits and claim blob uploads before followers. Followers that need a blob still in-flight wait on per-blob `Notify` handles via `ClaimAction::Wait`. Mount sources are restricted to repos with committed manifests, ensuring mount attempts only target repos that can fulfill them. See [progressive promotion in the engine doc](./engine#progressive-promotion) for details.
 
 ### ECR BLOB_MOUNTING
 
@@ -145,7 +145,7 @@ See [Performance](../performance) for the full benchmark table. Summary (39 imag
 - **24-38% fewer API requests** through global blob dedup and mount-first strategy
 - **Cross-repo blob mounting** avoids re-pulling shared layers from source (87% mount success rate)
 - **Zero duplicate blob GETs** (source-pull dedup via staging)
-- **AIMD congestion control** adapts to registry capacity before hitting rate limits
+- **AIMD congestion control** adapts to registry capacity through rate-limit feedback
 - **Typed error handling** for registry responses -- non-JSON bodies (HTML rate-limit pages, proxy errors) produce structured `RegistryError` variants with status code and body context, not parse failures. Comparable tools that deserialize every response as JSON crash or log parse errors (`invalid character 'b' looking for beginning of value`) when a registry returns HTML.
 
 The lower peak RSS of sequential tools reflects their one-image-at-a-time architecture. `ocync`'s ~48 MB comes from concurrent blob transfers, staging maps, and the transfer state cache -- the memory trade-off buys the wall-clock advantage.

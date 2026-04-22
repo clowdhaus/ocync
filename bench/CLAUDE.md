@@ -76,7 +76,7 @@ Instance metadata (type, CPU, memory, network, region) is captured from `ec2:Des
 The harness enforces these automatically -- do not bypass them.
 
 **Before any tool runs (once per scenario):**
-0. **CDN pre-warm** -- HEAD every source manifest with OCI token exchange to populate CDN edge caches. Wait 6 minutes for CloudFront propagation. Without this, the first tool hits cold CDN (7% hit rate) while the last tool gets 99% hits -- a massive unfair advantage from execution order.
+0. **CDN pre-warm** -- HEAD every source manifest AND GET every unique blob (following 302 redirects to CloudFront, consuming full body) with OCI token exchange to populate both manifest and blob CDN edge caches. Wait 6 minutes for CloudFront propagation. Without this, the first tool hits cold CDN while the last tool gets near-100% hits -- a massive unfair advantage from execution order.
 1. **Randomize tool order** -- Fisher-Yates shuffle so no tool systematically runs first or last. The randomized order is logged for traceability.
 
 **Before every tool run (including the first):**

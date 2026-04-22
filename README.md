@@ -3,7 +3,7 @@
 Sync OCI container images across registries - efficiently.
 
 <p align="center">
-  <img src="docs/public/ecr-banner.svg" alt="ocync - 4x faster, 40% fewer requests, 0 rate-limit errors" width="900">
+  <img src="docs/public/ecr-banner.svg" alt="ocync - 4x faster, 40% fewer requests, adaptive rate control" width="900">
 </p>
 
 [![CI](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml/badge.svg)](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml)

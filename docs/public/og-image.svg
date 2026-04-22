@@ -82,9 +82,9 @@
   <!-- Stat card 3: Reliability -->
   <rect x="620" y="390" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="435" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#F736F6" letter-spacing="2">RELIABILITY</text>
-  <text x="660" y="495" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#pink-grad)">0</text>
-  <text x="720" y="478" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">rate-limit</text>
-  <text x="720" y="503" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">errors</text>
+  <text x="660" y="495" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="48" font-weight="800" fill="url(#pink-grad)">AIMD</text>
+  <text x="870" y="478" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">adaptive</text>
+  <text x="870" y="503" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">rate control</text>
 
   <!-- Bottom gradient bar -->
   <rect x="0" y="620" width="1200" height="10" fill="url(#accent)"/>
