@@ -38,7 +38,7 @@ To enable:
 aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED
 ```
 
-`ocync`'s leader-follower algorithm ensures shared blobs are uploaded exactly once. One image is elected leader for each shared blob and performs the actual upload; all other images (followers) wait and then mount from the leader's repository.
+`ocync`'s leader-follower algorithm ensures shared blobs are uploaded exactly once. Images are elected as leaders using a greedy set-cover algorithm; each leader uploads all its blobs and commits its manifest. Followers mount shared blobs from leader repositories, with mount sources restricted to repos that have committed manifests.
 
 ## Batch blob existence checks
 

@@ -816,5 +816,130 @@
         ]
       }
     ]
+  },
+  {
+    "timestamp": "2026-04-22-121126",
+    "git_ref": "cd2fc9f",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 250.844974983,
+            "peak_rss_kb": 46672,
+            "requests": 7203,
+            "response_bytes": 55405604071,
+            "source_blob_gets": 1451,
+            "source_blob_bytes": 55405345825,
+            "mount_successes": 314,
+            "mount_attempts": 365,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 17,
+            "cdn_hits": 677,
+            "cdn_misses": 379
+          },
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-22T12:11:25Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 1127.286506765,
+            "peak_rss_kb": 387948,
+            "requests": 11299,
+            "response_bytes": 55288211967,
+            "source_blob_gets": 1371,
+            "source_blob_bytes": 55288177410,
+            "mount_successes": 325,
+            "mount_attempts": 325,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 894,
+            "cdn_misses": 82
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 945.586593866,
+            "peak_rss_kb": 27596,
+            "requests": 9532,
+            "response_bytes": 65268271850,
+            "source_blob_gets": 1695,
+            "source_blob_bytes": 65268262350,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 988,
+            "cdn_misses": 0
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 2.114610237,
+            "peak_rss_kb": 15972,
+            "requests": 181,
+            "response_bytes": 131802,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 127721,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
+          },
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-22T12:11:25Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 100.366697158,
+            "peak_rss_kb": 33400,
+            "requests": 3145,
+            "response_bytes": 1925714,
+            "source_blob_gets": 227,
+            "source_blob_bytes": 1891158,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 165,
+            "cdn_misses": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 12.873680977,
+            "peak_rss_kb": 20564,
+            "requests": 170,
+            "response_bytes": 124520,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 120355,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
+          }
+        ]
+      }
+    ]
   }
 ]

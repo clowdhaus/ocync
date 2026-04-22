@@ -108,10 +108,10 @@ scenario, one question, one headline number per run.
 
 **Rules:**
 
-- **Pre-warm is mandatory.** Before the timed window, `ocync` makes a
-  dummy HEAD/auth request to every registry in the corpus. Auth token
-  fetches, DNS, TCP setup, and initial [AIMD](./overview#adaptive-concurrency-aimd) ramp-up must not show up
-  in the cold-throughput number.
+- **CDN pre-warm is mandatory.** Before the timed window, the harness
+  HEADs every source manifest and GETs every unique blob (following CDN
+  redirects) to equalize CDN edge cache state across all tools. Auth
+  token fetches, DNS, and TCP setup are also amortized during pre-warm.
 - **Iterations >= 3, default 5, median reported, p10/p90 published.**
   Single-run variance hides real regressions.
 - **Results are versioned artifacts.** Output lands at

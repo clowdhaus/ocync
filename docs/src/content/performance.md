@@ -12,16 +12,16 @@ Measured 2026-04-22 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps) in
 
 | Metric | `ocync` | `dregsy` | `regsync` |
 |---|---:|---:|---:|
-| Wall clock | **4m 17s** | 18m 14s | 16m 26s |
-| Peak RSS | 47.7 MB | 319.8 MB | **28.3 MB** |
-| Requests | **7,189** | 11,631 | 9,527 |
+| Wall clock | **4m 10s** | 18m 47s | 15m 45s |
+| Peak RSS | 47.8 MB | 397.3 MB | **28.3 MB** |
+| Requests | **7,203** | 11,299 | 9,532 |
 | Response bytes | 55.4 GB | **55.3 GB** | 65.3 GB |
-| Source blob GETs | 1,450 | **1,370** | 1,694 |
+| Source blob GETs | 1,451 | **1,371** | 1,695 |
 | Source blob bytes | 55.4 GB | **55.3 GB** | 65.3 GB |
-| Mounts (success/attempt) | 319/365 | **324/324** | 0/0 |
+| Mounts (success/attempt) | 314/365 | **325/325** | 0/0 |
 | Duplicate blob GETs | **0** | **0** | **0** |
-| CDN hits/misses | **1,047/8** | 975/0 | 987/0 |
-| Rate-limit 429s | 21 | **0** | **0** |
+| CDN hits/misses | 677/379 | 894/82 | **988/0** |
+| Rate-limit 429s | 17 | **0** | **0** |
 <!-- BENCH:END -->
 
 ## How tools compare
@@ -63,15 +63,15 @@ Measured 2026-04-22 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps) in
 
 | Metric | `ocync` | `dregsy` | `regsync` |
 |---|---:|---:|---:|
-| Wall clock | **2s** | 1m 49s | 18s |
-| Peak RSS | **16.5 MB** | 34.2 MB | 21.5 MB |
-| Requests | **181** | 3,145 | 325 |
-| Response bytes | **131.8 KB** | 1.9 MB | 62.0 MB |
-| Source blob GETs | **0** | 227 | 21 |
-| Source blob bytes | **127.7 KB** | 1.9 MB | 62.0 MB |
+| Wall clock | **2s** | 1m 40s | 12s |
+| Peak RSS | **16.4 MB** | 34.2 MB | 21.1 MB |
+| Requests | 181 | 3,145 | **170** |
+| Response bytes | 131.8 KB | 1.9 MB | **124.5 KB** |
+| Source blob GETs | **0** | 227 | **0** |
+| Source blob bytes | 127.7 KB | 1.9 MB | **120.4 KB** |
 | Mounts (success/attempt) | **0/0** | **0/0** | **0/0** |
 | Duplicate blob GETs | **0** | **0** | **0** |
-| CDN hits/misses | 0/0 | **165/0** | 15/6 |
+| CDN hits/misses | 0/0 | **165/0** | 0/0 |
 | Rate-limit 429s | **0** | **0** | **0** |
 <!-- BENCH-WARM:END -->
 
@@ -89,11 +89,11 @@ Container images share layers heavily. A sync run touching 39 images may referen
 
 ### Cross-repo blob mounting
 
-When a blob already exists in another repository on the same registry, `ocync` mounts it (a server-side copy) instead of uploading. A leader-follower election algorithm ensures exactly one image uploads each shared blob while all others mount from the leader. One image is elected leader for each shared blob and performs the actual upload; followers wait and then mount from the leader's repository.
+When a blob already exists in another repository on the same registry, `ocync` mounts it (a server-side copy) instead of uploading. Images are elected as leaders using a greedy set-cover algorithm; each leader uploads all its blobs and commits its manifest. Followers mount shared blobs from leader repositories, with mount sources restricted to repos that have committed manifests.
 
 ### Adaptive rate limiting
 
-Per-(registry, action) [AIMD](../design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency windows discover actual registry capacity through feedback, using the same algorithm TCP uses for congestion control. ECR has 9 independent rate limits (one per API action), and `ocync` tracks each independently. This avoids both under-utilization and 429 errors.
+Per-(registry, action) [AIMD](../design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency windows discover actual registry capacity through feedback, using the same algorithm TCP uses for congestion control. ECR has 9 independent rate limits (one per API action), and `ocync` tracks each independently. This avoids under-utilization and minimizes 429 errors through capacity discovery.
 
 ### Transfer state cache
 

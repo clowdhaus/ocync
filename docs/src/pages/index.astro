@@ -32,7 +32,7 @@ const jsonLd = {
 const stats = [
   { value: "4x", desc: "faster cold syncs", color: "stat-pink" },
   { value: "40%", desc: "fewer API requests", color: "stat-purple" },
-  { value: "0", desc: "rate-limit errors", color: "stat-aqua" },
+  { value: "AIMD", desc: "adaptive rate control", color: "stat-aqua" },
 ];
 
 const securityPills = [
@@ -67,7 +67,7 @@ const registries = [
       <p class="hero-sub">
         ocync copies OCI images with blob deduplication, cross-repo mounting,
         and streaming transfers. Faster syncs, fewer requests, fewer
-        bytes transferred, and zero rate-limit errors.
+        bytes transferred, and adaptive rate control.
       </p>
       <div class="hero-actions">
         <a href={`${base}getting-started`} class="btn btn-primary"

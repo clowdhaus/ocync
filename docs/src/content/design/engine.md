@@ -136,15 +136,15 @@ When source and target share a registry, or when multiple images share base laye
 
 ### Leader-follower election
 
-The engine uses a greedy set-cover algorithm (`elect_leaders()`) to elect leader images, selecting those with the most shared blobs across all discovered images. Leaders execute first (wave 1), uploading their blobs and committing manifests. Followers execute second (wave 2), mounting shared blobs from leader repositories instead of re-uploading.
+The engine uses a greedy set-cover algorithm (`elect_leaders()`) to elect leader images, selecting those with the most shared blobs across all discovered images. Leaders are ordered to the front of the pending queue so they acquire semaphore permits and begin uploading before followers.
 
 The greedy set-cover provably covers every shared blob. No "uncovered follower" path exists because all followers' shared blobs are in the leader union. This means there is no code path where a follower needs a blob that was not already uploaded by a leader.
 
-### Wave promotion
+### Progressive promotion
 
-**Wave 1, leaders.** Leaders upload all their blobs from source and commit manifests to the target registry. Once a leader's manifest is committed, its repository becomes a valid mount source for all blobs it contains.
+All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Per-blob `Notify` handles via `ClaimAction::Wait` in `transfer_single_blob` provide fine-grained synchronization: a follower that needs a blob still being uploaded by a leader waits on that specific blob's notify, not on all leaders completing.
 
-**Wave 2, followers.** After wave 1 completes, followers start executing. For each shared blob, the follower attempts a mount from the leader's repository (which now has a committed manifest). Preferred mount sources (leader repos with committed manifests) are tried first, avoiding 202 rejections from repos whose manifests have not yet been committed. This raised mount success from 40% to 100% in testing.
+Mount sources are restricted to repos with committed manifests via a `committed_repos` set in the transfer state cache. After `push_manifests` succeeds, the repo is marked as committed. `blob_mount_source()` only returns repos from this set, ensuring mount attempts target repos that can fulfill them (ECR requires a committed manifest in the source repo for mount to return 201).
 
 ### ECR blob mounting
 
@@ -238,7 +238,7 @@ Each registry has different upload protocol requirements. The engine detects the
 |---|---|---|---|
 | ECR | POST + streaming PUT | 2 | `Transfer-Encoding: chunked`, zero buffering |
 | Docker Hub | POST + streaming PUT | 2 | Same streaming path as ECR |
-| GHCR | POST + single PATCH + PUT | 2 | Multi-PATCH broken (last PATCH overwrites previous chunks). Single PATCH without `Content-Range` headers. Blob size from source manifest descriptor sets `Content-Length` on the streaming body |
+| GHCR | POST + single PATCH + PUT | 3 | Multi-PATCH broken (last PATCH overwrites previous chunks). Single PATCH without `Content-Range` headers. Blob size from source manifest descriptor sets `Content-Length` on the streaming body |
 | GAR | POST + buffered monolithic PUT | 2 | PATCH errors entirely. Full blob buffered in memory |
 | ACR | POST + streaming PUT | 2 | Known ~20 MB body limit; chunked PATCH not yet implemented |
 
