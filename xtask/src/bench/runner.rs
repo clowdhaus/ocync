@@ -1,6 +1,6 @@
 //! Tool execution: spawn benchmark tool processes with timing and output capture.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,8 @@ pub(crate) struct RunResult {
     pub(crate) exit_code: Option<i32>,
     /// Peak resident set size in KB (from `/usr/bin/time -v`), if available.
     pub(crate) peak_rss_kb: Option<u64>,
+    /// Path to ocync's timing JSONL file (only set for ocync runs).
+    pub(crate) timing_path: Option<PathBuf>,
 }
 
 /// Returns the version argument(s) for a given tool.
@@ -158,6 +160,18 @@ pub(crate) async fn run_tool(
         _ => tool.binary().into(),
     };
 
+    // For ocync, set OCYNC_TIMING_FILE so the engine writes phase timing JSONL.
+    let timing_path = if tool == Tool::Ocync {
+        Some(
+            config_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("timing.jsonl"),
+        )
+    } else {
+        None
+    };
+
     let start = Instant::now();
 
     // Wrap with /usr/bin/time -v to capture peak RSS. GNU time writes its
@@ -167,20 +181,26 @@ pub(crate) async fn run_tool(
     let mut child = if use_gnu_time {
         let mut time_args = vec!["-v", binary.as_ref()];
         time_args.extend(args.iter().copied());
-        tokio::process::Command::new("/usr/bin/time")
-            .args(&time_args)
+        let mut cmd = tokio::process::Command::new("/usr/bin/time");
+        cmd.args(&time_args)
             .env("HTTPS_PROXY", proxy_url)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        if let Some(ref tp) = timing_path {
+            cmd.env("OCYNC_TIMING_FILE", tp);
+        }
+        cmd.spawn()
             .map_err(|e| format!("failed to spawn /usr/bin/time {}: {e}", tool.binary()))?
     } else {
-        tokio::process::Command::new(binary.as_ref())
-            .args(&args)
+        let mut cmd = tokio::process::Command::new(binary.as_ref());
+        cmd.args(&args)
             .env("HTTPS_PROXY", proxy_url)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        if let Some(ref tp) = timing_path {
+            cmd.env("OCYNC_TIMING_FILE", tp);
+        }
+        cmd.spawn()
             .map_err(|e| format!("failed to spawn {}: {e}", tool.binary()))?
     };
 
@@ -244,6 +264,7 @@ pub(crate) async fn run_tool(
         wall_clock,
         exit_code: status.code(),
         peak_rss_kb,
+        timing_path,
     })
 }
 

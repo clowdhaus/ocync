@@ -14,7 +14,7 @@ pub(crate) struct Baseline {
     /// Wall-clock time for the run in seconds.
     pub(crate) wall_clock_secs: f64,
     /// Total number of HTTP requests made.
-    pub(crate) total_requests: u64,
+    pub(crate) requests: u64,
     /// Total bytes transferred.
     pub(crate) total_bytes: u64,
 }
@@ -43,10 +43,7 @@ pub(crate) fn compare(
     threshold_pct: u32,
 ) -> RegressionResult {
     let wall_clock_delta_pct = pct_delta(current.wall_clock_secs, baseline.wall_clock_secs);
-    let requests_delta_pct = pct_delta(
-        current.total_requests as f64,
-        baseline.total_requests as f64,
-    );
+    let requests_delta_pct = pct_delta(current.requests as f64, baseline.requests as f64);
     let bytes_delta_pct = pct_delta(current.total_bytes as f64, baseline.total_bytes as f64);
 
     let threshold = threshold_pct as f64;
@@ -146,12 +143,12 @@ mod tests {
     fn no_regression_within_threshold() {
         let baseline = Baseline {
             wall_clock_secs: 100.0,
-            total_requests: 1000,
+            requests: 1000,
             total_bytes: 1_000_000,
         };
         let current = Baseline {
             wall_clock_secs: 115.0,
-            total_requests: 1100,
+            requests: 1100,
             total_bytes: 1_100_000,
         };
         let result = compare(&current, &baseline, 20);
@@ -164,12 +161,12 @@ mod tests {
     fn regression_detected_when_over_threshold() {
         let baseline = Baseline {
             wall_clock_secs: 100.0,
-            total_requests: 1000,
+            requests: 1000,
             total_bytes: 1_000_000,
         };
         let current = Baseline {
             wall_clock_secs: 125.0,
-            total_requests: 1000,
+            requests: 1000,
             total_bytes: 1_000_000,
         };
         let result = compare(&current, &baseline, 20);
@@ -181,12 +178,12 @@ mod tests {
     fn improvement_is_negative_delta() {
         let baseline = Baseline {
             wall_clock_secs: 100.0,
-            total_requests: 1000,
+            requests: 1000,
             total_bytes: 1_000_000,
         };
         let current = Baseline {
             wall_clock_secs: 80.0,
-            total_requests: 800,
+            requests: 800,
             total_bytes: 800_000,
         };
         let result = compare(&current, &baseline, 20);
@@ -228,12 +225,12 @@ mod tests {
     fn zero_baseline_returns_zero_delta() {
         let baseline = Baseline {
             wall_clock_secs: 0.0,
-            total_requests: 0,
+            requests: 0,
             total_bytes: 0,
         };
         let current = Baseline {
             wall_clock_secs: 50.0,
-            total_requests: 500,
+            requests: 500,
             total_bytes: 1_000_000,
         };
         let result = compare(&current, &baseline, 20);
@@ -247,12 +244,12 @@ mod tests {
     fn regression_triggered_by_request_count_only() {
         let baseline = Baseline {
             wall_clock_secs: 100.0,
-            total_requests: 1000,
+            requests: 1000,
             total_bytes: 1_000_000,
         };
         let current = Baseline {
             wall_clock_secs: 105.0, // 5% -- within threshold
-            total_requests: 1250,   // 25% -- exceeds threshold
+            requests: 1250,         // 25% -- exceeds threshold
             total_bytes: 1_000_000,
         };
         let result = compare(&current, &baseline, 20);
@@ -266,12 +263,12 @@ mod tests {
         // Delta exactly equal to threshold should NOT trigger regression.
         let baseline = Baseline {
             wall_clock_secs: 100.0,
-            total_requests: 1000,
+            requests: 1000,
             total_bytes: 1_000_000,
         };
         let current = Baseline {
             wall_clock_secs: 120.0, // exactly 20%
-            total_requests: 1200,   // exactly 20%
+            requests: 1200,         // exactly 20%
             total_bytes: 1_200_000,
         };
         let result = compare(&current, &baseline, 20);
@@ -284,14 +281,14 @@ mod tests {
     fn baseline_roundtrip() {
         let baseline = Baseline {
             wall_clock_secs: 47.5,
-            total_requests: 847,
+            requests: 847,
             total_bytes: 2_100_000_000,
         };
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
         save_baseline(tmpfile.path(), &baseline).unwrap();
         let loaded = load_baseline(tmpfile.path()).unwrap();
         assert_eq!(loaded.wall_clock_secs, 47.5);
-        assert_eq!(loaded.total_requests, 847);
+        assert_eq!(loaded.requests, 847);
         assert_eq!(loaded.total_bytes, 2_100_000_000);
     }
 
