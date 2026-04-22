@@ -20,7 +20,7 @@ const ECR_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Response from an ECR `GetAuthorizationToken` call.
 #[derive(Clone)]
-pub(crate) struct EcrTokenResponse {
+pub(super) struct EcrTokenResponse {
     /// The raw base64-encoded authorization token (`AWS:<password>`).
     pub encoded_token: String,
     /// Time until the token expires, if provided by the API.
@@ -32,7 +32,7 @@ pub(crate) struct EcrTokenResponse {
 /// Implementations are pre-configured with a specific registry and SDK client.
 /// The default ([`AwsEcrApi`]) holds a cached AWS SDK client constructed once
 /// at [`EcrAuth::new`] time.
-pub(crate) trait EcrApi: Send + Sync {
+pub(super) trait EcrApi: Send + Sync {
     /// Fetch an authorization token from ECR.
     fn get_authorization_token(
         &self,
@@ -88,18 +88,7 @@ impl EcrApi for AwsEcrApi {
                 })?;
 
             // Prefer the API-provided expiry over the hardcoded default.
-            let expires_in = auth_data.expires_at().map(|exp| {
-                let now_secs = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("system clock before UNIX epoch")
-                    .as_secs() as i64;
-                let remaining = exp.secs() - now_secs;
-                if remaining > 0 {
-                    Duration::from_secs(remaining as u64)
-                } else {
-                    Duration::ZERO
-                }
-            });
+            let expires_in = auth_data.expires_at().map(ttl_from_expiry);
 
             Ok(EcrTokenResponse {
                 encoded_token,
@@ -109,12 +98,29 @@ impl EcrApi for AwsEcrApi {
     }
 }
 
+/// Compute remaining TTL from an AWS SDK `DateTime` expiry.
+///
+/// Returns the duration between now and the expiry instant. If the expiry
+/// is in the past, returns [`Duration::ZERO`].
+pub(super) fn ttl_from_expiry(exp: &aws_sdk_ecr::primitives::DateTime) -> Duration {
+    let now_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs() as i64;
+    let remaining = exp.secs() - now_secs;
+    if remaining > 0 {
+        Duration::from_secs(remaining as u64)
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// Validate an ECR authorization token.
 ///
 /// ECR tokens are base64-encoded strings in the format `AWS:<token>`.
 /// Validates the format and returns the original encoded string unchanged --
 /// ECR expects it sent as `Authorization: Basic <encoded>`.
-pub(crate) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Error> {
+pub(super) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Error> {
     let decoded = BASE64.decode(encoded).map_err(|e| Error::AuthFailed {
         registry: registry.to_owned(),
         reason: format!("invalid base64 in ECR token: {e}"),

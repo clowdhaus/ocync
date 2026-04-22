@@ -13,9 +13,40 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use http::StatusCode;
 use http::header::WWW_AUTHENTICATE;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 
 use super::{Credentials, Scope, Token};
 use crate::error::Error;
+
+/// Cached `WWW-Authenticate` challenge for a registry.
+///
+/// Stores the parsed realm + service from the first `/v2/` ping so
+/// subsequent token exchanges skip the ping entirely.
+pub(crate) struct ChallengeCache(Mutex<Option<WwwAuthenticate>>);
+
+impl ChallengeCache {
+    /// Create an empty challenge cache.
+    pub(crate) fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Read the cached challenge (clones to release the lock before await).
+    pub(crate) async fn get(&self) -> Option<WwwAuthenticate> {
+        self.0.lock().await.clone()
+    }
+
+    /// Store a challenge if one was returned.
+    pub(crate) async fn set(&self, challenge: Option<WwwAuthenticate>) {
+        if let Some(ch) = challenge {
+            *self.0.lock().await = Some(ch);
+        }
+    }
+
+    /// Clear the cached challenge.
+    pub(crate) async fn clear(&self) {
+        *self.0.lock().await = None;
+    }
+}
 
 /// The `Bearer` auth scheme prefix used in `WWW-Authenticate` challenges.
 const BEARER_SCHEME: &str = "bearer";
@@ -26,46 +57,57 @@ const BEARER_SCHEME: &str = "bearer";
 /// challenge, then requests a token from the realm URL. When `credentials` is
 /// `Some`, an `Authorization: Basic` header is included on the token request.
 ///
-/// If `/v2/` returns 200 (no auth required), returns an empty token.
+/// When `cached_challenge` is `Some`, the `/v2/` ping is skipped and the
+/// cached realm/service are used directly. This eliminates redundant pings
+/// when the challenge is stable per-registry.
+///
+/// Returns the token and the parsed challenge (if one was obtained). The
+/// challenge is `None` when the registry requires no auth (200 on `/v2/`).
 pub(crate) async fn exchange(
     http: &reqwest::Client,
     base_url: &str,
     scopes: &[Scope],
     credentials: Option<&Credentials>,
-) -> Result<Token, Error> {
-    let v2_url = format!("{base_url}/v2/");
-    let resp = http.get(&v2_url).send().await?;
+    cached_challenge: Option<&WwwAuthenticate>,
+) -> Result<(Token, Option<WwwAuthenticate>), Error> {
+    let challenge = if let Some(cached) = cached_challenge {
+        tracing::debug!(base_url, "using cached WWW-Authenticate challenge");
+        cached.clone()
+    } else {
+        let v2_url = format!("{base_url}/v2/");
+        let resp = http.get(&v2_url).send().await?;
 
-    if resp.status().is_success() {
-        tracing::debug!(base_url, "registry requires no auth, returning empty token");
-        return Ok(Token::new(""));
-    }
+        if resp.status().is_success() {
+            tracing::debug!(base_url, "registry requires no auth, returning empty token");
+            return Ok((Token::new(""), None));
+        }
 
-    // Only 401 carries a WWW-Authenticate challenge. Any other non-success
-    // status (403, 500, etc.) is a hard error -- don't fall through to header
-    // parsing with a misleading "missing WWW-Authenticate" message.
-    if resp.status() != StatusCode::UNAUTHORIZED {
-        let status = resp.status();
-        tracing::warn!(base_url, %status, "registry ping returned unexpected status");
-        return Err(Error::AuthFailed {
+        // Only 401 carries a WWW-Authenticate challenge. Any other non-success
+        // status (403, 500, etc.) is a hard error -- don't fall through to header
+        // parsing with a misleading "missing WWW-Authenticate" message.
+        if resp.status() != StatusCode::UNAUTHORIZED {
+            let status = resp.status();
+            tracing::warn!(base_url, %status, "registry ping returned unexpected status");
+            return Err(Error::AuthFailed {
+                registry: base_url.to_owned(),
+                reason: format!("registry ping returned {status} (expected 401 challenge)"),
+            });
+        }
+
+        let www_auth = resp
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Error::AuthFailed {
+                registry: base_url.to_owned(),
+                reason: "401 response missing WWW-Authenticate header".into(),
+            })?;
+
+        WwwAuthenticate::parse(www_auth).map_err(|reason| Error::AuthFailed {
             registry: base_url.to_owned(),
-            reason: format!("registry ping returned {status} (expected 401 challenge)"),
-        });
-    }
-
-    let www_auth = resp
-        .headers()
-        .get(WWW_AUTHENTICATE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| Error::AuthFailed {
-            registry: base_url.to_owned(),
-            reason: "401 response missing WWW-Authenticate header".into(),
-        })?;
-
-    let challenge = WwwAuthenticate::parse(www_auth).map_err(|reason| Error::AuthFailed {
-        registry: base_url.to_owned(),
-        reason,
-    })?;
+            reason,
+        })?
+    };
 
     // Build token request URL.
     let mut url = reqwest::Url::parse(&challenge.realm).map_err(|e| Error::AuthFailed {
@@ -124,7 +166,7 @@ pub(crate) async fn exchange(
         }
     };
 
-    Ok(token)
+    Ok((token, Some(challenge)))
 }
 
 /// Build the `Authorization: Basic ...` header value from credentials.
@@ -135,12 +177,15 @@ fn basic_header_value(credentials: &Credentials) -> String {
 }
 
 /// Parsed `WWW-Authenticate: Bearer realm="...",service="..."` header.
+///
+/// Cached by auth providers to skip redundant `/v2/` pings -- the challenge
+/// (realm + service) is stable per-registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WwwAuthenticate {
+pub(crate) struct WwwAuthenticate {
     /// The token endpoint URL.
-    realm: String,
+    pub(crate) realm: String,
     /// The service name (optional).
-    service: Option<String>,
+    pub(crate) service: Option<String>,
 }
 
 impl WwwAuthenticate {
@@ -356,10 +401,11 @@ mod tests {
             .await;
 
         let http = crate::test_http_client();
-        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let (token, challenge) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
             .await
             .unwrap();
         assert_eq!(token.value(), "anon-tok");
+        assert!(challenge.is_some(), "challenge should be returned");
     }
 
     #[tokio::test]
@@ -395,9 +441,15 @@ mod tests {
             password: "pass".into(),
         };
         let http = crate::test_http_client();
-        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], Some(&creds))
-            .await
-            .unwrap();
+        let (token, _) = exchange(
+            &http,
+            &mock.uri(),
+            &[Scope::pull("repo")],
+            Some(&creds),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(token.value(), "basic-tok");
     }
 
@@ -413,10 +465,11 @@ mod tests {
             .await;
 
         let http = crate::test_http_client();
-        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let (token, challenge) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
             .await
             .unwrap();
         assert_eq!(token.value(), "");
+        assert!(challenge.is_none(), "no challenge for no-auth registry");
     }
 
     #[tokio::test]
@@ -431,7 +484,7 @@ mod tests {
             .await;
 
         let http = crate::test_http_client();
-        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("WWW-Authenticate"));
@@ -459,7 +512,7 @@ mod tests {
             .await;
 
         let http = crate::test_http_client();
-        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
             .await
             .unwrap_err();
         assert!(
@@ -496,7 +549,7 @@ mod tests {
             .await;
 
         let http = crate::test_http_client();
-        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let (token, _) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
             .await
             .unwrap();
         assert_eq!(token.value(), "fallback-tok");
@@ -528,7 +581,7 @@ mod tests {
             .await;
 
         let http = crate::test_http_client();
-        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let (token, _) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
             .await
             .unwrap();
         assert_eq!(token.value(), "perm-tok");
@@ -561,7 +614,7 @@ mod tests {
             .await;
 
         let http = crate::test_http_client();
-        let token = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let (token, _) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
             .await
             .unwrap();
         assert_eq!(token.value(), "zero-tok");
@@ -594,7 +647,9 @@ mod tests {
 
         let http = crate::test_http_client();
         let scopes = [Scope::pull("repo-a"), Scope::pull_push("repo-b")];
-        let token = exchange(&http, &mock.uri(), &scopes, None).await.unwrap();
+        let (token, _) = exchange(&http, &mock.uri(), &scopes, None, None)
+            .await
+            .unwrap();
         assert_eq!(token.value(), "multi-tok");
 
         // Verify both scope params are present in the token request URL.
@@ -628,7 +683,7 @@ mod tests {
             .await;
 
         let http = crate::test_http_client();
-        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -655,7 +710,7 @@ mod tests {
             .await;
 
         let http = crate::test_http_client();
-        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None)
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -663,5 +718,58 @@ mod tests {
             msg.contains("500") && msg.contains("expected 401 challenge"),
             "unexpected error message: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn challenge_cache_reuse() {
+        let mock = wiremock::MockServer::start().await;
+
+        // /v2/ should only be hit once -- the second exchange reuses the cached challenge.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token",service="test""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Token endpoint is called twice (different scopes).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "reused", "expires_in": 300})),
+            )
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        let http = crate::test_http_client();
+
+        // First call: no cached challenge, /v2/ is pinged.
+        let (t1, challenge) = exchange(&http, &mock.uri(), &[Scope::pull("repo-a")], None, None)
+            .await
+            .unwrap();
+        assert_eq!(t1.value(), "reused");
+        let challenge = challenge.expect("first call should return challenge");
+
+        // Second call: pass cached challenge, /v2/ is NOT pinged.
+        let (t2, challenge2) = exchange(
+            &http,
+            &mock.uri(),
+            &[Scope::pull("repo-b")],
+            None,
+            Some(&challenge),
+        )
+        .await
+        .unwrap();
+        assert_eq!(t2.value(), "reused");
+        assert!(
+            challenge2.is_some(),
+            "cached path should still return challenge"
+        );
+        // wiremock expect(1) on /v2/ verifies it was not called a second time.
     }
 }

@@ -14,6 +14,7 @@ use ocync_distribution::auth::basic::BasicAuth;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::auth::docker::{DockerConfig, DockerConfigAuth};
 use ocync_distribution::auth::ecr::EcrAuth;
+use ocync_distribution::auth::ecr_public::EcrPublicAuth;
 use ocync_distribution::auth::static_token::StaticTokenAuth;
 
 use tracing_subscriber::{EnvFilter, fmt};
@@ -236,6 +237,11 @@ pub(crate) async fn build_registry_client(
                 let auth = EcrAuth::new(bare_host).await.map_err(|e| {
                     CliError::Input(format!("ECR auth setup for '{bare_host}': {e}"))
                 })?;
+                RegistryClient::builder(url).auth(auth)
+            } else if let Some(ProviderKind::EcrPublic) = detect_provider_kind(bare_host) {
+                let auth = EcrPublicAuth::new()
+                    .await
+                    .map_err(|e| CliError::Input(format!("ECR Public auth setup: {e}")))?;
                 RegistryClient::builder(url).auth(auth)
             } else {
                 // Try docker config - falls back to anonymous exchange if no creds found.

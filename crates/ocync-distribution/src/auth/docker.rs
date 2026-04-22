@@ -322,6 +322,8 @@ pub struct DockerConfigAuth {
     credentials: Option<Credentials>,
     /// Cached tokens keyed by sorted scope strings.
     cache: Mutex<HashMap<String, Token>>,
+    /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
+    challenge_cache: token_exchange::ChallengeCache,
 }
 
 impl fmt::Debug for DockerConfigAuth {
@@ -354,6 +356,7 @@ impl DockerConfigAuth {
             http,
             credentials,
             cache: Mutex::new(HashMap::new()),
+            challenge_cache: token_exchange::ChallengeCache::new(),
         })
     }
 
@@ -369,6 +372,7 @@ impl DockerConfigAuth {
             http,
             credentials,
             cache: Mutex::new(HashMap::new()),
+            challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 }
@@ -394,17 +398,22 @@ impl AuthProvider for DockerConfigAuth {
             }
 
             tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-            let token = token_exchange::exchange(
+            let cached_challenge = self.challenge_cache.get().await;
+            let (token, challenge) = token_exchange::exchange(
                 &self.http,
                 &self.base_url,
                 &scopes,
                 self.credentials.as_ref(),
+                cached_challenge.as_ref(),
             )
             .await
             .map_err(|e| {
                 tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
                 e
             })?;
+
+            self.challenge_cache.set(challenge).await;
+
             cache.insert(key, token.clone());
 
             Ok(token)
@@ -416,6 +425,9 @@ impl AuthProvider for DockerConfigAuth {
             let mut cache = self.cache.lock().await;
             tracing::debug!(base_url = %self.base_url, entries = cache.len(), "invalidating token cache");
             cache.clear();
+            drop(cache);
+
+            self.challenge_cache.clear().await;
         })
     }
 }

@@ -12,11 +12,13 @@ repository = "https://github.com/clowdhaus/ocync"
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "rt-tokio", "rustls"] }
 aws-lc-rs = { version = "1", default-features = false }
 aws-sdk-ecr = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
+aws-sdk-ecrpublic = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 bytes = { version = "1", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 http = { version = "1", default-features = false }
 schemars = { version = "0.8", default-features = false, features = ["derive"] }
+futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 serde_yaml = { package = "serde_yaml_ng", version = "0.10", default-features = false }

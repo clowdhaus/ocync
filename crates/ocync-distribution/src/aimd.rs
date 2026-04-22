@@ -157,7 +157,7 @@ const UNKNOWN_TAG_LIST: u8 = 34;
 ///
 /// - **ECR**: every action has an independent limit - 9 distinct windows.
 /// - **Docker Hub**: HEAD operations are unmetered and share a window; manifest
-///   reads have a separate 200-pull/6h quota; other operations share.
+///   reads have a separate 100-pull/6h quota; other operations share.
 /// - **GAR**: all actions share a single per-project quota.
 /// - **Unknown**: coarse grouping - HEADs share, reads share, uploads share,
 ///   manifest writes and tag listing get their own windows.
@@ -297,6 +297,8 @@ impl AimdController {
             aggregate_permit,
             action_permit: Some(action_permit),
             reported: false,
+            host: self.host.clone(),
+            action: op,
         }
     }
 
@@ -329,6 +331,10 @@ pub struct AimdPermit<'a> {
     /// `Option` so `throttled()` can forget the permit to shrink the semaphore.
     action_permit: Option<OwnedSemaphorePermit>,
     reported: bool,
+    /// Registry hostname for diagnostic logging in [`throttled`](Self::throttled).
+    host: String,
+    /// The operation type for diagnostic logging in [`throttled`](Self::throttled).
+    action: RegistryAction,
 }
 
 impl std::fmt::Debug for AimdPermit<'_> {
@@ -381,6 +387,13 @@ impl<'a> AimdPermit<'a> {
             state.window.on_throttle();
             let new_limit = state.window.limit();
             if new_limit < old_limit {
+                tracing::warn!(
+                    registry = %self.host,
+                    action = ?self.action,
+                    old_window = old_limit,
+                    new_window = new_limit,
+                    "AIMD halved on 429"
+                );
                 // Replace the semaphore so new acquires are bounded by the
                 // reduced limit. Forget our permit so it doesn't return to
                 // the old (now-orphaned) semaphore.
