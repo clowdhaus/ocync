@@ -56,7 +56,7 @@ use crate::{
 /// Used for benchmark instrumentation via `OCYNC_TIMING_FILE`. Each line is
 /// `{"phase":"<name>","elapsed_ms":<N>}`. No-ops when `file` is `None`.
 ///
-/// Safety: `phase` must be an ASCII identifier (no quotes or backslashes).
+/// `phase` must be an ASCII identifier (no quotes or backslashes).
 /// All call sites pass string literals, so this invariant is enforced at
 /// compile time. We avoid adding a `serde_json` dependency to this crate
 /// for a two-field diagnostic line.
