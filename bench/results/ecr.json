@@ -31,7 +31,9 @@
             "mount_successes": 243,
             "mount_attempts": 243,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           },
           {
             "tool": "dregsy",
@@ -45,7 +47,9 @@
             "mount_successes": 326,
             "mount_attempts": 326,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           },
           {
             "tool": "regsync",
@@ -59,7 +63,9 @@
             "mount_successes": 0,
             "mount_attempts": 865,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -97,7 +103,9 @@
             "mount_successes": 88,
             "mount_attempts": 88,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -135,7 +143,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -173,7 +183,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -211,7 +223,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -249,7 +263,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -287,7 +303,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -325,7 +343,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -363,7 +383,9 @@
             "mount_successes": 88,
             "mount_attempts": 88,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           },
           {
             "tool": "dregsy",
@@ -377,7 +399,9 @@
             "mount_successes": 78,
             "mount_attempts": 78,
             "duplicate_blob_gets": 1,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           },
           {
             "tool": "regsync",
@@ -391,7 +415,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -429,7 +455,9 @@
             "mount_successes": 349,
             "mount_attempts": 365,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           },
           {
             "tool": "dregsy",
@@ -443,7 +471,9 @@
             "mount_successes": 324,
             "mount_attempts": 324,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           },
           {
             "tool": "regsync",
@@ -457,7 +487,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           }
         ]
       }
@@ -495,7 +527,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           },
           {
             "tool": "dregsy",
@@ -509,7 +543,9 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
           },
           {
             "tool": "regsync",
@@ -523,7 +559,259 @@
             "mount_successes": 0,
             "mount_attempts": 0,
             "duplicate_blob_gets": 0,
-            "rate_limit_429s": 0
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-22-000654",
+    "git_ref": "ae45a23",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 465.772145254,
+            "peak_rss_kb": 52312,
+            "requests": 7709,
+            "response_bytes": 55442732444,
+            "source_blob_gets": 1453,
+            "source_blob_bytes": 55442473737,
+            "mount_successes": 301,
+            "mount_attempts": 365,
+            "duplicate_blob_gets": 3,
+            "rate_limit_429s": 23,
+            "cdn_hits": 76,
+            "cdn_misses": 979
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 1509.182771728,
+            "peak_rss_kb": 28156,
+            "requests": 9532,
+            "response_bytes": 65282760587,
+            "source_blob_gets": 1694,
+            "source_blob_bytes": 65282756422,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 240,
+            "cdn_misses": 747
+          },
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-22T00:06:54Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 1156.102257413,
+            "peak_rss_kb": 305312,
+            "requests": 11291,
+            "response_bytes": 55302680476,
+            "source_blob_gets": 1370,
+            "source_blob_bytes": 55302645916,
+            "mount_successes": 324,
+            "mount_attempts": 324,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 968,
+            "cdn_misses": 7
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 151.14448624,
+            "peak_rss_kb": 21056,
+            "requests": 655,
+            "response_bytes": 22779854,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 22775773,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 14.624605877,
+            "peak_rss_kb": 20256,
+            "requests": 171,
+            "response_bytes": 129856,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 120355,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
+          },
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-22T00:06:54Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 100.627212002,
+            "peak_rss_kb": 33388,
+            "requests": 3145,
+            "response_bytes": 1925761,
+            "source_blob_gets": 227,
+            "source_blob_bytes": 1891201,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 165,
+            "cdn_misses": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-22-021352",
+    "git_ref": "809f685",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "tools": [
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-22T02:13:52Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 1094.799679749,
+            "peak_rss_kb": 312344,
+            "requests": 11631,
+            "response_bytes": 55302685882,
+            "source_blob_gets": 1370,
+            "source_blob_bytes": 55302645988,
+            "mount_successes": 324,
+            "mount_attempts": 324,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 975,
+            "cdn_misses": 0
+          },
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 257.029771722,
+            "peak_rss_kb": 46620,
+            "requests": 7189,
+            "response_bytes": 55420072947,
+            "source_blob_gets": 1450,
+            "source_blob_bytes": 55419814372,
+            "mount_successes": 319,
+            "mount_attempts": 365,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 21,
+            "cdn_hits": 1047,
+            "cdn_misses": 8
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 986.337893828,
+            "peak_rss_kb": 27624,
+            "requests": 9527,
+            "response_bytes": 65282734222,
+            "source_blob_gets": 1694,
+            "source_blob_bytes": 65282730057,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 987,
+            "cdn_misses": 0
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "tools": [
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-22T02:13:52Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 109.68968546,
+            "peak_rss_kb": 33368,
+            "requests": 3145,
+            "response_bytes": 1925614,
+            "source_blob_gets": 227,
+            "source_blob_bytes": 1891055,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 165,
+            "cdn_misses": 0
+          },
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 2.329967248,
+            "peak_rss_kb": 16080,
+            "requests": 181,
+            "response_bytes": 131803,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 127722,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 0,
+            "cdn_misses": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 18.587196803,
+            "peak_rss_kb": 21032,
+            "requests": 325,
+            "response_bytes": 61952024,
+            "source_blob_gets": 21,
+            "source_blob_bytes": 61952024,
+            "mount_successes": 0,
+            "mount_attempts": 0,
+            "duplicate_blob_gets": 0,
+            "rate_limit_429s": 0,
+            "cdn_hits": 15,
+            "cdn_misses": 6
           }
         ]
       }

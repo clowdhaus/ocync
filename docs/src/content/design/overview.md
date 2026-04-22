@@ -138,15 +138,17 @@ The 50:1 ratio between `UploadLayerPart` (500 TPS) and `PutImage` (10 TPS) means
 
 ## Competitive position
 
-See [Performance](../performance) for the full benchmark table. Summary (39 images, 51 tags, cold sync to ECR on c6in.4xlarge):
+See [Performance](../performance) for the full benchmark table. Summary (39 images, 51 tags, cold sync to ECR on c6in.4xlarge, CDN pre-warmed):
 
-- **4x faster** wall clock than comparable tools
-- **25-38% fewer API requests** through global blob dedup and mount-first strategy
-- **Cross-repo blob mounting** avoids re-pulling shared layers from source (95.6% mount success rate)
+- **4x faster** cold sync wall clock than comparable tools (3.8-4.3x depending on tool)
+- **2-second warm sync** (no-op re-sync with 181 requests vs 325-3,145 for comparable tools)
+- **24-38% fewer API requests** through global blob dedup and mount-first strategy
+- **Cross-repo blob mounting** avoids re-pulling shared layers from source (87% mount success rate)
 - **Zero duplicate blob GETs** (source-pull dedup via staging)
-- **Zero rate-limit 429s** (AIMD congestion control adapts before hitting limits)
+- **AIMD congestion control** adapts to registry capacity before hitting rate limits
+- **Typed error handling** for registry responses -- non-JSON bodies (HTML rate-limit pages, proxy errors) produce structured `RegistryError` variants with status code and body context, not parse failures. Comparable tools that deserialize every response as JSON crash or log parse errors (`invalid character 'b' looking for beginning of value`) when a registry returns HTML.
 
-The lower peak RSS of sequential tools reflects their one-image-at-a-time architecture. `ocync`'s ~51 MB comes from concurrent blob transfers, staging maps, and the transfer state cache -- the memory trade-off buys the wall-clock advantage.
+The lower peak RSS of sequential tools reflects their one-image-at-a-time architecture. `ocync`'s ~48 MB comes from concurrent blob transfers, staging maps, and the transfer state cache -- the memory trade-off buys the wall-clock advantage.
 
 Methodology: all traffic routed through bench-proxy (pure-Rust MITM) for byte-accurate request/response counting. Instance metadata captured from `ec2:DescribeInstanceTypes`. Run records archived to `bench/results/ecr.json`.
 

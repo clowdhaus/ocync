@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: How ocync achieves 4x faster sync than comparable tools with fewer requests and cross-repo blob mounting.
+description: How ocync achieves 4x faster cold sync and 2-second warm sync than comparable tools with fewer requests and cross-repo blob mounting.
 order: 6
 ---
 
@@ -8,19 +8,20 @@ order: 6
 
 <!-- Auto-updated by `cargo xtask bench`; shows first scenario (cold sync) only. -->
 <!-- BENCH:START -->
-Measured 2026-04-19 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps). Full corpus: 39 images, 51 tags across quay.io, Docker Hub, cgr.dev, public ECR. Cold sync to ECR us-east-1. All traffic routed through bench-proxy for byte-accurate measurement.
+Measured 2026-04-22 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps) in us-east-2. Full corpus: 39 images, 51 tags across quay.io, Docker Hub, cgr.dev, public ECR. Cold sync to ECR. CDN pre-warmed for fair comparison. All traffic routed through bench-proxy for byte-accurate measurement.
 
 | Metric | `ocync` | `dregsy` | `regsync` |
 |---|---:|---:|---:|
-| Wall clock | **7m 9s** | 32m 15s | 25m 35s |
-| Peak RSS | 50.6 MB | 293.5 MB | **28.0 MB** |
-| Requests | **7,140** | 11,604 | 9,532 |
-| Response bytes | **55.3 GB** | **55.3 GB** | 65.3 GB |
-| Source blob GETs | **1,370** | **1,370** | 1,694 |
-| Source blob bytes | **55.3 GB** | **55.3 GB** | 65.3 GB |
-| Mounts (success/attempt) | **349/365** | 324/324 | 0/0 |
+| Wall clock | **4m 17s** | 18m 14s | 16m 26s |
+| Peak RSS | 47.7 MB | 319.8 MB | **28.3 MB** |
+| Requests | **7,189** | 11,631 | 9,527 |
+| Response bytes | 55.4 GB | **55.3 GB** | 65.3 GB |
+| Source blob GETs | 1,450 | **1,370** | 1,694 |
+| Source blob bytes | 55.4 GB | **55.3 GB** | 65.3 GB |
+| Mounts (success/attempt) | 319/365 | **324/324** | 0/0 |
 | Duplicate blob GETs | **0** | **0** | **0** |
-| Rate-limit 429s | **0** | **0** | **0** |
+| CDN hits/misses | **1,047/8** | 975/0 | 987/0 |
+| Rate-limit 429s | 21 | **0** | **0** |
 <!-- BENCH:END -->
 
 ## How tools compare
@@ -58,22 +59,23 @@ Measured 2026-04-19 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps). F
 ### Warm sync efficiency
 
 <!-- BENCH-WARM:START -->
-Measured 2026-04-20 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 39 images, 51 tags. Warm sync (no changes) to ECR us-east-1. All traffic routed through bench-proxy for byte-accurate measurement.
+Measured 2026-04-22 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps) in us-east-2. Full corpus: 39 images, 51 tags. Warm sync (no changes) to ECR. All traffic routed through bench-proxy for byte-accurate measurement.
 
 | Metric | `ocync` | `dregsy` | `regsync` |
 |---|---:|---:|---:|
-| Wall clock | 2m 32s | 1m 43s | **12s** |
-| Peak RSS | 22.2 MB | 33.9 MB | **21.0 MB** |
-| Requests | 925 | 3,145 | **169** |
-| Response bytes | 23.3 MB | 1.9 MB | **119.9 KB** |
-| Source blob GETs | **0** | 227 | **0** |
-| Source blob bytes | 23.3 MB | 1.9 MB | **119.9 KB** |
+| Wall clock | **2s** | 1m 49s | 18s |
+| Peak RSS | **16.5 MB** | 34.2 MB | 21.5 MB |
+| Requests | **181** | 3,145 | 325 |
+| Response bytes | **131.8 KB** | 1.9 MB | 62.0 MB |
+| Source blob GETs | **0** | 227 | 21 |
+| Source blob bytes | **127.7 KB** | 1.9 MB | 62.0 MB |
 | Mounts (success/attempt) | **0/0** | **0/0** | **0/0** |
 | Duplicate blob GETs | **0** | **0** | **0** |
+| CDN hits/misses | 0/0 | **165/0** | 15/6 |
 | Rate-limit 429s | **0** | **0** | **0** |
 <!-- BENCH-WARM:END -->
 
-> **Note:** `ocync` performs full target HEAD verification on every warm cycle to detect out-of-band changes (e.g., images deleted by lifecycle policies or modified by other tools), ensuring correctness at the cost of additional requests. Alternatives that achieve faster warm sync times typically use tag list caching, which is faster but can miss changes made outside the tool.
+`ocync` skips tag enumeration when exact tags are configured (no wildcard, semver, or latest filters), using the configured tag names directly instead of paginating through the registry's full tag list. Combined with the transfer state cache and source manifest HEAD checks, this reduces a no-op warm sync to ~180 requests regardless of how many tags exist at the source.
 
 ## Why `ocync` is fast
 

@@ -7,7 +7,7 @@ Benchmark infrastructure for comparing ocync against dregsy and regsync.
 - `~/.ssh/id_ed25519` exists, public key added to GitHub
 - AWS credentials with ECR access + SSM parameter read (Docker Hub creds)
 - Terraform installed
-- SSM parameters populated:
+- SSM parameters populated in us-east-2:
   - `/ocync/bench/dockerhub-access-token` - Docker Hub PAT for authenticated pulls
   - `/ocync/bench/dockerhub-username` - Docker Hub account name
 
@@ -65,22 +65,28 @@ cargo xtask bench-remote --provider aws --fetch
 | Source blob bytes | Bench-proxy (non-target host) | lowest |
 | Mounts (success/attempt) | Bench-proxy (POST with mount=) | highest |
 | Duplicate blob GETs | Bench-proxy (same URL fetched twice) | lowest |
+| CDN hits | Bench-proxy (X-Cache header, source requests only) | highest (after pre-warm) |
+| CDN misses | Bench-proxy (X-Cache header, source requests only) | lowest |
 | Rate-limit 429s | Bench-proxy (HTTP 429 responses) | lowest |
 
 Instance metadata (type, CPU, memory, network, region) is captured from `ec2:DescribeInstanceTypes`.
 
 ## Benchmark fairness invariants
 
-Every tool run (including the first) must start from a verified clean slate. The harness enforces this automatically -- do not bypass it.
+The harness enforces these automatically -- do not bypass them.
 
-**Before every tool run:**
-1. **Drop OS page cache** -- `sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'`. Without this, tool 2 benefits from tool 1's source blobs cached in RAM (55GB corpus = massive unfair advantage).
-2. **Clean staging tmpdir** -- remove all files in `$TMPDIR`. Prevents staged blobs from a previous tool consuming disk.
-3. **Delete + recreate ECR repos** -- not just create-if-not-exists. Repos from aborted runs or previous tools may contain partial data that makes a "cold" sync warm.
-4. **30s cooldown** -- allows TCP TIME_WAIT connections to drain and EBS burst credits to stabilize.
+**Before any tool runs (once per scenario):**
+0. **CDN pre-warm** -- HEAD every source manifest with OCI token exchange to populate CDN edge caches. Wait 6 minutes for CloudFront propagation. Without this, the first tool hits cold CDN (7% hit rate) while the last tool gets 99% hits -- a massive unfair advantage from execution order.
+1. **Randomize tool order** -- Fisher-Yates shuffle so no tool systematically runs first or last. The randomized order is logged for traceability.
+
+**Before every tool run (including the first):**
+2. **Drop OS page cache** -- `sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'`. Without this, tool 2 benefits from tool 1's source blobs cached in RAM (55GB corpus = massive unfair advantage).
+3. **Clean staging tmpdir** -- remove all files in `$TMPDIR`. Prevents staged blobs from a previous tool consuming disk.
+4. **Delete + recreate ECR repos** -- not just create-if-not-exists. Repos from aborted runs or previous tools may contain partial data that makes a "cold" sync warm.
+5. **10s cooldown** -- allows process cleanup between tool runs. CDN state is handled by pre-warm (invariant 0), not by inter-tool cooldown.
 
 **After every tool run (cold and warm):**
-5. **Verify sync correctness** -- list tags in every target ECR repo, confirm all expected tags are present. An unverified benchmark may report fast times for incomplete syncs.
+6. **Verify sync correctness** -- list tags in every target ECR repo (per-repo output), confirm all expected tags are present. An unverified benchmark may report fast times for incomplete syncs.
 
 **Never run benchmarks manually via SSH.** The `bench-remote` xtask handles all of the above. Manual `cargo xtask bench` on the instance skips TMPDIR setup and other safeguards. SSH is for debugging only.
 
@@ -96,7 +102,7 @@ cd ~/ocync
 export TMPDIR=$HOME/ocync/bench/.tmp
 rm -rf "$TMPDIR" && mkdir -p "$TMPDIR"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com
+export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-2.amazonaws.com
 cargo xtask bench --tools ocync,dregsy,regsync sync
 ```
 
