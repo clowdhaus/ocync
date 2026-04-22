@@ -101,7 +101,10 @@ fn round_trip_mount_source_survives() {
 
     cache.persist(&path).unwrap();
 
-    let loaded = TransferStateCache::load(&path, long_ttl());
+    let mut loaded = TransferStateCache::load(&path, long_ttl());
+    // committed_repos is runtime-only (not persisted). Mark committed
+    // to verify the blob repos data survived the round-trip.
+    loaded.mark_repo_committed("reg.io", &repo("repo/a"));
     assert_eq!(
         loaded.blob_mount_source(
             "reg.io",

@@ -2611,15 +2611,16 @@ async fn budget_circuit_breaker_emits_tracing_warn() {
     let num_tags: usize = 10;
 
     // The first tag responds instantly (sets rate_limit_remaining=0 on the
-    // client). Remaining tags are delayed 50ms so they are guaranteed to be
-    // in-flight when the budget check fires after the first completion. This
-    // makes the warn emission deterministic regardless of CI load.
+    // client). Remaining tags are delayed 200ms so they are guaranteed to be
+    // in-flight when the budget check fires after the first completion. The
+    // delay must be long enough to survive CI load on slow runners (50ms was
+    // insufficient on x86 ubuntu CI).
     for i in 0..num_tags {
         let tag = format!("v{i}");
         let delay = if i == 0 {
             std::time::Duration::ZERO
         } else {
-            std::time::Duration::from_millis(50)
+            std::time::Duration::from_millis(200)
         };
         Mock::given(method("GET"))
             .and(path(format!("/v2/library/traced/manifests/{tag}")))

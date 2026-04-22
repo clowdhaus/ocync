@@ -222,7 +222,8 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         .await;
     mount_manifest_push(&target_server, "repo-b", "v1").await;
 
-    // Pre-warm the cache: blobs already exist at repo-a on the target.
+    // Pre-warm the cache: blobs already exist at repo-a on the target,
+    // and repo-a has a committed manifest (so it's a valid mount source).
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
@@ -237,6 +238,7 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
             parts.layer_descs[0].digest.clone(),
             RepositoryName::new("repo-a").unwrap(),
         );
+        c.mark_repo_committed(target, &RepositoryName::new("repo-a").unwrap());
     }
 
     let mapping = mapping_from_servers(
@@ -305,6 +307,8 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
             parts.layer_descs[0].digest.clone(),
             RepositoryName::new("repo-a").unwrap(),
         );
+        // Mark repo-a as committed so it's a valid mount source.
+        c.mark_repo_committed(target_name, &RepositoryName::new("repo-a").unwrap());
     }
 
     let mapping = resolved_mapping(
@@ -496,7 +500,8 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         .await;
     mount_manifest_push(&target_server, "repo", "v1").await;
 
-    // Pre-warm cache with stale mount source.
+    // Pre-warm cache with stale mount source. Mark it as committed so the
+    // mount is attempted (and fails), triggering lazy invalidation.
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
@@ -510,6 +515,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
             parts.layer_descs[0].digest.clone(),
             RepositoryName::new("stale-repo").unwrap(),
         );
+        c.mark_repo_committed("target", &RepositoryName::new("stale-repo").unwrap());
     }
 
     let mapping = mapping_from_servers(

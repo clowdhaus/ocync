@@ -24,7 +24,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 - Greedy set-cover election in `elect_leaders()` provably covers every shared blob.
 - No "uncovered follower" path exists - all followers' shared blobs are in the leader union.
 - Do NOT add wave partitioning among followers (dead code).
-- Waves: Wave 1 transfers blobs covered by leaders (the repos elected to pull-and-push shared blobs). Wave 2 handles inter-follower dependencies that wait for wave 1 manifests to commit before mounting.
+- All tasks promoted simultaneously after discovery (leaders ordered first by `elect_leaders`). Per-blob `Notify` via `ClaimAction::Wait` synchronizes followers that need blobs still in-flight. Mount sources restricted to repos with committed manifests via `committed_repos` HashSet in cache.
 
 ## Notify contracts (critical)
 
