@@ -311,6 +311,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ecrpublic"
+version = "1.101.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89f5754e124925336a6ea6407e78b21b402102c4fdf93e928502aa90f27151db"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sts"
 version = "1.103.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2081,6 +2105,7 @@ dependencies = [
  "aws-config",
  "aws-lc-rs",
  "aws-sdk-ecr",
+ "aws-sdk-ecrpublic",
  "base64 0.22.1",
  "bytes",
  "futures-util",
@@ -2540,6 +2565,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
@@ -4003,6 +4029,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-ecr",
  "clap",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

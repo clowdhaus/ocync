@@ -8,8 +8,10 @@ pub mod basic;
 pub mod detect;
 /// Docker config.json credential resolution.
 pub mod docker;
-/// AWS ECR authentication provider.
+/// AWS ECR Private authentication provider.
 pub mod ecr;
+/// AWS ECR Public authentication provider.
+pub mod ecr_public;
 /// Static bearer token authentication provider.
 pub mod static_token;
 /// Shared Docker v2 token-exchange protocol.

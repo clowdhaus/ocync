@@ -136,8 +136,16 @@ pub(crate) async fn serve(
     // the Host header and break the S3 signature. The client under
     // test (ocync) will follow the 302 itself and open a new CONNECT
     // for the S3 host, which is what lets the signature verify.
+    //
+    // `http1_only()`: the proxy serves HTTP/1.1 to clients (hyper
+    // http1::Builder). Upstream must also be HTTP/1.1 to avoid protocol
+    // mismatches. Cargo feature unification means the workspace `http2`
+    // feature bleeds into this binary; without this pin, reqwest would
+    // negotiate H2 with origins like cgr.dev (Google Frontend), which
+    // returns 502 on H2 connections.
     let upstream = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .http1_only()
         .pool_max_idle_per_host(32)
         .build()
         .map_err(|e| format!("reqwest client: {e}"))?;

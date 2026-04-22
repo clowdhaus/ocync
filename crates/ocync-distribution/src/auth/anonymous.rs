@@ -24,6 +24,8 @@ pub struct AnonymousAuth {
     http: reqwest::Client,
     /// Cached tokens keyed by sorted scope strings.
     cache: Mutex<HashMap<String, Token>>,
+    /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
+    challenge_cache: token_exchange::ChallengeCache,
 }
 
 impl fmt::Debug for AnonymousAuth {
@@ -45,6 +47,7 @@ impl AnonymousAuth {
             base_url: format!("https://{registry}"),
             http,
             cache: Mutex::new(HashMap::new()),
+            challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 
@@ -56,6 +59,7 @@ impl AnonymousAuth {
             base_url: base_url.into(),
             http,
             cache: Mutex::new(HashMap::new()),
+            challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 }
@@ -82,12 +86,22 @@ impl AuthProvider for AnonymousAuth {
             }
 
             tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-            let token = token_exchange::exchange(&self.http, &self.base_url, &scopes, None)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                    e
-                })?;
+            let cached_challenge = self.challenge_cache.get().await;
+            let (token, challenge) = token_exchange::exchange(
+                &self.http,
+                &self.base_url,
+                &scopes,
+                None,
+                cached_challenge.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                e
+            })?;
+
+            self.challenge_cache.set(challenge).await;
+
             cache.insert(key, token.clone());
 
             Ok(token)
@@ -99,6 +113,9 @@ impl AuthProvider for AnonymousAuth {
             let mut cache = self.cache.lock().await;
             tracing::debug!(base_url = %self.base_url, entries = cache.len(), "invalidating token cache");
             cache.clear();
+            drop(cache);
+
+            self.challenge_cache.clear().await;
         })
     }
 }
@@ -201,6 +218,40 @@ mod tests {
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.invalidate().await;
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anonymous_auth_challenge_cache_reuse() {
+        let server = MockServer::start().await;
+
+        // /v2/ should only be hit once -- second get_token reuses the cached challenge.
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token",service="test""#, server.uri()),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Token endpoint is called twice (different scopes).
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "reused", "expires_in": 300})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let auth = AnonymousAuth::with_base_url(server.uri(), crate::test_http_client());
+        let t1 = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
+        let t2 = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
+        assert_eq!(t1.value(), "reused");
+        assert_eq!(t2.value(), "reused");
+        // expect(1) on /v2/ proves the challenge was cached and reused.
     }
 
     #[test]

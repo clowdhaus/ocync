@@ -29,6 +29,8 @@ pub struct BasicAuth {
     credentials: Credentials,
     /// Cached tokens keyed by sorted scope strings.
     cache: Mutex<HashMap<String, Token>>,
+    /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
+    challenge_cache: token_exchange::ChallengeCache,
 }
 
 impl fmt::Debug for BasicAuth {
@@ -56,6 +58,7 @@ impl BasicAuth {
             http,
             credentials,
             cache: Mutex::new(HashMap::new()),
+            challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 
@@ -72,6 +75,7 @@ impl BasicAuth {
             http,
             credentials,
             cache: Mutex::new(HashMap::new()),
+            challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 }
@@ -98,17 +102,22 @@ impl AuthProvider for BasicAuth {
             }
 
             tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-            let token = token_exchange::exchange(
+            let cached_challenge = self.challenge_cache.get().await;
+            let (token, challenge) = token_exchange::exchange(
                 &self.http,
                 &self.base_url,
                 &scopes,
                 Some(&self.credentials),
+                cached_challenge.as_ref(),
             )
             .await
             .map_err(|e| {
                 tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
                 e
             })?;
+
+            self.challenge_cache.set(challenge).await;
+
             cache.insert(key, token.clone());
 
             Ok(token)
@@ -120,6 +129,9 @@ impl AuthProvider for BasicAuth {
             let mut cache = self.cache.lock().await;
             tracing::debug!(base_url = %self.base_url, entries = cache.len(), "invalidating token cache");
             cache.clear();
+            drop(cache);
+
+            self.challenge_cache.clear().await;
         })
     }
 }
@@ -284,6 +296,25 @@ mod tests {
             BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
         assert!(err.to_string().contains("WWW-Authenticate"));
+    }
+
+    #[tokio::test]
+    async fn basic_auth_challenge_cache_reuse() {
+        let server = MockServer::start().await;
+
+        // /v2/ should only be hit once -- second get_token reuses the cached challenge.
+        mount_v2_challenge(&server, 1).await;
+
+        // Token endpoint is called twice (different scopes).
+        mount_token_endpoint(&server, "reused", 2).await;
+
+        let auth =
+            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let t1 = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
+        let t2 = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
+        assert_eq!(t1.value(), "reused");
+        assert_eq!(t2.value(), "reused");
+        // expect(1) on /v2/ proves the challenge was cached and reused.
     }
 
     #[test]
