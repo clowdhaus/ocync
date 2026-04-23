@@ -568,10 +568,10 @@ mod tests {
             .max_concurrent(4)
             .build()
             .unwrap();
-        // The AIMD controller initialises per-action windows lazily, so verify
-        // via the window_limit accessor (which returns the default initial value
-        // capped at max_concurrent before any requests are made).
-        assert_eq!(client.aimd.window_limit(RegistryAction::BlobRead), 4);
+        // The AIMD controller initialises per-action windows lazily. Before any
+        // requests, the window limit equals ceil(DEFAULT_INITIAL_WINDOW) capped
+        // at max_concurrent. DEFAULT_INITIAL_WINDOW is 1.0, so ceil(1.0) = 1.
+        assert_eq!(client.aimd.window_limit(RegistryAction::BlobRead), 1);
     }
 
     #[test]
