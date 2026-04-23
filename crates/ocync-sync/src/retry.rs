@@ -59,9 +59,12 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
 
 /// Determine whether a transport-level (non-HTTP) error should be retried.
 ///
-/// Returns `true` for connection failures and request timeouts surfaced by
-/// `reqwest` before any HTTP response is received. These are transient by
-/// nature and safe to retry idempotent OCI operations on.
+/// Returns `true` for connection failures, request timeouts, and response
+/// body errors (premature EOF, truncated body, decode failures from
+/// corrupted transport) surfaced by `reqwest`. These are transient by
+/// nature and safe to retry idempotent OCI operations on. Deterministic
+/// decode failures (e.g. malformed registry responses) are bounded by
+/// `max_retries`.
 ///
 /// # Known limitation
 ///
@@ -75,7 +78,10 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
 /// show which variant was encountered so the match can be extended.
 pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
     if let ocync_distribution::Error::Http(reqwest_err) = error {
-        reqwest_err.is_connect() || reqwest_err.is_timeout()
+        reqwest_err.is_connect()
+            || reqwest_err.is_timeout()
+            || reqwest_err.is_body()
+            || reqwest_err.is_decode()
     } else {
         tracing::debug!(
             error = %error,
