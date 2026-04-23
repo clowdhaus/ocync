@@ -1087,9 +1087,9 @@ async fn cdn_prewarm(corpus: &Corpus) {
     // fetched exactly once.
     let mut unique_blobs: HashSet<(String, String, String)> = HashSet::new();
 
-    // Cache tokens by (registry, repo) for the blob-discovery phase too,
-    // so we don't issue O(N_images) /v2/ pings when ~3 registries suffice.
-    let mut discovery_token_cache: HashMap<(String, String), String> = HashMap::new();
+    // Cache tokens by (registry, repo) so we don't issue O(N_images) /v2/
+    // pings when ~3 registries suffice. Reused for blob pre-warming below.
+    let mut token_cache: HashMap<(String, String), String> = HashMap::new();
 
     for image in &corpus.images {
         let (raw_registry, repo) = match image.source.find('/') {
@@ -1099,12 +1099,12 @@ async fn cdn_prewarm(corpus: &Corpus) {
         let registry = normalize_registry(raw_registry);
 
         let cache_key = (registry.to_owned(), repo.to_owned());
-        let token = if let Some(t) = discovery_token_cache.get(&cache_key) {
+        let token = if let Some(t) = token_cache.get(&cache_key) {
             t.clone()
         } else {
             match oci_token(&client, registry, repo, corpus).await {
                 Some(t) => {
-                    discovery_token_cache.insert(cache_key, t.clone());
+                    token_cache.insert(cache_key, t.clone());
                     t
                 }
                 None => continue,
@@ -1156,18 +1156,6 @@ async fn cdn_prewarm(corpus: &Corpus) {
     // on a sequential 55 GB download. Uses a semaphore to bound concurrency
     // within a single-threaded tokio runtime.
     let blobs_vec: Vec<_> = unique_blobs.into_iter().collect();
-
-    // Pre-fetch tokens keyed by (registry, repo) so we don't issue O(N_blobs)
-    // /v2/ pings when we only need O(N_images).
-    let mut token_cache: HashMap<(String, String), String> = HashMap::new();
-    for (registry, repo, _) in &blobs_vec {
-        let key = (registry.clone(), repo.clone());
-        if let std::collections::hash_map::Entry::Vacant(e) = token_cache.entry(key) {
-            if let Some(t) = oci_token(&client, registry, repo, corpus).await {
-                e.insert(t);
-            }
-        }
-    }
 
     // Per-registry rate controllers and stats, initialized in a single pass.
     let rate_controllers: std::cell::RefCell<HashMap<String, PrewarmRateController>> =

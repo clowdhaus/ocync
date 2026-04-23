@@ -239,7 +239,7 @@ pub(crate) async fn build_registry_client(
                 })?;
                 RegistryClient::builder(url).auth(auth)
             } else if let Some(ProviderKind::EcrPublic) = detect_provider_kind(bare_host) {
-                let auth = EcrPublicAuth::new()
+                let auth = EcrPublicAuth::new(http.clone())
                     .await
                     .map_err(|e| CliError::Input(format!("ECR Public auth setup: {e}")))?;
                 RegistryClient::builder(url).auth(auth)
