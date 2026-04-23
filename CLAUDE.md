@@ -46,7 +46,7 @@ Every PR ships the smallest correct change + one test that catches regression. D
 - **Docs**: every `.rs` file gets `//!`; all `pub` items get `///`
 - **Errors**: invalid user config returns `Result`, never silently degrades
 - **Dependencies**: `default-features = false` everywhere; justify every new dep; prefer hand-written under ~100 lines over a crate
-- **Crypto**: `aws-lc-rs` is the sole TLS crypto provider (FIPS and non-FIPS). `ring` and `native-tls` are banned in `deny.toml`. `reqwest` uses `rustls-tls-native-roots-no-provider`; the provider is installed via `ocync_distribution::install_crypto_provider()` at process startup.
+- **Crypto**: `aws-lc-rs` is the sole TLS crypto provider (FIPS and non-FIPS). `ring` and `native-tls` are banned in `deny.toml`. `reqwest` uses `rustls-no-provider`; the provider is installed via `ocync_distribution::install_crypto_provider()` at process startup.
 - **Process control**: return `ExitCode` via `Termination`; never `process::exit()`
 - **Concurrency model**: single-threaded tokio (`current_thread`). All shared state uses `Rc<RefCell<>>`, never `Arc<Mutex<>>`. See `crates/ocync-sync/CLAUDE.md` for full rules.
 

@@ -17,5 +17,5 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls-native-roots"] }
+reqwest = { workspace = true, features = ["rustls"] }
 tokio = { workspace = true, features = ["rt", "process", "time"] }
