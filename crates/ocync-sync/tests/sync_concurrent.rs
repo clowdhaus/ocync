@@ -5,7 +5,7 @@ mod helpers;
 
 use std::sync::Arc;
 
-use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType};
+use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
 use ocync_sync::ImageStatus;
 use ocync_sync::engine::{SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
@@ -959,4 +959,316 @@ async fn sync_image_with_more_layers_than_blob_concurrency_limit() {
     // 11 blobs total: 1 config + 10 layers.
     assert_eq!(report.images[0].blob_stats.transferred, 11);
     assert_eq!(report.stats.blobs_transferred, 11);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: leader-follower watch channel -- adversarial timing
+// ---------------------------------------------------------------------------
+
+/// The leader's manifest push succeeds instantly (no delay), while the
+/// follower's blob HEAD checks are delayed. This forces the "fire-before-
+/// subscribe" path in the watch channel: the leader calls
+/// `mark_repo_committed` before the follower ever calls `repo_committed_watch`.
+///
+/// Without `send_replace` (using plain `send`), the leader's signal would be
+/// lost and the follower would deadlock waiting for a commit that already
+/// happened.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_leader_commits_before_follower_subscribes() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // Two images sharing a layer. Leader finishes fast, follower starts late.
+    let shared_data = b"shared-late-subscribe";
+    let parts_a = ManifestBuilder::new(b"config-leader-fast")
+        .layer(shared_data)
+        .build();
+    let parts_b = ManifestBuilder::new(b"config-follower-slow")
+        .layer(shared_data)
+        .build();
+
+    // Source: leader's blobs return instantly; follower's config blob is
+    // delayed so the follower reaches the mount-source check after the
+    // leader has already committed its manifest.
+    parts_a.mount_source(&source_server, "src-a", "v1").await;
+
+    // Follower source: manifest + shared layer (instant), config blob (delayed).
+    mount_source_manifest(
+        &source_server,
+        "src-b",
+        "v1",
+        &serde_json::to_vec(&ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: parts_b.config_desc.clone(),
+            layers: parts_b.layer_descs.clone(),
+            subject: None,
+            artifact_type: None,
+            annotations: None,
+        })
+        .unwrap(),
+    )
+    .await;
+    // Shared layer: same digest as leader's, served instantly.
+    mount_blob_pull(
+        &source_server,
+        "src-b",
+        &parts_b.layer_descs[0].digest,
+        shared_data,
+    )
+    .await;
+    // Config blob: 200ms delay forces follower to reach mount-source check
+    // after leader has committed.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v2/src-b/blobs/{}",
+            parts_b.config_desc.digest
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"config-follower-slow".to_vec())
+                .insert_header("content-length", b"config-follower-slow".len().to_string())
+                .set_delay(std::time::Duration::from_millis(200)),
+        )
+        .mount(&source_server)
+        .await;
+
+    // Target: both repos accept upload AND mount (symmetric mocks).
+    for repo in &["tgt-a", "tgt-b"] {
+        mount_manifest_head_not_found(&target_server, repo, "v1").await;
+        mount_blob_not_found(&target_server, repo, &parts_a.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_b.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_a.layer_descs[0].digest).await;
+        mount_blob_push(&target_server, repo).await;
+        mount_manifest_push(&target_server, repo, "v1").await;
+
+        // Mount mock for the shared layer (priority 1 over generic upload POST).
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{repo}/blobs/uploads/")))
+            .and(query_param(
+                "mount",
+                parts_a.layer_descs[0].digest.to_string(),
+            ))
+            .respond_with(ResponseTemplate::new(201))
+            .with_priority(1)
+            .mount(&target_server)
+            .await;
+    }
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_a = resolved_mapping(
+        Arc::clone(&source_client),
+        "src-a",
+        "tgt-a",
+        vec![target_entry("target", Arc::clone(&target_client))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_b = resolved_mapping(
+        source_client,
+        "src-b",
+        "tgt-b",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&ShutdownSignal::new()),
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 2);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "both images should sync (no deadlock): {:#?}",
+        report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
+    );
+    // Leader transfers shared layer + config; follower mounts shared layer + transfers config.
+    assert_eq!(
+        report.stats.blobs_transferred + report.stats.blobs_mounted,
+        4
+    );
+    assert!(
+        report.stats.blobs_mounted >= 1,
+        "follower should mount the shared layer, got {} mounts",
+        report.stats.blobs_mounted,
+    );
+}
+
+/// Leader's manifest push fails (500). Followers waiting on the watch channel
+/// must unblock via `notify_repo_failed`, see `is_repo_committed` = false,
+/// and fall through to HEAD+push instead of deadlocking.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_leader_manifest_push_fails_follower_falls_through() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let shared_data = b"shared-leader-fail";
+    let parts_a = ManifestBuilder::new(b"config-leader-fail")
+        .layer(shared_data)
+        .build();
+    let parts_b = ManifestBuilder::new(b"config-follower-fallback")
+        .layer(shared_data)
+        .build();
+
+    parts_a.mount_source(&source_server, "src-a", "v1").await;
+    parts_b.mount_source(&source_server, "src-b", "v1").await;
+
+    // Target tgt-a: leader -- blob uploads succeed but manifest push fails (500).
+    mount_manifest_head_not_found(&target_server, "tgt-a", "v1").await;
+    mount_blob_not_found(&target_server, "tgt-a", &parts_a.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt-a", &parts_a.layer_descs[0].digest).await;
+    mount_blob_push(&target_server, "tgt-a").await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/tgt-a/manifests/v1"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+
+    // Target tgt-b: follower -- all operations succeed (including push fallback).
+    mount_manifest_head_not_found(&target_server, "tgt-b", "v1").await;
+    mount_blob_not_found(&target_server, "tgt-b", &parts_b.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt-b", &parts_b.layer_descs[0].digest).await;
+    mount_blob_push(&target_server, "tgt-b").await;
+    mount_manifest_push(&target_server, "tgt-b", "v1").await;
+    // Mount mock in case follower attempts mount before falling through.
+    Mock::given(method("POST"))
+        .and(path("/v2/tgt-b/blobs/uploads/"))
+        .and(query_param(
+            "mount",
+            parts_a.layer_descs[0].digest.to_string(),
+        ))
+        .respond_with(ResponseTemplate::new(201))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_a = resolved_mapping(
+        Arc::clone(&source_client),
+        "src-a",
+        "tgt-a",
+        vec![target_entry("target", Arc::clone(&target_client))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_b = resolved_mapping(
+        source_client,
+        "src-b",
+        "tgt-b",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let report = engine
+        .run(
+            vec![mapping_a, mapping_b],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&ShutdownSignal::new()),
+        )
+        .await;
+
+    assert_eq!(report.images.len(), 2);
+    // Leader fails.
+    assert!(
+        report
+            .images
+            .iter()
+            .any(|r| matches!(r.status, ImageStatus::Failed { .. })),
+        "leader should fail"
+    );
+    // Follower succeeds (did not deadlock waiting for leader's commit).
+    assert!(
+        report
+            .images
+            .iter()
+            .any(|r| matches!(r.status, ImageStatus::Synced)),
+        "follower should succeed after leader failure: {:#?}",
+        report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
+    );
+}
+
+/// Pre-warm the cache with committed repos so the follower's mount-source
+/// lookup returns a Tier 1 match (committed + preferred). The follower should
+/// mount immediately without waiting on the watch channel -- exercising the
+/// `Some(repo) if is_committed` branch (not the watch-wait branch).
+#[tokio::test(flavor = "current_thread")]
+async fn sync_prewarmed_committed_repo_skips_watch_wait() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let shared_data = b"shared-prewarm-mount";
+    let parts_a = ManifestBuilder::new(b"config-prewarm-a")
+        .layer(shared_data)
+        .build();
+    let parts_b = ManifestBuilder::new(b"config-prewarm-b")
+        .layer(shared_data)
+        .build();
+
+    parts_b.mount_source(&source_server, "src-b", "v1").await;
+
+    // Target tgt-b: blobs not found (except mount succeeds for shared layer).
+    mount_manifest_head_not_found(&target_server, "tgt-b", "v1").await;
+    mount_blob_not_found(&target_server, "tgt-b", &parts_b.config_desc.digest).await;
+    mount_blob_not_found(&target_server, "tgt-b", &parts_b.layer_descs[0].digest).await;
+    mount_blob_push(&target_server, "tgt-b").await;
+    mount_manifest_push(&target_server, "tgt-b", "v1").await;
+
+    // Mount mock from tgt-a (the pre-warmed committed source).
+    Mock::given(method("POST"))
+        .and(path("/v2/tgt-b/blobs/uploads/"))
+        .and(query_param(
+            "mount",
+            parts_b.layer_descs[0].digest.to_string(),
+        ))
+        .and(query_param("from", "tgt-a"))
+        .respond_with(ResponseTemplate::new(201))
+        .with_priority(1)
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    let target_name = "target";
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        // Pre-warm: tgt-a has the shared blob and a committed manifest.
+        c.set_blob_completed(
+            target_name,
+            parts_a.layer_descs[0].digest.clone(),
+            RepositoryName::new("tgt-a").unwrap(),
+        );
+        c.mark_repo_committed(target_name, &RepositoryName::new("tgt-a").unwrap());
+    }
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "src-b",
+        "tgt-b",
+        vec![target_entry(target_name, mock_client(&target_server))],
+        vec![TagPair::same("v1")],
+    );
+
+    let report = run_sync_with_cache(vec![mapping], cache).await;
+
+    assert_eq!(report.images.len(), 1);
+    assert_status!(report, 0, ImageStatus::Synced);
+    // Shared layer mounted from pre-warmed tgt-a; config transferred.
+    assert_eq!(report.images[0].blob_stats.mounted, 1);
+    assert_eq!(report.images[0].blob_stats.transferred, 1);
 }

@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ocync_distribution::Digest;
 use ocync_distribution::spec::{PlatformFilter, RegistryAuthority, RepositoryName};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
 use crate::plan::{BlobDedupMap, BlobStatus};
@@ -141,14 +141,15 @@ pub struct TransferStateCache {
     /// valid mount sources on ECR, which requires a committed manifest in the
     /// source repo for mount to succeed. Not serialized; fresh each engine run.
     committed_repos: HashMap<String, HashSet<RepositoryName>>,
-    /// Runtime-only: per-(target, repo) [`Notify`] used to wake followers when
-    /// a leader repo's manifest is committed (or fails). Followers waiting on
-    /// an uncommitted preferred mount source subscribe here to avoid sending
-    /// mount requests that ECR will reject with 202 (Not Fulfilled).
+    /// Runtime-only: per-(target, repo) [`watch`] channel that transitions
+    /// from `false` to `true` when a leader repo's manifest is committed.
+    /// Followers subscribe via [`repo_committed_watch`] and call
+    /// `wait_for(|&v| v).await`, which returns immediately if the leader
+    /// already committed -- no signal can be lost.
     ///
     /// Separated from [`blob_notifies`] because this synchronizes at the
     /// manifest level, not the blob level. Not serialized; fresh each engine run.
-    repo_committed_notifies: HashMap<String, HashMap<RepositoryName, Rc<Notify>>>,
+    repo_committed_watches: HashMap<String, HashMap<RepositoryName, watch::Sender<bool>>>,
 }
 
 impl TransferStateCache {
@@ -277,46 +278,60 @@ impl TransferStateCache {
     ///
     /// Only repos tracked here are eligible as cross-repo mount sources via
     /// [`blob_mount_source`]. ECR requires a committed manifest in the source
-    /// repo for mount to succeed. Wakes any followers waiting on this repo via
-    /// [`repo_committed_notify`].
+    /// repo for mount to succeed. Sends `true` on the watch channel so any
+    /// follower waiting via [`repo_committed_watch`] wakes immediately.
     pub fn mark_repo_committed(&mut self, target: &str, repo: &RepositoryName) {
         self.committed_repos
             .entry(target.to_owned())
             .or_default()
             .insert(repo.clone());
-        self.notify_repo_committed(target, repo);
-    }
-
-    /// Wake followers waiting for a repo's manifest commit without marking
-    /// the repo as committed.
-    ///
-    /// Called on leader failure paths so followers unblock and fall through
-    /// to HEAD+push instead of deadlocking on a commit that will never arrive.
-    pub fn notify_repo_committed(&self, target: &str, repo: &RepositoryName) {
-        if let Some(n) = self
-            .repo_committed_notifies
-            .get(target)
-            .and_then(|m| m.get(repo))
-        {
-            n.notify_waiters();
-        }
-    }
-
-    /// Return the [`Notify`] for a repo's manifest commit at a target,
-    /// creating it if absent.
-    ///
-    /// Followers call `notified().await` on the returned handle when
-    /// [`blob_mount_source`] returns an uncommitted preferred mount source.
-    /// The leader calls [`mark_repo_committed`] (which triggers
-    /// `notify_waiters`) after a successful manifest push, or
-    /// [`notify_repo_committed`] on failure.
-    pub fn repo_committed_notify(&mut self, target: &str, repo: &RepositoryName) -> Rc<Notify> {
-        self.repo_committed_notifies
+        // Create the watch sender if absent, then store `true`.
+        // `send_replace` unconditionally updates the stored value even when
+        // no receivers exist yet -- `send()` would silently skip the update
+        // and return `Err` if the initial receiver was dropped. Late
+        // subscribers (via `subscribe()`) see the current value immediately.
+        let tx = self
+            .repo_committed_watches
             .entry(target.to_owned())
             .or_default()
             .entry(repo.clone())
-            .or_insert_with(|| Rc::new(Notify::new()))
-            .clone()
+            .or_insert_with(|| watch::channel(false).0);
+        tx.send_replace(true);
+    }
+
+    /// Mark a repo's manifest commit as failed, unblocking followers.
+    ///
+    /// Creates the watch entry if absent and sends `true`, so even followers
+    /// that subscribe after the leader has already exited see the signal
+    /// immediately. Followers wake, re-check [`is_repo_committed`] (which
+    /// returns `false`), and fall through to HEAD+push.
+    pub fn notify_repo_failed(&mut self, target: &str, repo: &RepositoryName) {
+        let tx = self
+            .repo_committed_watches
+            .entry(target.to_owned())
+            .or_default()
+            .entry(repo.clone())
+            .or_insert_with(|| watch::channel(false).0);
+        tx.send_replace(true);
+    }
+
+    /// Return a [`watch::Receiver`] for a repo's manifest commit state.
+    ///
+    /// Followers call `wait_for(|&v| v).await` on the returned receiver.
+    /// If the leader already committed, the receiver sees `true` immediately.
+    /// If not, it blocks until the leader sends `true` via
+    /// [`mark_repo_committed`] or [`notify_repo_failed`].
+    pub fn repo_committed_watch(
+        &mut self,
+        target: &str,
+        repo: &RepositoryName,
+    ) -> watch::Receiver<bool> {
+        self.repo_committed_watches
+            .entry(target.to_owned())
+            .or_default()
+            .entry(repo.clone())
+            .or_insert_with(|| watch::channel(false).0)
+            .subscribe()
     }
 
     /// Check whether a repo has a committed manifest at the target.
@@ -399,10 +414,10 @@ impl TransferStateCache {
             tracing::debug!(count, "clearing stale blob notify handles");
             self.blob_notifies.clear();
         }
-        if !self.repo_committed_notifies.is_empty() {
-            let count: usize = self.repo_committed_notifies.values().map(|m| m.len()).sum();
-            tracing::debug!(count, "clearing stale repo-committed notify handles");
-            self.repo_committed_notifies.clear();
+        if !self.repo_committed_watches.is_empty() {
+            let count: usize = self.repo_committed_watches.values().map(|m| m.len()).sum();
+            tracing::debug!(count, "clearing stale repo-committed watch handles");
+            self.repo_committed_watches.clear();
         }
     }
 
@@ -538,7 +553,7 @@ impl TransferStateCache {
             snapshots,
             blob_notifies: HashMap::new(),
             committed_repos: HashMap::new(),
-            repo_committed_notifies: HashMap::new(),
+            repo_committed_watches: HashMap::new(),
         })
     }
 }
@@ -735,47 +750,159 @@ mod tests {
     }
 
     #[test]
-    fn repo_committed_notify_wakes_on_commit() {
+    fn repo_committed_watch_sees_commit() {
         let mut cache = TransferStateCache::new();
-        let notify = cache.repo_committed_notify("reg.io", &repo("repo/a"));
+        let rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
 
-        // Before commit, repo is not committed.
+        // Before commit, repo is not committed and watch value is false.
         assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
+        assert!(!*rx.borrow());
 
-        // mark_repo_committed wakes via notify_waiters.
+        // mark_repo_committed sets flag and sends true on watch.
         cache.mark_repo_committed("reg.io", &repo("repo/a"));
         assert!(cache.is_repo_committed("reg.io", &repo("repo/a")));
-
-        // The Notify should have fired (we can't assert the waker directly
-        // in a sync test, but we verify the Rc is shared).
-        assert_eq!(Rc::strong_count(&notify), 2); // cache + our handle
+        assert!(*rx.borrow());
     }
 
     #[test]
-    fn wake_repo_committed_without_marking() {
+    fn repo_committed_watch_late_subscriber_sees_true() {
         let mut cache = TransferStateCache::new();
-        let _notify = cache.repo_committed_notify("reg.io", &repo("repo/a"));
 
-        // notify_repo_committed fires without committing.
-        cache.notify_repo_committed("reg.io", &repo("repo/a"));
+        // Leader commits BEFORE any follower subscribes.
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+
+        // Late subscriber immediately sees true -- no lost signal.
+        let rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
+        assert!(*rx.borrow());
+    }
+
+    #[test]
+    fn notify_repo_failed_unblocks_without_marking() {
+        let mut cache = TransferStateCache::new();
+        let rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
+
+        // notify_repo_failed sends true to unblock waiters.
+        cache.notify_repo_failed("reg.io", &repo("repo/a"));
+        // Watch sees true (unblocked), but repo is NOT committed.
+        assert!(*rx.borrow());
         assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
     }
 
     #[test]
-    fn wake_repo_committed_no_notify_is_noop() {
-        let cache = TransferStateCache::new();
-        // No notify registered -- must not panic.
-        cache.notify_repo_committed("reg.io", &repo("repo/a"));
+    fn notify_repo_failed_no_watch_creates_entry() {
+        let mut cache = TransferStateCache::new();
+        // No watch registered -- must not panic, and must create entry.
+        cache.notify_repo_failed("reg.io", &repo("repo/a"));
+        assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
     }
 
     #[test]
-    fn clear_notifies_includes_repo_committed() {
+    fn clear_notifies_includes_repo_committed_watches() {
         let mut cache = TransferStateCache::new();
         let _blob = cache.blob_notify("reg.io", &digest());
-        let _repo = cache.repo_committed_notify("reg.io", &repo("repo/a"));
+        let _rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
         cache.clear_notifies();
         assert!(cache.blob_notifies.is_empty());
-        assert!(cache.repo_committed_notifies.is_empty());
+        assert!(cache.repo_committed_watches.is_empty());
+    }
+
+    // -- async watch channel tests -----------------------------------------
+    //
+    // These exercise the actual `wait_for(|&v| v).await` path that the engine
+    // uses, catching bugs that sync `borrow()` checks cannot (e.g. `send()`
+    // vs `send_replace()` with no receivers, sender-drop-while-waiting).
+
+    /// `wait_for` returns immediately when the leader has already committed
+    /// before any follower subscribes (the "fire-before-subscribe" path).
+    #[tokio::test(flavor = "current_thread")]
+    async fn repo_committed_wait_for_returns_on_late_subscribe() {
+        let mut cache = TransferStateCache::new();
+
+        // Leader commits before any follower exists.
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+
+        // Late subscriber's wait_for must return Ok immediately.
+        let mut rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
+        let result = rx.wait_for(|&v| v).await;
+        assert!(
+            result.is_ok(),
+            "late subscriber should see true immediately"
+        );
+    }
+
+    /// `wait_for` returns immediately when `notify_repo_failed` fires before
+    /// any follower subscribes -- the true fire-before-subscribe path where
+    /// no watch entry exists yet.
+    #[tokio::test(flavor = "current_thread")]
+    async fn repo_failed_wait_for_returns_on_late_subscribe() {
+        let mut cache = TransferStateCache::new();
+
+        // Leader fails before ANY follower has called repo_committed_watch.
+        // notify_repo_failed must create the entry and store `true`.
+        cache.notify_repo_failed("reg.io", &repo("repo/a"));
+
+        // Late subscriber should see true (unblocked) immediately.
+        let mut rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
+        let result = rx.wait_for(|&v| v).await;
+        assert!(result.is_ok(), "late subscriber should unblock on failure");
+        // But the repo is NOT committed.
+        assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
+    }
+
+    /// Multiple concurrent receivers all wake when the leader commits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn repo_committed_multiple_receivers_all_wake() {
+        let mut cache = TransferStateCache::new();
+
+        // Three followers subscribe before the leader commits.
+        let mut rx1 = cache.repo_committed_watch("reg.io", &repo("repo/a"));
+        let mut rx2 = cache.repo_committed_watch("reg.io", &repo("repo/a"));
+        let mut rx3 = cache.repo_committed_watch("reg.io", &repo("repo/a"));
+
+        // Spawn all three waiters concurrently.
+        let (r1, r2, r3) = tokio::join!(rx1.wait_for(|&v| v), rx2.wait_for(|&v| v), async {
+            // Commit while the first two are waiting.
+            cache.mark_repo_committed("reg.io", &repo("repo/a"));
+            rx3.wait_for(|&v| v).await
+        },);
+
+        assert!(r1.is_ok(), "receiver 1 should wake");
+        assert!(r2.is_ok(), "receiver 2 should wake");
+        assert!(r3.is_ok(), "receiver 3 should wake");
+    }
+
+    /// Dropping the sender (via `clear_notifies`) unblocks a waiting receiver
+    /// with `Err` rather than deadlocking.
+    #[tokio::test(flavor = "current_thread")]
+    async fn repo_committed_sender_drop_unblocks_receiver() {
+        let mut cache = TransferStateCache::new();
+        let mut rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
+
+        // Drop the sender by clearing all notifies.
+        cache.clear_notifies();
+
+        // wait_for should return Err (channel closed), not hang.
+        let result = rx.wait_for(|&v| v).await;
+        assert!(
+            result.is_err(),
+            "sender drop should yield Err, not deadlock"
+        );
+    }
+
+    /// Two independent repos have independent watch channels -- committing one
+    /// does not unblock a waiter on the other.
+    #[tokio::test(flavor = "current_thread")]
+    async fn repo_committed_watches_are_independent() {
+        let mut cache = TransferStateCache::new();
+
+        let rx_a = cache.repo_committed_watch("reg.io", &repo("repo/a"));
+        let rx_b = cache.repo_committed_watch("reg.io", &repo("repo/b"));
+
+        // Commit only repo/a.
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+
+        assert!(*rx_a.borrow(), "repo/a should be signaled");
+        assert!(!*rx_b.borrow(), "repo/b should NOT be signaled");
     }
 
     #[test]

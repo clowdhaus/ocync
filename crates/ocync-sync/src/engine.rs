@@ -1625,11 +1625,11 @@ async fn execute_item(
 
     if let Some(err) = outcome.error {
         warn!(target_name = %item.target_name, error = %err, "blob transfer failed");
-        // Wake any followers waiting for this repo's manifest commit so they
-        // fall through to HEAD+push instead of deadlocking.
+        // Unblock any followers waiting for this repo's manifest commit so
+        // they fall through to HEAD+push.
         cache
-            .borrow()
-            .notify_repo_committed(&item.target_name, &item.target.repo);
+            .borrow_mut()
+            .notify_repo_failed(&item.target_name, &item.target.repo);
         return ImageResult {
             image_id: Uuid::now_v7(),
             source: item.source.to_string(),
@@ -1737,11 +1737,11 @@ async fn execute_item(
             }
         }
         Err(err) => {
-            // Wake any followers waiting for this repo's manifest commit so
-            // they fall through to HEAD+push instead of deadlocking.
+            // Unblock any followers waiting for this repo's manifest commit
+            // so they fall through to HEAD+push.
             cache
-                .borrow()
-                .notify_repo_committed(&item.target_name, &item.target.repo);
+                .borrow_mut()
+                .notify_repo_failed(&item.target_name, &item.target.repo);
 
             if is_immutable_tag_error(&err) {
                 info!(
@@ -2191,13 +2191,16 @@ async fn transfer_single_blob(
                     target = %ctx.target_name,
                     "mount source uncommitted, waiting for leader manifest commit"
                 );
-                let notify = {
+                let mut rx = {
                     let mut c = ctx.cache.borrow_mut();
-                    c.repo_committed_notify(ctx.target_name, &repo)
+                    c.repo_committed_watch(ctx.target_name, &repo)
                 };
-                // No await between the committed check and notified() registration,
-                // so single-threaded runtime guarantees we don't miss the signal.
-                notify.notified().await;
+                // watch::Receiver::wait_for returns immediately if the leader
+                // already committed -- no signal can ever be lost, regardless
+                // of polling order in FuturesUnordered.
+                if rx.wait_for(|&v| v).await.is_err() {
+                    debug!(%digest, %repo, "repo-committed watch sender dropped");
+                }
 
                 // Leader committed or failed -- re-query mount source.
                 let c = ctx.cache.borrow();
