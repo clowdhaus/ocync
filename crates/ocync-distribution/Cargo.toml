@@ -23,6 +23,7 @@ aws-sdk-ecrpublic = { workspace = true }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 bytes.workspace = true
 futures-util = { version = "0.3", default-features = false }
+google-cloud-auth.workspace = true
 http.workspace = true
 hex.workspace = true
 regex-lite = { version = "0.1", default-features = false }

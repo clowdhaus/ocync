@@ -12,6 +12,8 @@ pub mod docker;
 pub mod ecr;
 /// AWS ECR Public authentication provider.
 pub mod ecr_public;
+/// Google Artifact Registry / Container Registry authentication provider.
+pub mod gcp;
 /// Static bearer token authentication provider.
 pub mod static_token;
 /// Shared Docker v2 token-exchange protocol.

@@ -15,6 +15,7 @@ use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::auth::docker::{DockerConfig, DockerConfigAuth};
 use ocync_distribution::auth::ecr::EcrAuth;
 use ocync_distribution::auth::ecr_public::EcrPublicAuth;
+use ocync_distribution::auth::gcp::GcpAuth;
 use ocync_distribution::auth::static_token::StaticTokenAuth;
 
 use tracing_subscriber::{EnvFilter, fmt};
@@ -205,11 +206,14 @@ pub(crate) async fn build_registry_client(
             let auth = StaticTokenAuth::new(endpoint, tok);
             RegistryClient::builder(url).auth(auth)
         }
-        Some(AuthType::Ghcr | AuthType::Gcr | AuthType::Acr | AuthType::DockerConfig) => {
-            if matches!(
-                auth_type,
-                Some(AuthType::Ghcr | AuthType::Gcr | AuthType::Acr)
-            ) {
+        Some(AuthType::Gar | AuthType::Gcr) => {
+            let auth = GcpAuth::new(bare_host, http)
+                .await
+                .map_err(|e| CliError::Input(format!("GCP auth setup for '{bare_host}': {e}")))?;
+            RegistryClient::builder(url).auth(auth)
+        }
+        Some(AuthType::Ghcr | AuthType::Acr | AuthType::DockerConfig) => {
+            if matches!(auth_type, Some(AuthType::Ghcr | AuthType::Acr)) {
                 tracing::debug!(
                     registry = bare_host,
                     auth_type = ?auth_type,
@@ -242,6 +246,14 @@ pub(crate) async fn build_registry_client(
                 let auth = EcrPublicAuth::new(http.clone())
                     .await
                     .map_err(|e| CliError::Input(format!("ECR Public auth setup: {e}")))?;
+                RegistryClient::builder(url).auth(auth)
+            } else if matches!(
+                detect_provider_kind(bare_host),
+                Some(ProviderKind::Gar | ProviderKind::Gcr)
+            ) {
+                let auth = GcpAuth::new(bare_host, http).await.map_err(|e| {
+                    CliError::Input(format!("GCP auth setup for '{bare_host}': {e}"))
+                })?;
                 RegistryClient::builder(url).auth(auth)
             } else {
                 // Try docker config - falls back to anonymous exchange if no creds found.
@@ -510,6 +522,7 @@ mod tests {
         // If a new variant is added, this fails to compile.
         let variants = [
             AuthType::Ecr,
+            AuthType::Gar,
             AuthType::Gcr,
             AuthType::Acr,
             AuthType::Ghcr,
@@ -521,6 +534,7 @@ mod tests {
         for variant in &variants {
             match variant {
                 AuthType::Ecr => {}
+                AuthType::Gar => {}
                 AuthType::Gcr => {}
                 AuthType::Acr => {}
                 AuthType::Ghcr => {}
