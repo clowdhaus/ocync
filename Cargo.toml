@@ -26,7 +26,7 @@ tempfile = { version = "3", default-features = false }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["system-proxy"] }
+reqwest = { git = "https://github.com/seanmonstar/reqwest", rev = "5f9c231502d827bdd19864277187b133bb746f2f", default-features = false, features = ["query", "system-proxy"] }
 url = { version = "2", default-features = false }
 uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
 ocync-distribution = { path = "crates/ocync-distribution", default-features = false }

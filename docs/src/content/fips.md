@@ -64,4 +64,4 @@ Non-FIPS builds show `compiled=no`. FIPS is a compile-time selection; there is n
 
 ## Banned dependencies
 
-`ring` and `native-tls` are banned via `deny.toml` to prevent accidental use of non-aws-lc-rs crypto. `reqwest` is configured with `rustls-tls-native-roots-no-provider`, and the crypto provider is installed explicitly at process startup.
+`ring` and `native-tls` are banned via `deny.toml` to prevent accidental use of non-aws-lc-rs crypto. `reqwest` is configured with `rustls-no-provider`, and the crypto provider is installed explicitly at process startup.
