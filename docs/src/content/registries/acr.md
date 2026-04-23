@@ -18,7 +18,7 @@ ACR supports cross-repo blob mounting within the same registry.
 
 ## Rate limits
 
-ACR rate limits are per-registry and vary by SKU (Basic/Standard/Premium). `ocync` uses coarse AIMD window grouping for ACR: HEADs, reads, uploads, manifest writes, and tag listing each get independent windows that adapt to 429 feedback.
+ACR rate limits are per-registry and vary by SKU (Basic/Standard/Premium).
 
 ## Example config
 

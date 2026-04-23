@@ -83,12 +83,12 @@ The levels compose via dual permit acquisition: every request acquires one permi
 
 Each `(registry, window_key)` pair maintains an independent concurrency window using AIMD (Additive Increase, Multiplicative Decrease):
 
-1. **Start:** `window` = 5.0 (conservative)
+1. **Start:** `window` = `DEFAULT_INITIAL_WINDOW` (conservative -- first request always succeeds)
 2. **On success:** `window += 1.0 / window` (fractional additive increase)
 3. **On 429/throttle:** halve once per congestion epoch (see below)
 4. **Cap:** `max_concurrent` from per-registry config (default 50)
 
-From initial 5.0, the window reaches 50 in ~1,200 successful responses, a gradual ramp that avoids overshoot. At 50ms latency with 5 concurrent requests, this takes ~12 seconds. If the registry throttles at 30 concurrent, the controller oscillates between ~15 and ~30 (the classic AIMD sawtooth), settling to an effective average of ~22.5 concurrent requests.
+The window grows slowly from a conservative start. If the registry throttles at 30 concurrent, the controller oscillates between ~15 and ~30 (the classic AIMD sawtooth), settling to an effective average of ~22.5 concurrent requests.
 
 The fractional increase (`+1/window`) means it takes a full window's worth of successes to increase by 1. This is standard TCP congestion avoidance. A naive `+1 per success` would be slow-start (exponential growth), causing aggressive oscillation.
 
@@ -117,7 +117,7 @@ Actions are fine-grained, matching the actual API action granularity of each reg
 |---|---|---|
 | ECR | 9 (one per action) | Critical: `InitiateLayerUpload` (100 TPS) and `UploadLayerPart` (500 TPS) have a 5x rate disparity, so a 429 on session initiation must not throttle chunk uploads |
 | Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 100-pull/6h quota). Other actions share one window |
-| GAR | 1 (all shared) | GAR uses a shared per-project quota across all operation types; initial window of 5, grows adaptively to `max_concurrent` |
+| GAR | 1 (all shared) | GAR uses a shared per-project quota across all operation types; grows adaptively to `max_concurrent` |
 | ACR, GHCR, others | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as safe default for registries without documented per-action limits |
 
 The mapping function is ~20 lines. The window key is derived from HTTP method + URL pattern, which `ocync` already tracks in request labels.

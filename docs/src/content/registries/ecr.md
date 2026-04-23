@@ -46,13 +46,7 @@ aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED
 
 ## Rate limits
 
-ECR has per-action rate limits. `ocync` tracks 9 independent [AIMD](../../design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency windows, using the same algorithm TCP uses for congestion control:
-
-- `ManifestHead`, `ManifestRead`, `ManifestWrite`
-- `BlobHead`, `BlobRead`, `BlobUploadInit`, `BlobUploadChunk`, `BlobUploadComplete`
-- `TagList`
-
-Each window adapts independently, so a 429 on blob uploads does not throttle manifest reads. Windows start at 5 concurrent requests and grow adaptively up to `max_concurrent` (default 50).
+ECR has per-action rate limits (e.g., `PutImage` at ~10 TPS vs `UploadLayerPart` at ~500 TPS). `ocync` tracks 9 independent concurrency windows -- one per API action -- so a 429 on blob uploads does not throttle manifest reads.
 
 ## ECR Public
 

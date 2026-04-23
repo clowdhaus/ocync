@@ -63,7 +63,7 @@ Static concurrency limits force operators to guess at registry capacity. Too low
 
 - **On success:** `window += 1.0 / window` (fractional increase)
 - **On 429:** `window /= 2` (multiplicative decrease, once per congestion epoch)
-- **Initial window:** 5.0, **Cap:** `max_concurrent` per registry (default 50)
+- **Cap:** `max_concurrent` per registry (default 50)
 
 If the registry throttles at 30 concurrent, the controller oscillates between ~15 and ~30 (the classic AIMD sawtooth), settling to an effective average of ~22.5. See [AIMD formula in the engine doc](./engine#aimd-formula) for the full derivation.
 
@@ -113,44 +113,6 @@ Stale entries self-heal via lazy invalidation: failed mounts or pushes invalidat
 ## Streaming transfers
 
 For single-target mappings, bytes stream directly from source to target with no disk I/O -- two HTTP requests per blob (POST + streaming PUT), memory bounded by chunk size. For multi-target mappings (e.g., us-ecr + eu-ecr + ap-ecr), `ocync` pulls each source blob once and writes it to a content-addressable disk file; all target pushes read from disk independently, with recently-written data served from OS page cache at memory speed. Single-target deployments pay zero staging overhead. See [streaming transfers and staging](./engine#streaming-transfers-and-staging) and [upload strategy per registry](./engine#upload-strategy-per-registry) in the engine doc.
-
-## Registry behavior
-
-### Capability matrix
-
-| Registry | Cross-repo mount | Batch discovery APIs | Rate limit model |
-|---|---|---|---|
-| ECR (private) | Yes (opt-in, same account/region) | Yes (BatchCheck, BatchGet, ListImages) | Per-action TPS (10-3000) |
-| ECR Public | No | Partial (BatchCheck only) | Separate from private |
-| Docker Hub | Yes (implicit global dedup) | No | 100-pull/6h authed manifest GETs; HEADs free |
-| GAR | No | No | Per-project shared quota |
-| GHCR | Yes (implicit global dedup) | No | GitHub API rate limit |
-| ACR | Yes | No | Per-registry |
-| Chainguard | N/A (source only) | No | No rate limits |
-
-### Docker Hub rate limits
-
-Docker Hub tightened limits in April 2025: 10 pulls/hour anonymous, 100 pulls/6 hours authenticated free, unlimited for paid tiers. Only manifest GETs count; blob GETs are free (CDN-served) and manifest HEADs are free (subject to a separate abuse limit). Authentication is mandatory for any serious sync workload.
-
-### ECR rate limits
-
-The 50:1 ratio between `UploadLayerPart` (500 TPS) and `PutImage` (10 TPS) means blob uploads can saturate while manifest pushes trickle. This is why per-action AIMD windows matter -- a single per-host window would let PutImage throttling stall all blob uploads.
-
-## Competitive position
-
-See [Performance](../performance) for the full benchmark table. Summary (39 images, 51 tags, cold sync to ECR on c6in.4xlarge, CDN pre-warmed):
-
-- **4x faster** cold sync wall clock than comparable tools (3.8-4.3x depending on tool)
-- **2-second warm sync** (no-op re-sync with 181 requests vs 325-3,145 for comparable tools)
-- **24-38% fewer API requests** through global blob dedup and mount-first strategy
-- **Cross-repo blob mounting** avoids re-pulling shared layers from source (87% mount success rate)
-- **Zero duplicate blob GETs** (source-pull dedup via staging)
-- **AIMD congestion control** adapts to registry capacity through rate-limit feedback
-- **Typed error handling** for registry responses -- non-JSON bodies (HTML rate-limit pages, proxy errors) produce structured `RegistryError` variants with status code and body context, not parse failures. Comparable tools that deserialize every response as JSON crash or log parse errors (`invalid character 'b' looking for beginning of value`) when a registry returns HTML.
-
-The lower peak RSS of sequential tools reflects their one-image-at-a-time architecture. `ocync`'s ~48 MB comes from concurrent blob transfers, staging maps, and the transfer state cache -- the memory trade-off buys the wall-clock advantage.
-
-Methodology: all traffic routed through bench-proxy (pure-Rust MITM) for byte-accurate request/response counting. Instance metadata captured from `ec2:DescribeInstanceTypes`. Run records archived to `bench/results/ecr.json`.
 
 ## Deployment model
 

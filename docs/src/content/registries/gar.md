@@ -8,6 +8,8 @@ order: 4
 
 GAR uses credentials from your Docker config file, typically configured via `gcloud auth configure-docker`.
 
+Legacy GCR hostnames (`gcr.io`, `us.gcr.io`, `eu.gcr.io`, `asia.gcr.io`) are also detected and handled the same way.
+
 ## Upload behavior
 
 GAR does not support chunked uploads. `ocync` automatically buffers the full blob and performs a monolithic PUT upload.
@@ -18,7 +20,7 @@ GAR has not been observed to fulfill cross-repo blob mounts. `ocync` still attem
 
 ## Rate limits
 
-GAR uses a shared per-project quota across all operation types. `ocync` uses a single shared AIMD window for GAR with an initial concurrency of 5 that grows adaptively up to `max_concurrent` (default 50) based on 429 feedback.
+GAR uses a shared per-project quota across all operation types.
 
 ## Example config
 
