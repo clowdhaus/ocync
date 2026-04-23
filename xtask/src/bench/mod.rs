@@ -78,6 +78,11 @@ pub(crate) struct BenchArgs {
     /// Images from these registries are excluded from the corpus.
     #[arg(long, value_delimiter = ',')]
     pub(crate) skip_registries: Vec<String>,
+
+    /// Skip CDN pre-warming. Only use for single-tool runs where CDN
+    /// fairness across tools is not a concern (e.g. ocync-only reruns).
+    #[arg(long)]
+    pub(crate) skip_prewarm: bool,
 }
 
 /// Benchmark scenario to run (CLI subcommand).
@@ -339,7 +344,11 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
 
     // Pre-warm CDN so all tools see identically cached source manifests.
-    cdn_prewarm(&corpus).await;
+    if args.skip_prewarm {
+        eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
+    } else {
+        cdn_prewarm(&corpus).await;
+    }
 
     for scenario in scenarios {
         // Randomize tool execution order to prevent systematic bias from
