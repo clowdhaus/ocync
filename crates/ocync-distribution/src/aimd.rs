@@ -19,8 +19,14 @@ use crate::auth::detect::{ProviderKind, detect_provider_kind};
 /// Default congestion epoch - prevents multiple halvings from the same burst.
 const DEFAULT_EPOCH: Duration = Duration::from_millis(100);
 
-/// Default initial concurrency window size (conservative, per spec).
-const DEFAULT_INITIAL_WINDOW: f64 = 5.0;
+/// Default initial concurrency window size.
+///
+/// Starts at 1.0 so the first request to any registry always succeeds (no
+/// blind burst). AIMD additive increase (`w += 1/w`) reaches window=5 after
+/// ~12 successes -- under 1 second at typical cloud RTTs. This eliminates
+/// the class of startup-burst 429s observed on registries with low burst
+/// tolerance (Docker Hub cold sync: 21 429s at window=5, 0 at window=1).
+const DEFAULT_INITIAL_WINDOW: f64 = 1.0;
 
 /// One AIMD window tracking concurrency for a specific registry action.
 ///
@@ -531,10 +537,10 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn window_converges_from_5_to_50() {
+    fn window_converges_from_1_to_50() {
         let cap = 50;
-        let mut w = AimdWindow::with_epoch(5.0, cap, Duration::from_millis(1));
-        // AIMD additive increase (w += 1/w) takes ~1237 steps to go from 5 to 50.
+        let mut w = AimdWindow::with_epoch(1.0, cap, Duration::from_millis(1));
+        // AIMD additive increase (w += 1/w) takes ~1249 steps to go from 1 to 50.
         // Use 1500 to have a safe margin.
         for _ in 0..1500 {
             w.on_success();

@@ -40,12 +40,6 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 - Mount POST returns 201 (success) or 202 (not fulfilled, upload session started).
 - Mount is attempted on all providers unconditionally; the 202 fallback is cheap (~100ms).
 
-## Dependencies
-
-- `default-features = false` everywhere; justify every new dep.
-- `reqwest` needs `system-proxy` + `rustls-tls-native-roots-no-provider` or proxy/trust-store is silently disabled.
-- Crypto backend: `fips` vs `non-fips` feature flags (unavoidable platform linking).
-
 ## Testing
 
 - Network mocking: `wiremock`. Every optimization needs `.expect(0)` on the slow path AND `.expect(1)` on the fast path.

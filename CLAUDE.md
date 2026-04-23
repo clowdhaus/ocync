@@ -83,22 +83,6 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && ca
 
 # Run all tests
 cargo test
-
-# Integration tests against local registry (requires Docker)
-cargo test --package ocync-distribution --test registry2_client
-cargo test --package ocync-distribution --test registry2_mount
 ```
 
-## Benchmarks
-
-Prerequisites: Terraform, AWS credentials with ECR access, SSM parameters populated in us-east-2:
-- `/ocync/bench/dockerhub-username` - Docker Hub account name
-- `/ocync/bench/dockerhub-access-token` - Docker Hub PAT for authenticated pulls
-
-```bash
-cd bench/terraform/aws && terraform init && terraform apply
-cargo xtask bench-remote --provider aws --scenario sync
-cd bench/terraform/aws && terraform destroy
-```
-
-See `bench/CLAUDE.md` for full benchmark infrastructure details including bench-remote, competitor config gotchas, instance ops, and proxy log analysis.
+See crate CLAUDE.md files for crate-specific test commands. See `bench/CLAUDE.md` for benchmark infrastructure.
