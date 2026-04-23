@@ -6,6 +6,7 @@
 //! [`super::basic::BasicAuth`].
 
 use std::fmt;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use base64::Engine;
@@ -14,6 +15,7 @@ use http::StatusCode;
 use http::header::WWW_AUTHENTICATE;
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use url::Host;
 
 use super::{Credentials, Scope, Token};
 use crate::error::Error;
@@ -51,6 +53,327 @@ impl ChallengeCache {
 /// The `Bearer` auth scheme prefix used in `WWW-Authenticate` challenges.
 const BEARER_SCHEME: &str = "bearer";
 
+/// Build a dedicated HTTP client for realm token requests.
+///
+/// Uses `redirect::Policy::none()` to prevent open-redirect SSRF: a
+/// malicious realm URL that 302s to a cloud metadata endpoint would
+/// bypass [`validate_realm_url`] if the client followed it silently.
+fn realm_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(concat!("ocync/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("realm HTTP client builder should not fail")
+}
+
+/// Check whether the given URL host is a loopback address.
+fn is_loopback_host(host: Option<Host<&str>>) -> bool {
+    match host {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                mapped.is_loopback()
+            } else {
+                ip.is_loopback()
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Validate an IPv4 realm address against the cloud-metadata denylist.
+fn validate_ipv4(
+    ip: &Ipv4Addr,
+    registry_is_loopback: bool,
+    realm: &reqwest::Url,
+    registry_str: &str,
+) -> Result<(), Error> {
+    // Link-local (169.254.0.0/16) -- AWS/GCP/Azure IMDS.
+    if ip.is_link_local() {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!("realm URL '{realm}' points to link-local address {ip}"),
+        });
+    }
+
+    // Alibaba Cloud metadata (100.100.100.200).
+    if *ip == Ipv4Addr::new(100, 100, 100, 200) {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!("realm URL '{realm}' points to Alibaba Cloud metadata address {ip}"),
+        });
+    }
+
+    // Unspecified (0.0.0.0).
+    if ip.is_unspecified() {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!("realm URL '{realm}' points to unspecified address {ip}"),
+        });
+    }
+
+    // Loopback -- allowed only when the registry itself is loopback.
+    if ip.is_loopback() && !registry_is_loopback {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!(
+                "realm URL '{realm}' points to loopback address {ip} but registry is not loopback"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validate an IPv6 realm address against the cloud-metadata denylist.
+fn validate_ipv6(
+    ip: &Ipv6Addr,
+    registry_is_loopback: bool,
+    realm: &reqwest::Url,
+    registry_str: &str,
+) -> Result<(), Error> {
+    // Normalize IPv4-mapped IPv6 (::ffff:x.y.z.w) and delegate to IPv4 checks.
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return validate_ipv4(&mapped, registry_is_loopback, realm, registry_str);
+    }
+
+    // IPv4-translated (::ffff:0:x.y.z.w, RFC 6145) and NAT64 well-known prefix
+    // (64:ff9b::x.y.z.w, RFC 6052) embed an IPv4 address in the last 32 bits.
+    // `to_ipv4_mapped()` returns None for these, so extract manually.
+    let segs = ip.segments();
+    let embedded_ipv4 = if segs[0] == 0
+        && segs[1] == 0
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0xffff
+        && segs[5] == 0
+    {
+        // ::ffff:0:x.y.z.w (IPv4-translated)
+        Some(Ipv4Addr::new(
+            (segs[6] >> 8) as u8,
+            segs[6] as u8,
+            (segs[7] >> 8) as u8,
+            segs[7] as u8,
+        ))
+    } else if segs[0] == 0x0064
+        && segs[1] == 0xff9b
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0
+        && segs[5] == 0
+    {
+        // 64:ff9b::x.y.z.w (NAT64 well-known prefix)
+        Some(Ipv4Addr::new(
+            (segs[6] >> 8) as u8,
+            segs[6] as u8,
+            (segs[7] >> 8) as u8,
+            segs[7] as u8,
+        ))
+    } else {
+        None
+    };
+    if let Some(v4) = embedded_ipv4 {
+        return validate_ipv4(&v4, registry_is_loopback, realm, registry_str);
+    }
+
+    // Unspecified (::).
+    if ip.is_unspecified() {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!("realm URL '{realm}' points to unspecified address {ip}"),
+        });
+    }
+
+    // Link-local IPv6 (fe80::/10).
+    // std does not have is_unicast_link_local() on stable; check manually.
+    if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!("realm URL '{realm}' points to link-local address {ip}"),
+        });
+    }
+
+    // AWS IPv6 IMDS (fd00:ec2::254).
+    if *ip == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254) {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!("realm URL '{realm}' points to AWS IPv6 IMDS address {ip}"),
+        });
+    }
+
+    // Loopback (::1) -- allowed only when the registry itself is loopback.
+    if ip.is_loopback() && !registry_is_loopback {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!(
+                "realm URL '{realm}' points to loopback address {ip} but registry is not loopback"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validate a realm URL before sending credentials to it.
+///
+/// **Layer 1 -- structural:** must have a host, no userinfo, scheme must be
+/// `https` (or `http` only when the registry itself is `http`).
+///
+/// **Layer 2 -- IP denylist:** blocks link-local (169.254.0.0/16), Alibaba
+/// metadata (100.100.100.200), unspecified (0.0.0.0 / [::]), link-local
+/// IPv6 (`fe80::/10`), AWS IPv6 IMDS (`fd00:ec2::254`), and loopback unless the
+/// registry is also loopback. IPv4-mapped, IPv4-translated (RFC 6145), and
+/// NAT64 (RFC 6052) addresses are normalized before checking. Domain names
+/// pass Layer 2 (resolved later by DNS).
+///
+/// **Layer 4 -- domain binding:** the realm host must be the registry host,
+/// or share a parent domain with it (e.g. `auth.docker.io` and
+/// `registry-1.docker.io` both have parent `docker.io`). Hosts with 2 or
+/// fewer labels require an exact match. IP-based realms skip this check.
+fn validate_realm_url(realm: &reqwest::Url, registry_base: &reqwest::Url) -> Result<(), Error> {
+    let registry_str = registry_base.as_str().trim_end_matches('/');
+
+    // Layer 1: structural checks.
+
+    // Must have a host.
+    if realm.host().is_none() {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!("realm URL '{realm}' has no host"),
+        });
+    }
+
+    // No userinfo (username/password in URL).
+    if !realm.username().is_empty() || realm.password().is_some() {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!("realm URL '{realm}' contains userinfo"),
+        });
+    }
+
+    // Scheme check: https always allowed; http only when registry is also http.
+    match realm.scheme() {
+        "https" => {}
+        "http" => {
+            if registry_base.scheme() != "http" {
+                return Err(Error::AuthFailed {
+                    registry: registry_str.to_owned(),
+                    reason: format!(
+                        "realm URL '{realm}' uses http but registry uses {scheme}",
+                        scheme = registry_base.scheme()
+                    ),
+                });
+            }
+        }
+        _ => {
+            return Err(Error::AuthFailed {
+                registry: registry_str.to_owned(),
+                reason: format!(
+                    "realm URL '{realm}' uses unsupported scheme '{scheme}'",
+                    scheme = realm.scheme()
+                ),
+            });
+        }
+    }
+
+    // Layer 2: IP denylist.
+    let registry_is_loopback = is_loopback_host(registry_base.host());
+
+    match realm.host() {
+        Some(Host::Ipv4(ip)) => validate_ipv4(&ip, registry_is_loopback, realm, registry_str)?,
+        Some(Host::Ipv6(ip)) => validate_ipv6(&ip, registry_is_loopback, realm, registry_str)?,
+        Some(Host::Domain(_)) => {
+            // Domain names pass Layer 2 -- resolved later by DNS.
+        }
+        None => unreachable!("already checked above"),
+    }
+
+    // Layer 4: domain binding -- the realm host must be related to the
+    // registry host. Prevents a compromised registry from exfiltrating
+    // credentials to an unrelated domain.
+    validate_domain_binding(realm, registry_base, registry_str)?;
+
+    Ok(())
+}
+
+/// Verify the realm host is related to the registry host.
+///
+/// Rules:
+/// - IP-based realms skip this check (Layer 2 already validated them).
+/// - If either host has 2 or fewer labels (e.g. `ghcr.io`), require exact
+///   host match.
+/// - Otherwise, strip the leftmost label from each and compare the
+///   remainders. `auth.docker.io` -> `docker.io`, `registry-1.docker.io`
+///   -> `docker.io` -- match.
+///
+/// This prevents a compromised registry from directing credentials to an
+/// unrelated domain (e.g. `realm="https://attacker.com/steal"`).
+fn validate_domain_binding(
+    realm: &reqwest::Url,
+    registry_base: &reqwest::Url,
+    registry_str: &str,
+) -> Result<(), Error> {
+    let realm_host = match realm.host_str() {
+        Some(h) => h,
+        // IP addresses and missing hosts are handled by earlier layers.
+        None => return Ok(()),
+    };
+    let registry_host = match registry_base.host_str() {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+
+    // IP addresses skip domain binding (already validated by Layer 2).
+    if realm.host().is_some_and(|h| !matches!(h, Host::Domain(_)))
+        || registry_base
+            .host()
+            .is_some_and(|h| !matches!(h, Host::Domain(_)))
+    {
+        return Ok(());
+    }
+
+    // Exact match is always allowed.
+    if realm_host.eq_ignore_ascii_case(registry_host) {
+        return Ok(());
+    }
+
+    // Split into labels.
+    let realm_labels: Vec<&str> = realm_host.split('.').collect();
+    let registry_labels: Vec<&str> = registry_host.split('.').collect();
+
+    // If either host has 2 or fewer labels, require exact match (already
+    // failed above). Stripping a label from `ghcr.io` gives `io` which is
+    // too broad -- any `.io` domain would pass.
+    if realm_labels.len() <= 2 || registry_labels.len() <= 2 {
+        return Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!(
+                "realm host '{realm_host}' does not match registry host '{registry_host}'"
+            ),
+        });
+    }
+
+    // Strip the leftmost label and compare remainders (case-insensitive).
+    let realm_parent = &realm_labels[1..];
+    let registry_parent = &registry_labels[1..];
+
+    if realm_parent.len() == registry_parent.len()
+        && realm_parent
+            .iter()
+            .zip(registry_parent.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    {
+        Ok(())
+    } else {
+        Err(Error::AuthFailed {
+            registry: registry_str.to_owned(),
+            reason: format!(
+                "realm host '{realm_host}' does not match registry host '{registry_host}'"
+            ),
+        })
+    }
+}
+
 /// Perform the Docker v2 token-exchange flow.
 ///
 /// Pings the registry's `/v2/` endpoint, parses the `WWW-Authenticate: Bearer`
@@ -70,6 +393,11 @@ pub(crate) async fn exchange(
     credentials: Option<&Credentials>,
     cached_challenge: Option<&WwwAuthenticate>,
 ) -> Result<(Token, Option<WwwAuthenticate>), Error> {
+    let registry_url = reqwest::Url::parse(base_url).map_err(|e| Error::AuthFailed {
+        registry: base_url.to_owned(),
+        reason: format!("invalid registry base URL: {e}"),
+    })?;
+
     let challenge = if let Some(cached) = cached_challenge {
         tracing::debug!(base_url, "using cached WWW-Authenticate challenge");
         cached.clone()
@@ -115,6 +443,8 @@ pub(crate) async fn exchange(
         reason: format!("invalid realm URL: {e}"),
     })?;
 
+    validate_realm_url(&url, &registry_url)?;
+
     {
         let mut query = url.query_pairs_mut();
         if let Some(ref service) = challenge.service {
@@ -125,12 +455,24 @@ pub(crate) async fn exchange(
         }
     }
 
-    let mut request = http.get(url);
+    let mut request = realm_http_client().get(url);
     if let Some(creds) = credentials {
         request = request.header("Authorization", basic_header_value(creds));
     }
 
     let resp = request.send().await?;
+
+    if resp.status().is_redirection() {
+        let status = resp.status();
+        tracing::warn!(base_url, %status, "realm URL returned redirect");
+        return Err(Error::AuthFailed {
+            registry: base_url.to_owned(),
+            reason: format!(
+                "realm URL returned redirect ({status}), which is not allowed for token endpoints"
+            ),
+        });
+    }
+
     if resp.status().is_client_error() || resp.status().is_server_error() {
         let status = resp.status();
         tracing::warn!(base_url, %status, "token endpoint returned error");
@@ -771,5 +1113,337 @@ mod tests {
             "cached path should still return challenge"
         );
         // wiremock expect(1) on /v2/ verifies it was not called a second time.
+    }
+
+    // --- Layer 1: structural validation ---
+
+    #[test]
+    fn validate_realm_rejects_http_when_registry_is_https() {
+        let realm = reqwest::Url::parse("http://evil.com/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("http"), "expected 'http' in error: {msg}");
+    }
+
+    #[test]
+    fn validate_realm_rejects_userinfo() {
+        let realm = reqwest::Url::parse("https://user:pass@evil.com/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("userinfo"),
+            "expected 'userinfo' in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_realm_rejects_non_web_scheme() {
+        let realm = reqwest::Url::parse("ftp://evil.com/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_realm_rejects_no_host() {
+        let realm = reqwest::Url::parse("data:text/plain,hello").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_realm_allows_https_cross_domain() {
+        let realm = reqwest::Url::parse("https://auth.docker.io/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry-1.docker.io").unwrap();
+        validate_realm_url(&realm, &registry).unwrap();
+    }
+
+    #[test]
+    fn validate_realm_allows_http_when_registry_is_http() {
+        let realm = reqwest::Url::parse("http://my-registry:5000/token").unwrap();
+        let registry = reqwest::Url::parse("http://my-registry:5000").unwrap();
+        validate_realm_url(&realm, &registry).unwrap();
+    }
+
+    #[test]
+    fn validate_realm_allows_same_host_different_port() {
+        let realm = reqwest::Url::parse("https://host:8443/token").unwrap();
+        let registry = reqwest::Url::parse("https://host:5000").unwrap();
+        validate_realm_url(&realm, &registry).unwrap();
+    }
+
+    // --- Layer 2: IP denylist ---
+
+    #[test]
+    fn validate_realm_rejects_link_local_ipv4() {
+        let realm = reqwest::Url::parse("https://169.254.169.254/latest/meta-data").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("link-local"),
+            "expected 'link-local' in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_realm_rejects_ipv4_mapped_ipv6_metadata() {
+        let realm = reqwest::Url::parse("https://[::ffff:169.254.169.254]/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_realm_rejects_aws_ipv6_imds() {
+        let realm = reqwest::Url::parse("https://[fd00:ec2::254]/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_realm_rejects_unspecified_ipv4() {
+        let realm = reqwest::Url::parse("http://0.0.0.0/token").unwrap();
+        let registry = reqwest::Url::parse("http://0.0.0.0").unwrap();
+        let err = validate_realm_url(&realm, &registry);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_realm_rejects_link_local_ipv6() {
+        let realm = reqwest::Url::parse("http://[fe80::1]/token").unwrap();
+        let registry = reqwest::Url::parse("http://[fe80::1]").unwrap();
+        let err = validate_realm_url(&realm, &registry);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_realm_rejects_unspecified_ipv6() {
+        let realm = reqwest::Url::parse("http://[::]/token").unwrap();
+        let registry = reqwest::Url::parse("http://[::]").unwrap();
+        let err = validate_realm_url(&realm, &registry);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_realm_rejects_alibaba_metadata() {
+        let realm = reqwest::Url::parse("https://100.100.100.200/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_realm_rejects_loopback_when_registry_is_not_loopback() {
+        let realm = reqwest::Url::parse("http://127.0.0.1/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_realm_allows_loopback_when_registry_is_loopback() {
+        let realm = reqwest::Url::parse("http://127.0.0.1:9999/token").unwrap();
+        let registry = reqwest::Url::parse("http://127.0.0.1:5000").unwrap();
+        validate_realm_url(&realm, &registry).unwrap();
+    }
+
+    #[test]
+    fn validate_realm_allows_private_ip() {
+        let realm = reqwest::Url::parse("https://192.168.1.50/token").unwrap();
+        let registry = reqwest::Url::parse("https://192.168.1.50").unwrap();
+        validate_realm_url(&realm, &registry).unwrap();
+    }
+
+    // --- Layer 3: integration tests ---
+
+    #[tokio::test]
+    async fn exchange_rejects_realm_redirect() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("Location", "http://169.254.169.254/latest/meta-data"),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let http = crate::test_http_client();
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::AuthFailed { .. }),
+            "expected AuthFailed, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("redirect"),
+            "expected 'redirect' in error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_validates_cached_challenge() {
+        let mock = wiremock::MockServer::start().await;
+
+        // Neither /v2/ nor /token should be called -- cached challenge skips
+        // the ping, and validation rejects before the token request.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "should-not-reach"})),
+            )
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let malicious_challenge = WwwAuthenticate {
+            realm: "http://169.254.169.254/latest/meta-data".to_owned(),
+            service: None,
+        };
+
+        let http = crate::test_http_client();
+        let err = exchange(
+            &http,
+            &mock.uri(),
+            &[Scope::pull("repo")],
+            None,
+            Some(&malicious_challenge),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::AuthFailed { .. }),
+            "expected AuthFailed, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("link-local"),
+            "expected 'link-local' in error: {msg}"
+        );
+    }
+
+    // --- IPv6 edge cases (bypass prevention) ---
+
+    #[test]
+    fn validate_realm_rejects_ipv6_loopback_when_registry_is_not_loopback() {
+        let realm = reqwest::Url::parse("http://[::1]/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        assert!(matches!(err, Error::AuthFailed { .. }));
+    }
+
+    #[test]
+    fn validate_realm_rejects_ipv4_mapped_ipv6_loopback_when_registry_is_not_loopback() {
+        let realm = reqwest::Url::parse("http://[::ffff:127.0.0.1]/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        assert!(matches!(err, Error::AuthFailed { .. }));
+    }
+
+    #[test]
+    fn validate_realm_rejects_ipv4_translated_metadata() {
+        // RFC 6145 IPv4-translated: ::ffff:0:a9fe:a9fe embeds 169.254.169.254.
+        let realm = reqwest::Url::parse("https://[::ffff:0:a9fe:a9fe]/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        assert!(matches!(err, Error::AuthFailed { .. }));
+    }
+
+    #[test]
+    fn validate_realm_rejects_nat64_metadata() {
+        // RFC 6052 NAT64 well-known prefix: 64:ff9b::a9fe:a9fe embeds 169.254.169.254.
+        let realm = reqwest::Url::parse("https://[64:ff9b::a9fe:a9fe]/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        assert!(matches!(err, Error::AuthFailed { .. }));
+    }
+
+    // --- Layer 4: domain binding ---
+
+    #[test]
+    fn validate_realm_allows_same_host() {
+        let realm = reqwest::Url::parse("https://ghcr.io/token").unwrap();
+        let registry = reqwest::Url::parse("https://ghcr.io").unwrap();
+        validate_realm_url(&realm, &registry).unwrap();
+    }
+
+    #[test]
+    fn validate_realm_allows_sibling_subdomain() {
+        // Docker Hub: registry-1.docker.io -> auth.docker.io (same parent docker.io).
+        let realm = reqwest::Url::parse("https://auth.docker.io/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry-1.docker.io").unwrap();
+        validate_realm_url(&realm, &registry).unwrap();
+    }
+
+    #[test]
+    fn validate_realm_rejects_unrelated_domain() {
+        let realm = reqwest::Url::parse("https://attacker.com/steal").unwrap();
+        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        assert!(matches!(err, Error::AuthFailed { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("does not match"), "error: {msg}");
+    }
+
+    #[test]
+    fn validate_realm_rejects_different_tld() {
+        let realm = reqwest::Url::parse("https://auth.docker.com/token").unwrap();
+        let registry = reqwest::Url::parse("https://registry-1.docker.io").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        assert!(matches!(err, Error::AuthFailed { .. }));
+    }
+
+    #[test]
+    fn validate_realm_rejects_short_host_cross_domain() {
+        // ghcr.io has only 2 labels -- require exact match.
+        let realm = reqwest::Url::parse("https://evil.io/token").unwrap();
+        let registry = reqwest::Url::parse("https://ghcr.io").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        assert!(matches!(err, Error::AuthFailed { .. }));
+    }
+
+    #[test]
+    fn validate_realm_allows_ip_realm_skips_domain_binding() {
+        // IP-based realms skip domain binding (Layer 2 already validated).
+        let realm = reqwest::Url::parse("http://127.0.0.1:9999/token").unwrap();
+        let registry = reqwest::Url::parse("http://127.0.0.1:5000").unwrap();
+        validate_realm_url(&realm, &registry).unwrap();
+    }
+
+    #[test]
+    fn validate_realm_rejects_subdomain_of_short_host() {
+        // Registry is quay.io (2 labels), realm is sub.quay.io --
+        // since registry has <= 2 labels and hosts don't match exactly, reject.
+        let realm = reqwest::Url::parse("https://auth.quay.io/token").unwrap();
+        let registry = reqwest::Url::parse("https://quay.io").unwrap();
+        let err = validate_realm_url(&realm, &registry).unwrap_err();
+        assert!(matches!(err, Error::AuthFailed { .. }));
     }
 }
