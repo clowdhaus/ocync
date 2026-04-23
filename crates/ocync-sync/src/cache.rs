@@ -141,6 +141,14 @@ pub struct TransferStateCache {
     /// valid mount sources on ECR, which requires a committed manifest in the
     /// source repo for mount to succeed. Not serialized; fresh each engine run.
     committed_repos: HashMap<String, HashSet<RepositoryName>>,
+    /// Runtime-only: per-(target, repo) [`Notify`] used to wake followers when
+    /// a leader repo's manifest is committed (or fails). Followers waiting on
+    /// an uncommitted preferred mount source subscribe here to avoid sending
+    /// mount requests that ECR will reject with 202 (Not Fulfilled).
+    ///
+    /// Separated from [`blob_notifies`] because this synchronizes at the
+    /// manifest level, not the blob level. Not serialized; fresh each engine run.
+    repo_committed_notifies: HashMap<String, HashMap<RepositoryName, Rc<Notify>>>,
 }
 
 impl TransferStateCache {
@@ -269,17 +277,50 @@ impl TransferStateCache {
     ///
     /// Only repos tracked here are eligible as cross-repo mount sources via
     /// [`blob_mount_source`]. ECR requires a committed manifest in the source
-    /// repo for mount to succeed.
+    /// repo for mount to succeed. Wakes any followers waiting on this repo via
+    /// [`repo_committed_notify`].
     pub fn mark_repo_committed(&mut self, target: &str, repo: &RepositoryName) {
         self.committed_repos
             .entry(target.to_owned())
             .or_default()
             .insert(repo.clone());
+        self.notify_repo_committed(target, repo);
+    }
+
+    /// Wake followers waiting for a repo's manifest commit without marking
+    /// the repo as committed.
+    ///
+    /// Called on leader failure paths so followers unblock and fall through
+    /// to HEAD+push instead of deadlocking on a commit that will never arrive.
+    pub fn notify_repo_committed(&self, target: &str, repo: &RepositoryName) {
+        if let Some(n) = self
+            .repo_committed_notifies
+            .get(target)
+            .and_then(|m| m.get(repo))
+        {
+            n.notify_waiters();
+        }
+    }
+
+    /// Return the [`Notify`] for a repo's manifest commit at a target,
+    /// creating it if absent.
+    ///
+    /// Followers call `notified().await` on the returned handle when
+    /// [`blob_mount_source`] returns an uncommitted preferred mount source.
+    /// The leader calls [`mark_repo_committed`] (which triggers
+    /// `notify_waiters`) after a successful manifest push, or
+    /// [`notify_repo_committed`] on failure.
+    pub fn repo_committed_notify(&mut self, target: &str, repo: &RepositoryName) -> Rc<Notify> {
+        self.repo_committed_notifies
+            .entry(target.to_owned())
+            .or_default()
+            .entry(repo.clone())
+            .or_insert_with(|| Rc::new(Notify::new()))
+            .clone()
     }
 
     /// Check whether a repo has a committed manifest at the target.
-    #[cfg(test)]
-    pub(crate) fn is_repo_committed(&self, target: &str, repo: &RepositoryName) -> bool {
+    pub fn is_repo_committed(&self, target: &str, repo: &RepositoryName) -> bool {
         self.committed_repos
             .get(target)
             .is_some_and(|repos| repos.contains(repo))
@@ -345,9 +386,9 @@ impl TransferStateCache {
         }
     }
 
-    /// Drop all in-flight blob notify handles.
+    /// Drop all in-flight notify handles (blob and repo-committed).
     ///
-    /// [`Notify`] entries are only needed during active blob coordination
+    /// [`Notify`] entries are only needed during active coordination
     /// within a single sync run. Once the run completes, all pending
     /// transfers have resolved and the handles are stale. Call this at the
     /// end of each sync run to prevent monotonic growth across repeated
@@ -357,6 +398,11 @@ impl TransferStateCache {
             let count: usize = self.blob_notifies.values().map(|m| m.len()).sum();
             tracing::debug!(count, "clearing stale blob notify handles");
             self.blob_notifies.clear();
+        }
+        if !self.repo_committed_notifies.is_empty() {
+            let count: usize = self.repo_committed_notifies.values().map(|m| m.len()).sum();
+            tracing::debug!(count, "clearing stale repo-committed notify handles");
+            self.repo_committed_notifies.clear();
         }
     }
 
@@ -492,6 +538,7 @@ impl TransferStateCache {
             snapshots,
             blob_notifies: HashMap::new(),
             committed_repos: HashMap::new(),
+            repo_committed_notifies: HashMap::new(),
         })
     }
 }
@@ -620,6 +667,63 @@ mod tests {
     }
 
     #[test]
+    fn mount_source_returns_none_when_only_self() {
+        let mut cache = TransferStateCache::new();
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+
+        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/a"), &[]);
+        assert!(source.is_none(), "should not mount from self");
+    }
+
+    #[test]
+    fn mount_source_deterministic_ordering() {
+        let mut cache = TransferStateCache::new();
+
+        // Insert in non-alphabetical order.
+        cache.set_blob_completed("reg.io", digest(), repo("repo/redis"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/nginx"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/alpine"));
+
+        // BTreeSet iterates alphabetically: alpine, nginx, redis.
+        // Tier 3 (no committed repos) returns the first non-self candidate.
+        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/redis"), &[]);
+        assert_eq!(source, Some(&repo("repo/alpine")));
+
+        // When self is the alphabetically first, returns the next.
+        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/alpine"), &[]);
+        assert_eq!(source, Some(&repo("repo/nginx")));
+    }
+
+    #[test]
+    fn mount_source_preferred_is_self_falls_to_next() {
+        let mut cache = TransferStateCache::new();
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/c"));
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+        cache.mark_repo_committed("reg.io", &repo("repo/b"));
+
+        // Preferred repo IS target_repo -- tier 1 skips it, falls to next preferred.
+        let preferred = [repo("repo/a"), repo("repo/b")];
+        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/a"), &preferred);
+        assert_eq!(source, Some(&repo("repo/b")));
+    }
+
+    #[test]
+    fn mount_source_preferred_not_in_set_falls_back() {
+        let mut cache = TransferStateCache::new();
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+
+        // Preferred repo is not known to have the blob -- tier 1 skips it,
+        // tier 2 returns repo/a (committed).
+        let preferred = [repo("repo/unknown")];
+        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/b"), &preferred);
+        assert_eq!(source, Some(&repo("repo/a")));
+    }
+
+    #[test]
     fn is_repo_committed_tracks_state() {
         let mut cache = TransferStateCache::new();
         assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
@@ -628,6 +732,50 @@ mod tests {
         assert!(cache.is_repo_committed("reg.io", &repo("repo/a")));
         assert!(!cache.is_repo_committed("reg.io", &repo("repo/b")));
         assert!(!cache.is_repo_committed("other.io", &repo("repo/a")));
+    }
+
+    #[test]
+    fn repo_committed_notify_wakes_on_commit() {
+        let mut cache = TransferStateCache::new();
+        let notify = cache.repo_committed_notify("reg.io", &repo("repo/a"));
+
+        // Before commit, repo is not committed.
+        assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
+
+        // mark_repo_committed wakes via notify_waiters.
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+        assert!(cache.is_repo_committed("reg.io", &repo("repo/a")));
+
+        // The Notify should have fired (we can't assert the waker directly
+        // in a sync test, but we verify the Rc is shared).
+        assert_eq!(Rc::strong_count(&notify), 2); // cache + our handle
+    }
+
+    #[test]
+    fn wake_repo_committed_without_marking() {
+        let mut cache = TransferStateCache::new();
+        let _notify = cache.repo_committed_notify("reg.io", &repo("repo/a"));
+
+        // notify_repo_committed fires without committing.
+        cache.notify_repo_committed("reg.io", &repo("repo/a"));
+        assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
+    }
+
+    #[test]
+    fn wake_repo_committed_no_notify_is_noop() {
+        let cache = TransferStateCache::new();
+        // No notify registered -- must not panic.
+        cache.notify_repo_committed("reg.io", &repo("repo/a"));
+    }
+
+    #[test]
+    fn clear_notifies_includes_repo_committed() {
+        let mut cache = TransferStateCache::new();
+        let _blob = cache.blob_notify("reg.io", &digest());
+        let _repo = cache.repo_committed_notify("reg.io", &repo("repo/a"));
+        cache.clear_notifies();
+        assert!(cache.blob_notifies.is_empty());
+        assert!(cache.repo_committed_notifies.is_empty());
     }
 
     #[test]

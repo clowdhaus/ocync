@@ -115,6 +115,88 @@ pub(super) fn ttl_from_expiry(exp: &aws_sdk_ecr::primitives::DateTime) -> Durati
     }
 }
 
+/// Cached SDK credential with TTL tracking.
+///
+/// Generic cache for ECR SDK credentials that uses a read-lock fast path
+/// for concurrent cache hits and a write-lock with double-check for
+/// refreshes. Used by both [`EcrAuth`] (caching `Token`) and
+/// [`super::ecr_public::EcrPublicAuth`] (caching `Credentials`).
+pub(super) struct SdkCredentialCache<T> {
+    cached: RwLock<Option<SdkCacheEntry<T>>>,
+}
+
+struct SdkCacheEntry<T> {
+    value: T,
+    /// Tracks TTL via `is_valid()`.
+    lifetime: Token,
+}
+
+impl<T: Clone + Send + Sync> SdkCredentialCache<T> {
+    /// Create an empty cache.
+    pub(super) fn new() -> Self {
+        Self {
+            cached: RwLock::new(None),
+        }
+    }
+
+    /// Return the cached value if still valid, otherwise await `refresh` to
+    /// obtain a new one.
+    ///
+    /// `label` is used as the `Token` value for TTL tracking (not for auth).
+    /// The refresh future is created at the call site but only polled on
+    /// cache miss, so the API call is never issued when the cache is warm.
+    pub(super) async fn get_or_refresh(
+        &self,
+        label: &str,
+        refresh: impl Future<Output = Result<(T, Duration), Error>>,
+    ) -> Result<T, Error> {
+        // Fast path: read-lock check allows concurrent readers.
+        {
+            let cached = self.cached.read().await;
+            if let Some(ref entry) = *cached {
+                if entry.lifetime.is_valid() {
+                    return Ok(entry.value.clone());
+                }
+            }
+        }
+
+        // Slow path: write-lock for refresh.
+        let mut cached = self.cached.write().await;
+
+        // Double-check after acquiring write lock -- another task may have
+        // already refreshed while we waited.
+        if let Some(ref entry) = *cached {
+            if entry.lifetime.is_valid() {
+                return Ok(entry.value.clone());
+            }
+        }
+
+        let (value, ttl) = refresh.await?;
+
+        *cached = Some(SdkCacheEntry {
+            value: value.clone(),
+            lifetime: Token::with_ttl(label, ttl),
+        });
+
+        Ok(value)
+    }
+
+    /// Clear the cached value, forcing the next `get_or_refresh` to call
+    /// the refresh function.
+    pub(super) async fn clear(&self) {
+        *self.cached.write().await = None;
+    }
+
+    /// Replace the cached value (test helper).
+    #[cfg(test)]
+    pub(super) async fn set(&self, value: T, ttl: Duration) {
+        *self.cached.write().await = Some(SdkCacheEntry {
+            value,
+            lifetime: Token::with_ttl("test-lifetime", ttl),
+        });
+    }
+}
+
 /// Validate an ECR authorization token.
 ///
 /// ECR tokens are base64-encoded strings in the format `AWS:<token>`.
@@ -144,10 +226,11 @@ pub(super) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Er
 /// AWS ECR authentication provider.
 ///
 /// Uses the AWS SDK to obtain authorization tokens via `GetAuthorizationToken`.
-/// The SDK client is created once at construction time. Tokens are cached with
-/// [`RwLock`] (read-fast-path for concurrent cache hits, write-lock for fetches)
-/// and refreshed when they approach expiry. The actual token lifetime is read
-/// from the API response, falling back to 12 hours if not provided.
+/// The SDK client is created once at construction time. Tokens are cached via
+/// [`SdkCredentialCache`] (read-lock fast path for concurrent cache hits,
+/// write-lock with double-check for fetches) and refreshed when they approach
+/// expiry. The actual token lifetime is read from the API response, falling
+/// back to 12 hours if not provided.
 ///
 /// Supports all AWS credential sources via the default credential chain:
 /// environment variables, shared config/credential files, IMDS/ECS
@@ -156,9 +239,8 @@ pub(super) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Er
 pub struct EcrAuth {
     /// The ECR registry hostname.
     hostname: String,
-    /// Cached bearer token. Uses `RwLock` so concurrent readers can check
-    /// the cache without blocking each other.
-    cached_token: RwLock<Option<Token>>,
+    /// Cached ECR token with TTL-based refresh.
+    credential_cache: SdkCredentialCache<Token>,
     /// ECR API implementation.
     api: Box<dyn EcrApi>,
 }
@@ -191,7 +273,7 @@ impl EcrAuth {
 
         Ok(Self {
             hostname,
-            cached_token: RwLock::new(None),
+            credential_cache: SdkCredentialCache::new(),
             api: Box::new(AwsEcrApi {
                 ecr_client,
                 registry,
@@ -204,7 +286,7 @@ impl EcrAuth {
     fn with_api(hostname: impl Into<String>, api: impl EcrApi + 'static) -> Self {
         Self {
             hostname: hostname.into(),
-            cached_token: RwLock::new(None),
+            credential_cache: SdkCredentialCache::new(),
             api: Box::new(api),
         }
     }
@@ -212,45 +294,29 @@ impl EcrAuth {
     /// Replace the cached token (test helper).
     #[cfg(test)]
     async fn set_cached_token(&self, token: Token) {
-        let mut cached = self.cached_token.write().await;
-        *cached = Some(token);
+        self.credential_cache
+            .set(token, Duration::from_secs(10))
+            .await;
     }
 
     async fn get_token_inner(&self) -> Result<Token, Error> {
-        // Fast path: read-lock cache check allows concurrent readers.
-        {
-            let cached = self.cached_token.read().await;
-            if let Some(token) = cached.as_ref().filter(|t| t.is_valid()) {
-                tracing::debug!(registry = %self.hostname, "token cache hit (read-lock fast path)");
-                return Ok(token.clone());
-            }
-        }
-
-        // Slow path: write-lock for fetch + update.
-        let mut cached = self.cached_token.write().await;
-
-        // Double-check after acquiring write lock -- another task may have
-        // already refreshed the token while we waited.
-        if let Some(token) = cached.as_ref().filter(|t| t.is_valid()) {
-            tracing::debug!(registry = %self.hostname, "token cache hit (write-lock recheck)");
-            return Ok(token.clone());
-        }
-
-        tracing::debug!(registry = %self.hostname, "token cache miss, calling GetAuthorizationToken");
-        let response = self.api.get_authorization_token().await.map_err(|e| {
-            tracing::warn!(registry = %self.hostname, error = %e, "ECR GetAuthorizationToken failed");
-            e
-        })?;
-        validate_ecr_token(&response.encoded_token, &self.hostname)?;
-        let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
-        tracing::debug!(registry = %self.hostname, ttl_secs = ttl.as_secs(), "ECR token refreshed");
-        // ECR expects `Authorization: Basic <base64(AWS:password)>`. The encoded
-        // token from GetAuthorizationToken is already in the right format.
-        let token = Token::with_ttl(response.encoded_token, ttl).with_scheme(AuthScheme::Basic);
-
-        *cached = Some(token.clone());
-
-        Ok(token)
+        self.credential_cache
+            .get_or_refresh("ecr-token", async {
+                tracing::debug!(registry = %self.hostname, "token cache miss, calling GetAuthorizationToken");
+                let response = self.api.get_authorization_token().await.map_err(|e| {
+                    tracing::warn!(registry = %self.hostname, error = %e, "ECR GetAuthorizationToken failed");
+                    e
+                })?;
+                validate_ecr_token(&response.encoded_token, &self.hostname)?;
+                let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
+                tracing::debug!(registry = %self.hostname, ttl_secs = ttl.as_secs(), "ECR token refreshed");
+                // ECR expects `Authorization: Basic <base64(AWS:password)>`. The encoded
+                // token from GetAuthorizationToken is already in the right format.
+                let token =
+                    Token::with_ttl(response.encoded_token, ttl).with_scheme(AuthScheme::Basic);
+                Ok((token, ttl))
+            })
+            .await
     }
 }
 
@@ -268,9 +334,8 @@ impl AuthProvider for EcrAuth {
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let mut cached = self.cached_token.write().await;
             tracing::debug!(registry = %self.hostname, "invalidating cached ECR token");
-            *cached = None;
+            self.credential_cache.clear().await;
         })
     }
 }
