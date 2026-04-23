@@ -63,7 +63,6 @@ Every PR ships the smallest correct change + one test that catches regression. D
 - Run the CI gate locally before push: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test && cargo deny check`
 - During rebase conflicts on `Cargo.lock`, regenerate with `git checkout --theirs Cargo.lock && cargo generate-lockfile`
 - Never squash commits with `git reset --soft` when intermediate commits touch the same files -- content from middle commits is silently dropped. Use `git rebase -i` with fixup/squash instead.
-- Never squash commits with `git reset --soft` when intermediate commits touch the same files -- content from middle commits is silently dropped. Use `git rebase -i` with fixup/squash instead.
 
 ## Plans and specs
 

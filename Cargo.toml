@@ -14,6 +14,7 @@ aws-lc-rs = { version = "1", default-features = false }
 aws-sdk-ecr = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
 aws-sdk-ecrpublic = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+google-cloud-auth = { version = "1.9", default-features = false }
 bytes = { version = "1", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 http = { version = "1", default-features = false }
@@ -81,6 +82,11 @@ url.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true
+
+# Redirect crates.io reqwest to our git pin so transitive deps
+# (google-cloud-auth) resolve to the same version as workspace deps.
+[patch.crates-io]
+reqwest = { git = "https://github.com/seanmonstar/reqwest", rev = "5f9c231502d827bdd19864277187b133bb746f2f" }
 
 [profile.release]
 strip = true

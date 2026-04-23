@@ -494,6 +494,13 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         {
+          "description": "Google Artifact Registry native auth (ADC).",
+          "type": "string",
+          "enum": [
+            "gar"
+          ]
+        },
+        {
           "description": "Google Cloud artifact/container registry.",
           "type": "string",
           "enum": [

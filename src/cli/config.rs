@@ -179,6 +179,8 @@ impl Default for GlobalConfig {
 pub(crate) enum AuthType {
     /// AWS ECR token exchange.
     Ecr,
+    /// Google Artifact Registry native auth (ADC).
+    Gar,
     /// Google Cloud artifact/container registry.
     Gcr,
     /// Azure Container Registry.
@@ -620,6 +622,7 @@ fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), Config
                 }
             }
             AuthType::Ecr
+            | AuthType::Gar
             | AuthType::Gcr
             | AuthType::Acr
             | AuthType::Ghcr
