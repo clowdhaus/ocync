@@ -24,9 +24,11 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
-use super::ecr::{EcrApi, EcrTokenResponse, ttl_from_expiry, validate_ecr_token};
+use super::ecr::{
+    EcrApi, EcrTokenResponse, SdkCredentialCache, ttl_from_expiry, validate_ecr_token,
+};
 use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::error::Error;
@@ -126,25 +128,15 @@ fn decode_ecr_credentials(
     ))
 }
 
-/// Cached SDK credentials with a TTL-tracking token.
-///
-/// The `Token` is not used for auth -- it only tracks the SDK
-/// credential lifetime via `is_valid()` / `should_refresh()`.
-struct CachedSdkCredentials {
-    credentials: Credentials,
-    /// Tracks the SDK token's TTL for refresh decisions.
-    lifetime: Token,
-}
-
 /// AWS ECR Public authentication provider.
 ///
 /// Obtains AWS credentials via `ecr-public:GetAuthorizationToken` (always
 /// targeting `us-east-1`), then uses them as HTTP Basic credentials in
 /// the standard OCI Bearer token exchange flow.
 ///
-/// SDK credentials are cached with TTL and refreshed when approaching
-/// expiry, matching [`super::ecr::EcrAuth`]'s refresh behavior for
-/// long-running processes (watch mode).
+/// SDK credentials are cached via [`SdkCredentialCache`] with the same
+/// read-lock fast path / write-lock refresh pattern as
+/// [`super::ecr::EcrAuth`], supporting long-running processes (watch mode).
 ///
 /// Bearer tokens are cached per-scope with the same challenge-cache
 /// optimization as [`super::basic::BasicAuth`].
@@ -155,8 +147,8 @@ pub struct EcrPublicAuth {
     http: reqwest::Client,
     /// ECR Public SDK API for credential refresh.
     api: Box<dyn EcrApi>,
-    /// Cached SDK credentials with TTL tracking.
-    sdk_credentials: RwLock<Option<CachedSdkCredentials>>,
+    /// Cached SDK credentials (username/password) with TTL-based refresh.
+    sdk_credential_cache: SdkCredentialCache<Credentials>,
     /// Cached Bearer tokens keyed by sorted scope strings.
     cache: Mutex<HashMap<String, Token>>,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
@@ -189,7 +181,7 @@ impl EcrPublicAuth {
             api: Box::new(AwsEcrPublicApi {
                 client: aws_sdk_ecrpublic::Client::new(&config),
             }),
-            sdk_credentials: RwLock::new(None),
+            sdk_credential_cache: SdkCredentialCache::new(),
             cache: Mutex::new(HashMap::new()),
             challenge_cache: token_exchange::ChallengeCache::new(),
         })
@@ -206,55 +198,30 @@ impl EcrPublicAuth {
             base_url: base_url.into(),
             http,
             api: Box::new(api),
-            sdk_credentials: RwLock::new(None),
+            sdk_credential_cache: SdkCredentialCache::new(),
             cache: Mutex::new(HashMap::new()),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 
     /// Get or refresh SDK credentials from `GetAuthorizationToken`.
-    ///
-    /// Uses the same read-lock fast path / write-lock refresh pattern as
-    /// [`super::ecr::EcrAuth::get_token_inner`].
     async fn ensure_credentials(&self) -> Result<Credentials, Error> {
-        // Fast path: read-lock check.
-        {
-            let cached = self.sdk_credentials.read().await;
-            if let Some(ref sdk) = *cached {
-                if sdk.lifetime.is_valid() {
-                    return Ok(sdk.credentials.clone());
-                }
-            }
-        }
-
-        // Slow path: write-lock for refresh.
-        let mut cached = self.sdk_credentials.write().await;
-
-        // Double-check after acquiring write lock.
-        if let Some(ref sdk) = *cached {
-            if sdk.lifetime.is_valid() {
-                return Ok(sdk.credentials.clone());
-            }
-        }
-
-        tracing::debug!("ECR Public SDK credentials expired or missing, refreshing");
-        let response = self.api.get_authorization_token().await.map_err(|e| {
-            tracing::warn!(error = %e, "ECR Public GetAuthorizationToken failed");
-            e
-        })?;
-        let (credentials, ttl) =
-            decode_ecr_credentials(&response.encoded_token, response.expires_in)?;
-        tracing::debug!(
-            ttl_secs = ttl.as_secs(),
-            "ECR Public SDK credentials refreshed"
-        );
-
-        *cached = Some(CachedSdkCredentials {
-            credentials: credentials.clone(),
-            lifetime: Token::with_ttl("sdk-credential-tracker", ttl),
-        });
-
-        Ok(credentials)
+        self.sdk_credential_cache
+            .get_or_refresh("ecr-public-sdk-credential", async {
+                tracing::debug!("ECR Public SDK credentials expired or missing, refreshing");
+                let response = self.api.get_authorization_token().await.map_err(|e| {
+                    tracing::warn!(error = %e, "ECR Public GetAuthorizationToken failed");
+                    e
+                })?;
+                let (credentials, ttl) =
+                    decode_ecr_credentials(&response.encoded_token, response.expires_in)?;
+                tracing::debug!(
+                    ttl_secs = ttl.as_secs(),
+                    "ECR Public SDK credentials refreshed"
+                );
+                Ok((credentials, ttl))
+            })
+            .await
     }
 }
 
@@ -314,8 +281,7 @@ impl AuthProvider for EcrPublicAuth {
             self.challenge_cache.clear().await;
 
             // Also clear SDK credentials so they are re-fetched on next use.
-            let mut sdk = self.sdk_credentials.write().await;
-            *sdk = None;
+            self.sdk_credential_cache.clear().await;
         })
     }
 }

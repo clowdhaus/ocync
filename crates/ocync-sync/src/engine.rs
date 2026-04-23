@@ -651,16 +651,20 @@ impl DiscoveryCounters {
 /// futures. The phase advances monotonically: `Discovering -> Done`.
 ///
 /// Leaders are ordered first by `elect_leaders` so they acquire semaphore
-/// permits and claim blob uploads before followers. Followers that need a
-/// blob still in-flight wait on the per-blob `Notify` via `ClaimAction::Wait`
-/// in `transfer_single_blob`, providing fine-grained synchronization.
+/// permits and claim blob uploads before followers. Two-level Notify
+/// synchronization ensures correctness:
+/// 1. Per-blob `Notify` via `ClaimAction::Wait`: followers wait for a
+///    leader's blob upload to complete before claiming the same blob.
+/// 2. Per-repo committed `Notify`: followers wait for the leader's
+///    manifest commit before attempting cross-repo mounts. ECR requires
+///    the source repo to have a committed manifest for mount to succeed.
 enum PromotionPhase {
     /// Discovery futures still in flight; tasks accumulate in `pending`.
     Discovering,
     /// All tasks promoted (leaders and followers together); no further
-    /// phase transitions. Per-blob `Notify` synchronization in
-    /// `transfer_single_blob` ensures followers wait for their specific
-    /// leader blobs without a coarse gate.
+    /// phase transitions. Per-blob and per-repo-committed `Notify`
+    /// synchronization in `transfer_single_blob` ensures followers wait
+    /// for their specific leader blobs and manifest commits.
     Done,
 }
 
@@ -1621,6 +1625,11 @@ async fn execute_item(
 
     if let Some(err) = outcome.error {
         warn!(target_name = %item.target_name, error = %err, "blob transfer failed");
+        // Wake any followers waiting for this repo's manifest commit so they
+        // fall through to HEAD+push instead of deadlocking.
+        cache
+            .borrow()
+            .notify_repo_committed(&item.target_name, &item.target.repo);
         return ImageResult {
             image_id: Uuid::now_v7(),
             source: item.source.to_string(),
@@ -1728,6 +1737,12 @@ async fn execute_item(
             }
         }
         Err(err) => {
+            // Wake any followers waiting for this repo's manifest commit so
+            // they fall through to HEAD+push instead of deadlocking.
+            cache
+                .borrow()
+                .notify_repo_committed(&item.target_name, &item.target.repo);
+
             if is_immutable_tag_error(&err) {
                 info!(
                     source_repo = %item.source.repo,
@@ -2138,16 +2153,78 @@ async fn transfer_single_blob(
 
     // Step 2b: Cross-repo mount. Prefer leader repos (committed manifests)
     // over other followers (whose manifests may not be committed yet).
+    //
+    // ECR requires the source repo to have a committed manifest for a mount
+    // to return 201. When `blob_mount_source` returns an uncommitted leader
+    // repo (Tier 3), we wait for the leader's manifest to commit rather than
+    // sending a mount request that will be rejected with 202. This avoids
+    // wasted round-trips and the `remove_blob_repo` cascade that would
+    // permanently discard a valid mount source.
     let mut mount_attempted = false;
-    let mount_source = {
-        let c = ctx.cache.borrow();
-        c.blob_mount_source(
-            ctx.target_name,
-            digest,
-            ctx.target_repo,
-            ctx.preferred_mount_sources,
-        )
-        .cloned()
+    let mount_source: Option<RepositoryName> = {
+        let (source, is_committed) = {
+            let c = ctx.cache.borrow();
+            let source = c
+                .blob_mount_source(
+                    ctx.target_name,
+                    digest,
+                    ctx.target_repo,
+                    ctx.preferred_mount_sources,
+                )
+                .cloned();
+            let committed = source
+                .as_ref()
+                .is_some_and(|r| c.is_repo_committed(ctx.target_name, r));
+            (source, committed)
+        };
+
+        match source {
+            // No mount source available.
+            None => None,
+            // Source has a committed manifest (Tier 1/2) -- mount immediately.
+            Some(repo) if is_committed => Some(repo),
+            // Source is an uncommitted leader -- wait for manifest commit.
+            Some(repo) if ctx.preferred_mount_sources.contains(&repo) => {
+                debug!(
+                    %digest,
+                    %repo,
+                    target = %ctx.target_name,
+                    "mount source uncommitted, waiting for leader manifest commit"
+                );
+                let notify = {
+                    let mut c = ctx.cache.borrow_mut();
+                    c.repo_committed_notify(ctx.target_name, &repo)
+                };
+                // No await between the committed check and notified() registration,
+                // so single-threaded runtime guarantees we don't miss the signal.
+                notify.notified().await;
+
+                // Leader committed or failed -- re-query mount source.
+                let c = ctx.cache.borrow();
+                if c.is_repo_committed(ctx.target_name, &repo) {
+                    c.blob_mount_source(
+                        ctx.target_name,
+                        digest,
+                        ctx.target_repo,
+                        ctx.preferred_mount_sources,
+                    )
+                    .cloned()
+                } else {
+                    // Leader failed; fall through to HEAD+push.
+                    debug!(
+                        %digest,
+                        %repo,
+                        target = %ctx.target_name,
+                        "leader manifest push failed, skipping mount"
+                    );
+                    None
+                }
+            }
+            // Uncommitted non-leader (Tier 3 fallback) -- attempt mount
+            // directly. Non-ECR registries may fulfill mounts without a
+            // committed manifest.
+            Some(repo) => Some(repo),
+        }
     };
 
     if let Some(from_repo) = mount_source {
@@ -3469,6 +3546,36 @@ mod tests {
         assert_eq!(c.cache_hits, 0);
         assert_eq!(c.head_failures, 0);
         assert_eq!(c.head_first_skips, 0);
+    }
+
+    #[test]
+    fn write_timing_writes_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timing.jsonl");
+        let mut file = Some(std::fs::File::create(&path).unwrap());
+        let start = Instant::now();
+
+        write_timing(&mut file, "discovery_start", &start);
+        write_timing(&mut file, "execution_complete", &start);
+
+        drop(file);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // Verify each line is valid JSON with expected fields.
+        for (i, phase) in ["discovery_start", "execution_complete"].iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(lines[i]).unwrap();
+            assert_eq!(v["phase"].as_str().unwrap(), *phase);
+            assert!(v["elapsed_ms"].as_u64().is_some());
+        }
+    }
+
+    #[test]
+    fn write_timing_noop_when_none() {
+        let mut file: Option<std::fs::File> = None;
+        let start = Instant::now();
+        // Should not panic or error.
+        write_timing(&mut file, "test_phase", &start);
     }
 
     #[test]

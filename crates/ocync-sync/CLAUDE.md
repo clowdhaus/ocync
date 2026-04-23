@@ -24,13 +24,16 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 - Greedy set-cover election in `elect_leaders()` provably covers every shared blob.
 - No "uncovered follower" path exists - all followers' shared blobs are in the leader union.
 - Do NOT add wave partitioning among followers (dead code).
-- All tasks promoted simultaneously after discovery (leaders ordered first by `elect_leaders`). Per-blob `Notify` via `ClaimAction::Wait` synchronizes followers that need blobs still in-flight. Mount sources restricted to repos with committed manifests via `committed_repos` HashSet in cache.
+- All tasks promoted simultaneously after discovery (leaders ordered first by `elect_leaders`). Two-level Notify synchronization:
+  1. Per-blob `Notify` via `ClaimAction::Wait`: followers wait for leader's blob upload.
+  2. Per-repo committed `Notify` via `repo_committed_notify`: followers wait for leader's manifest commit before mounting. ECR requires a committed manifest in the source repo for mount to succeed (201); without this wait, mounts hit Tier 3 and get 202 (Not Fulfilled).
 
 ## Notify contracts (critical)
 
 - `tokio::sync::Notify::notify_waiters()` does NOT store permits.
 - Every code path that transitions a blob out of `InProgress` MUST call `notify_blob`.
 - Same applies to `BlobStage::notify_staged` / `notify_failed` for source-pull dedup.
+- Every code path that exits `execute_item` without calling `mark_repo_committed` MUST call `notify_repo_committed` (blob failure + manifest push failure).
 - Missing notify = deadlock for concurrent waiters.
 
 ## Transfer state cache

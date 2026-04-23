@@ -947,6 +947,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_config_auth_challenge_cache_reuse() {
+        let mock = wiremock::MockServer::start().await;
+
+        // /v2/ should only be hit once -- second get_token reuses the cached challenge.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // Token endpoint is called twice (different scopes).
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "reused", "expires_in": 300})),
+            )
+            .expect(2)
+            .mount(&mock)
+            .await;
+
+        let auth = DockerConfigAuth::with_base_url(mock.uri(), crate::test_http_client(), None);
+        let t1 = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
+        let t2 = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
+        assert_eq!(t1.value(), "reused");
+        assert_eq!(t2.value(), "reused");
+        // expect(1) on /v2/ proves the challenge was cached and reused.
+    }
+
+    #[tokio::test]
     async fn docker_config_auth_no_match_is_anonymous() {
         let config = DockerConfig {
             auths: {
