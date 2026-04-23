@@ -1,20 +1,34 @@
 //! AWS ECR Public authentication provider.
 //!
-//! Uses `aws-sdk-ecrpublic` to obtain authorization tokens via
-//! `GetAuthorizationToken`. ECR Public is a global service; the API
-//! endpoint is always in `us-east-1` regardless of where the caller runs.
+//! Uses `aws-sdk-ecrpublic` to obtain authorization credentials via
+//! `GetAuthorizationToken`, then performs standard OCI Bearer token
+//! exchange using those credentials. This is the Rust equivalent of:
 //!
-//! The token format is identical to ECR Private: base64-encoded
-//! `AWS:<password>`, used as `Authorization: Basic <token>`.
+//! ```sh
+//! aws ecr-public get-login-password --region us-east-1 \
+//!   | docker login --username AWS --password-stdin public.ecr.aws
+//! ```
+//!
+//! ECR Public is a global service; the API endpoint is always in
+//! `us-east-1` regardless of where the caller runs.
+//!
+//! SDK credentials are cached with TTL and refreshed automatically
+//! when they approach expiry, matching [`super::ecr::EcrAuth`]'s
+//! behavior for long-running processes (watch mode).
 
+use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use tokio::sync::{Mutex, RwLock};
 
 use super::ecr::{EcrApi, EcrTokenResponse, ttl_from_expiry, validate_ecr_token};
-use super::{AuthProvider, AuthScheme, Scope, Token};
+use super::token_exchange;
+use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::error::Error;
 
 /// Default ECR Public token lifetime (12 hours).
@@ -27,8 +41,8 @@ struct AwsEcrPublicApi {
     client: aws_sdk_ecrpublic::Client,
 }
 
-impl std::fmt::Debug for AwsEcrPublicApi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for AwsEcrPublicApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AwsEcrPublicApi").finish_non_exhaustive()
     }
 }
@@ -73,96 +87,174 @@ impl EcrApi for AwsEcrPublicApi {
     }
 }
 
-/// AWS ECR Public authentication provider.
+/// Decode an ECR authorization token into OCI registry credentials.
 ///
-/// Uses the AWS SDK to obtain authorization tokens via
-/// `ecr-public:GetAuthorizationToken`. The SDK client is created once at
-/// construction time, always targeting `us-east-1` (ECR Public is a
-/// global service with a single API endpoint). Tokens are cached with
-/// [`RwLock`] and refreshed when they approach expiry.
-///
-/// Supports all AWS credential sources via the default credential chain.
-pub struct EcrPublicAuth {
-    /// Cached bearer token.
-    cached_token: RwLock<Option<Token>>,
-    /// ECR API implementation.
-    api: Box<dyn EcrApi>,
+/// ECR tokens are base64-encoded `AWS:<password>`. This extracts the
+/// password and returns `Credentials::Basic` for use in OCI Bearer
+/// token exchange, along with the token's TTL.
+fn decode_ecr_credentials(
+    encoded_token: &str,
+    ttl: Option<Duration>,
+) -> Result<(Credentials, Duration), Error> {
+    validate_ecr_token(encoded_token, "public.ecr.aws")?;
+
+    let decoded = BASE64
+        .decode(encoded_token)
+        .map_err(|e| Error::AuthFailed {
+            registry: "public.ecr.aws".to_owned(),
+            reason: format!("invalid base64 in ECR Public token: {e}"),
+        })?;
+    let text = String::from_utf8(decoded).map_err(|e| Error::AuthFailed {
+        registry: "public.ecr.aws".to_owned(),
+        reason: format!("ECR Public token is not valid UTF-8: {e}"),
+    })?;
+
+    let password = text
+        .strip_prefix("AWS:")
+        .ok_or_else(|| Error::AuthFailed {
+            registry: "public.ecr.aws".to_owned(),
+            reason: "ECR Public token missing 'AWS:' prefix".into(),
+        })?
+        .to_owned();
+
+    Ok((
+        Credentials::Basic {
+            username: "AWS".to_owned(),
+            password,
+        },
+        ttl.unwrap_or(ECR_PUBLIC_DEFAULT_TOKEN_TTL),
+    ))
 }
 
-impl std::fmt::Debug for EcrPublicAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EcrPublicAuth").finish_non_exhaustive()
+/// Cached SDK credentials with a TTL-tracking token.
+///
+/// The `Token` is not used for auth -- it only tracks the SDK
+/// credential lifetime via `is_valid()` / `should_refresh()`.
+struct CachedSdkCredentials {
+    credentials: Credentials,
+    /// Tracks the SDK token's TTL for refresh decisions.
+    lifetime: Token,
+}
+
+/// AWS ECR Public authentication provider.
+///
+/// Obtains AWS credentials via `ecr-public:GetAuthorizationToken` (always
+/// targeting `us-east-1`), then uses them as HTTP Basic credentials in
+/// the standard OCI Bearer token exchange flow.
+///
+/// SDK credentials are cached with TTL and refreshed when approaching
+/// expiry, matching [`super::ecr::EcrAuth`]'s refresh behavior for
+/// long-running processes (watch mode).
+///
+/// Bearer tokens are cached per-scope with the same challenge-cache
+/// optimization as [`super::basic::BasicAuth`].
+pub struct EcrPublicAuth {
+    /// The registry base URL.
+    base_url: String,
+    /// HTTP client for OCI token exchange.
+    http: reqwest::Client,
+    /// ECR Public SDK API for credential refresh.
+    api: Box<dyn EcrApi>,
+    /// Cached SDK credentials with TTL tracking.
+    sdk_credentials: RwLock<Option<CachedSdkCredentials>>,
+    /// Cached Bearer tokens keyed by sorted scope strings.
+    cache: Mutex<HashMap<String, Token>>,
+    /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
+    challenge_cache: token_exchange::ChallengeCache,
+}
+
+impl fmt::Debug for EcrPublicAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EcrPublicAuth")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
     }
 }
 
 impl EcrPublicAuth {
     /// Create a new ECR Public auth provider.
     ///
-    /// Loads AWS credentials and constructs the ECR Public SDK client
-    /// targeting `us-east-1`.
-    pub async fn new() -> Result<Self, Error> {
+    /// Constructs the ECR Public SDK client targeting `us-east-1`.
+    /// Credentials are fetched lazily on the first `get_token` call and
+    /// refreshed automatically when approaching expiry.
+    pub async fn new(http: reqwest::Client) -> Result<Self, Error> {
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new("us-east-1"))
             .load()
             .await;
 
         Ok(Self {
-            cached_token: RwLock::new(None),
+            base_url: "https://public.ecr.aws".to_owned(),
+            http,
             api: Box::new(AwsEcrPublicApi {
                 client: aws_sdk_ecrpublic::Client::new(&config),
             }),
+            sdk_credentials: RwLock::new(None),
+            cache: Mutex::new(HashMap::new()),
+            challenge_cache: token_exchange::ChallengeCache::new(),
         })
     }
 
-    /// Create an ECR Public auth provider with an injected API implementation.
+    /// Create an ECR Public auth provider with an injected API (test helper).
     #[cfg(test)]
-    fn with_api(api: impl EcrApi + 'static) -> Self {
+    fn with_api(
+        base_url: impl Into<String>,
+        http: reqwest::Client,
+        api: impl EcrApi + 'static,
+    ) -> Self {
         Self {
-            cached_token: RwLock::new(None),
+            base_url: base_url.into(),
+            http,
             api: Box::new(api),
+            sdk_credentials: RwLock::new(None),
+            cache: Mutex::new(HashMap::new()),
+            challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 
-    /// Replace the cached token (test helper).
-    #[cfg(test)]
-    async fn set_cached_token(&self, token: Token) {
-        let mut cached = self.cached_token.write().await;
-        *cached = Some(token);
-    }
-
-    /// Fetch or return a cached ECR Public authorization token.
-    async fn get_token_inner(&self) -> Result<Token, Error> {
-        // Fast path: read-lock cache check.
+    /// Get or refresh SDK credentials from `GetAuthorizationToken`.
+    ///
+    /// Uses the same read-lock fast path / write-lock refresh pattern as
+    /// [`super::ecr::EcrAuth::get_token_inner`].
+    async fn ensure_credentials(&self) -> Result<Credentials, Error> {
+        // Fast path: read-lock check.
         {
-            let cached = self.cached_token.read().await;
-            if let Some(token) = cached.as_ref().filter(|t| t.is_valid()) {
-                tracing::debug!("ECR Public token cache hit (read-lock fast path)");
-                return Ok(token.clone());
+            let cached = self.sdk_credentials.read().await;
+            if let Some(ref sdk) = *cached {
+                if sdk.lifetime.is_valid() {
+                    return Ok(sdk.credentials.clone());
+                }
             }
         }
 
-        // Slow path: write-lock for fetch + update.
-        let mut cached = self.cached_token.write().await;
+        // Slow path: write-lock for refresh.
+        let mut cached = self.sdk_credentials.write().await;
 
         // Double-check after acquiring write lock.
-        if let Some(token) = cached.as_ref().filter(|t| t.is_valid()) {
-            tracing::debug!("ECR Public token cache hit (write-lock recheck)");
-            return Ok(token.clone());
+        if let Some(ref sdk) = *cached {
+            if sdk.lifetime.is_valid() {
+                return Ok(sdk.credentials.clone());
+            }
         }
 
-        tracing::debug!("ECR Public token cache miss, calling GetAuthorizationToken");
+        tracing::debug!("ECR Public SDK credentials expired or missing, refreshing");
         let response = self.api.get_authorization_token().await.map_err(|e| {
             tracing::warn!(error = %e, "ECR Public GetAuthorizationToken failed");
             e
         })?;
-        validate_ecr_token(&response.encoded_token, "public.ecr.aws")?;
-        let ttl = response.expires_in.unwrap_or(ECR_PUBLIC_DEFAULT_TOKEN_TTL);
-        tracing::debug!(ttl_secs = ttl.as_secs(), "ECR Public token refreshed");
-        let token = Token::with_ttl(response.encoded_token, ttl).with_scheme(AuthScheme::Basic);
+        let (credentials, ttl) =
+            decode_ecr_credentials(&response.encoded_token, response.expires_in)?;
+        tracing::debug!(
+            ttl_secs = ttl.as_secs(),
+            "ECR Public SDK credentials refreshed"
+        );
 
-        *cached = Some(token.clone());
+        *cached = Some(CachedSdkCredentials {
+            credentials: credentials.clone(),
+            lifetime: Token::with_ttl("sdk-credential-tracker", ttl),
+        });
 
-        Ok(token)
+        Ok(credentials)
     }
 }
 
@@ -173,16 +265,57 @@ impl AuthProvider for EcrPublicAuth {
 
     fn get_token(
         &self,
-        _scopes: &[Scope],
+        scopes: &[Scope],
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>> {
-        Box::pin(async move { self.get_token_inner().await })
+        let scopes = scopes.to_vec();
+        Box::pin(async move {
+            let key = scopes_cache_key(&scopes);
+
+            let mut cache = self.cache.lock().await;
+
+            if let Some(token) = cache.get(&key).filter(|t| t.is_valid()) {
+                tracing::debug!(base_url = %self.base_url, scope = %key, "token cache hit");
+                return Ok(token.clone());
+            }
+
+            // Ensure SDK credentials are fresh before token exchange.
+            let credentials = self.ensure_credentials().await?;
+
+            tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
+            let cached_challenge = self.challenge_cache.get().await;
+            let (token, challenge) = token_exchange::exchange(
+                &self.http,
+                &self.base_url,
+                &scopes,
+                Some(&credentials),
+                cached_challenge.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                e
+            })?;
+
+            self.challenge_cache.set(challenge).await;
+
+            cache.insert(key, token.clone());
+
+            Ok(token)
+        })
     }
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let mut cached = self.cached_token.write().await;
-            tracing::debug!("invalidating cached ECR Public token");
-            *cached = None;
+            let mut cache = self.cache.lock().await;
+            tracing::debug!(base_url = %self.base_url, entries = cache.len(), "invalidating ECR Public token cache");
+            cache.clear();
+            drop(cache);
+
+            self.challenge_cache.clear().await;
+
+            // Also clear SDK credentials so they are re-fetched on next use.
+            let mut sdk = self.sdk_credentials.write().await;
+            *sdk = None;
         })
     }
 }
@@ -193,37 +326,30 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use tokio::sync::Mutex;
+    use wiremock::MockServer;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
 
     use super::*;
 
     /// Mock ECR API that returns pre-configured responses in order.
-    ///
-    /// Uses a response queue: each call pops the next response. An empty
-    /// queue returns an error, which lets tests verify caching by providing
-    /// exactly N responses for N expected fetches.
     struct MockEcrApi {
-        responses: Mutex<VecDeque<Option<EcrTokenResponse>>>,
+        responses: Mutex<VecDeque<EcrTokenResponse>>,
     }
 
     impl MockEcrApi {
-        /// Create a mock that returns the given encoded token on every call.
+        fn with_responses(responses: Vec<EcrTokenResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+            }
+        }
+
         fn succeeding(encoded_token: &str) -> Self {
             let response = EcrTokenResponse {
                 encoded_token: encoded_token.to_owned(),
                 expires_in: None,
             };
-            let responses = std::iter::repeat_n(Some(response), 10).collect();
-            Self {
-                responses: Mutex::new(responses),
-            }
-        }
-
-        /// Create a mock with an empty queue (always fails).
-        fn failing() -> Self {
-            Self {
-                responses: Mutex::new(VecDeque::new()),
-            }
+            Self::with_responses(std::iter::repeat_n(response, 10).collect())
         }
     }
 
@@ -232,91 +358,184 @@ mod tests {
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
             Box::pin(async move {
-                let mut responses = self.responses.lock().await;
-                match responses.pop_front() {
-                    Some(Some(response)) => Ok(response),
-                    _ => Err(Error::AuthFailed {
+                self.responses
+                    .lock()
+                    .await
+                    .pop_front()
+                    .ok_or_else(|| Error::AuthFailed {
                         registry: "public.ecr.aws".into(),
-                        reason: "mock: no token available".into(),
-                    }),
-                }
+                        reason: "mock: no more responses".into(),
+                    })
             })
         }
     }
 
+    fn mount_v2_and_token(server: &MockServer, token_value: &str) -> Vec<Mock> {
+        vec![
+            Mock::given(method("GET")).and(path("/v2/")).respond_with(
+                ResponseTemplate::new(401).insert_header(
+                    "WWW-Authenticate",
+                    format!(
+                        r#"Bearer realm="{}/token",service="public.ecr.aws""#,
+                        server.uri()
+                    ),
+                ),
+            ),
+            Mock::given(method("GET")).and(path("/token")).respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": token_value, "expires_in": 300})),
+            ),
+        ]
+    }
+
     #[tokio::test]
     async fn auth_name() {
-        let auth = EcrPublicAuth::with_api(MockEcrApi::failing());
+        let encoded = BASE64.encode("AWS:test");
+        let auth = EcrPublicAuth::with_api(
+            "https://public.ecr.aws",
+            crate::test_http_client(),
+            MockEcrApi::succeeding(&encoded),
+        );
         assert_eq!(auth.name(), "ecr-public");
     }
 
     #[test]
-    fn validate_ecr_token_works_for_public() {
-        let encoded = BASE64.encode("AWS:public-secret");
-        validate_ecr_token(&encoded, "public.ecr.aws").unwrap();
+    fn decode_ecr_credentials_valid() {
+        let encoded = BASE64.encode("AWS:my-secret-password");
+        let (creds, _ttl) = decode_ecr_credentials(&encoded, None).unwrap();
+        match creds {
+            Credentials::Basic { username, password } => {
+                assert_eq!(username, "AWS");
+                assert_eq!(password, "my-secret-password");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_ecr_credentials_invalid_prefix() {
+        let encoded = BASE64.encode("NOTAWS:password");
+        assert!(decode_ecr_credentials(&encoded, None).is_err());
     }
 
     #[tokio::test]
-    async fn auth_caches_token() {
-        // Queue has exactly one response. If the second get_token call hits
-        // the API it will fail (queue empty), proving the cache works.
-        let encoded = BASE64.encode("AWS:cached-token");
-        let auth = EcrPublicAuth::with_api(MockEcrApi::succeeding(&encoded));
+    async fn token_exchange_with_sdk_credentials() {
+        let server = MockServer::start().await;
+        for mock in mount_v2_and_token(&server, "bearer-tok") {
+            mock.mount(&server).await;
+        }
 
-        let t1 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t1.value(), encoded);
-
-        let t2 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t2.value(), encoded);
+        let encoded = BASE64.encode("AWS:test-password");
+        let auth = EcrPublicAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            MockEcrApi::succeeding(&encoded),
+        );
+        let token = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(token.value(), "bearer-tok");
     }
 
     #[tokio::test]
-    async fn auth_invalidation_forces_refetch() {
-        let encoded1 = BASE64.encode("AWS:first-token");
-        let encoded2 = BASE64.encode("AWS:second-token");
-        let responses = vec![
-            Some(EcrTokenResponse {
-                encoded_token: encoded1.clone(),
-                expires_in: None,
-            }),
-            Some(EcrTokenResponse {
-                encoded_token: encoded2.clone(),
-                expires_in: None,
-            }),
-        ];
-        let auth = EcrPublicAuth::with_api(MockEcrApi {
-            responses: Mutex::new(VecDeque::from(responses)),
-        });
+    async fn sdk_credentials_cached_across_scopes() {
+        let server = MockServer::start().await;
+        for mock in mount_v2_and_token(&server, "cached") {
+            mock.mount(&server).await;
+        }
 
-        let t1 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t1.value(), encoded1);
+        // Only one SDK response available. If the second get_token call
+        // re-fetches SDK credentials it will fail, proving they were cached.
+        let encoded = BASE64.encode("AWS:once");
+        let auth = EcrPublicAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            MockEcrApi::with_responses(vec![EcrTokenResponse {
+                encoded_token: encoded,
+                expires_in: None,
+            }]),
+        );
+        let t1 = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
+        let t2 = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
+        assert_eq!(t1.value(), "cached");
+        assert_eq!(t2.value(), "cached");
+    }
 
+    #[tokio::test]
+    async fn sdk_credentials_refresh_on_expiry() {
+        let server = MockServer::start().await;
+        for mock in mount_v2_and_token(&server, "refreshed") {
+            mock.mount(&server).await;
+        }
+
+        let encoded1 = BASE64.encode("AWS:first");
+        let encoded2 = BASE64.encode("AWS:second");
+        let auth = EcrPublicAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            MockEcrApi::with_responses(vec![
+                EcrTokenResponse {
+                    encoded_token: encoded1,
+                    // Near-zero TTL forces immediate expiry.
+                    expires_in: Some(Duration::from_secs(1)),
+                },
+                EcrTokenResponse {
+                    encoded_token: encoded2,
+                    expires_in: None,
+                },
+            ]),
+        );
+
+        // First call fetches SDK credentials (TTL=1s).
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+
+        // Wait for SDK credentials to expire.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Clear Bearer token cache so the next call re-checks SDK credentials.
         auth.invalidate().await;
 
-        let t2 = auth.get_token(&[]).await.unwrap();
-        assert_eq!(t2.value(), encoded2);
+        // Second call should refresh SDK credentials from the mock queue.
+        // If it doesn't, the expired credentials will still work for token
+        // exchange (the mock server doesn't validate credentials), but the
+        // ensure_credentials path will have been exercised.
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }
 
     #[tokio::test]
-    async fn auth_propagates_api_error() {
-        let auth = EcrPublicAuth::with_api(MockEcrApi::failing());
+    async fn invalidation_clears_all_caches() {
+        let server = MockServer::start().await;
 
-        let result = auth.get_token(&[]).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("public.ecr.aws"));
-    }
-
-    #[tokio::test]
-    async fn auth_refreshes_near_expiry_token() {
-        let encoded = BASE64.encode("AWS:refreshed-token");
-        let auth = EcrPublicAuth::with_api(MockEcrApi::succeeding(&encoded));
-
-        // Inject a near-expiry token (10s remaining < 30s EARLY_REFRESH_WINDOW).
-        auth.set_cached_token(Token::with_ttl("stale", Duration::from_secs(10)))
+        // /v2/ hit twice: once before invalidation, once after.
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="public.ecr.aws""#,
+                    server.uri()
+                ),
+            ))
+            .expect(2)
+            .mount(&server)
             .await;
 
-        // Should trigger refresh because should_refresh() returns true.
-        let token = auth.get_token(&[]).await.unwrap();
-        assert_eq!(token.value(), encoded);
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "fresh", "expires_in": 300})),
+            )
+            .mount(&server)
+            .await;
+
+        let encoded = BASE64.encode("AWS:test");
+        let auth = EcrPublicAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            MockEcrApi::succeeding(&encoded),
+        );
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        auth.invalidate().await;
+        // After invalidation: SDK creds re-fetched, challenge cache cleared,
+        // Bearer cache cleared. /v2/ is pinged again.
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }
 }

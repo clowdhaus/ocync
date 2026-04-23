@@ -4,7 +4,8 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 
 ## Auth protocol
 
-- ECR private uses HTTP Basic auth (not Bearer token exchange). AWS SDK manages credentials directly.
+- ECR private uses HTTP Basic auth (not Bearer token exchange). AWS SDK `GetAuthorizationToken` returns a pre-encoded base64 token used directly.
+- ECR Public uses SDK `GetAuthorizationToken` -> decode base64 -> OCI Bearer token exchange with those credentials. SDK tokens are NOT valid as direct Bearer tokens; they must drive standard `/v2/token` exchange. SDK credentials are cached with TTL and refreshed on expiry.
 - Parse `WWW-Authenticate` header dynamically; never hardcode token exchange endpoints.
 - Token caching: `EARLY_REFRESH_WINDOW` = 30s. Docker Hub issues 300s tokens; a 15m window was a bug that bypassed the cache entirely.
 - Per-scope tokens: format `repository:<name>:<actions>` where actions = `pull`, `push`, or `pull,push`.
