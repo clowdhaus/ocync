@@ -31,6 +31,5 @@ uuid.workspace = true
 [dev-dependencies]
 tempfile = { version = "3", default-features = false }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 url.workspace = true
 wiremock = { version = "0.6", default-features = false }

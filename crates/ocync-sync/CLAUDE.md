@@ -52,6 +52,8 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 ### Structure
 
 - Integration tests live in `tests/sync_*.rs` (one file per subsystem). Shared helpers in `tests/helpers/`.
+- Do not write tests that capture tracing output via `set_default()` -- tracing's global `MAX_LEVEL` and callsite interest caching make per-test subscriber capture unreliable when `cargo test` runs tests in parallel within the same process. Test behavior via engine outcomes, not log messages.
+- Tests that capture tracing output via `set_default()` MUST use `#[tokio::test(flavor = "current_thread")]`. The subscriber is thread-local; `multi_thread` runtime may fire events on a different worker thread where the subscriber is not installed.
 - Each test file starts with `mod helpers; use helpers::*;` -- helpers are NOT auto-discovered.
 - Helper sub-modules use `#![allow(dead_code, unused_imports, unreachable_pub)]` (required for test module visibility).
 - `MockBatchChecker`/`FailingBatchChecker` live in `sync_cache.rs` (not in shared helpers) since only cache tests use them.
