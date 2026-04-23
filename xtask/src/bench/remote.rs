@@ -65,6 +65,10 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long)]
     pub(crate) skip_registries: Option<String>,
 
+    /// Skip CDN pre-warming (passed through to `cargo xtask bench`).
+    #[arg(long)]
+    pub(crate) skip_prewarm: bool,
+
     /// Local directory to save fetched results.
     #[arg(long, default_value = "bench/results")]
     pub(crate) output: String,
@@ -144,6 +148,9 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     }
     if let Some(ref skip) = args.skip_registries {
         bench_args.push_str(&format!(" --skip-registries '{}'", shell_escape(skip)));
+    }
+    if args.skip_prewarm {
+        bench_args.push_str(" --skip-prewarm");
     }
     bench_args.push_str(&format!(" '{}'", shell_escape(&args.scenario)));
 
