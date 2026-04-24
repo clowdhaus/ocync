@@ -9,6 +9,7 @@ pub(crate) mod shutdown;
 
 use ocync_distribution::RegistryClient;
 use ocync_distribution::auth::Credentials;
+use ocync_distribution::auth::acr::AcrAuth;
 use ocync_distribution::auth::anonymous::AnonymousAuth;
 use ocync_distribution::auth::basic::BasicAuth;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
@@ -212,8 +213,14 @@ pub(crate) async fn build_registry_client(
                 .map_err(|e| CliError::Input(format!("GCP auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
         }
-        Some(AuthType::Ghcr | AuthType::Acr | AuthType::DockerConfig) => {
-            if matches!(auth_type, Some(AuthType::Ghcr | AuthType::Acr)) {
+        Some(AuthType::Acr) => {
+            let auth = AcrAuth::new(bare_host, http)
+                .await
+                .map_err(|e| CliError::Input(format!("ACR auth setup for '{bare_host}': {e}")))?;
+            RegistryClient::builder(url).auth(auth)
+        }
+        Some(AuthType::Ghcr | AuthType::DockerConfig) => {
+            if matches!(auth_type, Some(AuthType::Ghcr)) {
                 tracing::debug!(
                     registry = bare_host,
                     auth_type = ?auth_type,
@@ -254,12 +261,13 @@ pub(crate) async fn build_registry_client(
                     })?;
                     RegistryClient::builder(url).auth(auth)
                 }
-                Some(
-                    ProviderKind::Acr
-                    | ProviderKind::Ghcr
-                    | ProviderKind::DockerHub
-                    | ProviderKind::Chainguard,
-                )
+                Some(ProviderKind::Acr) => {
+                    let auth = AcrAuth::new(bare_host, http).await.map_err(|e| {
+                        CliError::Input(format!("ACR auth setup for '{bare_host}': {e}"))
+                    })?;
+                    RegistryClient::builder(url).auth(auth)
+                }
+                Some(ProviderKind::Ghcr | ProviderKind::DockerHub | ProviderKind::Chainguard)
                 | None => {
                     // Try docker config - falls back to anonymous exchange if no creds found.
                     match DockerConfig::load_default() {

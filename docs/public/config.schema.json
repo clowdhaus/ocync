@@ -116,7 +116,7 @@
           ]
         },
         {
-          "description": "Azure Container Registry.",
+          "description": "Azure Container Registry native auth (AAD).",
           "type": "string",
           "enum": [
             "acr"
