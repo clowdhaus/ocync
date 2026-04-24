@@ -109,7 +109,7 @@
           ]
         },
         {
-          "description": "Google Cloud artifact/container registry.",
+          "description": "Google Container Registry native auth (ADC).",
           "type": "string",
           "enum": [
             "gcr"
