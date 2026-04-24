@@ -181,7 +181,7 @@ pub(crate) enum AuthType {
     Ecr,
     /// Google Artifact Registry native auth (ADC).
     Gar,
-    /// Google Cloud artifact/container registry.
+    /// Google Container Registry native auth (ADC).
     Gcr,
     /// Azure Container Registry.
     Acr,
