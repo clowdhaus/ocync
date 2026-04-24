@@ -1,5 +1,7 @@
 //! Authentication providers and token management for OCI registries.
 
+/// Azure Container Registry authentication provider.
+pub mod acr;
 /// Anonymous token-exchange authentication.
 pub mod anonymous;
 /// HTTP Basic credential token-exchange authentication.

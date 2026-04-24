@@ -508,7 +508,7 @@ The schema is generated from the Rust config types and verified in CI to stay in
           ]
         },
         {
-          "description": "Azure Container Registry.",
+          "description": "Azure Container Registry native auth (AAD).",
           "type": "string",
           "enum": [
             "acr"

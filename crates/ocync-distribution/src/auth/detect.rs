@@ -399,6 +399,11 @@ mod tests {
     }
 
     #[test]
+    fn detect_acr_rejects_spoofed_suffix() {
+        assert_eq!(detect_provider_kind("myregistry.azurecr.io.evil.com"), None);
+    }
+
+    #[test]
     fn detect_empty_and_degenerate_inputs() {
         assert_eq!(detect_provider_kind(""), None);
         assert_eq!(detect_provider_kind("."), None);

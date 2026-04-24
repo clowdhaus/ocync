@@ -183,7 +183,7 @@ pub(crate) enum AuthType {
     Gar,
     /// Google Container Registry native auth (ADC).
     Gcr,
-    /// Azure Container Registry.
+    /// Azure Container Registry native auth (AAD).
     Acr,
     /// GitHub Container Registry (`GITHUB_TOKEN`).
     Ghcr,
