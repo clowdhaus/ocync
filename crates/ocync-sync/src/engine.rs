@@ -2156,11 +2156,18 @@ async fn transfer_single_blob(
     //
     // ECR requires the source repo to have a committed manifest for a mount
     // to return 201. When `blob_mount_source` returns an uncommitted leader
-    // repo (Tier 3), we wait for the leader's manifest to commit rather than
-    // sending a mount request that will be rejected with 202. This avoids
-    // wasted round-trips and the `remove_blob_repo` cascade that would
-    // permanently discard a valid mount source.
+    // repo (Tier 3), followers wait for the leader's manifest to commit
+    // rather than sending a mount request that will be rejected with 202.
+    // This avoids wasted round-trips and the `remove_blob_repo` cascade
+    // that would permanently discard a valid mount source.
+    //
+    // Leaders must NOT wait on other leaders' `repo_committed_watch` --
+    // this creates a circular dependency when two leaders share blobs and
+    // each waits for the other's manifest commit before its own blobs can
+    // finish. Leaders instead fall through to the direct mount attempt
+    // (which may get 202 on ECR, triggering HEAD+push fallback).
     let mut mount_attempted = false;
+    let is_leader = ctx.preferred_mount_sources.contains(ctx.target_repo);
     let mount_source: Option<RepositoryName> = {
         let (source, is_committed) = {
             let c = ctx.cache.borrow();
@@ -2183,8 +2190,11 @@ async fn transfer_single_blob(
             None => None,
             // Source has a committed manifest (Tier 1/2) -- mount immediately.
             Some(repo) if is_committed => Some(repo),
-            // Source is an uncommitted leader -- wait for manifest commit.
-            Some(repo) if ctx.preferred_mount_sources.contains(&repo) => {
+            // Source is an uncommitted leader and we are a follower -- wait
+            // for the leader's manifest commit. Leaders skip this branch to
+            // avoid circular waits (leader A waiting on leader B while B
+            // waits on A).
+            Some(repo) if !is_leader && ctx.preferred_mount_sources.contains(&repo) => {
                 debug!(
                     %digest,
                     %repo,
@@ -2223,9 +2233,10 @@ async fn transfer_single_blob(
                     None
                 }
             }
-            // Uncommitted non-leader (Tier 3 fallback) -- attempt mount
-            // directly. Non-ECR registries may fulfill mounts without a
-            // committed manifest.
+            // Uncommitted non-leader source, or we are a leader ourselves
+            // (Tier 3 fallback) -- attempt mount directly. Non-ECR registries
+            // may fulfill mounts without a committed manifest; on ECR the 202
+            // triggers HEAD+push fallback.
             Some(repo) => Some(repo),
         }
     };

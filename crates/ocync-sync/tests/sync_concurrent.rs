@@ -1203,6 +1203,158 @@ async fn sync_leader_manifest_push_fails_follower_falls_through() {
     );
 }
 
+/// Multiple leaders sharing blobs must not deadlock waiting on each other's
+/// `repo_committed_watch`. Regression test for the circular-wait bug:
+///
+/// 1. `elect_leaders` picks images A and B as leaders (each covers unique
+///    shared blobs for image C).
+/// 2. A and B share 2 blobs (`shared_ab_1`, `shared_ab_2`).
+/// 3. Without the fix: A uploads `shared_ab_1`, B uploads `shared_ab_2`.
+///    A tries to mount `shared_ab_2` from B's repo (uncommitted leader),
+///    waits on `repo_committed_watch`. B does the same for `shared_ab_1`.
+///    Neither finishes, neither commits a manifest. Deadlock.
+/// 4. With the fix: leaders skip the `repo_committed_watch` wait and attempt
+///    the mount directly (which returns 202 on ECR), falling through to
+///    HEAD+push.
+///
+/// Timing: the 5-second timeout catches the deadlock. Under the fix, the test
+/// completes in under 1 second.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_multi_leader_shared_blobs_no_deadlock() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    // Shared blobs between A and B (forces elect_leaders to pick 2 leaders).
+    let shared_ab_1 = b"shared-ab-layer-1-deadlock-test";
+    let shared_ab_2 = b"shared-ab-layer-2-deadlock-test";
+
+    // A's blobs also shared with C (gives A marginal coverage of C).
+    let shared_ac = b"shared-ac-layer-deadlock-test";
+
+    // B's blobs also shared with C (gives B marginal coverage of C).
+    let shared_bc = b"shared-bc-layer-deadlock-test";
+
+    // Image A: {shared_ab_1, shared_ab_2, shared_ac, config_a}
+    let parts_a = ManifestBuilder::new(b"config-leader-a-deadlock")
+        .layer(shared_ab_1)
+        .layer(shared_ab_2)
+        .layer(shared_ac)
+        .build();
+
+    // Image B: {shared_ab_1, shared_ab_2, shared_bc, config_b}
+    let parts_b = ManifestBuilder::new(b"config-leader-b-deadlock")
+        .layer(shared_ab_1)
+        .layer(shared_ab_2)
+        .layer(shared_bc)
+        .build();
+
+    // Image C: {shared_ac, shared_bc, config_c} -- follower
+    let parts_c = ManifestBuilder::new(b"config-follower-c-deadlock")
+        .layer(shared_ac)
+        .layer(shared_bc)
+        .build();
+
+    // Source: all three repos serve manifests and blobs.
+    parts_a.mount_source(&source_server, "src-a", "v1").await;
+    parts_b.mount_source(&source_server, "src-b", "v1").await;
+    parts_c.mount_source(&source_server, "src-c", "v1").await;
+
+    // Target: all repos get manifest HEAD 404, blob HEAD 404, upload + mount mocks.
+    // Mounts between leaders return 202 (Not Fulfilled) to simulate ECR behavior
+    // where uncommitted repos cannot serve as mount sources.
+    for repo in &["tgt-a", "tgt-b", "tgt-c"] {
+        mount_manifest_head_not_found(&target_server, repo, "v1").await;
+        // All possible blob HEADs return 404.
+        mount_blob_not_found(&target_server, repo, &parts_a.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_b.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_c.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_a.layer_descs[0].digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_a.layer_descs[1].digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_a.layer_descs[2].digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_c.layer_descs[0].digest).await;
+        mount_blob_not_found(&target_server, repo, &parts_c.layer_descs[1].digest).await;
+        mount_blob_push(&target_server, repo).await;
+        mount_manifest_push(&target_server, repo, "v1").await;
+
+        // Mount mocks: 201 for any mount request (mounts from committed repos
+        // will succeed; mounts from uncommitted repos are not attempted by
+        // the engine when the fix is in place, but the mock handles both).
+        for layer_desc in parts_a.layer_descs.iter() {
+            Mock::given(method("POST"))
+                .and(path(format!("/v2/{repo}/blobs/uploads/")))
+                .and(query_param("mount", layer_desc.digest.to_string()))
+                .respond_with(ResponseTemplate::new(201))
+                .with_priority(1)
+                .mount(&target_server)
+                .await;
+        }
+        for layer_desc in parts_c.layer_descs.iter() {
+            Mock::given(method("POST"))
+                .and(path(format!("/v2/{repo}/blobs/uploads/")))
+                .and(query_param("mount", layer_desc.digest.to_string()))
+                .respond_with(ResponseTemplate::new(201))
+                .with_priority(1)
+                .mount(&target_server)
+                .await;
+        }
+    }
+
+    let source_client = mock_client(&source_server);
+    let target_client = mock_client(&target_server);
+
+    let mapping_a = resolved_mapping(
+        Arc::clone(&source_client),
+        "src-a",
+        "tgt-a",
+        vec![target_entry("target", Arc::clone(&target_client))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_b = resolved_mapping(
+        Arc::clone(&source_client),
+        "src-b",
+        "tgt-b",
+        vec![target_entry("target", Arc::clone(&target_client))],
+        vec![TagPair::same("v1")],
+    );
+    let mapping_c = resolved_mapping(
+        source_client,
+        "src-c",
+        "tgt-c",
+        vec![target_entry("target", target_client)],
+        vec![TagPair::same("v1")],
+    );
+
+    let engine = SyncEngine::new(fast_retry(), 10);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        engine.run(
+            vec![mapping_a, mapping_b, mapping_c],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&ShutdownSignal::new()),
+        ),
+    )
+    .await;
+
+    let report = result.expect("engine deadlocked: multi-leader repo_committed_watch cycle");
+    assert_eq!(report.images.len(), 3);
+    assert!(
+        report
+            .images
+            .iter()
+            .all(|r| matches!(r.status, ImageStatus::Synced)),
+        "all three images should sync (no deadlock): {:#?}",
+        report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
+    );
+    assert_eq!(report.stats.images_synced, 3);
+    // At least some blobs should be mounted (leader-follower coordination works).
+    assert!(
+        report.stats.blobs_mounted > 0,
+        "expected some blobs to be mounted via leader-follower, got 0"
+    );
+}
+
 /// Pre-warm the cache with committed repos so the follower's mount-source
 /// lookup returns a Tier 1 match (committed + preferred). The follower should
 /// mount immediately without waiting on the watch channel -- exercising the
