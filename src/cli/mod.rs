@@ -214,7 +214,7 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Acr) => {
-            let auth = AcrAuth::new(bare_host, http)
+            let auth = AcrAuth::new(bare_host)
                 .await
                 .map_err(|e| CliError::Input(format!("ACR auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
@@ -262,7 +262,7 @@ pub(crate) async fn build_registry_client(
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Acr) => {
-                    let auth = AcrAuth::new(bare_host, http).await.map_err(|e| {
+                    let auth = AcrAuth::new(bare_host).await.map_err(|e| {
                         CliError::Input(format!("ACR auth setup for '{bare_host}': {e}"))
                     })?;
                     RegistryClient::builder(url).auth(auth)
