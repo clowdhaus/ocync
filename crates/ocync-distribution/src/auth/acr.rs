@@ -97,12 +97,18 @@ fn extract_jwt_exp(token: &str) -> Result<i64, Error> {
 ///
 /// Sovereign clouds use different AAD login endpoints and resource URIs.
 fn azure_cloud(registry_host: &str) -> (&'static str, &'static str) {
-    if registry_host.ends_with(".azurecr.cn") {
+    // Strip port if present -- bare_hostname() preserves ports
+    // (e.g. "myregistry.azurecr.cn:443") which would break the
+    // suffix match for sovereign clouds.
+    let host = registry_host
+        .rsplit_once(':')
+        .map_or(registry_host, |(h, _)| h);
+    if host.ends_with(".azurecr.cn") {
         (
             "login.chinacloudapi.cn",
             "https://containerregistry.azure.cn",
         )
-    } else if registry_host.ends_with(".azurecr.us") {
+    } else if host.ends_with(".azurecr.us") {
         (
             "login.microsoftonline.us",
             "https://containerregistry.azure.us",
@@ -150,25 +156,13 @@ struct CliTokenResponse {
 pub(crate) struct AadToken {
     access_token: String,
     /// Seconds since Unix epoch when this token expires.
-    #[allow(dead_code)] // read by Task 7 ACR refresh TTL tracking
+    ///
+    /// Set by the credential chain but not currently read -- the ACR
+    /// refresh/access token TTLs come from JWT `exp` claims on the ACR
+    /// tokens, not from the AAD token's expiry. Retained for future
+    /// AAD-level token caching.
+    #[allow(dead_code)]
     expires_on: i64,
-}
-
-impl AadToken {
-    /// Remaining TTL as a `Duration`, floored at zero.
-    #[allow(dead_code)] // called by Task 7 ACR refresh TTL tracking
-    fn ttl(&self) -> Duration {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("system clock before Unix epoch")
-            .as_secs() as i64;
-        let remaining = self.expires_on - now;
-        if remaining > 0 {
-            Duration::from_secs(remaining as u64)
-        } else {
-            Duration::ZERO
-        }
-    }
 }
 
 // --- Task 3: AzureTokenSource Trait ---
@@ -215,10 +209,15 @@ fn acr_exchange_http_client() -> reqwest::Client {
 /// status-code-only errors.
 fn truncate_body(body: &str) -> &str {
     if body.len() <= 200 {
-        body
-    } else {
-        &body[..200]
+        return body;
     }
+    // Find the last char boundary at or before byte 200 to avoid
+    // panicking on multi-byte UTF-8 sequences.
+    let mut end = 200;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
 }
 
 /// ACR refresh token response from `/oauth2/exchange`.
@@ -899,12 +898,39 @@ mod tests {
         assert_eq!(resource, "https://containerregistry.azure.us");
     }
 
+    #[test]
+    fn azure_cloud_strips_port_for_sovereign_match() {
+        let (authority, _) = azure_cloud("myregistry.azurecr.cn:443");
+        assert_eq!(authority, "login.chinacloudapi.cn");
+        let (authority, _) = azure_cloud("myregistry.azurecr.us:443");
+        assert_eq!(authority, "login.microsoftonline.us");
+    }
+
+    #[test]
+    fn truncate_body_short() {
+        assert_eq!(truncate_body("short"), "short");
+    }
+
+    #[test]
+    fn truncate_body_at_multibyte_boundary() {
+        // 198 ASCII chars + a 3-byte UTF-8 char (euro sign) = 201 bytes.
+        // Naive &body[..200] would slice mid-char and panic.
+        let body = format!("{}x{}", "a".repeat(197), '\u{20AC}');
+        assert_eq!(body.len(), 201);
+        let truncated = truncate_body(&body);
+        assert!(truncated.len() <= 200);
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
     // --- Task 3: Mock token source ---
 
     /// Mock Azure token source that returns pre-configured AAD tokens.
     #[derive(Debug)]
     struct MockAzureTokenSource {
         tokens: Mutex<VecDeque<AadToken>>,
+        /// Shared counter so tests can verify `invalidate()` calls
+        /// `api.reset()` even after the mock is moved into `AcrAuth`.
+        reset_count: std::sync::Arc<AtomicUsize>,
     }
 
     impl MockAzureTokenSource {
@@ -921,12 +947,14 @@ mod tests {
                 tokens: Mutex::new(VecDeque::from(
                     std::iter::repeat_n(token, 10).collect::<Vec<_>>(),
                 )),
+                reset_count: std::sync::Arc::new(AtomicUsize::new(0)),
             }
         }
 
         fn with_tokens(tokens: Vec<AadToken>) -> Self {
             Self {
                 tokens: Mutex::new(VecDeque::from(tokens)),
+                reset_count: std::sync::Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -946,6 +974,10 @@ mod tests {
                         reason: "mock: no more tokens".into(),
                     })
             })
+        }
+
+        fn reset(&self) {
+            self.reset_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1072,27 +1104,6 @@ mod tests {
         fake_jwt(&payload)
     }
 
-    fn mount_acr_exchange(
-        _server: &MockServer,
-        refresh_token: &str,
-        access_token: &str,
-    ) -> Vec<Mock> {
-        vec![
-            Mock::given(method("POST"))
-                .and(path("/oauth2/exchange"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"refresh_token": refresh_token})),
-                ),
-            Mock::given(method("POST"))
-                .and(path("/oauth2/token"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"access_token": access_token})),
-                ),
-        ]
-    }
-
     #[tokio::test]
     async fn auth_name() {
         let auth = AcrAuth::with_api(
@@ -1109,9 +1120,31 @@ mod tests {
         let server = MockServer::start().await;
         let refresh_jwt = fake_jwt_with_exp("", 10800);
         let access_jwt = fake_jwt_with_exp("", 4500);
-        for mock in mount_acr_exchange(&server, &refresh_jwt, &access_jwt) {
-            mock.mount(&server).await;
-        }
+
+        // Verify the AAD token flows through to the /oauth2/exchange body.
+        Mock::given(method("POST"))
+            .and(path("/oauth2/exchange"))
+            .and(body_string_contains("access_token=aad-tok"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"refresh_token": &refresh_jwt})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Verify the scope format flows through to the /oauth2/token body.
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .and(body_string_contains("scope=repository%3Amyrepo%3Apull"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": &access_jwt})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
         let auth = AcrAuth::with_api(
             &server.uri(),
             "myregistry.azurecr.io",
@@ -1255,14 +1288,24 @@ mod tests {
             )
             .mount(&server)
             .await;
+
+        let mock = MockAzureTokenSource::succeeding("aad-tok");
+        let reset_count = mock.reset_count.clone();
+
         let auth = AcrAuth::with_api(
             &server.uri(),
             "myregistry.azurecr.io",
             crate::test_http_client(),
-            MockAzureTokenSource::succeeding("aad-tok"),
+            mock,
         );
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(reset_count.load(Ordering::Relaxed), 0);
         auth.invalidate().await;
+        assert_eq!(
+            reset_count.load(Ordering::Relaxed),
+            1,
+            "invalidate() must call api.reset()"
+        );
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }
 
@@ -1307,7 +1350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credential_chain_skips_not_configured() {
+    async fn mock_source_returns_sequential_tokens() {
         let source = MockAzureTokenSource::succeeding("first-call");
         let token = source
             .get_token("https://containerregistry.azure.net")
@@ -1322,7 +1365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credential_chain_all_not_configured_error() {
+    async fn mock_source_empty_returns_error() {
         let source = MockAzureTokenSource::with_tokens(vec![]);
         let err = source
             .get_token("https://containerregistry.azure.net")
