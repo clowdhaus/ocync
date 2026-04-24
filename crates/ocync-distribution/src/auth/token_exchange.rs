@@ -53,17 +53,18 @@ impl ChallengeCache {
 /// The `Bearer` auth scheme prefix used in `WWW-Authenticate` challenges.
 const BEARER_SCHEME: &str = "bearer";
 
-/// Build a dedicated HTTP client for realm token requests.
+/// Build a no-redirect HTTP client for token-bearing requests.
 ///
 /// Uses `redirect::Policy::none()` to prevent open-redirect SSRF: a
-/// malicious realm URL that 302s to a cloud metadata endpoint would
-/// bypass [`validate_realm_url`] if the client followed it silently.
-fn realm_http_client() -> reqwest::Client {
+/// 307 redirect from a malicious endpoint would forward credentials
+/// (realm auth headers, ACR exchange form bodies) to the redirect
+/// target. Also used by [`super::acr::AcrAuth`] for exchange POSTs.
+pub(crate) fn no_redirect_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(concat!("ocync/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("realm HTTP client builder should not fail")
+        .expect("no-redirect HTTP client builder should not fail")
 }
 
 /// Shorthand for realm validation errors.
@@ -209,7 +210,7 @@ fn validate_ipv6(
 /// later by DNS).
 ///
 /// **Layer 3 -- no-redirect client:** enforced in [`exchange`] via
-/// [`realm_http_client`], not in this function.
+/// [`no_redirect_http_client`], not in this function.
 ///
 /// **Layer 4 -- domain binding:** the realm host must be the registry host,
 /// or share a parent domain with it (e.g. `auth.docker.io` and
@@ -288,7 +289,7 @@ fn validate_realm_url(realm: &reqwest::Url, registry_base: &reqwest::Url) -> Res
     }
 
     // Layer 3 (no-redirect client) is enforced in exchange() via
-    // realm_http_client() -- see redirect::Policy::none() and the explicit
+    // no_redirect_http_client() -- see redirect::Policy::none() and the explicit
     // redirect status check after send().
 
     // Layer 4: domain binding -- the realm host must be related to the
@@ -454,7 +455,7 @@ pub(crate) async fn exchange(
         }
     }
 
-    let mut request = realm_http_client().get(url);
+    let mut request = no_redirect_http_client().get(url);
     if let Some(creds) = credentials {
         request = request.header("Authorization", basic_header_value(creds));
     }
