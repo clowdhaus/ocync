@@ -420,7 +420,7 @@ async fn sync_cache_persist_and_load_round_trip() {
     let loaded = TransferStateCache::load(&cache_path, std::time::Duration::from_secs(3600));
 
     assert!(
-        loaded.blob_known_at_repo(
+        loaded.blob_present_at(
             "target-reg",
             &parts.config_desc.digest,
             &RepositoryName::new("repo").unwrap()
@@ -428,7 +428,7 @@ async fn sync_cache_persist_and_load_round_trip() {
         "config blob should be recorded as completed at repo"
     );
     assert!(
-        loaded.blob_known_at_repo(
+        loaded.blob_present_at(
             "target-reg",
             &parts.layer_descs[0].digest,
             &RepositoryName::new("repo").unwrap()
@@ -436,7 +436,7 @@ async fn sync_cache_persist_and_load_round_trip() {
         "layer blob should be recorded as completed at repo"
     );
     assert!(
-        !loaded.blob_known_at_repo(
+        !loaded.blob_present_at(
             "target-reg",
             &parts.config_desc.digest,
             &RepositoryName::new("other-repo").unwrap()
@@ -533,7 +533,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
     // Verify: stale mount source is gone, blobs are now recorded at "repo".
     let c = cache.borrow();
     assert!(
-        !c.blob_known_at_repo(
+        !c.blob_present_at(
             "target",
             &parts.config_desc.digest,
             &RepositoryName::new("stale-repo").unwrap()
@@ -541,7 +541,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         "stale cache entry for config at stale-repo should be invalidated"
     );
     assert!(
-        !c.blob_known_at_repo(
+        !c.blob_present_at(
             "target",
             &parts.layer_descs[0].digest,
             &RepositoryName::new("stale-repo").unwrap()
@@ -549,7 +549,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         "stale cache entry for layer at stale-repo should be invalidated"
     );
     assert!(
-        c.blob_known_at_repo(
+        c.blob_present_at(
             "target",
             &parts.config_desc.digest,
             &RepositoryName::new("repo").unwrap()
@@ -557,7 +557,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         "config blob should be recorded as completed at repo after fallback push"
     );
     assert!(
-        c.blob_known_at_repo(
+        c.blob_present_at(
             "target",
             &parts.layer_descs[0].digest,
             &RepositoryName::new("repo").unwrap()
@@ -1675,7 +1675,7 @@ async fn sync_batch_checker_with_prewarmed_cache() {
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
-        c.set_blob_exists(
+        c.set_blob_verified(
             "target",
             parts.config_desc.digest.clone(),
             RepositoryName::new("repo").unwrap(),

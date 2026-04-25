@@ -14,22 +14,21 @@
 //! [4 bytes: CRC32 of everything before this]
 //! ```
 //!
-//! Only [`BlobStatus::ExistsAtTarget`] and [`BlobStatus::Completed`] entries
-//! are written to disk; transient states are stripped before serialization.
+//! Only `Verified` and `Completed` entries are written to disk; transient
+//! states are stripped before serialization.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
-use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ocync_distribution::Digest;
 use ocync_distribution::spec::{PlatformFilter, RegistryAuthority, RepositoryName};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::plan::{BlobDedupMap, BlobStatus};
+use crate::plan::{BlobDedupMap, ClaimAction};
 
 /// Cache file format version. Bump on incompatible layout changes; mismatched
 /// versions are discarded and rebuilt from scratch on the next sync cycle.
@@ -117,9 +116,8 @@ type SourceSnapshotMap = HashMap<SnapshotKey, SourceSnapshot>;
 /// Persistent transfer state cache.
 ///
 /// Wraps [`BlobDedupMap`] and adds load/persist operations so that stable blob
-/// states survive across process restarts. Only [`BlobStatus::ExistsAtTarget`]
-/// and [`BlobStatus::Completed`] entries are persisted; transient states are
-/// dropped on write.
+/// states survive across process restarts. Only `Verified` and `Completed`
+/// entries are persisted; transient states are dropped on write.
 ///
 /// `load` never returns an error - a missing, corrupt, or expired file simply
 /// yields an empty cache, and the next sync run will repopulate it.
@@ -127,28 +125,13 @@ type SourceSnapshotMap = HashMap<SnapshotKey, SourceSnapshot>;
 pub struct TransferStateCache {
     dedup: BlobDedupMap,
     snapshots: SourceSnapshotMap,
-    /// Runtime-only: per-(target, digest) [`Notify`] used to wake waiters when
-    /// an in-progress blob upload completes or fails. Concurrent transfers of
-    /// the same blob from different source repos wait on this to avoid
-    /// redundant uploads - the winner pushes, losers mount from it.
-    ///
-    /// Lives outside `BlobDedupMap` so it's not part of the persisted cache
-    /// format. Not serialized; fresh each engine run.
-    /// Nested map avoids allocating `(String, Digest)` keys on the read path.
-    blob_notifies: HashMap<String, HashMap<Digest, Rc<Notify>>>,
     /// Runtime-only: tracks which (target, repo) pairs have had their manifests
-    /// committed (pushed successfully). Only repos with committed manifests are
-    /// valid mount sources on ECR, which requires a committed manifest in the
-    /// source repo for mount to succeed. Not serialized; fresh each engine run.
+    /// committed. Only repos here are eligible mount sources. Fresh each run.
     committed_repos: HashMap<String, HashSet<RepositoryName>>,
-    /// Runtime-only: per-(target, repo) [`watch`] channel that transitions
-    /// from `false` to `true` when a leader repo's manifest is committed.
-    /// Followers subscribe via [`repo_committed_watch`] and call
-    /// `wait_for(|&v| v).await`, which returns immediately if the leader
-    /// already committed -- no signal can be lost.
-    ///
-    /// Separated from [`blob_notifies`] because this synchronizes at the
-    /// manifest level, not the blob level. Not serialized; fresh each engine run.
+    /// Runtime-only: per-(target, repo) `watch` channel that transitions from
+    /// `false` to `true` when the repo's manifest commits or fails. Followers
+    /// subscribe via `repo_committed_watch` and call `wait_for(|&v| v).await`.
+    /// Fresh each run.
     repo_committed_watches: HashMap<String, HashMap<RepositoryName, watch::Sender<bool>>>,
 }
 
@@ -163,133 +146,125 @@ impl TransferStateCache {
         self.dedup.is_empty() && self.snapshots.is_empty()
     }
 
-    /// Get the current status for a blob at the given target.
-    pub fn blob_status(&self, target: &str, digest: &Digest) -> Option<&BlobStatus> {
-        self.dedup.status(target, digest)
+    /// Whether the blob is present (Verified or Completed) at the given (target, repo).
+    pub fn blob_present_at(&self, target: &str, digest: &Digest, repo: &RepositoryName) -> bool {
+        self.dedup.blob_present_at(target, digest, repo)
     }
 
-    /// Find a cross-repo mount source for a blob at a target.
-    ///
-    /// Priority order:
-    /// 1. Preferred repos (leaders) with committed manifests
-    /// 2. Any repo with a committed manifest
-    /// 3. Any repo that has the blob (intra-run mounts where the blob was
-    ///    just uploaded but the manifest is not yet committed)
-    ///
-    /// ECR requires a committed manifest for mount to return 201. Tier 3
-    /// mounts may get 202 (not fulfilled) on ECR, which the engine handles
-    /// by falling through to HEAD+push. This is acceptable because intra-run
-    /// mounts from a leader whose blobs are uploaded but manifest not yet
-    /// committed are rare (only during the brief window between blob upload
-    /// completion and manifest push).
-    pub fn blob_mount_source(
-        &self,
-        target: &str,
-        digest: &Digest,
-        current_repo: &RepositoryName,
-        preferred: &[RepositoryName],
-    ) -> Option<&RepositoryName> {
-        let info = self.dedup.known_repos(target, digest)?;
-
-        if let Some(committed) = self.committed_repos.get(target) {
-            // Tier 1: preferred repos with committed manifests.
-            for pref in preferred {
-                if pref != current_repo && info.contains(pref) && committed.contains(pref) {
-                    return info.get(pref);
-                }
-            }
-
-            // Tier 2: any committed repo.
-            if let Some(r) = info
-                .iter()
-                .find(|r| *r != current_repo && committed.contains(r))
-            {
-                return Some(r);
-            }
-        }
-
-        // Tier 3: any repo with the blob (intra-run fallback).
-        info.iter().find(|r| *r != current_repo)
-    }
-
-    /// Mark a blob as already existing at the target in the given repo.
-    pub fn set_blob_exists(&mut self, target: &str, digest: Digest, repo: RepositoryName) {
-        self.dedup.set_exists(target, &digest, &repo);
-    }
-
-    /// Mark a blob as in-progress at the target, uploaded by `repo`.
-    ///
-    /// Recording the uploading repo enables concurrent transfers of the same
-    /// blob to wait for completion and mount from `repo` via
-    /// [`blob_in_progress_uploader`] + [`blob_notify`].
-    pub fn set_blob_in_progress(&mut self, target: &str, digest: Digest, repo: RepositoryName) {
-        self.dedup.set_in_progress(target, &digest, &repo);
-    }
-
-    /// Return the [`Notify`] for a blob at a target, creating it if absent.
-    ///
-    /// Waiters call `notified().await` on the returned handle before dropping
-    /// the cache borrow; the uploading task calls [`notify_blob`] after
-    /// marking the blob completed or failed.
-    pub fn blob_notify(&mut self, target: &str, digest: &Digest) -> Rc<Notify> {
-        self.blob_notifies
-            .entry(target.to_owned())
-            .or_default()
-            .entry(digest.clone())
-            .or_insert_with(|| Rc::new(Notify::new()))
-            .clone()
-    }
-
-    /// Wake all waiters for a blob's transfer completion.
-    ///
-    /// Called by the uploading task after [`set_blob_completed`] or
-    /// [`set_blob_failed`] so concurrent transfers of the same blob can
-    /// proceed (either to mount from the completed repo or to retry).
-    pub fn notify_blob(&self, target: &str, digest: &Digest) {
-        if let Some(n) = self.blob_notifies.get(target).and_then(|m| m.get(digest)) {
-            n.notify_waiters();
-        }
-    }
-
-    /// Return the repository currently uploading `digest` at `target`, if any,
-    /// as long as it differs from `current_repo`. Used by concurrent transfers
-    /// to identify a mount source before initiating their own upload.
-    pub fn blob_in_progress_uploader<'a>(
+    /// The current cross-repo upload-claim holder for this digest, excluding
+    /// `current_repo`. Replaces `blob_in_progress_uploader`.
+    pub fn blob_claim_for<'a>(
         &'a self,
         target: &str,
         digest: &Digest,
         current_repo: &RepositoryName,
     ) -> Option<&'a RepositoryName> {
-        self.dedup
-            .in_progress_uploader(target, digest, current_repo)
+        self.dedup.claim_holder(target, digest, current_repo)
     }
 
-    /// Mark a blob as successfully transferred to the given repo at the target.
+    /// Atomic check-and-claim on the upload-coordination slot.
+    pub fn claim_blob_upload(
+        &mut self,
+        target: &str,
+        digest: &Digest,
+        current_repo: &RepositoryName,
+    ) -> ClaimAction {
+        self.dedup.claim_blob_upload(target, digest, current_repo)
+    }
+
+    /// Release the upload claim, waking waiters.
+    pub fn release_blob_claim(&mut self, target: &str, digest: &Digest) {
+        self.dedup.release_blob_claim(target, digest);
+    }
+
+    /// Mark `repo`'s state as a stale mount source (mount from this repo was
+    /// rejected). Excluded from future `committed_mount_sources` results.
+    pub fn mark_blob_repo_stale(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
+        self.dedup.mark_blob_repo_stale(target, digest, repo);
+    }
+
+    /// Set a repo's state to `Verified`.
+    pub fn set_blob_verified(&mut self, target: &str, digest: Digest, repo: RepositoryName) {
+        self.dedup.set_blob_verified(target, &digest, &repo);
+    }
+
+    /// Set a repo's state to `Completed`.
     pub fn set_blob_completed(&mut self, target: &str, digest: Digest, repo: RepositoryName) {
-        self.dedup.set_completed(target, &digest, &repo);
+        self.dedup.set_blob_completed(target, &digest, &repo);
     }
 
-    /// Mark a blob as failed at the target.
-    pub fn set_blob_failed(&mut self, target: &str, digest: Digest, error: String) {
-        self.dedup.set_failed(target, &digest, error);
+    /// Set a repo's state to `Failed` (this repo's own upload failed).
+    pub fn set_blob_failed(
+        &mut self,
+        target: &str,
+        digest: Digest,
+        repo: RepositoryName,
+        error: String,
+    ) {
+        self.dedup.set_blob_failed(target, &digest, &repo, error);
     }
 
-    /// Record that a repo has had its manifest committed (pushed successfully).
+    /// Iterator over committed mount sources for a blob, excluding `current_repo`.
+    /// Yields only repos with state in `{Verified, Completed}` AND a committed
+    /// manifest at `target`. Iteration is in `BTreeMap` order (deterministic).
+    pub fn committed_mount_sources<'a>(
+        &'a self,
+        target: &'a str,
+        digest: &'a Digest,
+        current_repo: &'a RepositoryName,
+    ) -> impl Iterator<Item = &'a RepositoryName> + 'a {
+        let committed = self.committed_repos.get(target);
+        self.dedup
+            .repos_iter(target, digest)
+            .filter(move |(r, state)| {
+                *r != current_repo
+                    && state.is_present()
+                    && committed.is_some_and(|set| set.contains(*r))
+            })
+            .map(|(r, _)| r)
+    }
+
+    /// `Watch::Receivers` for repos that:
+    ///   1. Have the blob with state in {Verified, Completed, Uploading} (NOT Failed)
+    ///   2. Have not yet had their `repo_committed_watch` fire
     ///
-    /// Only repos tracked here are eligible as cross-repo mount sources via
-    /// [`blob_mount_source`]. ECR requires a committed manifest in the source
-    /// repo for mount to succeed. Sends `true` on the watch channel so any
-    /// follower waiting via [`repo_committed_watch`] wakes immediately.
+    /// Used by the resolver to subscribe only to repos still able to become a
+    /// committed mount source.
+    pub fn unresolved_watches_for(
+        &mut self,
+        target: &str,
+        digest: &Digest,
+        current_repo: &RepositoryName,
+    ) -> Vec<watch::Receiver<bool>> {
+        let candidates: Vec<RepositoryName> = self
+            .dedup
+            .repos_iter(target, digest)
+            .filter(|(r, state)| *r != current_repo && state.is_active())
+            .map(|(r, _)| r.clone())
+            .collect();
+
+        let watches = self
+            .repo_committed_watches
+            .entry(target.to_owned())
+            .or_default();
+        candidates
+            .into_iter()
+            .filter_map(|repo| {
+                let tx = watches
+                    .entry(repo)
+                    .or_insert_with(|| watch::channel(false).0);
+                let rx = tx.subscribe();
+                if *rx.borrow() { None } else { Some(rx) }
+            })
+            .collect()
+    }
+
+    /// Record that a repo has had its manifest committed.
     pub fn mark_repo_committed(&mut self, target: &str, repo: &RepositoryName) {
         self.committed_repos
             .entry(target.to_owned())
             .or_default()
             .insert(repo.clone());
-        // Create the watch sender if absent, then store `true`.
-        // `send_replace` unconditionally updates the stored value even when
-        // no receivers exist yet -- `send()` would silently skip the update
-        // and return `Err` if the initial receiver was dropped. Late
-        // subscribers (via `subscribe()`) see the current value immediately.
         let tx = self
             .repo_committed_watches
             .entry(target.to_owned())
@@ -300,11 +275,6 @@ impl TransferStateCache {
     }
 
     /// Mark a repo's manifest commit as failed, unblocking followers.
-    ///
-    /// Creates the watch entry if absent and sends `true`, so even followers
-    /// that subscribe after the leader has already exited see the signal
-    /// immediately. Followers wake, re-check [`is_repo_committed`] (which
-    /// returns `false`), and fall through to HEAD+push.
     pub fn notify_repo_failed(&mut self, target: &str, repo: &RepositoryName) {
         let tx = self
             .repo_committed_watches
@@ -315,12 +285,7 @@ impl TransferStateCache {
         tx.send_replace(true);
     }
 
-    /// Return a [`watch::Receiver`] for a repo's manifest commit state.
-    ///
-    /// Followers call `wait_for(|&v| v).await` on the returned receiver.
-    /// If the leader already committed, the receiver sees `true` immediately.
-    /// If not, it blocks until the leader sends `true` via
-    /// [`mark_repo_committed`] or [`notify_repo_failed`].
+    /// Subscribe to a repo's manifest-commit watch.
     pub fn repo_committed_watch(
         &mut self,
         target: &str,
@@ -334,38 +299,24 @@ impl TransferStateCache {
             .subscribe()
     }
 
-    /// Check whether a repo has a committed manifest at the target.
+    /// Whether a repo is committed at the target.
     pub fn is_repo_committed(&self, target: &str, repo: &RepositoryName) -> bool {
         self.committed_repos
             .get(target)
-            .is_some_and(|repos| repos.contains(repo))
+            .is_some_and(|set| set.contains(repo))
     }
 
-    /// Check whether a blob is known to exist at a specific repo on the target.
-    ///
-    /// Returns `true` if the blob has been recorded (via `set_blob_exists` or
-    /// `set_blob_completed`) at the given `(target, repo)` pair. This is the
-    /// repo-scoped skip check: a blob known at `repo-a` is NOT accessible from
-    /// `repo-b` without a mount.
-    pub fn blob_known_at_repo(&self, target: &str, digest: &Digest, repo: &RepositoryName) -> bool {
-        self.dedup
-            .known_repos(target, digest)
-            .is_some_and(|repos| repos.contains(repo))
+    /// Drop runtime-only watch handles. Called between sync runs in long-lived
+    /// processes to prevent monotonic growth of the watch map.
+    pub fn clear_notifies(&mut self) {
+        if !self.repo_committed_watches.is_empty() {
+            let count: usize = self.repo_committed_watches.values().map(|m| m.len()).sum();
+            tracing::debug!(count, "clearing stale repo-committed watch handles");
+            self.repo_committed_watches.clear();
+        }
     }
 
-    /// Remove a specific repo from a blob's known repos set at the target.
-    ///
-    /// Used after a failed mount to discard the stale mount source without
-    /// removing the entire blob entry. The blob remains `InProgress` so
-    /// concurrent waiters do not re-claim and start duplicate pushes.
-    pub fn remove_blob_repo(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
-        self.dedup.remove_repo(target, digest, repo);
-    }
-
-    /// Remove the entry for the given blob at the target.
-    ///
-    /// Use this for lazy invalidation when a mount or push fails so the next
-    /// sync re-evaluates the blob rather than trusting stale cached state.
+    /// Lazy invalidation: drop the entire entry for the blob.
     pub fn invalidate_blob(&mut self, target: &str, digest: &Digest) {
         self.dedup.invalidate(target, digest);
     }
@@ -390,7 +341,7 @@ impl TransferStateCache {
 
     /// Remove dedup entries for targets no longer in the active configuration.
     ///
-    /// The dedup map accumulates `ExistsAtTarget`/`Completed` entries for every
+    /// The dedup map accumulates `Verified`/`Completed` entries for every
     /// (target, digest) pair observed. When targets are removed from config,
     /// their entries become stale and grow unboundedly across runs. Call after
     /// each sync cycle with the set of currently-configured target names.
@@ -401,30 +352,10 @@ impl TransferStateCache {
         }
     }
 
-    /// Drop all in-flight notify handles (blob and repo-committed).
-    ///
-    /// [`Notify`] entries are only needed during active coordination
-    /// within a single sync run. Once the run completes, all pending
-    /// transfers have resolved and the handles are stale. Call this at the
-    /// end of each sync run to prevent monotonic growth across repeated
-    /// runs in a long-lived process.
-    pub fn clear_notifies(&mut self) {
-        if !self.blob_notifies.is_empty() {
-            let count: usize = self.blob_notifies.values().map(|m| m.len()).sum();
-            tracing::debug!(count, "clearing stale blob notify handles");
-            self.blob_notifies.clear();
-        }
-        if !self.repo_committed_watches.is_empty() {
-            let count: usize = self.repo_committed_watches.values().map(|m| m.len()).sum();
-            tracing::debug!(count, "clearing stale repo-committed watch handles");
-            self.repo_committed_watches.clear();
-        }
-    }
-
     /// Atomically write the cache to `path`.
     ///
-    /// Only [`BlobStatus::ExistsAtTarget`] and [`BlobStatus::Completed`]
-    /// entries are written. The write sequence is:
+    /// Only `Verified` and `Completed` entries are written. The write sequence
+    /// is:
     /// 1. Serialize to a temporary file (`{path}.tmp.{pid}`)
     /// 2. fsync the temporary file
     /// 3. Rename to `path` (atomic on POSIX)
@@ -551,7 +482,6 @@ impl TransferStateCache {
         Ok(Self {
             dedup,
             snapshots,
-            blob_notifies: HashMap::new(),
             committed_repos: HashMap::new(),
             repo_committed_watches: HashMap::new(),
         })
@@ -612,6 +542,8 @@ fn build_cache_bytes(
 mod tests {
     use super::*;
 
+    use crate::plan::{ClaimAction, RepoBlobState};
+
     const TEST_DIGEST: &str =
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -635,107 +567,117 @@ mod tests {
     }
 
     #[test]
-    fn set_and_read_status() {
+    fn committed_mount_sources_excludes_uncommitted_repos() {
         let mut cache = TransferStateCache::new();
-        cache.set_blob_exists("reg.io", digest(), repo("repo/a"));
-        assert_eq!(
-            cache.blob_status("reg.io", &digest()),
-            Some(&BlobStatus::ExistsAtTarget)
-        );
-        assert!(!cache.is_empty());
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+
+        let sources: Vec<_> = cache
+            .committed_mount_sources("reg.io", &digest(), &repo("repo/b"))
+            .cloned()
+            .collect();
+        assert!(sources.is_empty(), "uncommitted repo must be excluded");
     }
 
     #[test]
-    fn mount_source_prefers_committed_repo() {
+    fn committed_mount_sources_yields_repo_after_mark_committed() {
         let mut cache = TransferStateCache::new();
         cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
-        cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
-
-        // Without committed repos, tier 3 returns alphabetically first.
-        assert_eq!(
-            cache.blob_mount_source("reg.io", &digest(), &repo("repo/b"), &[]),
-            Some(&repo("repo/a")),
-        );
-
-        // After committing repo/a, tier 2 returns it (same result, higher confidence).
         cache.mark_repo_committed("reg.io", &repo("repo/a"));
-        assert_eq!(
-            cache.blob_mount_source("reg.io", &digest(), &repo("repo/b"), &[]),
-            Some(&repo("repo/a")),
-        );
+
+        let sources: Vec<_> = cache
+            .committed_mount_sources("reg.io", &digest(), &repo("repo/b"))
+            .cloned()
+            .collect();
+        assert_eq!(sources, vec![repo("repo/a")]);
     }
 
     #[test]
-    fn mount_source_prefers_committed_over_uncommitted() {
-        let mut cache = TransferStateCache::new();
-        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
-        cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
-        cache.set_blob_completed("reg.io", digest(), repo("repo/c"));
-
-        // repo/a is preferred but not committed; repo/b is committed.
-        // Tier 1 skips repo/a (not committed). Tier 2 returns repo/b.
-        cache.mark_repo_committed("reg.io", &repo("repo/b"));
-
-        let preferred = [repo("repo/a")];
-        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/c"), &preferred);
-        assert_eq!(source, Some(&repo("repo/b")));
-    }
-
-    #[test]
-    fn mount_source_returns_none_when_only_self() {
-        let mut cache = TransferStateCache::new();
-        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
-
-        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/a"), &[]);
-        assert!(source.is_none(), "should not mount from self");
-    }
-
-    #[test]
-    fn mount_source_deterministic_ordering() {
-        let mut cache = TransferStateCache::new();
-
-        // Insert in non-alphabetical order.
-        cache.set_blob_completed("reg.io", digest(), repo("repo/redis"));
-        cache.set_blob_completed("reg.io", digest(), repo("repo/nginx"));
-        cache.set_blob_completed("reg.io", digest(), repo("repo/alpine"));
-
-        // BTreeSet iterates alphabetically: alpine, nginx, redis.
-        // Tier 3 (no committed repos) returns the first non-self candidate.
-        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/redis"), &[]);
-        assert_eq!(source, Some(&repo("repo/alpine")));
-
-        // When self is the alphabetically first, returns the next.
-        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/alpine"), &[]);
-        assert_eq!(source, Some(&repo("repo/nginx")));
-    }
-
-    #[test]
-    fn mount_source_preferred_is_self_falls_to_next() {
-        let mut cache = TransferStateCache::new();
-        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
-        cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
-        cache.set_blob_completed("reg.io", digest(), repo("repo/c"));
-        cache.mark_repo_committed("reg.io", &repo("repo/a"));
-        cache.mark_repo_committed("reg.io", &repo("repo/b"));
-
-        // Preferred repo IS target_repo -- tier 1 skips it, falls to next preferred.
-        let preferred = [repo("repo/a"), repo("repo/b")];
-        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/a"), &preferred);
-        assert_eq!(source, Some(&repo("repo/b")));
-    }
-
-    #[test]
-    fn mount_source_preferred_not_in_set_falls_back() {
+    fn committed_mount_sources_excludes_failed_repos() {
         let mut cache = TransferStateCache::new();
         cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
         cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
         cache.mark_repo_committed("reg.io", &repo("repo/a"));
+        cache.mark_repo_committed("reg.io", &repo("repo/b"));
 
-        // Preferred repo is not known to have the blob -- tier 1 skips it,
-        // tier 2 returns repo/a (committed).
-        let preferred = [repo("repo/unknown")];
-        let source = cache.blob_mount_source("reg.io", &digest(), &repo("repo/b"), &preferred);
-        assert_eq!(source, Some(&repo("repo/a")));
+        cache.mark_blob_repo_stale("reg.io", &digest(), &repo("repo/b"));
+
+        let sources: Vec<_> = cache
+            .committed_mount_sources("reg.io", &digest(), &repo("repo/c"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            sources,
+            vec![repo("repo/a")],
+            "failed mount-source must be excluded",
+        );
+    }
+
+    #[test]
+    fn committed_mount_sources_excludes_self() {
+        let mut cache = TransferStateCache::new();
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+
+        let sources: Vec<_> = cache
+            .committed_mount_sources("reg.io", &digest(), &repo("repo/a"))
+            .cloned()
+            .collect();
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn unresolved_watches_for_excludes_already_fired_watches() {
+        let mut cache = TransferStateCache::new();
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
+
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+
+        let receivers = cache.unresolved_watches_for("reg.io", &digest(), &repo("repo/c"));
+        assert_eq!(receivers.len(), 1);
+    }
+
+    #[test]
+    fn unresolved_watches_for_excludes_failed_repos() {
+        let mut cache = TransferStateCache::new();
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+        cache.set_blob_completed("reg.io", digest(), repo("repo/b"));
+        cache.mark_blob_repo_stale("reg.io", &digest(), &repo("repo/b"));
+
+        let receivers = cache.unresolved_watches_for("reg.io", &digest(), &repo("repo/c"));
+        assert_eq!(receivers.len(), 1);
+    }
+
+    #[test]
+    fn claim_blob_upload_returns_wait_when_held() {
+        let mut cache = TransferStateCache::new();
+        match cache.claim_blob_upload("reg.io", &digest(), &repo("x")) {
+            ClaimAction::Claimed => {}
+            _ => panic!(),
+        }
+        match cache.claim_blob_upload("reg.io", &digest(), &repo("y")) {
+            ClaimAction::Wait { holder, notify: _ } => {
+                assert_eq!(holder, repo("x"));
+            }
+            _ => panic!("y should be told to wait"),
+        }
+    }
+
+    #[test]
+    fn blob_present_at_returns_true_for_verified_and_completed_only() {
+        let mut cache = TransferStateCache::new();
+        cache.set_blob_verified("reg.io", digest(), repo("a"));
+        cache.set_blob_completed("reg.io", digest(), repo("b"));
+        match cache.claim_blob_upload("reg.io", &digest(), &repo("c")) {
+            ClaimAction::Claimed => {}
+            _ => panic!(),
+        }
+        cache.set_blob_failed("reg.io", digest(), repo("d"), "oops".into());
+
+        assert!(cache.blob_present_at("reg.io", &digest(), &repo("a")));
+        assert!(cache.blob_present_at("reg.io", &digest(), &repo("b")));
+        assert!(!cache.blob_present_at("reg.io", &digest(), &repo("c")));
+        assert!(!cache.blob_present_at("reg.io", &digest(), &repo("d")));
     }
 
     #[test]
@@ -746,189 +688,51 @@ mod tests {
         cache.mark_repo_committed("reg.io", &repo("repo/a"));
         assert!(cache.is_repo_committed("reg.io", &repo("repo/a")));
         assert!(!cache.is_repo_committed("reg.io", &repo("repo/b")));
-        assert!(!cache.is_repo_committed("other.io", &repo("repo/a")));
-    }
-
-    #[test]
-    fn repo_committed_watch_sees_commit() {
-        let mut cache = TransferStateCache::new();
-        let rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-
-        // Before commit, repo is not committed and watch value is false.
-        assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
-        assert!(!*rx.borrow());
-
-        // mark_repo_committed sets flag and sends true on watch.
-        cache.mark_repo_committed("reg.io", &repo("repo/a"));
-        assert!(cache.is_repo_committed("reg.io", &repo("repo/a")));
-        assert!(*rx.borrow());
     }
 
     #[test]
     fn repo_committed_watch_late_subscriber_sees_true() {
         let mut cache = TransferStateCache::new();
-
-        // Leader commits BEFORE any follower subscribes.
         cache.mark_repo_committed("reg.io", &repo("repo/a"));
-
-        // Late subscriber immediately sees true -- no lost signal.
         let rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
         assert!(*rx.borrow());
     }
 
-    #[test]
-    fn notify_repo_failed_unblocks_without_marking() {
-        let mut cache = TransferStateCache::new();
-        let rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-
-        // notify_repo_failed sends true to unblock waiters.
-        cache.notify_repo_failed("reg.io", &repo("repo/a"));
-        // Watch sees true (unblocked), but repo is NOT committed.
-        assert!(*rx.borrow());
-        assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
-    }
-
-    #[test]
-    fn notify_repo_failed_no_watch_creates_entry() {
-        let mut cache = TransferStateCache::new();
-        // No watch registered -- must not panic, and must create entry.
-        cache.notify_repo_failed("reg.io", &repo("repo/a"));
-        assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
-    }
-
-    #[test]
-    fn clear_notifies_includes_repo_committed_watches() {
-        let mut cache = TransferStateCache::new();
-        let _blob = cache.blob_notify("reg.io", &digest());
-        let _rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-        cache.clear_notifies();
-        assert!(cache.blob_notifies.is_empty());
-        assert!(cache.repo_committed_watches.is_empty());
-    }
-
-    // -- async watch channel tests -----------------------------------------
-    //
-    // These exercise the actual `wait_for(|&v| v).await` path that the engine
-    // uses, catching bugs that sync `borrow()` checks cannot (e.g. `send()`
-    // vs `send_replace()` with no receivers, sender-drop-while-waiting).
-
-    /// `wait_for` returns immediately when the leader has already committed
-    /// before any follower subscribes (the "fire-before-subscribe" path).
     #[tokio::test(flavor = "current_thread")]
     async fn repo_committed_wait_for_returns_on_late_subscribe() {
         let mut cache = TransferStateCache::new();
-
-        // Leader commits before any follower exists.
         cache.mark_repo_committed("reg.io", &repo("repo/a"));
 
-        // Late subscriber's wait_for must return Ok immediately.
         let mut rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
         let result = rx.wait_for(|&v| v).await;
-        assert!(
-            result.is_ok(),
-            "late subscriber should see true immediately"
-        );
+        assert!(result.is_ok());
     }
 
-    /// `wait_for` returns immediately when `notify_repo_failed` fires before
-    /// any follower subscribes -- the true fire-before-subscribe path where
-    /// no watch entry exists yet.
     #[tokio::test(flavor = "current_thread")]
     async fn repo_failed_wait_for_returns_on_late_subscribe() {
         let mut cache = TransferStateCache::new();
-
-        // Leader fails before ANY follower has called repo_committed_watch.
-        // notify_repo_failed must create the entry and store `true`.
         cache.notify_repo_failed("reg.io", &repo("repo/a"));
 
-        // Late subscriber should see true (unblocked) immediately.
         let mut rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
         let result = rx.wait_for(|&v| v).await;
-        assert!(result.is_ok(), "late subscriber should unblock on failure");
-        // But the repo is NOT committed.
+        assert!(result.is_ok());
         assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
-    }
-
-    /// Multiple concurrent receivers all wake when the leader commits.
-    #[tokio::test(flavor = "current_thread")]
-    async fn repo_committed_multiple_receivers_all_wake() {
-        let mut cache = TransferStateCache::new();
-
-        // Three followers subscribe before the leader commits.
-        let mut rx1 = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-        let mut rx2 = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-        let mut rx3 = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-
-        // Spawn all three waiters concurrently.
-        let (r1, r2, r3) = tokio::join!(rx1.wait_for(|&v| v), rx2.wait_for(|&v| v), async {
-            // Commit while the first two are waiting.
-            cache.mark_repo_committed("reg.io", &repo("repo/a"));
-            rx3.wait_for(|&v| v).await
-        },);
-
-        assert!(r1.is_ok(), "receiver 1 should wake");
-        assert!(r2.is_ok(), "receiver 2 should wake");
-        assert!(r3.is_ok(), "receiver 3 should wake");
-    }
-
-    /// Dropping the sender (via `clear_notifies`) unblocks a waiting receiver
-    /// with `Err` rather than deadlocking.
-    #[tokio::test(flavor = "current_thread")]
-    async fn repo_committed_sender_drop_unblocks_receiver() {
-        let mut cache = TransferStateCache::new();
-        let mut rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-
-        // Drop the sender by clearing all notifies.
-        cache.clear_notifies();
-
-        // wait_for should return Err (channel closed), not hang.
-        let result = rx.wait_for(|&v| v).await;
-        assert!(
-            result.is_err(),
-            "sender drop should yield Err, not deadlock"
-        );
-    }
-
-    /// Two independent repos have independent watch channels -- committing one
-    /// does not unblock a waiter on the other.
-    #[tokio::test(flavor = "current_thread")]
-    async fn repo_committed_watches_are_independent() {
-        let mut cache = TransferStateCache::new();
-
-        let rx_a = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-        let rx_b = cache.repo_committed_watch("reg.io", &repo("repo/b"));
-
-        // Commit only repo/a.
-        cache.mark_repo_committed("reg.io", &repo("repo/a"));
-
-        assert!(*rx_a.borrow(), "repo/a should be signaled");
-        assert!(!*rx_b.borrow(), "repo/b should NOT be signaled");
-    }
-
-    #[test]
-    fn blob_known_at_repo_checks_specific_repo() {
-        let mut cache = TransferStateCache::new();
-        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
-        assert!(cache.blob_known_at_repo("reg.io", &digest(), &repo("repo/a")));
-        assert!(!cache.blob_known_at_repo("reg.io", &digest(), &repo("repo/b")));
-        assert!(!cache.blob_known_at_repo("other.io", &digest(), &repo("repo/a")));
     }
 
     #[test]
     fn invalidate_removes_entry() {
         let mut cache = TransferStateCache::new();
-        cache.set_blob_exists("reg.io", digest(), repo("repo/a"));
+        cache.set_blob_verified("reg.io", digest(), repo("repo/a"));
         cache.invalidate_blob("reg.io", &digest());
-        assert_eq!(cache.blob_status("reg.io", &digest()), None);
+        assert!(!cache.blob_present_at("reg.io", &digest(), &repo("repo/a")));
     }
 
     #[test]
     fn build_cache_bytes_roundtrip() {
-        let mut dedup = BlobDedupMap::new();
-        dedup.set_completed("reg.io", &digest(), &repo("repo/a"));
+        let mut dedup = BlobDedupMap::default();
+        dedup.set_blob_completed("reg.io", &digest(), &repo("repo/a"));
         let snapshots = SourceSnapshotMap::default();
         let bytes = build_cache_bytes(&dedup, &snapshots).unwrap();
-        // Verify CRC covers the entire payload
         let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);
         let stored = u32::from_le_bytes(crc_bytes.try_into().unwrap());
         assert_eq!(stored, crc32fast::hash(payload));
@@ -937,17 +741,23 @@ mod tests {
     #[test]
     fn filter_persistable_excludes_transient() {
         let mut cache = TransferStateCache::new();
-        cache.set_blob_exists("reg.io", digest(), repo("repo/a"));
-        cache.set_blob_in_progress("reg.io", digest2(), repo("repo/a"));
-        cache.set_blob_failed("reg.io", digest2(), "oops".into());
+        cache.set_blob_verified("reg.io", digest(), repo("repo/a"));
+        match cache.claim_blob_upload("reg.io", &digest2(), &repo("repo/a")) {
+            ClaimAction::Claimed => {}
+            _ => panic!(),
+        }
+        cache.set_blob_failed("reg.io", digest2(), repo("repo/a"), "oops".into());
 
-        // Only ExistsAtTarget should survive
         let filtered = cache.dedup.filter_persistable();
         assert_eq!(
-            filtered.status("reg.io", &digest()),
-            Some(&BlobStatus::ExistsAtTarget)
+            filtered.repo_state("reg.io", &digest(), &repo("repo/a")),
+            Some(&RepoBlobState::Verified),
         );
-        assert_eq!(filtered.status("reg.io", &digest2()), None);
+        assert!(
+            filtered
+                .repo_state("reg.io", &digest2(), &repo("repo/a"))
+                .is_none()
+        );
     }
 
     #[test]
