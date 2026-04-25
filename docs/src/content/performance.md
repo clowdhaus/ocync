@@ -8,19 +8,20 @@ order: 6
 
 <!-- Auto-updated by `cargo xtask bench`; shows first scenario (cold sync) only. -->
 <!-- BENCH:START -->
-Measured on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps) in us-east-2. Full corpus: 39 images, 51 tags across quay.io, Docker Hub, cgr.dev, public ECR. Cold sync to ECR. Source registry CDNs are pre-warmed before each tool runs to ensure fair comparison. All traffic routed through bench-proxy for byte-accurate measurement. ocync numbers from 2026-04-24; dregsy and regsync from 2026-04-22 (last 3-tool run).
+Measured 2026-04-25 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 39 images, 51 tags. Cold sync to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement.
 
-| Metric | `ocync` | `dregsy` | `regsync` |
+| Metric | ocync | dregsy | regsync |
 |---|---:|---:|---:|
-| Wall clock | **3m 9s** | 18m 47s | 15m 45s |
-| Peak RSS | 81.0 MB | 397.3 MB | **28.3 MB** |
-| Requests | **7,415** | 11,299 | 9,532 |
+| Wall clock | **4m 6s** | 21m 12s | 12m 45s |
+| Peak RSS | 85.1 MB | 371.9 MB | **28.3 MB** |
+| Requests | **7408** | 11303 | 9532 |
 | Response bytes | 55.4 GB | **55.3 GB** | 65.3 GB |
-| Source blob GETs | 1,451 | **1,371** | 1,695 |
+| Source blob GETs | 1451 | **1371** | 1695 |
 | Source blob bytes | 55.4 GB | **55.3 GB** | 65.3 GB |
-| Mounts (success/attempt) | 423/446 | **325/325** | 0/0 |
+| Mounts (success/attempt) | **414/421** | 326/326 | 0/0 |
 | Duplicate blob GETs | **0** | **0** | **0** |
-| Rate-limit 429s | **0** | **0** | **0** |
+| CDN hits/misses | **1004/52** | 280/696 | 963/25 |
+| Rate-limit 429s | 5 | **0** | **0** |
 <!-- BENCH:END -->
 
 ## How tools compare
@@ -58,18 +59,19 @@ Measured on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps) in us-east-2.
 ### Warm sync efficiency
 
 <!-- BENCH-WARM:START -->
-Measured on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, up to 50 Gbps) in us-east-2. Full corpus: 39 images, 51 tags. Warm sync (no changes) to ECR. All traffic routed through bench-proxy for byte-accurate measurement. ocync numbers from 2026-04-24; dregsy and regsync from 2026-04-22 (last 3-tool run).
+Measured 2026-04-25 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 39 images, 51 tags. Warm sync (no changes) to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement.
 
-| Metric | `ocync` | `dregsy` | `regsync` |
+| Metric | ocync | dregsy | regsync |
 |---|---:|---:|---:|
-| Wall clock | **1s** | 1m 40s | 12s |
-| Peak RSS | **18.2 MB** | 34.2 MB | 21.1 MB |
-| Requests | 147 | 3,145 | **170** |
-| Response bytes | 135.1 KB | 1.9 MB | **124.5 KB** |
+| Wall clock | **1s** | 1m 37s | 12s |
+| Peak RSS | **18.8 MB** | 34.3 MB | 20.8 MB |
+| Requests | **147** | 3145 | 169 |
+| Response bytes | 135.1 KB | 1.9 MB | **120.4 KB** |
 | Source blob GETs | **0** | 227 | **0** |
-| Source blob bytes | **125.7 KB** | 1.9 MB | 120.4 KB |
+| Source blob bytes | 125.7 KB | 1.9 MB | **120.4 KB** |
 | Mounts (success/attempt) | **0/0** | **0/0** | **0/0** |
 | Duplicate blob GETs | **0** | **0** | **0** |
+| CDN hits/misses | 0/0 | **165/0** | 0/0 |
 | Rate-limit 429s | **0** | **0** | **0** |
 <!-- BENCH-WARM:END -->
 
