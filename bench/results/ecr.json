@@ -1251,5 +1251,372 @@
         ]
       }
     ]
+  },
+  {
+    "timestamp": "2026-04-25-195157",
+    "git_ref": "53ca400",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 231.161348534,
+            "peak_rss_kb": 80984,
+            "requests": 7364,
+            "rate_limit_429s": 4,
+            "response_bytes": 55405358481,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 463,
+            "mount_successes": 459,
+            "source_blob_gets": 1451,
+            "source_blob_bytes": 55405107554,
+            "cdn_hits": 1033,
+            "cdn_misses": 23,
+            "status_429_by_action": {
+              "ManifestWrite": 4
+            },
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1033,
+            "blob_cdn_misses": 23,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "phase_timing_ms": {
+              "discovery_complete": 4749,
+              "discovery_start": 0,
+              "execution_complete": 231036
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 1.433204066,
+            "peak_rss_kb": 18076,
+            "requests": 147,
+            "rate_limit_429s": 0,
+            "response_bytes": 135139,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 125722,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "phase_timing_ms": {
+              "discovery_complete": 1387,
+              "discovery_start": 0,
+              "execution_complete": 1387
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-25-201005",
+    "git_ref": "53ca400",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 204.143569933,
+            "peak_rss_kb": 81448,
+            "requests": 7423,
+            "rate_limit_429s": 0,
+            "response_bytes": 57322197874,
+            "duplicate_blob_gets": 1,
+            "mount_attempts": 398,
+            "mount_successes": 396,
+            "source_blob_gets": 1452,
+            "source_blob_bytes": 57321947211,
+            "cdn_hits": 1056,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1056,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "phase_timing_ms": {
+              "discovery_complete": 2613,
+              "discovery_start": 0,
+              "execution_complete": 204021
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 1.451178337,
+            "peak_rss_kb": 18132,
+            "requests": 147,
+            "rate_limit_429s": 0,
+            "response_bytes": 135140,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 125723,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "phase_timing_ms": {
+              "discovery_complete": 1415,
+              "discovery_start": 0,
+              "execution_complete": 1415
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-25-214442",
+    "git_ref": "5b086d6",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "shuffle_seed": 5766421381091724967,
+        "tool_order": [
+          "dregsy",
+          "ocync",
+          "regsync"
+        ],
+        "tools": [
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-25T21:43:16Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 1272.886356196,
+            "peak_rss_kb": 363136,
+            "requests": 11303,
+            "rate_limit_429s": 0,
+            "response_bytes": 55287986476,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 326,
+            "mount_successes": 326,
+            "source_blob_gets": 1371,
+            "source_blob_bytes": 55287946578,
+            "cdn_hits": 280,
+            "cdn_misses": 696,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 280,
+            "blob_cdn_misses": 696,
+            "auth_v2_pings": 102,
+            "auth_token_requests": 54
+          },
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 246.809184584,
+            "peak_rss_kb": 83076,
+            "requests": 7408,
+            "rate_limit_429s": 5,
+            "response_bytes": 55405358524,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 421,
+            "mount_successes": 414,
+            "source_blob_gets": 1451,
+            "source_blob_bytes": 55405107531,
+            "cdn_hits": 1004,
+            "cdn_misses": 52,
+            "status_429_by_action": {
+              "BlobUploadInit": 5
+            },
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1004,
+            "blob_cdn_misses": 52,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "phase_timing_ms": {
+              "discovery_complete": 2547,
+              "discovery_start": 0,
+              "execution_complete": 246683
+            }
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 765.109647566,
+            "peak_rss_kb": 27676,
+            "requests": 9532,
+            "rate_limit_429s": 0,
+            "response_bytes": 65269804401,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 1695,
+            "source_blob_bytes": 65269794901,
+            "cdn_hits": 963,
+            "cdn_misses": 25,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 963,
+            "blob_cdn_misses": 25,
+            "auth_v2_pings": 0,
+            "auth_token_requests": 35
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "shuffle_seed": 5766421381091724967,
+        "tool_order": [
+          "dregsy",
+          "ocync",
+          "regsync"
+        ],
+        "tools": [
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-25T21:43:16Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 97.345743231,
+            "peak_rss_kb": 33456,
+            "requests": 3145,
+            "rate_limit_429s": 0,
+            "response_bytes": 1925769,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 227,
+            "source_blob_bytes": 1891207,
+            "cdn_hits": 165,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 165,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 102,
+            "auth_token_requests": 51
+          },
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 1.352586136,
+            "peak_rss_kb": 18380,
+            "requests": 147,
+            "rate_limit_429s": 0,
+            "response_bytes": 135140,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 125723,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "phase_timing_ms": {
+              "discovery_complete": 1312,
+              "discovery_start": 0,
+              "execution_complete": 1312
+            }
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 12.461308371,
+            "peak_rss_kb": 20344,
+            "requests": 169,
+            "rate_limit_429s": 0,
+            "response_bytes": 120355,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 120355,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 0,
+            "auth_token_requests": 33
+          }
+        ]
+      }
+    ]
   }
 ]
