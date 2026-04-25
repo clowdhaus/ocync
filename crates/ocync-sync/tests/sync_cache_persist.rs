@@ -10,7 +10,6 @@ use ocync_distribution::Digest;
 use ocync_distribution::spec::RegistryAuthority;
 use ocync_distribution::spec::RepositoryName;
 use ocync_sync::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
-use ocync_sync::plan::BlobStatus;
 
 const DIGEST_A: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const DIGEST_B: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -62,14 +61,14 @@ fn round_trip_exists_at_target() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_exists("reg.io", digest_a(), repo("repo/alpine"));
+    cache.set_blob_verified("reg.io", digest_a(), repo("repo/alpine"));
 
     cache.persist(&path).unwrap();
 
     let loaded = TransferStateCache::load(&path, long_ttl());
-    assert_eq!(
-        loaded.blob_status("reg.io", &digest_a()),
-        Some(&BlobStatus::ExistsAtTarget)
+    assert!(
+        loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/alpine")),
+        "verified blob should survive round-trip"
     );
 }
 
@@ -84,9 +83,9 @@ fn round_trip_completed() {
     cache.persist(&path).unwrap();
 
     let loaded = TransferStateCache::load(&path, long_ttl());
-    assert_eq!(
-        loaded.blob_status("reg.io", &digest_a()),
-        Some(&BlobStatus::Completed)
+    assert!(
+        loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/alpine")),
+        "completed blob should survive round-trip"
     );
 }
 
@@ -105,14 +104,14 @@ fn round_trip_mount_source_survives() {
     // committed_repos is runtime-only (not persisted). Mark committed
     // to verify the blob repos data survived the round-trip.
     loaded.mark_repo_committed("reg.io", &repo("repo/a"));
+    // committed_mount_sources returns an iterator of repos that are present
+    // and committed; repo/a should appear as a mount source for repo/b.
     assert_eq!(
-        loaded.blob_mount_source(
-            "reg.io",
-            &digest_a(),
-            &RepositoryName::new("repo/b").unwrap(),
-            &[]
-        ),
-        Some(&RepositoryName::new("repo/a").unwrap())
+        loaded
+            .committed_mount_sources("reg.io", &digest_a(), &repo("repo/b"))
+            .next()
+            .cloned(),
+        Some(repo("repo/a"))
     );
 }
 
@@ -123,18 +122,18 @@ fn round_trip_multiple_targets() {
 
     let mut cache = TransferStateCache::new();
     cache.set_blob_completed("reg-a.io", digest_a(), repo("repo/x"));
-    cache.set_blob_exists("reg-b.io", digest_b(), repo("repo/y"));
+    cache.set_blob_verified("reg-b.io", digest_b(), repo("repo/y"));
 
     cache.persist(&path).unwrap();
 
     let loaded = TransferStateCache::load(&path, long_ttl());
-    assert_eq!(
-        loaded.blob_status("reg-a.io", &digest_a()),
-        Some(&BlobStatus::Completed)
+    assert!(
+        loaded.blob_present_at("reg-a.io", &digest_a(), &repo("repo/x")),
+        "completed blob at reg-a should survive round-trip"
     );
-    assert_eq!(
-        loaded.blob_status("reg-b.io", &digest_b()),
-        Some(&BlobStatus::ExistsAtTarget)
+    assert!(
+        loaded.blob_present_at("reg-b.io", &digest_b(), &repo("repo/y")),
+        "verified blob at reg-b should survive round-trip"
     );
 }
 
@@ -156,7 +155,10 @@ fn expired_cache_returns_empty() {
     std::thread::sleep(Duration::from_millis(1100));
     let loaded = TransferStateCache::load(&path, Duration::from_secs(1));
     assert!(loaded.is_empty());
-    assert_eq!(loaded.blob_status("reg.io", &digest_a()), None);
+    assert!(
+        !loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+        "expired cache should not return blobs"
+    );
 }
 
 #[test]
@@ -171,7 +173,10 @@ fn zero_ttl_means_never_expire() {
     // Duration::ZERO disables TTL -- the cache never expires by age.
     let loaded = TransferStateCache::load(&path, Duration::ZERO);
     assert!(!loaded.is_empty());
-    assert!(loaded.blob_status("reg.io", &digest_a()).is_some());
+    assert!(
+        loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+        "zero TTL should never expire the cache"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -236,12 +241,20 @@ fn failed_blobs_not_persisted() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_failed("reg.io", digest_a(), "connection refused".into());
+    cache.set_blob_failed(
+        "reg.io",
+        digest_a(),
+        repo("repo/a"),
+        "connection refused".into(),
+    );
 
     cache.persist(&path).unwrap();
 
     let loaded = TransferStateCache::load(&path, long_ttl());
-    assert_eq!(loaded.blob_status("reg.io", &digest_a()), None);
+    assert!(
+        !loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+        "failed blob should not be persisted"
+    );
 }
 
 #[test]
@@ -250,12 +263,16 @@ fn in_progress_blobs_not_persisted() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_in_progress("reg.io", digest_a(), repo("repo/a"));
+    // claim_blob_upload sets the repo's state to Uploading (the new in-progress).
+    cache.claim_blob_upload("reg.io", &digest_a(), &repo("repo/a"));
 
     cache.persist(&path).unwrap();
 
     let loaded = TransferStateCache::load(&path, long_ttl());
-    assert_eq!(loaded.blob_status("reg.io", &digest_a()), None);
+    assert!(
+        !loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+        "uploading (in-progress) blob should not be persisted"
+    );
 }
 
 #[test]
@@ -267,16 +284,19 @@ fn only_stable_entries_survive_persist() {
     // Stable
     cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
     // Transient -- should not appear after reload
-    cache.set_blob_failed("reg.io", digest_b(), "oops".into());
+    cache.set_blob_failed("reg.io", digest_b(), repo("repo/b"), "oops".into());
 
     cache.persist(&path).unwrap();
 
     let loaded = TransferStateCache::load(&path, long_ttl());
-    assert_eq!(
-        loaded.blob_status("reg.io", &digest_a()),
-        Some(&BlobStatus::Completed)
+    assert!(
+        loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+        "completed blob should survive persist"
     );
-    assert_eq!(loaded.blob_status("reg.io", &digest_b()), None);
+    assert!(
+        !loaded.blob_present_at("reg.io", &digest_b(), &repo("repo/b")),
+        "failed blob should not survive persist"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -286,11 +306,17 @@ fn only_stable_entries_survive_persist() {
 #[test]
 fn invalidate_blob_removes_entry() {
     let mut cache = TransferStateCache::new();
-    cache.set_blob_exists("reg.io", digest_a(), repo("repo/a"));
-    assert!(cache.blob_status("reg.io", &digest_a()).is_some());
+    cache.set_blob_verified("reg.io", digest_a(), repo("repo/a"));
+    assert!(
+        cache.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+        "blob should be present before invalidation"
+    );
 
     cache.invalidate_blob("reg.io", &digest_a());
-    assert_eq!(cache.blob_status("reg.io", &digest_a()), None);
+    assert!(
+        !cache.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+        "blob should not be present after invalidation"
+    );
 }
 
 #[test]
@@ -334,7 +360,7 @@ fn roundtrip_with_source_snapshots() {
     ]));
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_exists("reg.io", digest(), repo("repo/a"));
+    cache.set_blob_verified("reg.io", digest(), repo("repo/a"));
     cache.set_source_snapshot(
         key.clone(),
         SourceSnapshot {
@@ -347,7 +373,7 @@ fn roundtrip_with_source_snapshots() {
     cache.persist(&path).unwrap();
     let loaded = TransferStateCache::load(&path, Duration::from_secs(3600));
 
-    assert!(loaded.blob_known_at_repo("reg.io", &digest(), &repo("repo/a")));
+    assert!(loaded.blob_present_at("reg.io", &digest(), &repo("repo/a")));
     let snap = loaded.source_snapshot(&key).unwrap();
     assert_eq!(snap.source_digest, digest());
     assert_eq!(snap.filtered_digest, digest2());
@@ -368,7 +394,7 @@ fn coexistence_blobs_and_snapshots() {
 
     let mut cache = TransferStateCache::new();
     // Multiple blob entries.
-    cache.set_blob_exists("reg1.io", digest(), repo("repo/a"));
+    cache.set_blob_verified("reg1.io", digest(), repo("repo/a"));
     cache.set_blob_completed("reg2.io", digest2(), repo("repo/b"));
     // Multiple snapshot entries.
     cache.set_source_snapshot(
@@ -394,8 +420,8 @@ fn coexistence_blobs_and_snapshots() {
     let loaded = TransferStateCache::load(&path, Duration::from_secs(3600));
 
     // Verify all blob entries survived.
-    assert!(loaded.blob_known_at_repo("reg1.io", &digest(), &repo("repo/a")));
-    assert!(loaded.blob_known_at_repo("reg2.io", &digest2(), &repo("repo/b")));
+    assert!(loaded.blob_present_at("reg1.io", &digest(), &repo("repo/a")));
+    assert!(loaded.blob_present_at("reg2.io", &digest2(), &repo("repo/b")));
     // Verify all snapshot entries survived.
     let s1 = loaded.source_snapshot(&key1).unwrap();
     assert_eq!(

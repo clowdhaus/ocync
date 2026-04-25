@@ -715,6 +715,8 @@ pub struct SyncEngine {
     drain_deadline: Duration,
     /// Timeout for the optimization source HEAD request. Default: 5 seconds.
     source_head_timeout: Duration,
+    /// Deadline for the per-blob mount-source wait. Default: 60 seconds.
+    mount_source_wait_deadline: Duration,
 }
 
 impl SyncEngine {
@@ -728,6 +730,7 @@ impl SyncEngine {
             max_concurrent,
             drain_deadline: Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
             source_head_timeout: Duration::from_secs(5),
+            mount_source_wait_deadline: Duration::from_secs(60),
         }
     }
 
@@ -744,6 +747,16 @@ impl SyncEngine {
     /// the engine falls through to the full source manifest pull.
     pub fn with_source_head_timeout(mut self, timeout: Duration) -> Self {
         self.source_head_timeout = timeout;
+        self
+    }
+
+    /// Configure the per-blob mount-source wait deadline.
+    ///
+    /// When a follower's resolver subscribes to a leader's manifest-commit
+    /// watch, the wait is bounded by this deadline. On expiry, the follower
+    /// falls back to push instead of hanging. Default 60 seconds.
+    pub fn with_mount_source_wait_deadline(mut self, deadline: Duration) -> Self {
+        self.mount_source_wait_deadline = deadline;
         self
     }
 
@@ -797,10 +810,6 @@ impl SyncEngine {
         // After discovery completes, all tasks are promoted at once (leaders
         // ordered first). Per-blob `Notify` handles synchronization.
         let mut promotion_phase = PromotionPhase::Discovering;
-        // Repos whose manifests are already committed at the target. Followers
-        // prefer these as cross-repo mount sources because ECR requires a
-        // committed manifest for mount to succeed.
-        let mut preferred_mount_sources: Vec<RepositoryName> = Vec::new();
 
         // Budget circuit breaker: pause discovery when a source registry's
         // rate-limit remaining drops below 10% of the remaining discovery count.
@@ -882,9 +891,9 @@ impl SyncEngine {
         }
 
         // Helper closure: promote a task from `pending` into an execution future.
+        let mount_source_wait_deadline = self.mount_source_wait_deadline;
         let promote = |item: TransferTask,
-                       ctx: &PromoteContext<'_>,
-                       preferred_mount_sources: &[RepositoryName]|
+                       ctx: &PromoteContext<'_>|
          -> std::pin::Pin<Box<dyn Future<Output = ImageResult>>> {
             let sem = Rc::clone(ctx.sem);
             let cache_ref = Rc::clone(ctx.cache);
@@ -900,7 +909,6 @@ impl SyncEngine {
             let referrers_ref = Rc::clone(ctx.referrers_cache);
             let source_str = item.source.to_string();
             let target_str = item.target.to_string();
-            let preferred_mount_sources = preferred_mount_sources.to_vec();
             Box::pin(async move {
                 let _permit = sem.acquire().await.unwrap();
                 progress.image_started(&source_str, &target_str);
@@ -910,7 +918,7 @@ impl SyncEngine {
                     &staging_ref,
                     &freq_counts,
                     &retry,
-                    &preferred_mount_sources,
+                    mount_source_wait_deadline,
                     &referrers_ref,
                 )
                 .await
@@ -960,15 +968,7 @@ impl SyncEngine {
                 // All discovery complete - elect leaders and promote.
                 // `freq_map` is frozen from this point (no more discovery
                 // mutations), so `PromoteContext` can borrow it.
-                let n = elect_leaders(&mut pending);
-                // Collect leader target repos for follower mount preference.
-                if n > 0 {
-                    preferred_mount_sources = pending
-                        .iter()
-                        .take(n)
-                        .map(|t| t.target.repo.clone())
-                        .collect();
-                }
+                elect_leaders(&mut pending);
                 promotion_phase = PromotionPhase::Done;
                 write_timing(&mut timing_file, "discovery_complete", &run_start);
                 let ctx = PromoteContext {
@@ -982,7 +982,7 @@ impl SyncEngine {
                 let to_promote = pending.len();
                 for _ in 0..to_promote {
                     if let Some(item) = pending.pop_front() {
-                        execution_futures.push(promote(item, &ctx, &preferred_mount_sources));
+                        execution_futures.push(promote(item, &ctx));
                     }
                 }
             }
@@ -1604,7 +1604,7 @@ async fn execute_item(
     staging: &Rc<BlobStage>,
     freq_counts: &HashMap<Digest, usize>,
     retry: &RetryConfig,
-    preferred_mount_sources: &[RepositoryName],
+    mount_source_wait_deadline: Duration,
     referrers_cache: &ReferrersCache,
 ) -> ImageResult {
     let start = Instant::now();
@@ -1619,7 +1619,7 @@ async fn execute_item(
         target_name: &item.target_name,
         target_repo: &item.target.repo,
         batch_checker: item.batch_checker.as_ref(),
-        preferred_mount_sources,
+        mount_source_wait_deadline,
     };
     let outcome = transfer_image_blobs(&ctx, &item.source_data, freq_counts).await;
 
@@ -1942,32 +1942,14 @@ fn blobs_from_manifest(source_data: &PulledManifest) -> Vec<&Descriptor> {
     }
 }
 
-/// Outcome of the atomic check-and-claim on a blob's in-progress state.
-///
-/// Used by [`execute_transfer_blobs`] to decide whether to wait for another
-/// repository's in-flight upload or to claim the upload itself. See the
-/// Step 2a comment for the reasoning.
-enum ClaimAction {
-    /// Another repository is currently uploading this blob; wait on `notify`
-    /// then re-check. `uploader` is included for diagnostic logs.
-    Wait {
-        uploader: RepositoryName,
-        notify: Rc<tokio::sync::Notify>,
-    },
-    /// This repository has claimed the upload (set in-progress state). Proceed
-    /// with HEAD + push; on completion, call `notify_blob` to wake waiters.
-    Claimed,
-}
-
 /// Write-only view of the transfer state cache for use inside the
 /// per-image blob semaphore.
 ///
 /// Exposes completion/failure signals and repo management but NOT wait
-/// primitives (`repo_committed_watch`, `blob_in_progress_uploader`,
-/// `blob_notify`). This boundary is the structural guarantee against
-/// semaphore-exhaustion deadlocks: code holding a permit literally
-/// cannot block on external signals because the type does not expose
-/// the methods needed to do so.
+/// primitives (`repo_committed_watch`, `claim_blob_upload`). This boundary
+/// is the structural guarantee against semaphore-exhaustion deadlocks:
+/// code holding a permit literally cannot block on external signals because
+/// the type does not expose the methods needed to do so.
 struct BlobSink<'a> {
     cache: &'a Rc<RefCell<TransferStateCache>>,
     target_name: &'a RegistryAlias,
@@ -1980,26 +1962,28 @@ impl<'a> BlobSink<'a> {
             .set_blob_completed(self.target_name, digest, repo);
     }
 
-    fn fail(&self, digest: Digest, error: String) {
+    fn fail(&self, digest: Digest, repo: RepositoryName, error: String) {
         self.cache
             .borrow_mut()
-            .set_blob_failed(self.target_name, digest, error);
+            .set_blob_failed(self.target_name, digest, repo, error);
     }
 
     fn exists(&self, digest: Digest, repo: RepositoryName) {
         self.cache
             .borrow_mut()
-            .set_blob_exists(self.target_name, digest, repo);
+            .set_blob_verified(self.target_name, digest, repo);
     }
 
-    fn notify(&self, digest: &Digest) {
-        self.cache.borrow().notify_blob(self.target_name, digest);
-    }
-
-    fn remove_repo(&self, digest: &Digest, repo: &RepositoryName) {
+    fn release_claim(&self, digest: &Digest) {
         self.cache
             .borrow_mut()
-            .remove_blob_repo(self.target_name, digest, repo);
+            .release_blob_claim(self.target_name, digest);
+    }
+
+    fn mark_repo_stale(&self, digest: &Digest, repo: &RepositoryName) {
+        self.cache
+            .borrow_mut()
+            .mark_blob_repo_stale(self.target_name, digest, repo);
     }
 }
 
@@ -2073,8 +2057,8 @@ struct TransferContext<'a> {
     target_repo: &'a RepositoryName,
     /// Optional batch blob checker for pre-populating the cache.
     batch_checker: Option<&'a Rc<dyn BatchBlobChecker>>,
-    /// Leader repos whose manifests are committed. Preferred as mount sources.
-    preferred_mount_sources: &'a [RepositoryName],
+    /// Per-blob deadline for mount-source resolution.
+    mount_source_wait_deadline: Duration,
 }
 
 /// Transfer all blobs for a single image to one target.
@@ -2119,12 +2103,11 @@ async fn transfer_image_blobs(
                 {
                     let mut c = ctx.cache.borrow_mut();
                     for digest in &existing {
-                        c.set_blob_exists(
+                        c.set_blob_verified(
                             ctx.target_name,
                             digest.clone(),
                             ctx.target_repo.to_owned(),
                         );
-                        c.notify_blob(ctx.target_name, digest);
                     }
                 }
                 // Record all checked digests so the per-blob loop can skip
@@ -2185,8 +2168,8 @@ async fn transfer_image_blobs(
             // `run_under_semaphore` takes `BlobIoContext` (not
             // `TransferContext`), so `ctx` is unreachable inside the
             // permit scope. `BlobSink` has no repo_committed_watch,
-            // no blob_in_progress_uploader, no blob_notify -- adding
-            // an external wait inside the semaphore is a compile error.
+            // no claim_blob_upload -- adding an external wait inside the
+            // semaphore is a compile error.
             let _permit = sem.acquire().await.unwrap();
             run_under_semaphore(
                 &BlobIoContext::from_ctx(ctx),
@@ -2233,64 +2216,55 @@ enum BlobClaim {
     Claimed,
 }
 
-/// Cache check + claim loop, run OUTSIDE the per-image blob semaphore.
+/// Cache check + atomic claim, run OUTSIDE the per-image blob semaphore.
 ///
-/// This must not hold a semaphore permit because the claim-wait
-/// (`Notify::notified().await`) can block indefinitely waiting for another
-/// image to finish uploading a shared blob. If all semaphore permits were
-/// consumed by claim-waits, the image could not make progress on its own
-/// claimed blobs, creating a cross-image deadlock.
+/// Step 1: skip if blob is already present at our repo.
+/// Step 2: `claim_or_wait` loop -- atomic check-and-claim against the cache,
+/// with `notify.notified().await` between iterations.
 async fn wait_for_blob_claim(
     ctx: &TransferContext<'_>,
     digest: &Digest,
     cancel: &Cell<bool>,
 ) -> BlobClaim {
-    // Step 1: Check cache -- known at this repo -> skip (0 API calls).
+    // Step 1: blob already at our repo -> skip.
     let skip = {
         let c = ctx.cache.borrow();
-        c.blob_known_at_repo(ctx.target_name, digest, ctx.target_repo)
+        c.blob_present_at(ctx.target_name, digest, ctx.target_repo)
     };
     if skip {
         return BlobClaim::Skipped;
     }
 
-    // Step 2a: Atomic check-and-claim.
+    // Step 2: atomic check-and-claim.
     loop {
         if cancel.get() {
             return BlobClaim::Cancelled;
         }
-        let action: ClaimAction = {
+        let action = {
             let mut c = ctx.cache.borrow_mut();
-            match c
-                .blob_in_progress_uploader(ctx.target_name, digest, ctx.target_repo)
-                .cloned()
-            {
-                Some(uploader) => ClaimAction::Wait {
-                    uploader,
-                    notify: c.blob_notify(ctx.target_name, digest),
-                },
-                None => {
-                    c.set_blob_in_progress(
-                        ctx.target_name,
-                        digest.clone(),
-                        ctx.target_repo.to_owned(),
-                    );
-                    ClaimAction::Claimed
-                }
-            }
+            c.claim_blob_upload(ctx.target_name, digest, ctx.target_repo)
         };
         match action {
-            ClaimAction::Wait { uploader, notify } => {
+            crate::plan::ClaimAction::Wait { holder, notify } => {
                 debug!(
                     %digest,
-                    %uploader,
+                    holder = %holder,
                     target = %ctx.target_name,
                     "waiting for in-flight upload to complete before mounting",
                 );
                 notify.notified().await;
+                // Re-check skip on wake -- a batch_check could have populated
+                // our repo's state during the wait. Otherwise loop and re-claim.
+                let skip = {
+                    let c = ctx.cache.borrow();
+                    c.blob_present_at(ctx.target_name, digest, ctx.target_repo)
+                };
+                if skip {
+                    return BlobClaim::Skipped;
+                }
                 continue;
             }
-            ClaimAction::Claimed => return BlobClaim::Claimed,
+            crate::plan::ClaimAction::Claimed => return BlobClaim::Claimed,
         }
     }
 }
@@ -2318,117 +2292,76 @@ async fn resolve_staging(staging: &Rc<BlobStage>, digest: &Digest) -> StagingCla
     }
 }
 
-/// Resolve the cross-repo mount source for a claimed blob, run OUTSIDE the
-/// per-image blob semaphore.
+/// Cross-repo mount-source resolver with bounded deadline.
 ///
-/// This wait can block for the entire duration of a leader's blob transfers
-/// and manifest push. Running it under the semaphore would consume all
-/// `BLOB_CONCURRENCY` permits when enough blobs wait on the same leader,
-/// preventing the image from uploading other blobs that could break the
-/// dependency chain. This is the same class of deadlock as the blob claim
-/// wait (see [`wait_for_blob_claim`] and `sync_cross_image_blob_claim_no_deadlock`).
+/// Loops until either (a) a committed mount source emerges, (b) all candidate
+/// repos resolve without committing, or (c) the deadline expires. Returns
+/// the mount source to attempt, or `None` if the caller should fall back to
+/// push.
 ///
-/// Returns the repository to attempt a cross-repo mount from, or `None` if
-/// no mount source is available and the caller should proceed to HEAD+push.
+/// The wait runs OUTSIDE the per-image blob semaphore; see
+/// `wait_for_blob_claim` for the parallel reasoning. `select_all` is
+/// cancel-safe; if the per-blob future is dropped (engine cancellation),
+/// all watches release cleanly.
 async fn resolve_mount_source(
     ctx: &TransferContext<'_>,
     digest: &Digest,
 ) -> Option<RepositoryName> {
-    // Cross-repo mount. Prefer leader repos (committed manifests)
-    // over other followers (whose manifests may not be committed yet).
-    //
-    // ECR requires the source repo to have a committed manifest for a mount
-    // to return 201. When `blob_mount_source` returns an uncommitted leader
-    // repo (Tier 3), followers wait for the leader's manifest to commit
-    // rather than sending a mount request that will be rejected with 202.
-    // This avoids wasted round-trips and the `remove_blob_repo` cascade
-    // that would permanently discard a valid mount source.
-    //
-    // Leaders must NOT wait on other leaders' `repo_committed_watch` --
-    // this creates a circular dependency when two leaders share blobs and
-    // each waits for the other's manifest commit before its own blobs can
-    // finish. Leaders instead fall through to the direct mount attempt
-    // (which may get 202 on ECR, triggering HEAD+push fallback).
-    let is_leader = ctx.preferred_mount_sources.contains(ctx.target_repo);
-    let (source, is_committed) = {
-        let c = ctx.cache.borrow();
-        let source = c
-            .blob_mount_source(
-                ctx.target_name,
-                digest,
-                ctx.target_repo,
-                ctx.preferred_mount_sources,
-            )
-            .cloned();
-        let committed = source
-            .as_ref()
-            .is_some_and(|r| c.is_repo_committed(ctx.target_name, r));
-        (source, committed)
-    };
-
-    match source {
-        // No mount source available.
-        None => None,
-        // Source has a committed manifest (Tier 1/2) -- mount immediately.
-        Some(repo) if is_committed => Some(repo),
-        // Source is an uncommitted leader and we are a follower -- wait
-        // for the leader's manifest commit. Leaders skip this branch to
-        // avoid circular waits (leader A waiting on leader B while B
-        // waits on A).
-        Some(repo) if !is_leader && ctx.preferred_mount_sources.contains(&repo) => {
-            debug!(
-                %digest,
-                %repo,
-                target = %ctx.target_name,
-                "mount source uncommitted, waiting for leader manifest commit"
-            );
-            let mut rx = {
-                let mut c = ctx.cache.borrow_mut();
-                c.repo_committed_watch(ctx.target_name, &repo)
-            };
-            // watch::Receiver::wait_for returns immediately if the leader
-            // already committed -- no signal can ever be lost, regardless
-            // of polling order in FuturesUnordered.
-            if rx.wait_for(|&v| v).await.is_err() {
-                debug!(%digest, %repo, "repo-committed watch sender dropped");
-            }
-
-            // Leader committed or failed -- re-query mount source.
-            let c = ctx.cache.borrow();
-            if c.is_repo_committed(ctx.target_name, &repo) {
-                c.blob_mount_source(
-                    ctx.target_name,
-                    digest,
-                    ctx.target_repo,
-                    ctx.preferred_mount_sources,
-                )
+    let deadline = tokio::time::Instant::now() + ctx.mount_source_wait_deadline;
+    loop {
+        let receivers: Vec<tokio::sync::watch::Receiver<bool>> = {
+            let mut c = ctx.cache.borrow_mut();
+            if let Some(r) = c
+                .committed_mount_sources(ctx.target_name, digest, ctx.target_repo)
+                .next()
                 .cloned()
-            } else {
-                // Leader failed; fall through to HEAD+push.
+            {
+                return Some(r);
+            }
+            c.unresolved_watches_for(ctx.target_name, digest, ctx.target_repo)
+        };
+        if receivers.is_empty() {
+            return None;
+        }
+
+        let wait = wait_any_fired(receivers);
+        tokio::pin!(wait);
+        tokio::select! {
+            _ = &mut wait => continue,
+            _ = tokio::time::sleep_until(deadline) => {
                 debug!(
                     %digest,
-                    %repo,
                     target = %ctx.target_name,
-                    "leader manifest push failed, skipping mount"
+                    "mount-source wait deadline reached, falling back to push"
                 );
-                None
+                return None;
             }
         }
-        // Uncommitted non-leader source, or we are a leader ourselves
-        // (Tier 3 fallback) -- attempt mount directly. Non-ECR registries
-        // may fulfill mounts without a committed manifest; on ECR the 202
-        // triggers HEAD+push fallback.
-        Some(repo) => Some(repo),
     }
+}
+
+/// Wait until ANY of the given watch receivers fires (transitions to true).
+async fn wait_any_fired(receivers: Vec<tokio::sync::watch::Receiver<bool>>) {
+    if receivers.is_empty() {
+        return;
+    }
+    let futures: Vec<_> = receivers
+        .into_iter()
+        .map(|mut rx| {
+            Box::pin(async move {
+                let _ = rx.wait_for(|&v| v).await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+        })
+        .collect();
+    let _ = futures_util::future::select_all(futures).await;
 }
 
 /// Entry point for the semaphore-bounded phase of blob transfer.
 ///
 /// Takes [`BlobIoContext`] (not [`TransferContext`]), making it impossible
-/// to call cache wait methods (`repo_committed_watch`,
-/// `blob_in_progress_uploader`, `blob_notify`) inside the semaphore scope.
-/// This is the compile-time enforcement boundary against semaphore-exhaustion
-/// deadlocks.
+/// to call cache wait methods (`repo_committed_watch`, `claim_blob_upload`)
+/// inside the semaphore scope. This is the compile-time enforcement boundary
+/// against semaphore-exhaustion deadlocks.
 async fn run_under_semaphore(
     io: &BlobIoContext<'_>,
     digest: &Digest,
@@ -2442,8 +2375,12 @@ async fn run_under_semaphore(
         if matches!(staging, StagingClaim::Pull) {
             io.staging.notify_failed(digest);
         }
-        io.sink.fail(digest.clone(), "cancelled".into());
-        io.sink.notify(digest);
+        io.sink.fail(
+            digest.clone(),
+            io.target_repo.to_owned(),
+            "cancelled".into(),
+        );
+        io.sink.release_claim(digest);
         return BlobResult::Cancelled;
     }
     transfer_claimed_blob(io, digest, size, batch_checked, mount_source, staging).await
@@ -2479,18 +2416,18 @@ async fn transfer_claimed_blob(
                     io.staging.notify_failed(digest);
                 }
                 io.sink.complete(digest.clone(), io.target_repo.to_owned());
-                io.sink.notify(digest);
+                io.sink.release_claim(digest);
                 return BlobResult::Mounted;
             }
             Ok(MountResult::NotMounted) | Err(_) => {
                 debug!(%digest, %from_repo, target = %io.sink.target_name, "mount not fulfilled, falling back to HEAD+push");
-                // Remove the stale mount source from repos, but keep the
-                // blob entry as InProgress. This task already owns the claim
-                // and will proceed with HEAD+push. Removing only the stale
-                // repo prevents future mount attempts from retrying it,
-                // while keeping the entry prevents concurrent waiters from
-                // re-claiming and starting duplicate pushes.
-                io.sink.remove_repo(digest, &from_repo);
+                // Mark the stale mount source as failed for this repo, but
+                // keep the upload claim. This task already owns the claim
+                // and will proceed with HEAD+push. Marking stale prevents
+                // future mount attempts from retrying it, while keeping the
+                // claim prevents concurrent waiters from re-claiming and
+                // starting duplicate pushes.
+                io.sink.mark_repo_stale(digest, &from_repo);
                 mount_attempted = true;
             }
         }
@@ -2504,7 +2441,7 @@ async fn transfer_claimed_blob(
                     io.staging.notify_failed(digest);
                 }
                 io.sink.exists(digest.clone(), io.target_repo.to_owned());
-                io.sink.notify(digest);
+                io.sink.release_claim(digest);
                 return BlobResult::Skipped;
             }
             Ok(None) => {}
@@ -2554,8 +2491,9 @@ async fn transfer_claimed_blob(
                     digest: digest.clone(),
                     source: e,
                 };
-                io.sink.fail(digest.clone(), err.to_string());
-                io.sink.notify(digest);
+                io.sink
+                    .fail(digest.clone(), io.target_repo.to_owned(), err.to_string());
+                io.sink.release_claim(digest);
                 return BlobResult::Failed(err);
             }
             io.staging.notify_staged(digest);
@@ -2586,12 +2524,13 @@ async fn transfer_claimed_blob(
     match transfer_result {
         Ok(()) => {
             io.sink.complete(digest.clone(), io.target_repo.to_owned());
-            io.sink.notify(digest);
+            io.sink.release_claim(digest);
             BlobResult::Transferred { bytes: size }
         }
         Err(err) => {
-            io.sink.fail(digest.clone(), err.to_string());
-            io.sink.notify(digest);
+            io.sink
+                .fail(digest.clone(), io.target_repo.to_owned(), err.to_string());
+            io.sink.release_claim(digest);
             BlobResult::Failed(err)
         }
     }

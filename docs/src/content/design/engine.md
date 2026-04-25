@@ -142,9 +142,15 @@ The greedy set-cover provably covers every shared blob. No "uncovered follower" 
 
 ### Progressive promotion
 
-All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Per-blob `Notify` handles via `ClaimAction::Wait` in `wait_for_blob_claim` provide fine-grained synchronization: a follower that needs a blob still being uploaded by a leader waits on that specific blob's notify, not on all leaders completing.
+All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Cross-repo upload coordination is per-(target, digest): the first repo to arrive holds an explicit `claim` slot in `BlobInfo`; other repos wait on its `claim_notify` and re-check after release.
 
-Mount sources are restricted to repos with committed manifests via a `committed_repos` set in the transfer state cache. After `push_manifests` succeeds, the repo is marked as committed. `blob_mount_source()` only returns repos from this set, ensuring mount attempts target repos that can fulfill them (ECR requires a committed manifest in the source repo for mount to return 201).
+### Bounded-deadline mount-source resolution
+
+Per-(repo) `RepoBlobState` tracks each repo's lifecycle independently (`Verified`, `Uploading`, `Completed`, `Failed`). `cache.committed_mount_sources(target, digest, current_repo)` returns an iterator over repos with state in `{Verified, Completed}` AND a committed manifest at `target` -- this is the *only* path to a mount source. There is no Tier 3 fallback to uncommitted repos.
+
+`resolve_mount_source` is a re-check loop bounded by a per-blob deadline (default 60s, configurable via `EngineConfig::mount_source_wait_deadline`). On each iteration, it queries `committed_mount_sources` and returns the first match; if none exist, it subscribes to `unresolved_watches_for` (which filters on watch-not-yet-fired AND state-not-`Failed`) and waits via `futures_util::future::select_all` over the per-repo manifest-commit watches. On wake (any commit or failure fires its watch), it re-queries. The deadline subsumes the leader-leader skip and any prior-run state cycle: on expiry, the resolver returns `None` and the caller falls back to push.
+
+`mark_blob_repo_stale` provides lazy invalidation: on mount failure (ECR 202 / 4xx / 5xx), the source repo's state transitions to `Failed`, and subsequent `committed_mount_sources` iteration excludes it. If alternative committed sources remain, the resolver retries; otherwise it falls through to push.
 
 ### ECR blob mounting
 
