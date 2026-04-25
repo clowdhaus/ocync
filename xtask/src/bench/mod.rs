@@ -83,6 +83,11 @@ pub(crate) struct BenchArgs {
     /// fairness across tools is not a concern (e.g. ocync-only reruns).
     #[arg(long)]
     pub(crate) skip_prewarm: bool,
+
+    /// Disable bench-proxy. Tools connect directly to registries.
+    /// Disables traffic metrics, source error detection, and CDN stats.
+    #[arg(long)]
+    pub(crate) no_proxy: bool,
 }
 
 /// Benchmark scenario to run (CLI subcommand).
@@ -544,7 +549,7 @@ async fn run_single_tool(
     std::fs::write(&config_path, &config_content)
         .map_err(|e| format!("write config {}: {e}", config_path.display()))?;
 
-    // 3. Start bench-proxy (our pure-Rust MITM replacement for mitmdump).
+    // 3. Start bench-proxy (unless --no-proxy).
     //
     // The proxy binary, CA cert, and CA private key are configured via the
     // `--proxy-binary`, `--proxy-ca`, and `--proxy-ca-key` CLI flags, which
@@ -555,16 +560,22 @@ async fn run_single_tool(
     // which API calls the tool issued.
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
-    let log_path = output_dir.join(format!("{tool}-{phase}-proxy.jsonl"));
-    let handle = proxy::start(
-        &args.proxy_binary,
-        &args.proxy_ca,
-        &args.proxy_ca_key,
-        &log_path,
-        args.proxy_port,
-    )
-    .await?;
-    let proxy_url = handle.proxy_url();
+    let (proxy_handle, proxy_url) = if !args.no_proxy {
+        let log_path = output_dir.join(format!("{tool}-{phase}-proxy.jsonl"));
+        let handle = proxy::start(
+            &args.proxy_binary,
+            &args.proxy_ca,
+            &args.proxy_ca_key,
+            &log_path,
+            args.proxy_port,
+        )
+        .await?;
+        let url = handle.proxy_url();
+        (Some(handle), Some(url))
+    } else {
+        eprintln!("bench: proxy disabled -- no traffic metrics");
+        (None, None)
+    };
 
     // 4. Run the tool.
     //
@@ -572,78 +583,49 @@ async fn run_single_tool(
     // update-ca-trust on AL2023) so that rustls-native-certs and OpenSSL
     // both trust the MITM'd connections. HTTPS_PROXY alone is sufficient.
     let workspace_root = Path::new(".");
-    let result = runner::run_tool(tool, &config_path, &proxy_url, workspace_root).await?;
+    let result = runner::run_tool(tool, &config_path, proxy_url.as_deref(), workspace_root).await?;
 
-    // 6. Stop proxy, parse log, aggregate metrics.
-    let entries = proxy::stop(handle).await?;
-    let metrics = proxy::aggregate(&entries, &corpus.settings.target_registry);
-
-    // Abort on source registry errors (status >= 400) that indicate tainted
-    // benchmark data. Two status codes are excluded:
-    //
-    // - 401: expected as part of OCI auth. Every `/v2/` ping returns 401 with
-    //   a `WWW-Authenticate` header advertising the token endpoint. This is
-    //   how authentication *starts*, not an error.
-    // - 404: expected for blob existence checks. HEAD requests return 404 when
-    //   a blob doesn't exist at the target (mount fallback, skip detection).
-    //
-    // Everything else from a source registry means something broke: 403
-    // (auth failed), 429 (rate limited), 5xx (registry outage), etc.
-    let source_errors: BTreeMap<&str, Vec<u16>> = entries
-        .iter()
-        .filter(|e| {
-            e.host != corpus.settings.target_registry
-                && e.status >= 400
-                && e.status != 401
-                && e.status != 404
-        })
-        .fold(BTreeMap::new(), |mut acc, e| {
-            acc.entry(e.host.as_str()).or_default().push(e.status);
-            acc
-        });
-    if !source_errors.is_empty() {
-        let summary: Vec<String> = source_errors
-            .iter()
-            .map(|(host, codes)| {
-                let unique: Vec<u16> = codes
-                    .iter()
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let code_str: Vec<String> = unique.iter().map(|c| c.to_string()).collect();
-                format!("{} ({}x: {})", host, codes.len(), code_str.join("/"))
-            })
-            .collect();
-        let hosts: Vec<&str> = source_errors.keys().copied().collect();
-        return Err(format!(
-            "aborting: source registry errors from: {}. \
-             Use --skip-registries {} to exclude, or retry later.",
-            summary.join(", "),
-            hosts.join(","),
-        )
-        .into());
-    }
+    // 6. Stop proxy, parse log, aggregate metrics. Abort on source
+    //    registry errors that indicate tainted benchmark data.
+    let proxy_metrics = if let Some(handle) = proxy_handle {
+        let entries = proxy::stop(handle).await?;
+        check_source_errors(&entries, &corpus.settings.target_registry)?;
+        Some(proxy::aggregate(&entries, &corpus.settings.target_registry))
+    } else {
+        None
+    };
 
     let rss_display = result
         .peak_rss_kb
         .map(|kb| report::format_bytes(kb * 1024))
         .unwrap_or_else(|| "n/a".into());
-    eprintln!(
-        "  {}: wall_clock={:.1}s exit={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
-        tool,
-        result.wall_clock.as_secs_f64(),
-        result
-            .exit_code
-            .map_or_else(|| "signal".to_string(), |c| c.to_string()),
-        rss_display,
-        metrics.requests,
-        report::format_bytes(metrics.response_bytes),
-        metrics.mount_successes,
-        metrics.mount_attempts,
-        metrics.source_blob_gets,
-        report::format_bytes(metrics.source_blob_bytes),
-    );
+    if let Some(ref metrics) = proxy_metrics {
+        eprintln!(
+            "  {}: wall_clock={:.1}s exit={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
+            tool,
+            result.wall_clock.as_secs_f64(),
+            result
+                .exit_code
+                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            rss_display,
+            metrics.requests,
+            report::format_bytes(metrics.response_bytes),
+            metrics.mount_successes,
+            metrics.mount_attempts,
+            metrics.source_blob_gets,
+            report::format_bytes(metrics.source_blob_bytes),
+        );
+    } else {
+        eprintln!(
+            "  {}: wall_clock={:.1}s exit={} rss={}",
+            tool,
+            result.wall_clock.as_secs_f64(),
+            result
+                .exit_code
+                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            rss_display,
+        );
+    }
 
     // Read phase timing from ocync's OCYNC_TIMING_FILE if present.
     let phase_timing_ms = if let Some(ref tp) = result.timing_path {
@@ -657,9 +639,51 @@ async fn run_single_tool(
         wall_clock_secs: result.wall_clock.as_secs_f64(),
         exit_code: result.exit_code,
         peak_rss_kb: result.peak_rss_kb,
-        proxy_metrics: Some(metrics),
+        proxy_metrics,
         phase_timing_ms,
     })
+}
+
+/// Abort on source registry errors (status >= 400) that indicate tainted
+/// benchmark data. Excludes 401 (expected OCI auth challenge) and 404
+/// (expected blob existence checks).
+fn check_source_errors(
+    entries: &[proxy::ProxyEntry],
+    target_registry: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_errors: BTreeMap<&str, Vec<u16>> = entries
+        .iter()
+        .filter(|e| {
+            e.host != target_registry && e.status >= 400 && e.status != 401 && e.status != 404
+        })
+        .fold(BTreeMap::new(), |mut acc, e| {
+            acc.entry(e.host.as_str()).or_default().push(e.status);
+            acc
+        });
+    if source_errors.is_empty() {
+        return Ok(());
+    }
+    let summary: Vec<String> = source_errors
+        .iter()
+        .map(|(host, codes)| {
+            let unique: Vec<u16> = codes
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let code_str: Vec<String> = unique.iter().map(|c| c.to_string()).collect();
+            format!("{} ({}x: {})", host, codes.len(), code_str.join("/"))
+        })
+        .collect();
+    let hosts: Vec<&str> = source_errors.keys().copied().collect();
+    Err(format!(
+        "aborting: source registry errors from: {}. \
+         Use --skip-registries {} to exclude, or retry later.",
+        summary.join(", "),
+        hosts.join(","),
+    )
+    .into())
 }
 
 /// Sync scenario: full sync (measured), then immediate re-sync

@@ -69,6 +69,10 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long)]
     pub(crate) skip_prewarm: bool,
 
+    /// Disable bench-proxy on the remote instance.
+    #[arg(long)]
+    pub(crate) no_proxy: bool,
+
     /// Local directory to save fetched results.
     #[arg(long, default_value = "bench/results")]
     pub(crate) output: String,
@@ -139,6 +143,19 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         return Err("git push failed".into());
     }
 
+    // Resolve to exact SHA after pushing. The remote script checks out this
+    // SHA, not the branch name. This makes the build immune to force-pushes
+    // that land between our push and the instance's fetch -- the SHA is
+    // immutable even if the branch ref moves.
+    let sha_output = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
+    if !sha_output.status.success() {
+        return Err("git rev-parse HEAD failed".into());
+    }
+    let git_sha = String::from_utf8_lossy(&sha_output.stdout)
+        .trim()
+        .to_owned();
+    eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
+
     // Build the bench command args. Shell-escape all user-supplied
     // values to prevent injection via crafted tool names, registry
     // names, or scenario strings.
@@ -151,6 +168,9 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     }
     if args.skip_prewarm {
         bench_args.push_str(" --skip-prewarm");
+    }
+    if args.no_proxy {
+        bench_args.push_str(" --no-proxy");
     }
     bench_args.push_str(&format!(" '{}'", shell_escape(&args.scenario)));
 
@@ -170,13 +190,17 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
 
     let force_clause = if args.force {
         r#"
-# --force: kill any running bench and clean up.
+# --force: kill any running bench and all child processes.
+# The PID file tracks the subshell, not cargo/ocync directly.
+# Kill by name to catch orphaned children that survive subshell death.
 if [ -f "$PID_FILE" ]; then
   echo "bench-remote: --force killing PID $(cat "$PID_FILE")"
   kill -9 $(cat "$PID_FILE") 2>/dev/null || true
   rm -f "$PID_FILE"
 fi
 pkill -9 -f "bench-proxy serve" 2>/dev/null || true
+pkill -9 -f "cargo xtask bench" 2>/dev/null || true
+pkill -9 -f "target/release/ocync" 2>/dev/null || true
 sleep 1
 "#
     } else {
@@ -184,6 +208,7 @@ sleep 1
     };
 
     let escaped_git_ref = shell_escape(&git_ref);
+    let escaped_git_sha = shell_escape(&git_sha);
 
     let script = format!(
         r#"#!/bin/bash
@@ -210,35 +235,49 @@ cd ~/ocync
 PID_FILE=bench/.bench-run.pid
 LOG_FILE=bench/.bench-run.log
 {force_clause}
-# Check for existing run.
+# Check for existing run. Always kill stale processes and start fresh --
+# attaching to an in-progress run from a previous invocation risks using
+# a stale binary that was built from different source code.
 if [ -f "$PID_FILE" ]; then
   OLD_PID=$(cat "$PID_FILE")
   if kill -0 "$OLD_PID" 2>/dev/null; then
-    if [ -f "$LOG_FILE" ]; then
-      echo "bench-remote: attaching to run in progress (PID $OLD_PID)"
-      tail -n+1 -f "$LOG_FILE" --pid="$OLD_PID"
-      exit 0
-    else
-      echo "bench-remote: PID $OLD_PID alive but log missing, cleaning up"
-      kill -9 "$OLD_PID" 2>/dev/null || true
-      pkill -9 -f "bench-proxy serve" 2>/dev/null || true
-      rm -f "$PID_FILE"
-      sleep 1
-    fi
-  else
-    echo "bench-remote: cleaning up stale PID file (PID $OLD_PID)"
-    rm -f "$PID_FILE"
+    echo "bench-remote: killing previous run (PID $OLD_PID)"
+    kill -9 "$OLD_PID" 2>/dev/null || true
   fi
+  rm -f "$PID_FILE"
 fi
+# Kill any orphaned processes from previous runs regardless of PID file.
+pkill -9 -f "bench-proxy serve" 2>/dev/null || true
+pkill -9 -f "cargo xtask bench" 2>/dev/null || true
+pkill -9 -f "target/release/ocync" 2>/dev/null || true
+sleep 1
 
-# Pull code and build.
-echo '[1/4] Pulling {escaped_git_ref}...'
-git fetch origin '{escaped_git_ref}' && git checkout '{escaped_git_ref}' && git reset --hard 'origin/{escaped_git_ref}'
+# Pull code and build. Use exact SHA (not branch name) so force-pushes
+# between our local push and the instance's fetch cannot change what gets
+# built. The SHA is resolved locally before pushing and is immutable.
+echo '[1/4] Checking out {escaped_git_sha} ({escaped_git_ref})...'
+git fetch origin
+git checkout '{escaped_git_sha}' --detach
+# Remove untracked files left by previous builds or deleted from the repo.
+git clean -fdx -e target/ -e bench/results/ -e bench/.bench-run.* -e bench/.tmp/
 
 echo '[2/4] Building ocync + bench-proxy...'
 source ~/.bench-env 2>/dev/null || true
 source ~/.cargo/env
-cargo build --release --package ocync --package bench-proxy
+# Nuke the entire target directory. cargo's mtime-based fingerprinting
+# is unreliable after git operations (git does not preserve mtimes), and
+# partial cleans (cargo clean -p, cargo clean --release) miss transitive
+# deps, LTO artifacts, and the xtask dev build itself. A full nuke adds
+# ~5 minutes (rebuilds deps from source) but guarantees every binary
+# matches the checked-out source. Worth it vs hours of debugging stale
+# binaries.
+rm -rf target/
+CARGO_INCREMENTAL=0 cargo build --release --package ocync --package bench-proxy 2>&1 | tee /tmp/bench-build.log
+# Verify cargo actually recompiled our code.
+if ! grep -q 'Compiling ocync ' /tmp/bench-build.log; then
+  echo "FATAL: cargo did not recompile ocync -- stale build artifacts"
+  exit 1
+fi
 cp target/release/ocync ~/.cargo/bin/ocync
 cp target/release/bench-proxy ~/.cargo/bin/bench-proxy
 
@@ -402,6 +441,25 @@ fn fetch_results(
             .status()?;
         if !status.success() {
             eprintln!("bench-remote: warning: failed to copy {json_file}");
+        }
+    }
+
+    // Pull the auto-updated performance page back to the local working tree.
+    // The bench harness updates docs/src/content/performance.md between the
+    // BENCH:START/END and BENCH-WARM:START/END markers on the remote instance.
+    // Without this fetch, the update stays on the instance and is never committed.
+    let perf_page = "docs/src/content/performance.md";
+    let remote_perf = format!("~/ocync/{perf_page}");
+    let local_perf = Path::new(perf_page);
+    if local_perf.exists() {
+        eprintln!("bench-remote: updating {perf_page}");
+        let status = Command::new("scp")
+            .args(SSH_OPTS)
+            .arg(format!("{}@{}:{}", config.user, config.host, remote_perf))
+            .arg(local_perf)
+            .status()?;
+        if !status.success() {
+            eprintln!("bench-remote: warning: failed to fetch updated {perf_page}");
         }
     }
 

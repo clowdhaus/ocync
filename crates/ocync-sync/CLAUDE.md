@@ -33,6 +33,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 - Per-blob `Notify::notify_waiters()` does NOT store permits. Every code path that transitions a blob out of `InProgress` MUST call `notify_blob`. Same applies to `BlobStage::notify_staged` / `notify_failed` for source-pull dedup. Missing notify = deadlock for concurrent waiters.
 - Per-repo `watch::Sender::send(true)` is called by `mark_repo_committed` (success) and `notify_repo_failed` (failure). Unlike Notify, watch retains state -- late subscribers see the value immediately. No lost-signal risk.
 - Leaders MUST NOT wait on `repo_committed_watch` for other leaders. Multiple images can be elected as leaders when they share distinct blob subsets with different followers. If leader A waits for leader B's manifest commit while B waits for A's, the circular dependency deadlocks the engine. Leaders detect themselves via `preferred_mount_sources.contains(target_repo)` and skip the wait, falling through to a direct mount attempt (202 on ECR triggers HEAD+push fallback).
+- Blob claim waits (`Notify::notified()` in the claim loop) MUST NOT hold the per-image blob semaphore. The claim-wait blocks until another image finishes uploading a shared blob. If all `BLOB_CONCURRENCY` permits are consumed by claim-waits, the image cannot make progress on its own claimed blobs, creating a cross-image deadlock. The `wait_for_blob_claim` function runs outside the semaphore; `transfer_claimed_blob` runs inside it.
 
 ## Transfer state cache
 

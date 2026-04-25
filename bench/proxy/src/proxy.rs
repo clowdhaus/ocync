@@ -17,12 +17,12 @@ use std::time::Instant;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::header::{
-    CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING,
-    UPGRADE,
+    CONNECTION, CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
+    TRANSFER_ENCODING, UPGRADE,
 };
 use http::uri::Authority;
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyDataStream, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -343,22 +343,44 @@ async fn handle_request(
         .unwrap_or_else(|| uri.path().to_owned());
     let url = format!("https://{}{}", target.as_str(), path_and_query);
 
-    let headers = forward_request_headers(req.headers(), &host);
+    // Extract Content-Length before consuming the body. We must read
+    // headers before `into_body()` since the borrow is consumed.
+    let content_length: Option<u64> = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
 
-    // Buffer the request body. PATCH/PUT blob chunks are bounded (ocync
-    // emits 5–50 MB chunks) and manifests are KB; buffering keeps the
-    // forward path simple and lets us report `request_bytes` exactly
-    // once we've read the whole thing.
-    let collected = match req.into_body().collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(e) => return Ok(error_response(500, format!("read request body: {e}"))),
-    };
-    let request_bytes = collected.len() as u64;
+    let mut headers = forward_request_headers(req.headers(), &host);
 
-    let upstream_req = upstream
+    // Strip Content-Length from forwarded headers. We set it explicitly
+    // on the reqwest builder below when present. Sending both
+    // Content-Length and chunked Transfer-Encoding violates RFC 7230
+    // section 3.3.2 and confuses some registries.
+    headers.remove(CONTENT_LENGTH);
+
+    // Stream the request body to upstream, counting bytes via an
+    // AtomicU64 counter instead of buffering the entire body in memory.
+    // A monolithic PUT of a multi-GB blob would OOM the proxy otherwise.
+    let request_counter = Arc::new(AtomicU64::new(0));
+    let counter_for_req = request_counter.clone();
+
+    let body_stream = BodyDataStream::new(req.into_body()).map(move |chunk| {
+        chunk
+            .inspect(|b| {
+                counter_for_req.fetch_add(b.len() as u64, Ordering::Relaxed);
+            })
+            .map_err(|e| e.to_string())
+    });
+
+    let mut upstream_req = upstream
         .request(method.clone(), &url)
         .headers(headers)
-        .body(collected);
+        .body(reqwest::Body::wrap_stream(body_stream));
+
+    if let Some(len) = content_length {
+        upstream_req = upstream_req.header(CONTENT_LENGTH, len);
+    }
 
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
@@ -369,7 +391,7 @@ async fn handle_request(
                 method: method.as_str(),
                 host: &host,
                 url: &path_and_query,
-                request_bytes,
+                request_bytes: request_counter.load(Ordering::Relaxed),
                 response_bytes: 0,
                 status: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
@@ -416,11 +438,13 @@ async fn handle_request(
         .map_err(|e| BodyError(e.to_string()))
     });
     // Attach a final future that fires after the stream drains.
+    let request_counter_for_log = request_counter.clone();
     let logging_stream = LogOnDrop {
         inner: stream,
         logged: false,
         on_drop: Some(Box::new(move || {
             let entry_bytes = byte_counter.load(Ordering::Relaxed);
+            let req_bytes = request_counter_for_log.load(Ordering::Relaxed);
             let elapsed = start.elapsed();
             let log = log_for_stream.clone();
             let method = method_for_log.clone();
@@ -434,7 +458,7 @@ async fn handle_request(
                         method: &method,
                         host: &host,
                         url: &url,
-                        request_bytes,
+                        request_bytes: req_bytes,
                         response_bytes: entry_bytes,
                         status: status_code,
                         duration_ms: elapsed.as_millis() as u64,
@@ -904,6 +928,36 @@ mod tests {
             1,
             "spawned task should write one JSONL entry"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Streaming body counter
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn streaming_body_counter_accurate() {
+        let chunks: Vec<Result<Bytes, String>> = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+            Ok(Bytes::from_static(b"!")),
+        ];
+        let counter = Arc::new(AtomicU64::new(0));
+        let counter_clone = counter.clone();
+
+        let stream = stream::iter(chunks).map(move |chunk| {
+            chunk.inspect(|b| {
+                counter_clone.fetch_add(b.len() as u64, Ordering::Relaxed);
+            })
+        });
+
+        // Drain the stream to trigger counting.
+        let mut total = 0usize;
+        tokio::pin!(stream);
+        while let Some(Ok(chunk)) = stream.next().await {
+            total += chunk.len();
+        }
+        assert_eq!(total, 12);
+        assert_eq!(counter.load(Ordering::Relaxed), 12);
     }
 
     // -----------------------------------------------------------------
