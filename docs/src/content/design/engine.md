@@ -142,7 +142,7 @@ The greedy set-cover provably covers every shared blob. No "uncovered follower" 
 
 ### Progressive promotion
 
-All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Per-blob `Notify` handles via `ClaimAction::Wait` in `transfer_single_blob` provide fine-grained synchronization: a follower that needs a blob still being uploaded by a leader waits on that specific blob's notify, not on all leaders completing.
+All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Per-blob `Notify` handles via `ClaimAction::Wait` in `wait_for_blob_claim` provide fine-grained synchronization: a follower that needs a blob still being uploaded by a leader waits on that specific blob's notify, not on all leaders completing.
 
 Mount sources are restricted to repos with committed manifests via a `committed_repos` set in the transfer state cache. After `push_manifests` succeeds, the repo is marked as committed. `blob_mount_source()` only returns repos from this set, ensuring mount attempts target repos that can fulfill them (ECR requires a committed manifest in the source repo for mount to return 201).
 

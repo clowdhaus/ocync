@@ -663,7 +663,7 @@ enum PromotionPhase {
     Discovering,
     /// All tasks promoted (leaders and followers together); no further
     /// phase transitions. Per-blob and per-repo-committed `Notify`
-    /// synchronization in `transfer_single_blob` ensures followers wait
+    /// synchronization in `wait_for_blob_claim` ensures followers wait
     /// for their specific leader blobs and manifest commits.
     Done,
 }
@@ -951,7 +951,7 @@ impl SyncEngine {
             // Leaders are ordered first by `elect_leaders` so they acquire
             // semaphore permits and claim blob uploads before followers.
             // Followers that need a blob still in-flight will wait on the
-            // per-blob `Notify` via `ClaimAction::Wait` in `transfer_single_blob`,
+            // per-blob `Notify` via `ClaimAction::Wait` in `wait_for_blob_claim`,
             // providing fine-grained synchronization without a coarse gate.
             if !shutting_down
                 && matches!(promotion_phase, PromotionPhase::Discovering)
@@ -2064,11 +2064,28 @@ async fn transfer_image_blobs(
         let cancel = &cancel;
         let batch = &batch_checked;
         blob_futures.push(async move {
+            // Cache skip and blob claim happen OUTSIDE the semaphore.
+            // The claim loop may wait on `Notify` for a blob claimed by
+            // another image. If that wait held a semaphore permit, all 6
+            // permits could be consumed by claim-waits, preventing this
+            // image from making progress on its own claimed blobs --
+            // deadlocking when two images each wait on blobs the other
+            // claimed. See: sync_cross_image_blob_claim_no_deadlock test.
+            let claim = wait_for_blob_claim(ctx, &digest, cancel).await;
+            match claim {
+                BlobClaim::Skipped => return BlobResult::Skipped,
+                BlobClaim::Cancelled => return BlobResult::Cancelled,
+                BlobClaim::Claimed => {}
+            }
             let _permit = sem.acquire().await.unwrap();
             if cancel.get() {
+                // Release claim: notify waiters so they don't hang.
+                let mut c = ctx.cache.borrow_mut();
+                c.set_blob_failed(ctx.target_name, digest.clone(), "cancelled".into());
+                c.notify_blob(ctx.target_name, &digest);
                 return BlobResult::Cancelled;
             }
-            transfer_single_blob(ctx, &digest, size, batch).await
+            transfer_claimed_blob(ctx, &digest, size, batch).await
         });
     }
 
@@ -2094,28 +2111,42 @@ async fn transfer_image_blobs(
     outcome
 }
 
-/// Transfer a single blob to one target: cache check, claim, mount, HEAD, pull+push.
+/// Result of the pre-semaphore blob claim phase.
+enum BlobClaim {
+    /// Blob already exists at target -- skip.
+    Skipped,
+    /// Cancel flag was set -- abort.
+    Cancelled,
+    /// Blob claimed for upload by this task.
+    Claimed,
+}
+
+/// Cache check + claim loop, run OUTSIDE the per-image blob semaphore.
 ///
-/// All `RefCell` borrows are dropped before `await` points, preserving the
-/// single-threaded cooperative scheduling invariant.
-async fn transfer_single_blob(
+/// This must not hold a semaphore permit because the claim-wait
+/// (`Notify::notified().await`) can block indefinitely waiting for another
+/// image to finish uploading a shared blob. If all semaphore permits were
+/// consumed by claim-waits, the image could not make progress on its own
+/// claimed blobs, creating a cross-image deadlock.
+async fn wait_for_blob_claim(
     ctx: &TransferContext<'_>,
     digest: &Digest,
-    size: u64,
-    batch_checked: &HashSet<Digest>,
-) -> BlobResult {
-    // Step 1: Check cache - known at this repo -> skip (0 API calls).
+    cancel: &Cell<bool>,
+) -> BlobClaim {
+    // Step 1: Check cache -- known at this repo -> skip (0 API calls).
     let skip = {
         let c = ctx.cache.borrow();
         c.blob_known_at_repo(ctx.target_name, digest, ctx.target_repo)
     };
-
     if skip {
-        return BlobResult::Skipped;
+        return BlobClaim::Skipped;
     }
 
     // Step 2a: Atomic check-and-claim.
     loop {
+        if cancel.get() {
+            return BlobClaim::Cancelled;
+        }
         let action: ClaimAction = {
             let mut c = ctx.cache.borrow_mut();
             match c
@@ -2147,10 +2178,22 @@ async fn transfer_single_blob(
                 notify.notified().await;
                 continue;
             }
-            ClaimAction::Claimed => break,
+            ClaimAction::Claimed => return BlobClaim::Claimed,
         }
     }
+}
 
+/// Transfer a claimed blob to one target: mount, HEAD, pull+push.
+///
+/// The blob MUST already be claimed via [`wait_for_blob_claim`]. This
+/// function runs under the per-image blob semaphore to bound concurrent
+/// I/O. All `RefCell` borrows are dropped before `await` points.
+async fn transfer_claimed_blob(
+    ctx: &TransferContext<'_>,
+    digest: &Digest,
+    size: u64,
+    batch_checked: &HashSet<Digest>,
+) -> BlobResult {
     // Step 2b: Cross-repo mount. Prefer leader repos (committed manifests)
     // over other followers (whose manifests may not be committed yet).
     //

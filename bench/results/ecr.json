@@ -1162,5 +1162,94 @@
         ]
       }
     ]
+  },
+  {
+    "timestamp": "2026-04-24-190047",
+    "git_ref": "2fed5e5",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 189.419495718,
+            "peak_rss_kb": 79108,
+            "requests": 7415,
+            "rate_limit_429s": 0,
+            "response_bytes": 55405079358,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 446,
+            "mount_successes": 423,
+            "source_blob_gets": 1451,
+            "source_blob_bytes": 55404828696,
+            "cdn_hits": 1056,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1056,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "phase_timing_ms": {
+              "discovery_complete": 2685,
+              "discovery_start": 0,
+              "execution_complete": 189292
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 1.438958545,
+            "peak_rss_kb": 17728,
+            "requests": 147,
+            "rate_limit_429s": 0,
+            "response_bytes": 135140,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 125723,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "phase_timing_ms": {
+              "discovery_complete": 1395,
+              "discovery_start": 0,
+              "execution_complete": 1395
+            }
+          }
+        ]
+      }
+    ]
   }
 ]

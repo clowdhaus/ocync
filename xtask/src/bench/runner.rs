@@ -98,7 +98,21 @@ pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
 }
 
 /// Builds ocync and bench-proxy in release mode from the given workspace root.
+///
+/// Touches all workspace `.rs` files before building to force cargo's
+/// mtime-based fingerprinting to detect changes. After `git checkout` or
+/// `git reset --hard`, git may preserve mtimes on unchanged files, causing
+/// cargo to consider stale object files "fresh" and skip recompilation.
 pub(crate) async fn build_ocync(workspace_root: &Path) -> Result<(), String> {
+    // Force source mtimes newer than any cached dep-info so cargo
+    // recompiles workspace crates even if git preserved mtimes.
+    for dir in ["crates", "src", "bench/proxy/src"] {
+        let target = workspace_root.join(dir);
+        if target.is_dir() {
+            touch_rs_files(&target);
+        }
+    }
+
     let status = tokio::process::Command::new("cargo")
         .args([
             "build",
@@ -125,6 +139,32 @@ pub(crate) async fn build_ocync(workspace_root: &Path) -> Result<(), String> {
     }
 }
 
+/// Touch all `.rs` files under `dir` to set their mtime to now.
+///
+/// This is a local-path defense for `build_ocync()`. In the remote bench
+/// path, `rm -rf target/` already forces a full rebuild, making this a
+/// no-op. For local runs (or if `rm -rf target/` is ever removed), this
+/// ensures cargo sees workspace sources as newer than cached dep-info.
+fn touch_rs_files(dir: &Path) {
+    let Ok(walker) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            touch_rs_files(&path);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            // Explicitly set mtime -- opening with O_APPEND without writing
+            // does NOT update mtime on Linux ext4/xfs (POSIX requires a
+            // write, not just an open).
+            if let Ok(f) = std::fs::File::open(&path) {
+                let _ = f.set_modified(now);
+            }
+        }
+    }
+}
+
 /// Spawns a benchmark tool with timing and output capture.
 ///
 /// Sets `HTTPS_PROXY` to `proxy_url` so all HTTP traffic routes through the
@@ -139,7 +179,7 @@ pub(crate) async fn build_ocync(workspace_root: &Path) -> Result<(), String> {
 pub(crate) async fn run_tool(
     tool: Tool,
     config_path: &Path,
-    proxy_url: &str,
+    proxy_url: Option<&str>,
     workspace_root: &Path,
 ) -> Result<RunResult, String> {
     let config_str = config_path.to_string_lossy();
@@ -178,31 +218,32 @@ pub(crate) async fn run_tool(
     // report to stderr; the tool's own stderr is interleaved but the RSS
     // line has a distinctive prefix we can parse.
     let use_gnu_time = Path::new("/usr/bin/time").exists();
-    let mut child = if use_gnu_time {
+    let mut cmd = if use_gnu_time {
         let mut time_args = vec!["-v", binary.as_ref()];
         time_args.extend(args.iter().copied());
-        let mut cmd = tokio::process::Command::new("/usr/bin/time");
-        cmd.args(&time_args)
-            .env("HTTPS_PROXY", proxy_url)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(ref tp) = timing_path {
-            cmd.env("OCYNC_TIMING_FILE", tp);
-        }
-        cmd.spawn()
-            .map_err(|e| format!("failed to spawn /usr/bin/time {}: {e}", tool.binary()))?
+        let mut c = tokio::process::Command::new("/usr/bin/time");
+        c.args(&time_args);
+        c
     } else {
-        let mut cmd = tokio::process::Command::new(binary.as_ref());
-        cmd.args(&args)
-            .env("HTTPS_PROXY", proxy_url)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(ref tp) = timing_path {
-            cmd.env("OCYNC_TIMING_FILE", tp);
-        }
-        cmd.spawn()
-            .map_err(|e| format!("failed to spawn {}: {e}", tool.binary()))?
+        let mut c = tokio::process::Command::new(binary.as_ref());
+        c.args(&args);
+        c
     };
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(url) = proxy_url {
+        cmd.env("HTTPS_PROXY", url);
+    }
+    if let Some(ref tp) = timing_path {
+        cmd.env("OCYNC_TIMING_FILE", tp);
+    }
+    let spawn_desc = if use_gnu_time {
+        format!("/usr/bin/time {}", tool.binary())
+    } else {
+        tool.binary().to_string()
+    };
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {spawn_desc}: {e}"))?;
 
     // Stream stdout and stderr line-by-line while capturing for RunResult.
     // Lines go to stderr (not stdout) so they flow through the nohup log

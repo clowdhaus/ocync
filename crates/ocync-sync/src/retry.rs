@@ -59,11 +59,12 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
 
 /// Determine whether a transport-level (non-HTTP) error should be retried.
 ///
-/// Returns `true` for connection failures, request timeouts, and response
-/// body errors (premature EOF, truncated body, decode failures from
-/// corrupted transport) surfaced by `reqwest`. These are transient by
-/// nature and safe to retry idempotent OCI operations on. Deterministic
-/// decode failures (e.g. malformed registry responses) are bounded by
+/// Returns `true` for connection failures, request timeouts, mid-stream
+/// send failures (connection reset during body upload), and response body
+/// errors (premature EOF, truncated body, decode failures from corrupted
+/// transport) surfaced by `reqwest`. These are transient by nature and
+/// safe to retry idempotent OCI operations on. Deterministic decode
+/// failures (e.g. malformed registry responses) are bounded by
 /// `max_retries`.
 ///
 /// # Known limitation
@@ -78,10 +79,16 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
 /// show which variant was encountered so the match can be extended.
 pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
     if let ocync_distribution::Error::Http(reqwest_err) = error {
+        // `is_request()` is a superset of `is_connect()` and `is_timeout()`
+        // for the async hyper path (all errors from `Client::send_request`
+        // are wrapped as Kind::Request). The narrower predicates are kept
+        // for documentation: they make the intended coverage explicit and
+        // guard against future reqwest taxonomy changes.
         reqwest_err.is_connect()
             || reqwest_err.is_timeout()
             || reqwest_err.is_body()
             || reqwest_err.is_decode()
+            || reqwest_err.is_request()
     } else {
         tracing::debug!(
             error = %error,
@@ -255,5 +262,30 @@ mod tests {
             source: std::io::Error::other("staging read failed"),
         };
         assert!(!should_retry_transport(&err));
+    }
+
+    /// Positive-path test: a real reqwest connection failure (refused port)
+    /// must be classified as retryable. This exercises the `is_connect()`
+    /// and `is_request()` predicates on a genuine `reqwest::Error`.
+    #[tokio::test]
+    async fn should_retry_transport_on_connect_failure() {
+        ocync_distribution::install_crypto_provider();
+        // Connect to a port where nothing is listening -- produces a real
+        // reqwest::Error with is_connect()=true and is_request()=true.
+        let client = reqwest::Client::new();
+        let reqwest_err = client
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .expect_err("connect to port 1 should fail");
+        assert!(
+            reqwest_err.is_connect(),
+            "expected is_connect(), got: {reqwest_err}"
+        );
+        let err = ocync_distribution::Error::Http(reqwest_err);
+        assert!(
+            should_retry_transport(&err),
+            "connection refused should be retryable"
+        );
     }
 }

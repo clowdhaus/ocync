@@ -629,11 +629,17 @@ fn scenario_markdown(report: &BenchReport, scenario: &ScenarioResult, descriptio
     let inst = &report.instance;
     let mut out = String::new();
 
+    let proxy_note = if scenario.runs.iter().all(|r| r.proxy_metrics.is_none()) {
+        "Direct connections (proxy disabled -- no traffic metrics)."
+    } else {
+        "All traffic routed through bench-proxy for byte-accurate measurement."
+    };
+
     let memory_gib = inst.memory_mib as f64 / 1024.0;
     out.push_str(&format!(
         "Measured {date} on {inst_type} ({arch}, {vcpus} vCPUs, {mem:.0} GiB, {net}). \
          Full corpus: {images} images, {tags} tags. {description} to ECR {region}. \
-         All traffic routed through bench-proxy for byte-accurate measurement.\n\n",
+         {proxy_note}\n\n",
         date = report.timestamp.get(..10).unwrap_or(&report.timestamp),
         inst_type = inst.instance_type,
         arch = inst.arch,
@@ -1159,7 +1165,8 @@ mod tests {
         assert!(md.contains("c7g.xlarge"));
         assert!(md.contains("28 images, 40 tags"));
         assert!(md.contains("Cold sync to ECR"));
-        assert!(md.contains("bench-proxy"));
+        // sample_report() has no proxy metrics, so the no-proxy note is shown.
+        assert!(md.contains("Direct connections (proxy disabled"));
         // Contains the metric table.
         assert!(md.contains("| Metric | ocync | dregsy |"));
         assert!(md.contains("| Wall clock |"));
