@@ -46,7 +46,7 @@ aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED
 
 ## Rate limits
 
-ECR has per-action rate limits (e.g., `PutImage` at ~10 TPS vs `UploadLayerPart` at ~500 TPS). `ocync` tracks 9 independent concurrency windows -- one per API action -- so a 429 on blob uploads does not throttle manifest reads.
+ECR has per-action rate limits (e.g., `PutImage` at ~10 TPS vs `UploadLayerPart` at ~500 TPS). `ocync` tracks 9 independent concurrency windows -- one per API action -- so a 429 on blob uploads does not throttle manifest reads. These per-action limits are enforced pre-emptively by ocync's token-bucket layer; specific rate values are catalogued in the [rate-bucket spec](../../../superpowers/specs/2026-04-26-aimd-rate-bucket-design.md).
 
 ## ECR Public
 

@@ -96,6 +96,71 @@ impl AimdWindow {
     }
 }
 
+/// Token-bucket rate limiter. Tokens refill at `rate_per_sec` up to `burst`;
+/// [`acquire`](Self::acquire) blocks until a token is available.
+///
+/// Used alongside [`AimdWindow`] to bound TPS where AIMD's concurrency
+/// window cannot. AIMD discovers a healthy concurrency level via 429
+/// feedback; the bucket enforces a hard rate ceiling derived from
+/// documented registry quotas (see `bucket_config_for_window`).
+///
+/// Uses [`tokio::time::Instant`] (not [`std::time::Instant`]) for the
+/// `last_refill` timestamp. Refill arithmetic and the internal
+/// [`tokio::time::sleep`] then share a single clock source, which is
+/// required for `#[tokio::test(start_paused = true)]` -- with mixed
+/// clocks the bucket would livelock under paused virtual time because
+/// the std clock never advances while `sleep` returns immediately.
+///
+/// The mutex is released before sleeping, so concurrent consumers do
+/// not serialize on lock contention.
+#[derive(Debug)]
+pub(crate) struct TokenBucket {
+    rate_per_sec: f64,
+    burst: f64,
+    state: Mutex<TokenBucketState>,
+}
+
+#[derive(Debug)]
+struct TokenBucketState {
+    tokens: f64,
+    last_refill: tokio::time::Instant,
+}
+
+impl TokenBucket {
+    pub(crate) fn new(rate_per_sec: f64, burst: f64) -> Self {
+        Self {
+            rate_per_sec,
+            burst,
+            state: Mutex::new(TokenBucketState {
+                tokens: burst,
+                last_refill: tokio::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Acquire a single token, sleeping until one is available.
+    pub(crate) async fn acquire(&self) {
+        loop {
+            let sleep_for = {
+                let mut s = self.state.lock().expect("token-bucket lock poisoned");
+                let now = tokio::time::Instant::now();
+                let elapsed = now.duration_since(s.last_refill).as_secs_f64();
+                s.tokens = (s.tokens + elapsed * self.rate_per_sec).min(self.burst);
+                s.last_refill = now;
+                if s.tokens >= 1.0 {
+                    s.tokens -= 1.0;
+                    return;
+                }
+                let need = 1.0 - s.tokens;
+                Duration::from_secs_f64(need / self.rate_per_sec)
+            };
+            // IMPORTANT: lock released before sleep so other tasks make
+            // progress. A held lock here would serialize all consumers.
+            tokio::time::sleep(sleep_for).await;
+        }
+    }
+}
+
 /// An OCI registry API action, used to map operations to independent AIMD windows.
 ///
 /// ECR enforces rate limits at the individual action level (e.g., `InitiateLayerUpload`
@@ -150,6 +215,21 @@ const DOCKER_HUB_OTHER: u8 = 12;
 // - GAR window key: single shared project quota --
 const GAR_SHARED: u8 = 20;
 
+// - ECR Public window keys: per-action TPS (5 windows) --
+const ECR_PUBLIC_PULL: u8 = 40; // manifest reads/heads, blob reads/heads, tag list
+const ECR_PUBLIC_MANIFEST_WRITE: u8 = 41;
+const ECR_PUBLIC_BLOB_UPLOAD_INIT: u8 = 42;
+const ECR_PUBLIC_BLOB_UPLOAD_CHUNK: u8 = 43;
+const ECR_PUBLIC_BLOB_UPLOAD_COMPLETE: u8 = 44;
+
+// - GHCR window keys: per-namespace reads, per-token writes --
+const GHCR_READ: u8 = 50;
+const GHCR_WRITE: u8 = 51;
+
+// - ACR window keys: aggregate ReadOps and WriteOps per registry --
+const ACR_READ: u8 = 60;
+const ACR_WRITE: u8 = 61;
+
 // - Unknown registry window keys: coarse grouping --
 const UNKNOWN_HEADS: u8 = 30;
 const UNKNOWN_READS: u8 = 31;
@@ -161,16 +241,17 @@ const UNKNOWN_TAG_LIST: u8 = 34;
 ///
 /// The mapping reflects each registry's actual rate-limit granularity:
 ///
-/// - **ECR**: every action has an independent limit - 9 distinct windows.
-/// - **Docker Hub**: HEAD operations are unmetered and share a window; manifest
-///   reads have a separate 100-pull/6h quota; other operations share.
-/// - **GAR**: all actions share a single per-project quota.
-/// - **Unknown**: coarse grouping - HEADs share, reads share, uploads share,
-///   manifest writes and tag listing get their own windows.
+/// - **ECR**: every action has an independent limit -- 9 distinct windows.
+/// - **ECR Public**: 5 windows (pull paths share, plus 4 write windows).
+/// - **Docker Hub**: HEADs unmetered/shared; manifest reads quota'd; rest shared.
+/// - **GAR / GCR**: single shared project quota.
+/// - **GHCR**: per-namespace reads, per-token writes -- 2 windows.
+/// - **ACR**: aggregate `ReadOps` and `WriteOps` per registry -- 2 windows.
+/// - **Unknown** (Chainguard, Quay, generic): coarse grouping -- HEADs / reads
+///   / uploads / manifest writes / tag listing.
 pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey {
     match detect_provider_kind(host) {
         Some(ProviderKind::Ecr) => {
-            // ECR: independent TPS limit per action
             let key = match action {
                 RegistryAction::ManifestHead => ECR_MANIFEST_HEAD,
                 RegistryAction::ManifestRead => ECR_MANIFEST_READ,
@@ -184,8 +265,21 @@ pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey 
             };
             WindowKey(key)
         }
+        Some(ProviderKind::EcrPublic) => {
+            let key = match action {
+                RegistryAction::ManifestHead
+                | RegistryAction::ManifestRead
+                | RegistryAction::BlobHead
+                | RegistryAction::BlobRead
+                | RegistryAction::TagList => ECR_PUBLIC_PULL,
+                RegistryAction::ManifestWrite => ECR_PUBLIC_MANIFEST_WRITE,
+                RegistryAction::BlobUploadInit => ECR_PUBLIC_BLOB_UPLOAD_INIT,
+                RegistryAction::BlobUploadChunk => ECR_PUBLIC_BLOB_UPLOAD_CHUNK,
+                RegistryAction::BlobUploadComplete => ECR_PUBLIC_BLOB_UPLOAD_COMPLETE,
+            };
+            WindowKey(key)
+        }
         Some(ProviderKind::DockerHub) => {
-            // Docker Hub: HEADs are free, manifest reads quota'd, rest shared
             let key = match action {
                 RegistryAction::ManifestHead | RegistryAction::BlobHead => DOCKER_HUB_HEADS,
                 RegistryAction::ManifestRead => DOCKER_HUB_MANIFEST_READ,
@@ -193,13 +287,40 @@ pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey 
             };
             WindowKey(key)
         }
-        Some(ProviderKind::Gar) => {
-            // GAR: single shared project quota
+        Some(ProviderKind::Gar) | Some(ProviderKind::Gcr) => {
+            // Single shared project quota; GCR is now an alias for GAR.
             WindowKey(GAR_SHARED)
         }
+        Some(ProviderKind::Ghcr) => {
+            let key = match action {
+                RegistryAction::ManifestHead
+                | RegistryAction::ManifestRead
+                | RegistryAction::BlobHead
+                | RegistryAction::BlobRead
+                | RegistryAction::TagList => GHCR_READ,
+                RegistryAction::ManifestWrite
+                | RegistryAction::BlobUploadInit
+                | RegistryAction::BlobUploadChunk
+                | RegistryAction::BlobUploadComplete => GHCR_WRITE,
+            };
+            WindowKey(key)
+        }
+        Some(ProviderKind::Acr) => {
+            let key = match action {
+                RegistryAction::ManifestHead
+                | RegistryAction::ManifestRead
+                | RegistryAction::BlobHead
+                | RegistryAction::BlobRead
+                | RegistryAction::TagList => ACR_READ,
+                RegistryAction::ManifestWrite
+                | RegistryAction::BlobUploadInit
+                | RegistryAction::BlobUploadChunk
+                | RegistryAction::BlobUploadComplete => ACR_WRITE,
+            };
+            WindowKey(key)
+        }
         _ => {
-            // All other registries (GHCR, ACR, Chainguard, ECR Public,
-            // GCR, unknown): coarse grouping
+            // Chainguard, Quay, generic -- coarse grouping.
             let key = match action {
                 RegistryAction::ManifestHead | RegistryAction::BlobHead => UNKNOWN_HEADS,
                 RegistryAction::ManifestRead | RegistryAction::BlobRead => UNKNOWN_READS,
@@ -214,11 +335,55 @@ pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey 
     }
 }
 
+/// Token-bucket configuration `(rate_per_sec, burst)` for the given window
+/// key, or `None` if rate gating is not configured for this window (AIMD
+/// alone governs concurrency).
+///
+/// Returned as a tuple rather than a constructed [`TokenBucket`] so this
+/// function is a pure lookup -- testable without instantiating tokio
+/// types and reusable from non-async contexts. Callers in async code wrap
+/// the result via `.map(|(r, b)| Arc::new(TokenBucket::new(r, b)))`.
+///
+/// Values are 20% under documented caps to absorb tail bursts without
+/// artificial throttling at steady state. Per-cap source citations live
+/// in `docs/superpowers/specs/2026-04-26-aimd-rate-bucket-design.md`;
+/// that spec is the authoritative ledger of which caps come from which
+/// official documentation versus community measurement. Verify the
+/// citations against the live registry docs as part of the bench gate.
+fn bucket_config_for_window(key: WindowKey) -> Option<(f64, f64)> {
+    let cfg = match key.0 {
+        // ECR private (per-account, per-region; AWS docs)
+        ECR_MANIFEST_WRITE => (8.0, 10.0),
+        ECR_BLOB_UPLOAD_INIT => (80.0, 20.0),
+        ECR_BLOB_UPLOAD_COMPLETE => (80.0, 20.0),
+        ECR_BLOB_UPLOAD_CHUNK => (400.0, 50.0),
+        // ECR Public (per-account, per-region; AWS docs)
+        ECR_PUBLIC_PULL => (8.0, 10.0),
+        ECR_PUBLIC_MANIFEST_WRITE => (8.0, 10.0),
+        ECR_PUBLIC_BLOB_UPLOAD_INIT => (8.0, 10.0),
+        ECR_PUBLIC_BLOB_UPLOAD_COMPLETE => (8.0, 10.0),
+        ECR_PUBLIC_BLOB_UPLOAD_CHUNK => (200.0, 30.0),
+        // GHCR (per-namespace reads, per-token writes; community-measured)
+        GHCR_READ => (580.0, 50.0),
+        GHCR_WRITE => (26.0, 10.0),
+        // GAR/GCR (per-project, per-region; Google docs)
+        GAR_SHARED => (240.0, 30.0),
+        // ACR (per-registry, Premium SKU defaults; Microsoft historical docs)
+        ACR_READ => (130.0, 30.0),
+        ACR_WRITE => (26.0, 10.0),
+        // Everything else: AIMD only.
+        _ => return None,
+    };
+    Some(cfg)
+}
+
 /// State stored per AIMD window inside [`AimdController`].
 struct WindowState {
     window: AimdWindow,
     /// Semaphore enforcing the current window limit.
     semaphore: Arc<Semaphore>,
+    /// Optional token bucket for hard TPS ceilings (None = AIMD only).
+    bucket: Option<Arc<TokenBucket>>,
 }
 
 impl std::fmt::Debug for WindowState {
@@ -272,20 +437,31 @@ impl AimdController {
     pub async fn acquire(&self, op: RegistryAction) -> AimdPermit<'_> {
         let key = window_key_for_registry(&self.host, op);
 
-        // Ensure the window entry exists, then read its semaphore.
-        let action_semaphore = {
+        // Ensure the window entry exists, then capture the semaphore + bucket.
+        let (action_semaphore, bucket) = {
             let mut map = self.windows.lock().expect("aimd lock poisoned");
             let state = map.entry(key).or_insert_with(|| {
                 let initial = DEFAULT_INITIAL_WINDOW.min(self.max_concurrent as f64);
                 let window = AimdWindow::new(initial, self.max_concurrent);
                 let limit = window.limit();
+                let bucket = bucket_config_for_window(key)
+                    .map(|(rate, burst)| Arc::new(TokenBucket::new(rate, burst)));
                 WindowState {
                     window,
                     semaphore: Arc::new(Semaphore::new(limit)),
+                    bucket,
                 }
             });
-            Arc::clone(&state.semaphore)
+            (Arc::clone(&state.semaphore), state.bucket.clone())
         };
+
+        // Bucket gate: acquire BEFORE concurrency permits so a paced action
+        // does not occupy a slot that could service another window. Released
+        // to other tasks during sleep (lock is dropped before await inside
+        // TokenBucket::acquire).
+        if let Some(b) = &bucket {
+            b.acquire().await;
+        }
 
         // Acquire aggregate permit first, then per-action.
         let aggregate_permit = Arc::clone(&self.aggregate)
@@ -549,6 +725,324 @@ mod tests {
             w.limit(),
             cap,
             "window should grow to cap after enough successes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // TokenBucket -- pacing under paused virtual time
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn token_bucket_burst_completes_without_pacing() {
+        // Burst capacity covers the first N acquires with zero wait.
+        let tb = TokenBucket::new(80.0, 20.0);
+        let start = tokio::time::Instant::now();
+        for _ in 0..20 {
+            tb.acquire().await;
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1),
+            "burst of 20 should complete near-instantly, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_bucket_paces_after_burst() {
+        // After draining the burst, the next acquire must wait >= 1/rate seconds.
+        let tb = TokenBucket::new(80.0, 20.0);
+        for _ in 0..20 {
+            tb.acquire().await;
+        }
+        let before = tokio::time::Instant::now();
+        tb.acquire().await;
+        let waited = before.elapsed();
+        let expected = std::time::Duration::from_secs_f64(1.0 / 80.0);
+        assert!(
+            waited >= expected,
+            "expected wait >= {expected:?}, got {waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_bucket_refills_at_configured_rate() {
+        // Drain the bucket, advance by exactly enough for one refill, then
+        // verify the next acquire is immediate (no further sleep).
+        let tb = TokenBucket::new(10.0, 1.0);
+        tb.acquire().await; // consume the only token
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        let before = tokio::time::Instant::now();
+        tb.acquire().await;
+        assert!(
+            before.elapsed() < std::time::Duration::from_millis(1),
+            "token should be available after 100ms refill at 10/s, got {:?}",
+            before.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn token_bucket_serves_concurrent_consumers_without_deadlock() {
+        // Lock-correctness check. If TokenBucket::acquire holds the std::sync
+        // Mutex across tokio::time::sleep, the second consumer's lock() call
+        // blocks the only thread on a current_thread runtime, deadlocking the
+        // runtime entirely (the awaiting task holding the lock can never be
+        // polled to release it). cargo test's per-test timeout catches this
+        // as a hang. We do NOT assert on elapsed wall-clock -- timing assertions
+        // are flaky in CI; "all 20 acquires complete" is the property we want.
+        use std::sync::Arc;
+        let tb = Arc::new(TokenBucket::new(100.0, 10.0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let tb = Arc::clone(&tb);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..5 {
+                    tb.acquire().await;
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // Reaching here means all 20 acquires completed; the lock is released
+        // across the await inside acquire().
+    }
+
+    // - Window-key routing tests --
+
+    #[test]
+    fn ecr_public_window_keys_route_per_action() {
+        use RegistryAction::*;
+        let host = "public.ecr.aws";
+        let cases: &[(RegistryAction, u8)] = &[
+            (ManifestHead, ECR_PUBLIC_PULL),
+            (ManifestRead, ECR_PUBLIC_PULL),
+            (BlobHead, ECR_PUBLIC_PULL),
+            (BlobRead, ECR_PUBLIC_PULL),
+            (TagList, ECR_PUBLIC_PULL),
+            (ManifestWrite, ECR_PUBLIC_MANIFEST_WRITE),
+            (BlobUploadInit, ECR_PUBLIC_BLOB_UPLOAD_INIT),
+            (BlobUploadChunk, ECR_PUBLIC_BLOB_UPLOAD_CHUNK),
+            (BlobUploadComplete, ECR_PUBLIC_BLOB_UPLOAD_COMPLETE),
+        ];
+        for &(action, expected) in cases {
+            let got = window_key_for_registry(host, action).0;
+            assert_eq!(got, expected, "ECR Public {action:?} -> key");
+        }
+    }
+
+    #[test]
+    fn ghcr_window_keys_route_read_vs_write() {
+        use RegistryAction::*;
+        let host = "ghcr.io";
+        let cases: &[(RegistryAction, u8)] = &[
+            (ManifestHead, GHCR_READ),
+            (ManifestRead, GHCR_READ),
+            (BlobHead, GHCR_READ),
+            (BlobRead, GHCR_READ),
+            (TagList, GHCR_READ),
+            (ManifestWrite, GHCR_WRITE),
+            (BlobUploadInit, GHCR_WRITE),
+            (BlobUploadChunk, GHCR_WRITE),
+            (BlobUploadComplete, GHCR_WRITE),
+        ];
+        for &(action, expected) in cases {
+            let got = window_key_for_registry(host, action).0;
+            assert_eq!(got, expected, "GHCR {action:?} -> key");
+        }
+    }
+
+    #[test]
+    fn acr_window_keys_route_read_vs_write() {
+        use RegistryAction::*;
+        let host = "myreg.azurecr.io";
+        let cases: &[(RegistryAction, u8)] = &[
+            (ManifestHead, ACR_READ),
+            (ManifestRead, ACR_READ),
+            (BlobHead, ACR_READ),
+            (BlobRead, ACR_READ),
+            (TagList, ACR_READ),
+            (ManifestWrite, ACR_WRITE),
+            (BlobUploadInit, ACR_WRITE),
+            (BlobUploadChunk, ACR_WRITE),
+            (BlobUploadComplete, ACR_WRITE),
+        ];
+        for &(action, expected) in cases {
+            let got = window_key_for_registry(host, action).0;
+            assert_eq!(got, expected, "ACR {action:?} -> key");
+        }
+    }
+
+    // - bucket_config_for_window: structural invariants --
+
+    #[test]
+    fn bucket_table_has_all_required_ecr_upload_windows() {
+        // ECR private upload paths must have a bucket; the bench failure that
+        // motivated this PR was 5x429s on InitiateLayerUpload under cross-repo
+        // aggregation. Removing any of these silently re-opens that hazard.
+        for key in [
+            ECR_MANIFEST_WRITE,
+            ECR_BLOB_UPLOAD_INIT,
+            ECR_BLOB_UPLOAD_COMPLETE,
+            ECR_BLOB_UPLOAD_CHUNK,
+        ] {
+            assert!(
+                bucket_config_for_window(WindowKey(key)).is_some(),
+                "ECR upload key {key} must have a bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_table_excludes_unmetered_windows() {
+        // ECR HEAD is documented as unmetered; Docker Hub HEAD is unmetered;
+        // UNKNOWN_* registries have no documented cap and must fall back to
+        // AIMD-only.
+        for key in [
+            ECR_MANIFEST_HEAD,
+            ECR_BLOB_HEAD,
+            DOCKER_HUB_HEADS,
+            DOCKER_HUB_MANIFEST_READ,
+            DOCKER_HUB_OTHER,
+            UNKNOWN_HEADS,
+            UNKNOWN_READS,
+            UNKNOWN_UPLOADS,
+            UNKNOWN_MANIFEST_WRITE,
+            UNKNOWN_TAG_LIST,
+        ] {
+            assert!(
+                bucket_config_for_window(WindowKey(key)).is_none(),
+                "key {key} must NOT have a bucket (no documented cap)"
+            );
+        }
+    }
+
+    #[test]
+    fn ecr_chunk_rate_exceeds_init_rate() {
+        // AWS documents InitiateLayerUpload at 100 TPS and UploadLayerPart at
+        // 500 TPS. Chunk MUST be the more permissive of the two; reversing
+        // this is a documented misconfiguration that would slow uploads.
+        let init = bucket_config_for_window(WindowKey(ECR_BLOB_UPLOAD_INIT)).unwrap();
+        let chunk = bucket_config_for_window(WindowKey(ECR_BLOB_UPLOAD_CHUNK)).unwrap();
+        assert!(
+            chunk.0 > init.0,
+            "ECR chunk rate ({}) must exceed init rate ({})",
+            chunk.0,
+            init.0
+        );
+    }
+
+    #[test]
+    fn bucket_values_are_sane() {
+        // Walk every configured key and assert: rate > 0, burst > 0, both
+        // finite, and burst is bounded relative to rate. A bucket only
+        // emits sustained traffic at `rate_per_sec`; the burst absorbs a
+        // brief over-rate prefix before depletion. We therefore cannot
+        // assert `burst <= rate` (low-rate windows like ECR ManifestWrite
+        // deliberately set burst at ~1 documented-cap-second), but a
+        // burst more than 10x the per-second rate is structurally unsafe
+        // because it lets a cold path emit a multi-second over-cap spike
+        // before the bucket reins it in.
+        let configured: &[u8] = &[
+            ECR_MANIFEST_WRITE,
+            ECR_BLOB_UPLOAD_INIT,
+            ECR_BLOB_UPLOAD_COMPLETE,
+            ECR_BLOB_UPLOAD_CHUNK,
+            ECR_PUBLIC_PULL,
+            ECR_PUBLIC_MANIFEST_WRITE,
+            ECR_PUBLIC_BLOB_UPLOAD_INIT,
+            ECR_PUBLIC_BLOB_UPLOAD_COMPLETE,
+            ECR_PUBLIC_BLOB_UPLOAD_CHUNK,
+            GHCR_READ,
+            GHCR_WRITE,
+            GAR_SHARED,
+            ACR_READ,
+            ACR_WRITE,
+        ];
+        for &k in configured {
+            let (rate, burst) = bucket_config_for_window(WindowKey(k)).unwrap_or_else(|| {
+                panic!("key {k} listed as configured but bucket_config_for_window returned None")
+            });
+            assert!(
+                rate.is_finite() && rate > 0.0,
+                "key {k}: rate {rate} not positive-finite"
+            );
+            assert!(
+                burst.is_finite() && burst > 0.0,
+                "key {k}: burst {burst} not positive-finite"
+            );
+            assert!(
+                burst <= 10.0 * rate,
+                "key {k}: burst {burst} exceeds 10x rate {rate}; permits multi-second over-cap spike"
+            );
+        }
+    }
+
+    // - AimdController bucket integration --
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn controller_paces_ecr_blob_upload_init() {
+        // ECR_BLOB_UPLOAD_INIT is configured at 80/sec burst 20.
+        // Acquire 100 permits in series; total elapsed should be at least
+        // (100 - 20) / 80 = 1.0 sec because of bucket pacing past burst.
+        let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
+        let ctrl = AimdController::new(host, 100);
+        let start = tokio::time::Instant::now();
+        for _ in 0..100 {
+            let permit = ctrl.acquire(RegistryAction::BlobUploadInit).await;
+            permit.success();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "100 acquires at 80/sec burst 20 should take >= 1s, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn controller_does_not_pace_unconfigured_window() {
+        // ECR_MANIFEST_HEAD has no bucket -- acquires should be near-instant.
+        let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
+        let ctrl = AimdController::new(host, 100);
+        let start = tokio::time::Instant::now();
+        for _ in 0..100 {
+            let permit = ctrl.acquire(RegistryAction::ManifestHead).await;
+            permit.success();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "100 acquires on unconfigured window should be near-instant, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn aimd_halving_preserves_bucket_state() {
+        // AIMD halving rebuilds the per-action Semaphore (the action_permit is
+        // forgotten). The bucket must NOT be rebuilt -- it represents an
+        // independent rate-cap concern that survives concurrency adjustment.
+        // Regression: a future refactor that rebuilds bucket on halving would
+        // restore burst tokens and re-enable over-cap traffic exactly when the
+        // registry has signalled it cannot handle current load.
+        let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
+        let ctrl = AimdController::new(host, 100);
+
+        // Drain the bucket: 20 burst + a small post-burst sample.
+        for _ in 0..21 {
+            let permit = ctrl.acquire(RegistryAction::BlobUploadInit).await;
+            permit.success();
+        }
+        // Trigger a 429 halving.
+        let permit = ctrl.acquire(RegistryAction::BlobUploadInit).await;
+        permit.throttled();
+        // Next acquire must still observe bucket pacing (>= 1/80s) -- bucket
+        // was not reset by the halving.
+        let before = tokio::time::Instant::now();
+        let permit = ctrl.acquire(RegistryAction::BlobUploadInit).await;
+        permit.success();
+        let waited = before.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_secs_f64(1.0 / 80.0),
+            "bucket pacing must survive AIMD halving, got {waited:?}"
         );
     }
 }

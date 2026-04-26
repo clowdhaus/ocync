@@ -82,6 +82,10 @@ A 429 on `PutImage` must not throttle `UploadLayerPart`. Per-action windows ensu
 
 Window grouping is registry-specific (ECR uses 9 windows matching its per-action TPS limits; Docker Hub uses 3 to separate free HEADs from metered manifest GETs; GAR uses 1 shared window). Congestion epochs prevent catastrophic window collapse when multiple 429s arrive simultaneously (TCP Reno's approach -- halve once per epoch, not once per response). Concurrency is controlled at three levels -- global image semaphore, per-registry aggregate semaphore, and per-action AIMD windows -- composing via dual permit acquisition. See [per-registry window groupings](./engine#per-registry-window-groupings), [congestion epochs](./engine#congestion-epochs), and [three-level hierarchy](./engine#three-level-hierarchy) in the engine doc.
 
+### Token-bucket layer for documented caps
+
+AIMD discovers a healthy concurrency level via 429 feedback but cannot bound TPS when one rate cap is shared across multiple windows the controller treats independently. Cross-repo aggregation under high parallelism can exceed a documented per-account cap before AIMD halves. A `TokenBucket` per `WindowKey` enforces the documented ceiling directly, gated BEFORE concurrency permits so a paced action does not occupy a slot another window could service. ECR, ECR Public, GHCR, GAR, and ACR ship with documented caps; registries without a published cap fall back to AIMD-only. Specific cap values are catalogued in the rate-bucket spec.
+
 ## Cross-repo blob mounting
 
 When a blob already exists in another repository on the same target registry, OCI registries can "mount" it -- zero bytes over the wire. `ocync` maximizes mount success through leader-follower election and per-blob synchronization. See [cross-repo blob mounting in the engine doc](./engine#cross-repo-blob-mounting) for the full implementation.

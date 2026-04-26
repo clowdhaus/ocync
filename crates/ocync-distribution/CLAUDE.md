@@ -30,6 +30,8 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 - GAR: all actions share a single key (per-project quota).
 - ACR (and other unknown registries): coarse grouping with 5 distinct windows (heads, reads, uploads, manifest-write, tag-list).
 - AIMD congestion epochs: 100ms epoch prevents cascade collapse from burst 429s.
+- Token-bucket layer (`TokenBucket` in `aimd.rs`) sits in front of the AIMD windows for registries with documented per-account TPS caps. Configured per `WindowKey` via `bucket_config_for_window()`; ECR/ECR Public/GHCR/GAR/ACR get buckets, others fall back to AIMD-only. Bucket pacing happens BEFORE concurrency permits so a paced action does not occupy a slot another window could service.
+- AIMD halving rebuilds the per-action semaphore but preserves the bucket: rate-cap state is independent of concurrency state. Restoring burst tokens during throttle would defeat the purpose.
 
 ## Upload protocol quirks
 
@@ -40,7 +42,8 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 
 ## Cross-repo mount
 
-- ECR fulfills mount when `BLOB_MOUNTING=ENABLED` account setting + source blob has a committed manifest.
+- ECR fulfills mount when `BLOB_MOUNTING=ENABLED` account setting + a committed manifest in the source repo *references the specific blob being mounted*. "Source repo has *some* committed manifest" is insufficient — the committed manifest must include the blob in its config or layer set.
+- Multi-tag image gotcha: when a source repo has tag1 committed and tag2's blobs still uploading, a follower mounting one of tag2's blobs sees the source repo's commit watch as `true` (tag1 satisfied it) and attempts the mount. ECR returns 202 because that specific blob isn't yet referenced by any committed manifest. The engine's `mark_blob_repo_stale` + push fallback handles it correctly; ~200ms wasted per occurrence.
 - Mount POST returns 201 (success) or 202 (not fulfilled, upload session started).
 - Mount is attempted on all providers unconditionally; the 202 fallback is cheap (~100ms).
 
