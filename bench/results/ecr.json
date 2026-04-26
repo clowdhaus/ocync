@@ -39,7 +39,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -85,7 +86,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -131,7 +133,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -177,7 +180,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -223,7 +227,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -269,7 +274,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -315,7 +321,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -361,7 +368,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "dregsy",
@@ -383,7 +391,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "regsync",
@@ -405,7 +414,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -451,7 +461,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "dregsy",
@@ -473,7 +484,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "regsync",
@@ -495,7 +507,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -541,7 +554,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "dregsy",
@@ -563,7 +577,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "regsync",
@@ -585,7 +600,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -631,7 +647,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "regsync",
@@ -653,7 +670,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "dregsy",
@@ -675,7 +693,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       },
@@ -702,7 +721,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "regsync",
@@ -724,7 +744,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "dregsy",
@@ -746,7 +767,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -792,7 +814,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "ocync",
@@ -814,7 +837,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "regsync",
@@ -836,7 +860,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       },
@@ -863,7 +888,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "ocync",
@@ -885,7 +911,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "regsync",
@@ -907,7 +934,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -953,7 +981,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "dregsy",
@@ -975,7 +1004,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "regsync",
@@ -997,7 +1027,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       },
@@ -1024,7 +1055,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "dregsy",
@@ -1046,7 +1078,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           },
           {
             "tool": "regsync",
@@ -1068,7 +1101,8 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 0
+            "auth_token_requests": 0,
+            "referrer_calls": 0
           }
         ]
       }
@@ -1118,6 +1152,7 @@
             "blob_cdn_misses": 0,
             "auth_v2_pings": 4,
             "auth_token_requests": 40,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 3234,
               "discovery_start": 0,
@@ -1153,6 +1188,7 @@
             "blob_cdn_misses": 0,
             "auth_v2_pings": 4,
             "auth_token_requests": 39,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 1626,
               "discovery_start": 0,
@@ -1207,6 +1243,7 @@
             "blob_cdn_misses": 0,
             "auth_v2_pings": 4,
             "auth_token_requests": 39,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 2685,
               "discovery_start": 0,
@@ -1242,6 +1279,7 @@
             "blob_cdn_misses": 0,
             "auth_v2_pings": 4,
             "auth_token_requests": 39,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 1395,
               "discovery_start": 0,
@@ -1299,6 +1337,7 @@
             "blob_cdn_misses": 23,
             "auth_v2_pings": 4,
             "auth_token_requests": 39,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 4749,
               "discovery_start": 0,
@@ -1334,6 +1373,7 @@
             "blob_cdn_misses": 0,
             "auth_v2_pings": 4,
             "auth_token_requests": 39,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 1387,
               "discovery_start": 0,
@@ -1388,6 +1428,7 @@
             "blob_cdn_misses": 0,
             "auth_v2_pings": 4,
             "auth_token_requests": 39,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 2613,
               "discovery_start": 0,
@@ -1423,6 +1464,7 @@
             "blob_cdn_misses": 0,
             "auth_v2_pings": 4,
             "auth_token_requests": 39,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 1415,
               "discovery_start": 0,
@@ -1479,7 +1521,8 @@
             "blob_cdn_hits": 280,
             "blob_cdn_misses": 696,
             "auth_v2_pings": 102,
-            "auth_token_requests": 54
+            "auth_token_requests": 54,
+            "referrer_calls": 0
           },
           {
             "tool": "ocync",
@@ -1505,6 +1548,7 @@
             "blob_cdn_misses": 52,
             "auth_v2_pings": 4,
             "auth_token_requests": 39,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 2547,
               "discovery_start": 0,
@@ -1531,7 +1575,8 @@
             "blob_cdn_hits": 963,
             "blob_cdn_misses": 25,
             "auth_v2_pings": 0,
-            "auth_token_requests": 35
+            "auth_token_requests": 35,
+            "referrer_calls": 0
           }
         ]
       },
@@ -1564,7 +1609,8 @@
             "blob_cdn_hits": 165,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 102,
-            "auth_token_requests": 51
+            "auth_token_requests": 51,
+            "referrer_calls": 0
           },
           {
             "tool": "ocync",
@@ -1587,6 +1633,7 @@
             "blob_cdn_misses": 0,
             "auth_v2_pings": 4,
             "auth_token_requests": 39,
+            "referrer_calls": 0,
             "phase_timing_ms": {
               "discovery_complete": 1312,
               "discovery_start": 0,
@@ -1613,7 +1660,197 @@
             "blob_cdn_hits": 0,
             "blob_cdn_misses": 0,
             "auth_v2_pings": 0,
-            "auth_token_requests": 33
+            "auth_token_requests": 33,
+            "referrer_calls": 0
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-04-26-131910",
+    "git_ref": "77bdc8c",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2"
+    },
+    "corpus": {
+      "images": 39,
+      "tags": 51
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "shuffle_seed": 7410896061643667028,
+        "tool_order": [
+          "dregsy",
+          "regsync",
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-26T13:17:46Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 916.310607094,
+            "peak_rss_kb": 323212,
+            "requests": 11301,
+            "rate_limit_429s": 0,
+            "response_bytes": 55287950115,
+            "duplicate_blob_gets": 1,
+            "mount_attempts": 325,
+            "mount_successes": 325,
+            "source_blob_gets": 1372,
+            "source_blob_bytes": 55287910221,
+            "cdn_hits": 971,
+            "cdn_misses": 5,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 971,
+            "blob_cdn_misses": 5,
+            "auth_v2_pings": 102,
+            "auth_token_requests": 52,
+            "referrer_calls": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 777.030404016,
+            "peak_rss_kb": 27296,
+            "requests": 9532,
+            "rate_limit_429s": 0,
+            "response_bytes": 65269778517,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 1695,
+            "source_blob_bytes": 65269769016,
+            "cdn_hits": 988,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 988,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 0,
+            "auth_token_requests": 35,
+            "referrer_calls": 0
+          },
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 229.419948885,
+            "peak_rss_kb": 63668,
+            "requests": 7373,
+            "rate_limit_429s": 0,
+            "response_bytes": 55405332417,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 454,
+            "mount_successes": 448,
+            "source_blob_gets": 1451,
+            "source_blob_bytes": 55405081754,
+            "cdn_hits": 1045,
+            "cdn_misses": 11,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1045,
+            "blob_cdn_misses": 11,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "referrer_calls": 51,
+            "phase_timing_ms": {
+              "discovery_complete": 25076,
+              "discovery_start": 0,
+              "execution_complete": 229296
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "shuffle_seed": 7410896061643667028,
+        "tool_order": [
+          "dregsy",
+          "regsync",
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "dregsy",
+            "version": "time=\"2026-04-26T13:17:46Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "wall_clock_secs": 124.350207111,
+            "peak_rss_kb": 33364,
+            "requests": 3145,
+            "rate_limit_429s": 0,
+            "response_bytes": 1925620,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 227,
+            "source_blob_bytes": 1891061,
+            "cdn_hits": 165,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 165,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 102,
+            "auth_token_requests": 51,
+            "referrer_calls": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.3",
+            "wall_clock_secs": 12.8886028,
+            "peak_rss_kb": 20476,
+            "requests": 170,
+            "rate_limit_429s": 0,
+            "response_bytes": 124520,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 120355,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 0,
+            "auth_token_requests": 33,
+            "referrer_calls": 0
+          },
+          {
+            "tool": "ocync",
+            "version": "ocync 0.1.0",
+            "wall_clock_secs": 2.138562209,
+            "peak_rss_kb": 18072,
+            "requests": 147,
+            "rate_limit_429s": 0,
+            "response_bytes": 135140,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 125723,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 39,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2099,
+              "discovery_start": 0,
+              "execution_complete": 2099
+            }
           }
         ]
       }
