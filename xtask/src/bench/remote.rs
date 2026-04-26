@@ -1,7 +1,7 @@
 //! Remote benchmark orchestration via SSH.
 //!
-//! Prerequisites: `~/.ssh/id_ed25519` exists and its public key is on GitHub,
-//! Terraform applied for the target provider (`bench/terraform/<provider>/`).
+//! Prerequisites: git push access to the repo and Terraform applied for the
+//! target provider (`bench/terraform/<provider>/`).
 //!
 //! `cargo xtask bench-remote --provider aws` pushes the current branch, SSHs
 //! into the bench instance, builds and runs benchmarks with live streamed output,
@@ -18,7 +18,8 @@ use serde::Deserialize;
 ///
 /// `accept-new` trusts the host key on first connect (the instance is
 /// ephemeral; re-created on every `terraform apply`). `BatchMode`
-/// prevents interactive prompts from hanging the automation.
+/// prevents interactive prompts from hanging the automation. `IdentitiesOnly`
+/// stops `ssh-agent` from offering unrelated keys before the instance key.
 const SSH_OPTS: &[&str] = &[
     "-o",
     "StrictHostKeyChecking=accept-new",
@@ -26,7 +27,17 @@ const SSH_OPTS: &[&str] = &[
     "BatchMode=yes",
     "-o",
     "ConnectTimeout=30",
+    "-o",
+    "IdentitiesOnly=yes",
 ];
+
+/// Builds the SSH/SCP arg vector for a given config: the Terraform-generated
+/// identity file followed by the common options.
+fn ssh_args(config: &BenchConfig) -> Vec<&str> {
+    let mut args = vec!["-i", &config.ssh_key_path];
+    args.extend_from_slice(SSH_OPTS);
+    args
+}
 
 /// Arguments for the `bench-remote` subcommand.
 #[derive(Args)]
@@ -84,6 +95,9 @@ struct BenchConfig {
     provider: String,
     host: String,
     user: String,
+    /// Absolute path to the Terraform-generated SSH private key for this
+    /// instance. Written by `local_sensitive_file.ssh_key`.
+    ssh_key_path: String,
 }
 
 /// Returns the path to bench.json for a given provider.
@@ -343,7 +357,7 @@ exit $EXIT
 /// Returns the exit code of the remote script.
 fn ssh_stream(config: &BenchConfig, script: &str) -> Result<i32, Box<dyn std::error::Error>> {
     let mut child = Command::new("ssh")
-        .args(SSH_OPTS)
+        .args(ssh_args(config))
         .args(["-o", "ServerAliveInterval=30"])
         .args(["-o", "ServerAliveCountMax=120"])
         .arg(format!("{}@{}", config.user, config.host))
@@ -409,7 +423,7 @@ fn fetch_results(
     );
     let status = Command::new("scp")
         .args(["-r"])
-        .args(SSH_OPTS)
+        .args(ssh_args(config))
         .arg(format!("{}@{}:{}", config.user, config.host, remote_dir))
         .arg(local_output)
         .status()?;
@@ -435,7 +449,7 @@ fn fetch_results(
             local_json.display()
         );
         let status = Command::new("scp")
-            .args(SSH_OPTS)
+            .args(ssh_args(config))
             .arg(format!("{}@{}:{}", config.user, config.host, json_file))
             .arg(local_json.to_str().unwrap_or("."))
             .status()?;
@@ -454,7 +468,7 @@ fn fetch_results(
     if local_perf.exists() {
         eprintln!("bench-remote: updating {perf_page}");
         let status = Command::new("scp")
-            .args(SSH_OPTS)
+            .args(ssh_args(config))
             .arg(format!("{}@{}:{}", config.user, config.host, remote_perf))
             .arg(local_perf)
             .status()?;
@@ -478,7 +492,7 @@ fn fetch_results(
 /// Run a single command on the remote instance and capture its stdout.
 fn ssh_run(config: &BenchConfig, command: &str) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("ssh")
-        .args(SSH_OPTS)
+        .args(ssh_args(config))
         .arg(format!("{}@{}", config.user, config.host))
         .arg(command)
         .output()?;
@@ -516,11 +530,12 @@ mod tests {
 
     #[test]
     fn parse_bench_config() {
-        let json = r#"{"provider":"aws","host":"54.123.45.67","user":"ec2-user"}"#;
+        let json = r#"{"provider":"aws","host":"54.123.45.67","user":"ec2-user","ssh_key_path":"/tmp/.ssh-key"}"#;
         let config: BenchConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.provider, "aws");
         assert_eq!(config.host, "54.123.45.67");
         assert_eq!(config.user, "ec2-user");
+        assert_eq!(config.ssh_key_path, "/tmp/.ssh-key");
     }
 
     #[test]

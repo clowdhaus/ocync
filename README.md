@@ -3,7 +3,7 @@
 Sync OCI container images across registries - efficiently.
 
 <p align="center">
-  <img src="docs/public/ecr-banner.svg" alt="ocync - 4x faster, 40% fewer requests, adaptive rate control" width="900">
+  <img src="docs/public/ecr-banner.svg" alt="ocync - 4x faster sync, 30% fewer API requests, adaptive rate control" width="900">
 </p>
 
 [![CI](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml/badge.svg)](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml)
@@ -11,7 +11,9 @@ Sync OCI container images across registries - efficiently.
 [![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2025/06/26/Rust-1.94.0.html)
 [![ECR Public](https://img.shields.io/badge/ECR_Public-clowdhaus%2Focync-ff9900.svg?logo=amazonecs)](https://gallery.ecr.aws/clowdhaus/ocync)
 
-ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. On real-world workloads, ocync completes cold syncs 4x faster than comparable tools with up to 40% fewer API requests.
+ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. On real-world workloads it completes cold syncs 4x faster than comparable tools, with up to 30% fewer API requests, zero duplicate blob fetches across the run, and zero 429s on every benchmarked registry. See [Performance](https://clowdhaus.github.io/ocync/performance) for the full comparison.
+
+ocync is purpose-built for one job: efficiently mirroring images from upstream registries (Docker Hub, GHCR, GAR, Chainguard) to a private registry (ECR, GAR, ACR). It is not a build tool, a registry, or a content rewriter - it copies bytes verbatim and lets the registry do its job.
 
 ## Features
 
@@ -124,7 +126,7 @@ Full documentation at [clowdhaus.github.io/ocync](https://clowdhaus.github.io/oc
 | Amazon ECR (private) | IAM (automatic) | Yes (opt-in) | Batch APIs, per-action rate limits |
 | Amazon ECR Public | IAM (automatic) | No | Separate auth from private ECR |
 | Chainguard | Token exchange | N/A (source) | No rate limits |
-| Docker Hub | Docker config / static | Yes | 100/6hr authenticated manifest GETs; HEADs free |
+| Docker Hub | Docker config / static | Yes | 10/hr anon, 100/6hr auth manifest GETs; blob GETs unmetered |
 | GitHub Container Registry | Docker config | Yes | Single-PATCH upload fallback |
 | Google Artifact Registry | Docker config | Yes | Monolithic upload only |
 | Azure Container Registry | Docker config | Yes | Streaming PUT (chunked upload planned) |
