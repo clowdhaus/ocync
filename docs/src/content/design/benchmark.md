@@ -155,6 +155,21 @@ part of CI. Runs are manually initiated.
   partial success, the run is reported as partial. No more config
   generation knowing every quirk.
 
+### Cross-tool fairness for OCI 1.1 referrers
+
+`ocync` syncs OCI 1.1 referrer artifacts (SBOM, SLSA attestations) by
+default. Comparable tools do not implement the referrers API. A naive
+"`ocync` 55.4 GB > comparable 55.3 GB" reading of the source-bytes
+column would infer `ocync` is less efficient when the truth is +117 MB
+of attestation content `ocync` correctly transferred.
+
+To surface this honestly, the bench tracks `referrer_calls`
+(GET requests to `/v2/<repo>/referrers/...`) per tool and emits a
+footnote in `summary.md` and the docs `performance.md` snippet whenever
+any tool's count is non-zero. Comparable tools always show `0`;
+`ocync`'s count surfaces the feature gap so the bytes/GETs comparison is
+read with context.
+
 ## What this avoids
 
 The wasted cycles in the original benchmark came from four questions

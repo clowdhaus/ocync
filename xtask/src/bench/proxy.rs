@@ -109,6 +109,11 @@ pub(crate) struct ProxyMetrics {
     /// GET requests to token endpoints (`/token` or `/v2/auth`).
     #[serde(default)]
     pub(crate) auth_token_requests: u64,
+    /// Calls to the OCI 1.1 referrers API endpoint
+    /// (`GET /v2/<repo>/referrers/...`). Marker for artifact-sync workload;
+    /// comparable tools (dregsy, regsync) issue zero such calls.
+    #[serde(default)]
+    pub(crate) referrer_calls: u64,
 }
 
 /// Spawns a `bench-proxy` process and waits for it to bind its port.
@@ -262,6 +267,7 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
     let mut blob_cdn_misses = 0u64;
     let mut auth_v2_pings = 0u64;
     let mut auth_token_requests = 0u64;
+    let mut referrer_calls = 0u64;
 
     // Track GET requests to blob URLs for duplicate detection.
     let mut blob_get_counts: HashMap<String, u64> = HashMap::new();
@@ -329,6 +335,12 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
             }
         }
 
+        // OCI 1.1 referrer-artifact discovery -- marks artifact-sync calls.
+        // Comparable tools (dregsy, regsync) do not implement this API.
+        if entry.method == "GET" && entry.url.contains("/referrers/") {
+            referrer_calls += 1;
+        }
+
         // OCI cross-repo blob mount: `POST /v2/.../blobs/uploads/?mount=<digest>&from=<repo>`.
         // A successful mount returns 201 Created and skips the data upload entirely; a
         // 202 means the registry started a new upload session (mount fallback).
@@ -374,6 +386,7 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
         blob_cdn_misses,
         auth_v2_pings,
         auth_token_requests,
+        referrer_calls,
     }
 }
 
@@ -787,5 +800,59 @@ mod tests {
         tmpfile.flush().unwrap();
 
         assert!(parse_log(tmpfile.path()).is_err());
+    }
+
+    #[test]
+    fn aggregate_counts_referrer_calls() {
+        let entries = vec![
+            entry(
+                "GET",
+                "public.ecr.aws",
+                "/v2/foo/bar/referrers/sha256:abc",
+                0,
+                376,
+                200,
+                12,
+            ),
+            entry(
+                "GET",
+                "public.ecr.aws",
+                "/v2/foo/bar/referrers/sha256:def",
+                0,
+                412,
+                200,
+                10,
+            ),
+        ];
+        let metrics = aggregate(&entries, "ecr.us-east-2.amazonaws.com");
+        assert_eq!(metrics.referrer_calls, 2);
+    }
+
+    #[test]
+    fn aggregate_does_not_count_manifests_or_blobs_as_referrers() {
+        // Same hostname and shape -- only the path segment differs. Catches
+        // a lazy `contains("ref")` or wrong substring.
+        let entries = vec![
+            entry(
+                "GET",
+                "public.ecr.aws",
+                "/v2/foo/bar/manifests/sha256:abc",
+                0,
+                1024,
+                200,
+                12,
+            ),
+            entry(
+                "GET",
+                "public.ecr.aws",
+                "/v2/foo/bar/blobs/sha256:def",
+                0,
+                2048,
+                200,
+                10,
+            ),
+        ];
+        let metrics = aggregate(&entries, "ecr.us-east-2.amazonaws.com");
+        assert_eq!(metrics.referrer_calls, 0);
     }
 }
