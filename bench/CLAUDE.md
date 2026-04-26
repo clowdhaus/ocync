@@ -68,6 +68,9 @@ cargo xtask bench-remote --provider aws --fetch
 | CDN hits | Bench-proxy (X-Cache header, source requests only) | highest (after pre-warm) |
 | CDN misses | Bench-proxy (X-Cache header, source requests only) | lowest |
 | Rate-limit 429s | Bench-proxy (HTTP 429 responses) | lowest |
+| Referrer calls | Bench-proxy (`GET /v2/<repo>/referrers/...`) | n/a (fairness signal) |
+
+`ProxyMetrics::referrer_calls` counts `GET /v2/<repo>/referrers/...` requests. Used by `referrer_footnote()` in `report.rs` to inject a fairness note when any tool issues referrer calls. ocync issues these by default; comparable tools do not.
 
 Instance metadata (type, CPU, memory, network, region) is captured from `ec2:DescribeInstanceTypes`.
 
@@ -158,8 +161,12 @@ Raw per-request data lives in `<tool>-proxy.jsonl` files in `bench/results/<time
 # Count requests by method
 jq -r '.method' <tool>-proxy.jsonl | sort | uniq -c | sort -rn
 
-# Source blob pulls only (non-ECR hosts)
-jq -r 'select(.method=="GET" and (.url | contains("/blobs/sha256:")) and (.host | contains("ecr") | not))' <tool>-proxy.jsonl | wc -l
+# Source blob pulls only (non-target hosts)
+# NOTE: filter by exact target_registry, NOT by substring "ecr" — public.ecr.aws
+# is a SOURCE host. The aggregate() metric uses `host != target_registry`.
+jq -r --arg target "$BENCH_TARGET_REGISTRY" \
+  'select(.method=="GET" and (.url | contains("/blobs/sha256:")) and .host != $target)' \
+  <tool>-proxy.jsonl | wc -l
 
 # Mount attempts and success rate
 jq -r 'select(.url | contains("mount="))' <tool>-proxy.jsonl | jq -r '.status' | sort | uniq -c

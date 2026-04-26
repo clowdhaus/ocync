@@ -344,6 +344,46 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Render the OCI 1.1 referrers footnote for a scenario, or `None` if no
+/// tool issued referrer calls.
+///
+/// ocync issues `GET /v2/<repo>/referrers/...` to discover artifact
+/// attestations (SBOM, SLSA) and transfers any referenced artifacts.
+/// Comparable tools do not implement this OCI 1.1 endpoint. The footnote
+/// surfaces the per-tool count so the Source blob GETs / Source blob
+/// bytes columns are not read as a fairness violation.
+///
+/// Returned string starts with a leading newline so it can be appended
+/// directly after a metric table without manual spacing.
+fn referrer_footnote(scenario: &ScenarioResult) -> Option<String> {
+    let calls: Vec<(&str, u64)> = scenario
+        .runs
+        .iter()
+        .filter_map(|r| {
+            r.proxy_metrics
+                .as_ref()
+                .map(|m| (r.tool.as_str(), m.referrer_calls))
+        })
+        .collect();
+    if !calls.iter().any(|(_, n)| *n > 0) {
+        return None;
+    }
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str("> **Artifact sync (OCI 1.1 referrers).** ");
+    out.push_str("ocync issues `GET /v2/<repo>/referrers/...` to discover ");
+    out.push_str("attestations (SBOM, SLSA) and transfers any referenced ");
+    out.push_str("artifacts. Comparable tools do not implement this. The ");
+    out.push_str("Source blob GETs and Source blob bytes columns above include ");
+    out.push_str("this artifact content for ocync.\n>\n> ");
+    let parts: Vec<String> = calls
+        .iter()
+        .map(|(tool, n)| format!("{tool}: {n}"))
+        .collect();
+    out.push_str(&format!("Referrers calls -- {}.\n", parts.join(", ")));
+    Some(out)
+}
+
 /// Generates a Markdown summary of the benchmark report.
 ///
 /// Produces a `# Benchmark Results` heading, a corpus size line, a
@@ -394,6 +434,9 @@ fn summary_markdown(report: &BenchReport) -> String {
             scenario.runs.iter().map(|r| (r.tool.as_str(), r)).collect();
 
         render_metric_table(&columns, &by_tool, &mut out);
+        if let Some(footnote) = referrer_footnote(scenario) {
+            out.push_str(&footnote);
+        }
         out.push('\n');
     }
 
@@ -656,6 +699,9 @@ fn scenario_markdown(report: &BenchReport, scenario: &ScenarioResult, descriptio
         scenario.runs.iter().map(|r| (r.tool.as_str(), r)).collect();
 
     render_metric_table(&columns, &by_tool, &mut out);
+    if let Some(footnote) = referrer_footnote(scenario) {
+        out.push_str(&footnote);
+    }
 
     out
 }
@@ -1571,5 +1617,131 @@ mod tests {
         // Warm section should be replaced.
         assert!(!content.contains("old warm"));
         assert!(content.contains("Warm sync (no changes) to ECR"));
+    }
+
+    #[test]
+    fn summary_markdown_includes_referrer_footnote_when_present() {
+        let report = BenchReport {
+            timestamp: "2026-04-26-100000".into(),
+            instance: test_instance(),
+            corpus_size: 28,
+            total_tags: 40,
+            tool_versions: BTreeMap::from([
+                ("ocync".into(), "0.1.0".into()),
+                ("dregsy".into(), "0.5.0".into()),
+                ("regsync".into(), "0.7.0".into()),
+            ]),
+            scenarios: vec![ScenarioResult {
+                scenario: "Cold sync".into(),
+                runs: vec![
+                    ToolRun {
+                        tool: "ocync".into(),
+                        wall_clock_secs: 250.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(60_000),
+                        proxy_metrics: Some(ProxyMetrics {
+                            referrer_calls: 79,
+                            ..Default::default()
+                        }),
+                        phase_timing_ms: BTreeMap::new(),
+                    },
+                    ToolRun {
+                        tool: "dregsy".into(),
+                        wall_clock_secs: 2000.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(300_000),
+                        proxy_metrics: Some(ProxyMetrics::default()),
+                        phase_timing_ms: BTreeMap::new(),
+                    },
+                    ToolRun {
+                        tool: "regsync".into(),
+                        wall_clock_secs: 2200.0,
+                        exit_code: Some(0),
+                        peak_rss_kb: Some(280_000),
+                        proxy_metrics: Some(ProxyMetrics::default()),
+                        phase_timing_ms: BTreeMap::new(),
+                    },
+                ],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
+            }],
+            scale: vec![],
+        };
+        let md = summary_markdown(&report);
+        assert!(
+            md.contains("OCI 1.1 referrers"),
+            "footnote missing from summary.md:\n{md}"
+        );
+        assert!(md.contains("ocync: 79"), "ocync count missing:\n{md}");
+        assert!(md.contains("dregsy: 0"), "dregsy count missing:\n{md}");
+        assert!(md.contains("regsync: 0"), "regsync count missing:\n{md}");
+    }
+
+    #[test]
+    fn summary_markdown_omits_referrer_footnote_when_no_calls() {
+        let report = BenchReport {
+            timestamp: "2026-04-26-100000".into(),
+            instance: test_instance(),
+            corpus_size: 28,
+            total_tags: 40,
+            tool_versions: BTreeMap::from([("dregsy".into(), "0.5.0".into())]),
+            scenarios: vec![ScenarioResult {
+                scenario: "Cold sync".into(),
+                runs: vec![ToolRun {
+                    tool: "dregsy".into(),
+                    wall_clock_secs: 2000.0,
+                    exit_code: Some(0),
+                    peak_rss_kb: Some(300_000),
+                    proxy_metrics: Some(ProxyMetrics::default()),
+                    phase_timing_ms: BTreeMap::new(),
+                }],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
+            }],
+            scale: vec![],
+        };
+        let md = summary_markdown(&report);
+        assert!(
+            !md.contains("OCI 1.1 referrers"),
+            "footnote should be absent when no tool has referrer_calls > 0:\n{md}"
+        );
+    }
+
+    #[test]
+    fn scenario_markdown_includes_referrer_footnote_when_present() {
+        // Parity with summary.md: the docs performance.md snippet (via
+        // update_performance_page -> scenario_markdown) must also surface
+        // referrers when ocync is in the run.
+        let report = BenchReport {
+            timestamp: "2026-04-26-100000".into(),
+            instance: test_instance(),
+            corpus_size: 28,
+            total_tags: 40,
+            tool_versions: BTreeMap::from([("ocync".into(), "0.1.0".into())]),
+            scenarios: vec![ScenarioResult {
+                scenario: "Cold sync".into(),
+                runs: vec![ToolRun {
+                    tool: "ocync".into(),
+                    wall_clock_secs: 250.0,
+                    exit_code: Some(0),
+                    peak_rss_kb: Some(60_000),
+                    proxy_metrics: Some(ProxyMetrics {
+                        referrer_calls: 79,
+                        ..Default::default()
+                    }),
+                    phase_timing_ms: BTreeMap::new(),
+                }],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
+            }],
+            scale: vec![],
+        };
+        let scenario = &report.scenarios[0];
+        let md = scenario_markdown(&report, scenario, "Cold sync");
+        assert!(
+            md.contains("OCI 1.1 referrers"),
+            "footnote missing from scenario_markdown:\n{md}"
+        );
+        assert!(md.contains("ocync: 79"), "count missing:\n{md}");
     }
 }

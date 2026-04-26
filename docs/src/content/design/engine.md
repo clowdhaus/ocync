@@ -36,6 +36,7 @@ Config
 |     2. Push: stream (1 target) or stage (N)       |
 |     3. Update cache                               |
 |     4. Push manifests (children first, then index) |
+|   Pre-permit: token bucket gate (if configured)   |
 |   On 429: AIMD halve for (registry, action)       |
 |                                                   |
 | Each discovery result may promote pending -> exec. |
@@ -67,15 +68,17 @@ The `else` arm (both pools empty and no pending items) is the clean termination 
 
 ## Adaptive concurrency (AIMD)
 
-Concurrency is controlled at three levels that compose naturally, replacing any need for operators to guess at registry capacity.
+Concurrency is controlled at four levels that compose naturally, replacing any need for operators to guess at registry capacity.
 
-### Three-level hierarchy
+### Four-level hierarchy
 
 **Level 1, global image semaphore** (default: 50). Bounds how many `(tag, target)` pairs are in-flight simultaneously, preventing memory explosion. This is the engine-level `max_concurrent_transfers` config.
 
 **Level 2, per-registry aggregate semaphore** (`max_concurrent` per registry, default: 50). Bounds total concurrent HTTP requests to a single registry host across all action types. This is a safety ceiling for connection/memory pressure, not a rate-limit mechanism. With HTTP/2 multiplexing, 100+ concurrent requests share ~6-8 TCP connections, so the aggregate cap is conservative. A request must acquire a permit from this semaphore before proceeding to the per-action AIMD check.
 
 **Level 3, per-(registry, action) AIMD windows.** Each action type adapts independently within the aggregate ceiling. A 429 on `InitiateLayerUpload` halves that window only, while `UploadLayerPart` continues at its own pace. Each window's effective cap is `min(aimd_window, aggregate_permits_available)`.
+
+**Level 4, per-window token bucket (opt-in).** Some registries publish hard per-account TPS ceilings (ECR's `InitiateLayerUpload` at 100 TPS, etc.). AIMD discovers a healthy concurrency level via 429 feedback but cannot bound the rate when the cap is shared across multiple windows the controller treats independently -- cross-repo aggregation under high parallelism can exceed a documented cap before AIMD halves. A `TokenBucket` per `WindowKey` enforces the documented ceiling directly, gated BEFORE concurrency permits so a paced action does not occupy a slot another window could service. Specific cap values per registry are listed in the per-registry window groupings table above; registries without a published cap fall back to AIMD-only.
 
 The levels compose via dual permit acquisition: every request acquires one permit from the registry aggregate semaphore AND one from the per-action AIMD window. The aggregate semaphore prevents resource exhaustion; the AIMD windows prevent per-action rate-limit storms. Slow actions (PutImage at 10 TPS) release aggregate permits promptly, so fast actions (UploadLayerPart at 500 TPS) are never starved.
 
@@ -115,10 +118,13 @@ Actions are fine-grained, matching the actual API action granularity of each reg
 
 | Registry | Windows | Rationale |
 |---|---|---|
-| ECR | 9 (one per action) | Critical: `InitiateLayerUpload` (100 TPS) and `UploadLayerPart` (500 TPS) have a 5x rate disparity, so a 429 on session initiation must not throttle chunk uploads |
+| ECR private | 9 (one per action) | Critical: `InitiateLayerUpload` (100 TPS) and `UploadLayerPart` (500 TPS) have a 5x rate disparity, so a 429 on session initiation must not throttle chunk uploads |
+| ECR Public | 5 (read paths share, write paths split) | Same per-action enforcement as private but caps are 10x lower; `UploadLayerPart` at 260 TPS still warrants its own window |
 | Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 100-pull/6h quota). Other actions share one window |
-| GAR | 1 (all shared) | GAR uses a shared per-project quota across all operation types; grows adaptively to `max_concurrent` |
-| ACR, GHCR, others | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as safe default for registries without documented per-action limits |
+| GAR / GCR | 1 (all shared) | Shared per-project quota across all operation types; grows adaptively to `max_concurrent` |
+| GHCR | 1 (all shared) | GitHub enforces a single 2000 RPM aggregate cap per authenticated principal across reads and writes; separate windows would let combined traffic exceed the cap |
+| ACR | 2 (read, write) | Premium SKU exposes separate ReadOps and WriteOps quotas |
+| Unknown (Chainguard, Quay, generic) | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as safe default for registries without documented per-action limits |
 
 The mapping function is ~20 lines. The window key is derived from HTTP method + URL pattern, which `ocync` already tracks in request labels.
 

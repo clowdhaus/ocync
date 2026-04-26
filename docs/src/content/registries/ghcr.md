@@ -28,7 +28,7 @@ GHCR supports cross-repo blob mounting within the same organization/user namespa
 
 ## Rate limits
 
-GHCR rate limits are tied to your GitHub account's API rate limit and Actions minutes/storage quotas.
+GHCR enforces a single aggregate cap of 2000 requests per minute per authenticated principal, shared across read and write actions. `ocync` models this with one shared AIMD window for `ghcr.io` (rather than separate read/write windows) so the token-bucket layer cannot exceed the documented cap by spending the read budget and write budget concurrently.
 
 ## Example config
 

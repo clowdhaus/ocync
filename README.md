@@ -21,7 +21,7 @@ ocync copies container images between OCI registries with blob deduplication, cr
 - **Global blob deduplication** - shared layers across all images are transferred once per sync run
 - **Cross-repo blob mounting** - leader-follower election ensures shared layers mount instead of re-upload
 - **Streaming transfers** - bytes flow source to target with no intermediate disk (single-target mode)
-- **Adaptive rate limiting** - per-(registry, action) [AIMD](https://clowdhaus.github.io/ocync/design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency adapts to each registry's limits
+- **Adaptive rate limiting** - per-(registry, action) [AIMD](https://clowdhaus.github.io/ocync/design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency adapts to each registry's observed throttling, complemented by a token-bucket layer that enforces documented per-account TPS ceilings where the registry publishes them
 - **Transfer state cache** - persistent cache skips already-synced blobs across runs
 - **FIPS 140-3 by default** - aws-lc-rs with NIST Certificate #4816
 - **Tag filtering** - glob patterns, semver ranges, exclude patterns, sort, latest-N
