@@ -118,10 +118,13 @@ Actions are fine-grained, matching the actual API action granularity of each reg
 
 | Registry | Windows | Rationale |
 |---|---|---|
-| ECR | 9 (one per action) | Critical: `InitiateLayerUpload` (100 TPS) and `UploadLayerPart` (500 TPS) have a 5x rate disparity, so a 429 on session initiation must not throttle chunk uploads |
+| ECR private | 9 (one per action) | Critical: `InitiateLayerUpload` (100 TPS) and `UploadLayerPart` (500 TPS) have a 5x rate disparity, so a 429 on session initiation must not throttle chunk uploads |
+| ECR Public | 5 (read paths share, write paths split) | Same per-action enforcement as private but caps are 10x lower; `UploadLayerPart` at 260 TPS still warrants its own window |
 | Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 100-pull/6h quota). Other actions share one window |
-| GAR | 1 (all shared) | GAR uses a shared per-project quota across all operation types; grows adaptively to `max_concurrent` |
-| ACR, GHCR, others | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as safe default for registries without documented per-action limits |
+| GAR / GCR | 1 (all shared) | Shared per-project quota across all operation types; grows adaptively to `max_concurrent` |
+| GHCR | 1 (all shared) | GitHub enforces a single 2000 RPM aggregate cap per authenticated principal across reads and writes; separate windows would let combined traffic exceed the cap |
+| ACR | 2 (read, write) | Premium SKU exposes separate ReadOps and WriteOps quotas |
+| Unknown (Chainguard, Quay, generic) | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as safe default for registries without documented per-action limits |
 
 The mapping function is ~20 lines. The window key is derived from HTTP method + URL pattern, which `ocync` already tracks in request labels.
 
