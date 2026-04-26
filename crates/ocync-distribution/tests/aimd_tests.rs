@@ -128,8 +128,8 @@ fn gar_all_actions_share_single_key() {
 #[test]
 fn unknown_registry_coarse_grouping() {
     // Use a host with no provider-specific routing so the `_` arm
-    // (coarse 5-group grouping) is exercised. ghcr.io now routes to
-    // GHCR_READ/GHCR_WRITE; cgr.dev and ecr/gar/azurecr also have
+    // (coarse 5-group grouping) is exercised. ghcr.io routes to a
+    // single GhcrShared window; cgr.dev and ecr/gar/azurecr also have
     // dedicated arms. quay.io currently has no detect_provider_kind
     // mapping and falls through to the coarse default.
     let host = "quay.io";

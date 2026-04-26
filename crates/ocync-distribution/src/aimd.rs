@@ -6,7 +6,10 @@
 //!
 //! [`AimdController`] manages one set of windows per registry host. The aggregate
 //! concurrency cap is enforced by a shared [`tokio::sync::Semaphore`]; the per-action
-//! windows refine that limit further.
+//! windows refine that limit further. For registries with documented per-account TPS
+//! ceilings (ECR / ECR Public / GHCR / GAR / ACR), a per-window [`TokenBucket`] gates
+//! [`AimdController::acquire`] BEFORE either semaphore so paced actions do not occupy
+//! concurrency slots another window could service.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -444,9 +447,12 @@ impl AimdController {
 
     /// Acquire concurrency permits for the given operation.
     ///
-    /// Blocks until both the aggregate semaphore and the per-action window
-    /// semaphore have capacity. Returns an [`AimdPermit`] that must be
-    /// resolved via [`AimdPermit::success`] or [`AimdPermit::throttled`].
+    /// For windows with a documented per-account TPS cap (ECR / ECR Public /
+    /// GHCR / GAR / ACR), first blocks on a [`TokenBucket`] that enforces the
+    /// documented rate even when both semaphores have capacity. Then blocks
+    /// until both the aggregate semaphore and the per-action window semaphore
+    /// have capacity. Returns an [`AimdPermit`] that must be resolved via
+    /// [`AimdPermit::success`] or [`AimdPermit::throttled`].
     pub async fn acquire(&self, op: RegistryAction) -> AimdPermit<'_> {
         let key = window_key_for_registry(&self.host, op);
 

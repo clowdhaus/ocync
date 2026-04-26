@@ -68,9 +68,9 @@ The `else` arm (both pools empty and no pending items) is the clean termination 
 
 ## Adaptive concurrency (AIMD)
 
-Concurrency is controlled at three levels that compose naturally, replacing any need for operators to guess at registry capacity.
+Concurrency is controlled at four levels that compose naturally, replacing any need for operators to guess at registry capacity.
 
-### Three-level hierarchy
+### Four-level hierarchy
 
 **Level 1, global image semaphore** (default: 50). Bounds how many `(tag, target)` pairs are in-flight simultaneously, preventing memory explosion. This is the engine-level `max_concurrent_transfers` config.
 
@@ -78,7 +78,7 @@ Concurrency is controlled at three levels that compose naturally, replacing any 
 
 **Level 3, per-(registry, action) AIMD windows.** Each action type adapts independently within the aggregate ceiling. A 429 on `InitiateLayerUpload` halves that window only, while `UploadLayerPart` continues at its own pace. Each window's effective cap is `min(aimd_window, aggregate_permits_available)`.
 
-**Level 4, per-window token bucket (opt-in).** Some registries publish hard per-account TPS ceilings (ECR's `InitiateLayerUpload` at 100 TPS, etc.). AIMD discovers a healthy concurrency level via 429 feedback but cannot bound the rate when the cap is shared across multiple windows the controller treats independently -- cross-repo aggregation under high parallelism can exceed a documented cap before AIMD halves. A `TokenBucket` per `WindowKey` enforces the documented ceiling directly, gated BEFORE concurrency permits so a paced action does not occupy a slot another window could service. Specific cap values per registry are catalogued in the [rate-bucket spec](../../../superpowers/specs/2026-04-26-aimd-rate-bucket-design.md); registries without a published cap fall back to AIMD-only.
+**Level 4, per-window token bucket (opt-in).** Some registries publish hard per-account TPS ceilings (ECR's `InitiateLayerUpload` at 100 TPS, etc.). AIMD discovers a healthy concurrency level via 429 feedback but cannot bound the rate when the cap is shared across multiple windows the controller treats independently -- cross-repo aggregation under high parallelism can exceed a documented cap before AIMD halves. A `TokenBucket` per `WindowKey` enforces the documented ceiling directly, gated BEFORE concurrency permits so a paced action does not occupy a slot another window could service. Specific cap values per registry are listed in the per-registry window groupings table above; registries without a published cap fall back to AIMD-only.
 
 The levels compose via dual permit acquisition: every request acquires one permit from the registry aggregate semaphore AND one from the per-action AIMD window. The aggregate semaphore prevents resource exhaustion; the AIMD windows prevent per-action rate-limit storms. Slow actions (PutImage at 10 TPS) release aggregate permits promptly, so fast actions (UploadLayerPart at 500 TPS) are never starved.
 
