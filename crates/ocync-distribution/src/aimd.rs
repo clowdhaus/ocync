@@ -190,60 +190,81 @@ pub enum RegistryAction {
 
 /// Identifies a per-action AIMD window within an [`AimdController`].
 ///
-/// Different registries have different rate-limit granularities: ECR
-/// charges per individual API action, GAR shares one project quota, GHCR
-/// shares one aggregate quota, etc. [`window_key_for_registry`] maps a
-/// (host, action) pair to the correct key for that registry's enforcement
-/// model.
+/// Each provider declares its own enforcement granularity by selecting a
+/// nested grouping enum:
+/// - ECR private charges per [`RegistryAction`] -- one window per action.
+/// - ECR Public groups reads and splits writes via [`EcrPublicGroup`].
+/// - Docker Hub uses [`DockerHubGroup`] (HEADs unmetered, manifest reads
+///   quota'd, rest shared).
+/// - GAR / GCR and GHCR share one window across all actions.
+/// - ACR separates [`AcrGroup::Read`] and [`AcrGroup::Write`].
+/// - Anything not detected falls into [`UnknownGroup`]'s coarse grouping.
 ///
-/// As a typed enum (not a `u8` newtype), the variant set is a closed
-/// universe -- adding or removing a window is a structural change visible
-/// to every match site, and id-collision bugs are impossible.
+/// [`window_key_for_registry`] performs the (host, action) -> key mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(missing_docs)] // Variant names self-document via the WindowKey enum docstring above.
 pub enum WindowKey {
-    // ECR private: every API action has an independent per-region TPS cap.
-    EcrManifestHead,
-    EcrManifestRead,
-    EcrManifestWrite,
-    EcrBlobHead,
-    EcrBlobRead,
-    EcrBlobUploadInit,
-    EcrBlobUploadChunk,
-    EcrBlobUploadComplete,
-    EcrTagList,
-
-    // ECR Public: same per-action model as private, but caps are 10x lower.
-    // EcrPublicRead covers manifest/blob reads + heads + tag list.
-    EcrPublicRead,
-    EcrPublicManifestWrite,
-    EcrPublicBlobUploadInit,
-    EcrPublicBlobUploadChunk,
-    EcrPublicBlobUploadComplete,
-
-    // Docker Hub: HEADs unmetered, manifest reads quota'd, rest shared.
-    DockerHubHeads,
-    DockerHubManifestRead,
-    DockerHubOther,
-
-    // GAR / GCR: a single per-project, per-region request quota.
+    /// ECR private: every API action has an independent per-region TPS cap.
+    Ecr(RegistryAction),
+    /// ECR Public: same per-action enforcement model but caps are 10x lower
+    /// and read paths are aggregated.
+    EcrPublic(EcrPublicGroup),
+    /// Docker Hub: HEADs unmetered, manifest reads quota'd, others shared.
+    DockerHub(DockerHubGroup),
+    /// GAR / GCR: a single per-project, per-region quota shared across all
+    /// actions.
     GarShared,
-
-    // GHCR: GitHub enforces a single 2000 RPM aggregate limit across all
-    // actions per authenticated principal, so reads and writes share.
+    /// GHCR: a single 2000 RPM aggregate cap per authenticated principal,
+    /// shared across reads and writes.
     GhcrShared,
+    /// ACR: separate `ReadOps` and `WriteOps` quotas per registry.
+    Acr(AcrGroup),
+    /// Coarse fallback for registries with no documented per-action cap
+    /// (Chainguard, Quay, generic). AIMD discovers capacity from 429s.
+    Unknown(UnknownGroup),
+}
 
-    // ACR: documented as separate ReadOps and WriteOps per registry.
-    AcrRead,
-    AcrWrite,
+/// Action grouping for ECR Public: all read paths share one window, each
+/// write action gets its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(missing_docs)] // Variants are self-describing.
+pub enum EcrPublicGroup {
+    /// Manifest reads/heads, blob reads/heads, and tag list (10 TPS).
+    Read,
+    ManifestWrite,
+    BlobUploadInit,
+    BlobUploadChunk,
+    BlobUploadComplete,
+}
 
-    // Coarse fallback for registries with no documented per-action cap
-    // (Chainguard, Quay, generic). AIMD discovers capacity from 429s.
-    UnknownHeads,
-    UnknownReads,
-    UnknownUploads,
-    UnknownManifestWrite,
-    UnknownTagList,
+/// Action grouping for Docker Hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DockerHubGroup {
+    /// Manifest and blob HEADs -- unmetered.
+    Heads,
+    /// Manifest GETs -- counted against the 100/6h pull quota.
+    ManifestRead,
+    /// All other actions share one window.
+    Other,
+}
+
+/// Action grouping for ACR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AcrGroup {
+    /// Reads + heads + tag list (`ReadOps`).
+    Read,
+    /// Manifest writes + blob upload phases (`WriteOps`).
+    Write,
+}
+
+/// Coarse action grouping for registries without a documented per-action cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(missing_docs)] // Variants are self-describing.
+pub enum UnknownGroup {
+    Heads,
+    Reads,
+    Uploads,
+    ManifestWrite,
+    TagList,
 }
 
 /// Map a registry host and action to an AIMD window key.
@@ -259,67 +280,38 @@ pub enum WindowKey {
 /// - **Unknown** (Chainguard, Quay, generic): coarse grouping -- HEADs / reads
 ///   / uploads / manifest writes / tag listing.
 pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey {
+    use RegistryAction::*;
     match detect_provider_kind(host) {
-        Some(ProviderKind::Ecr) => match action {
-            RegistryAction::ManifestHead => WindowKey::EcrManifestHead,
-            RegistryAction::ManifestRead => WindowKey::EcrManifestRead,
-            RegistryAction::ManifestWrite => WindowKey::EcrManifestWrite,
-            RegistryAction::BlobHead => WindowKey::EcrBlobHead,
-            RegistryAction::BlobRead => WindowKey::EcrBlobRead,
-            RegistryAction::BlobUploadInit => WindowKey::EcrBlobUploadInit,
-            RegistryAction::BlobUploadChunk => WindowKey::EcrBlobUploadChunk,
-            RegistryAction::BlobUploadComplete => WindowKey::EcrBlobUploadComplete,
-            RegistryAction::TagList => WindowKey::EcrTagList,
-        },
-        Some(ProviderKind::EcrPublic) => match action {
-            RegistryAction::ManifestHead
-            | RegistryAction::ManifestRead
-            | RegistryAction::BlobHead
-            | RegistryAction::BlobRead
-            | RegistryAction::TagList => WindowKey::EcrPublicRead,
-            RegistryAction::ManifestWrite => WindowKey::EcrPublicManifestWrite,
-            RegistryAction::BlobUploadInit => WindowKey::EcrPublicBlobUploadInit,
-            RegistryAction::BlobUploadChunk => WindowKey::EcrPublicBlobUploadChunk,
-            RegistryAction::BlobUploadComplete => WindowKey::EcrPublicBlobUploadComplete,
-        },
-        Some(ProviderKind::DockerHub) => match action {
-            RegistryAction::ManifestHead | RegistryAction::BlobHead => WindowKey::DockerHubHeads,
-            RegistryAction::ManifestRead => WindowKey::DockerHubManifestRead,
-            _ => WindowKey::DockerHubOther,
-        },
-        Some(ProviderKind::Gar) | Some(ProviderKind::Gcr) => {
-            // Single shared project quota; GCR is now an alias for GAR.
-            WindowKey::GarShared
-        }
-        Some(ProviderKind::Ghcr) => {
-            // GitHub enforces an aggregate 2000 RPM cap shared across read
-            // and write actions for an authenticated principal, so a single
-            // shared window models the actual enforcement.
-            WindowKey::GhcrShared
-        }
-        Some(ProviderKind::Acr) => match action {
-            RegistryAction::ManifestHead
-            | RegistryAction::ManifestRead
-            | RegistryAction::BlobHead
-            | RegistryAction::BlobRead
-            | RegistryAction::TagList => WindowKey::AcrRead,
-            RegistryAction::ManifestWrite
-            | RegistryAction::BlobUploadInit
-            | RegistryAction::BlobUploadChunk
-            | RegistryAction::BlobUploadComplete => WindowKey::AcrWrite,
-        },
-        _ => {
-            // Chainguard, Quay, generic -- coarse grouping.
-            match action {
-                RegistryAction::ManifestHead | RegistryAction::BlobHead => WindowKey::UnknownHeads,
-                RegistryAction::ManifestRead | RegistryAction::BlobRead => WindowKey::UnknownReads,
-                RegistryAction::BlobUploadInit
-                | RegistryAction::BlobUploadChunk
-                | RegistryAction::BlobUploadComplete => WindowKey::UnknownUploads,
-                RegistryAction::ManifestWrite => WindowKey::UnknownManifestWrite,
-                RegistryAction::TagList => WindowKey::UnknownTagList,
+        Some(ProviderKind::Ecr) => WindowKey::Ecr(action),
+        Some(ProviderKind::EcrPublic) => WindowKey::EcrPublic(match action {
+            ManifestHead | ManifestRead | BlobHead | BlobRead | TagList => EcrPublicGroup::Read,
+            ManifestWrite => EcrPublicGroup::ManifestWrite,
+            BlobUploadInit => EcrPublicGroup::BlobUploadInit,
+            BlobUploadChunk => EcrPublicGroup::BlobUploadChunk,
+            BlobUploadComplete => EcrPublicGroup::BlobUploadComplete,
+        }),
+        Some(ProviderKind::DockerHub) => WindowKey::DockerHub(match action {
+            ManifestHead | BlobHead => DockerHubGroup::Heads,
+            ManifestRead => DockerHubGroup::ManifestRead,
+            _ => DockerHubGroup::Other,
+        }),
+        // GAR/GCR (GCR is an alias for GAR) and GHCR each enforce a single
+        // shared cap across all actions.
+        Some(ProviderKind::Gar | ProviderKind::Gcr) => WindowKey::GarShared,
+        Some(ProviderKind::Ghcr) => WindowKey::GhcrShared,
+        Some(ProviderKind::Acr) => WindowKey::Acr(match action {
+            ManifestHead | ManifestRead | BlobHead | BlobRead | TagList => AcrGroup::Read,
+            ManifestWrite | BlobUploadInit | BlobUploadChunk | BlobUploadComplete => {
+                AcrGroup::Write
             }
-        }
+        }),
+        _ => WindowKey::Unknown(match action {
+            ManifestHead | BlobHead => UnknownGroup::Heads,
+            ManifestRead | BlobRead => UnknownGroup::Reads,
+            BlobUploadInit | BlobUploadChunk | BlobUploadComplete => UnknownGroup::Uploads,
+            ManifestWrite => UnknownGroup::ManifestWrite,
+            TagList => UnknownGroup::TagList,
+        }),
     }
 }
 
@@ -345,27 +337,25 @@ pub(crate) struct BucketConfig {
 /// official registry documentation (AWS service quotas, Google quotas
 /// page, Microsoft historical SKU table) on 2026-04-26.
 fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
+    use RegistryAction::*;
     // Helper to keep the table readable.
     let cfg = |rate_per_sec: f64, burst: f64| BucketConfig {
         rate_per_sec,
         burst,
     };
-    let result = match key {
+    Some(match key {
         // ECR private (per-account, per-region; AWS docs).
         // PutImage 10 TPS, InitiateLayerUpload/CompleteLayerUpload 100 TPS,
-        // UploadLayerPart 500 TPS.
-        WindowKey::EcrManifestWrite => cfg(8.0, 10.0),
-        WindowKey::EcrBlobUploadInit => cfg(80.0, 20.0),
-        WindowKey::EcrBlobUploadComplete => cfg(80.0, 20.0),
-        WindowKey::EcrBlobUploadChunk => cfg(400.0, 50.0),
+        // UploadLayerPart 500 TPS. Reads (HEAD/GET/TagList) have headroom
+        // far above any sync workload, so AIMD alone governs them.
+        WindowKey::Ecr(ManifestWrite) => cfg(8.0, 10.0),
+        WindowKey::Ecr(BlobUploadInit | BlobUploadComplete) => cfg(80.0, 20.0),
+        WindowKey::Ecr(BlobUploadChunk) => cfg(400.0, 50.0),
         // ECR Public (per-account, per-region; AWS docs).
         // PutImage / InitiateLayerUpload / CompleteLayerUpload / authenticated
         // pulls 10 TPS each, UploadLayerPart 260 TPS.
-        WindowKey::EcrPublicRead => cfg(8.0, 10.0),
-        WindowKey::EcrPublicManifestWrite => cfg(8.0, 10.0),
-        WindowKey::EcrPublicBlobUploadInit => cfg(8.0, 10.0),
-        WindowKey::EcrPublicBlobUploadComplete => cfg(8.0, 10.0),
-        WindowKey::EcrPublicBlobUploadChunk => cfg(200.0, 30.0),
+        WindowKey::EcrPublic(EcrPublicGroup::BlobUploadChunk) => cfg(200.0, 30.0),
+        WindowKey::EcrPublic(_) => cfg(8.0, 10.0),
         // GHCR: single 2000 RPM (~33 RPS) aggregate cap per authenticated
         // principal. 20 TPS leaves 40% headroom for tail bursts.
         WindowKey::GhcrShared => cfg(20.0, 10.0),
@@ -377,12 +367,11 @@ fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
         // and ~2,000 WriteOps/min (33 RPS). Microsoft removed the explicit
         // table in 2026-03; values preserved from the prior published
         // numbers. Basic / Standard SKUs hit AIMD halve on first 429.
-        WindowKey::AcrRead => cfg(130.0, 30.0),
-        WindowKey::AcrWrite => cfg(26.0, 10.0),
+        WindowKey::Acr(AcrGroup::Read) => cfg(130.0, 30.0),
+        WindowKey::Acr(AcrGroup::Write) => cfg(26.0, 10.0),
         // All other windows: AIMD only.
-        _ => return None,
-    };
-    Some(result)
+        WindowKey::Ecr(_) | WindowKey::DockerHub(_) | WindowKey::Unknown(_) => return None,
+    })
 }
 
 /// State stored per AIMD window inside [`AimdController`].
@@ -392,6 +381,22 @@ struct WindowState {
     semaphore: Arc<Semaphore>,
     /// Optional token bucket for hard TPS ceilings (None = AIMD only).
     bucket: Option<Arc<TokenBucket>>,
+}
+
+impl WindowState {
+    /// Build a fresh window for `key` capped at `max_concurrent`.
+    fn new_for(key: WindowKey, max_concurrent: usize) -> Self {
+        let initial = DEFAULT_INITIAL_WINDOW.min(max_concurrent as f64);
+        let window = AimdWindow::new(initial, max_concurrent);
+        let limit = window.limit();
+        let bucket = bucket_config_for_window(key)
+            .map(|c| Arc::new(TokenBucket::new(c.rate_per_sec, c.burst)));
+        Self {
+            window,
+            semaphore: Arc::new(Semaphore::new(limit)),
+            bucket,
+        }
+    }
 }
 
 impl std::fmt::Debug for WindowState {
@@ -448,18 +453,9 @@ impl AimdController {
         // Ensure the window entry exists, then capture the semaphore + bucket.
         let (action_semaphore, bucket) = {
             let mut map = self.windows.lock().expect("aimd lock poisoned");
-            let state = map.entry(key).or_insert_with(|| {
-                let initial = DEFAULT_INITIAL_WINDOW.min(self.max_concurrent as f64);
-                let window = AimdWindow::new(initial, self.max_concurrent);
-                let limit = window.limit();
-                let bucket = bucket_config_for_window(key)
-                    .map(|c| Arc::new(TokenBucket::new(c.rate_per_sec, c.burst)));
-                WindowState {
-                    window,
-                    semaphore: Arc::new(Semaphore::new(limit)),
-                    bucket,
-                }
-            });
+            let state = map
+                .entry(key)
+                .or_insert_with(|| WindowState::new_for(key, self.max_concurrent));
             (Arc::clone(&state.semaphore), state.bucket.clone())
         };
 
@@ -826,18 +822,22 @@ mod tests {
 
     #[test]
     fn ecr_public_window_keys_route_per_action() {
+        use EcrPublicGroup as G;
         use RegistryAction::*;
         let host = "public.ecr.aws";
         let cases: &[(RegistryAction, WindowKey)] = &[
-            (ManifestHead, WindowKey::EcrPublicRead),
-            (ManifestRead, WindowKey::EcrPublicRead),
-            (BlobHead, WindowKey::EcrPublicRead),
-            (BlobRead, WindowKey::EcrPublicRead),
-            (TagList, WindowKey::EcrPublicRead),
-            (ManifestWrite, WindowKey::EcrPublicManifestWrite),
-            (BlobUploadInit, WindowKey::EcrPublicBlobUploadInit),
-            (BlobUploadChunk, WindowKey::EcrPublicBlobUploadChunk),
-            (BlobUploadComplete, WindowKey::EcrPublicBlobUploadComplete),
+            (ManifestHead, WindowKey::EcrPublic(G::Read)),
+            (ManifestRead, WindowKey::EcrPublic(G::Read)),
+            (BlobHead, WindowKey::EcrPublic(G::Read)),
+            (BlobRead, WindowKey::EcrPublic(G::Read)),
+            (TagList, WindowKey::EcrPublic(G::Read)),
+            (ManifestWrite, WindowKey::EcrPublic(G::ManifestWrite)),
+            (BlobUploadInit, WindowKey::EcrPublic(G::BlobUploadInit)),
+            (BlobUploadChunk, WindowKey::EcrPublic(G::BlobUploadChunk)),
+            (
+                BlobUploadComplete,
+                WindowKey::EcrPublic(G::BlobUploadComplete),
+            ),
         ];
         for &(action, expected) in cases {
             assert_eq!(
@@ -879,15 +879,15 @@ mod tests {
         use RegistryAction::*;
         let host = "myreg.azurecr.io";
         let cases: &[(RegistryAction, WindowKey)] = &[
-            (ManifestHead, WindowKey::AcrRead),
-            (ManifestRead, WindowKey::AcrRead),
-            (BlobHead, WindowKey::AcrRead),
-            (BlobRead, WindowKey::AcrRead),
-            (TagList, WindowKey::AcrRead),
-            (ManifestWrite, WindowKey::AcrWrite),
-            (BlobUploadInit, WindowKey::AcrWrite),
-            (BlobUploadChunk, WindowKey::AcrWrite),
-            (BlobUploadComplete, WindowKey::AcrWrite),
+            (ManifestHead, WindowKey::Acr(AcrGroup::Read)),
+            (ManifestRead, WindowKey::Acr(AcrGroup::Read)),
+            (BlobHead, WindowKey::Acr(AcrGroup::Read)),
+            (BlobRead, WindowKey::Acr(AcrGroup::Read)),
+            (TagList, WindowKey::Acr(AcrGroup::Read)),
+            (ManifestWrite, WindowKey::Acr(AcrGroup::Write)),
+            (BlobUploadInit, WindowKey::Acr(AcrGroup::Write)),
+            (BlobUploadChunk, WindowKey::Acr(AcrGroup::Write)),
+            (BlobUploadComplete, WindowKey::Acr(AcrGroup::Write)),
         ];
         for &(action, expected) in cases {
             assert_eq!(
@@ -905,11 +905,12 @@ mod tests {
         // ECR private upload paths must have a bucket; the bench failure that
         // motivated this PR was 5x429s on InitiateLayerUpload under cross-repo
         // aggregation. Removing any of these silently re-opens that hazard.
+        use RegistryAction::*;
         for key in [
-            WindowKey::EcrManifestWrite,
-            WindowKey::EcrBlobUploadInit,
-            WindowKey::EcrBlobUploadComplete,
-            WindowKey::EcrBlobUploadChunk,
+            WindowKey::Ecr(ManifestWrite),
+            WindowKey::Ecr(BlobUploadInit),
+            WindowKey::Ecr(BlobUploadComplete),
+            WindowKey::Ecr(BlobUploadChunk),
         ] {
             assert!(
                 bucket_config_for_window(key).is_some(),
@@ -923,17 +924,18 @@ mod tests {
         // ECR HEAD is documented as unmetered; Docker Hub HEAD is unmetered;
         // Unknown* registries have no documented cap and must fall back to
         // AIMD-only.
+        use RegistryAction::*;
         for key in [
-            WindowKey::EcrManifestHead,
-            WindowKey::EcrBlobHead,
-            WindowKey::DockerHubHeads,
-            WindowKey::DockerHubManifestRead,
-            WindowKey::DockerHubOther,
-            WindowKey::UnknownHeads,
-            WindowKey::UnknownReads,
-            WindowKey::UnknownUploads,
-            WindowKey::UnknownManifestWrite,
-            WindowKey::UnknownTagList,
+            WindowKey::Ecr(ManifestHead),
+            WindowKey::Ecr(BlobHead),
+            WindowKey::DockerHub(DockerHubGroup::Heads),
+            WindowKey::DockerHub(DockerHubGroup::ManifestRead),
+            WindowKey::DockerHub(DockerHubGroup::Other),
+            WindowKey::Unknown(UnknownGroup::Heads),
+            WindowKey::Unknown(UnknownGroup::Reads),
+            WindowKey::Unknown(UnknownGroup::Uploads),
+            WindowKey::Unknown(UnknownGroup::ManifestWrite),
+            WindowKey::Unknown(UnknownGroup::TagList),
         ] {
             assert!(
                 bucket_config_for_window(key).is_none(),
@@ -947,8 +949,10 @@ mod tests {
         // AWS documents InitiateLayerUpload at 100 TPS and UploadLayerPart at
         // 500 TPS. Chunk MUST be the more permissive of the two; reversing
         // this is a documented misconfiguration that would slow uploads.
-        let init = bucket_config_for_window(WindowKey::EcrBlobUploadInit).unwrap();
-        let chunk = bucket_config_for_window(WindowKey::EcrBlobUploadChunk).unwrap();
+        let init =
+            bucket_config_for_window(WindowKey::Ecr(RegistryAction::BlobUploadInit)).unwrap();
+        let chunk =
+            bucket_config_for_window(WindowKey::Ecr(RegistryAction::BlobUploadChunk)).unwrap();
         assert!(
             chunk.rate_per_sec > init.rate_per_sec,
             "ECR chunk rate ({}) must exceed init rate ({})",
@@ -968,20 +972,22 @@ mod tests {
         // burst more than 10x the per-second rate is structurally unsafe
         // because it lets a cold path emit a multi-second over-cap spike
         // before the bucket reins it in.
+        use EcrPublicGroup as Pub;
+        use RegistryAction::*;
         let configured = [
-            WindowKey::EcrManifestWrite,
-            WindowKey::EcrBlobUploadInit,
-            WindowKey::EcrBlobUploadComplete,
-            WindowKey::EcrBlobUploadChunk,
-            WindowKey::EcrPublicRead,
-            WindowKey::EcrPublicManifestWrite,
-            WindowKey::EcrPublicBlobUploadInit,
-            WindowKey::EcrPublicBlobUploadComplete,
-            WindowKey::EcrPublicBlobUploadChunk,
+            WindowKey::Ecr(ManifestWrite),
+            WindowKey::Ecr(BlobUploadInit),
+            WindowKey::Ecr(BlobUploadComplete),
+            WindowKey::Ecr(BlobUploadChunk),
+            WindowKey::EcrPublic(Pub::Read),
+            WindowKey::EcrPublic(Pub::ManifestWrite),
+            WindowKey::EcrPublic(Pub::BlobUploadInit),
+            WindowKey::EcrPublic(Pub::BlobUploadComplete),
+            WindowKey::EcrPublic(Pub::BlobUploadChunk),
             WindowKey::GhcrShared,
             WindowKey::GarShared,
-            WindowKey::AcrRead,
-            WindowKey::AcrWrite,
+            WindowKey::Acr(AcrGroup::Read),
+            WindowKey::Acr(AcrGroup::Write),
         ];
         for key in configured {
             let cfg = bucket_config_for_window(key).unwrap_or_else(|| {
