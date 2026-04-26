@@ -49,7 +49,6 @@
   </g>
 
   <!-- Left section: Logo + branding -->
-  <!-- Logo icon inline with title -->
   <rect x="60" y="100" width="72" height="72" rx="16" fill="url(#logobg)"/>
   <path d="M104 108L78 140h16L86 164L114 130h-16L104 108z" fill="#ff44ee"/>
   <text x="148" y="160" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="72" font-weight="800" fill="url(#pink-grad)">ocync</text>
@@ -64,22 +63,32 @@
   <rect x="60" y="300" width="150" height="32" rx="16" fill="#ffffff" fill-opacity="0.06" stroke="#ffffff" stroke-opacity="0.12" stroke-width="1"/>
   <text x="135" y="321" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" font-weight="600" fill="#8b92b0">Open Source - Rust</text>
 
-  <!-- Right section: Stats -->
-  <!-- Stat card 1: Speed -->
+  <!-- Feature ticks -->
+  <circle cx="74" cy="380" r="8" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.18"/>
+  <path d="M70 380 L73 383 L78 377" stroke="url(#cyan-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <text x="92" y="386" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="20" fill="#bcc6ec">Zero duplicate blob fetches</text>
+
+  <circle cx="74" cy="420" r="8" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.18"/>
+  <path d="M70 420 L73 423 L78 417" stroke="url(#purple-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <text x="92" y="426" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="20" fill="#bcc6ec">Cross-repo blob mount</text>
+
+  <circle cx="74" cy="460" r="8" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.18"/>
+  <path d="M70 460 L73 463 L78 457" stroke="url(#pink-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <text x="92" y="466" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="20" fill="#bcc6ec">OCI 1.1 referrer artifacts</text>
+
+  <!-- Right section: Stat cards -->
   <rect x="620" y="70" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="115" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#06b6d4" letter-spacing="2">SPEED</text>
   <text x="660" y="170" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#cyan-grad)">4x</text>
   <text x="810" y="155" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">faster than</text>
   <text x="810" y="180" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">alternatives</text>
 
-  <!-- Stat card 2: Efficiency -->
   <rect x="620" y="230" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="275" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#a855f7" letter-spacing="2">EFFICIENCY</text>
-  <text x="660" y="330" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#purple-grad)">40%</text>
+  <text x="660" y="330" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#purple-grad)">30%</text>
   <text x="845" y="315" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">fewer</text>
   <text x="845" y="340" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">requests</text>
 
-  <!-- Stat card 3: Reliability -->
   <rect x="620" y="390" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="435" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#F736F6" letter-spacing="2">RELIABILITY</text>
   <text x="660" y="495" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="48" font-weight="800" fill="url(#pink-grad)">AIMD</text>

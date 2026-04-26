@@ -32,3 +32,4 @@ bench/terraform/*/.terraform/
 bench/terraform/*/.terraform.lock.hcl
 bench/terraform/*/terraform.tfstate*
 bench/terraform/*/bench.json
+bench/terraform/*/.ssh-key

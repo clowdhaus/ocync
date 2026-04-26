@@ -5,7 +5,8 @@ Workspace automation via `cargo xtask`. Provides benchmark orchestration for com
 ## Prerequisites
 
 - Terraform installed
-- `~/.ssh/id_ed25519` exists, public key added to GitHub
+- Git push access to the repo (xtask pushes the current branch from the operator's machine)
+- OpenSSH public key authorized for instance access, supplied to Terraform via `terraform.tfvars` or `TF_VAR_ssh_public_key`
 - AWS credentials with ECR access + SSM parameter read
 - SSM parameters populated:
   - `/ocync/bench/dockerhub-username` - Docker Hub account name

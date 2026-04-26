@@ -28,26 +28,6 @@ dnf install -y \
   openssl-devel \
   gpgme-devel
 
-# ── SSH key (instance access + git clone) ─────────────────────────────────────
-
-echo "--- Configuring SSH key for ec2-user"
-mkdir -p /home/ec2-user/.ssh
-chmod 700 /home/ec2-user/.ssh
-
-cat > /home/ec2-user/.ssh/id_ed25519 <<'KEYEOF'
-${ssh_private_key}
-KEYEOF
-chmod 600 /home/ec2-user/.ssh/id_ed25519
-
-cat > /home/ec2-user/.ssh/config <<'SSHEOF'
-Host github.com
-  IdentityFile ~/.ssh/id_ed25519
-  StrictHostKeyChecking accept-new
-SSHEOF
-chmod 600 /home/ec2-user/.ssh/config
-
-chown -R ec2-user:ec2-user /home/ec2-user/.ssh
-
 # ── Docker Hub credentials ───────────────────────────────────────────────────
 # Written to a dedicated env file (not .bashrc) so that non-interactive
 # SSH sessions (bench-remote) can source them reliably.
@@ -162,7 +142,7 @@ echo "--- Cloning and building ocync (as ec2-user)"
 
 su - ec2-user -c "
   source \$HOME/.cargo/env
-  git clone git@github.com:clowdhaus/ocync.git \$HOME/ocync
+  git clone https://github.com/clowdhaus/ocync.git \$HOME/ocync
   cd \$HOME/ocync
   cargo build --release --package ocync --package bench-proxy
   cp target/release/ocync \$HOME/.cargo/bin/ocync

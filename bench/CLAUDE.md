@@ -4,7 +4,8 @@ Benchmark infrastructure for comparing ocync against dregsy and regsync.
 
 ## Prerequisites
 
-- `~/.ssh/id_ed25519` exists, public key added to GitHub
+- Git push access to the repo (the `bench-remote` xtask pushes the current branch from the operator's machine)
+- An OpenSSH public key authorized for instance access, supplied to Terraform via `terraform.tfvars` or `TF_VAR_ssh_public_key`
 - AWS credentials with ECR access + SSM parameter read (Docker Hub creds)
 - Terraform installed
 - SSM parameters populated in us-east-2:
@@ -45,7 +46,7 @@ cargo xtask bench-remote --provider aws --fetch
 
 **What it does:**
 1. `git push` the current branch
-2. SSH into the instance (using `~/.ssh/id_ed25519`)
+2. SSH into the instance
 3. Pull code, build, run benchmarks with live streamed output
 4. SCP results back: `summary.md` and historical JSON archive
 
@@ -135,7 +136,6 @@ The IAM role includes: `AmazonEC2ContainerRegistryFullAccess`, `ec2:DescribeInst
 
 ## Security notes
 
-- **SSH key in user-data**: The operator's `~/.ssh/id_ed25519` private key is templated into EC2 user-data via Terraform and stored in Terraform state (S3, encrypted). Acceptable for a single-operator throwaway instance. The same key grants write access to the repo via GitHub SSH -- use a dedicated deploy key if this infrastructure is ever extended to multiple operators.
 - **IAM `AmazonEC2ContainerRegistryFullAccess`**: Intentionally broad because bench scenarios create and delete ECR repos (`ecr::create_repos` / `ecr::delete_repos`). Not scoped to specific repos because repo names are derived from the corpus at runtime.
 - **Docker Hub token in `.bench-env`**: Credentials are written to `~/.bench-env` (chmod 600) and sourced from `.bashrc`. Visible to any process running as ec2-user. Acceptable for single-operator ephemeral instances.
 - **SSH `StrictHostKeyChecking=accept-new`**: First-connect TOFU since the instance is recreated on every `terraform apply`. Host key is not verified against a known value.
