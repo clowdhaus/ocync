@@ -140,7 +140,7 @@ impl AuthProvider for BasicAuth {
 mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -175,6 +175,25 @@ mod tests {
     async fn mount_token_endpoint(server: &MockServer, token_value: &str, expect: u64) {
         Mock::given(method("GET"))
             .and(path("/token"))
+            .and(header("Authorization", expected_basic_header().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": token_value,
+                "expires_in": 3600
+            })))
+            .expect(expect)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_token_endpoint_for_scope(
+        server: &MockServer,
+        scope: &str,
+        token_value: &str,
+        expect: u64,
+    ) {
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(query_param("scope", scope))
             .and(header("Authorization", expected_basic_header().as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "token": token_value,
@@ -315,6 +334,86 @@ mod tests {
         assert_eq!(t1.value(), "reused");
         assert_eq!(t2.value(), "reused");
         // expect(1) on /v2/ proves the challenge was cached and reused.
+    }
+
+    #[tokio::test]
+    async fn basic_auth_different_scopes_get_different_tokens() {
+        // Multi-repo "Chainguard-shaped" mirror: one credential set, two
+        // repositories, distinct scopes. Asserts the per-scope token cache
+        // does not collapse the two scopes onto a shared token (stronger
+        // than basic_auth_challenge_cache_reuse, which uses the same mock
+        // return value for both scopes).
+        let server = MockServer::start().await;
+        mount_v2_challenge(&server, 1).await;
+        mount_token_endpoint_for_scope(&server, "repository:repo-a:pull", "tok-a", 1).await;
+        mount_token_endpoint_for_scope(&server, "repository:repo-b:pull", "tok-b", 1).await;
+
+        let auth =
+            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let t_a = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
+        let t_b = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
+        assert_eq!(t_a.value(), "tok-a");
+        assert_eq!(t_b.value(), "tok-b");
+    }
+
+    #[tokio::test]
+    async fn basic_auth_scope_upgrade_fetches_new_token() {
+        // pull cached -> pull,push must miss the cache and fetch a new
+        // token, because scopes_cache_key includes the action set. Two
+        // sequential pull calls should produce a single /token hit; the
+        // pull,push call adds a second hit.
+        let server = MockServer::start().await;
+        mount_v2_challenge(&server, 1).await;
+        mount_token_endpoint_for_scope(&server, "repository:repo:pull", "pull-tok", 1).await;
+        mount_token_endpoint_for_scope(&server, "repository:repo:pull,push", "push-tok", 1).await;
+
+        let auth =
+            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let t_pull1 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(t_pull1.value(), "pull-tok");
+        // Second pull -> cache hit; the expect(1) on the pull mock above
+        // would fail wiremock verification on drop if a second hit landed.
+        let t_pull2 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(t_pull2.value(), "pull-tok");
+        // Upgrade scope -> different cache key -> new fetch.
+        let t_pp = auth.get_token(&[Scope::pull_push("repo")]).await.unwrap();
+        assert_eq!(t_pp.value(), "push-tok");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn basic_auth_concurrent_requests_coalesce() {
+        // 20 concurrent get_token calls for the same scope produce exactly
+        // 1 token-endpoint hit. The check-then-fetch holds the cache mutex
+        // for the entire path (basic.rs:97), so the first task to acquire
+        // the lock fetches and populates the cache; the rest see the
+        // populated entry and return without an HTTP exchange.
+        //
+        // current_thread flavor matches auth_anonymous.rs:165 -- the
+        // production binary uses single-threaded tokio, so coalescing
+        // under that runtime model is what matters.
+        let server = MockServer::start().await;
+        mount_v2_challenge(&server, 1).await;
+        mount_token_endpoint(&server, "single-tok", 1).await;
+
+        let auth = std::sync::Arc::new(BasicAuth::with_base_url(
+            server.uri(),
+            crate::test_http_client(),
+            test_credentials(),
+        ));
+
+        let mut tasks = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let auth = auth.clone();
+            tasks.push(tokio::spawn(async move {
+                auth.get_token(&[Scope::pull("repo")]).await.unwrap()
+            }));
+        }
+        for task in tasks {
+            let token = task.await.unwrap();
+            assert_eq!(token.value(), "single-tok");
+        }
+        // expect(1) on /token (in mount_token_endpoint) is verified on
+        // MockServer drop; fan-out without coalescing would trip it.
     }
 
     #[test]

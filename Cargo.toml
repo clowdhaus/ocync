@@ -81,6 +81,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 url.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 uuid.workspace = true
 
 # Redirect crates.io reqwest to our git pin so transitive deps

@@ -72,6 +72,110 @@ extraArgs: []
 ##       value: "true"
 env: []
 
+## @param envFrom envFrom sources for the container
+## Use for token-based auth (DOCKER_PASSWORD, GITHUB_TOKEN, chainctl tokens).
+## The referenced Secret/ConfigMap must already exist in the cluster.
+##   envFrom:
+##     - secretRef:
+##         name: ocync-credentials
+envFrom: []
+
+## @param extraVolumes Additional pod volumes appended to the workload's volumes list
+## Use for docker-config.json from a Secret, CA bundle ConfigMaps, GCP SA key files,
+## or CSI-driven secret stores. See charts/ocync/ci/*-values.yaml for examples.
+extraVolumes: []
+
+## @param extraVolumeMounts Additional container volume mounts appended to volumeMounts
+## Pair each entry with an extraVolumes entry of the same name.
+extraVolumeMounts: []
+
+## @param podAnnotations Pod-level annotations
+## Required for Vault Agent Injector (vault.hashicorp.com/agent-inject) and
+## service-mesh sidecars (linkerd.io/inject, sidecar.istio.io/inject).
+podAnnotations: {}
+
+## @param podLabels Pod-level labels
+## Required for Azure AD Workload Identity (azure.workload.identity/use: "true")
+## and any label-selector-driven controllers.
+podLabels: {}
+
+## External Secrets Operator (ESO) integration.
+## Generates an ExternalSecret resource (external-secrets.io/v1) that pulls
+## from a SecretStore/ClusterSecretStore and writes a native K8s Secret which
+## the workload then consumes via envFrom or extraVolumes.
+##
+## Requires: external-secrets-operator installed cluster-side. The chart does
+## not pre-check CRD presence; if missing, `kubectl apply` returns
+## `no matches for kind "ExternalSecret"` -- the standard, debuggable failure.
+externalSecrets:
+  ## @param externalSecrets.enabled Render an ExternalSecret resource
+  enabled: false
+  ## @param externalSecrets.refreshInterval Refresh interval for the secret
+  refreshInterval: "1h"
+  ## @param externalSecrets.secretStoreRef Reference to the SecretStore/ClusterSecretStore
+  ## Shape: { name: <store-name>, kind: SecretStore | ClusterSecretStore }
+  secretStoreRef: {}
+  ## @param externalSecrets.target Target K8s Secret to create
+  ## Shape: { name?: <secret-name (default: chart fullname)>, creationPolicy?: Owner | Orphan }
+  target: {}
+  ## @param externalSecrets.data Mapping of secret keys to remote references
+  ## Shape: [{ secretKey, remoteRef: { key, property? } }]
+  data: []
+
+## CSI Secrets Store Driver integration.
+## Generates a SecretProviderClass (secrets-store.csi.x-k8s.io/v1) that the
+## CSI driver uses to mount secrets from a cloud secret store as files (and
+## optionally sync into K8s Secrets). The pod must reference the resulting
+## SecretProviderClass via extraVolumes (csi: driver: secrets-store.csi.k8s.io).
+##
+## Requires: secrets-store-csi-driver + provider plugin (aws/azure/gcp/vault)
+## installed cluster-side.
+secretProviderClass:
+  ## @param secretProviderClass.enabled Render a SecretProviderClass resource
+  enabled: false
+  ## @param secretProviderClass.provider Provider plugin: aws | azure | gcp | vault
+  provider: ""
+  ## @param secretProviderClass.parameters Provider-specific parameters
+  parameters: {}
+  ## @param secretProviderClass.secretObjects Optional K8s Secret sync targets
+  ## Shape: [{ secretName, type, data: [{ objectName, key }] }]
+  secretObjects: []
+
+## Workload Identity convenience block.
+## Sets the appropriate ServiceAccount annotations and pod labels for the
+## chosen cloud provider. Composes with `serviceAccount.annotations` and
+## `podLabels` (both are merged in; user-set keys win on conflict).
+##
+## When `provider` is "none" no annotations or labels are added.
+##
+## EKS Pod Identity is intentionally not represented here -- it is
+## configured cluster-side via PodIdentityAssociation, not the pod spec.
+## See docs/src/content/registries/ecr.md for the alternative path.
+workloadIdentity:
+  ## @param workloadIdentity.provider Workload identity provider: none | aws | gcp | azure
+  provider: none
+
+  aws:
+    ## @param workloadIdentity.aws.roleArn IAM role ARN to assume via IRSA
+    ## Sets `eks.amazonaws.com/role-arn` on the ServiceAccount.
+    roleArn: ""
+
+  gcp:
+    ## @param workloadIdentity.gcp.serviceAccount GSA email for GKE Workload Identity
+    ## Sets `iam.gke.io/gcp-service-account` on the ServiceAccount.
+    serviceAccount: ""
+
+  azure:
+    ## @param workloadIdentity.azure.clientId AAD app client ID
+    ## Sets `azure.workload.identity/client-id` on the ServiceAccount AND
+    ## `azure.workload.identity/use: "true"` on the pod (the latter is the
+    ## critical pod label without which the AAD webhook does not inject the
+    ## projected SA token).
+    clientId: ""
+    ## @param workloadIdentity.azure.tenantId AAD tenant ID (optional)
+    ## When set, adds `azure.workload.identity/tenant-id` to the ServiceAccount.
+    tenantId: ""
+
 ## @param resources Resource requests and limits
 ## ocync is single-threaded (tokio current_thread) but network-bound during sync.
 ## CPU request influences Karpenter instance-type selection; 500m ensures the

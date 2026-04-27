@@ -14,8 +14,24 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 - Realm URL validation: `validate_realm_url()` in `token_exchange.rs` validates realm URLs before sending credentials. Four layers: structural (scheme, userinfo, host), IP denylist (link-local, cloud metadata, unspecified, localhost, conditional loopback, IPv4-translated/NAT64), no-redirect client, domain binding (realm host must match or share parent domain with registry). Runs on both fresh and cached challenges.
 - Parse `WWW-Authenticate` header dynamically; never hardcode token exchange endpoints.
 - Token caching: `EARLY_REFRESH_WINDOW` = 30s. Docker Hub issues 300s tokens; a 15m window was a bug that bypassed the cache entirely.
-- Per-scope tokens: format `repository:<name>:<actions>` where actions = `pull`, `push`, or `pull,push`.
-- cgr.dev uses per-repo tokens that 403 on wrong scope; scope-keyed cache handles it.
+- Per-scope tokens: format `repository:<name>:<actions>` where actions = `pull`, `push`, or `pull,push`. Per-scope caching (`scopes_cache_key` in `auth/mod.rs`) is universal across every Bearer-issuing provider (anonymous, basic, docker-config, ecr-public, gcp). It is NOT a Chainguard-specific feature.
+- cgr.dev's specific quirk is *enforcement*: it returns 403 on cross-scope token reuse where some registries silently accept it. The scope-keyed cache is what makes ocync correct against this enforcement -- but the cache itself exists for every Bearer flow.
+
+## Provider dispatch (auto-detection)
+
+When `auth_type` is unset in registry config, `src/cli/mod.rs` selects the auth provider by `detect_provider_kind(hostname)`:
+
+| Detected `ProviderKind` | Auth provider |
+| --- | --- |
+| `Ecr` | `EcrAuth` |
+| `EcrPublic` | `EcrPublicAuth` |
+| `Gar` / `Gcr` | `GcpAuth` |
+| `Acr` | `AcrAuth` |
+| `Ghcr` / `DockerHub` / `Chainguard` / unknown | `DockerConfigAuth` (try `~/.docker/config.json`); falls back to `AnonymousAuth` if no config or no entry for the host |
+
+This means `cgr.dev`, `ghcr.io`, `docker.io`, and any unrecognized hostname all share the same default path: docker-config first, anonymous fallback. `docker login <host>` (or `chainctl auth login` for cgr.dev paid tags) is the supported way to supply credentials when `auth_type` is not set explicitly.
+
+When `auth_type` IS set in config, it overrides detection. Valid values: `ecr`, `gar`, `gcr`, `acr`, `basic`, `static_token`, `ghcr`, `docker_config`, `anonymous`. (`ghcr` and `docker_config` are equivalent.)
 
 ## Registry detection
 
@@ -58,6 +74,25 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 - Protocol correctness: `testcontainers` against `registry:2` in `tests/registry2_*.rs`.
 - Mock trait impls must honor the real contract - filter inputs, assert context params (repo, registry) match expected values.
 - Realm validation tests: realm and registry must use the same scheme (both `https://` or both `http://`) unless the test specifically targets the scheme check. Mismatched schemes cause the scheme check to fire first, masking the intended denylist rule. Always assert on the error message substring, not just `is_err()`.
+- Per-provider auth coverage convention: in-file `#[cfg(test)] mod tests` next to the provider, using `wiremock::MockServer` against `BasicAuth::with_base_url` / `AcrAuth::with_api` / `GcpAuth::with_api` constructors. New behavioral tests for an existing provider are added to that in-file module, not a parallel `tests/auth_*.rs`. The pre-existing `tests/auth_anonymous.rs` predates this convention; do not migrate it but do not pattern-match on it either.
+- BasicAuth helpers reusable for new tests: `mount_v2_challenge` (`auth/basic.rs:160`), `mount_token_endpoint` / `mount_token_endpoint_for_scope` (`:175` / `:189`; the latter filters by `scope` query param for multi-scope assertions), `test_credentials` (`:148`).
+- Concurrent-coalescing tests use `#[tokio::test(flavor = "current_thread")]` (matching `tests/auth_anonymous.rs:165`) -- the production binary uses single-threaded tokio, so coalescing under that runtime model is the contract that matters.
+
+## Provider name surface (testability)
+
+`RegistryClient::auth_name()` (`client.rs`) returns the configured provider's `AuthProvider::name()` or `None`. Used by `src/cli/auth_dispatch_tests.rs` to assert that each `auth_type` config value (and each auto-detected hostname) routes to the expected provider. Provider-name strings are the public testability surface; keep them stable -- changing one from `"docker-config"` to `"docker_config"` would silently break every dispatch test row.
+
+Provider names:
+- `EcrAuth` -> `"ecr"`
+- `EcrPublicAuth` -> `"ecr-public"`
+- `GcpAuth` -> `"gcp"` (covers both `Gar` and `Gcr` `ProviderKind`s)
+- `AcrAuth` -> `"acr"`
+- `BasicAuth` -> `"basic"`
+- `StaticTokenAuth` -> `"static-token"`
+- `DockerConfigAuth` -> `"docker-config"` (covers `auth_type: docker_config` and the `auth_type: ghcr` alias)
+- `AnonymousAuth` -> `"anonymous"`
+
+`build_registry_client` (`src/cli/mod.rs`) calls `ocync_distribution::install_crypto_provider()` at the top -- production main does this too, but the dispatch entry point is also reached from tests that bypass main, so the install must be idempotent there.
 
 ## Commands
 

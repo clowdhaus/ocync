@@ -1,0 +1,26 @@
+## Smoke fixture: cronjob mode pulling registry credentials from a Secret
+## via envFrom. The Secret is assumed to be created out-of-band (e.g.,
+## `kubectl create secret generic ocync-credentials --from-literal=...`).
+mode: cronjob
+
+config:
+  registries:
+    src:
+      url: cgr.dev
+    dst:
+      url: docker.io/example/mirror
+      auth_type: basic
+  defaults:
+    source: src
+    targets:
+      - dst
+  mappings:
+    - from: chainguard/static
+      to: example/static
+
+envFrom:
+  - secretRef:
+      name: ocync-credentials
+
+podAnnotations:
+  example.com/owner: platform
