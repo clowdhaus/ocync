@@ -144,6 +144,15 @@ impl RegistryClient {
         RegistryClientBuilder::new(url)
     }
 
+    /// Return the configured auth provider's name, or `None` if no auth was set.
+    ///
+    /// Exposes [`AuthProvider::name`] from the boxed provider. Used by dispatch
+    /// tests to assert that the right provider was selected for a given config
+    /// without needing to inspect the boxed trait object directly.
+    pub fn auth_name(&self) -> Option<&'static str> {
+        self.auth.as_ref().map(|a| a.name())
+    }
+
     /// Ping the registry's `/v2/` endpoint.
     ///
     /// Returns `Ok(())` if the registry responds with 200 or 401 (which confirms

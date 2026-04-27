@@ -1,0 +1,18 @@
+## Smoke fixture: default watch-mode deployment with no secret affordances.
+## Renders a Deployment + ConfigMap + Service + ServiceAccount and pipes
+## through `kubectl apply --dry-run=client` to catch templating regressions.
+mode: watch
+
+config:
+  registries:
+    src:
+      url: cgr.dev
+    dst:
+      url: ghcr.io/example/mirror
+  defaults:
+    source: src
+    targets:
+      - dst
+  mappings:
+    - from: chainguard/static
+      to: example/static

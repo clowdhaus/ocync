@@ -1,0 +1,27 @@
+## Smoke fixture: watch-mode deployment using Azure AD Workload Identity.
+## Sets the AAD client-id annotation on the ServiceAccount and the
+## `azure.workload.identity/use: "true"` label on the pod (the latter is
+## the critical pod label without which the AAD webhook does not inject
+## the projected SA token).
+mode: watch
+
+config:
+  registries:
+    src:
+      url: cgr.dev
+    dst:
+      url: example.azurecr.io
+      auth_type: acr
+  defaults:
+    source: src
+    targets:
+      - dst
+  mappings:
+    - from: chainguard/static
+      to: example/static
+
+workloadIdentity:
+  provider: azure
+  azure:
+    clientId: "00000000-0000-0000-0000-000000000000"
+    tenantId: "11111111-1111-1111-1111-111111111111"

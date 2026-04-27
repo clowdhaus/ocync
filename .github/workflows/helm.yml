@@ -21,3 +21,37 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: helm lint charts/ocync
       - run: helm template ocync charts/ocync
+      - name: Install kubeconform
+        # Pinned binary + sha256 verification. kubeconform validates against
+        # bundled JSON schemas offline - kubectl apply --dry-run=client requires
+        # API discovery from a live cluster, which we don't have in CI.
+        env:
+          KUBECONFORM_VERSION: v0.6.7
+          KUBECONFORM_SHA256: 95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/kubeconform.tgz \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  /tmp/kubeconform.tgz" | sha256sum -c -
+          tar -xzf /tmp/kubeconform.tgz -C /tmp
+          sudo install -m 0755 /tmp/kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+      - name: Smoke render fixtures
+        # For every charts/ocync/ci/*-values.yaml fixture, render with helm
+        # and validate the output schema with kubeconform. New fixtures are
+        # picked up automatically. -ignore-missing-schemas accepts CRDs whose
+        # schemas are not bundled (added in later steps: ExternalSecret,
+        # SecretProviderClass); -strict rejects unknown fields on core types.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          fixtures=(charts/ocync/ci/*-values.yaml)
+          if [ ${#fixtures[@]} -eq 0 ]; then
+            echo "::error::no fixtures found in charts/ocync/ci/" >&2
+            exit 1
+          fi
+          for f in "${fixtures[@]}"; do
+            echo "=== $f ==="
+            helm template ocync charts/ocync --values "$f" \
+              | kubeconform -strict -summary -ignore-missing-schemas
+          done

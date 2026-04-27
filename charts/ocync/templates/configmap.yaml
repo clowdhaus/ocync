@@ -1,3 +1,4 @@
+{{- include "ocync.validate" . -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

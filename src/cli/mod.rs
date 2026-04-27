@@ -7,6 +7,9 @@ pub(crate) mod output;
 pub(crate) mod progress;
 pub(crate) mod shutdown;
 
+#[cfg(test)]
+mod auth_dispatch_tests;
+
 use ocync_distribution::RegistryClient;
 use ocync_distribution::auth::Credentials;
 use ocync_distribution::auth::acr::AcrAuth;
@@ -153,6 +156,11 @@ pub(crate) async fn build_registry_client(
     hostname: &str,
     registry_config: Option<&RegistryConfig>,
 ) -> Result<RegistryClient, CliError> {
+    // Idempotent: required before any reqwest::Client::new() call below
+    // because reqwest is built with rustls-no-provider. The production
+    // entry point installs this at `main` startup; this call covers
+    // test entry points and any future caller that bypasses main.
+    ocync_distribution::install_crypto_provider();
     let bare_host = bare_hostname(hostname);
     // Rewrite the HTTP endpoint host while keeping `bare_host` as-is for auth
     // scope. Docker Hub requires this split: requests go to registry-1.docker.io,
