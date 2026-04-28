@@ -22,11 +22,41 @@ use ocync_distribution::auth::ecr_public::EcrPublicAuth;
 use ocync_distribution::auth::gcp::GcpAuth;
 use ocync_distribution::auth::static_token::StaticTokenAuth;
 
+use std::sync::Once;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
 
 use crate::cli::config::{AuthType, RegistryConfig};
 use crate::{Cli, LogFormat};
+
+/// Process-global once-fire for the `auth_type: ghcr` deprecation warning.
+///
+/// `Ghcr` is a deprecated alias of `DockerConfig`. We emit a single
+/// `tracing::warn!` per process the first time it's resolved -- not per
+/// `build_registry_client` call, which would spam logs for `watch` mode or
+/// any caller that builds clients repeatedly.
+static GHCR_DEPRECATION_ONCE: Once = Once::new();
+
+/// Test-only counter incremented inside the `Once` body. Lets the dispatch
+/// test suite assert the warn fires at most once across many calls without
+/// installing a tracing subscriber harness.
+#[cfg(test)]
+pub(super) static GHCR_DEPRECATION_FIRES: AtomicUsize = AtomicUsize::new(0);
+
+/// Emit the `auth_type: ghcr` deprecation warning at most once per process.
+fn warn_ghcr_deprecation_once(host: &str) {
+    GHCR_DEPRECATION_ONCE.call_once(|| {
+        tracing::warn!(
+            registry = host,
+            "auth_type: ghcr is deprecated; use auth_type: docker_config or auth_type: static_token instead"
+        );
+        #[cfg(test)]
+        GHCR_DEPRECATION_FIRES.fetch_add(1, Ordering::Relaxed);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Exit codes (grep/POSIX convention)
@@ -229,11 +259,7 @@ pub(crate) async fn build_registry_client(
         }
         Some(AuthType::Ghcr | AuthType::DockerConfig) => {
             if matches!(auth_type, Some(AuthType::Ghcr)) {
-                tracing::debug!(
-                    registry = bare_host,
-                    auth_type = ?auth_type,
-                    "using docker config credential resolution for registry provider"
-                );
+                warn_ghcr_deprecation_once(bare_host);
             }
             let docker_config = DockerConfig::load_default().map_err(|e| {
                 CliError::Input(format!(

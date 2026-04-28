@@ -204,11 +204,38 @@ async fn explicit_ghcr_alias_dispatches_to_docker_config() {
     let client = build_registry_client(&cfg.url, Some(&cfg))
         .await
         .expect("build client");
-    // The Ghcr branch logs a debug-level alias hint and otherwise behaves
-    // identically to DockerConfig. Asserting on the tracing log would
-    // require a tracing_subscriber test harness; we assert the behavioral
-    // equivalence (same provider name) instead.
+    // The Ghcr branch routes to DockerConfigAuth and emits a warn-level
+    // deprecation hint at most once per process via `warn_ghcr_deprecation_once`
+    // (see `ghcr_deprecation_fires_at_most_once` for the Once-gating
+    // assertion). Routing is verified here.
     assert_eq!(client.auth_name(), Some("docker-config"));
+}
+
+#[tokio::test]
+async fn ghcr_deprecation_fires_at_most_once() {
+    // The deprecation warn is gated by a process-global `Once` so that
+    // long-running modes (e.g. `watch`) don't spam the log. We assert via
+    // GHCR_DEPRECATION_FIRES, a #[cfg(test)] counter incremented inside
+    // the Once body. The counter is process-global; another test may have
+    // already incremented it, so we measure the delta from a baseline.
+    let baseline = crate::cli::GHCR_DEPRECATION_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+
+    for _ in 0..3 {
+        let dir = tempdir_with_config();
+        let _g = EnvGuard::set_docker_config(dir.path());
+        let cfg = config("ghcr.io", Some(AuthType::Ghcr));
+        let _ = build_registry_client(&cfg.url, Some(&cfg))
+            .await
+            .expect("build client");
+    }
+
+    let after = crate::cli::GHCR_DEPRECATION_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+    let delta = after - baseline;
+    assert!(
+        delta <= 1,
+        "Ghcr deprecation warn should fire at most once across 3 dispatch calls; \
+         got {delta} fires (baseline={baseline}, after={after})"
+    );
 }
 
 #[tokio::test]
