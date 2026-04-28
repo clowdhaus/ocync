@@ -644,6 +644,22 @@ fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), Config
         }
     }
 
+    if let Some(ref profile) = registry.aws_profile {
+        if profile.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "registries.{name}: aws_profile must not be empty"
+            )));
+        }
+        match registry.auth_type {
+            Some(AuthType::Ecr) => {}
+            _ => {
+                return Err(ConfigError::Validation(format!(
+                    "registries.{name}: aws_profile requires explicit 'auth_type: ecr'"
+                )));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1972,5 +1988,73 @@ mappings:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let artifacts = config.mappings[0].artifacts.as_ref().unwrap();
         assert!(artifacts.enabled, "enabled should default to true");
+    }
+
+    // - aws_profile validation -----------------------------------------------
+
+    #[test]
+    fn aws_profile_with_ecr_auth_type_passes() {
+        let registry = RegistryConfig {
+            url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_string(),
+            auth_type: Some(AuthType::Ecr),
+            max_concurrent: None,
+            credentials: None,
+            token: None,
+            head_first: false,
+            aws_profile: Some("vendor".to_string()),
+        };
+        validate_registry("vendor", &registry).unwrap();
+    }
+
+    #[test]
+    fn aws_profile_without_auth_type_fails() {
+        let registry = RegistryConfig {
+            url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_string(),
+            auth_type: None,
+            max_concurrent: None,
+            credentials: None,
+            token: None,
+            head_first: false,
+            aws_profile: Some("vendor".to_string()),
+        };
+        let err = validate_registry("vendor", &registry).unwrap_err().to_string();
+        assert!(err.contains("aws_profile"), "error must mention aws_profile: {err}");
+        assert!(err.contains("auth_type"), "error must mention auth_type: {err}");
+        assert!(err.contains("ecr"), "error must mention ecr: {err}");
+    }
+
+    #[test]
+    fn aws_profile_with_non_ecr_auth_type_fails() {
+        let registry = RegistryConfig {
+            url: "ghcr.io".to_string(),
+            auth_type: Some(AuthType::Basic),
+            max_concurrent: None,
+            credentials: Some(BasicCredentials {
+                username: "u".into(),
+                password: "p".into(),
+            }),
+            token: None,
+            head_first: false,
+            aws_profile: Some("vendor".to_string()),
+        };
+        let err = validate_registry("vendor", &registry).unwrap_err().to_string();
+        assert!(err.contains("aws_profile"), "error must mention aws_profile: {err}");
+        assert!(err.contains("ecr"), "error must mention ecr: {err}");
+    }
+
+    #[test]
+    fn aws_profile_empty_string_fails() {
+        let registry = RegistryConfig {
+            url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_string(),
+            auth_type: Some(AuthType::Ecr),
+            max_concurrent: None,
+            credentials: None,
+            token: None,
+            head_first: false,
+            aws_profile: Some(String::new()),
+        };
+        let err = validate_registry("vendor", &registry).unwrap_err().to_string();
+        assert!(err.contains("aws_profile"), "error must mention aws_profile: {err}");
+        assert!(err.contains("empty"), "error must mention empty: {err}");
     }
 }
