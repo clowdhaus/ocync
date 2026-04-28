@@ -17,7 +17,7 @@ Personal access tokens (created at <https://app.docker.com/settings/personal-acc
 Notable behaviors:
 
 - Endpoint split. The canonical identifier (image references, token scopes, `/v2/token` `service` parameter) is `docker.io`, but the `/v2/` API is served from `registry-1.docker.io` (`docker.io` itself 302s to Docker's marketing site). ocync rewrites the endpoint while keeping the auth scope as `docker.io`, matching docker / skopeo / crane / regclient. `docker.io`, `index.docker.io`, and `registry-1.docker.io` are recognized as aliases; use `docker.io` in new configs.
-- **Rate-limit accounting.** Manifest GETs count against the documented limit (10 anonymous / hour, 100 authenticated free / 6h); blob GETs do **not**, and HEADs are free. ocync issues HEAD checks before GETs wherever possible to minimize quota burn.
+- Rate-limit accounting: manifest GETs count against the documented limit (10 anonymous / hour, 100 authenticated free / 6h); blob GETs do not, and HEADs are free. ocync issues HEAD checks before GETs wherever possible to minimize quota burn.
 - Three concurrency windows: HEADs share an unmetered window, manifest reads have their own rate-limited window, and writes share a third. A manifest-read 429 does not block blob HEADs.
 - Cross-repo blob mounting is fulfilled within the same account. Mount POSTs returning 202 (not fulfilled) fall back to upload.
 

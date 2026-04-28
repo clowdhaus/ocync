@@ -186,6 +186,6 @@ envFrom:
 
 ## What the chart does *not* render
 
-- **Native `Secret` resources.** Encouraging secrets in `values.yaml` is an anti-pattern; the chart consumes Secrets but never creates them.
-- **SealedSecrets templates.** SealedSecrets produces a normal `Secret`, which is picked up by `envFrom` from Pattern 1.
-- **Vault Agent Injector annotations.** Driven entirely by `podAnnotations` (Tier 1) and ServiceAccount annotations (`serviceAccount.annotations`); no chart-specific gating needed.
+- Native `Secret` resources. Encouraging secrets in `values.yaml` is an anti-pattern; the chart consumes Secrets but never creates them.
+- SealedSecrets templates. SealedSecrets produces a normal `Secret`, which is picked up by `envFrom` from the first pattern.
+- Vault Agent Injector annotations. Driven entirely by `podAnnotations` and `serviceAccount.annotations`; no chart-specific gating needed.

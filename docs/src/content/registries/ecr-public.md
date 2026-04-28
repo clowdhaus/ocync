@@ -35,27 +35,4 @@ For authenticated pulls, ensure ambient AWS credentials are present (env vars, s
 
 ## Kubernetes deployment
 
-ECR Public reuses the same AWS IRSA / Pod Identity surface as private ECR -- the SDK uses whatever AWS identity the workload has:
-
-```yaml
-# values.yaml
-config:
-  registries:
-    src: { url: public.ecr.aws }
-    dst: { url: 123456789012.dkr.ecr.us-east-1.amazonaws.com }
-  defaults:
-    source: src
-    targets: dst
-  mappings:
-    - from: docker/library/alpine
-      to: alpine
-
-workloadIdentity:
-  provider: aws
-  aws:
-    roleArn: arn:aws:iam::123456789012:role/ocync-irsa
-```
-
-For pure anonymous pulls (no AWS identity needed), omit `workloadIdentity` entirely. The pod will still be able to pull from `public.ecr.aws` but at the lower anonymous rate limit.
-
-For other secret-injection patterns, see [Kubernetes secret patterns](./secrets).
+Anonymous pulls require no AWS identity, so the simplest pod has no `workloadIdentity` block at all -- accept the lower per-IP rate limit. For authenticated reads (higher rate limit), the SDK uses whatever AWS identity the workload has, exactly as for ECR private. See [ECR Kubernetes deployment](./ecr#kubernetes-deployment) for the EKS Pod Identity and IRSA setups; both apply unchanged.
