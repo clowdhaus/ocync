@@ -55,6 +55,9 @@ license.workspace = true
 repository.workspace = true
 description = "OCI registry sync tool"
 
+[package.metadata.release]
+publish = false
+
 [features]
 default = ["fips"]
 fips = ["ocync-distribution/fips"]
