@@ -1,186 +1,151 @@
-## @param mode Deployment mode: watch | cronjob | job
+# -- Deployment mode: `watch` (Deployment with sync interval), `cronjob` (CronJob), or `job` (one-shot Job).
 mode: watch
 
 image:
-  ## @param image.repository Container image repository
+  # -- Container image repository.
   repository: public.ecr.aws/clowdhaus/ocync
-  ## @param image.tag Container image tag (defaults to appVersion-fips)
+  # -- Container image tag.
+  # @default -- `<chart-app-version>-fips`
   tag: ""
-  ## @param image.pullPolicy Container image pull policy
+  # -- Image pull policy.
   pullPolicy: IfNotPresent
 
-## @param imagePullSecrets Image pull secrets
+# -- Image pull secrets for the workload pods.
 imagePullSecrets: []
-## @param nameOverride Override the name of the chart
+# -- Override the chart name used in resource names and labels.
 nameOverride: ""
-## @param fullnameOverride Override the full name of the chart
+# -- Override the fully-qualified release name (overrides `<release>-<chartname>`).
 fullnameOverride: ""
 
 serviceAccount:
-  ## @param serviceAccount.create Create a service account
+  # -- Whether the chart should create a ServiceAccount for the workload.
   create: true
-  ## @param serviceAccount.annotations Annotations for the service account (e.g. IRSA/Pod Identity)
+  # -- Annotations to add to the ServiceAccount. Composed with `workloadIdentity` (user-set keys win).
   annotations: {}
-  ## @param serviceAccount.name Override the service account name
+  # -- Override the ServiceAccount name (defaults to the chart fullname).
   name: ""
 
-## @param config ocync configuration YAML content
-## Note: global.cache_dir is automatically set to /tmp/ocync-cache so that
-## the transfer state cache and blob staging area use the writable /tmp emptyDir.
-## You can override this in your config if needed.
-## Example:
-##   config:
-##     registries:
-##       source:
-##         url: cgr.dev
-##       target:
-##         url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
-##     defaults:
-##       source: source
-##       targets: target
-##       tags:
-##         sort: semver
-##         latest: 5
-##     mappings:
-##       - from: chainguard/static
-##         to: chainguard/static
+# -- ocync configuration YAML, rendered into a ConfigMap mounted at `/etc/ocync/config.yaml`.
+# `global.cache_dir` is auto-injected as `/tmp/ocync-cache` if not set, so the transfer
+# state cache and blob staging area land in the writable `/tmp` emptyDir.
+# @default -- `{}` (you must supply registries, defaults, and mappings)
 config: {}
 
 watch:
-  ## @param watch.interval Sync interval in seconds
+  # -- Sync interval in seconds (watch mode only).
   interval: 300
-  ## @param watch.healthPort Health check port
+  # -- Health check port (watch mode only). Exposed via Service and used by liveness/readiness probes.
   healthPort: 8080
 
 cronjob:
-  ## @param cronjob.schedule Cron schedule expression
+  # -- Cron schedule expression (cronjob mode only).
   schedule: "0 */6 * * *"
-  ## @param cronjob.successfulJobsHistoryLimit Number of successful jobs to retain
+  # -- Number of successful CronJob runs to retain.
   successfulJobsHistoryLimit: 3
-  ## @param cronjob.failedJobsHistoryLimit Number of failed jobs to retain
+  # -- Number of failed CronJob runs to retain.
   failedJobsHistoryLimit: 3
-  ## @param cronjob.concurrencyPolicy CronJob concurrency policy
+  # -- CronJob concurrency policy: `Allow` | `Forbid` | `Replace`.
   concurrencyPolicy: Forbid
 
-## @param extraArgs Additional CLI arguments
+# -- Additional CLI arguments appended to the container args after the mode-specific defaults.
 extraArgs: []
 
-## @param env Additional environment variables
-## Uncomment to route ECR API calls through AWS FIPS endpoints:
-##   env:
-##     - name: AWS_USE_FIPS_ENDPOINT
-##       value: "true"
+# -- Additional environment variables for the container. Set `AWS_USE_FIPS_ENDPOINT=true` to route
+# ECR API calls through FIPS endpoints.
 env: []
 
-## @param envFrom envFrom sources for the container
-## Use for token-based auth (DOCKER_PASSWORD, GITHUB_TOKEN, chainctl tokens).
-## The referenced Secret/ConfigMap must already exist in the cluster.
-##   envFrom:
-##     - secretRef:
-##         name: ocync-credentials
+# -- envFrom sources (Secret/ConfigMap references). Use for token-based auth: DOCKER_PASSWORD,
+# GITHUB_TOKEN, chainctl tokens. The referenced resource must already exist or be created
+# alongside (e.g. via `externalSecrets`).
 envFrom: []
 
-## @param extraVolumes Additional pod volumes appended to the workload's volumes list
-## Use for docker-config.json from a Secret, CA bundle ConfigMaps, GCP SA key files,
-## or CSI-driven secret stores. See charts/ocync/ci/*-values.yaml for examples.
+# -- Additional pod volumes appended to the workload's volumes list. Use for docker-config.json
+# from a Secret, CA bundles, GCP SA key files, or CSI-driven secret stores.
 extraVolumes: []
 
-## @param extraVolumeMounts Additional container volume mounts appended to volumeMounts
-## Pair each entry with an extraVolumes entry of the same name.
+# -- Additional container volume mounts appended to volumeMounts. Pair each entry with an
+# `extraVolumes` entry of the same name.
 extraVolumeMounts: []
 
-## @param podAnnotations Pod-level annotations
-## Required for Vault Agent Injector (vault.hashicorp.com/agent-inject) and
-## service-mesh sidecars (linkerd.io/inject, sidecar.istio.io/inject).
+# -- Pod-level annotations. Required for Vault Agent Injector
+# (`vault.hashicorp.com/agent-inject`) and service-mesh sidecars
+# (`linkerd.io/inject`, `sidecar.istio.io/inject`).
 podAnnotations: {}
 
-## @param podLabels Pod-level labels
-## Required for Azure AD Workload Identity (azure.workload.identity/use: "true")
-## and any label-selector-driven controllers.
+# -- Pod-level labels. Composed with `workloadIdentity.podLabels` (the chart sets
+# `azure.workload.identity/use: "true"` automatically when `workloadIdentity.provider` is `azure`).
 podLabels: {}
 
-## External Secrets Operator (ESO) integration.
-## Generates an ExternalSecret resource (external-secrets.io/v1) that pulls
-## from a SecretStore/ClusterSecretStore and writes a native K8s Secret which
-## the workload then consumes via envFrom or extraVolumes.
-##
-## Requires: external-secrets-operator installed cluster-side. The chart does
-## not pre-check CRD presence; if missing, `kubectl apply` returns
-## `no matches for kind "ExternalSecret"` -- the standard, debuggable failure.
+# External Secrets Operator (ESO) integration.
+# Generates an ExternalSecret resource (external-secrets.io/v1) that pulls
+# from a SecretStore/ClusterSecretStore and writes a native K8s Secret which
+# the workload then consumes via envFrom or extraVolumes.
+#
+# Requires: external-secrets-operator installed cluster-side. The chart does
+# not pre-check CRD presence; if missing, `kubectl apply` returns
+# `no matches for kind "ExternalSecret"` -- the standard, debuggable failure.
 externalSecrets:
-  ## @param externalSecrets.enabled Render an ExternalSecret resource
+  # -- Render an ExternalSecret resource.
   enabled: false
-  ## @param externalSecrets.refreshInterval Refresh interval for the secret
+  # -- ExternalSecret refresh interval.
   refreshInterval: "1h"
-  ## @param externalSecrets.secretStoreRef Reference to the SecretStore/ClusterSecretStore
-  ## Shape: { name: <store-name>, kind: SecretStore | ClusterSecretStore }
+  # -- Reference to the SecretStore / ClusterSecretStore. Shape: `{ name, kind: SecretStore | ClusterSecretStore }`.
   secretStoreRef: {}
-  ## @param externalSecrets.target Target K8s Secret to create
-  ## Shape: { name?: <secret-name (default: chart fullname)>, creationPolicy?: Owner | Orphan }
+  # -- Target K8s Secret to create. Shape: `{ name?: string, creationPolicy?: Owner | Orphan }`. Defaults to chart fullname / `Owner`.
   target: {}
-  ## @param externalSecrets.data Mapping of secret keys to remote references
-  ## Shape: [{ secretKey, remoteRef: { key, property? } }]
+  # -- Mapping of secret keys to remote references. Shape: `[{ secretKey, remoteRef: { key, property? } }]`.
   data: []
 
-## CSI Secrets Store Driver integration.
-## Generates a SecretProviderClass (secrets-store.csi.x-k8s.io/v1) that the
-## CSI driver uses to mount secrets from a cloud secret store as files (and
-## optionally sync into K8s Secrets). The pod must reference the resulting
-## SecretProviderClass via extraVolumes (csi: driver: secrets-store.csi.k8s.io).
-##
-## Requires: secrets-store-csi-driver + provider plugin (aws/azure/gcp/vault)
-## installed cluster-side.
+# CSI Secrets Store Driver integration.
+# Generates a SecretProviderClass (secrets-store.csi.x-k8s.io/v1) that the
+# CSI driver uses to mount secrets from a cloud secret store as files (and
+# optionally sync into K8s Secrets). The pod must reference the resulting
+# SecretProviderClass via extraVolumes (csi: driver: secrets-store.csi.k8s.io).
+#
+# Requires: secrets-store-csi-driver + provider plugin (aws/azure/gcp/vault)
+# installed cluster-side.
 secretProviderClass:
-  ## @param secretProviderClass.enabled Render a SecretProviderClass resource
+  # -- Render a SecretProviderClass resource.
   enabled: false
-  ## @param secretProviderClass.provider Provider plugin: aws | azure | gcp | vault
+  # -- Provider plugin: `aws` | `azure` | `gcp` | `vault`.
   provider: ""
-  ## @param secretProviderClass.parameters Provider-specific parameters
+  # -- Provider-specific parameters (free-form map).
   parameters: {}
-  ## @param secretProviderClass.secretObjects Optional K8s Secret sync targets
-  ## Shape: [{ secretName, type, data: [{ objectName, key }] }]
+  # -- Optional K8s Secret sync targets. Shape: `[{ secretName, type, data: [{ objectName, key }] }]`.
   secretObjects: []
 
-## Workload Identity convenience block.
-## Sets the appropriate ServiceAccount annotations and pod labels for the
-## chosen cloud provider. Composes with `serviceAccount.annotations` and
-## `podLabels` (both are merged in; user-set keys win on conflict).
-##
-## When `provider` is "none" no annotations or labels are added.
-##
-## EKS Pod Identity is intentionally not represented here -- it is
-## configured cluster-side via PodIdentityAssociation, not the pod spec.
-## See docs/src/content/registries/ecr.md for the alternative path.
+# Workload Identity convenience block.
+# Sets the appropriate ServiceAccount annotations and pod labels for the
+# chosen cloud provider. Composes with `serviceAccount.annotations` and
+# `podLabels` (both are merged in; user-set keys win on conflict).
+#
+# EKS Pod Identity is intentionally not represented here -- it is
+# configured cluster-side via PodIdentityAssociation, not the pod spec.
+# See docs/src/content/registries/ecr.md for the alternative path.
 workloadIdentity:
-  ## @param workloadIdentity.provider Workload identity provider: none | aws | gcp | azure
+  # -- Workload identity provider: `none` | `aws` | `gcp` | `azure`.
   provider: none
 
   aws:
-    ## @param workloadIdentity.aws.roleArn IAM role ARN to assume via IRSA
-    ## Sets `eks.amazonaws.com/role-arn` on the ServiceAccount.
+    # -- IAM role ARN to assume via IRSA. Sets `eks.amazonaws.com/role-arn` on the ServiceAccount.
     roleArn: ""
 
   gcp:
-    ## @param workloadIdentity.gcp.serviceAccount GSA email for GKE Workload Identity
-    ## Sets `iam.gke.io/gcp-service-account` on the ServiceAccount.
+    # -- GSA email for GKE Workload Identity. Sets `iam.gke.io/gcp-service-account` on the ServiceAccount.
     serviceAccount: ""
 
   azure:
-    ## @param workloadIdentity.azure.clientId AAD app client ID
-    ## Sets `azure.workload.identity/client-id` on the ServiceAccount AND
-    ## `azure.workload.identity/use: "true"` on the pod (the latter is the
-    ## critical pod label without which the AAD webhook does not inject the
-    ## projected SA token).
+    # -- AAD app client ID. Sets `azure.workload.identity/client-id` on the ServiceAccount AND
+    # `azure.workload.identity/use: "true"` on the pod (the latter is the critical pod label
+    # without which the AAD webhook does not inject the projected SA token).
     clientId: ""
-    ## @param workloadIdentity.azure.tenantId AAD tenant ID (optional)
-    ## When set, adds `azure.workload.identity/tenant-id` to the ServiceAccount.
+    # -- AAD tenant ID (optional). When set, adds `azure.workload.identity/tenant-id` to the ServiceAccount.
     tenantId: ""
 
-## @param resources Resource requests and limits
-## ocync is single-threaded (tokio current_thread) but network-bound during sync.
-## CPU request influences Karpenter instance-type selection; 500m ensures the
-## workload has enough weight to steer toward network-optimized nodes.
-## Memory: peak RSS observed at ~58 MB during full cold sync (42 images).
+# -- Resource requests and limits. ocync is single-threaded (tokio current_thread) but network-bound
+# during sync. CPU request influences Karpenter instance-type selection; 500m ensures the workload
+# has enough weight to steer toward network-optimized nodes. Peak RSS observed at ~58 MB during full
+# cold sync (42 images).
 resources:
   requests:
     cpu: 500m
@@ -190,16 +155,16 @@ resources:
     memory: 256Mi
     ephemeral-storage: 2Gi
 
-## @param nodeSelector Node selector
+# -- Node selector for the pod.
 nodeSelector: {}
 
-## @param tolerations Tolerations
+# -- Tolerations for the pod.
 tolerations: []
 
-## @param affinity Affinity rules
-## Defaults to preferring EC2 network-optimized instance types (25-200 Gbps).
-## This is a soft preference -- pods schedule on any node if these are unavailable.
-## Override with affinity: {} to disable, or replace with your own rules.
+# -- Pod affinity / anti-affinity. Defaults to preferring EC2 network-optimized instance types
+# (`c5n` / `c6in` / `m5n` / `m6in` / `r5n` / `r6in` families, 25-200 Gbps). Soft preference --
+# pods schedule on any node if these are unavailable. Override with `affinity: {}` to disable.
+# @default -- See [values.yaml](./values.yaml) for the full instance-type list.
 affinity:
   nodeAffinity:
     preferredDuringSchedulingIgnoredDuringExecution:
@@ -259,11 +224,13 @@ affinity:
                 - r6in.24xlarge
                 - r6in.32xlarge
 
+# -- Pod security context.
 podSecurityContext:
   runAsNonRoot: true
   seccompProfile:
     type: RuntimeDefault
 
+# -- Container security context.
 securityContext:
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true

@@ -1,0 +1,187 @@
+## workloadIdentity helper behavior across providers.
+## - aws  -> SA gets eks.amazonaws.com/role-arn
+## - gcp  -> SA gets iam.gke.io/gcp-service-account
+## - azure -> SA gets azure.workload.identity/client-id (+ tenant-id if set)
+##           AND pod gets azure.workload.identity/use: "true" label
+## - none -> no annotations or labels added
+suite: workloadIdentity
+
+tests:
+  - it: provider none does not add SA annotations
+    template: serviceaccount.yaml
+    set:
+      workloadIdentity:
+        provider: none
+    asserts:
+      - notExists:
+          path: metadata.annotations
+
+  - it: provider none does not add pod labels
+    template: deployment.yaml
+    set:
+      mode: watch
+      workloadIdentity:
+        provider: none
+    asserts:
+      - notExists:
+          path: spec.template.metadata.labels["azure.workload.identity/use"]
+
+  - it: aws provider sets eks.amazonaws.com/role-arn on the SA
+    template: serviceaccount.yaml
+    set:
+      workloadIdentity:
+        provider: aws
+        aws:
+          roleArn: arn:aws:iam::123456789012:role/ocync-irsa
+    asserts:
+      - equal:
+          path: metadata.annotations["eks.amazonaws.com/role-arn"]
+          value: arn:aws:iam::123456789012:role/ocync-irsa
+
+  - it: aws provider does not add pod labels
+    template: deployment.yaml
+    set:
+      mode: watch
+      workloadIdentity:
+        provider: aws
+        aws:
+          roleArn: arn:aws:iam::123456789012:role/ocync-irsa
+    asserts:
+      - notExists:
+          path: spec.template.metadata.labels["azure.workload.identity/use"]
+
+  - it: gcp provider sets iam.gke.io/gcp-service-account on the SA
+    template: serviceaccount.yaml
+    set:
+      workloadIdentity:
+        provider: gcp
+        gcp:
+          serviceAccount: ocync@my-project.iam.gserviceaccount.com
+    asserts:
+      - equal:
+          path: metadata.annotations["iam.gke.io/gcp-service-account"]
+          value: ocync@my-project.iam.gserviceaccount.com
+
+  - it: azure provider sets client-id annotation on the SA
+    template: serviceaccount.yaml
+    set:
+      workloadIdentity:
+        provider: azure
+        azure:
+          clientId: 00000000-0000-0000-0000-000000000000
+    asserts:
+      - equal:
+          path: metadata.annotations["azure.workload.identity/client-id"]
+          value: 00000000-0000-0000-0000-000000000000
+      - notExists:
+          path: metadata.annotations["azure.workload.identity/tenant-id"]
+
+  - it: azure provider sets tenant-id annotation when configured
+    template: serviceaccount.yaml
+    set:
+      workloadIdentity:
+        provider: azure
+        azure:
+          clientId: 00000000-0000-0000-0000-000000000000
+          tenantId: 11111111-1111-1111-1111-111111111111
+    asserts:
+      - equal:
+          path: metadata.annotations["azure.workload.identity/tenant-id"]
+          value: 11111111-1111-1111-1111-111111111111
+
+  - it: azure provider sets use=true pod label (the critical AAD webhook trigger)
+    template: deployment.yaml
+    set:
+      mode: watch
+      workloadIdentity:
+        provider: azure
+        azure:
+          clientId: 00000000-0000-0000-0000-000000000000
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels["azure.workload.identity/use"]
+          value: "true"
+
+  - it: azure pod label appears on cronjob mode too
+    template: cronjob.yaml
+    set:
+      mode: cronjob
+      workloadIdentity:
+        provider: azure
+        azure:
+          clientId: 00000000-0000-0000-0000-000000000000
+    asserts:
+      - equal:
+          path: spec.jobTemplate.spec.template.metadata.labels["azure.workload.identity/use"]
+          value: "true"
+
+  - it: workloadIdentity composes with serviceAccount.annotations
+    template: serviceaccount.yaml
+    set:
+      workloadIdentity:
+        provider: aws
+        aws:
+          roleArn: arn:aws:iam::123456789012:role/ocync-irsa
+      serviceAccount:
+        annotations:
+          example.com/owner: platform
+    asserts:
+      - equal:
+          path: metadata.annotations["eks.amazonaws.com/role-arn"]
+          value: arn:aws:iam::123456789012:role/ocync-irsa
+      - equal:
+          path: metadata.annotations["example.com/owner"]
+          value: platform
+
+  - it: workloadIdentity podLabels compose with user-supplied podLabels
+    template: deployment.yaml
+    set:
+      mode: watch
+      workloadIdentity:
+        provider: azure
+        azure:
+          clientId: 00000000-0000-0000-0000-000000000000
+      podLabels:
+        team: platform
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels["azure.workload.identity/use"]
+          value: "true"
+      - equal:
+          path: spec.template.metadata.labels.team
+          value: platform
+
+  ## Negative tests: required-when-provider validation. Empty / missing fields
+  ## must fail loudly at template time, not silently render a SA with no
+  ## annotations (which would surface only at pod runtime as a credential
+  ## error from the cloud SDK).
+  - it: aws provider with empty roleArn fails with a clear message
+    set:
+      workloadIdentity:
+        provider: aws
+        aws:
+          roleArn: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "ocync: workloadIdentity.aws.roleArn is required when workloadIdentity.provider is 'aws'"
+
+  - it: gcp provider with empty serviceAccount fails with a clear message
+    set:
+      workloadIdentity:
+        provider: gcp
+        gcp:
+          serviceAccount: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "ocync: workloadIdentity.gcp.serviceAccount is required when workloadIdentity.provider is 'gcp'"
+
+  - it: azure provider with empty clientId fails with a clear message
+    set:
+      workloadIdentity:
+        provider: azure
+        azure:
+          clientId: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "ocync: workloadIdentity.azure.clientId is required when workloadIdentity.provider is 'azure'"
+

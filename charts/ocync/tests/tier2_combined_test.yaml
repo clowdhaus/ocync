@@ -1,0 +1,63 @@
+## ExternalSecret + SecretProviderClass enabled simultaneously.
+## They are independent CRs (one ESO, one CSI) and both must render
+## without conflict; a single chart install can use ESO for one set of
+## secrets and SPC for another (e.g., ESO for sync-from-cloud, SPC for
+## a different mount-as-files use case in the same pod). helm-unittest
+## indexes assertions per template, so we run two separate test cases
+## sharing the same value set rather than one cross-template case.
+suite: tier 2 - ESO + SPC simultaneous
+
+set: &both_enabled
+  externalSecrets:
+    enabled: true
+    secretStoreRef:
+      name: aws-secret-store
+      kind: ClusterSecretStore
+    target:
+      name: ocync-credentials
+    data:
+      - secretKey: DOCKER_PASSWORD
+        remoteRef:
+          key: prod/ocync/docker-password
+  secretProviderClass:
+    enabled: true
+    provider: aws
+    parameters:
+      objects: |
+        - objectName: prod/ocync/extra
+          objectType: secretsmanager
+    secretObjects:
+      - secretName: ocync-extra
+        type: Opaque
+        data:
+          - objectName: prod/ocync/extra
+            key: extra
+
+tests:
+  - it: ExternalSecret renders correctly when SPC is also enabled
+    templates:
+      - externalsecret.yaml
+    set: *both_enabled
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: ExternalSecret
+      - equal:
+          path: spec.target.name
+          value: ocync-credentials
+
+  - it: SecretProviderClass renders correctly when ESO is also enabled
+    templates:
+      - secretproviderclass.yaml
+    set: *both_enabled
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: SecretProviderClass
+      - equal:
+          path: spec.secretObjects[0].secretName
+          value: ocync-extra

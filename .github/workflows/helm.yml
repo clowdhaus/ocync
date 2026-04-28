@@ -21,6 +21,48 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: helm lint charts/ocync
       - run: helm template ocync charts/ocync
+      - name: Install helm-unittest
+        # helm-unittest is a helm plugin (not a standalone binary). `helm plugin
+        # install --version <ref>` selects a specific git tag of the plugin repo.
+        env:
+          HELM_UNITTEST_VERSION: v1.0.3
+        run: |
+          set -euo pipefail
+          helm plugin install https://github.com/helm-unittest/helm-unittest \
+            --version "${HELM_UNITTEST_VERSION}"
+          helm unittest --help > /dev/null
+      - name: Run helm-unittest
+        # Asserts behavioral contracts on the rendered chart (Tier 1 wiring,
+        # Tier 2 conditional rendering, workloadIdentity per-provider, watch-
+        # vs-cronjob-vs-job pod spec). New tests in charts/ocync/tests/*.yaml
+        # are picked up automatically.
+        run: helm unittest charts/ocync
+      - name: Install helm-docs
+        # Pinned binary + sha256. helm-docs reads `# --` comments in values.yaml
+        # and regenerates the chart README. CI verifies the committed README
+        # matches what helm-docs would generate.
+        env:
+          HELM_DOCS_VERSION: v1.14.2
+          HELM_DOCS_SHA256: a8cf72ada34fad93285ba2a452b38bdc5bd52cc9a571236244ec31022928d6cc
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/helm-docs.tgz \
+            "https://github.com/norwoodj/helm-docs/releases/download/${HELM_DOCS_VERSION}/helm-docs_${HELM_DOCS_VERSION#v}_Linux_x86_64.tar.gz"
+          echo "${HELM_DOCS_SHA256}  /tmp/helm-docs.tgz" | sha256sum -c -
+          tar -xzf /tmp/helm-docs.tgz -C /tmp
+          sudo install -m 0755 /tmp/helm-docs /usr/local/bin/helm-docs
+          helm-docs --version
+      - name: Verify chart README is in sync with values.yaml
+        # If a contributor changed values.yaml without regenerating README.md,
+        # this step fails with a diff. Regenerate locally with:
+        #   helm-docs --chart-search-root charts
+        run: |
+          set -euo pipefail
+          helm-docs --chart-search-root charts
+          if ! git diff --exit-code charts/ocync/README.md; then
+            echo "::error::charts/ocync/README.md is out of date. Run 'helm-docs --chart-search-root charts' and commit the result." >&2
+            exit 1
+          fi
       - name: Install kubeconform
         # Pinned binary + sha256 verification. kubeconform validates against
         # bundled JSON schemas offline - kubectl apply --dry-run=client requires
