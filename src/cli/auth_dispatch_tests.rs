@@ -84,6 +84,7 @@ fn config(url: &str, auth_type: Option<AuthType>) -> RegistryConfig {
         token: None,
         max_concurrent: None,
         head_first: false,
+        aws_profile: None,
     }
 }
 
@@ -98,6 +99,7 @@ fn config_with_basic(url: &str) -> RegistryConfig {
         token: None,
         max_concurrent: None,
         head_first: false,
+        aws_profile: None,
     }
 }
 
@@ -109,6 +111,7 @@ fn config_with_token(url: &str) -> RegistryConfig {
         token: Some("ci-token".to_owned()),
         max_concurrent: None,
         head_first: false,
+        aws_profile: None,
     }
 }
 
@@ -162,6 +165,7 @@ async fn auth_type_token_alias_dispatches_to_static_token() {
         token: Some("ci-token".to_owned()),
         max_concurrent: None,
         head_first: false,
+        aws_profile: None,
     };
     let client = build_registry_client(&cfg.url, Some(&cfg))
         .await
