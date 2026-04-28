@@ -828,9 +828,6 @@ mod tests {
     use super::*;
 
     const SCHEMA_JSON_PATH: &str = "docs/public/config.schema.json";
-    const SCHEMA_MD_PATH: &str = "docs/src/content/configuration.md";
-    const SCHEMA_MD_START: &str = "<!-- BEGIN GENERATED SCHEMA -->";
-    const SCHEMA_MD_END: &str = "<!-- END GENERATED SCHEMA -->";
 
     fn generate_schema_json() -> String {
         let schema = schemars::schema_for!(Config);
@@ -847,27 +844,12 @@ mod tests {
     fn json_schema_up_to_date() {
         let expected = generate_schema_json();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-        // Check static JSON file.
         let json_path = root.join(SCHEMA_JSON_PATH);
         let committed_json = std::fs::read_to_string(&json_path).unwrap_or_default();
         assert_eq!(
             committed_json.trim(),
             expected.trim(),
             "config.schema.json is out of date. Run: cargo test --package ocync -- update_json_schema --ignored"
-        );
-
-        // Check embedded schema in configuration.md.
-        let md_path = root.join(SCHEMA_MD_PATH);
-        let md = std::fs::read_to_string(&md_path).unwrap();
-        let embedded = md
-            .split(SCHEMA_MD_START)
-            .nth(1)
-            .and_then(|s| s.split(SCHEMA_MD_END).next())
-            .unwrap_or("");
-        assert!(
-            embedded.contains(&expected),
-            "configuration.md schema is out of date. Run: cargo test --package ocync -- update_json_schema --ignored"
         );
     }
 
@@ -876,22 +858,8 @@ mod tests {
     fn update_json_schema() {
         let json = generate_schema_json();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-        // Write static JSON file.
         let json_path = root.join(SCHEMA_JSON_PATH);
         std::fs::write(&json_path, format!("{json}\n")).unwrap();
-
-        // Update embedded schema in configuration.md.
-        let md_path = root.join(SCHEMA_MD_PATH);
-        let md = std::fs::read_to_string(&md_path).unwrap();
-        let before = md.split(SCHEMA_MD_START).next().unwrap();
-        let after = md.split(SCHEMA_MD_END).nth(1).unwrap();
-        let updated = format!(
-            "{before}{start}\n\n```json\n{json}\n```\n\n{end}{after}",
-            start = SCHEMA_MD_START,
-            end = SCHEMA_MD_END,
-        );
-        std::fs::write(&md_path, updated).unwrap();
     }
 
     // - Deserialization ----------------------------------------------------
