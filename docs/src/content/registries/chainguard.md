@@ -19,7 +19,7 @@ Notable behaviors:
 - cgr.dev returns **403** on cross-scope token reuse where most registries silently accept it. ocync's per-scope token cache (universal, not Chainguard-specific) issues a fresh exchange per `repository:<name>:<actions>` scope and avoids this.
 - Anonymous tag visibility is restricted: only `:latest` and `:latest-dev` are listable / resolvable. Other tags need a pull-token even for public-catalog images.
 
-## CLI example
+## CLI examples
 
 ### Anonymous
 

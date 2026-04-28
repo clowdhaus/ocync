@@ -18,7 +18,7 @@ See the [GCP ADC docs](https://cloud.google.com/docs/authentication/application-
 Notable behaviors:
 
 - The OAuth2 access token is sent as the password half of HTTP Basic credentials (username `oauth2accesstoken`) to drive a standard OCI `/v2/token` Bearer exchange. This matches what `gcloud auth configure-docker` writes into the docker config.
-- **Monolithic uploads.** GAR does not support OCI chunked uploads. ocync buffers the full blob in memory and performs a single PUT, so RSS scales with blob size during pushes; a 2 GB layer spikes memory accordingly.
+- Monolithic uploads: GAR does not support OCI chunked uploads. ocync buffers the full blob in memory and performs a single PUT, so RSS scales with blob size during pushes; a 2 GB layer spikes memory accordingly.
 - Cross-repo blob mounts have not been observed to be fulfilled by GAR. ocync attempts the mount POST anyway (cheap, ~100 ms) and falls through to upload on 202.
 - GAR enforces a single per-project quota across all operation types; ocync uses one AIMD window per project rather than per-action.
 - SDK credential TTL is a conservative 10 minutes (`google-cloud-auth` does not expose `expires_in`), so watch-mode refresh is decoupled from actual token lifetime. ADC refreshes are sub-millisecond.
