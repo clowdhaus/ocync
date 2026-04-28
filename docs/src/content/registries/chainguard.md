@@ -1,6 +1,6 @@
 ---
 title: Chainguard Registry (cgr.dev)
-description: Using ocync with cgr.dev via anonymous pulls of `:latest` / `:latest-dev` or pull-tokens for paid-tier tags. Recommended path for headless / CI use is `auth_type: basic` with a chainctl pull-token.
+description: "Using ocync with cgr.dev via anonymous pulls of `:latest` / `:latest-dev` or pull-tokens for paid-tier tags. Recommended path for headless / CI use is `auth_type: basic` with a chainctl pull-token."
 order: 7
 ---
 
