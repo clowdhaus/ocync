@@ -261,7 +261,7 @@ async fn build_batch_checkers(
             continue;
         }
 
-        let checker = BatchChecker::from_hostname(hostname)
+        let checker = BatchChecker::from_hostname(hostname, reg.aws_profile.as_deref())
             .await
             .map_err(|e| CliError::Input(format!("ECR batch checker for '{name}': {e}")))?;
         checkers.insert(name.clone(), Rc::new(checker));

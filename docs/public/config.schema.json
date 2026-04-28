@@ -383,6 +383,14 @@
             }
           ]
         },
+        "aws_profile": {
+          "description": "Named AWS profile for ECR credential resolution.\n\nWhen set, ECR auth for this registry uses `aws_config::ConfigLoader::profile_name(p)` instead of the ambient credential chain. Only valid with explicit `auth_type: ecr`.\n\nUse this when the registry requires credentials distinct from the ambient identity (for example, a third-party ECR accessed with static IAM-user keys while the ambient chain serves the rest of the workload).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "credentials": {
           "description": "Credentials for Basic auth (`auth_type: basic`).",
           "default": null,

@@ -217,7 +217,8 @@ pub(crate) async fn build_registry_client(
 
     let mut builder = match auth_type {
         Some(AuthType::Ecr) => {
-            let auth = EcrAuth::new(bare_host)
+            let profile = registry_config.and_then(|r| r.aws_profile.as_deref());
+            let auth = EcrAuth::new(bare_host, profile)
                 .await
                 .map_err(|e| CliError::Input(format!("ECR auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
@@ -278,7 +279,7 @@ pub(crate) async fn build_registry_client(
             // the result to avoid redundant regex evaluation.
             match detect_provider_kind(bare_host) {
                 Some(ProviderKind::Ecr) => {
-                    let auth = EcrAuth::new(bare_host).await.map_err(|e| {
+                    let auth = EcrAuth::new(bare_host, None).await.map_err(|e| {
                         CliError::Input(format!("ECR auth setup for '{bare_host}': {e}"))
                     })?;
                     RegistryClient::builder(url).auth(auth)

@@ -232,6 +232,18 @@ pub(crate) struct RegistryConfig {
     /// quotas (e.g., Docker Hub).
     #[serde(default)]
     pub head_first: bool,
+
+    /// Named AWS profile for ECR credential resolution.
+    ///
+    /// When set, ECR auth for this registry uses
+    /// `aws_config::ConfigLoader::profile_name(p)` instead of the ambient
+    /// credential chain. Only valid with explicit `auth_type: ecr`.
+    ///
+    /// Use this when the registry requires credentials distinct from the
+    /// ambient identity (for example, a third-party ECR accessed with static
+    /// IAM-user keys while the ambient chain serves the rest of the workload).
+    #[serde(default)]
+    pub aws_profile: Option<String>,
 }
 
 impl std::fmt::Debug for RegistryConfig {
@@ -243,6 +255,7 @@ impl std::fmt::Debug for RegistryConfig {
             .field("head_first", &self.head_first)
             .field("credentials", &self.credentials)
             .field("token", &"[REDACTED]")
+            .field("aws_profile", &self.aws_profile)
             .finish()
     }
 }
@@ -628,6 +641,22 @@ fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), Config
             | AuthType::Ghcr
             | AuthType::Anonymous
             | AuthType::DockerConfig => {}
+        }
+    }
+
+    if let Some(ref profile) = registry.aws_profile {
+        if profile.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "registries.{name}: aws_profile must not be empty"
+            )));
+        }
+        match registry.auth_type {
+            Some(AuthType::Ecr) => {}
+            _ => {
+                return Err(ConfigError::Validation(format!(
+                    "registries.{name}: aws_profile requires explicit 'auth_type: ecr'"
+                )));
+            }
         }
     }
 
@@ -1582,6 +1611,7 @@ mappings:
             credentials: None,
             token: None,
             head_first: false,
+            aws_profile: None,
         };
         let err = validate_registry("example", &registry).unwrap_err();
         match err {
@@ -1602,6 +1632,7 @@ mappings:
             credentials: None,
             token: None,
             head_first: false,
+            aws_profile: None,
         };
         validate_registry("example", &registry).unwrap();
     }
@@ -1741,10 +1772,46 @@ mappings:
             credentials: None,
             token: Some("secret-bearer-token".to_string()),
             head_first: false,
+            aws_profile: None,
         };
         let debug_output = format!("{registry:?}");
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("secret-bearer-token"));
+    }
+
+    #[test]
+    fn parses_registry_with_aws_profile() {
+        let yaml = r#"
+registries:
+  vendor:
+    url: 222222222222.dkr.ecr.us-east-1.amazonaws.com
+    auth_type: ecr
+    aws_profile: vendor
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let reg = &config.registries["vendor"];
+        assert_eq!(reg.auth_type, Some(AuthType::Ecr));
+        assert_eq!(reg.aws_profile.as_deref(), Some("vendor"));
+    }
+
+    #[test]
+    fn registry_aws_profile_defaults_to_none() {
+        let yaml = r#"
+registries:
+  ecr:
+    url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+    auth_type: ecr
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.registries["ecr"].aws_profile, None);
     }
 
     // - ArtifactsConfig -------------------------------------------------------
@@ -1921,5 +1988,91 @@ mappings:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let artifacts = config.mappings[0].artifacts.as_ref().unwrap();
         assert!(artifacts.enabled, "enabled should default to true");
+    }
+
+    // - aws_profile validation -----------------------------------------------
+
+    #[test]
+    fn aws_profile_with_ecr_auth_type_passes() {
+        let registry = RegistryConfig {
+            url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_string(),
+            auth_type: Some(AuthType::Ecr),
+            max_concurrent: None,
+            credentials: None,
+            token: None,
+            head_first: false,
+            aws_profile: Some("vendor".to_string()),
+        };
+        validate_registry("vendor", &registry).unwrap();
+    }
+
+    #[test]
+    fn aws_profile_without_auth_type_fails() {
+        let registry = RegistryConfig {
+            url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_string(),
+            auth_type: None,
+            max_concurrent: None,
+            credentials: None,
+            token: None,
+            head_first: false,
+            aws_profile: Some("vendor".to_string()),
+        };
+        let err = validate_registry("vendor", &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("aws_profile"),
+            "error must mention aws_profile: {err}"
+        );
+        assert!(
+            err.contains("auth_type"),
+            "error must mention auth_type: {err}"
+        );
+        assert!(err.contains("ecr"), "error must mention ecr: {err}");
+    }
+
+    #[test]
+    fn aws_profile_with_non_ecr_auth_type_fails() {
+        let registry = RegistryConfig {
+            url: "ghcr.io".to_string(),
+            auth_type: Some(AuthType::Basic),
+            max_concurrent: None,
+            credentials: Some(BasicCredentials {
+                username: "u".into(),
+                password: "p".into(),
+            }),
+            token: None,
+            head_first: false,
+            aws_profile: Some("vendor".to_string()),
+        };
+        let err = validate_registry("vendor", &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("aws_profile"),
+            "error must mention aws_profile: {err}"
+        );
+        assert!(err.contains("ecr"), "error must mention ecr: {err}");
+    }
+
+    #[test]
+    fn aws_profile_empty_string_fails() {
+        let registry = RegistryConfig {
+            url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_string(),
+            auth_type: Some(AuthType::Ecr),
+            max_concurrent: None,
+            credentials: None,
+            token: None,
+            head_first: false,
+            aws_profile: Some(String::new()),
+        };
+        let err = validate_registry("vendor", &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("aws_profile"),
+            "error must mention aws_profile: {err}"
+        );
+        assert!(err.contains("empty"), "error must mention empty: {err}");
     }
 }

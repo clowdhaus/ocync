@@ -127,7 +127,7 @@ For other secret-injection patterns (External Secrets Operator, CSI Secrets Stor
 
 ## Multi-account access
 
-ocync uses one ambient AWS credential chain per process. Syncing across accounts (e.g., one source ECR plus several target ECRs in different accounts) means giving that one principal the right permissions for every account it touches. There are three patterns, in order of preference.
+ocync uses one ambient AWS credential chain per process. Syncing across accounts (e.g., one source ECR plus several target ECRs in different accounts) means giving that one principal the right permissions for every account it touches. There are four patterns, in order of preference.
 
 ### Cross-account ECR repository policies
 
@@ -189,4 +189,36 @@ role_arn = arn:aws:iam::DESTINATION_ACCOUNT:role/ocync-target
 AWS_PROFILE=ocync-target ocync sync --config ocync.yaml
 ```
 
-The AWS SDK handles the `AssumeRole` call and credential refresh transparently. This works for one destination role per ocync invocation; if you need different roles per registry in a single process, file an issue describing the deployment shape — there is no built-in support today, and the workarounds (one process per role, or unified cross-account repository policies) cover most cases.
+The AWS SDK handles the `AssumeRole` call and credential refresh transparently. The whole-process `AWS_PROFILE` mechanism applies one profile to every ECR registry; for per-registry overrides, see the next section.
+
+### Per-registry static credentials (third-party access)
+
+Use this when one ECR registry needs credentials distinct from the ambient chain. The canonical case is a third-party ECR accessed with static IAM-user keys: Pod Identity / IRSA serves your own ECRs, and one specific registry uses keys the third party issued.
+
+The `aws_profile` per-registry field scopes ECR credential resolution for that registry to a named AWS profile, leaving every other ECR registry on the ambient chain.
+
+```yaml
+registries:
+  my-source:
+    url: 111111111111.dkr.ecr.us-east-1.amazonaws.com
+    auth_type: ecr
+    # no aws_profile -> ambient chain (Pod Identity, IRSA, env, IMDS)
+
+  vendor-source:
+    url: 222222222222.dkr.ecr.us-east-1.amazonaws.com
+    auth_type: ecr        # required when aws_profile is set
+    aws_profile: vendor   # reads [vendor] from the shared credentials file
+```
+
+Author the credentials file with the section the third party gave you:
+
+```ini
+[vendor]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+# session_token = ...   # only if they issued STS temporary credentials
+```
+
+The AWS SDK reads the file from `~/.aws/credentials` by default, or from the path in `AWS_SHARED_CREDENTIALS_FILE`. The file does not need a `[default]` section — the ambient chain skips the file entirely when no profile is named, so Pod Identity / IRSA still serves `my-source`.
+
+For Kubernetes deployments, see the AWS shared-config files section of [Kubernetes secrets](./secrets) for two production-grade injection patterns (External Secrets Operator and CSI Secrets Store).
