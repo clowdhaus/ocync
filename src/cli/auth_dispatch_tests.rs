@@ -488,3 +488,20 @@ fn auth_type_ecr_public_is_a_parse_error() {
         "auth_type 'ecr_public' must be rejected at parse time (no AuthType::EcrPublic variant)"
     );
 }
+
+#[tokio::test]
+async fn ecr_dispatch_with_aws_profile_succeeds() {
+    let cfg = RegistryConfig {
+        url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_owned(),
+        auth_type: Some(AuthType::Ecr),
+        credentials: None,
+        token: None,
+        max_concurrent: None,
+        head_first: false,
+        aws_profile: Some("vendor".to_owned()),
+    };
+    let client = build_registry_client("123456789012.dkr.ecr.us-east-1.amazonaws.com", Some(&cfg))
+        .await
+        .expect("ECR dispatch with aws_profile should succeed");
+    assert_eq!(client.auth_name(), Some("ecr"));
+}
