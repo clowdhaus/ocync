@@ -2017,9 +2017,17 @@ mappings:
             head_first: false,
             aws_profile: Some("vendor".to_string()),
         };
-        let err = validate_registry("vendor", &registry).unwrap_err().to_string();
-        assert!(err.contains("aws_profile"), "error must mention aws_profile: {err}");
-        assert!(err.contains("auth_type"), "error must mention auth_type: {err}");
+        let err = validate_registry("vendor", &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("aws_profile"),
+            "error must mention aws_profile: {err}"
+        );
+        assert!(
+            err.contains("auth_type"),
+            "error must mention auth_type: {err}"
+        );
         assert!(err.contains("ecr"), "error must mention ecr: {err}");
     }
 
@@ -2037,8 +2045,13 @@ mappings:
             head_first: false,
             aws_profile: Some("vendor".to_string()),
         };
-        let err = validate_registry("vendor", &registry).unwrap_err().to_string();
-        assert!(err.contains("aws_profile"), "error must mention aws_profile: {err}");
+        let err = validate_registry("vendor", &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("aws_profile"),
+            "error must mention aws_profile: {err}"
+        );
         assert!(err.contains("ecr"), "error must mention ecr: {err}");
     }
 
@@ -2053,8 +2066,13 @@ mappings:
             head_first: false,
             aws_profile: Some(String::new()),
         };
-        let err = validate_registry("vendor", &registry).unwrap_err().to_string();
-        assert!(err.contains("aws_profile"), "error must mention aws_profile: {err}");
+        let err = validate_registry("vendor", &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("aws_profile"),
+            "error must mention aws_profile: {err}"
+        );
         assert!(err.contains("empty"), "error must mention empty: {err}");
     }
 }
