@@ -260,13 +260,12 @@ impl EcrAuth {
     /// an error if the region cannot be extracted from the hostname.
     pub async fn new(hostname: impl Into<String>) -> Result<Self, Error> {
         let hostname = hostname.into();
-        let config =
-            crate::ecr::load_sdk_config(&hostname)
-                .await
-                .map_err(|e| Error::AuthFailed {
-                    registry: hostname.clone(),
-                    reason: format!("failed to load AWS SDK config: {e}"),
-                })?;
+        let config = crate::ecr::load_sdk_config(&hostname, None)
+            .await
+            .map_err(|e| Error::AuthFailed {
+                registry: hostname.clone(),
+                reason: format!("failed to load AWS SDK config: {e}"),
+            })?;
 
         let ecr_client = aws_sdk_ecr::Client::new(&config);
         let registry = hostname.clone();

@@ -55,20 +55,34 @@ fn ecr_registry_id(hostname: &str) -> Option<&str> {
     }
 }
 
-/// Load an AWS SDK config for the given ECR hostname.
+/// Load an SDK config for the given ECR hostname.
 ///
 /// Extracts the region from the hostname and configures the SDK with it.
 /// FIPS endpoint support is handled at the SDK level: set
 /// `AWS_USE_FIPS_ENDPOINT=true` before calling this function.
-pub(crate) async fn load_sdk_config(hostname: &str) -> Result<aws_config::SdkConfig, Error> {
+///
+/// When `profile` is `Some`, the SDK builder calls
+/// [`aws_config::ConfigLoader::profile_name`] to scope credential resolution
+/// to that named profile in the shared credentials/config file. When `None`,
+/// the ambient default credential chain is used unchanged (env vars,
+/// shared-config `[default]`, IRSA, EKS Pod Identity, IMDS).
+///
+/// Profile-not-found errors do not surface here; they surface at the first
+/// ECR API call as `Error::AuthFailed`.
+pub(crate) async fn load_sdk_config(
+    hostname: &str,
+    profile: Option<&str>,
+) -> Result<aws_config::SdkConfig, Error> {
     let region = ecr_region(hostname).ok_or_else(|| Error::EcrApi {
         reason: format!("cannot extract AWS region from ECR hostname '{hostname}'"),
     })?;
 
-    Ok(aws_config::defaults(BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.to_owned()))
-        .load()
-        .await)
+    let mut builder = aws_config::defaults(BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_owned()));
+    if let Some(p) = profile {
+        builder = builder.profile_name(p);
+    }
+    Ok(builder.load().await)
 }
 
 /// Maximum number of layer digests per `BatchCheckLayerAvailability` API call.
@@ -205,7 +219,7 @@ impl BatchChecker {
     /// then builds an SDK config and ECR client internally. Returns an error
     /// if the region cannot be determined from the hostname.
     pub async fn from_hostname(hostname: &str) -> Result<Self, Error> {
-        let sdk_config = load_sdk_config(hostname).await?;
+        let sdk_config = load_sdk_config(hostname, None).await?;
         let registry_id = ecr_registry_id(hostname).map(|s| s.to_owned());
         let client = aws_sdk_ecr::Client::new(&sdk_config);
         Ok(Self {
@@ -737,5 +751,32 @@ mod tests {
     fn batch_blob_checker_is_object_safe() {
         // Verify the trait can be used as Rc<dyn BatchBlobChecker>.
         fn _assert_object_safe(_: std::rc::Rc<dyn BatchBlobChecker>) {}
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::load_sdk_config;
+
+    #[tokio::test]
+    async fn load_sdk_config_accepts_none_profile() {
+        let cfg = load_sdk_config("123456789012.dkr.ecr.us-east-1.amazonaws.com", None)
+            .await
+            .unwrap();
+        assert_eq!(cfg.region().map(|r| r.as_ref()), Some("us-east-1"));
+    }
+
+    #[tokio::test]
+    async fn load_sdk_config_accepts_named_profile() {
+        // Profile-not-found does NOT error at config-load time -- it surfaces
+        // at the first SDK API call. This test asserts the load itself succeeds
+        // with an unknown profile name.
+        let cfg = load_sdk_config(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            Some("nonexistent-profile-for-test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cfg.region().map(|r| r.as_ref()), Some("us-east-1"));
     }
 }
