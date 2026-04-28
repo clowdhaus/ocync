@@ -1,5 +1,5 @@
 ---
-title: GitHub Container Registry (GHCR)
+title: GitHub Container Registry
 description: Using ocync with GHCR via PAT, GITHUB_TOKEN, or docker-config.
 order: 6
 ---

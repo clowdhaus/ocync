@@ -1,5 +1,5 @@
 ---
-title: Azure Container Registry (ACR)
+title: Azure Container Registry
 description: Using ocync with ACR via the AAD credential chain and proprietary OAuth2 exchange.
 order: 4
 ---
