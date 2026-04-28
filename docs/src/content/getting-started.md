@@ -120,4 +120,4 @@ ocync sync -c config.yaml --dry-run
 - [CLI reference](../cli-reference) for all commands, flags, and exit codes
 - [Helm chart](../helm) for Kubernetes deployment (CronJob, Deployment, or Job)
 - [Observability](../observability) for logging, JSON output, and health endpoints
-- Registry guides: [Amazon ECR](../registries/ecr), [Docker Hub](../registries/docker-hub), [GHCR](../registries/ghcr), [GAR](../registries/gar), [ACR](../registries/acr), [Chainguard](../registries/chainguard)
+- Registry guides: [Amazon ECR](../registries/ecr), [Amazon ECR Public](../registries/ecr-public), [Docker Hub](../registries/docker-hub), [GHCR](../registries/ghcr), [GAR](../registries/gar), [ACR](../registries/acr), [Chainguard](../registries/chainguard), [Kubernetes secrets](../registries/secrets)
