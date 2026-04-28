@@ -1,29 +1,23 @@
 ---
 title: Chainguard Registry (cgr.dev)
-description: "Using ocync with cgr.dev via anonymous pulls of `:latest` / `:latest-dev` or pull-tokens for paid-tier tags. Recommended path for headless / CI use is `auth_type: basic` with a chainctl pull-token."
+description: "Using ocync with cgr.dev: anonymous for :latest, chainctl pull-token + auth_type basic for paid tags."
 order: 7
 ---
 
 ## Auth
 
-Chainguard's `cgr.dev` uses the standard OCI Bearer token exchange. There are three credential surfaces, in the order you'll most likely use them:
+`cgr.dev` uses the standard OCI Bearer token exchange. Three credential paths, in order of likely use:
 
-- **`auth_type: basic` with a chainctl pull-token (recommended for headless / CI / Kubernetes).** `chainctl auth pull-token` issues a long-lived `(username, password)` pair scoped to an organization or library. Drop those values directly into `credentials.username` / `credentials.password` -- no docker config file required. This is the natural fit for ocync's primary use case (sync running unattended in CI or in a Kubernetes pod).
-- **`auth_type: docker_config` (or unset auto-detect) with `chainctl auth login` (recommended for developer machines).** `chainctl auth login` opens an OIDC browser flow and `chainctl auth configure-docker` writes the resulting credentials into `~/.docker/config.json`. ocync auto-detects the docker config path for `cgr.dev`.
-- **Anonymous (free tier).** No credentials required. Limited to `:latest` and `:latest-dev` tags on the public image catalog. Version-pinned tags (e.g., `python:3.12`), historical revisions, and the full FIPS catalog all require a pull-token.
+- `auth_type: basic` with a chainctl pull-token (recommended for CI / Kubernetes). `chainctl auth pull-token` issues a long-lived `(username, password)` pair scoped to an organization or library. Drop those values into `credentials.username` / `credentials.password`; no docker config file required.
+- `auth_type: docker_config` (or unset, which auto-detects) with `chainctl auth login` (recommended for developer machines). `chainctl auth configure-docker` writes credentials into `~/.docker/config.json`.
+- Anonymous (free tier). Limited to `:latest` and `:latest-dev` on the public catalog. Version-pinned tags, historical revisions, and the full FIPS catalog require a pull-token.
 
 See the [Chainguard auth docs](https://edu.chainguard.dev/chainguard/chainguard-registry/authenticating/) for issuing pull-tokens and configuring chainctl.
 
-ocync's resolution order when a request hits `cgr.dev`:
+Notable behaviors:
 
-1. Explicit `auth_type: basic` with `credentials:` -- HTTP Basic in the `/v2/token` exchange.
-2. Explicit `auth_type: docker_config` (or unset, which auto-detects to docker-config for `cgr.dev`) -- read `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`); HTTP Basic with the matching entry's username/password.
-3. Anonymous fallback when no docker config entry exists for `cgr.dev`.
-
-ocync-specific behaviors:
-
-- **Per-scope token cache (universal, not Chainguard-specific).** Every Bearer-issuing provider in ocync caches tokens per repository scope, keyed by `repository:<name>:<actions>`. cgr.dev's notable quirk is *enforcement*: it returns **403** on cross-scope token reuse, where some registries silently accept cross-scope tokens. The per-scope cache avoids this 403 by issuing a fresh exchange for each scope.
-- **Anonymous tag visibility is restricted.** Only `:latest` and `:latest-dev` are listed/resolvable anonymously. Pulling other tags requires a pull-token even for images in the public catalog.
+- cgr.dev returns **403** on cross-scope token reuse where most registries silently accept it. ocync's per-scope token cache (universal, not Chainguard-specific) issues a fresh exchange per `repository:<name>:<actions>` scope and avoids this.
+- Anonymous tag visibility is restricted: only `:latest` and `:latest-dev` are listable / resolvable. Other tags need a pull-token even for public-catalog images.
 
 ## CLI example
 

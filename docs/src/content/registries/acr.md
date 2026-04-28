@@ -1,6 +1,6 @@
 ---
 title: Azure Container Registry (ACR)
-description: Using ocync with Azure Container Registry via the AAD credential chain, sovereign clouds, and the AAD-to-ACR-refresh-to-ACR-access exchange.
+description: Using ocync with ACR via the AAD credential chain and proprietary OAuth2 exchange.
 order: 4
 ---
 
@@ -9,20 +9,18 @@ order: 4
 ocync auto-detects ACR (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`) and authenticates against ACR's proprietary OAuth2 endpoints (not standard OCI Bearer exchange) via a four-source Azure AD credential chain:
 
 1. Client secret (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`)
-2. Workload Identity (the `AZURE_FEDERATED_TOKEN_FILE` projected token; AKS Workload Identity or any equivalent OIDC federation)
+2. Workload Identity (`AZURE_FEDERATED_TOKEN_FILE`; AKS Workload Identity or any OIDC federation)
 3. Managed Identity (`IDENTITY_ENDPOINT` / `IDENTITY_HEADER`; AKS pod-managed identity, App Service, Functions)
-4. Azure CLI (`az login` -- developer machines)
+4. Azure CLI (`az login`; developer machines)
 
-See the [Azure DefaultAzureCredential docs](https://learn.microsoft.com/azure/developer/intro/authentication-overview#defaultazurecredential) for credential precedence; ocync's chain is extracted from `azure_identity` patterns with zero external dependencies.
+See the [Azure DefaultAzureCredential docs](https://learn.microsoft.com/azure/developer/intro/authentication-overview#defaultazurecredential) for credential precedence.
 
-ocync-specific behaviors:
+Notable behaviors:
 
-- **Two-step OAuth2 exchange.** AAD access token -> `POST /oauth2/exchange` -> ACR refresh token (~3h JWT `exp`). Refresh token + scope -> `POST /oauth2/token` -> ACR access token (~75min JWT `exp`). Token TTLs are driven by the JWT `exp` claim, not a static default.
-- **Sovereign cloud routing.** `*.azurecr.cn` uses `login.chinacloudapi.cn` and `containerregistry.azure.cn`; `*.azurecr.us` uses `login.microsoftonline.us` and `containerregistry.azure.us`. The hostname suffix determines both the AAD authority and the ACR resource endpoint.
-- **No-redirect HTTP client.** ACR's `/oauth2/exchange` and `/oauth2/token` POSTs use a no-redirect reqwest client, matching upstream `azure_identity`'s global redirect-disable. This prevents accidental credential exposure to a redirected host.
-- **Credential chain caches the winning source.** Once one of the four AAD credential sources succeeds, ocync caches its index and uses it directly for refresh. `invalidate()` resets the cached index, allowing a different source to win after credential rotation.
-- **~20 MB streaming PUT body limit.** ACR rejects streaming uploads larger than ~20 MB with a connection reset or HTTP 413. Chunked PATCH fallback is not yet implemented; blobs exceeding ~20 MB cannot be pushed to ACR with the current ocync release.
-- **Two rate-limit windows.** ACR enforces separate ReadOps and WriteOps quotas; ocync tracks them as two AIMD windows.
+- Two-step OAuth2 exchange: AAD access token -> `POST /oauth2/exchange` -> ACR refresh token (~3h) -> `POST /oauth2/token` with scope -> ACR access token (~75min). TTLs are driven by the JWT `exp` claim.
+- Sovereign cloud routing: `*.azurecr.cn` uses `login.chinacloudapi.cn`; `*.azurecr.us` uses `login.microsoftonline.us`. The hostname suffix selects both the AAD authority and the ACR resource endpoint.
+- **~20 MB streaming PUT body limit.** ACR rejects streaming uploads above ~20 MB with a connection reset or 413; chunked PATCH fallback is not yet implemented. Blobs exceeding this limit cannot currently be pushed to ACR.
+- Two rate-limit windows: ACR enforces separate ReadOps and WriteOps quotas; ocync tracks them as two AIMD windows.
 
 ## CLI example
 
