@@ -5,6 +5,7 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 ## Auth protocol
 
 - ECR private uses HTTP Basic auth (not Bearer token exchange). AWS SDK `GetAuthorizationToken` returns a pre-encoded base64 token used directly.
+- `EcrAuth::new(hostname, profile)` accepts an optional named AWS profile. When `Some(p)`, the SDK builder calls `.profile_name(p)`, scoping credential resolution to that profile in the shared credentials/config file. When `None`, the ambient default credential chain is used. Per-registry isolation is structural — each `EcrAuth` instance holds its own `SdkConfig` — so a profile override on one registry does not affect any other registry's credential resolution. `EcrPublicAuth` is unchanged (out of scope).
 - ECR Public uses SDK `GetAuthorizationToken` -> decode base64 -> OCI Bearer token exchange with those credentials. SDK tokens are NOT valid as direct Bearer tokens; they must drive standard `/v2/token` exchange.
 - Both ECR providers cache SDK credentials via `SdkCredentialCache<T>` in `auth/ecr.rs` (generic read-lock fast path / write-lock + double-check). New ECR-style providers must use this cache, not hand-roll the RwLock pattern.
 - GAR/GCR uses `google-cloud-auth` ADC (`devstorage.read_write` scope) -> `oauth2accesstoken:<token>` Basic creds -> `token_exchange::exchange()` -> Bearer token. Same flow as ECR Public. Auto-detected via `ProviderKind::Gar`/`Gcr`. SDK credential TTL is 600s (conservative: `google-cloud-auth` does not expose `expires_in`). Implementation in `auth/gcp.rs`.
