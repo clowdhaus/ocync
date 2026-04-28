@@ -117,16 +117,17 @@ registries:
 
 | Value | Description |
 |---|---|
-| `ecr` | AWS ECR token exchange via IAM credentials |
-| `gcr` | Google Cloud artifact/container registry |
-| `acr` | Azure Container Registry |
-| `ghcr` | GitHub Container Registry |
-| `basic` | HTTP basic auth (requires `credentials` with both `username` and `password`) |
-| `static_token` or `token` | Pre-obtained bearer token (requires `token` field) |
-| `docker_config` | Docker config.json credential store |
-| `anonymous` | No authentication |
+| `ecr` | AWS ECR private. HTTP Basic using an SDK-issued token; ambient AWS credentials |
+| `gar` | Google Artifact Registry (`*-docker.pkg.dev`); Application Default Credentials |
+| `gcr` | Legacy Google Container Registry (`*.gcr.io`); same provider as `gar` |
+| `acr` | Azure Container Registry; AAD credential chain via proprietary OAuth2 exchange |
+| `ghcr` | Alias for `docker_config`. Prefer `static_token` (e.g., `GITHUB_TOKEN`) or `docker_config` directly |
+| `basic` | HTTP Basic. Requires `credentials` with `username` and `password` |
+| `static_token` or `token` | Pre-obtained bearer token. Requires `token`. Does not refresh |
+| `docker_config` | Reads `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) |
+| `anonymous` | No credentials; still performs the `/v2/token` Bearer exchange when challenged |
 
-Auth type is auto-detected from the hostname for ECR, Docker Hub, GHCR, GAR, ACR, and Chainguard. Any OCI-compliant registry works with auto-detected or explicit auth.
+Auto-detected from hostname. ECR (private and Public), GAR, GCR, and ACR each route to a dedicated native-auth provider. GHCR, Docker Hub, Chainguard, and any unrecognized hostname share the same fallback path: `docker_config` first (using `~/.docker/config.json` or `$DOCKER_CONFIG/config.json`), then anonymous if no entry is found. Set `auth_type` explicitly to override detection.
 
 See the [registry guides](../registries/ecr) for provider-specific auth details.
 
