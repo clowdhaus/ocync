@@ -1,6 +1,6 @@
 ---
 title: Amazon ECR Public
-description: Using ocync with public.ecr.aws via the SDK GetAuthorizationToken to OCI Bearer exchange, or anonymous pulls.
+description: Using ocync with public.ecr.aws via SDK auth or anonymous pulls.
 order: 2
 ---
 
@@ -10,18 +10,17 @@ ECR Public (`public.ecr.aws`) is a separate registry from ECR private with a dif
 
 Authenticated path:
 
-- ocync calls `ecr-public:GetAuthorizationToken` (always against `us-east-1`, ECR Public is single-region).
+- ocync calls `ecr-public:GetAuthorizationToken` (always against `us-east-1`; ECR Public is single-region).
 - The returned token is base64-decoded to extract the password half (`AWS:<password>`).
 - That password is used as HTTP Basic credentials in the standard OCI `/v2/token` Bearer exchange.
 
-Anonymous pulls work without any AWS credentials but have lower per-IP rate limits. Use authenticated access for any non-trivial sync workload.
+Anonymous pulls work without AWS credentials but have lower per-IP rate limits. Use authenticated access for any non-trivial sync workload.
 
-ocync-specific behaviors:
+Notable behaviors:
 
-- **Distinct from ECR private.** No `AuthType::EcrPublic` config variant exists; ECR Public is reachable only via auto-detection on the `public.ecr.aws` hostname. Setting `auth_type: ecr_public` in config is a parse error.
-- **No `BatchCheckLayerAvailability`.** ECR Public uses per-blob HEAD requests via the OCI Distribution path, not the ECR SDK batch API. The ECR-private optimization at `synchronize.rs:257` does not apply here.
-- **Standard Bearer flow.** Once the SDK-derived Basic credentials are exchanged for a Bearer token, ocync uses the same per-scope token cache and challenge cache as every other Bearer-issuing provider.
-- **Lower rate limits than ECR private.** Read paths share a single window; write windows are separate but their caps are 10x lower than ECR private.
+- No `auth_type` value exists for ECR Public; it is reachable only via auto-detection on `public.ecr.aws`. Setting `auth_type: ecr_public` is a parse error.
+- No `BatchCheckLayerAvailability`. ECR Public uses per-blob HEADs via the OCI Distribution path, not the ECR SDK batch API.
+- Lower rate limits than ECR private. Read paths share a single window; write window caps are 10x lower than ECR private.
 
 ## CLI example
 
