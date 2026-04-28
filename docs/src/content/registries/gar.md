@@ -1,5 +1,5 @@
 ---
-title: Google Artifact Registry (GAR / GCR)
+title: Google Artifact Registry
 description: Using ocync with GAR and legacy GCR via Application Default Credentials.
 order: 3
 ---

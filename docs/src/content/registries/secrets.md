@@ -1,16 +1,16 @@
 ---
-title: Kubernetes secret patterns
-description: Four ways to plug registry credentials into the ocync Helm chart - envFrom, ExternalSecrets, CSI Secrets Store, Workload Identity.
+title: Kubernetes secrets
+description: Four ways to plug registry credentials into the ocync Helm chart.
 order: 8
 ---
 
-ocync's Helm chart exposes four orthogonal patterns for getting registry credentials into the workload pod. Pick the one that matches how secrets are managed in your cluster; you can combine them (e.g., Workload Identity for AWS plus envFrom for a Docker Hub PAT).
+ocync's Helm chart exposes four orthogonal patterns for getting registry credentials into the workload pod: `envFrom`, External Secrets Operator, CSI Secrets Store, and Workload Identity. Pick the one that matches how secrets are managed in your cluster; combinations are fine (e.g., Workload Identity for AWS plus `envFrom` for a Docker Hub PAT).
 
 The chart values referenced below are documented inline in [`charts/ocync/values.yaml`](https://github.com/clowdhaus/ocync/blob/main/charts/ocync/values.yaml). Working CI fixtures live in [`charts/ocync/ci/`](https://github.com/clowdhaus/ocync/tree/main/charts/ocync/ci).
 
-## Pattern 1: `envFrom` from an existing Secret
+## envFrom
 
-Simplest pattern. Create a `Secret` out-of-band, reference it via `envFrom`. The ocync config substitutes `${VAR_NAME}` from environment variables.
+Simplest pattern. Create a `Secret` out-of-band and reference it via `envFrom`; the ocync config substitutes `${VAR_NAME}` from environment variables.
 
 ```yaml
 # values.yaml
@@ -37,7 +37,7 @@ kubectl create secret generic ocync-credentials \
 
 This pattern composes with everything below: Workload Identity covers cloud auth, `envFrom` covers token-based registries in the same pod.
 
-## Pattern 2: External Secrets Operator (ExternalSecrets)
+## External Secrets Operator
 
 When secrets live in AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, HashiCorp Vault, or a similar external store, [External Secrets Operator (ESO)](https://external-secrets.io/) keeps a native `Secret` synchronized from the source of truth. The chart can render the `ExternalSecret` resource for you so the entire deployment is declarative:
 
@@ -69,7 +69,7 @@ The chart renders `ExternalSecret` (`external-secrets.io/v1`); ESO writes the `o
 
 For the underlying `SecretStore` / `ClusterSecretStore` (which provider, how it authenticates), see the [ESO provider docs](https://external-secrets.io/latest/provider/aws-secrets-manager/) for your target store.
 
-## Pattern 3: CSI Secrets Store Driver (`SecretProviderClass`)
+## CSI Secrets Store
 
 When you want secrets mounted as files (not env vars) and synced into a native Secret as a side effect, the [Secrets Store CSI Driver](https://secrets-store-csi-driver.sigs.k8s.io/) is the standard pattern. The chart renders a `SecretProviderClass` (`secrets-store.csi.x-k8s.io/v1`) and you consume it via `extraVolumes`:
 
@@ -117,7 +117,7 @@ Both the CSI driver and the cloud-specific provider plugin (AWS, Azure, GCP, or 
 
 **First-pod startup race.** The CSI driver populates the synced `Secret` (the one referenced by `envFrom`) only after the volume has mounted. `envFrom` resolves at container start, so on a brand-new pod the `Secret` may not exist yet and Kubernetes surfaces `CreateContainerConfigError`. The pod recovers automatically once the driver finishes the first sync (typically within seconds). This is expected behavior of the CSI Secrets Store Driver, not a chart bug; if you need deterministic ordering, populate the `Secret` out-of-band (or via ExternalSecrets) and have the driver merely refresh it.
 
-## Pattern 4: Workload Identity (cloud-IAM, no Secret needed)
+## Workload Identity
 
 For cloud registries (ECR, ECR Public, GAR, ACR), the cleanest path is **no Secret at all** -- bind the workload to a cloud IAM identity and let the SDK resolve credentials on each pod. The chart's `workloadIdentity` block sets the right ServiceAccount annotation (and pod label, for Azure) for your provider:
 

@@ -20,7 +20,7 @@ helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.1.0
 | `cronjob` | CronJob | Scheduled sync every N minutes |
 | `job` | Job | One-shot sync for CI or seeding |
 
-## CronJob mode (recommended)
+## CronJob mode
 
 ```yaml
 # values.yaml
@@ -69,7 +69,7 @@ config:
 
 The process is I/O-bound (single-threaded tokio runtime), not compute-bound. The `cpu: 500m` request gives the pod enough scheduling weight for Karpenter to steer toward network-optimized instances.
 
-## Watch mode (Deployment)
+## Watch mode
 
 ```yaml
 mode: watch

@@ -250,9 +250,9 @@ The `DOCKER_CONFIG` environment variable controls the Docker config file locatio
 
 ## Example configurations
 
-### Chainguard to ECR (single region)
+### Chainguard to ECR
 
-Sync a curated set of Chainguard base images to ECR, keeping only the latest 5 semver-stable tags for `linux/amd64` and `linux/arm64`:
+Single region. Sync a curated set of Chainguard base images to ECR, keeping only the latest 5 semver-stable tags for `linux/amd64` and `linux/arm64`:
 
 ```yaml
 registries:
@@ -281,7 +281,7 @@ mappings:
     to: node
 ```
 
-### Docker Hub to ECR (multi-region fan-out)
+### Docker Hub fan-out
 
 Mirror Docker Hub images to multiple ECR regions with authenticated pulls and debug tag exclusion:
 

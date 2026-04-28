@@ -1,5 +1,5 @@
 ---
-title: Chainguard Registry (cgr.dev)
+title: Chainguard
 description: "Using ocync with cgr.dev: anonymous for :latest, chainctl pull-token + auth_type basic for paid tags."
 order: 7
 ---
@@ -21,7 +21,9 @@ Notable behaviors:
 
 ## CLI example
 
-### Anonymous (free tier, `:latest` only)
+### Anonymous
+
+Free tier, limited to `:latest` and `:latest-dev`.
 
 ```bash
 ocync copy \
@@ -29,9 +31,9 @@ ocync copy \
   ghcr.io/myorg/static:latest
 ```
 
-### Static credentials via `chainctl auth pull-token` (recommended for CI)
+### Pull-token
 
-Generate a pull-token once (output includes a username and password; capture both into your secret store):
+Recommended for CI. Generate a pull-token once; the output includes a username and password to capture into your secret store.
 
 ```bash
 chainctl auth pull-token --library-paid <your-org-slug>
@@ -73,7 +75,9 @@ mappings:
     to: myorg/python
 ```
 
-### Developer machine via `chainctl auth login` + docker config
+### Developer machine
+
+`chainctl auth login` + `chainctl auth configure-docker` writes credentials to `~/.docker/config.json`; ocync picks them up automatically.
 
 ```bash
 chainctl auth login
@@ -130,9 +134,9 @@ kubectl create secret generic ocync-credentials \
 
 For credential rotation -- pulling the pull-token out of AWS Secrets Manager / GCP Secret Manager / Azure Key Vault / Vault and refreshing it on a schedule -- use the External Secrets Operator or CSI Secrets Store patterns documented in [Kubernetes secret patterns](./secrets); the `auth_type: basic` configuration above stays unchanged, only the source of `CHAINGUARD_USERNAME` / `CHAINGUARD_PASSWORD` changes.
 
-### Alternative: docker-config-volume approach
+### Docker config volume
 
-When you have an existing `chainctl auth configure-docker` flow (e.g., a machine that already has `~/.docker/config.json` populated and you want to lift-and-shift), mount a Secret-backed docker config and use `auth_type: docker_config`:
+For a lift-and-shift from a machine that already has `~/.docker/config.json` populated by `chainctl auth configure-docker`, mount a Secret-backed docker config and use `auth_type: docker_config`:
 
 ```yaml
 # values.yaml

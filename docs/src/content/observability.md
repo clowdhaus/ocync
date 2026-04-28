@@ -81,9 +81,9 @@ JSON log format is auto-detected when running inside Kubernetes (via `KUBERNETES
 
 Override with the `RUST_LOG` environment variable for fine-grained filter directives.
 
-## Health endpoints (watch mode)
+## Health endpoints
 
-When running in watch mode, `ocync` exposes HTTP health endpoints:
+In watch mode, `ocync` exposes HTTP health endpoints:
 
 | Endpoint | Purpose | Healthy |
 |---|---|---|

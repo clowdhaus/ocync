@@ -1,5 +1,5 @@
 ---
-title: Amazon ECR (private)
+title: Amazon ECR
 description: Using ocync with private Amazon ECR via IAM credentials, IRSA, and EKS Pod Identity.
 order: 1
 ---
