@@ -1,0 +1,21 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.versionBadge" . }} {{ template "chart.typeBadge" . }} {{ template "chart.appVersionBadge" . }}
+
+```bash
+helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version {{ .Version }}
+```
+
+See the [Helm chart documentation](https://clowdhaus.github.io/ocync/helm) and [`docs/src/content/registries/secrets.md`](../../docs/src/content/registries/secrets.md) for configuration, deployment modes, and the four supported secret-injection patterns.
+
+{{ template "chart.maintainersSection" . }}
+
+{{ template "chart.sourcesSection" . }}
+
+{{ template "chart.requirementsSection" . }}
+
+{{ template "chart.valuesSection" . }}
+
+{{ template "helm-docs.versionFooter" . }}

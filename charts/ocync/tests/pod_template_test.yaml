@@ -1,0 +1,145 @@
+## Behavioral assertions on _pod.tpl across the three workload modes.
+## Asserts the partial routes args, ports/probes, restartPolicy, and the
+## checksum/config annotation correctly per .Values.mode.
+suite: pod template (_pod.tpl)
+
+templates:
+  - deployment.yaml
+  - cronjob.yaml
+  - job.yaml
+
+tests:
+  - it: watch mode renders container args [watch, --config, ..., --interval, --health-port]
+    set:
+      mode: watch
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args[0]
+          value: watch
+      - equal:
+          path: spec.template.spec.containers[0].args[1]
+          value: --config
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --interval
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --health-port
+
+  - it: cronjob mode renders container args [sync, --config, ...]
+    set:
+      mode: cronjob
+    template: cronjob.yaml
+    asserts:
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          value: sync
+      - notContains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args
+          content: watch
+      - notContains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args
+          content: --interval
+
+  - it: job mode renders container args [sync, --config, ...]
+    set:
+      mode: job
+    template: job.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args[0]
+          value: sync
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: watch
+
+  - it: watch mode has health port and probes
+    set:
+      mode: watch
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].name
+          value: health
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /healthz
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
+
+  - it: cronjob mode has no ports or probes
+    set:
+      mode: cronjob
+    template: cronjob.yaml
+    asserts:
+      - notExists:
+          path: spec.jobTemplate.spec.template.spec.containers[0].ports
+      - notExists:
+          path: spec.jobTemplate.spec.template.spec.containers[0].livenessProbe
+      - notExists:
+          path: spec.jobTemplate.spec.template.spec.containers[0].readinessProbe
+
+  - it: job mode has no ports or probes
+    set:
+      mode: job
+    template: job.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].ports
+      - notExists:
+          path: spec.template.spec.containers[0].livenessProbe
+      - notExists:
+          path: spec.template.spec.containers[0].readinessProbe
+
+  - it: watch mode does not set restartPolicy (defaults Always)
+    set:
+      mode: watch
+    template: deployment.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.restartPolicy
+
+  - it: cronjob mode sets restartPolicy OnFailure
+    set:
+      mode: cronjob
+    template: cronjob.yaml
+    asserts:
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.restartPolicy
+          value: OnFailure
+
+  - it: job mode sets restartPolicy OnFailure
+    set:
+      mode: job
+    template: job.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.restartPolicy
+          value: OnFailure
+
+  - it: watch mode adds checksum/config pod annotation
+    set:
+      mode: watch
+    template: deployment.yaml
+    asserts:
+      - exists:
+          path: spec.template.metadata.annotations["checksum/config"]
+
+  - it: cronjob mode does not add checksum/config annotation
+    set:
+      mode: cronjob
+    template: cronjob.yaml
+    asserts:
+      - notExists:
+          path: spec.jobTemplate.spec.template.metadata.annotations
+
+  - it: job mode does not add checksum/config annotation
+    set:
+      mode: job
+    template: job.yaml
+    asserts:
+      - notExists:
+          path: spec.template.metadata.annotations
+

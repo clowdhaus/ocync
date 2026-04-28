@@ -1,0 +1,38 @@
+## Cross-field validation anchored in configmap.yaml via `ocync.validate`.
+## Each test renders configmap.yaml (which always renders) so the embedded
+## `fail()` calls in `_helpers.tpl` are reached deterministically and
+## helm-unittest's `failedTemplate` assertion captures them.
+##
+## These cover the silent-misconfig footguns flagged in PR #68 review:
+## - `mode` typos previously produced an empty release with no error
+## - `workloadIdentity.provider: <bogus>` was silently treated as `none`
+## - `secretProviderClass.enabled: true` without `provider` rendered
+##   `provider: <null>` and failed with an opaque kubeconform error
+suite: validation
+
+templates:
+  - configmap.yaml
+
+tests:
+  - it: default values pass validation (configmap renders)
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: kind
+          value: ConfigMap
+
+  - it: invalid mode fails with a clear message
+    set:
+      mode: bogus
+    asserts:
+      - failedTemplate:
+          errorMessage: "ocync: invalid mode 'bogus' (must be one of: watch, cronjob, job)"
+
+  - it: invalid workloadIdentity.provider fails with a clear message
+    set:
+      workloadIdentity:
+        provider: bogus
+    asserts:
+      - failedTemplate:
+          errorMessage: "ocync: invalid workloadIdentity.provider 'bogus' (must be one of: none, aws, gcp, azure)"
