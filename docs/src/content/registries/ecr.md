@@ -124,3 +124,69 @@ env:
 ```
 
 For other secret-injection patterns (External Secrets Operator, CSI Secrets Store), see [Kubernetes secrets](./secrets).
+
+## Multi-account access
+
+ocync uses one ambient AWS credential chain per process. Syncing across accounts (e.g., one source ECR plus several target ECRs in different accounts) means giving that one principal the right permissions for every account it touches. There are three patterns, in order of preference.
+
+### Cross-account ECR repository policies
+
+Simplest. Attach a repository policy on each destination ECR repository that grants pull/push permissions to the principal ocync runs as. No assume-role hop, one set of credentials, the AWS SDK does no extra work.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AllowOcyncFromOriginAccount",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::ORIGIN_ACCOUNT:role/ocync" },
+    "Action": [
+      "ecr:BatchGetImage",
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:InitiateLayerUpload",
+      "ecr:UploadLayerPart",
+      "ecr:CompleteLayerUpload",
+      "ecr:PutImage"
+    ]
+  }]
+}
+```
+
+Pair with `ecr:GetAuthorizationToken` on the ocync principal in the origin account. This works on every host (EKS, ECS, EC2, Lambda, local).
+
+### EKS Pod Identity with `targetRoleArn`
+
+When repository policies aren't an option (e.g., the destination accounts are owned by a different team and they prefer trust-policy-based access), EKS Pod Identity natively supports cross-account role chaining. Configure a `PodIdentityAssociation` with both `roleArn` (the local cluster role) and `targetRoleArn` (the role in the destination account):
+
+```bash
+aws eks create-pod-identity-association \
+  --cluster-name my-cluster \
+  --namespace ocync \
+  --service-account my-release-ocync \
+  --role-arn arn:aws:iam::ORIGIN_ACCOUNT:role/ocync-source \
+  --target-role-arn arn:aws:iam::DESTINATION_ACCOUNT:role/ocync-target
+```
+
+The Pod Identity Agent assumes `targetRoleArn` for you; the credentials ocync sees are already the destination-account credentials. No ocync configuration needed.
+
+### Shared-config role chains (non-EKS)
+
+On hosts that don't use Pod Identity (ECS, EC2, on-prem, local dev), use the AWS shared-config role-chaining mechanism. Define a profile that names a `source_profile` and a `role_arn`, and run ocync with `AWS_PROFILE=<chain-profile>`:
+
+```ini
+# ~/.aws/config
+[profile ocync-base]
+region = us-east-1
+# Resolves base credentials from env, IMDS, or another source
+
+[profile ocync-target]
+source_profile = ocync-base
+role_arn = arn:aws:iam::DESTINATION_ACCOUNT:role/ocync-target
+```
+
+```bash
+AWS_PROFILE=ocync-target ocync sync --config ocync.yaml
+```
+
+The AWS SDK handles the `AssumeRole` call and credential refresh transparently. This works for one destination role per ocync invocation; if you need different roles per registry in a single process, file an issue describing the deployment shape — there is no built-in support today, and the workarounds (one process per role, or unified cross-account repository policies) cover most cases.
