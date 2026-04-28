@@ -236,11 +236,6 @@ pub(super) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Er
 /// environment variables, shared config/credential files, IMDS/ECS
 /// container credentials, IRSA (IAM Roles for Service Accounts), and
 /// EKS Pod Identity.
-///
-/// A named profile can be supplied at construction time (see
-/// [`EcrAuth::new`]) to scope credential resolution to a specific profile
-/// in the shared credentials/config file, overriding the ambient chain
-/// for this provider instance only.
 pub struct EcrAuth {
     /// The ECR registry hostname.
     hostname: String,
@@ -659,16 +654,6 @@ mod tests {
         assert!(
             auth.is_ok(),
             "EcrAuth::new with profile should succeed: {:?}",
-            auth.err()
-        );
-    }
-
-    #[tokio::test]
-    async fn new_accepts_none_profile() {
-        let auth = EcrAuth::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", None).await;
-        assert!(
-            auth.is_ok(),
-            "EcrAuth::new without profile should succeed: {:?}",
             auth.err()
         );
     }

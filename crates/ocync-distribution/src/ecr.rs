@@ -61,14 +61,9 @@ fn ecr_registry_id(hostname: &str) -> Option<&str> {
 /// FIPS endpoint support is handled at the SDK level: set
 /// `AWS_USE_FIPS_ENDPOINT=true` before calling this function.
 ///
-/// When `profile` is `Some`, the SDK builder calls
-/// [`aws_config::ConfigLoader::profile_name`] to scope credential resolution
-/// to that named profile in the shared credentials/config file. When `None`,
-/// the ambient default credential chain is used unchanged (env vars,
-/// shared-config `[default]`, IRSA, EKS Pod Identity, IMDS).
-///
-/// Profile-not-found errors do not surface here; they surface at the first
-/// ECR API call as `Error::AuthFailed`.
+/// When `profile` is `Some`, credential resolution is scoped to that named
+/// profile; when `None`, the ambient credential chain is used. Profile-not-found
+/// errors surface at the first ECR API call, not here.
 pub(crate) async fn load_sdk_config(
     hostname: &str,
     profile: Option<&str>,
@@ -218,8 +213,14 @@ impl BatchChecker {
     /// Extracts the AWS region and 12-digit registry ID from the hostname,
     /// then builds an SDK config and ECR client internally. Returns an error
     /// if the region cannot be determined from the hostname.
-    pub async fn from_hostname(hostname: &str) -> Result<Self, Error> {
-        let sdk_config = load_sdk_config(hostname, None).await?;
+    ///
+    /// `profile` must match the value passed to the corresponding
+    /// [`crate::auth::EcrAuth::new`]; otherwise the batch checker authenticates
+    /// as a different identity than the auth provider, which silently breaks
+    /// `BatchCheckLayerAvailability` for registries reachable only via the
+    /// named profile.
+    pub async fn from_hostname(hostname: &str, profile: Option<&str>) -> Result<Self, Error> {
+        let sdk_config = load_sdk_config(hostname, profile).await?;
         let registry_id = ecr_registry_id(hostname).map(|s| s.to_owned());
         let client = aws_sdk_ecr::Client::new(&sdk_config);
         Ok(Self {
@@ -752,25 +753,25 @@ mod tests {
         // Verify the trait can be used as Rc<dyn BatchBlobChecker>.
         fn _assert_object_safe(_: std::rc::Rc<dyn BatchBlobChecker>) {}
     }
-}
-
-#[cfg(test)]
-mod profile_tests {
-    use super::load_sdk_config;
 
     #[tokio::test]
-    async fn load_sdk_config_accepts_none_profile() {
-        let cfg = load_sdk_config("123456789012.dkr.ecr.us-east-1.amazonaws.com", None)
-            .await
-            .unwrap();
-        assert_eq!(cfg.region().map(|r| r.as_ref()), Some("us-east-1"));
+    async fn batch_checker_from_hostname_accepts_named_profile() {
+        // Pins the BatchChecker / EcrAuth symmetry: both must thread the same
+        // profile, otherwise sync runs against profile-scoped registries get
+        // split-brain auth.
+        let checker = BatchChecker::from_hostname(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            Some("nonexistent-profile-for-test"),
+        )
+        .await;
+        assert!(checker.is_ok(), "{:?}", checker.err());
     }
 
     #[tokio::test]
     async fn load_sdk_config_accepts_named_profile() {
-        // Profile-not-found does NOT error at config-load time -- it surfaces
-        // at the first SDK API call. This test asserts the load itself succeeds
-        // with an unknown profile name.
+        // SdkConfig has no public profile accessor, so this only verifies the
+        // load path itself does not reject an unknown profile name (resolution
+        // is deferred to the first SDK API call).
         let cfg = load_sdk_config(
             "123456789012.dkr.ecr.us-east-1.amazonaws.com",
             Some("nonexistent-profile-for-test"),

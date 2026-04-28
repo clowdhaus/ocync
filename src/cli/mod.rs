@@ -217,8 +217,6 @@ pub(crate) async fn build_registry_client(
 
     let mut builder = match auth_type {
         Some(AuthType::Ecr) => {
-            // aws_profile is only honored on the explicit-auth_type path.
-            // Validation guarantees aws_profile is None on every other branch.
             let profile = registry_config.and_then(|r| r.aws_profile.as_deref());
             let auth = EcrAuth::new(bare_host, profile)
                 .await
