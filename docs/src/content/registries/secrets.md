@@ -150,6 +150,79 @@ The Azure provider sets both the SA annotation (`azure.workload.identity/client-
 
 EKS Pod Identity is *not* represented in `workloadIdentity` because it is configured cluster-side via `PodIdentityAssociation` (not via the pod spec). Set up the association out-of-band and link it to the chart's ServiceAccount; no chart values are needed.
 
+## AWS shared-config files
+
+Use this pattern when one ECR registry needs credentials distinct from the ambient chain (see [ECR per-registry profile](./ecr#per-registry-static-credentials-third-party-access)). The `aws_profile` config field reads from a credentials file mounted at the path in `AWS_SHARED_CREDENTIALS_FILE`; this section covers two production-grade ways to populate that file.
+
+The recommended secret-store layout is to store the entire INI blob -- including the `[profile-name]` header -- as a single string value at one key. This keeps the chart values minimal and avoids per-field templating.
+
+### External Secrets Operator (AWS shared-config)
+
+The third party's credentials are mirrored into AWS Secrets Manager, Vault, Azure Key Vault, GCP Secret Manager, or another store. ESO syncs to a native `Secret` that the chart mounts as a file:
+
+```yaml
+# values.yaml
+externalSecrets:
+  enabled: true
+  refreshInterval: "1h"
+  secretStoreRef:
+    name: cluster-secret-store
+    kind: ClusterSecretStore
+  data:
+    - secretKey: credentials
+      remoteRef:
+        key: vendor/aws-creds   # value: full INI blob, one string
+
+extraVolumes:
+  - name: aws-creds
+    secret:
+      secretName: my-release-ocync   # default ExternalSecret target
+extraVolumeMounts:
+  - name: aws-creds
+    mountPath: /etc/aws
+    readOnly: true
+env:
+  - name: AWS_SHARED_CREDENTIALS_FILE
+    value: /etc/aws/credentials
+```
+
+Rotation handled upstream; audit trail in the source store; nothing plaintext in your repos.
+
+If your secret store holds the access key and secret key as separate fields, flatten them upstream into a single INI blob value. The chart does not currently expose ESO's `target.template:` for in-cluster assembly; if you have a hard requirement to keep them separate at rest, open an issue describing the constraint.
+
+### CSI Secrets Store driver (AWS shared-config)
+
+For clusters where policy mandates the CSI driver and forbids long-lived `Secret` resources. Same source-of-truth as the ESO path, but the driver mounts directly from the cloud secret store:
+
+```yaml
+# values.yaml
+secretProviderClass:
+  enabled: true
+  provider: aws  # | azure | gcp | vault
+  parameters:
+    objects: |
+      - objectName: vendor/aws-creds
+        objectType: secretsmanager
+        objectAlias: credentials
+
+extraVolumes:
+  - name: aws-creds
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: ocync   # release name (matches the existing CSI section above)
+extraVolumeMounts:
+  - name: aws-creds
+    mountPath: /etc/aws
+    readOnly: true
+env:
+  - name: AWS_SHARED_CREDENTIALS_FILE
+    value: /etc/aws/credentials
+```
+
+The CSI race-on-startup behavior described in the [CSI Secrets Store](#csi-secrets-store) section above applies here too: the file may not exist for the first few seconds after a brand-new pod starts.
+
 ## Combining patterns
 
 A typical mixed deployment (mirror from Docker Hub to ECR using IRSA + envFrom):
