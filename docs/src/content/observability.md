@@ -90,7 +90,7 @@ In watch mode, `ocync` exposes HTTP health endpoints:
 | `/healthz` | Liveness probe | Process is running |
 | `/readyz` | Readiness probe | At least one successful sync completed |
 
-Configure the port via `--health-port` (default 8080) or in [Helm values](../helm):
+Configure the port via `--health-port` (default 8080) or in [Helm values](/helm):
 
 ```yaml
 mode: watch
@@ -98,4 +98,4 @@ watch:
   healthPort: 8080
 ```
 
-See [CLI reference](../cli-reference#watch) for all `watch` flags including `--interval` and `--json`.
+See [CLI reference](/cli-reference#watch) for all `watch` flags including `--interval` and `--json`.

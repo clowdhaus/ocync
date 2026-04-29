@@ -44,7 +44,7 @@ Measured 2026-04-26 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit)
 
 | Tool | Default concurrency | Adaptive backoff | Rate limit strategy |
 |------|:---:|:---:|-----|
-| `ocync` | 5 initial, 50 cap ([AIMD](../design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](../design/overview#adaptive-concurrency-aimd) congestion control on 429 |
+| `ocync` | 5 initial, 50 cap ([AIMD](/design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](/design/overview#adaptive-concurrency-aimd) congestion control on 429 |
 | containerd | 3 layers | No | Lock-based dedup, retries on 429 (no backoff) |
 | regsync | 3 per registry | No | Reads `RateLimit-Remaining` header, pauses proactively |
 | crane | 4 jobs | Retry with backoff (0.1s-0.9s transport, 1s-9s operation) | Retry on 408/5xx, 3 attempts |
@@ -97,7 +97,7 @@ When a blob already exists in another repository on the same registry, `ocync` m
 
 ### Adaptive rate limiting
 
-Per-(registry, action) [AIMD](../design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency windows discover actual registry capacity through feedback, using the same algorithm TCP uses for congestion control. ECR has 9 independent rate limits (one per API action), and `ocync` tracks each independently. This avoids under-utilization and minimizes 429 errors through capacity discovery.
+Per-(registry, action) [AIMD](/design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency windows discover actual registry capacity through feedback, using the same algorithm TCP uses for congestion control. ECR has 9 independent rate limits (one per API action), and `ocync` tracks each independently. This avoids under-utilization and minimizes 429 errors through capacity discovery.
 
 ### Transfer state cache
 
@@ -109,7 +109,7 @@ In single-target mode, bytes flow directly from source to target with no interme
 
 ## Tuning
 
-`ocync` auto-discovers registry capacity through [AIMD](../design/overview#adaptive-concurrency-aimd) feedback. Manual tuning is rarely needed. The key settings (see [configuration](../configuration) for full reference):
+`ocync` auto-discovers registry capacity through [AIMD](/design/overview#adaptive-concurrency-aimd) feedback. Manual tuning is rarely needed. The key settings (see [configuration](/configuration) for full reference):
 
 - **Concurrency**: starts conservatively and ramps up. Each registry action has its own window. Override with `global.max_concurrent_transfers` or per-registry `max_concurrent`.
 - **Platform filter**: sync only the architectures you deploy. `linux/amd64` alone halves transfer volume for multi-arch images.

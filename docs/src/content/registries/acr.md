@@ -13,7 +13,7 @@ ocync auto-detects ACR (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`) and auth
 3. Managed Identity (`IDENTITY_ENDPOINT` / `IDENTITY_HEADER`; AKS pod-managed identity, App Service, Functions)
 4. Azure CLI (`az login`; developer machines)
 
-See the [Azure DefaultAzureCredential docs](https://learn.microsoft.com/azure/developer/intro/authentication-overview#defaultazurecredential) for credential precedence.
+See the [Azure DefaultAzureCredential docs](https://learn.microsoft.com/en-us/dotnet/azure/sdk/authentication/credential-chains) for credential precedence.
 
 Notable behaviors:
 
@@ -79,4 +79,4 @@ workloadIdentity:
 
 For sovereign clouds, the AAD authority is selected automatically from the registry hostname suffix; the chart values are unchanged. Configuring the AAD app, federated identity credential, and ACR `AcrPull` role assignment is the user's IAM/AAD work; see [Azure Workload Identity docs](https://azure.github.io/azure-workload-identity/docs/).
 
-For other secret-injection patterns, see [Kubernetes secret patterns](./secrets).
+For other secret-injection patterns, see [Kubernetes secret patterns](/registries/secrets).

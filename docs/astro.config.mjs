@@ -3,17 +3,22 @@ import sitemap from "@astrojs/sitemap";
 import rehypeSlug from "rehype-slug";
 import rehypeAutolinkHeadings from "rehype-autolink-headings";
 import rehypeExternalLinks from "rehype-external-links";
+import { rewriteInternalLinks } from "./plugins/rewrite-internal-links.mjs";
 import ocyncLight from "./src/themes/ocync-light.json";
 import ocyncDark from "./src/themes/ocync-dark.json";
 
 const isProd = process.env.NODE_ENV === "production";
+const base = isProd ? "/ocync/" : "/";
 
 export default defineConfig({
   site: "https://clowdhaus.github.io",
-  base: isProd ? "/ocync/" : "/",
+  base,
   trailingSlash: "never",
   integrations: [sitemap()],
   markdown: {
+    remarkPlugins: [
+      [rewriteInternalLinks, { base }],
+    ],
     rehypePlugins: [
       rehypeSlug,
       [rehypeAutolinkHeadings, {

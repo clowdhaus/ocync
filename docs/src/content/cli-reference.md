@@ -93,7 +93,7 @@ ocync watch -c config.yaml --interval 600 --health-port 8080
 | `--health-port` | `8080` | Port for `/healthz` and `/readyz` endpoints |
 | `--json` | | Output sync reports as JSON |
 
-See [observability](../observability) for health endpoint details.
+See [observability](/observability) for health endpoint details.
 
 ## analyze
 
