@@ -92,4 +92,4 @@ kubectl create secret generic ocync-credentials \
   --from-literal=GITHUB_TOKEN="$(gh auth token)"
 ```
 
-For PAT rotation via External Secrets Operator or CSI Secrets Store, see [Kubernetes secret patterns](./secrets).
+For PAT rotation via External Secrets Operator or CSI Secrets Store, see [Kubernetes secret patterns](/registries/secrets).

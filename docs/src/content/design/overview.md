@@ -47,15 +47,15 @@ The naive approach -- discover all images, plan all transfers, execute all trans
                      +-------------------------------------------------+
 ```
 
-The `select!` loop uses `biased;` to prefer execution completions over new discovery results, maximizing throughput. Execution begins after ~1 second of discovery instead of waiting for all images to be enumerated. See [pipeline architecture in the engine doc](./engine#pipeline-architecture) for select loop discipline and backpressure details.
+The `select!` loop uses `biased;` to prefer execution completions over new discovery results, maximizing throughput. Execution begins after ~1 second of discovery instead of waiting for all images to be enumerated. See [pipeline architecture in the engine doc](/design/engine#pipeline-architecture) for select loop discipline and backpressure details.
 
 ### Progressive cache population
 
-Early transfers teach the cache about blob locations. Later images benefit from accumulated knowledge -- the pipeline saves hundreds of API calls compared to plan-then-execute by populating the cache as work proceeds. See [progressive cache population in the engine doc](./engine#progressive-cache-population-amplified-by-pipelining) for scale examples.
+Early transfers teach the cache about blob locations. Later images benefit from accumulated knowledge -- the pipeline saves hundreds of API calls compared to plan-then-execute by populating the cache as work proceeds. See [progressive cache population in the engine doc](/design/engine#progressive-cache-population-amplified-by-pipelining) for scale examples.
 
 ### Frequency ordering
 
-Within each image, blobs are transferred in descending order of reference count across all discovered images. On crash or interruption, the most-shared blobs have been pushed first, providing maximum mount opportunities for the next run. See [frequency ordering in the engine doc](./engine#frequency-ordering) for details.
+Within each image, blobs are transferred in descending order of reference count across all discovered images. On crash or interruption, the most-shared blobs have been pushed first, providing maximum mount opportunities for the next run. See [frequency ordering in the engine doc](/design/engine#frequency-ordering) for details.
 
 ## Adaptive concurrency (AIMD)
 
@@ -65,7 +65,7 @@ Static concurrency limits force operators to guess at registry capacity. Too low
 - **On 429:** `window /= 2` (multiplicative decrease, once per congestion epoch)
 - **Cap:** `max_concurrent` per registry (default 50)
 
-If the registry throttles at 30 concurrent, the controller oscillates between ~15 and ~30 (the classic AIMD sawtooth), settling to an effective average of ~22.5. See [AIMD formula in the engine doc](./engine#aimd-formula) for the full derivation.
+If the registry throttles at 30 concurrent, the controller oscillates between ~15 and ~30 (the classic AIMD sawtooth), settling to an effective average of ~22.5. See [AIMD formula in the engine doc](/design/engine#aimd-formula) for the full derivation.
 
 ### Why per-action, not per-host
 
@@ -80,7 +80,7 @@ ECR rate limits vary dramatically by API action:
 
 A 429 on `PutImage` must not throttle `UploadLayerPart`. Per-action windows ensure each adapts independently.
 
-Window grouping is registry-specific and matches each provider's actual rate-limit granularity: ECR private (9 windows, one per API action); ECR Public (5 windows, read paths share, write paths split); Docker Hub (3 windows, HEAD unmetered, manifest-read quota'd, rest shared); GAR / GCR (1 shared per-project window); GHCR (1 shared window, since GitHub enforces a single aggregate cap across reads and writes); ACR (2 windows, ReadOps and WriteOps); unknown (5-window coarse grouping). Congestion epochs prevent catastrophic window collapse when multiple 429s arrive simultaneously (TCP Reno's approach -- halve once per epoch, not once per response). Concurrency is controlled at four levels -- global image semaphore, per-registry aggregate semaphore, per-action AIMD windows, and an opt-in per-window token bucket for documented caps. See [per-registry window groupings](./engine#per-registry-window-groupings), [congestion epochs](./engine#congestion-epochs), and [four-level hierarchy](./engine#four-level-hierarchy) in the engine doc.
+Window grouping is registry-specific and matches each provider's actual rate-limit granularity: ECR private (9 windows, one per API action); ECR Public (5 windows, read paths share, write paths split); Docker Hub (3 windows, HEAD unmetered, manifest-read quota'd, rest shared); GAR / GCR (1 shared per-project window); GHCR (1 shared window, since GitHub enforces a single aggregate cap across reads and writes); ACR (2 windows, ReadOps and WriteOps); unknown (5-window coarse grouping). Congestion epochs prevent catastrophic window collapse when multiple 429s arrive simultaneously (TCP Reno's approach -- halve once per epoch, not once per response). Concurrency is controlled at four levels -- global image semaphore, per-registry aggregate semaphore, per-action AIMD windows, and an opt-in per-window token bucket for documented caps. See [per-registry window groupings](/design/engine#per-registry-window-groupings), [congestion epochs](/design/engine#congestion-epochs), and [four-level hierarchy](/design/engine#four-level-hierarchy) in the engine doc.
 
 ### Token-bucket layer for documented caps
 
@@ -88,21 +88,21 @@ AIMD discovers a healthy concurrency level via 429 feedback but cannot bound TPS
 
 ## Cross-repo blob mounting
 
-When a blob already exists in another repository on the same target registry, OCI registries can "mount" it -- zero bytes over the wire. `ocync` maximizes mount success through leader-follower election and per-blob synchronization. See [cross-repo blob mounting in the engine doc](./engine#cross-repo-blob-mounting) for the full implementation.
+When a blob already exists in another repository on the same target registry, OCI registries can "mount" it -- zero bytes over the wire. `ocync` maximizes mount success through leader-follower election and per-blob synchronization. See [cross-repo blob mounting in the engine doc](/design/engine#cross-repo-blob-mounting) for the full implementation.
 
 ### Leader-follower election
 
-Multiple images in a sync run often share base layers. If all images push independently, shared blobs are uploaded N times. `ocync` uses leader-follower election via a greedy set-cover algorithm (`elect_leaders()`) to ensure shared blobs are uploaded once by leaders and mounted everywhere else by followers. The algorithm provably covers every shared blob -- there is no "uncovered follower" path. See [leader-follower election in the engine doc](./engine#leader-follower-election) for the algorithm details.
+Multiple images in a sync run often share base layers. If all images push independently, shared blobs are uploaded N times. `ocync` uses leader-follower election via a greedy set-cover algorithm (`elect_leaders()`) to ensure shared blobs are uploaded once by leaders and mounted everywhere else by followers. The algorithm provably covers every shared blob -- there is no "uncovered follower" path. See [leader-follower election in the engine doc](/design/engine#leader-follower-election) for the algorithm details.
 
 ### Progressive promotion
 
-Followers cannot mount from a leader until the leader's manifest is committed. All tasks are promoted simultaneously after discovery, with leaders ordered first so they acquire semaphore permits and claim blob uploads before followers. Followers that need a blob still in-flight wait on per-blob `Notify` handles via `ClaimAction::Wait`. Mount sources are restricted to repos with committed manifests, ensuring mount attempts only target repos that can fulfill them. See [progressive promotion in the engine doc](./engine#progressive-promotion) for details.
+Followers cannot mount from a leader until the leader's manifest is committed. All tasks are promoted simultaneously after discovery, with leaders ordered first so they acquire semaphore permits and claim blob uploads before followers. Followers that need a blob still in-flight wait on per-blob `Notify` handles via `ClaimAction::Wait`. Mount sources are restricted to repos with committed manifests, ensuring mount attempts only target repos that can fulfill them. See [progressive promotion in the engine doc](/design/engine#progressive-promotion) for details.
 
 ### ECR BLOB_MOUNTING
 
-ECR requires an opt-in account setting (`BLOB_MOUNTING=ENABLED`, launched January 2026) for cross-repo mount to succeed. Mount POST returns 201 when the `from` repo has a committed manifest, both repos use identical encryption, and both are in the same account and region. Without `BLOB_MOUNTING` enabled, ECR returns 202 and starts a regular upload; `ocync` detects this and falls through to the standard upload path. See [ECR blob mounting in the engine doc](./engine#ecr-blob-mounting) for full requirements.
+ECR requires an opt-in account setting (`BLOB_MOUNTING=ENABLED`, launched January 2026) for cross-repo mount to succeed. Mount POST returns 201 when the `from` repo has a committed manifest, both repos use identical encryption, and both are in the same account and region. Without `BLOB_MOUNTING` enabled, ECR returns 202 and starts a regular upload; `ocync` detects this and falls through to the standard upload path. See [ECR blob mounting in the engine doc](/design/engine#ecr-blob-mounting) for full requirements.
 
-In testing (5-image Jupyter corpus, cold sync to ECR), leader-follower election reduced requests by 44%, response bytes by 57%, and improved wall clock by 3.8x with 100% mount success. See [measured impact in the engine doc](./engine#measured-impact) for the full breakdown.
+In testing (5-image Jupyter corpus, cold sync to ECR), leader-follower election reduced requests by 44%, response bytes by 57%, and improved wall clock by 3.8x with 100% mount success. See [measured impact in the engine doc](/design/engine#measured-impact) for the full breakdown.
 
 ## Transfer state cache
 
@@ -112,11 +112,11 @@ The cache eliminates redundant API calls by recording what is known about blob l
 
 **Tier 2 - warm cache (persistent disk).** Serialized on sync completion using binary format (~1 MB at typical scale). Only confirmed states are persisted. The warm cache enables CronJob deployments to skip HEAD checks for known blobs on every run.
 
-Stale entries self-heal via lazy invalidation: failed mounts or pushes invalidate the entry and fall back to fresh HEAD checks. See [transfer state cache in the engine doc](./engine#transfer-state-cache) for persistence rules, corruption detection, cold start behavior, and [lazy invalidation](./engine#lazy-invalidation).
+Stale entries self-heal via lazy invalidation: failed mounts or pushes invalidate the entry and fall back to fresh HEAD checks. See [transfer state cache in the engine doc](/design/engine#transfer-state-cache) for persistence rules, corruption detection, cold start behavior, and [lazy invalidation](/design/engine#lazy-invalidation).
 
 ## Streaming transfers
 
-For single-target mappings, bytes stream directly from source to target with no disk I/O -- two HTTP requests per blob (POST + streaming PUT), memory bounded by chunk size. For multi-target mappings (e.g., us-ecr + eu-ecr + ap-ecr), `ocync` pulls each source blob once and writes it to a content-addressable disk file; all target pushes read from disk independently, with recently-written data served from OS page cache at memory speed. Single-target deployments pay zero staging overhead. See [streaming transfers and staging](./engine#streaming-transfers-and-staging) and [upload strategy per registry](./engine#upload-strategy-per-registry) in the engine doc.
+For single-target mappings, bytes stream directly from source to target with no disk I/O -- two HTTP requests per blob (POST + streaming PUT), memory bounded by chunk size. For multi-target mappings (e.g., us-ecr + eu-ecr + ap-ecr), `ocync` pulls each source blob once and writes it to a content-addressable disk file; all target pushes read from disk independently, with recently-written data served from OS page cache at memory speed. Single-target deployments pay zero staging overhead. See [streaming transfers and staging](/design/engine#streaming-transfers-and-staging) and [upload strategy per registry](/design/engine#upload-strategy-per-registry) in the engine doc.
 
 ## Deployment model
 
@@ -128,7 +128,7 @@ For large sync runs (hundreds of images, multi-GB layers), increase memory to `5
 
 ### Graceful shutdown
 
-On SIGTERM or SIGINT, the engine stops accepting new work, drains in-flight transfers with a 25-second deadline (fitting Kubernetes' default 30s `terminationGracePeriodSeconds`), and persists the transfer state cache to disk. See [graceful shutdown in the engine doc](./engine#graceful-shutdown) for the full 5-step sequence.
+On SIGTERM or SIGINT, the engine stops accepting new work, drains in-flight transfers with a 25-second deadline (fitting Kubernetes' default 30s `terminationGracePeriodSeconds`), and persists the transfer state cache to disk. See [graceful shutdown in the engine doc](/design/engine#graceful-shutdown) for the full 5-step sequence.
 
 ### Deployment modes
 

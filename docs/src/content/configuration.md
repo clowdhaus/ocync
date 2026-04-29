@@ -129,7 +129,7 @@ registries:
 
 Auto-detected from hostname. ECR (private and Public), GAR, GCR, and ACR each route to a dedicated native-auth provider. GHCR, Docker Hub, Chainguard, and any unrecognized hostname share the same fallback path: `docker_config` first (using `~/.docker/config.json` or `$DOCKER_CONFIG/config.json`), then anonymous if no entry is found. Set `auth_type` explicitly to override detection.
 
-See the [registry guides](../registries/ecr) for provider-specific auth details.
+See the [registry guides](/registries/ecr) for provider-specific auth details.
 
 ## Target groups
 
@@ -359,7 +359,7 @@ mappings:
 
 ## JSON schema
 
-A [JSON schema](/ocync/config.schema.json) is available for editor autocompletion and validation. Add the schema comment to the top of your config file:
+A [JSON schema](/config.schema.json) is available for editor autocompletion and validation. Add the schema comment to the top of your config file:
 
 ```yaml
 # yaml-language-server: $schema=https://clowdhaus.github.io/ocync/config.schema.json
@@ -383,7 +383,7 @@ mappings:
 
 This works with any editor that supports the [YAML Language Server](https://github.com/redhat-developer/yaml-language-server) (VS Code with the YAML extension, Neovim with `yaml-language-server`, JetBrains IDEs).
 
-The schema is generated from the Rust config types and verified in CI to stay in sync. View the full schema at [`/ocync/config.schema.json`](/ocync/config.schema.json).
+The schema is generated from the Rust config types and verified in CI to stay in sync. View the full schema at [`/ocync/config.schema.json`](/config.schema.json).
 
 ## Validation
 

@@ -18,7 +18,7 @@ No Docker config or static credentials are needed. See the [AWS credential prece
 Notable behaviors:
 
 - HTTP Basic, not Bearer exchange. SDK `GetAuthorizationToken` returns a base64-encoded `AWS:<password>` blob that the registry accepts directly; ocync sends `Authorization: Basic <token>` and skips the `/v2/token` round-trip.
-- FIPS endpoints: set `AWS_USE_FIPS_ENDPOINT=true` to route SDK calls through `*.dkr.ecr-fips.<region>.amazonaws.com`. See the [FIPS guide](../../fips) for crypto provider details.
+- FIPS endpoints: set `AWS_USE_FIPS_ENDPOINT=true` to route SDK calls through `*.dkr.ecr-fips.<region>.amazonaws.com`. See the [FIPS guide](/fips) for crypto provider details.
 - Cross-repo blob mounting requires `BLOB_MOUNTING=ENABLED` on the account *and* a committed manifest in the source repo that references the specific blob. Enable per-account: `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`. Mount POSTs returning 202 (not yet fulfilled) fall back to a normal upload.
 - Batch existence checks use `BatchCheckLayerAvailability` (up to 100 digests per call) instead of per-blob HEADs, reducing API volume on cold syncs.
 - Per-action rate limits: ECR enforces independent quotas per API action (`UploadLayerPart` 500 TPS, `InitiateLayerUpload` / `CompleteLayerUpload` 100 TPS, `PutImage` 10 TPS). ocync tracks 9 separate AIMD windows so a 429 on uploads does not throttle manifest reads.
@@ -123,7 +123,7 @@ env:
     value: "true"
 ```
 
-For other secret-injection patterns (External Secrets Operator, CSI Secrets Store), see [Kubernetes secrets](./secrets).
+For other secret-injection patterns (External Secrets Operator, CSI Secrets Store), see [Kubernetes secrets](/registries/secrets).
 
 ## Multi-account access
 
@@ -221,4 +221,4 @@ aws_secret_access_key = ...
 
 The AWS SDK reads the file from `~/.aws/credentials` by default, or from the path in `AWS_SHARED_CREDENTIALS_FILE`. The file does not need a `[default]` section — the ambient chain skips the file entirely when no profile is named, so Pod Identity / IRSA still serves `my-source`.
 
-For Kubernetes deployments, see the AWS shared-config files section of [Kubernetes secrets](./secrets) for two production-grade injection patterns (External Secrets Operator and CSI Secrets Store).
+For Kubernetes deployments, see the AWS shared-config files section of [Kubernetes secrets](/registries/secrets) for two production-grade injection patterns (External Secrets Operator and CSI Secrets Store).

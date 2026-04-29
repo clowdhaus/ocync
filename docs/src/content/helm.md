@@ -78,7 +78,7 @@ watch:
   healthPort: 8080
 ```
 
-Exposes `/healthz` (liveness) and `/readyz` (readiness) endpoints. See [observability](../observability) for logging configuration.
+Exposes `/healthz` (liveness) and `/readyz` (readiness) endpoints. See [observability](/observability) for logging configuration.
 
 ## Job mode
 

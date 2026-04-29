@@ -152,7 +152,7 @@ EKS Pod Identity is *not* represented in `workloadIdentity` because it is config
 
 ## AWS shared-config files
 
-Use this pattern when one ECR registry needs credentials distinct from the ambient chain (see [ECR per-registry profile](./ecr#per-registry-static-credentials-third-party-access)). The `aws_profile` config field reads from a credentials file mounted at the path in `AWS_SHARED_CREDENTIALS_FILE`; this section covers two production-grade ways to populate that file.
+Use this pattern when one ECR registry needs credentials distinct from the ambient chain (see [ECR per-registry profile](/registries/ecr#per-registry-static-credentials-third-party-access)). The `aws_profile` config field reads from a credentials file mounted at the path in `AWS_SHARED_CREDENTIALS_FILE`; this section covers two production-grade ways to populate that file.
 
 The recommended secret-store layout is to store the entire INI blob -- including the `[profile-name]` header -- as a single string value at one key. This keeps the chart values minimal and avoids per-field templating.
 

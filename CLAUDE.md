@@ -9,6 +9,7 @@ Each crate has its own CLAUDE.md with targeted context:
 - `crates/ocync-distribution/CLAUDE.md` - auth protocols, AIMD, registry detection, upload quirks, testing (wiremock/testcontainers)
 - `crates/ocync-sync/CLAUDE.md` - concurrency model, RefCell rules, notify contracts, leader-follower, engine architecture, testing
 - `bench/CLAUDE.md` - benchmark infrastructure, bench-proxy, competitor config gotchas, instance ops
+- `docs/CLAUDE.md` - cross-page link convention, build-time link plugin, GH Pages trailing-slash bug class, link-verification approach
 
 ## Design priorities
 

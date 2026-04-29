@@ -132,7 +132,7 @@ kubectl create secret generic ocync-credentials \
   --from-literal=GITHUB_TOKEN="$(gh auth token)"
 ```
 
-For credential rotation -- pulling the pull-token out of AWS Secrets Manager / GCP Secret Manager / Azure Key Vault / Vault and refreshing it on a schedule -- use the External Secrets Operator or CSI Secrets Store patterns documented in [Kubernetes secret patterns](./secrets); the `auth_type: basic` configuration above stays unchanged, only the source of `CHAINGUARD_USERNAME` / `CHAINGUARD_PASSWORD` changes.
+For credential rotation -- pulling the pull-token out of AWS Secrets Manager / GCP Secret Manager / Azure Key Vault / Vault and refreshing it on a schedule -- use the External Secrets Operator or CSI Secrets Store patterns documented in [Kubernetes secret patterns](/registries/secrets); the `auth_type: basic` configuration above stays unchanged, only the source of `CHAINGUARD_USERNAME` / `CHAINGUARD_PASSWORD` changes.
 
 ### Docker config volume
 

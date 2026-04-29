@@ -102,4 +102,4 @@ kubectl create secret generic ocync-credentials \
   --from-literal=DOCKER_PASSWORD="$(cat ~/dockerhub-pat)"
 ```
 
-For ExternalSecrets-managed credentials or CSI-mounted secret stores, see [Kubernetes secret patterns](./secrets).
+For ExternalSecrets-managed credentials or CSI-mounted secret stores, see [Kubernetes secret patterns](/registries/secrets).

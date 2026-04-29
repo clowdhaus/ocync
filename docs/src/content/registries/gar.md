@@ -95,4 +95,4 @@ extraVolumeMounts:
     readOnly: true
 ```
 
-For ExternalSecrets-managed key files or CSI Secrets Store, see [Kubernetes secret patterns](./secrets).
+For ExternalSecrets-managed key files or CSI Secrets Store, see [Kubernetes secret patterns](/registries/secrets).

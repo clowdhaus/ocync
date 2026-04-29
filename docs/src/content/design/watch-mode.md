@@ -176,7 +176,7 @@ For CronJob + PVC deployments, the pod mounts a ReadWriteOnce PVC and the cache 
 
 ### Cache format versioning
 
-The tag digest cache extends the existing [transfer state cache](./engine#transfer-state-cache) format. The cache version will increment from v1 to v2 when the source snapshot map is added, with the new source snapshot map appended after the existing blob dedup map. Reads accept both v1 and v2: a v1 cache loads with an empty snapshot map, preserving blob dedup data across the version transition. An older binary encountering a v2 cache falls back to empty cache, which is the existing behavior for version mismatches. The same TTL and atomic write (tmp + rename + fsync) apply to both sections.
+The tag digest cache extends the existing [transfer state cache](/design/engine#transfer-state-cache) format. The cache version will increment from v1 to v2 when the source snapshot map is added, with the new source snapshot map appended after the existing blob dedup map. Reads accept both v1 and v2: a v1 cache loads with an empty snapshot map, preserving blob dedup data across the version transition. An older binary encountering a v2 cache falls back to empty cache, which is the existing behavior for version mismatches. The same TTL and atomic write (tmp + rename + fsync) apply to both sections.
 
 ### Observability
 
