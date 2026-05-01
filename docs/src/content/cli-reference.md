@@ -91,6 +91,7 @@ ocync watch -c config.yaml --interval 600 --health-port 8080
 | `-c`, `--config` | (required) | Path to sync config file |
 | `--interval` | `300` | Seconds between sync runs (minimum: 1) |
 | `--health-port` | `8080` | Port for `/healthz` and `/readyz` endpoints |
+| `--health-bind` | `127.0.0.1` | IP for the health endpoint to bind on. Set to `0.0.0.0` for container hosts where probes originate externally. The Helm chart sets this automatically in `watch` mode |
 | `--json` | | Output sync reports as JSON |
 
 See [observability](/observability) for health endpoint details.

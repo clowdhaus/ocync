@@ -9,50 +9,52 @@ templates:
   - job.yaml
 
 tests:
-  - it: watch mode renders container args [watch, --config, ..., --interval, --health-port]
+  - it: watch mode renders the full container args list (regression guard for #77)
+    # Asserts the exact ordered args. Substring `contains` would pass if
+    # --health-bind drifted away from its 0.0.0.0 value or if any flag/value
+    # pair separated; full-list equality catches both. Probes target the pod
+    # IP and the binary defaults to 127.0.0.1, so --health-bind 0.0.0.0 is
+    # load-bearing and must stay paired.
     set:
       mode: watch
     template: deployment.yaml
     asserts:
       - equal:
-          path: spec.template.spec.containers[0].args[0]
-          value: watch
-      - equal:
-          path: spec.template.spec.containers[0].args[1]
-          value: --config
-      - contains:
           path: spec.template.spec.containers[0].args
-          content: --interval
-      - contains:
-          path: spec.template.spec.containers[0].args
-          content: --health-port
+          value:
+            - watch
+            - --config
+            - /etc/ocync/config.yaml
+            - --interval
+            - "300"
+            - --health-port
+            - "8080"
+            - --health-bind
+            - 0.0.0.0
 
-  - it: cronjob mode renders container args [sync, --config, ...]
+  - it: cronjob mode renders the full container args list
     set:
       mode: cronjob
     template: cronjob.yaml
     asserts:
       - equal:
-          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
-          value: sync
-      - notContains:
           path: spec.jobTemplate.spec.template.spec.containers[0].args
-          content: watch
-      - notContains:
-          path: spec.jobTemplate.spec.template.spec.containers[0].args
-          content: --interval
+          value:
+            - sync
+            - --config
+            - /etc/ocync/config.yaml
 
-  - it: job mode renders container args [sync, --config, ...]
+  - it: job mode renders the full container args list
     set:
       mode: job
     template: job.yaml
     asserts:
       - equal:
-          path: spec.template.spec.containers[0].args[0]
-          value: sync
-      - notContains:
           path: spec.template.spec.containers[0].args
-          content: watch
+          value:
+            - sync
+            - --config
+            - /etc/ocync/config.yaml
 
   - it: watch mode has health port and probes
     set:

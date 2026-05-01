@@ -98,4 +98,6 @@ watch:
   healthPort: 8080
 ```
 
+The Helm chart binds the health server to `0.0.0.0` so kubelet probes (which target the pod IP) succeed without user override. Clusters with non-IPv4 pod networking need to pass an appropriate bind address via `extraArgs`.
+
 See [CLI reference](/cli-reference#watch) for all `watch` flags including `--interval` and `--json`.
