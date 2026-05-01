@@ -1,13 +1,13 @@
 name: Docker
 
+# Always triggers on every PR so the Build job reports a status. Step-level
+# `if` guards skip the actual work when no Dockerfile-relevant files changed,
+# letting the job report success without doing real work. This pattern lets
+# the job be named in branch protection without blocking unrelated PRs --
+# top-level `paths:` filters do not compose with required status checks.
+
 on:
   pull_request:
-    paths:
-      - "Dockerfile"
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - ".github/workflows/docker.yml"
 
 permissions:
   contents: read
@@ -17,9 +17,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build
+  changes:
+    name: Detect changes
     runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: docker build .
+      - id: filter
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        with:
+          filters: |
+            docker:
+              - 'Dockerfile'
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '.github/workflows/docker.yml'
+
+  build:
+    name: Build
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - if: needs.changes.outputs.docker == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: needs.changes.outputs.docker == 'true'
+        run: docker build .

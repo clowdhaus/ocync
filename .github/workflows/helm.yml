@@ -1,10 +1,13 @@
 name: Helm
 
+# Always triggers on every PR so the Lint job reports a status. Step-level
+# `if` guards skip the actual work when no chart files changed, letting the
+# job report success without doing real work. This pattern lets the job be
+# named in branch protection without blocking Rust-only or doc-only PRs --
+# top-level `paths:` filters do not compose with required status checks.
+
 on:
   pull_request:
-    paths:
-      - "charts/**"
-      - ".github/workflows/helm.yml"
 
 permissions:
   contents: read
@@ -14,16 +17,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    name: Lint
+  changes:
+    name: Detect changes
     runs-on: ubuntu-latest
+    outputs:
+      helm: ${{ steps.filter.outputs.helm }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: helm lint charts/ocync
-      - run: helm template ocync charts/ocync
+      - id: filter
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        with:
+          filters: |
+            helm:
+              - 'charts/**'
+              - '.github/workflows/helm.yml'
+
+  lint:
+    name: Lint
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - if: needs.changes.outputs.helm == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: needs.changes.outputs.helm == 'true'
+        run: helm lint charts/ocync
+      - if: needs.changes.outputs.helm == 'true'
+        run: helm template ocync charts/ocync
       - name: Install helm-unittest
         # helm-unittest is a helm plugin (not a standalone binary). `helm plugin
         # install --version <ref>` selects a specific git tag of the plugin repo.
+        if: needs.changes.outputs.helm == 'true'
         env:
           HELM_UNITTEST_VERSION: v1.0.3
         run: |
@@ -36,11 +59,13 @@ jobs:
         # Tier 2 conditional rendering, workloadIdentity per-provider, watch-
         # vs-cronjob-vs-job pod spec). New tests in charts/ocync/tests/*.yaml
         # are picked up automatically.
+        if: needs.changes.outputs.helm == 'true'
         run: helm unittest charts/ocync
       - name: Install helm-docs
         # Pinned binary + sha256. helm-docs reads `# --` comments in values.yaml
         # and regenerates the chart README. CI verifies the committed README
         # matches what helm-docs would generate.
+        if: needs.changes.outputs.helm == 'true'
         env:
           HELM_DOCS_VERSION: v1.14.2
           HELM_DOCS_SHA256: a8cf72ada34fad93285ba2a452b38bdc5bd52cc9a571236244ec31022928d6cc
@@ -56,6 +81,7 @@ jobs:
         # If a contributor changed values.yaml without regenerating README.md,
         # this step fails with a diff. Regenerate locally with:
         #   helm-docs --chart-search-root charts
+        if: needs.changes.outputs.helm == 'true'
         run: |
           set -euo pipefail
           helm-docs --chart-search-root charts
@@ -67,6 +93,7 @@ jobs:
         # Pinned binary + sha256 verification. kubeconform validates against
         # bundled JSON schemas offline - kubectl apply --dry-run=client requires
         # API discovery from a live cluster, which we don't have in CI.
+        if: needs.changes.outputs.helm == 'true'
         env:
           KUBECONFORM_VERSION: v0.6.7
           KUBECONFORM_SHA256: 95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73
@@ -84,6 +111,7 @@ jobs:
         # picked up automatically. -ignore-missing-schemas accepts CRDs whose
         # schemas are not bundled (added in later steps: ExternalSecret,
         # SecretProviderClass); -strict rejects unknown fields on core types.
+        if: needs.changes.outputs.helm == 'true'
         run: |
           set -euo pipefail
           shopt -s nullglob

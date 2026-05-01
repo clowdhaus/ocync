@@ -1,16 +1,13 @@
 name: CI
 
+# Always triggers on every PR so each job reports a status. Step-level `if`
+# guards skip the actual work when no Rust files changed, letting the job
+# report success without doing real work. This pattern lets these jobs be
+# named in branch protection without blocking chart-only or doc-only PRs --
+# top-level `paths:` filters do not compose with required status checks.
+
 on:
   pull_request:
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - ".github/workflows/ci.yml"
-      - ".github/actions/setup-rust/**"
-      - "clippy.toml"
-      - "rustfmt.toml"
-      - "deny.toml"
 
 permissions:
   contents: read
@@ -24,39 +21,73 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  format:
-    name: Format
+  changes:
+    name: Detect changes
     runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: ./.github/actions/setup-rust
+      - id: filter
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'clippy.toml'
+              - 'rustfmt.toml'
+              - 'deny.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/setup-rust/**'
+
+  format:
+    name: Format
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - if: needs.changes.outputs.rust == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: ./.github/actions/setup-rust
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo fmt --all -- --check
 
   lint:
     name: Lint
+    needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: ./.github/actions/setup-rust
+      - if: needs.changes.outputs.rust == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: ./.github/actions/setup-rust
         with:
           components: clippy
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.runner }})
+    needs: changes
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: ./.github/actions/setup-rust
-      - run: cargo test --workspace --locked
+      - if: needs.changes.outputs.rust == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: ./.github/actions/setup-rust
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo test --workspace --locked
 
   build:
     name: Build (${{ matrix.target }})
+    needs: changes
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -66,27 +97,38 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: ./.github/actions/setup-rust
+      - if: needs.changes.outputs.rust == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: ./.github/actions/setup-rust
       - name: Build release binary
+        if: needs.changes.outputs.rust == 'true'
         run: cargo build --release --locked
         env:
           CARGO_BUILD_RUSTFLAGS: "-C target-feature=+crt-static"
           CARGO_BUILD_TARGET: ${{ matrix.target }}
       - name: Verify static binary
+        if: needs.changes.outputs.rust == 'true'
         run: "! readelf -d target/${{ matrix.target }}/release/ocync | grep -q NEEDED"
 
   check-non-fips:
     name: Check (non-fips)
+    needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: ./.github/actions/setup-rust
-      - run: cargo check --locked --no-default-features --features non-fips
+      - if: needs.changes.outputs.rust == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: ./.github/actions/setup-rust
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo check --locked --no-default-features --features non-fips
 
   deny:
     name: Deny
+    needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2.0.17
+      - if: needs.changes.outputs.rust == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2.0.17
