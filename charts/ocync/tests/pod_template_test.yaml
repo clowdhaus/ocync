@@ -9,12 +9,7 @@ templates:
   - job.yaml
 
 tests:
-  - it: watch mode renders the full container args list (regression guard for #77)
-    # Asserts the exact ordered args. Substring `contains` would pass if
-    # --health-bind drifted away from its 0.0.0.0 value or if any flag/value
-    # pair separated; full-list equality catches both. Probes target the pod
-    # IP and the binary defaults to 127.0.0.1, so --health-bind 0.0.0.0 is
-    # load-bearing and must stay paired.
+  - it: watch mode renders the full container args list
     set:
       mode: watch
     template: deployment.yaml
@@ -30,7 +25,7 @@ tests:
             - --health-port
             - "8080"
             - --health-bind
-            - 0.0.0.0
+            - "0.0.0.0"
 
   - it: cronjob mode renders the full container args list
     set:
