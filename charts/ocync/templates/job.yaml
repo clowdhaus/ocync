@@ -5,6 +5,10 @@ metadata:
   name: {{ include "ocync.fullname" . }}
   labels:
     {{- include "ocync.labels" . | nindent 4 }}
+  {{- with .Values.jobAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   template:
     {{- include "ocync.podTemplate" . | nindent 4 }}
