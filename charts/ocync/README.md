@@ -26,10 +26,12 @@ See the [Helm chart documentation](https://clowdhaus.github.io/ocync/helm) and [
 |-----|------|---------|-------------|
 | affinity | object | See [values.yaml](./values.yaml) for the full instance-type list. | Pod affinity / anti-affinity. Defaults to preferring EC2 network-optimized instance types (`c5n` / `c6in` / `m5n` / `m6in` / `r5n` / `r6in` families, 25-200 Gbps). Soft preference -- pods schedule on any node if these are unavailable. Override with `affinity: {}` to disable. |
 | config | object | `{}` (you must supply registries, defaults, and mappings) | ocync configuration YAML, rendered into a ConfigMap mounted at `/etc/ocync/config.yaml`. `global.cache_dir` is auto-injected as `/tmp/ocync-cache` if not set, so the transfer state cache and blob staging area land in the writable `/tmp` emptyDir. |
+| cronJobAnnotations | object | `{}` | Annotations applied to the CronJob's `metadata.annotations` when `mode: cronjob`. Common uses: Helm lifecycle hooks (`helm.sh/hook`), Argo CD sync-wave / hook annotations, policy-controller selectors (Kyverno, Gatekeeper), cost-allocation tags. Pod-template annotations belong under `podAnnotations`. |
 | cronjob.concurrencyPolicy | string | `"Forbid"` | CronJob concurrency policy: `Allow` | `Forbid` | `Replace`. |
 | cronjob.failedJobsHistoryLimit | int | `3` | Number of failed CronJob runs to retain. |
 | cronjob.schedule | string | `"0 */6 * * *"` | Cron schedule expression (cronjob mode only). |
 | cronjob.successfulJobsHistoryLimit | int | `3` | Number of successful CronJob runs to retain. |
+| deploymentAnnotations | object | `{}` | Annotations applied to the Deployment's `metadata.annotations` when `mode: watch`. Use for controllers that key off workload-level metadata: Stakater Reloader (`reloader.stakater.com/auto`), Argo Rollouts notification subscriptions, etc. Pod-template annotations belong under `podAnnotations`. |
 | env | list | `[]` | Additional environment variables for the container. Set `AWS_USE_FIPS_ENDPOINT=true` to route ECR API calls through FIPS endpoints. |
 | envFrom | list | `[]` | envFrom sources (Secret/ConfigMap references). Use for token-based auth: DOCKER_PASSWORD, GITHUB_TOKEN, chainctl tokens. The referenced resource must already exist or be created alongside (e.g. via `externalSecrets`). |
 | externalSecrets.data | list | `[]` | Mapping of secret keys to remote references. Shape: `[{ secretKey, remoteRef: { key, property? } }]`. |
@@ -45,6 +47,7 @@ See the [Helm chart documentation](https://clowdhaus.github.io/ocync/helm) and [
 | image.repository | string | `"public.ecr.aws/clowdhaus/ocync"` | Container image repository. |
 | image.tag | string | `<chart-app-version>-fips` | Container image tag. |
 | imagePullSecrets | list | `[]` | Image pull secrets for the workload pods. |
+| jobAnnotations | object | `{}` | Annotations applied to the Job's `metadata.annotations` when `mode: job`. Common uses: Helm lifecycle hooks (`helm.sh/hook: post-install` etc.), Argo CD sync-wave / hook annotations on one-shot Jobs, policy-controller selectors. Pod-template annotations belong under `podAnnotations`. |
 | mode | string | `"watch"` | Deployment mode: `watch` (Deployment with sync interval), `cronjob` (CronJob), or `job` (one-shot Job). |
 | nameOverride | string | `""` | Override the chart name used in resource names and labels. |
 | nodeSelector | object | `{}` | Node selector for the pod. |

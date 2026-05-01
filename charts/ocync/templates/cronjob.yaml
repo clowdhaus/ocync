@@ -5,6 +5,10 @@ metadata:
   name: {{ include "ocync.fullname" . }}
   labels:
     {{- include "ocync.labels" . | nindent 4 }}
+  {{- with .Values.cronJobAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   schedule: {{ .Values.cronjob.schedule | quote }}
   successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}

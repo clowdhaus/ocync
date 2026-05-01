@@ -72,6 +72,24 @@ extraVolumeMounts: []
 # (`linkerd.io/inject`, `sidecar.istio.io/inject`).
 podAnnotations: {}
 
+# -- Annotations applied to the Deployment's `metadata.annotations` when
+# `mode: watch`. Use for controllers that key off workload-level metadata:
+# Stakater Reloader (`reloader.stakater.com/auto`), Argo Rollouts notification
+# subscriptions, etc. Pod-template annotations belong under `podAnnotations`.
+deploymentAnnotations: {}
+
+# -- Annotations applied to the CronJob's `metadata.annotations` when
+# `mode: cronjob`. Common uses: Helm lifecycle hooks (`helm.sh/hook`), Argo CD
+# sync-wave / hook annotations, policy-controller selectors (Kyverno, Gatekeeper),
+# cost-allocation tags. Pod-template annotations belong under `podAnnotations`.
+cronJobAnnotations: {}
+
+# -- Annotations applied to the Job's `metadata.annotations` when `mode: job`.
+# Common uses: Helm lifecycle hooks (`helm.sh/hook: post-install` etc.), Argo CD
+# sync-wave / hook annotations on one-shot Jobs, policy-controller selectors.
+# Pod-template annotations belong under `podAnnotations`.
+jobAnnotations: {}
+
 # -- Pod-level labels. Composed with `workloadIdentity.podLabels` (the chart sets
 # `azure.workload.identity/use: "true"` automatically when `workloadIdentity.provider` is `azure`).
 podLabels: {}

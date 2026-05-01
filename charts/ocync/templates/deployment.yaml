@@ -5,6 +5,10 @@ metadata:
   name: {{ include "ocync.fullname" . }}
   labels:
     {{- include "ocync.labels" . | nindent 4 }}
+  {{- with .Values.deploymentAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   replicas: 1
   selector:

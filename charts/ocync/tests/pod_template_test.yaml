@@ -143,3 +143,90 @@ tests:
       - notExists:
           path: spec.template.metadata.annotations
 
+  - it: deploymentAnnotations renders on the Deployment metadata (watch mode)
+    set:
+      mode: watch
+      deploymentAnnotations:
+        reloader.stakater.com/auto: "true"
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["reloader.stakater.com/auto"]
+          value: "true"
+      - notExists:
+          path: spec.template.metadata.annotations["reloader.stakater.com/auto"]
+
+  - it: cronJobAnnotations renders on the CronJob metadata (cronjob mode)
+    set:
+      mode: cronjob
+      cronJobAnnotations:
+        helm.sh/hook: post-install
+        argocd.argoproj.io/sync-wave: "5"
+    template: cronjob.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: post-install
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-wave"]
+          value: "5"
+
+  - it: jobAnnotations renders on the Job metadata (job mode)
+    set:
+      mode: job
+      jobAnnotations:
+        helm.sh/hook: post-install
+        helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    template: job.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: post-install
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation,hook-succeeded
+
+  - it: per-mode values do not cross-render (deploymentAnnotations ignored in cronjob mode)
+    set:
+      mode: cronjob
+      deploymentAnnotations:
+        should-not-appear: "true"
+    template: cronjob.yaml
+    asserts:
+      - notExists:
+          path: metadata.annotations
+
+  - it: per-mode values do not cross-render (jobAnnotations ignored in watch mode)
+    set:
+      mode: watch
+      jobAnnotations:
+        should-not-appear: "true"
+    template: deployment.yaml
+    asserts:
+      - notExists:
+          path: metadata.annotations
+
+  - it: deploymentAnnotations omitted produces no metadata.annotations on Deployment
+    set:
+      mode: watch
+    template: deployment.yaml
+    asserts:
+      - notExists:
+          path: metadata.annotations
+
+  - it: cronJobAnnotations omitted produces no metadata.annotations on CronJob
+    set:
+      mode: cronjob
+    template: cronjob.yaml
+    asserts:
+      - notExists:
+          path: metadata.annotations
+
+  - it: jobAnnotations omitted produces no metadata.annotations on Job
+    set:
+      mode: job
+    template: job.yaml
+    asserts:
+      - notExists:
+          path: metadata.annotations
+
