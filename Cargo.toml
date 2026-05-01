@@ -48,7 +48,7 @@ doc_markdown = "warn"
 
 [package]
 name = "ocync"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
