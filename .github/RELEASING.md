@@ -71,6 +71,12 @@ The workspace has one version, defined once at `[workspace.package].version` and
 
 If a library crate ever needs to publish independently, drop `version.workspace = true` from its `[package]`, set an explicit version, and remove `release = false` from its `[package.metadata.release]`.
 
+### Chart-only changes
+
+Chart-only fixes (templates, values, helpers — no Rust changes) ride with the next bundled release. Run `cargo release patch --execute` when the chart fix needs to ship; the binary gets rebuilt and re-tagged at the new version even though no Rust code changed. The Docker image is reproducible from `Cargo.lock`, so the new `<version>-fips` tag is identical bytes apart from the version stamp. There is no separate chart-only release path, by design — chart and binary versions stay locked so the chart's rendered flags always match a binary that recognizes them.
+
+If a chart bug ever genuinely cannot wait for the next bundled release and you don't want to consume a binary patch version, the escape hatch is a one-off `helm package charts/ocync` + `helm push` run by hand against ECR Public, with `--version` overriding `Chart.yaml`. That path is unsupported and bypasses the validate gate; prefer the bundled release.
+
 ## What you do NOT need to touch
 
 - `charts/ocync/values.yaml` `image.tag`. Left empty on purpose. The chart's `ocync.image` helper (`templates/_helpers.tpl`) defaults the tag to `<.Chart.AppVersion>-fips`, which now equals the bumped chart `appVersion`. Tag bump moves chart and image together.
