@@ -4,7 +4,9 @@ mode: watch
 image:
   # -- Container image repository.
   repository: public.ecr.aws/clowdhaus/ocync
-  # -- Container image tag.
+  # -- Container image tag. Overriding to a tag older than the chart's appVersion
+  # is not recommended: the chart may pass binary flags that older images do not
+  # recognize, causing the container to fail at startup.
   # @default -- `<chart-app-version>-fips`
   tag: ""
   # -- Image pull policy.
@@ -36,6 +38,9 @@ watch:
   interval: 300
   # -- Health check port (watch mode only). Exposed via Service and used by liveness/readiness probes.
   healthPort: 8080
+  # -- Health server bind address (watch mode only). Defaults to `0.0.0.0` so kubelet probes
+  # (which target the pod IP) succeed without override. Set to `::` for IPv6-only clusters.
+  healthBind: "0.0.0.0"
 
 cronjob:
   # -- Cron schedule expression (cronjob mode only).

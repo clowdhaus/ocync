@@ -80,6 +80,8 @@ watch:
 
 Exposes `/healthz` (liveness) and `/readyz` (readiness) endpoints. See [observability](/observability) for logging configuration.
 
+`watch.healthBind` defaults to `0.0.0.0` so kubelet probes (which target the pod IP) succeed without user override. Set `watch.healthBind: "::"` on IPv6-only clusters.
+
 ## Job mode
 
 ```yaml

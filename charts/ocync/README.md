@@ -45,7 +45,7 @@ See the [Helm chart documentation](https://clowdhaus.github.io/ocync/helm) and [
 | fullnameOverride | string | `""` | Override the fully-qualified release name (overrides `<release>-<chartname>`). |
 | image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
 | image.repository | string | `"public.ecr.aws/clowdhaus/ocync"` | Container image repository. |
-| image.tag | string | `<chart-app-version>-fips` | Container image tag. |
+| image.tag | string | `<chart-app-version>-fips` | Container image tag. Overriding to a tag older than the chart's appVersion is not recommended: the chart may pass binary flags that older images do not recognize, causing the container to fail at startup. |
 | imagePullSecrets | list | `[]` | Image pull secrets for the workload pods. |
 | jobAnnotations | object | `{}` | Annotations applied to the Job's `metadata.annotations` when `mode: job`. Common uses: Helm lifecycle hooks (`helm.sh/hook: post-install` etc.), Argo CD sync-wave / hook annotations on one-shot Jobs, policy-controller selectors. Pod-template annotations belong under `podAnnotations`. |
 | mode | string | `"watch"` | Deployment mode: `watch` (Deployment with sync interval), `cronjob` (CronJob), or `job` (one-shot Job). |
@@ -64,6 +64,7 @@ See the [Helm chart documentation](https://clowdhaus.github.io/ocync/helm) and [
 | serviceAccount.create | bool | `true` | Whether the chart should create a ServiceAccount for the workload. |
 | serviceAccount.name | string | `""` | Override the ServiceAccount name (defaults to the chart fullname). |
 | tolerations | list | `[]` | Tolerations for the pod. |
+| watch.healthBind | string | `"0.0.0.0"` | Health server bind address (watch mode only). Defaults to `0.0.0.0` so kubelet probes (which target the pod IP) succeed without override. Set to `::` for IPv6-only clusters. |
 | watch.healthPort | int | `8080` | Health check port (watch mode only). Exposed via Service and used by liveness/readiness probes. |
 | watch.interval | int | `300` | Sync interval in seconds (watch mode only). |
 | workloadIdentity.aws.roleArn | string | `""` | IAM role ARN to assume via IRSA. Sets `eks.amazonaws.com/role-arn` on the ServiceAccount. |

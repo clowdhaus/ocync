@@ -9,50 +9,74 @@ templates:
   - job.yaml
 
 tests:
-  - it: watch mode renders container args [watch, --config, ..., --interval, --health-port]
+  - it: watch mode renders the full container args list
     set:
       mode: watch
     template: deployment.yaml
     asserts:
       - equal:
-          path: spec.template.spec.containers[0].args[0]
-          value: watch
-      - equal:
-          path: spec.template.spec.containers[0].args[1]
-          value: --config
-      - contains:
           path: spec.template.spec.containers[0].args
-          content: --interval
-      - contains:
-          path: spec.template.spec.containers[0].args
-          content: --health-port
+          value:
+            - watch
+            - --config
+            - /etc/ocync/config.yaml
+            - --interval
+            - "300"
+            - --health-port
+            - "8080"
+            - --health-bind
+            - "0.0.0.0"
 
-  - it: cronjob mode renders container args [sync, --config, ...]
+  - it: watch.healthBind override flows through to container args
+    set:
+      mode: watch
+      watch:
+        healthBind: "::"
+    template: deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "::"
+
+  - it: extraArgs --health-bind suppresses the chart's own --health-bind to avoid duplicate flags
+    set:
+      mode: watch
+      extraArgs:
+        - --health-bind
+        - 127.0.0.1
+    template: deployment.yaml
+    asserts:
+      # Total args = 7 watch defaults (no --health-bind) + 2 extraArgs.
+      - lengthEqual:
+          path: spec.template.spec.containers[0].args
+          count: 9
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "127.0.0.1"
+
+  - it: cronjob mode renders the full container args list
     set:
       mode: cronjob
     template: cronjob.yaml
     asserts:
       - equal:
-          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
-          value: sync
-      - notContains:
           path: spec.jobTemplate.spec.template.spec.containers[0].args
-          content: watch
-      - notContains:
-          path: spec.jobTemplate.spec.template.spec.containers[0].args
-          content: --interval
+          value:
+            - sync
+            - --config
+            - /etc/ocync/config.yaml
 
-  - it: job mode renders container args [sync, --config, ...]
+  - it: job mode renders the full container args list
     set:
       mode: job
     template: job.yaml
     asserts:
       - equal:
-          path: spec.template.spec.containers[0].args[0]
-          value: sync
-      - notContains:
           path: spec.template.spec.containers[0].args
-          content: watch
+          value:
+            - sync
+            - --config
+            - /etc/ocync/config.yaml
 
   - it: watch mode has health port and probes
     set:

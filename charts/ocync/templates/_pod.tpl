@@ -55,6 +55,11 @@ spec:
         - {{ .Values.watch.interval | quote }}
         - --health-port
         - {{ .Values.watch.healthPort | quote }}
+        {{- /* Yield to extraArgs override; clap would resolve last-wins anyway, but skipping avoids duplicate flags in the rendered Deployment. */}}
+        {{- if not (has "--health-bind" .Values.extraArgs) }}
+        - --health-bind
+        - {{ .Values.watch.healthBind | quote }}
+        {{- end }}
         {{- else }}
         - sync
         - --config
