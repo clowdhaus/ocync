@@ -55,9 +55,11 @@ spec:
         - {{ .Values.watch.interval | quote }}
         - --health-port
         - {{ .Values.watch.healthPort | quote }}
-        {{- /* Required override: binary default 127.0.0.1 is unreachable from kubelet (probes pod IP). See #77. */}}
+        {{- /* Yield to extraArgs override; clap would resolve last-wins anyway, but skipping avoids duplicate flags in the rendered Deployment. */}}
+        {{- if not (has "--health-bind" .Values.extraArgs) }}
         - --health-bind
-        - "0.0.0.0"
+        - {{ .Values.watch.healthBind | quote }}
+        {{- end }}
         {{- else }}
         - sync
         - --config
