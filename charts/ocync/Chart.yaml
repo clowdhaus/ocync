@@ -2,8 +2,8 @@ apiVersion: v2
 name: ocync
 description: OCI container image sync tool
 type: application
-version: 0.3.0
-appVersion: "0.3.0"
+version: 0.3.1
+appVersion: "0.3.1"
 home: https://github.com/clowdhaus/ocync
 sources:
   - https://github.com/clowdhaus/ocync
