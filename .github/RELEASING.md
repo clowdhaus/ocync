@@ -20,7 +20,10 @@ Local flow uses [`cargo-release`](https://github.com/crate-ci/cargo-release) to 
 
 ```
 cargo install cargo-release
+brew install norwoodj/tap/helm-docs   # or follow the upstream installer
 ```
+
+`helm-docs` is invoked as a `pre-release-hook` during the bump to regenerate `charts/ocync/README.md` against the new chart version. Without it, cargo-release fails fast with a clear error before producing any commit or tag.
 
 Then, on a clean `main` checkout:
 
@@ -33,56 +36,55 @@ cargo release 0.2.0 --execute    # explicit version
 
 `cargo-release` will:
 
-1. Bump `[package].version` in the root `Cargo.toml` (the `ocync` binary crate).
-2. Regenerate `Cargo.lock` so `cargo build --locked` keeps working.
-3. Create a single commit with the bump.
-4. Tag it `v<version>` (matches the `v*` pattern the release workflow watches).
-5. Push the commit and tag to the remote.
+1. Bump `[workspace.package].version` in the root `Cargo.toml`. All five workspace crates (`ocync`, `ocync-distribution`, `ocync-sync`, `bench-proxy`, `xtask`) inherit via `version.workspace = true` and move together.
+2. Rewrite `version` and `appVersion` in `charts/ocync/Chart.yaml` to the new value (driven by `pre-release-replacements` in the root `[package.metadata.release]`).
+3. Run `helm-docs --chart-search-root charts` to regenerate `charts/ocync/README.md` against the new chart version (driven by `pre-release-hook`).
+4. Regenerate `Cargo.lock` so `cargo build --locked` keeps working.
+5. Create a single commit with all of the above.
+6. Tag it `v<version>` (matches the `v*` pattern the release workflow watches).
+7. Push the commit and tag to the remote.
 
 The pushed tag fires `workflows/release.yml` and the rest is automated.
+
+The four non-binary crates carry `[package.metadata.release] release = false` so cargo-release skips them entirely (no per-crate tags, no publish attempts). They still receive the version bump because their `[package].version` inherits from the workspace.
 
 ### Manual fallback
 
 If `cargo-release` is unavailable, the same outcome by hand:
 
 ```
-sed -i '' 's/^version = "0.1.0"/version = "0.2.0"/' Cargo.toml
+sed -i '' 's/^version = "0.3.0"/version = "0.4.0"/' Cargo.toml
+sed -i '' 's/^version: 0.3.0/version: 0.4.0/' charts/ocync/Chart.yaml
+sed -i '' 's/^appVersion: "0.3.0"/appVersion: "0.4.0"/' charts/ocync/Chart.yaml
+helm-docs --chart-search-root charts
 cargo generate-lockfile
-git commit -am "chore(release): v0.2.0"
-git tag v0.2.0
-git push origin main v0.2.0
+git commit -am "chore(release): v0.4.0"
+git tag v0.4.0
+git push origin main v0.4.0
 ```
 
-The validate job (`release.yml:23-37`) gates on `[package].version` matching the tag, so a mismatch fails fast before any artifact is built.
+The validate job (`release.yml`) gates the tag against `[workspace.package].version`, `Chart.yaml` `version`, and `Chart.yaml` `appVersion`. Any mismatch fails fast before artifacts are built.
 
 ### Workspace versioning
 
-Three crates live in this workspace: `ocync` (root, the binary), `ocync-distribution`, and `ocync-sync`. Only the root crate's version is gated by the release workflow, and only the root crate's version drives the released artifacts (Docker image tag, Helm `appVersion`, GitHub Release name). The library crates can stay at `0.1.0` indefinitely; they are not published to crates.io.
+The workspace has one version, defined once at `[workspace.package].version` and inherited by every crate. The five crates always carry the same number. None of them publish to crates.io; the version is the released-artifact identity (Docker tag, Helm chart version, GitHub Release name).
 
-On the first `cargo release` run, do a dry run (no `--execute`) and confirm only the root `Cargo.toml` is touched. If `cargo-release` proposes bumping the library crates, opt them out by adding to each library `Cargo.toml`:
-
-```toml
-[package.metadata.release]
-release = false
-```
-
-Library crates can opt back in later if we ever publish them.
+If a library crate ever needs to publish independently, drop `version.workspace = true` from its `[package]`, set an explicit version, and remove `release = false` from its `[package.metadata.release]`.
 
 ## What you do NOT need to touch
 
-- `charts/ocync/Chart.yaml` `version` / `appVersion`. `helm package --version $TAG --app-version $TAG` overrides them at release time. The committed `0.1.0` is a placeholder for `helm lint` / `helm template` in CI; do not chase it.
-- `charts/ocync/values.yaml` `image.tag`. Left empty on purpose. The chart's `ocync.image` helper (`templates/_helpers.tpl`) defaults the tag to `<.Chart.AppVersion>-fips`, which is whatever was passed to `helm package`. Tag bump moves chart and image together.
+- `charts/ocync/values.yaml` `image.tag`. Left empty on purpose. The chart's `ocync.image` helper (`templates/_helpers.tpl`) defaults the tag to `<.Chart.AppVersion>-fips`, which now equals the bumped chart `appVersion`. Tag bump moves chart and image together.
 
 If you ever need to override the image tag for a one-off install, that is a `helm install --set image.tag=...` decision, not a chart edit.
 
 ## Workflow steps
 
-1. **validate**: fails fast unless the tag (minus `v`) matches `Cargo.toml` `[package].version`. This is the only version gate; `Chart.yaml` is not checked because it is overridden during packaging.
+1. **validate**: fails fast unless the tag (minus `v`) matches `[workspace.package].version` in `Cargo.toml`, `version` in `charts/ocync/Chart.yaml`, AND `appVersion` in `charts/ocync/Chart.yaml`. Any mismatch is reported with `::error file=...::` against the offending file.
 2. **build-linux** (matrix amd64/arm64): builds with `RUSTFLAGS="-C target-feature=+crt-static"` for fully static FIPS binaries; `readelf -d` confirms no `NEEDED` entries.
 3. **build-macos** / **build-windows**: non-FIPS builds (the `aws-lc-rs` FIPS provider is Linux-only).
 4. **docker** (matrix amd64/arm64): assumes `ECR_PUBLIC_ROLE_ARN`, builds the Dockerfile, pushes the per-arch tag.
 5. **docker-manifest**: composes the per-arch images into `<version>-fips` and `latest-fips` manifests, signs both with cosign keyless.
-6. **helm**: `helm package` with `--version` / `--app-version` set to the tag, then `helm push` to ECR Public over OCI. Chart version and app version both equal the tag.
+6. **helm**: `helm package charts/ocync` (no flag overrides; chart version and appVersion come straight from `Chart.yaml`), then `helm push` to ECR Public over OCI.
 7. **release**: downloads all binary artifacts, generates `sha256sums.txt`, attests build provenance, runs `git-cliff` (config in `cliff.toml`) for release notes filtered by conventional-commit type, and creates the GitHub Release.
 
 The `helm` job depends on `docker-manifest`, so a failed image build short-circuits the chart push. The chart will never reference an image that does not exist.

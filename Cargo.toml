@@ -3,6 +3,7 @@ resolver = "2"
 members = ["bench/proxy", "crates/*", "xtask"]
 
 [workspace.package]
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -48,7 +49,7 @@ doc_markdown = "warn"
 
 [package]
 name = "ocync"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -57,6 +58,11 @@ description = "OCI registry sync tool"
 
 [package.metadata.release]
 publish = false
+pre-release-replacements = [
+  { file = "charts/ocync/Chart.yaml", search = "^version: .*$", replace = "version: {{version}}", exactly = 1 },
+  { file = "charts/ocync/Chart.yaml", search = '^appVersion: ".*"$', replace = 'appVersion: "{{version}}"', exactly = 1 },
+]
+pre-release-hook = ["helm-docs", "--chart-search-root", "charts"]
 
 [features]
 default = ["fips"]

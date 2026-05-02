@@ -1,11 +1,15 @@
 [package]
 name = "ocync-distribution"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "OCI Distribution client library"
+publish = false
+
+[package.metadata.release]
+release = false
 
 [features]
 default = ["fips"]
