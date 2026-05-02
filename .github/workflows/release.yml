@@ -25,16 +25,29 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Check tag matches Cargo.toml
+      - name: Check tag matches Cargo.toml and Chart.yaml
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
-          CARGO_VERSION="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)"
+          set -euo pipefail
           TAG_VERSION="${TAG_VERSION#v}"
+          CARGO_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)"
+          CHART_VERSION="$(sed -n 's/^version: //p' charts/ocync/Chart.yaml)"
+          CHART_APP_VERSION="$(sed -n 's/^appVersion: "\(.*\)"/\1/p' charts/ocync/Chart.yaml)"
+          fail=0
           if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::Tag v${TAG_VERSION} does not match Cargo.toml version ${CARGO_VERSION}"
-            exit 1
+            echo "::error file=Cargo.toml::workspace.package.version is ${CARGO_VERSION}, tag is v${TAG_VERSION}"
+            fail=1
           fi
+          if [ "$CHART_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error file=charts/ocync/Chart.yaml::version is ${CHART_VERSION}, tag is v${TAG_VERSION}"
+            fail=1
+          fi
+          if [ "$CHART_APP_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error file=charts/ocync/Chart.yaml::appVersion is ${CHART_APP_VERSION}, tag is v${TAG_VERSION}"
+            fail=1
+          fi
+          [ $fail -eq 0 ]
 
   build-linux:
     name: Build Linux (${{ matrix.artifact }})
@@ -188,11 +201,8 @@ jobs:
           aws-region: us-east-1
       - name: Login to ECR Public (Helm)
         run: aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
-      - name: Extract version
-        id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - name: Package Helm chart
-        run: helm package charts/ocync --version "${{ steps.version.outputs.VERSION }}" --app-version "${{ steps.version.outputs.VERSION }}"
+        run: helm package charts/ocync
       - name: Push Helm chart
         env:
           REGISTRY: ${{ env.ECR_REGISTRY }}

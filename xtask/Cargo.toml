@@ -1,9 +1,12 @@
 [package]
 name = "xtask"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+
+[package.metadata.release]
+release = false
 
 [lints]
 workspace = true
