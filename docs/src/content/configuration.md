@@ -55,7 +55,7 @@ defaults:
     - linux/arm64
   tags:
     semver: ">=1.0"
-    semver_prerelease: exclude
+    semver_prerelease: include   # cgr.dev tags carry -rN build suffixes
     sort: semver
     latest: 10
 
@@ -154,7 +154,9 @@ Applied to all mappings unless overridden at the mapping level:
 defaults:
   source: chainguard           # Default source registry
   targets: prod                # Default target group
-  platforms:                   # Platform filter
+  artifacts:                   # OCI 1.1 referrer handling (default: enabled)
+    enabled: true
+  platforms:                   # Platform filter (omit to preserve multi-arch)
     - linux/amd64
     - linux/arm64
   tags:
@@ -172,7 +174,8 @@ defaults:
 |---|---|---|
 | `source` | None | Default source registry name for all mappings |
 | `targets` | None | Default target group name or inline list |
-| `platforms` | All platforms | Platform filter applied to all mappings. Each entry must be `os/arch` or `os/arch/variant` (e.g., `linux/amd64`, `linux/arm/v7`). List must not be empty |
+| `artifacts` | `enabled: true` | OCI 1.1 referrer handling (signatures, SBOMs, attestations). See [Artifacts](#artifacts) |
+| `platforms` | All platforms | Platform filter. Each entry must be `os/arch` or `os/arch/variant` (e.g., `linux/amd64`, `linux/arm/v7`). When set, multi-arch indexes are rewritten at the target with a different digest than the source - bit-for-bit divergence. Omit to preserve multi-arch verbatim |
 | `tags` | None | Tag filtering pipeline (see [Tag filtering](#tag-filtering)) |
 
 ## Mappings
@@ -201,6 +204,64 @@ mappings:
 | `targets` | No | Override target group or inline list for this mapping |
 | `tags` | No | Override tag filtering for this mapping |
 | `platforms` | No | Override platform filter for this mapping. List must not be empty if provided |
+| `artifacts` | No | Override artifact handling for this mapping. See [Artifacts](#artifacts) |
+
+## Artifacts
+
+Controls whether OCI 1.1 referrers (cosign signatures, SBOMs, attestations) are discovered and transferred alongside their parent image manifests. Default: enabled.
+
+```yaml
+defaults:
+  artifacts:
+    enabled: true                  # Default; set to false to skip referrers
+    include:                       # When non-empty, only artifacts whose
+      - application/vnd.dev.cosign.simplesigning.v1+json   # artifact_type matches one of these
+      - application/vnd.cyclonedx+json
+    exclude:                       # Always-skip artifacts whose type matches
+      - application/vnd.in-toto+json
+    require_artifacts: false       # When true, fail the sync if a parent has zero referrers
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `true` | When `true`, after each image manifest is synced, `ocync` queries the source's `/v2/<repo>/referrers/<digest>` endpoint and transfers each referrer manifest plus its blobs to the target. Set to `false` to skip referrer discovery entirely |
+| `include` | All types | If non-empty, only referrers whose `artifact_type` matches one of these MIME types are transferred. Empty means all types pass |
+| `exclude` | None | Referrers whose `artifact_type` matches one of these are skipped, even if `include` matches |
+| `require_artifacts` | `false` | When `true`, an image with zero discovered referrers fails the sync with an error. Use to enforce that every mirrored image carries provenance |
+
+### Why default-on
+
+Defaulting `enabled: true` is the only setting consistent with `ocync`'s bit-for-bit promise. If `enabled: false` were the default, the mirror would look correct (every image present, every digest valid) but `cosign verify` against the source's signature would fail at deployment time, because the signature lives on a referrer that was never copied. The opt-out is there for users who deliberately want unsigned mirrors: testing setups, isolated networks, or hard byte budgets.
+
+### Opt-out
+
+```yaml
+defaults:
+  artifacts:
+    enabled: false              # Skip all referrer discovery and transfer
+```
+
+### Type filtering
+
+Mirror only SBOMs:
+
+```yaml
+defaults:
+  artifacts:
+    enabled: true
+    include:
+      - application/vnd.cyclonedx+json
+      - application/spdx+json
+```
+
+### Hard-fail on missing signatures
+
+```yaml
+defaults:
+  artifacts:
+    enabled: true
+    require_artifacts: true     # Fail sync if any image lacks referrers
+```
 
 ## Tag filtering
 
@@ -225,10 +286,13 @@ All filters are optional. Without any filters, all tags are synced.
 | `sort` | string | Sort order for remaining tags: `semver` or `alpha` |
 | `latest` | integer | Keep only the N most recent tags after sorting |
 | `min_tags` | integer | Minimum number of tags that must survive the filtering pipeline. If fewer tags remain, the sync for this mapping fails with an error |
+| `immutable_tags` | string | Glob pattern marking tags that never change content (e.g. `"v?[0-9]*.[0-9]*.[0-9]*"`). When a tag matches AND already exists in **every** target's tag list, the sync skips it with zero source and target requests. Useful for long-running mirrors of registries that publish many semver-pinned tags |
 
 **Validation constraints:**
 - `semver_prerelease` requires `semver` to be set
 - `latest` requires `sort` to be set
+
+**Override semantics:** when a mapping defines `tags:`, the entire block replaces `defaults.tags` - fields are not merged. If you want a mapping to inherit some default fields and override others, repeat the inherited fields in the mapping's `tags:` block.
 
 ## Environment variables
 
@@ -252,7 +316,7 @@ The `DOCKER_CONFIG` environment variable controls the Docker config file locatio
 
 ### Chainguard to ECR
 
-Single region. Sync a curated set of Chainguard base images to ECR, keeping only the latest 5 semver-stable tags for `linux/amd64` and `linux/arm64`:
+Single region. Sync a curated set of Chainguard base images to ECR, keeping the latest 5 semver-pinned tags for `linux/amd64` and `linux/arm64`. Chainguard tags carry a `-rN` build-revision suffix (`1.25.5-r0`, `1.25.5-r1`); the SemVer spec treats anything after `-` as a prerelease, so `semver_prerelease: include` is required for any `cgr.dev` tag to survive a `semver:` range:
 
 ```yaml
 registries:
@@ -269,6 +333,7 @@ defaults:
     - linux/arm64
   tags:
     semver: ">=1.0"
+    semver_prerelease: include
     sort: semver
     latest: 5
 
@@ -325,9 +390,15 @@ mappings:
   - from: library/postgres
     to: postgres
     tags:
+      # Mapping tags: replaces defaults.tags entirely. Repeat the
+      # inherited fields explicitly when a mapping needs both.
       semver: ">=15"
+      exclude:
+        - "*-debug"
+        - "*-rc*"
       sort: semver
       latest: 3
+      min_tags: 1
 ```
 
 ### GHCR to ECR with glob filtering
