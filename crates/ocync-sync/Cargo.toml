@@ -23,7 +23,6 @@ http.workspace = true
 ocync-distribution.workspace = true
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 reqwest.workspace = true
-semver = { version = "1", default-features = false, features = ["std"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
