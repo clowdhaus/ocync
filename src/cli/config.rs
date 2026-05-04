@@ -451,8 +451,8 @@ impl TagsConfig {
     ///
     /// Returns `Some` when `glob` contains only literal strings (no wildcard
     /// characters) and no other filter fields (`semver`, `latest`, `sort`,
-    /// `min_tags`) are set. In this case the tags can be used directly
-    /// without listing all tags from the registry.
+    /// `min_tags`, `exclude`, `include`) are set. In this case the tags can
+    /// be used directly without listing all tags from the registry.
     pub(crate) fn exact_tags(&self) -> Option<Vec<String>> {
         // Any field that requires the full tag list forces enumeration.
         if self.semver.is_some()
@@ -460,6 +460,7 @@ impl TagsConfig {
             || self.sort.is_some()
             || self.min_tags.is_some()
             || self.exclude.is_some()
+            || self.include.is_some()
         {
             return None;
         }
@@ -2041,6 +2042,16 @@ mappings:
         let tags = TagsConfig {
             glob: Some(GlobOrList::List(vec!["v1.0".into(), "v2.0".into()])),
             exclude: Some(GlobOrList::Single("v2.0".into())),
+            ..Default::default()
+        };
+        assert!(tags.exact_tags().is_none());
+    }
+
+    #[test]
+    fn exact_tags_with_include_returns_none() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::List(vec!["v2.13.0".into()])),
+            include: Some(GlobOrList::Single("latest".into())),
             ..Default::default()
         };
         assert!(tags.exact_tags().is_none());

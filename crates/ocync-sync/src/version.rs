@@ -7,7 +7,6 @@
 use std::cmp::Ordering;
 
 /// A token in a tokenized tag suffix.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Token {
     Numeric(u64),
@@ -18,7 +17,6 @@ pub(crate) enum Token {
 ///
 /// Empty `suffix` means the tag had no `-suffix` region (or the suffix
 /// tokenized to nothing, e.g. `1.0-` or `1.0---`).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TagVersion {
     pub(crate) prefix: Vec<u64>,
@@ -28,7 +26,6 @@ pub(crate) struct TagVersion {
 impl TagVersion {
     /// Parse a tag string into a `TagVersion`.
     /// Returns `None` if the tag has no parseable numeric prefix.
-    #[allow(dead_code)]
     pub(crate) fn parse(tag: &str) -> Option<Self> {
         if tag.is_empty() {
             return None;
@@ -64,7 +61,6 @@ impl TagVersion {
     /// `impl Ord` because zero-padding equality (`1.0` and `1.0.0` compare
     /// Equal) is incompatible with `Ord`'s contract that
     /// `cmp(a, b) == Equal` implies `a == b`.
-    #[allow(dead_code)]
     pub(crate) fn compare(a: &Self, b: &Self) -> Ordering {
         // Step 1: numeric prefix, zero-padded to the longer length.
         let max_len = a.prefix.len().max(b.prefix.len());
@@ -99,7 +95,6 @@ impl TagVersion {
 }
 
 /// Compare two suffix tokens. Numeric < Alpha at the same position (`SemVer` rule).
-#[allow(dead_code)]
 fn compare_tokens(a: &Token, b: &Token) -> Ordering {
     match (a, b) {
         (Token::Numeric(x), Token::Numeric(y)) => x.cmp(y),
@@ -111,7 +106,6 @@ fn compare_tokens(a: &Token, b: &Token) -> Ordering {
 
 /// Parse the prefix region: u64 components separated by '.' or '_'.
 /// Any non-digit character causes the whole tag to fail to parse.
-#[allow(dead_code)]
 fn parse_prefix(s: &str) -> Option<Vec<u64>> {
     let mut components = Vec::new();
     for part in s.split(['.', '_']) {
@@ -138,7 +132,6 @@ fn parse_prefix(s: &str) -> Option<Vec<u64>> {
 ///
 /// Empty strings are dropped. Each surviving string becomes Numeric(u64) if
 /// all-digit, otherwise Alpha(String).
-#[allow(dead_code)]
 fn tokenize_suffix(s: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     for part in s.split(['.', '-', '_']) {
@@ -160,7 +153,6 @@ fn tokenize_suffix(s: &str) -> Vec<Token> {
 }
 
 /// Split a string at every transition between digit and non-digit characters.
-#[allow(dead_code)]
 fn split_letter_digit(s: &str) -> Vec<&str> {
     let mut splits = Vec::new();
     let mut start = 0;
@@ -181,7 +173,6 @@ fn split_letter_digit(s: &str) -> Vec<&str> {
 
 /// A parsed version range: one or more constraints joined by AND.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct Range {
     constraints: Vec<Constraint>,
 }
@@ -215,7 +206,6 @@ impl std::fmt::Display for RangeParseError {
 
 impl std::error::Error for RangeParseError {}
 
-#[allow(dead_code)]
 impl Range {
     /// Parse a range string into a `Range`.
     ///

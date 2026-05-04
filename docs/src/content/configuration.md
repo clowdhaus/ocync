@@ -265,15 +265,14 @@ defaults:
 
 ## Tag filtering
 
-Tags are filtered through a pipeline in order:
+Tags are filtered through a pipeline:
 
-1. **glob**: include tags matching the glob pattern (string or list)
-2. **include**: always-include glob pattern(s) that override filters and system-exclude defaults
-3. **semver**: include tags satisfying the version range
-4. **exclude**: remove tags matching any exclude pattern (string or list)
-5. **sort**: order remaining tags (`semver`, `alpha`)
-6. **latest**: keep only the N most recent after sorting
-7. **min_tags**: validate at least N tags survived the pipeline (error if fewer)
+1. **glob + semver**: build the candidate pool by intersecting the glob match set (default `*`) with the version range
+2. **exclude**: remove tags matching any user `exclude` pattern OR any default-exclude pattern (see below)
+3. **sort**: order the pool (`semver` or `alpha`)
+4. **latest**: keep only the N most recent of the pool
+5. **include**: union always-include tag matches into the result (not subject to `glob`, `semver`, default-excludes, `sort`, or `latest`); still subject to user `exclude`
+6. **min_tags**: validate the final union has at least N tags (error if fewer)
 
 All filters are optional. Without any filters, all tags are synced.
 
