@@ -65,6 +65,14 @@ defaults:
 - A tag pattern (`v2.*`) is a glob, not a literal - either accept the listing cost or list each version explicitly.
 - Pinned tags and a filtered range cannot share a single mapping today; split into two mappings (one literal-only, one filtered) targeting the same `to:` repository.
 
+## When to use `glob:` vs `include:`
+
+`glob:` is the *filter* mechanism: it narrows the candidate pool. Use it when you want only specific tags, with no `semver:` range driving the pipeline.
+
+`include:` is the *augment* mechanism: it always-adds tags alongside a `semver:`-driven pipeline. Use it when you want literal pins (`latest`, `latest-dev`) plus a version range in the same mapping.
+
+For pin-only use cases (this recipe), `glob:` is the right field. For pin-plus-range, see [semver tracking](/recipes/semver-tracking).
+
 ## Related
 
 - [Minimum bytes](/recipes/minimum-bytes) for the broader cost-sensitive pattern
