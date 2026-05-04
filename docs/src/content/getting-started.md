@@ -116,6 +116,7 @@ ocync sync -c config.yaml --dry-run
 
 ## Next steps
 
+- [Recipes](/recipes/production-mirror) for common mirror patterns: production fidelity, minimum bytes, helm + images, variant filtering, semver tracking
 - [Configuration reference](/configuration) for full config file syntax and options
 - [CLI reference](/cli-reference) for all commands, flags, and exit codes
 - [Helm chart](/helm) for Kubernetes deployment (CronJob, Deployment, or Job)

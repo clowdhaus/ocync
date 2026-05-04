@@ -13,7 +13,7 @@ Sync OCI container images across registries - efficiently.
 
 ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. On real-world workloads it completes cold syncs 4x faster than comparable tools, with up to 30% fewer API requests, zero duplicate blob fetches across the run, and zero 429s on every benchmarked registry. See [Performance](https://clowdhaus.github.io/ocync/performance) for the full comparison.
 
-ocync is purpose-built for one job: efficiently mirroring images from upstream registries (Docker Hub, GHCR, GAR, Chainguard) to a private registry (ECR, GAR, ACR). It is not a build tool, a registry, or a content rewriter - it copies bytes verbatim and lets the registry do its job.
+ocync is purpose-built for one job: efficiently mirroring images from upstream registries (Docker Hub, GHCR, GAR, Chainguard) to a private registry (ECR, GAR, ACR). It is not a build tool, a registry, or a content rewriter - it copies bytes verbatim and lets the registry do its job. Multi-architecture indexes, manifests, blobs, and OCI 1.1 referrers (signatures, SBOMs, attestations) all flow through bit-for-bit.
 
 ## Features
 
@@ -40,17 +40,60 @@ ocync copy cgr.dev/chainguard/nginx:latest \
     123456789012.dkr.ecr.us-east-1.amazonaws.com/nginx:latest
 ```
 
-Sync from a config file:
+For repeated syncs, use a config file. Two starting points cover most cases.
+
+### Full-fidelity mirror (default)
+
+Multi-arch indexes, signatures, and SBOMs are preserved bit-for-bit. Use this for compliance and any workload that cares about supply-chain provenance.
+
+```yaml
+registries:
+  source: { url: ghcr.io }
+  ecr:    { url: 123456789012.dkr.ecr.us-east-1.amazonaws.com }
+
+defaults:
+  source: source
+  targets: ecr
+
+mappings:
+  - from: my-org/my-app
+    to: my-app
+    tags:
+      semver: ">=1.0"
+      sort: semver
+      latest: 5
+```
+
+### Minimum bytes
+
+Use this for CI mirrors and air-gapped fleets that do not verify signatures. Skip the OCI 1.1 referrers and narrow to the tags you actually need; multi-arch indexes still flow through verbatim.
+
+```yaml
+registries:
+  source: { url: cgr.dev }
+  ecr:    { url: 123456789012.dkr.ecr.us-east-1.amazonaws.com }
+
+defaults:
+  source: source
+  targets: ecr
+  artifacts:
+    enabled: false       # skip cosign signatures, SBOMs, attestations
+  tags:
+    glob: ["latest"]
+
+mappings:
+  - from: chainguard/curl
+    to: curl
+```
+
+Run a sync, or preview what would change:
 
 ```bash
 ocync sync -c config.yaml
-```
-
-Preview what would sync:
-
-```bash
 ocync sync -c config.yaml --dry-run
 ```
+
+See [Recipes](https://clowdhaus.github.io/ocync/recipes/production-mirror) for variant-only mirrors, helm-chart-and-images patterns (ArgoCD, cert-manager, Karpenter), semver release tracking, and more.
 
 ## Installation
 
@@ -113,6 +156,7 @@ Full documentation at [clowdhaus.github.io/ocync](https://clowdhaus.github.io/oc
 
 - [Getting started](https://clowdhaus.github.io/ocync/getting-started) - installation, first sync, key concepts
 - [Configuration](https://clowdhaus.github.io/ocync/configuration) - config file reference
+- [Recipes](https://clowdhaus.github.io/ocync/recipes/production-mirror) - common mirror patterns (production, minimum bytes, helm + images, variant filtering, semver tracking)
 - [CLI reference](https://clowdhaus.github.io/ocync/cli-reference) - commands, flags, exit codes
 - [Registry guides](https://clowdhaus.github.io/ocync/registries/ecr) - ECR, Docker Hub, GHCR, GAR, ACR, Chainguard
 - [Helm chart](https://clowdhaus.github.io/ocync/helm) - Kubernetes deployment

@@ -39,6 +39,9 @@ const isDocsActive =
 const isRegistriesActive = pathname.startsWith(
   `${base}registries`.replace(/\/$/, ""),
 );
+const isRecipesActive = pathname.startsWith(
+  `${base}recipes`.replace(/\/$/, ""),
+);
 const isDesignActive = pathname.startsWith(
   `${base}design/`.replace(/\/$/, ""),
 );
@@ -124,6 +127,12 @@ const isDesignActive = pathname.startsWith(
               href={`${base}registries/ecr`}
               aria-current={isRegistriesActive ? "true" : undefined}
             >Registries</a>
+          </li>
+          <li>
+            <a
+              href={`${base}recipes/production-mirror`}
+              aria-current={isRecipesActive ? "true" : undefined}
+            >Recipes</a>
           </li>
           <li>
             <a
