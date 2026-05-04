@@ -52,12 +52,11 @@ tags:
   # See pin-literals-only for the full discussion of the literal-pin pattern.
 ```
 
-Tracking the latest five releases of a major version. Chainguard tags carry a `-rN` build-revision suffix (`1.25.5-r0`, `1.25.5-r1`) which the SemVer spec treats as a prerelease, so `semver_prerelease: include` is required against `cgr.dev` for any tag to survive the range filter:
+Tracking the latest five releases of a major version. The lenient parser admits Chainguard's `-rN` build-revision suffix (`1.25.5-r0`, `1.25.5-r1`) directly:
 
 ```yaml
 tags:
   semver: ">=1.0.0, <2.0.0"
-  semver_prerelease: include
   sort: semver
   latest: 5
 ```
