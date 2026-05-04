@@ -663,4 +663,162 @@ mod tests {
         assert!(!result.contains(&"2023.12.31"));
         assert!(!result.contains(&"1.0.0"));
     }
+
+    // - system-exclude tests ---------------------------------------------
+
+    #[test]
+    fn system_exclude_drops_rc_by_default() {
+        let tags = vec![
+            "1.0.0",
+            "1.0.0-rc1",
+            "1.0.0-alpha",
+            "1.0.0-beta",
+            "1.0.0-snapshot",
+            "1.0.0-nightly",
+            "1.0.0-pre",
+        ];
+        let config = FilterConfig {
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["1.0.0"]);
+    }
+
+    #[test]
+    fn system_exclude_case_insensitive() {
+        let tags = vec!["5.0.0-SNAPSHOT", "5.0.0-RC1", "5.0.0-BETA1", "5.0.0"];
+        let config = FilterConfig {
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["5.0.0"]);
+    }
+
+    #[test]
+    fn system_exclude_keeps_dev_and_r_revisions() {
+        let tags = vec![
+            "1.0.0-dev",
+            "1.0.0-r0",
+            "1.0.0-edge",
+            "1.0.0-final",
+        ];
+        let config = FilterConfig {
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        // Order matches input; none of these match the default-exclude list.
+        assert!(result.contains(&"1.0.0-dev".to_string()));
+        assert!(result.contains(&"1.0.0-r0".to_string()));
+        assert!(result.contains(&"1.0.0-edge".to_string()));
+        assert!(result.contains(&"1.0.0-final".to_string()));
+        assert_eq!(result.len(), 4);
+    }
+
+    // - include tests -----------------------------------------------------
+
+    #[test]
+    fn include_pin_overrides_system_exclude() {
+        let tags = vec!["1.25.0-rc1", "1.0.0-rc2", "1.25.0"];
+        let config = FilterConfig {
+            include: vec!["1.25.0-rc1".into()],
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        // 1.25.0-rc1 survives via include; 1.0.0-rc2 drops via system-exclude;
+        // 1.25.0 survives via the pipeline.
+        assert!(result.contains(&"1.25.0-rc1".to_string()));
+        assert!(result.contains(&"1.25.0".to_string()));
+        assert!(!result.contains(&"1.0.0-rc2".to_string()));
+    }
+
+    /// `include` survives even when the tag would fail the `semver:` filter
+    /// (e.g., literal `latest` has no numeric prefix).
+    #[test]
+    fn include_pin_overrides_semver() {
+        let tags = vec!["latest", "1.0.0", "0.9.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"latest".to_string()));
+        assert!(result.contains(&"1.0.0".to_string()));
+        assert!(!result.contains(&"0.9.0".to_string()));
+    }
+
+    /// `include` survives even when the tag doesn't match `glob:` (which
+    /// would otherwise restrict the pool).
+    #[test]
+    fn include_pin_overrides_glob() {
+        // glob restricts pool to alpine variants; "latest" wouldn't match.
+        let tags = vec!["latest", "1.0.0-alpine", "1.0.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            glob: vec!["*-alpine".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"latest".to_string()));
+        assert!(result.contains(&"1.0.0-alpine".to_string()));
+        // 1.0.0 fails glob; not in include; not kept.
+        assert!(!result.contains(&"1.0.0".to_string()));
+    }
+
+    #[test]
+    fn user_exclude_wins_over_include() {
+        let tags = vec!["latest", "1.0.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            exclude: vec!["latest".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(!result.contains(&"latest".to_string()));
+    }
+
+    #[test]
+    fn latest_n_does_not_cap_include() {
+        // Pipeline has 5 candidates; latest:2 should keep only the top 2 of
+        // the pipeline side. Includes pass through uncapped.
+        let tags = vec![
+            "latest", "latest-dev",
+            "1.5.0", "1.4.0", "1.3.0", "1.2.0", "1.1.0",
+        ];
+        let config = FilterConfig {
+            include: vec!["latest".into(), "latest-dev".into()],
+            semver: Some(">=1.0".into()),
+            sort: Some(SortOrder::Semver),
+            latest: Some(2),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        // 2 includes + top 2 of pipeline = 4 tags.
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&"latest".to_string()));
+        assert!(result.contains(&"latest-dev".to_string()));
+        // Top 2 of pipeline kept; lower versions dropped by latest:N truncation.
+        assert!(result.contains(&"1.5.0".to_string()));
+        assert!(result.contains(&"1.4.0".to_string()));
+        assert!(!result.contains(&"1.3.0".to_string()));
+        assert!(!result.contains(&"1.2.0".to_string()));
+        assert!(!result.contains(&"1.1.0".to_string()));
+    }
+
+    #[test]
+    fn min_tags_counts_include_and_pipeline() {
+        let tags = vec!["latest", "1.0.0", "1.1.0", "1.2.0", "1.3.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            semver: Some(">=1.0".into()),
+            min_tags: Some(5),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result.len(), 5);
+    }
 }
