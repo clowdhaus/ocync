@@ -195,4 +195,91 @@ mod parse_tests {
         assert!(TagVersion::parse("17rc1").is_none());
         assert!(TagVersion::parse("1.24rc2").is_none());
     }
+
+    #[test]
+    fn rejects_u64_overflow() {
+        // 25 digits exceeds u64::MAX.
+        let too_big = "1".repeat(25);
+        assert!(TagVersion::parse(&too_big).is_none());
+    }
+
+    #[test]
+    fn collapses_trailing_dash() {
+        let v = TagVersion::parse("1.0-").unwrap();
+        assert_eq!(v.prefix, vec![1, 0]);
+        assert!(v.suffix.is_empty());
+    }
+
+    #[test]
+    fn collapses_suffix_with_only_separators() {
+        let v = TagVersion::parse("1.0---").unwrap();
+        assert!(v.suffix.is_empty());
+    }
+
+    #[test]
+    fn parses_suffix_alpine() {
+        let v = TagVersion::parse("15.10-alpine").unwrap();
+        assert_eq!(v.prefix, vec![15, 10]);
+        assert_eq!(v.suffix, vec![Token::Alpha("alpine".into())]);
+    }
+
+    #[test]
+    fn parses_suffix_chainguard_revision() {
+        let v = TagVersion::parse("1.25.5-r0").unwrap();
+        assert_eq!(v.prefix, vec![1, 25, 5]);
+        assert_eq!(v.suffix, vec![Token::Alpha("r".into()), Token::Numeric(0)]);
+    }
+
+    #[test]
+    fn parses_suffix_temurin_compound() {
+        let v = TagVersion::parse("25.0.3_9-jre-alpine-3.23").unwrap();
+        assert_eq!(v.prefix, vec![25, 0, 3, 9]);
+        assert_eq!(
+            v.suffix,
+            vec![
+                Token::Alpha("jre".into()),
+                Token::Alpha("alpine".into()),
+                Token::Numeric(3),
+                Token::Numeric(23),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_suffix_eks_distro() {
+        let v = TagVersion::parse("v1.27.6-eks-1-27-14").unwrap();
+        assert_eq!(v.prefix, vec![1, 27, 6]);
+        assert_eq!(
+            v.suffix,
+            vec![
+                Token::Alpha("eks".into()),
+                Token::Numeric(1),
+                Token::Numeric(27),
+                Token::Numeric(14),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_suffix_node_alpine_compound() {
+        let v = TagVersion::parse("20.18.1-alpine3.20").unwrap();
+        assert_eq!(v.prefix, vec![20, 18, 1]);
+        assert_eq!(
+            v.suffix,
+            vec![
+                Token::Alpha("alpine".into()),
+                Token::Numeric(3),
+                Token::Numeric(20),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenization_equivalence_rc1_and_rc_dot_1() {
+        // 1.0.0-rc1 and 1.0.0-rc.1 produce identical tokens.
+        let a = TagVersion::parse("1.0.0-rc1").unwrap();
+        let b = TagVersion::parse("1.0.0-rc.1").unwrap();
+        assert_eq!(a.suffix, b.suffix);
+        assert_eq!(a.suffix, vec![Token::Alpha("rc".into()), Token::Numeric(1)]);
+    }
 }
