@@ -72,11 +72,7 @@ impl FilterConfig {
 
         // 2. Semver filter
         if let Some(ref range) = self.semver {
-            current = filter_semver(
-                &current,
-                range,
-                self.semver_prerelease.unwrap_or(SemverPrerelease::Exclude),
-            )?;
+            current = filter_semver(&current, range)?;
         }
 
         // 3. Exclude
@@ -134,24 +130,11 @@ fn filter_glob<'a>(tags: &[&'a str], patterns: &[String]) -> Result<Vec<&'a str>
     Ok(tags.iter().copied().filter(|t| set.is_match(t)).collect())
 }
 
-/// Filter tags by a semver version range, with pre-release handling.
+/// Filter tags by a version range.
 ///
-/// Tags that cannot be parsed as semver are dropped with a warning.
-///
-/// # Pre-release matching
-///
-/// When `prerelease` is [`SemverPrerelease::Include`] or
-/// [`SemverPrerelease::Only`], pre-release tags are matched by comparing
-/// their **base version** (major.minor.patch) against the range. This means
-/// `1.0.0-rc1` matches `>=1.0.0` (base `1.0.0` satisfies the range), but
-/// `2.0.0-rc1` does NOT match `<2.0.0` (base `2.0.0` fails the range).
-/// This is consistent with how regsync and dregsy handle pre-releases.
-fn filter_semver<'a>(
-    tags: &[&'a str],
-    range: &str,
-    prerelease: SemverPrerelease,
-) -> Result<Vec<&'a str>, Error> {
-    let req = semver::VersionReq::parse(range).map_err(|e| Error::InvalidSemverRange {
+/// Tags that cannot be parsed as a version are dropped with a warning.
+fn filter_semver<'a>(tags: &[&'a str], range: &str) -> Result<Vec<&'a str>, Error> {
+    let req = crate::version::Range::parse(range).map_err(|e| Error::InvalidVersionRange {
         range: range.to_owned(),
         reason: e.to_string(),
     })?;
@@ -160,25 +143,11 @@ fn filter_semver<'a>(
         .iter()
         .copied()
         .filter(|tag| {
-            let Some(ver) = parse_semver(tag) else {
-                warn!(tag, "tag is not parseable as semver, dropping");
+            let Some(ver) = crate::version::TagVersion::parse(tag) else {
+                warn!(tag, "tag is not parseable as a version, dropping");
                 return false;
             };
-            let has_pre = !ver.pre.is_empty();
-            match prerelease {
-                SemverPrerelease::Exclude if has_pre => return false,
-                SemverPrerelease::Only if !has_pre => return false,
-                _ => {}
-            }
-            // The semver crate doesn't match pre-releases against ranges
-            // without pre-release specifiers, so compare the base version
-            // when the user wants to include them.
-            if has_pre && prerelease != SemverPrerelease::Exclude {
-                let base = semver::Version::new(ver.major, ver.minor, ver.patch);
-                req.matches(&base)
-            } else {
-                req.matches(&ver)
-            }
+            req.matches(&ver)
         })
         .collect())
 }
@@ -191,43 +160,26 @@ fn filter_exclude<'a>(tags: &[&'a str], patterns: &[String]) -> Result<Vec<&'a s
 
 /// Sort tags in-place in descending order (highest first).
 fn sort_tags_in_place(tags: &mut [&str], order: SortOrder) {
+    use crate::version::TagVersion;
+    use std::cmp::Ordering;
+
     match order {
         SortOrder::Semver => {
             tags.sort_by(|a, b| {
-                let va = parse_semver(a);
-                let vb = parse_semver(b);
+                let va = TagVersion::parse(a);
+                let vb = TagVersion::parse(b);
                 match (va, vb) {
-                    (Some(va), Some(vb)) => vb.cmp(&va), // descending
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(va), Some(vb)) => TagVersion::compare(&vb, &va), // descending
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
                     (None, None) => b.cmp(a), // alpha-descending fallback
                 }
             });
         }
         SortOrder::Alpha => {
-            tags.sort_by(|a, b| b.cmp(a)); // descending
+            tags.sort_by(|a, b| b.cmp(a));
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Semver parse helper
-// ---------------------------------------------------------------------------
-
-/// Parse a tag as semver, stripping an optional `v` prefix and normalising
-/// two-part versions (`X.Y` -> `X.Y.0`).
-fn parse_semver(tag: &str) -> Option<semver::Version> {
-    let s = tag.strip_prefix('v').unwrap_or(tag);
-    if let Ok(v) = semver::Version::parse(s) {
-        return Some(v);
-    }
-    // Try X.Y -> X.Y.0 (only pure numeric two-part, no pre-release suffix).
-    let parts: Vec<&str> = s.splitn(3, '.').collect();
-    if parts.len() == 2 {
-        let normalised = format!("{}.{}.0", parts[0], parts[1]);
-        return semver::Version::parse(&normalised).ok();
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
