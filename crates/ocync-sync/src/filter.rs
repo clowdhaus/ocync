@@ -6,18 +6,6 @@ use tracing::warn;
 
 use crate::Error;
 
-/// How to handle semver pre-release tags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum SemverPrerelease {
-    /// Include pre-release tags in results.
-    Include,
-    /// Exclude pre-release tags from results.
-    Exclude,
-    /// Return only pre-release tags.
-    Only,
-}
-
 /// Sort order for the final tag list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -70,9 +58,6 @@ pub struct FilterConfig {
     pub glob: Vec<String>,
     /// Semver version range constraint (e.g. `>=1.18.0`).
     pub semver: Option<String>,
-    /// Pre-release handling. Defaults to [`SemverPrerelease::Exclude`] when
-    /// a `semver` range is set.
-    pub semver_prerelease: Option<SemverPrerelease>,
     /// Exclude patterns (OR deny).
     pub exclude: Vec<String>,
     /// Sort order.

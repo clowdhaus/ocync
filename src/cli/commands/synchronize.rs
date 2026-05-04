@@ -451,9 +451,9 @@ fn build_filter(tags: Option<&TagsConfig>) -> FilterConfig {
     };
 
     FilterConfig {
+        include: glob_or_list_to_vec(tags.include.as_ref()),
         glob: glob_or_list_to_vec(tags.glob.as_ref()),
         semver: tags.semver.clone(),
-        semver_prerelease: tags.semver_prerelease,
         exclude: glob_or_list_to_vec(tags.exclude.as_ref()),
         sort: tags.sort,
         latest: tags.latest,
@@ -634,22 +634,23 @@ mod tests {
 
     #[test]
     fn build_filter_full() {
-        use ocync_sync::filter::{SemverPrerelease, SortOrder};
+        use ocync_sync::filter::SortOrder;
 
         let tags = TagsConfig {
+            include: Some(GlobOrList::List(vec!["latest".into()])),
             glob: Some(GlobOrList::Single("*".into())),
             semver: Some(">=1.0.0".into()),
-            semver_prerelease: Some(SemverPrerelease::Exclude),
             exclude: Some(GlobOrList::Single("*-alpine".into())),
             sort: Some(SortOrder::Semver),
             latest: Some(5),
             min_tags: Some(1),
             immutable_tags: None,
+            ..Default::default()
         };
         let filter = build_filter(Some(&tags));
+        assert_eq!(filter.include, vec!["latest"]);
         assert_eq!(filter.glob, vec!["*"]);
         assert_eq!(filter.semver.as_deref(), Some(">=1.0.0"));
-        assert_eq!(filter.semver_prerelease, Some(SemverPrerelease::Exclude));
         assert_eq!(filter.exclude, vec!["*-alpine"]);
         assert_eq!(filter.sort, Some(SortOrder::Semver));
         assert_eq!(filter.latest, Some(5));

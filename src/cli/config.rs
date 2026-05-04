@@ -409,9 +409,17 @@ pub(crate) struct TagsConfig {
     #[serde(default)]
     pub semver: Option<String>,
 
-    /// Whether to include or exclude semver pre-release tags.
+    /// Always-include glob patterns. Tags matching any pattern survive
+    /// `glob:`/`semver:` filters and the system-exclude defaults. Same syntax
+    /// as `exclude:`. Not subject to `sort:` or `latest:` truncation.
     #[serde(default)]
-    pub semver_prerelease: Option<SemverPrerelease>,
+    pub include: Option<GlobOrList>,
+
+    /// Removed in 2026-05; deserializing a config that still sets this field
+    /// triggers a fail-loud migration error pointing at `include:`.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub semver_prerelease: Option<RemovedSemverPrerelease>,
 
     /// Exclude tags matching one or more glob patterns.
     #[serde(default)]
@@ -480,7 +488,36 @@ pub(crate) enum GlobOrList {
     List(Vec<String>),
 }
 
-use ocync_sync::filter::{SemverPrerelease, SortOrder};
+use ocync_sync::filter::SortOrder;
+
+/// Placeholder type for the removed `tags.semver_prerelease` field. Triggers
+/// a custom Deserialize error if the field appears in user config, with a
+/// migration hint pointing at the new `include:` mechanism.
+#[derive(Debug)]
+pub(crate) struct RemovedSemverPrerelease;
+
+impl<'de> Deserialize<'de> for RemovedSemverPrerelease {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Consume the value so the deserializer is in a clean state.
+        let _: serde::de::IgnoredAny = Deserialize::deserialize(deserializer)?;
+        Err(<D::Error as serde::de::Error>::custom(
+            "tags.semver_prerelease has been removed. The default behavior matches the old 'exclude' mode (system-exclude drops *-rc*, *-alpha*, *-beta*, *-pre*, *-snapshot*, *-nightly*). To restore 'include' mode, add: include: [\"*-rc*\", \"*-alpha*\", \"*-beta*\", \"*-pre*\", \"*-snapshot*\", \"*-nightly*\"]",
+        ))
+    }
+}
+
+impl JsonSchema for RemovedSemverPrerelease {
+    fn schema_name() -> String {
+        "RemovedSemverPrerelease".to_owned()
+    }
+
+    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        schemars::schema::Schema::Bool(false)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Environment variable expansion
@@ -726,11 +763,6 @@ fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
             "tags.latest requires tags.sort to be set".to_string(),
         ));
     }
-    if tags.semver_prerelease.is_some() && tags.semver.is_none() {
-        return Err(ConfigError::Validation(
-            "tags.semver_prerelease requires tags.semver to be set".to_string(),
-        ));
-    }
     Ok(())
 }
 
@@ -932,7 +964,7 @@ mappings:
     tags:
       glob: "18.*"
       semver: ">=18.0.0"
-      semver_prerelease: exclude
+      include: "*-rc*"
       exclude: "*-alpine"
       sort: semver
       latest: 5
@@ -941,10 +973,24 @@ mappings:
         let tags = config.mappings[0].tags.as_ref().unwrap();
         assert!(matches!(tags.sort, Some(SortOrder::Semver)));
         assert_eq!(tags.latest, Some(5));
-        assert!(matches!(
-            tags.semver_prerelease,
-            Some(SemverPrerelease::Exclude)
-        ));
+        assert!(matches!(&tags.include, Some(GlobOrList::Single(s)) if s == "*-rc*"));
+    }
+
+    #[test]
+    fn deserialize_semver_prerelease_removed_errors() {
+        let yaml = r#"
+mappings:
+  - from: library/node
+    tags:
+      glob: "18.*"
+      semver_prerelease: exclude
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("semver_prerelease has been removed"),
+            "expected migration hint in error, got: {msg}"
+        );
     }
 
     #[test]
