@@ -179,6 +179,154 @@ fn split_letter_digit(s: &str) -> Vec<&str> {
     splits
 }
 
+/// A parsed version range: one or more constraints joined by AND.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct Range {
+    constraints: Vec<Constraint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Constraint {
+    op: Op,
+    bound: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Ge,
+    Le,
+    Gt,
+    Lt,
+    Eq,
+}
+
+/// Error returned when a version range string cannot be parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RangeParseError {
+    pub(crate) reason: String,
+}
+
+impl std::fmt::Display for RangeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for RangeParseError {}
+
+#[allow(dead_code)]
+impl Range {
+    /// Parse a range string into a `Range`.
+    ///
+    /// Accepts comma-joined constraints of the form `>=1.0, <2.0`.
+    /// Supported operators: `>=`, `<=`, `>`, `<`, `=`, and bare (implies `=`).
+    /// Caret (`^`), tilde (`~`), and wildcards (`x`, `X`, `*`) are rejected.
+    pub(crate) fn parse(s: &str) -> Result<Self, RangeParseError> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(RangeParseError {
+                reason: "empty range".into(),
+            });
+        }
+        let mut constraints = Vec::new();
+        for part in trimmed.split(',') {
+            constraints.push(parse_constraint(part.trim())?);
+        }
+        Ok(Range { constraints })
+    }
+
+    /// Returns `true` if `v` satisfies all constraints in the range.
+    pub(crate) fn matches(&self, v: &TagVersion) -> bool {
+        self.constraints.iter().all(|c| c.matches(&v.prefix))
+    }
+}
+
+fn parse_constraint(s: &str) -> Result<Constraint, RangeParseError> {
+    if s.is_empty() {
+        return Err(RangeParseError {
+            reason: "empty constraint".into(),
+        });
+    }
+    if s.starts_with('^')
+        || s.starts_with('~')
+        || s.contains('x')
+        || s.contains('X')
+        || s.contains('*')
+    {
+        return Err(RangeParseError {
+            reason: format!(
+                "unsupported range syntax '{}'; use a comma-joined combination of >=, <=, >, <, =",
+                s
+            ),
+        });
+    }
+
+    let (op, rest) = if let Some(r) = s.strip_prefix(">=") {
+        (Op::Ge, r.trim_start())
+    } else if let Some(r) = s.strip_prefix("<=") {
+        (Op::Le, r.trim_start())
+    } else if let Some(r) = s.strip_prefix('>') {
+        (Op::Gt, r.trim_start())
+    } else if let Some(r) = s.strip_prefix('<') {
+        (Op::Lt, r.trim_start())
+    } else if let Some(r) = s.strip_prefix('=') {
+        (Op::Eq, r.trim_start())
+    } else {
+        (Op::Eq, s)
+    };
+
+    let bound_str = rest.strip_prefix('v').unwrap_or(rest);
+    let bound = parse_bound(bound_str)?;
+    Ok(Constraint { op, bound })
+}
+
+fn parse_bound(s: &str) -> Result<Vec<u64>, RangeParseError> {
+    if s.contains('-') {
+        return Err(RangeParseError {
+            reason: format!("prerelease suffix not allowed in range bound: '{}'", s),
+        });
+    }
+    let mut components = Vec::new();
+    for part in s.split('.') {
+        if part.is_empty() {
+            return Err(RangeParseError {
+                reason: format!("malformed bound '{}'", s),
+            });
+        }
+        let n: u64 = part.parse().map_err(|_| RangeParseError {
+            reason: format!("malformed bound '{}'", s),
+        })?;
+        components.push(n);
+    }
+    if components.is_empty() {
+        Err(RangeParseError {
+            reason: format!("empty bound '{}'", s),
+        })
+    } else {
+        Ok(components)
+    }
+}
+
+impl Constraint {
+    fn matches(&self, prefix: &[u64]) -> bool {
+        let max_len = prefix.len().max(self.bound.len());
+        let lhs: Vec<u64> = (0..max_len)
+            .map(|i| prefix.get(i).copied().unwrap_or(0))
+            .collect();
+        let rhs: Vec<u64> = (0..max_len)
+            .map(|i| self.bound.get(i).copied().unwrap_or(0))
+            .collect();
+        match self.op {
+            Op::Ge => lhs >= rhs,
+            Op::Le => lhs <= rhs,
+            Op::Gt => lhs > rhs,
+            Op::Lt => lhs < rhs,
+            Op::Eq => lhs == rhs,
+        }
+    }
+}
+
 #[cfg(test)]
 mod parse_tests {
     use super::*;
@@ -331,6 +479,93 @@ mod parse_tests {
         let b = TagVersion::parse("1.0.0-rc.1").unwrap();
         assert_eq!(a.suffix, b.suffix);
         assert_eq!(a.suffix, vec![Token::Alpha("rc".into()), Token::Numeric(1)]);
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    fn matches(range: &str, tag: &str) -> bool {
+        let r = Range::parse(range).expect("valid range");
+        let v = TagVersion::parse(tag).expect("valid tag");
+        r.matches(&v)
+    }
+
+    #[test]
+    fn ge_simple() {
+        assert!(matches(">=1.0", "1.0.0"));
+        assert!(matches(">=1.0", "1.5.0"));
+        assert!(!matches(">=1.0", "0.9.0"));
+    }
+
+    #[test]
+    fn lt_simple() {
+        assert!(matches("<2.0", "1.99.99"));
+        assert!(!matches("<2.0", "2.0.0"));
+        // suffix opaque: 2.0.0-rc1 has prefix [2,0,0]
+        assert!(!matches("<2.0", "2.0.0-rc1"));
+    }
+
+    #[test]
+    fn comma_joined_narrows() {
+        assert!(matches(">=1.0, <2.0", "1.5.0"));
+        assert!(!matches(">=1.0, <2.0", "2.0.0"));
+        assert!(!matches(">=1.0, <2.0", "0.9.0"));
+    }
+
+    #[test]
+    fn whitespace_tolerated() {
+        assert!(matches(" >= 1.0 , < 2.0 ", "1.5.0"));
+    }
+
+    #[test]
+    fn no_operator_implies_equal() {
+        assert!(matches("1.0", "1.0.0"));
+        assert!(matches("1.0", "1"));
+        assert!(!matches("1.0", "1.0.5"));
+    }
+
+    #[test]
+    fn equal_explicit() {
+        assert!(matches("=15.0", "15"));
+        assert!(matches("=15.0", "15.0"));
+        assert!(matches("=15.0", "15.0.0"));
+        assert!(!matches("=15.0", "15.0.5"));
+    }
+
+    #[test]
+    fn two_part_bound_matches_three_part_prefix() {
+        assert!(matches(">=15.0", "15.10.5"));
+    }
+
+    #[test]
+    fn rejects_caret() {
+        assert!(Range::parse("^2").is_err());
+    }
+
+    #[test]
+    fn rejects_tilde() {
+        assert!(Range::parse("~1").is_err());
+    }
+
+    #[test]
+    fn rejects_wildcard() {
+        assert!(Range::parse("1.x").is_err());
+        assert!(Range::parse("1.*").is_err());
+        assert!(Range::parse("1.X").is_err());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(Range::parse("").is_err());
+    }
+
+    #[test]
+    fn rejects_prerelease_bound() {
+        assert!(Range::parse(">=1.0-rc1").is_err());
+        // Bare bound (no operator falls through to Op::Eq); same rejection path.
+        assert!(Range::parse("1.0.0-r0").is_err());
     }
 }
 
