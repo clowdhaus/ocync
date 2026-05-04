@@ -9,12 +9,12 @@ pub mod error;
 pub mod filter;
 /// Sync planning and transfer ordering.
 pub mod plan;
-/// Tag-version parser, comparator, and range matcher.
-pub(crate) mod version;
 /// Progress reporting trait and types.
 pub mod progress;
 /// Retry configuration and backoff logic.
 pub mod retry;
+/// Tag-version parser, comparator, and range matcher.
+pub(crate) mod version;
 
 /// Sync engine - pipelined concurrent orchestration of image transfers.
 pub mod engine;

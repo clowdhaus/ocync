@@ -37,7 +37,9 @@ fn build_system_exclude_set() -> GlobSet {
             .expect("system-exclude pattern is statically valid");
         builder.add(g);
     }
-    builder.build().expect("system-exclude GlobSet is statically valid")
+    builder
+        .build()
+        .expect("system-exclude GlobSet is statically valid")
 }
 
 /// Configuration for the tag filter pipeline.
@@ -195,7 +197,6 @@ fn filter_semver<'a>(tags: &[&'a str], range: &str) -> Result<Vec<&'a str>, Erro
         })
         .collect())
 }
-
 
 /// Sort tags in-place in descending order (highest first).
 fn sort_tags_in_place(tags: &mut [&str], order: SortOrder) {
@@ -683,12 +684,7 @@ mod tests {
 
     #[test]
     fn system_exclude_keeps_dev_and_r_revisions() {
-        let tags = vec![
-            "1.0.0-dev",
-            "1.0.0-r0",
-            "1.0.0-edge",
-            "1.0.0-final",
-        ];
+        let tags = vec!["1.0.0-dev", "1.0.0-r0", "1.0.0-edge", "1.0.0-final"];
         let config = FilterConfig {
             semver: Some(">=1.0".into()),
             ..FilterConfig::default()
@@ -771,8 +767,13 @@ mod tests {
         // Pipeline has 5 candidates; latest:2 should keep only the top 2 of
         // the pipeline side. Includes pass through uncapped.
         let tags = vec![
-            "latest", "latest-dev",
-            "1.5.0", "1.4.0", "1.3.0", "1.2.0", "1.1.0",
+            "latest",
+            "latest-dev",
+            "1.5.0",
+            "1.4.0",
+            "1.3.0",
+            "1.2.0",
+            "1.1.0",
         ];
         let config = FilterConfig {
             include: vec!["latest".into(), "latest-dev".into()],
