@@ -49,14 +49,28 @@ tags:
 
 ## Variations
 
-Adding a numeric range cutoff (e.g. "alpine variants of 15 and newer") on top of a variant glob does not work cleanly today. Tags like `15.10-alpine` are not parseable by the strict SemVer parser `ocync` currently uses, so they are dropped at the `semver:` stage with a warning. If you need a version floor on a suffixed tag set, enumerate the major versions in the glob:
+Combine a variant glob with a numeric range cutoff. The lenient parser admits `15.10-alpine` directly (prefix `[15, 10]`), so a `glob` plus `semver` bound work in the same mapping:
 
 ```yaml
 tags:
-  glob: ["15.*-alpine", "16.*-alpine", "17.*-alpine"]
+  glob: ["*-alpine"]
+  semver: ">=15.0"
+  sort: semver
+  latest: 5
 ```
 
-A more permissive version parser that handles `X.Y-suffix` tags is on the roadmap; once it lands, `glob + semver` will combine without enumeration.
+### Match only base versions
+
+To keep plain-numeric tags (`15.10`, `16.0`, `17.1.2`) and drop every dashed-suffix variant in one move, exclude any tag that contains a dash:
+
+```yaml
+tags:
+  semver: ">=15.0"
+  exclude: ["*-*"]
+  sort: semver
+```
+
+The `semver:` stage continues to drop non-version tags like `latest`, `lts-iron`, and `nightly`. The `exclude` patterns drop `15.10-alpine`, `15.10-bullseye-slim`, and any other variant.
 
 ## Related
 
