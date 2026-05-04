@@ -991,6 +991,33 @@ mappings:
             msg.contains("semver_prerelease has been removed"),
             "expected migration hint in error, got: {msg}"
         );
+        assert!(
+            msg.contains("include:"),
+            "expected include: recommendation in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_include_field() {
+        let yaml = r#"
+registries:
+  src: { url: docker.io }
+defaults:
+  source: src
+mappings:
+  - from: lib/redis
+    tags:
+      include: ["latest", "latest-dev"]
+      semver: ">=1.0"
+"#;
+        let cfg = serde_yaml::from_str::<Config>(yaml).expect("config parses");
+        let mapping = &cfg.mappings[0];
+        let include = mapping.tags.as_ref().unwrap().include.as_ref().unwrap();
+        let list = match include {
+            GlobOrList::List(l) => l,
+            GlobOrList::Single(s) => panic!("expected list, got single: {}", s),
+        };
+        assert_eq!(list, &vec!["latest".to_string(), "latest-dev".to_string()]);
     }
 
     #[test]
