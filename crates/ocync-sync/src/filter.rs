@@ -1,6 +1,6 @@
 //! Tag filtering pipeline: glob -> semver -> exclude -> sort + latest.
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -28,12 +28,44 @@ pub enum SortOrder {
     Alpha,
 }
 
+/// Glob patterns excluded from the `glob:`/`semver:` pipeline by default.
+/// Common prerelease markers, matched case-insensitively. Users override
+/// per-tag via `include:`.
+const SYSTEM_EXCLUDE: &[&str] = &[
+    "*-rc*",
+    "*-alpha*",
+    "*-beta*",
+    "*-pre*",
+    "*-snapshot*",
+    "*-nightly*",
+];
+
+fn build_system_exclude_set() -> GlobSet {
+    let mut builder = GlobSetBuilder::new();
+    for pat in SYSTEM_EXCLUDE {
+        let g = GlobBuilder::new(pat)
+            .case_insensitive(true)
+            .build()
+            .expect("system-exclude pattern is statically valid");
+        builder.add(g);
+    }
+    builder.build().expect("system-exclude GlobSet is statically valid")
+}
+
 /// Configuration for the tag filter pipeline.
 ///
 /// All stages are AND (narrowing). Each stage reduces the set:
 /// `glob → semver → exclude → sort → latest → min_tags`.
+/// Tags matching `include:` bypass the glob/semver pipeline (but are still
+/// subject to user `exclude:`).
 #[derive(Debug, Default)]
 pub struct FilterConfig {
+    /// Always-include glob patterns. Tags matching any pattern survive
+    /// `glob:`/`semver:` filters and the system-exclude defaults. Not
+    /// subject to `sort:` or `latest:` truncation (those only cap the
+    /// `glob:`/`semver:` pipeline side). Subject to user `exclude:`. Same
+    /// syntax as `exclude:`.
+    pub include: Vec<String>,
     /// Glob patterns (OR semantics). An empty list passes all tags through.
     pub glob: Vec<String>,
     /// Semver version range constraint (e.g. `>=1.18.0`).
@@ -58,49 +90,76 @@ impl FilterConfig {
     /// `sort`, or fewer tags survive than [`min_tags`](Self::min_tags)
     /// requires.
     pub fn apply(&self, tags: &[&str]) -> Result<Vec<String>, Error> {
-        // 0. Config validation
+        // 0. Config validation.
         if self.latest.is_some() && self.sort.is_none() {
             return Err(Error::LatestWithoutSort);
         }
 
-        // 1. Glob include
-        let mut current: Vec<&str> = if self.glob.is_empty() {
+        // Build user-exclude (optional) and system-exclude.
+        let user_exclude_set = if self.exclude.is_empty() {
+            None
+        } else {
+            Some(build_glob_set(&self.exclude)?)
+        };
+        let system_exclude_set = build_system_exclude_set();
+
+        // 1. include_set: tags matching any include: pattern, minus user-exclude.
+        let include_kept: Vec<&str> = if self.include.is_empty() {
+            Vec::new()
+        } else {
+            let inc_set = build_glob_set(&self.include)?;
+            tags.iter()
+                .copied()
+                .filter(|t| inc_set.is_match(t))
+                .filter(|t| user_exclude_set.as_ref().is_none_or(|s| !s.is_match(t)))
+                .collect()
+        };
+
+        // 2. pipeline_input: glob (default *) AND semver.
+        let mut pipeline: Vec<&str> = if self.glob.is_empty() {
             tags.to_vec()
         } else {
             filter_glob(tags, &self.glob)?
         };
-
-        // 2. Semver filter
         if let Some(ref range) = self.semver {
-            current = filter_semver(&current, range)?;
+            pipeline = filter_semver(&pipeline, range)?;
         }
 
-        // 3. Exclude
-        if !self.exclude.is_empty() {
-            current = filter_exclude(&current, &self.exclude)?;
+        // 3. pipeline minus user-exclude minus system-exclude.
+        if let Some(ref s) = user_exclude_set {
+            pipeline.retain(|t| !s.is_match(t));
         }
+        pipeline.retain(|t| !system_exclude_set.is_match(t));
 
-        // 4. Sort
+        // 4. sort + latest cap (pipeline only).
         if let Some(order) = self.sort {
-            sort_tags_in_place(&mut current, order);
+            sort_tags_in_place(&mut pipeline, order);
         }
-
-        // 5. Latest
         if let Some(n) = self.latest {
-            current.truncate(n);
+            pipeline.truncate(n);
         }
 
-        // 6. Min tags validation
+        // 5. Union: include first (preserves include input order), then
+        //    pipeline tags not already in include.
+        let mut seen: std::collections::HashSet<&str> = include_kept.iter().copied().collect();
+        let mut final_set: Vec<&str> = include_kept.clone();
+        for t in pipeline {
+            if seen.insert(t) {
+                final_set.push(t);
+            }
+        }
+
+        // 6. min_tags validation against the union.
         if let Some(min) = self.min_tags {
-            if current.len() < min {
+            if final_set.len() < min {
                 return Err(Error::BelowMinTags {
-                    matched: current.len(),
+                    matched: final_set.len(),
                     minimum: min,
                 });
             }
         }
 
-        Ok(current.into_iter().map(String::from).collect())
+        Ok(final_set.into_iter().map(String::from).collect())
     }
 }
 
@@ -152,11 +211,6 @@ fn filter_semver<'a>(tags: &[&'a str], range: &str) -> Result<Vec<&'a str>, Erro
         .collect())
 }
 
-/// Exclude tags matching any of the given glob patterns.
-fn filter_exclude<'a>(tags: &[&'a str], patterns: &[String]) -> Result<Vec<&'a str>, Error> {
-    let set = build_glob_set(patterns)?;
-    Ok(tags.iter().copied().filter(|t| !set.is_match(t)).collect())
-}
 
 /// Sort tags in-place in descending order (highest first).
 fn sort_tags_in_place(tags: &mut [&str], order: SortOrder) {
@@ -268,21 +322,22 @@ mod tests {
     #[test]
     fn exclude_basic() {
         let tags = vec!["1.0-alpine", "1.0-slim", "1.0", "1.1-alpine"];
-        let result = filter_exclude(&tags, &["*-alpine".into()]).unwrap();
+        let set = build_glob_set(&["*-alpine".into()]).unwrap();
+        let result: Vec<&str> = tags.into_iter().filter(|t| !set.is_match(t)).collect();
         assert_eq!(result, vec!["1.0-slim", "1.0"]);
     }
 
     #[test]
     fn exclude_multiple_patterns() {
         let tags = vec!["1.0-alpine", "1.0-slim", "1.0", "nightly"];
-        let result = filter_exclude(&tags, &["*-alpine".into(), "nightly".into()]).unwrap();
+        let set = build_glob_set(&["*-alpine".into(), "nightly".into()]).unwrap();
+        let result: Vec<&str> = tags.into_iter().filter(|t| !set.is_match(t)).collect();
         assert_eq!(result, vec!["1.0-slim", "1.0"]);
     }
 
     #[test]
     fn exclude_invalid_pattern_returns_error() {
-        let tags = vec!["1.0"];
-        let err = filter_exclude(&tags, &["[bad".into()]).unwrap_err();
+        let err = build_glob_set(&["[bad".into()]).unwrap_err();
         assert!(matches!(err, Error::InvalidGlob { .. }));
     }
 
