@@ -36,12 +36,12 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
     for mapping in &config.mappings {
         validate_mapping(mapping, has_default_tags)?;
         if let Some(ref tags) = mapping.tags {
-            validate_tags(tags)?;
+            validate_tags(&format!("mapping '{}'", mapping.from), tags)?;
         }
     }
     if let Some(ref defaults) = config.defaults {
         if let Some(ref tags) = defaults.tags {
-            validate_tags(tags)?;
+            validate_tags("defaults", tags)?;
         }
         if let Some(ref platforms) = defaults.platforms {
             validate_platforms("defaults", platforms)?;
@@ -409,9 +409,17 @@ pub(crate) struct TagsConfig {
     #[serde(default)]
     pub semver: Option<String>,
 
-    /// Whether to include or exclude semver pre-release tags.
+    /// Always-include glob patterns. Tags matching any pattern survive
+    /// `glob:`/`semver:` filters and the system-exclude defaults. Same syntax
+    /// as `exclude:`. Not subject to `sort:` or `latest:` truncation.
     #[serde(default)]
-    pub semver_prerelease: Option<SemverPrerelease>,
+    pub include: Option<GlobOrList>,
+
+    /// Removed in 2026-05; deserializing a config that still sets this field
+    /// triggers a fail-loud migration error pointing at `include:`.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub semver_prerelease: Option<RemovedSemverPrerelease>,
 
     /// Exclude tags matching one or more glob patterns.
     #[serde(default)]
@@ -443,8 +451,8 @@ impl TagsConfig {
     ///
     /// Returns `Some` when `glob` contains only literal strings (no wildcard
     /// characters) and no other filter fields (`semver`, `latest`, `sort`,
-    /// `min_tags`) are set. In this case the tags can be used directly
-    /// without listing all tags from the registry.
+    /// `min_tags`, `exclude`, `include`) are set. In this case the tags can
+    /// be used directly without listing all tags from the registry.
     pub(crate) fn exact_tags(&self) -> Option<Vec<String>> {
         // Any field that requires the full tag list forces enumeration.
         if self.semver.is_some()
@@ -452,6 +460,7 @@ impl TagsConfig {
             || self.sort.is_some()
             || self.min_tags.is_some()
             || self.exclude.is_some()
+            || self.include.is_some()
         {
             return None;
         }
@@ -480,7 +489,40 @@ pub(crate) enum GlobOrList {
     List(Vec<String>),
 }
 
-use ocync_sync::filter::{SemverPrerelease, SortOrder};
+use ocync_sync::filter::SortOrder;
+
+/// Placeholder type for the removed `tags.semver_prerelease` field. Triggers
+/// a custom Deserialize error if the field appears in user config, with a
+/// migration hint pointing at the new `include:` mechanism.
+#[derive(Debug)]
+pub(crate) struct RemovedSemverPrerelease;
+
+impl<'de> Deserialize<'de> for RemovedSemverPrerelease {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Consume the value so the deserializer is in a clean state.
+        let _: serde::de::IgnoredAny = Deserialize::deserialize(deserializer)?;
+        Err(<D::Error as serde::de::Error>::custom(
+            "tags.semver_prerelease has been removed. \
+             For the previous 'exclude' default (the common case), simply delete this field; \
+             the system-exclude default drops *-rc*, *-alpha*, *-beta*, *-pre*, *-snapshot*, *-nightly* automatically. \
+             For 'include' mode, replace this field with: include: [\"*-rc*\", \"*-alpha*\", \"*-beta*\", \"*-pre*\", \"*-snapshot*\", \"*-nightly*\"]. \
+             For 'only' mode, restrict via glob: e.g., glob: [\"*-rc*\", \"*-alpha*\", \"*-beta*\"] plus include: with the same patterns.",
+        ))
+    }
+}
+
+impl JsonSchema for RemovedSemverPrerelease {
+    fn schema_name() -> String {
+        "RemovedSemverPrerelease".to_owned()
+    }
+
+    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        schemars::schema::Schema::Bool(false)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Environment variable expansion
@@ -720,16 +762,19 @@ fn validate_artifacts(context: &str, artifacts: &ArtifactsConfig) -> Result<(), 
     Ok(())
 }
 
-fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
+fn validate_tags(context: &str, tags: &TagsConfig) -> Result<(), ConfigError> {
     if tags.latest.is_some() && tags.sort.is_none() {
         return Err(ConfigError::Validation(
             "tags.latest requires tags.sort to be set".to_string(),
         ));
     }
-    if tags.semver_prerelease.is_some() && tags.semver.is_none() {
-        return Err(ConfigError::Validation(
-            "tags.semver_prerelease requires tags.semver to be set".to_string(),
-        ));
+    if tags.semver.is_some() && tags.latest.is_none() {
+        tracing::warn!(
+            context,
+            "tags.semver is set without tags.latest: every tag matching the version range will sync. \
+             For long-running mirrors of images with many tags, consider adding 'latest: N' (with 'sort: semver') \
+             to cap output size and reduce bytes transferred"
+        );
     }
     Ok(())
 }
@@ -932,7 +977,7 @@ mappings:
     tags:
       glob: "18.*"
       semver: ">=18.0.0"
-      semver_prerelease: exclude
+      include: "*-rc*"
       exclude: "*-alpine"
       sort: semver
       latest: 5
@@ -941,10 +986,59 @@ mappings:
         let tags = config.mappings[0].tags.as_ref().unwrap();
         assert!(matches!(tags.sort, Some(SortOrder::Semver)));
         assert_eq!(tags.latest, Some(5));
-        assert!(matches!(
-            tags.semver_prerelease,
-            Some(SemverPrerelease::Exclude)
-        ));
+        assert!(matches!(&tags.include, Some(GlobOrList::Single(s)) if s == "*-rc*"));
+    }
+
+    #[test]
+    fn deserialize_semver_prerelease_removed_errors() {
+        let yaml = r#"
+mappings:
+  - from: library/node
+    tags:
+      glob: "18.*"
+      semver_prerelease: exclude
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("semver_prerelease has been removed"),
+            "expected migration hint in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("delete this field"),
+            "expected delete-this-field guidance in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("system-exclude default"),
+            "expected system-exclude default mention in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("include:"),
+            "expected include: recommendation in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_include_field() {
+        let yaml = r#"
+registries:
+  src: { url: docker.io }
+defaults:
+  source: src
+mappings:
+  - from: lib/redis
+    tags:
+      include: ["latest", "latest-dev"]
+      semver: ">=1.0"
+"#;
+        let cfg = serde_yaml::from_str::<Config>(yaml).expect("config parses");
+        let mapping = &cfg.mappings[0];
+        let include = mapping.tags.as_ref().unwrap().include.as_ref().unwrap();
+        let list = match include {
+            GlobOrList::List(l) => l,
+            GlobOrList::Single(s) => panic!("expected list, got single: {}", s),
+        };
+        assert_eq!(list, &vec!["latest".to_string(), "latest-dev".to_string()]);
     }
 
     #[test]
@@ -1164,7 +1258,7 @@ mappings:
             sort: None,
             ..Default::default()
         };
-        let err = validate_tags(&tags).unwrap_err();
+        let err = validate_tags("test", &tags).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
     }
 
@@ -1968,6 +2062,16 @@ mappings:
         let tags = TagsConfig {
             glob: Some(GlobOrList::List(vec!["v1.0".into(), "v2.0".into()])),
             exclude: Some(GlobOrList::Single("v2.0".into())),
+            ..Default::default()
+        };
+        assert!(tags.exact_tags().is_none());
+    }
+
+    #[test]
+    fn exact_tags_with_include_returns_none() {
+        let tags = TagsConfig {
+            glob: Some(GlobOrList::List(vec!["v2.13.0".into()])),
+            include: Some(GlobOrList::Single("latest".into())),
             ..Default::default()
         };
         assert!(tags.exact_tags().is_none());

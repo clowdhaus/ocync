@@ -29,8 +29,8 @@ mappings:
   - from: my-org/my-app
     to: my-app
     tags:
+      include: ["latest", "latest-dev"]
       semver: ">=2.0"
-      semver_prerelease: exclude
       sort: semver
       latest: 10
       min_tags: 1
@@ -38,50 +38,58 @@ mappings:
 
 ## Fields
 
-`semver: ">=2.0"` drops everything below 2.0. Non-semver tags like `latest` and `nightly` are also dropped at this stage, since they cannot be parsed as semver.
+`include: ["latest", "latest-dev"]` always pins these literal floats. They survive the `semver:` filter and the system-exclude defaults.
 
-`semver_prerelease: exclude` drops `2.0.0-rc.1`, `2.0.0-alpha`, and any other prerelease identifier. This is the default - it is spelled out here so the intent is obvious in the config.
+`semver: ">=2.0"` drops everything below 2.0 from the candidate pool. Common prerelease patterns (`*-rc*`, `*-alpha*`, `*-beta*`, `*-pre*`, `*-snapshot*`, `*-nightly*`) drop by default via the system-exclude. Variant suffixes like `-alpine` and `-r0` are admitted (suffix is opaque).
 
-`sort: semver` orders the surviving tags by semantic version, highest first.
+`sort: semver` orders the surviving pipeline tags by version, highest first.
 
-`latest: 10` keeps only the top 10 after sorting. This requires `sort:` to be set.
+`latest: 10` keeps only the top 10 of the pipeline side. Include-pinned floats pass through uncapped.
 
-`min_tags: 1` is a safety net for long-running mirrors. If upstream renames their tag scheme or drops below your range, the sync fails loudly rather than silently producing an empty mirror.
+> **Always set `latest:` for long-running mirrors.** If you omit `latest:`, every tag in the version range is synced -- popular images publish hundreds of variant tags (`-alpine`, `-bullseye-slim`, `-r0`, `-debian-12-r3`, etc.), and a `semver: ">=1.0"` mirror without a cap can sync hundreds of tags on the first run. Caps prevent the mirror from blowing up under variant proliferation.
+
+`min_tags: 1` is a safety net for long-running mirrors. Counts the union of include and pipeline.
 
 ## Variations
 
-The default `exclude` matches npm, cargo, and Masterminds semver. To include pre-releases:
+The default already drops `*-rc*`, `*-alpha*`, `*-beta*`, `*-pre*`, `*-snapshot*`, `*-nightly*` via the system-exclude -- no extra config needed for stable-only:
 
 ```yaml
 tags:
   semver: ">=2.0"
-  semver_prerelease: include    # 2.0.0-rc.1 matches >=2.0.0
   sort: semver
   latest: 10
 ```
 
-`include` mode compares the base version (`2.0.0` for `2.0.0-rc.1`) against the range. So `2.0.0-rc.1` matches `>=2.0.0` but not `<2.0.0`.
-
-To mirror only pre-releases:
+To opt back into all prereleases, add the patterns to `include:` (which overrides the system default):
 
 ```yaml
 tags:
+  include: ["*-rc*", "*-alpha*", "*-beta*", "*-pre*", "*-snapshot*", "*-nightly*"]
   semver: ">=2.0"
-  semver_prerelease: only
+  sort: semver
+  latest: 10
 ```
 
-Chainguard and Wolfi tags use a `-rN` build-revision suffix (`1.25.5-r0`, `1.25.5-r1`). Per the SemVer spec, anything after `-` is a prerelease identifier, so the default `exclude` drops them. To keep the `-rN` revisions while still rejecting the actual release-candidate prereleases:
+To pin a specific RC alongside stable releases:
 
 ```yaml
 tags:
+  include: ["1.25.0-rc1"]
   semver: ">=1.25.0"
-  semver_prerelease: include
-  exclude: ["*-rc*", "*-beta*", "*-alpha*"]
   sort: semver
   latest: 10
 ```
 
-`semver_prerelease: include` keeps the `-rN` tags, and the `exclude:` patterns drop the named prerelease channels. Most Chainguard mirrors converge on this shape.
+Chainguard `-rN` build revisions admit by default; no special configuration:
+
+```yaml
+tags:
+  include: ["latest", "latest-dev"]
+  semver: ">=1.25.0"
+  sort: semver
+  latest: 10
+```
 
 ## Related
 

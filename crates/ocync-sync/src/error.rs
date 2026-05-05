@@ -15,9 +15,9 @@ pub enum Error {
         reason: String,
     },
 
-    /// A semver version range could not be parsed.
-    #[error("invalid semver range '{range}': {reason}")]
-    InvalidSemverRange {
+    /// A version range could not be parsed.
+    #[error("invalid version range '{range}': {reason}")]
+    InvalidVersionRange {
         /// The range string that failed to parse.
         range: String,
         /// Why the range is invalid.
@@ -118,8 +118,8 @@ mod tests {
     }
 
     #[test]
-    fn display_invalid_semver_range() {
-        let err = Error::InvalidSemverRange {
+    fn display_invalid_version_range() {
+        let err = Error::InvalidVersionRange {
             range: ">= oops".into(),
             reason: "unexpected character".into(),
         };

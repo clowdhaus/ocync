@@ -55,7 +55,6 @@ defaults:
     - linux/arm64
   tags:
     semver: ">=1.0"
-    semver_prerelease: include   # cgr.dev tags carry -rN build suffixes
     sort: semver
     latest: 10
 
@@ -162,7 +161,6 @@ defaults:
   tags:
     glob: "*"                  # Glob pattern
     semver: ">=1.0"            # Semver range
-    semver_prerelease: exclude # Pre-release handling
     exclude:                   # Exclude patterns
       - "*-debug"
     sort: semver               # Sort order: semver, alpha
@@ -265,23 +263,22 @@ defaults:
 
 ## Tag filtering
 
-Tags are filtered through a pipeline in order:
+Tags are filtered through a pipeline:
 
-1. **glob**: include tags matching the glob pattern (string or list)
-2. **semver**: include tags satisfying the semver range
-3. **semver_prerelease**: control pre-release tag handling when `semver` is set
-4. **exclude**: remove tags matching any exclude pattern (string or list)
-5. **sort**: order remaining tags (`semver`, `alpha`)
-6. **latest**: keep only the N most recent after sorting
-7. **min_tags**: validate at least N tags survived the pipeline (error if fewer)
+1. **glob + semver**: build the candidate pool by intersecting the glob match set (default `*`) with the version range
+2. **exclude**: remove tags matching any user `exclude` pattern OR any default-exclude pattern (see below)
+3. **sort**: order the pool (`semver` or `alpha`)
+4. **latest**: keep only the N most recent of the pool
+5. **include**: union always-include tag matches into the result (not subject to `glob`, `semver`, default-excludes, `sort`, or `latest`); still subject to user `exclude`
+6. **min_tags**: validate the final union has at least N tags (error if fewer)
 
 All filters are optional. Without any filters, all tags are synced.
 
 | Field | Type | Description |
 |---|---|---|
 | `glob` | string or list | Include tags matching glob pattern(s). A single string or a list of patterns |
-| `semver` | string | Include tags satisfying a semver range (e.g., `">=1.0"`, `"^2"`, `"1.x"`) |
-| `semver_prerelease` | string | How to handle pre-release tags when `semver` is set. Values: `include`, `exclude`, `only`. Default: `exclude`. Requires `semver` to be set |
+| `include` | string or list | Always-include glob pattern(s). Tags matching any pattern survive `glob:`/`semver:` filters and the system-exclude defaults. Same syntax as `exclude:` |
+| `semver` | string | Include tags satisfying a version range. Operators: `>=`, `<=`, `>`, `<`, `=`. Comma-joined for AND-narrowing. Example: `">=1.0, <2.0"` |
 | `exclude` | string or list | Remove tags matching these glob pattern(s) |
 | `sort` | string | Sort order for remaining tags: `semver` or `alpha` |
 | `latest` | integer | Keep only the N most recent tags after sorting |
@@ -289,10 +286,33 @@ All filters are optional. Without any filters, all tags are synced.
 | `immutable_tags` | string | Glob pattern marking tags that never change content (e.g. `"v?[0-9]*.[0-9]*.[0-9]*"`). When a tag matches AND already exists in **every** target's tag list, the sync skips it with zero source and target requests. Useful for long-running mirrors of registries that publish many semver-pinned tags |
 
 **Validation constraints:**
-- `semver_prerelease` requires `semver` to be set
 - `latest` requires `sort` to be set
 
+### Capping output size
+
+`latest:` is optional, but mirrors with `semver:` and no `latest:` cap will sync every tag matching the version range. Under the lenient parser, popular images often publish hundreds of variant tags (`-alpine`, `-r0`, `-debian-12-rN`, `-bookworm-slim`, etc.). For long-running mirrors, set `latest: N` (with `sort: semver`) to cap output size. ocync emits a startup warning when `semver:` is set without `latest:`.
+
 **Override semantics:** when a mapping defines `tags:`, the entire block replaces `defaults.tags` - fields are not merged. If you want a mapping to inherit some default fields and override others, repeat the inherited fields in the mapping's `tags:` block.
+
+### Default-exclude patterns
+
+ocync drops common prerelease-marker tag patterns by default to keep mirrors focused on stable releases. The default-exclude list (case-insensitive) is:
+
+- `*-rc*`
+- `*-alpha*`
+- `*-beta*`
+- `*-pre*`
+- `*-snapshot*`
+- `*-nightly*`
+
+Patterns deliberately NOT in the default list (still admitted unless you exclude them yourself):
+
+- `*-dev*` -- Chainguard publishes `latest-dev` and `1.25.5-dev` as stable variants
+- `*-edge*` -- Alpine rolling stable channel
+- `*-final*` -- Java stable marker
+- `-r<N>` -- Chainguard/Bitnami build counters
+
+To opt back into prereleases, add them to `include:` (which overrides the default-exclude). To pin a single prerelease tag for testing, add the exact tag string to `include:`. To add custom exclude patterns on top of the defaults, use `exclude:`.
 
 ## Environment variables
 
@@ -316,7 +336,7 @@ The `DOCKER_CONFIG` environment variable controls the Docker config file locatio
 
 ### Chainguard to ECR
 
-Single region. Sync a curated set of Chainguard base images to ECR, keeping the latest 5 semver-pinned tags for `linux/amd64` and `linux/arm64`. Chainguard tags carry a `-rN` build-revision suffix (`1.25.5-r0`, `1.25.5-r1`); the SemVer spec treats anything after `-` as a prerelease, so `semver_prerelease: include` is required for any `cgr.dev` tag to survive a `semver:` range:
+Single region. Sync a curated set of Chainguard base images to ECR, keeping the latest 5 stable releases plus the `latest`/`latest-dev` floats for `linux/amd64` and `linux/arm64`. Chainguard's `-rN` build-revision suffix admits directly under the lenient parser:
 
 ```yaml
 registries:
@@ -332,8 +352,8 @@ defaults:
     - linux/amd64
     - linux/arm64
   tags:
+    include: ["latest", "latest-dev"]
     semver: ">=1.0"
-    semver_prerelease: include
     sort: semver
     latest: 5
 

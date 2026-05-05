@@ -451,9 +451,9 @@ fn build_filter(tags: Option<&TagsConfig>) -> FilterConfig {
     };
 
     FilterConfig {
+        include: glob_or_list_to_vec(tags.include.as_ref()),
         glob: glob_or_list_to_vec(tags.glob.as_ref()),
         semver: tags.semver.clone(),
-        semver_prerelease: tags.semver_prerelease,
         exclude: glob_or_list_to_vec(tags.exclude.as_ref()),
         sort: tags.sort,
         latest: tags.latest,
@@ -634,26 +634,76 @@ mod tests {
 
     #[test]
     fn build_filter_full() {
-        use ocync_sync::filter::{SemverPrerelease, SortOrder};
+        use ocync_sync::filter::SortOrder;
 
         let tags = TagsConfig {
+            include: Some(GlobOrList::List(vec!["latest".into()])),
             glob: Some(GlobOrList::Single("*".into())),
             semver: Some(">=1.0.0".into()),
-            semver_prerelease: Some(SemverPrerelease::Exclude),
             exclude: Some(GlobOrList::Single("*-alpine".into())),
             sort: Some(SortOrder::Semver),
             latest: Some(5),
             min_tags: Some(1),
             immutable_tags: None,
+            ..Default::default()
         };
         let filter = build_filter(Some(&tags));
+        assert_eq!(filter.include, vec!["latest"]);
         assert_eq!(filter.glob, vec!["*"]);
         assert_eq!(filter.semver.as_deref(), Some(">=1.0.0"));
-        assert_eq!(filter.semver_prerelease, Some(SemverPrerelease::Exclude));
         assert_eq!(filter.exclude, vec!["*-alpine"]);
         assert_eq!(filter.sort, Some(SortOrder::Semver));
         assert_eq!(filter.latest, Some(5));
         assert_eq!(filter.min_tags, Some(1));
+    }
+
+    /// End-to-end: a `TagsConfig` with `include:` + `semver:` builds a
+    /// `FilterConfig` that, when applied to a tag list, returns both the
+    /// pinned literals and the version-range matches.
+    #[test]
+    fn build_filter_include_pin_plus_range_full_flow() {
+        let tags_yaml = r#"
+include: ["latest", "latest-dev"]
+semver: ">=1.25.0"
+sort: semver
+latest: 5
+"#;
+        let tags: TagsConfig = serde_yaml::from_str(tags_yaml).expect("yaml parses");
+        let filter = build_filter(Some(&tags));
+
+        // Confirm the FilterConfig was built with the right include patterns.
+        assert_eq!(
+            filter.include,
+            vec!["latest".to_string(), "latest-dev".to_string()]
+        );
+
+        // Apply against a synthesized tag list and verify both arms work.
+        let candidate_tags = vec![
+            "latest",
+            "latest-dev",
+            "1.25.5-r0",
+            "1.25.4",
+            "1.25.3",
+            "1.25.2",
+            "1.25.1",
+            "1.25.0",
+            "1.24.0",     // below range, drops
+            "1.25.5-rc1", // RC, dropped by system-exclude
+        ];
+        let result = filter.apply(&candidate_tags).expect("filter applies");
+
+        // Floats survive via include.
+        assert!(result.contains(&"latest".to_string()));
+        assert!(result.contains(&"latest-dev".to_string()));
+        // Top 5 of the version range (1.25.5-r0 sorts above 1.25.5-rc1 if rc1
+        // weren't dropped, but rc1 IS dropped, so we expect 1.25.0..1.25.5-r0).
+        assert!(result.contains(&"1.25.5-r0".to_string()));
+        // Below range: dropped.
+        assert!(!result.contains(&"1.24.0".to_string()));
+        // RC: dropped by system-exclude.
+        assert!(!result.contains(&"1.25.5-rc1".to_string()));
+        // 5 versions + 2 floats = 7.
+        assert_eq!(result.len(), 7);
     }
 
     #[test]

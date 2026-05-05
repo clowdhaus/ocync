@@ -1,22 +1,13 @@
 //! Tag filtering pipeline: glob -> semver -> exclude -> sort + latest.
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::Error;
-
-/// How to handle semver pre-release tags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum SemverPrerelease {
-    /// Include pre-release tags in results.
-    Include,
-    /// Exclude pre-release tags from results.
-    Exclude,
-    /// Return only pre-release tags.
-    Only,
-}
 
 /// Sort order for the final tag list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -28,19 +19,53 @@ pub enum SortOrder {
     Alpha,
 }
 
+/// Glob patterns excluded from the `glob:`/`semver:` pipeline by default.
+/// Common prerelease markers, matched case-insensitively. Users override
+/// per-tag via `include:`.
+const SYSTEM_EXCLUDE: &[&str] = &[
+    "*-rc*",
+    "*-alpha*",
+    "*-beta*",
+    "*-pre*",
+    "*-snapshot*",
+    "*-nightly*",
+];
+
+fn system_exclude_set() -> &'static GlobSet {
+    static SET: OnceLock<GlobSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        let mut builder = GlobSetBuilder::new();
+        for pat in SYSTEM_EXCLUDE {
+            let g = GlobBuilder::new(pat)
+                .case_insensitive(true)
+                .build()
+                .expect("system-exclude pattern is statically valid");
+            builder.add(g);
+        }
+        builder
+            .build()
+            .expect("system-exclude GlobSet is statically valid")
+    })
+}
+
 /// Configuration for the tag filter pipeline.
 ///
 /// All stages are AND (narrowing). Each stage reduces the set:
 /// `glob → semver → exclude → sort → latest → min_tags`.
+/// Tags matching `include:` bypass the glob/semver pipeline (but are still
+/// subject to user `exclude:`).
 #[derive(Debug, Default)]
 pub struct FilterConfig {
+    /// Always-include glob patterns. Tags matching any pattern survive
+    /// `glob:`/`semver:` filters and the system-exclude defaults. Not
+    /// subject to `sort:` or `latest:` truncation (those only cap the
+    /// `glob:`/`semver:` pipeline side). Subject to user `exclude:`. Same
+    /// syntax as `exclude:`.
+    pub include: Vec<String>,
     /// Glob patterns (OR semantics). An empty list passes all tags through.
     pub glob: Vec<String>,
     /// Semver version range constraint (e.g. `>=1.18.0`).
     pub semver: Option<String>,
-    /// Pre-release handling. Defaults to [`SemverPrerelease::Exclude`] when
-    /// a `semver` range is set.
-    pub semver_prerelease: Option<SemverPrerelease>,
     /// Exclude patterns (OR deny).
     pub exclude: Vec<String>,
     /// Sort order.
@@ -58,53 +83,75 @@ impl FilterConfig {
     /// `sort`, or fewer tags survive than [`min_tags`](Self::min_tags)
     /// requires.
     pub fn apply(&self, tags: &[&str]) -> Result<Vec<String>, Error> {
-        // 0. Config validation
+        // 0. Config validation.
         if self.latest.is_some() && self.sort.is_none() {
             return Err(Error::LatestWithoutSort);
         }
 
-        // 1. Glob include
-        let mut current: Vec<&str> = if self.glob.is_empty() {
+        // Build user-exclude (optional) and system-exclude.
+        let user_exclude_set = if self.exclude.is_empty() {
+            None
+        } else {
+            Some(build_glob_set(&self.exclude)?)
+        };
+        let sys_exclude = system_exclude_set();
+
+        // 1. include_set: tags matching any include: pattern, minus user-exclude.
+        let include_kept: Vec<&str> = if self.include.is_empty() {
+            Vec::new()
+        } else {
+            let inc_set = build_glob_set(&self.include)?;
+            tags.iter()
+                .copied()
+                .filter(|t| inc_set.is_match(t))
+                .filter(|t| user_exclude_set.as_ref().is_none_or(|s| !s.is_match(t)))
+                .collect()
+        };
+
+        // 2. pipeline_input: glob (default *) AND semver.
+        let mut pipeline: Vec<&str> = if self.glob.is_empty() {
             tags.to_vec()
         } else {
             filter_glob(tags, &self.glob)?
         };
-
-        // 2. Semver filter
         if let Some(ref range) = self.semver {
-            current = filter_semver(
-                &current,
-                range,
-                self.semver_prerelease.unwrap_or(SemverPrerelease::Exclude),
-            )?;
+            pipeline = filter_semver(&pipeline, range)?;
         }
 
-        // 3. Exclude
-        if !self.exclude.is_empty() {
-            current = filter_exclude(&current, &self.exclude)?;
-        }
+        // 3. pipeline minus user-exclude minus system-exclude (one pass).
+        pipeline.retain(|t| {
+            user_exclude_set.as_ref().is_none_or(|s| !s.is_match(t)) && !sys_exclude.is_match(t)
+        });
 
-        // 4. Sort
+        // 4. sort + latest cap (pipeline only).
         if let Some(order) = self.sort {
-            sort_tags_in_place(&mut current, order);
+            sort_tags_in_place(&mut pipeline, order);
         }
-
-        // 5. Latest
         if let Some(n) = self.latest {
-            current.truncate(n);
+            pipeline.truncate(n);
         }
 
-        // 6. Min tags validation
+        // 5. Union: include first (preserves include input order), then
+        //    pipeline tags not already in include.
+        let mut seen: HashSet<&str> = include_kept.iter().copied().collect();
+        let mut final_set: Vec<&str> = include_kept;
+        for t in pipeline {
+            if seen.insert(t) {
+                final_set.push(t);
+            }
+        }
+
+        // 6. min_tags validation against the union.
         if let Some(min) = self.min_tags {
-            if current.len() < min {
+            if final_set.len() < min {
                 return Err(Error::BelowMinTags {
-                    matched: current.len(),
+                    matched: final_set.len(),
                     minimum: min,
                 });
             }
         }
 
-        Ok(current.into_iter().map(String::from).collect())
+        Ok(final_set.into_iter().map(String::from).collect())
     }
 }
 
@@ -134,24 +181,11 @@ fn filter_glob<'a>(tags: &[&'a str], patterns: &[String]) -> Result<Vec<&'a str>
     Ok(tags.iter().copied().filter(|t| set.is_match(t)).collect())
 }
 
-/// Filter tags by a semver version range, with pre-release handling.
+/// Filter tags by a version range.
 ///
-/// Tags that cannot be parsed as semver are dropped with a warning.
-///
-/// # Pre-release matching
-///
-/// When `prerelease` is [`SemverPrerelease::Include`] or
-/// [`SemverPrerelease::Only`], pre-release tags are matched by comparing
-/// their **base version** (major.minor.patch) against the range. This means
-/// `1.0.0-rc1` matches `>=1.0.0` (base `1.0.0` satisfies the range), but
-/// `2.0.0-rc1` does NOT match `<2.0.0` (base `2.0.0` fails the range).
-/// This is consistent with how regsync and dregsy handle pre-releases.
-fn filter_semver<'a>(
-    tags: &[&'a str],
-    range: &str,
-    prerelease: SemverPrerelease,
-) -> Result<Vec<&'a str>, Error> {
-    let req = semver::VersionReq::parse(range).map_err(|e| Error::InvalidSemverRange {
+/// Tags that cannot be parsed as a version are dropped with a warning.
+fn filter_semver<'a>(tags: &[&'a str], range: &str) -> Result<Vec<&'a str>, Error> {
+    let req = crate::version::Range::parse(range).map_err(|e| Error::InvalidVersionRange {
         range: range.to_owned(),
         reason: e.to_string(),
     })?;
@@ -160,74 +194,39 @@ fn filter_semver<'a>(
         .iter()
         .copied()
         .filter(|tag| {
-            let Some(ver) = parse_semver(tag) else {
-                warn!(tag, "tag is not parseable as semver, dropping");
+            let Some(ver) = crate::version::TagVersion::parse(tag) else {
+                warn!(tag, "tag is not parseable as a version, dropping");
                 return false;
             };
-            let has_pre = !ver.pre.is_empty();
-            match prerelease {
-                SemverPrerelease::Exclude if has_pre => return false,
-                SemverPrerelease::Only if !has_pre => return false,
-                _ => {}
-            }
-            // The semver crate doesn't match pre-releases against ranges
-            // without pre-release specifiers, so compare the base version
-            // when the user wants to include them.
-            if has_pre && prerelease != SemverPrerelease::Exclude {
-                let base = semver::Version::new(ver.major, ver.minor, ver.patch);
-                req.matches(&base)
-            } else {
-                req.matches(&ver)
-            }
+            req.matches(&ver)
         })
         .collect())
 }
 
-/// Exclude tags matching any of the given glob patterns.
-fn filter_exclude<'a>(tags: &[&'a str], patterns: &[String]) -> Result<Vec<&'a str>, Error> {
-    let set = build_glob_set(patterns)?;
-    Ok(tags.iter().copied().filter(|t| !set.is_match(t)).collect())
-}
-
 /// Sort tags in-place in descending order (highest first).
 fn sort_tags_in_place(tags: &mut [&str], order: SortOrder) {
+    use crate::version::TagVersion;
+    use std::cmp::Ordering;
+
     match order {
         SortOrder::Semver => {
-            tags.sort_by(|a, b| {
-                let va = parse_semver(a);
-                let vb = parse_semver(b);
-                match (va, vb) {
-                    (Some(va), Some(vb)) => vb.cmp(&va), // descending
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => b.cmp(a), // alpha-descending fallback
-                }
+            // Parse each tag once, sort on the parsed value, then write back.
+            let mut decorated: Vec<(Option<TagVersion<'_>>, &str)> =
+                tags.iter().map(|t| (TagVersion::parse(t), *t)).collect();
+            decorated.sort_by(|(va, ta), (vb, tb)| match (va, vb) {
+                (Some(a), Some(b)) => TagVersion::compare(b, a), // descending
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => tb.cmp(ta), // alpha-descending fallback
             });
+            for (i, (_, tag)) in decorated.into_iter().enumerate() {
+                tags[i] = tag;
+            }
         }
         SortOrder::Alpha => {
-            tags.sort_by(|a, b| b.cmp(a)); // descending
+            tags.sort_by(|a, b| b.cmp(a));
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Semver parse helper
-// ---------------------------------------------------------------------------
-
-/// Parse a tag as semver, stripping an optional `v` prefix and normalising
-/// two-part versions (`X.Y` -> `X.Y.0`).
-fn parse_semver(tag: &str) -> Option<semver::Version> {
-    let s = tag.strip_prefix('v').unwrap_or(tag);
-    if let Ok(v) = semver::Version::parse(s) {
-        return Some(v);
-    }
-    // Try X.Y -> X.Y.0 (only pure numeric two-part, no pre-release suffix).
-    let parts: Vec<&str> = s.splitn(3, '.').collect();
-    if parts.len() == 2 {
-        let normalised = format!("{}.{}.0", parts[0], parts[1]);
-        return semver::Version::parse(&normalised).ok();
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -273,106 +272,42 @@ mod tests {
     #[test]
     fn semver_range_filter() {
         let tags = vec!["1.18.0", "1.19.0", "1.20.0", "1.17.0"];
-        let result = filter_semver(&tags, ">=1.18.0", SemverPrerelease::Exclude).unwrap();
+        let result = filter_semver(&tags, ">=1.18.0").unwrap();
         assert_eq!(result, vec!["1.18.0", "1.19.0", "1.20.0"]);
     }
 
     #[test]
     fn semver_v_prefix_stripped() {
         let tags = vec!["v1.0.0", "v2.0.0", "v3.0.0"];
-        let result = filter_semver(&tags, ">=2.0.0", SemverPrerelease::Exclude).unwrap();
+        let result = filter_semver(&tags, ">=2.0.0").unwrap();
         assert_eq!(result, vec!["v2.0.0", "v3.0.0"]);
     }
 
     #[test]
     fn semver_two_part_normalised() {
         let tags = vec!["1.18", "1.19", "1.20"];
-        let result = filter_semver(&tags, ">=1.19.0", SemverPrerelease::Exclude).unwrap();
+        let result = filter_semver(&tags, ">=1.19.0").unwrap();
         assert_eq!(result, vec!["1.19", "1.20"]);
     }
 
     #[test]
     fn semver_invalid_range_returns_error() {
         let tags = vec!["1.0.0"];
-        let err = filter_semver(&tags, ">= not_a_version", SemverPrerelease::Exclude).unwrap_err();
-        assert!(matches!(err, Error::InvalidSemverRange { .. }));
+        let err = filter_semver(&tags, ">= not_a_version").unwrap_err();
+        assert!(matches!(err, Error::InvalidVersionRange { .. }));
     }
 
     #[test]
     fn semver_non_parseable_tags_dropped() {
         let tags = vec!["latest", "nightly", "1.0.0", "2.0.0"];
-        let result = filter_semver(&tags, ">=1.0.0", SemverPrerelease::Exclude).unwrap();
+        let result = filter_semver(&tags, ">=1.0.0").unwrap();
         assert_eq!(result, vec!["1.0.0", "2.0.0"]);
     }
 
     #[test]
     fn semver_empty_tags() {
-        let result = filter_semver(&[], ">=1.0.0", SemverPrerelease::Exclude).unwrap();
+        let result = filter_semver(&[], ">=1.0.0").unwrap();
         assert!(result.is_empty());
-    }
-
-    // - prerelease tests --------------------------------------------------
-
-    #[test]
-    fn prerelease_include() {
-        let tags = vec!["1.0.0", "1.1.0-rc1", "1.2.0"];
-        let result = filter_semver(&tags, ">=1.0.0", SemverPrerelease::Include).unwrap();
-        assert_eq!(result, vec!["1.0.0", "1.1.0-rc1", "1.2.0"]);
-    }
-
-    #[test]
-    fn prerelease_exclude() {
-        let tags = vec!["1.0.0", "1.1.0-rc1", "1.2.0"];
-        let result = filter_semver(&tags, ">=1.0.0", SemverPrerelease::Exclude).unwrap();
-        assert_eq!(result, vec!["1.0.0", "1.2.0"]);
-    }
-
-    #[test]
-    fn prerelease_only() {
-        let tags = vec!["1.0.0", "1.1.0-rc1", "1.2.0-beta2"];
-        let result = filter_semver(&tags, ">=1.0.0", SemverPrerelease::Only).unwrap();
-        assert_eq!(result, vec!["1.1.0-rc1", "1.2.0-beta2"]);
-    }
-
-    /// Docker convention: `1.0.0-alpine` parses as a semver pre-release.
-    /// `SemverPrerelease::Exclude` drops these. Users who want to keep
-    /// variant suffixes like `-alpine` or `-slim` while excluding actual
-    /// pre-releases (`-rc1`, `-beta2`) should leave prerelease as `Include`
-    /// and use the exclude stage with globs like `*-rc*`.
-    #[test]
-    fn prerelease_alpine_suffix_treated_as_prerelease() {
-        let tags = vec!["1.0.0", "1.0.0-alpine", "1.0.0-slim"];
-        let result = filter_semver(&tags, ">=1.0.0", SemverPrerelease::Exclude).unwrap();
-        assert_eq!(result, vec!["1.0.0"]);
-    }
-
-    /// `1.1.0-rc1` matches `>=1.1.0` with `Include` because the base
-    /// version `1.1.0` satisfies the range.
-    #[test]
-    fn prerelease_include_matches_base_range() {
-        let tags = vec!["1.0.0", "1.1.0-rc1", "1.2.0-beta1"];
-        let result = filter_semver(&tags, ">=1.1.0", SemverPrerelease::Include).unwrap();
-        assert_eq!(result, vec!["1.1.0-rc1", "1.2.0-beta1"]);
-    }
-
-    /// `1.0.9-rc1` does NOT match `>=1.1.0` even with `Include`, because
-    /// the base version `1.0.9` is below the range.
-    #[test]
-    fn prerelease_include_below_range_excluded() {
-        let tags = vec!["1.0.9-rc1", "1.1.0-rc1"];
-        let result = filter_semver(&tags, ">=1.1.0", SemverPrerelease::Include).unwrap();
-        assert_eq!(result, vec!["1.1.0-rc1"]);
-    }
-
-    /// Pre-release matching uses base-version comparison: `2.0.0-rc1` has
-    /// base `2.0.0` which does NOT match `<2.0.0`, so it is excluded.
-    /// This is consistent with regsync and dregsy behavior. Users who need
-    /// `2.0.0-rc1` can use `<2.1.0` or add it via a separate glob pattern.
-    #[test]
-    fn prerelease_include_upper_bound_uses_base_version() {
-        let tags = vec!["1.9.0", "2.0.0-rc1", "2.0.0"];
-        let result = filter_semver(&tags, "<2.0.0", SemverPrerelease::Include).unwrap();
-        assert_eq!(result, vec!["1.9.0"]);
     }
 
     // - exclude tests -----------------------------------------------------
@@ -380,21 +315,22 @@ mod tests {
     #[test]
     fn exclude_basic() {
         let tags = vec!["1.0-alpine", "1.0-slim", "1.0", "1.1-alpine"];
-        let result = filter_exclude(&tags, &["*-alpine".into()]).unwrap();
+        let set = build_glob_set(&["*-alpine".into()]).unwrap();
+        let result: Vec<&str> = tags.into_iter().filter(|t| !set.is_match(t)).collect();
         assert_eq!(result, vec!["1.0-slim", "1.0"]);
     }
 
     #[test]
     fn exclude_multiple_patterns() {
         let tags = vec!["1.0-alpine", "1.0-slim", "1.0", "nightly"];
-        let result = filter_exclude(&tags, &["*-alpine".into(), "nightly".into()]).unwrap();
+        let set = build_glob_set(&["*-alpine".into(), "nightly".into()]).unwrap();
+        let result: Vec<&str> = tags.into_iter().filter(|t| !set.is_match(t)).collect();
         assert_eq!(result, vec!["1.0-slim", "1.0"]);
     }
 
     #[test]
     fn exclude_invalid_pattern_returns_error() {
-        let tags = vec!["1.0"];
-        let err = filter_exclude(&tags, &["[bad".into()]).unwrap_err();
+        let err = build_glob_set(&["[bad".into()]).unwrap_err();
         assert!(matches!(err, Error::InvalidGlob { .. }));
     }
 
@@ -430,9 +366,10 @@ mod tests {
         assert_eq!(tags, vec!["v3.0.0", "v2.0.0", "v1.0.0"]);
     }
 
-    /// Pre-release tags sort below their base version: `1.0.0-rc1 < 1.0.0`.
+    /// Tags with `-rc1`/`-alpha`/`-beta` suffixes sort below their base
+    /// version and in descending suffix order within the same base.
     #[test]
-    fn sort_semver_prerelease_ordering() {
+    fn sort_semver_suffix_tags_descending() {
         let mut tags = vec!["1.0.0", "1.0.0-rc1", "1.0.0-alpha", "1.1.0-beta1", "1.1.0"];
         sort_tags_in_place(&mut tags, SortOrder::Semver);
         assert_eq!(
@@ -457,64 +394,11 @@ mod tests {
         assert_eq!(tags, vec!["2.0.0", "v1.5.0", "v1.0.0"]);
     }
 
-    // - prerelease + range edge cases -------------------------------------
-
-    /// `Only` mode with a narrowing range drops pre-releases whose base
-    /// version is below the range AND drops stable versions.
-    #[test]
-    fn prerelease_only_with_narrowing_range() {
-        let tags = vec!["1.0.0-rc1", "1.2.0-rc1", "1.3.0"];
-        let result = filter_semver(&tags, ">=1.2.0", SemverPrerelease::Only).unwrap();
-        assert_eq!(result, vec!["1.2.0-rc1"]);
-    }
-
-    // - recommended workflow: Include + exclude globs ---------------------
-
-    /// The documented workflow for keeping `-alpine`/`-slim` while excluding
-    /// actual pre-releases: use `SemverPrerelease::Include` with exclude
-    /// globs for `*-rc*`, `*-beta*`, etc.
-    #[test]
-    fn pipeline_include_prerelease_exclude_rc() {
-        let tags = vec![
-            "1.0.0",
-            "1.0.0-alpine",
-            "1.0.0-slim",
-            "1.1.0-rc1",
-            "1.1.0-beta1",
-        ];
-        let config = FilterConfig {
-            semver: Some(">=1.0.0".into()),
-            semver_prerelease: Some(SemverPrerelease::Include),
-            exclude: vec!["*-rc*".into(), "*-beta*".into()],
-            ..FilterConfig::default()
-        };
-        let result = config.apply(&tags).unwrap();
-        assert_eq!(result, vec!["1.0.0", "1.0.0-alpine", "1.0.0-slim"]);
-    }
-
-    // - parse_semver edge cases -------------------------------------------
-
-    /// Date-based tags like `20240101` are not valid semver and are dropped.
-    #[test]
-    fn semver_date_tags_dropped() {
-        let tags = vec!["20240101", "1.0.0"];
-        let result = filter_semver(&tags, ">=1.0.0", SemverPrerelease::Exclude).unwrap();
-        assert_eq!(result, vec!["1.0.0"]);
-    }
-
-    /// Build metadata (`+build`) is valid semver and is preserved.
-    #[test]
-    fn semver_build_metadata_parsed() {
-        let tags = vec!["1.0.0+build123", "2.0.0"];
-        let result = filter_semver(&tags, ">=1.0.0", SemverPrerelease::Exclude).unwrap();
-        assert_eq!(result, vec!["1.0.0+build123", "2.0.0"]);
-    }
-
-    /// Empty string and bare `v` are not parseable semver.
+    /// Empty string and bare `v` are not parseable as a version.
     #[test]
     fn semver_empty_and_bare_v_dropped() {
         let tags = vec!["", "v", "1.0.0"];
-        let result = filter_semver(&tags, ">=1.0.0", SemverPrerelease::Exclude).unwrap();
+        let result = filter_semver(&tags, ">=1.0.0").unwrap();
         assert_eq!(result, vec!["1.0.0"]);
     }
 
@@ -542,11 +426,11 @@ mod tests {
         let config = FilterConfig {
             glob: vec!["1.*".into()],
             semver: Some(">=1.18.0".into()),
-            semver_prerelease: Some(SemverPrerelease::Exclude),
-            exclude: vec![],
+            exclude: vec!["*-rc*".into()],
             sort: Some(SortOrder::Semver),
             latest: Some(2),
             min_tags: None,
+            ..FilterConfig::default()
         };
         let result = config.apply(&tags).unwrap();
         assert_eq!(result, vec!["1.20.0", "1.19.0"]);
@@ -579,7 +463,7 @@ mod tests {
             ..FilterConfig::default()
         };
         let err = config.apply(&["1.0.0"]).unwrap_err();
-        assert!(matches!(err, Error::InvalidSemverRange { .. }));
+        assert!(matches!(err, Error::InvalidVersionRange { .. }));
     }
 
     #[test]
@@ -703,5 +587,246 @@ mod tests {
     fn glob_set_invalid_pattern() {
         let err = build_glob_set(&["[bad".into()]).unwrap_err();
         assert!(matches!(err, Error::InvalidGlob { .. }));
+    }
+
+    // - lenient-parser regression tests ----------------------------------
+
+    /// Headline regression: `15.10-alpine` survives `>=15.0` under the
+    /// lenient parser. Today's strict-SemVer parser drops it.
+    #[test]
+    fn filter_semver_keeps_alpine_with_two_part_range() {
+        let tags = vec!["15.10-alpine", "15.10", "14.0-alpine"];
+        let result = filter_semver(&tags, ">=15.0").unwrap();
+        assert_eq!(result, vec!["15.10-alpine", "15.10"]);
+        // Negative assertion: 14.0-alpine drops (below range).
+        assert!(!result.contains(&"14.0-alpine"));
+    }
+
+    /// Chainguard `-rN` build revisions survive `>=N.M.K` directly.
+    #[test]
+    fn filter_semver_keeps_chainguard_revisions() {
+        let tags = vec!["1.25.5-r0", "1.25.5", "1.24.0-r5"];
+        let result = filter_semver(&tags, ">=1.25.0").unwrap();
+        assert_eq!(result, vec!["1.25.5-r0", "1.25.5"]);
+        assert!(!result.contains(&"1.24.0-r5"));
+    }
+
+    /// Eclipse Temurin underscore build is treated as a numeric prefix component.
+    #[test]
+    fn filter_semver_keeps_temurin_underscore_build() {
+        let tags = vec!["25.0.3_9-jre-alpine-3.23", "24.0.1-jre", "25.0.0"];
+        let result = filter_semver(&tags, ">=25.0").unwrap();
+        assert_eq!(result, vec!["25.0.3_9-jre-alpine-3.23", "25.0.0"]);
+        assert!(!result.contains(&"24.0.1-jre"));
+    }
+
+    /// EKS Distro compound suffix sorts numerically on the trailing components.
+    #[test]
+    fn sort_semver_eks_distro_compound_suffix() {
+        let mut tags = vec![
+            "v1.27.6-eks-1-27-9",
+            "v1.27.6-eks-1-27-14",
+            "v1.27.6-eks-1-27-12",
+        ];
+        sort_tags_in_place(&mut tags, SortOrder::Semver);
+        assert_eq!(
+            tags,
+            vec![
+                "v1.27.6-eks-1-27-14",
+                "v1.27.6-eks-1-27-12",
+                "v1.27.6-eks-1-27-9",
+            ]
+        );
+    }
+
+    /// Letter-digit split makes `rc10` sort above `rc9`.
+    #[test]
+    fn sort_semver_rc_above_9() {
+        let mut tags = vec!["1.0.0-rc9", "1.0.0-rc10", "1.0.0-rc1"];
+        sort_tags_in_place(&mut tags, SortOrder::Semver);
+        assert_eq!(tags, vec!["1.0.0-rc10", "1.0.0-rc9", "1.0.0-rc1"]);
+    }
+
+    /// Date-style tags now parse as N-component prefixes (replaces the old
+    /// `semver_date_tags_dropped` test which asserted the opposite).
+    #[test]
+    fn semver_date_tags_parse_as_components() {
+        let tags = vec!["2024.01.15", "2023.12.31", "1.0.0"];
+        let result = filter_semver(&tags, ">=2024.0.0").unwrap();
+        assert_eq!(result, vec!["2024.01.15"]);
+        assert!(!result.contains(&"2023.12.31"));
+        assert!(!result.contains(&"1.0.0"));
+    }
+
+    // - system-exclude tests ---------------------------------------------
+
+    #[test]
+    fn system_exclude_drops_rc_by_default() {
+        let tags = vec![
+            "1.0.0",
+            "1.0.0-rc1",
+            "1.0.0-alpha",
+            "1.0.0-beta",
+            "1.0.0-snapshot",
+            "1.0.0-nightly",
+            "1.0.0-pre",
+        ];
+        let config = FilterConfig {
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["1.0.0"]);
+    }
+
+    #[test]
+    fn system_exclude_case_insensitive() {
+        let tags = vec!["5.0.0-SNAPSHOT", "5.0.0-RC1", "5.0.0-BETA1", "5.0.0"];
+        let config = FilterConfig {
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["5.0.0"]);
+    }
+
+    #[test]
+    fn system_exclude_keeps_dev_and_r_revisions() {
+        let tags = vec!["1.0.0-dev", "1.0.0-r0", "1.0.0-edge", "1.0.0-final"];
+        let config = FilterConfig {
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        // Order matches input; none of these match the default-exclude list.
+        assert!(result.contains(&"1.0.0-dev".to_string()));
+        assert!(result.contains(&"1.0.0-r0".to_string()));
+        assert!(result.contains(&"1.0.0-edge".to_string()));
+        assert!(result.contains(&"1.0.0-final".to_string()));
+        assert_eq!(result.len(), 4);
+    }
+
+    // - include tests -----------------------------------------------------
+
+    #[test]
+    fn include_pin_overrides_system_exclude() {
+        let tags = vec!["1.25.0-rc1", "1.0.0-rc2", "1.25.0"];
+        let config = FilterConfig {
+            include: vec!["1.25.0-rc1".into()],
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        // 1.25.0-rc1 survives via include; 1.0.0-rc2 drops via system-exclude;
+        // 1.25.0 survives via the pipeline.
+        assert!(result.contains(&"1.25.0-rc1".to_string()));
+        assert!(result.contains(&"1.25.0".to_string()));
+        assert!(!result.contains(&"1.0.0-rc2".to_string()));
+    }
+
+    /// `include` survives even when the tag would fail the `semver:` filter
+    /// (e.g., literal `latest` has no numeric prefix).
+    #[test]
+    fn include_pin_overrides_semver() {
+        let tags = vec!["latest", "1.0.0", "0.9.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"latest".to_string()));
+        assert!(result.contains(&"1.0.0".to_string()));
+        assert!(!result.contains(&"0.9.0".to_string()));
+    }
+
+    /// `include` survives even when the tag doesn't match `glob:` (which
+    /// would otherwise restrict the pool).
+    #[test]
+    fn include_pin_overrides_glob() {
+        // glob restricts pool to alpine variants; "latest" wouldn't match.
+        let tags = vec!["latest", "1.0.0-alpine", "1.0.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            glob: vec!["*-alpine".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"latest".to_string()));
+        assert!(result.contains(&"1.0.0-alpine".to_string()));
+        // 1.0.0 fails glob; not in include; not kept.
+        assert!(!result.contains(&"1.0.0".to_string()));
+    }
+
+    #[test]
+    fn user_exclude_wins_over_include() {
+        let tags = vec!["latest", "1.0.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            exclude: vec!["latest".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(!result.contains(&"latest".to_string()));
+    }
+
+    #[test]
+    fn latest_n_does_not_cap_include() {
+        // Pipeline has 5 candidates; latest:2 should keep only the top 2 of
+        // the pipeline side. Includes pass through uncapped.
+        let tags = vec![
+            "latest",
+            "latest-dev",
+            "1.5.0",
+            "1.4.0",
+            "1.3.0",
+            "1.2.0",
+            "1.1.0",
+        ];
+        let config = FilterConfig {
+            include: vec!["latest".into(), "latest-dev".into()],
+            semver: Some(">=1.0".into()),
+            sort: Some(SortOrder::Semver),
+            latest: Some(2),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        // 2 includes + top 2 of pipeline = 4 tags.
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&"latest".to_string()));
+        assert!(result.contains(&"latest-dev".to_string()));
+        // Top 2 of pipeline kept; lower versions dropped by latest:N truncation.
+        assert!(result.contains(&"1.5.0".to_string()));
+        assert!(result.contains(&"1.4.0".to_string()));
+        assert!(!result.contains(&"1.3.0".to_string()));
+        assert!(!result.contains(&"1.2.0".to_string()));
+        assert!(!result.contains(&"1.1.0".to_string()));
+    }
+
+    #[test]
+    fn min_tags_counts_include_and_pipeline() {
+        let tags = vec!["latest", "1.0.0", "1.1.0", "1.2.0", "1.3.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            semver: Some(">=1.0".into()),
+            min_tags: Some(5),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result.len(), 5);
+    }
+
+    /// `HashiCorp` `alpha20241016` tags drop via system-exclude `*-alpha*`
+    /// (the wildcard catches the embedded date stamp).
+    #[test]
+    fn system_exclude_drops_alpha_with_date_stamp() {
+        let tags = vec!["1.10.0", "1.10.0-alpha20241016", "1.9.0-alpha20240501"];
+        let config = FilterConfig {
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["1.10.0"]);
+        assert!(!result.contains(&"1.10.0-alpha20241016".to_string()));
     }
 }

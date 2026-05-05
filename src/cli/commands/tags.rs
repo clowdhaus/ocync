@@ -34,11 +34,10 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     let filter = FilterConfig {
         glob: args.glob.clone(),
         semver: args.semver.clone(),
-        semver_prerelease: None,
         exclude: args.exclude.clone(),
         sort: args.sort.map(|s| s.into()),
         latest: args.latest,
-        min_tags: None,
+        ..FilterConfig::default()
     };
 
     let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
