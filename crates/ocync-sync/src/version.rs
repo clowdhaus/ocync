@@ -1,8 +1,9 @@
 //! Tag-version parser, comparator, and range matcher.
 //!
-//! Replaces the strict-SemVer parser previously used by the filter pipeline.
-//! See `docs/superpowers/specs/2026-05-04-tag-version-parser-design.md`
-//! for the design rationale.
+//! Lenient prefix-based parser for OCI registry tag patterns.
+//! Handles real-world variants (alpine, Chainguard `-rN`, Eclipse Temurin
+//! `_<digits>`, EKS Distro compound suffixes) by treating the suffix as
+//! opaque tokens for ordering only. Range matching is prefix-only.
 
 use std::cmp::Ordering;
 
@@ -31,13 +32,11 @@ impl TagVersion {
             return None;
         }
 
-        // Optional leading 'v' is stripped before prefix parsing.
         let s = tag.strip_prefix('v').unwrap_or(tag);
         if s.is_empty() {
             return None;
         }
 
-        // Prefix region: everything before the first '-'.
         let (prefix_str, suffix_str) = match s.find('-') {
             Some(i) => (&s[..i], Some(&s[i + 1..])),
             None => (s, None),
@@ -62,7 +61,7 @@ impl TagVersion {
     /// Equal) is incompatible with `Ord`'s contract that
     /// `cmp(a, b) == Equal` implies `a == b`.
     pub(crate) fn compare(a: &Self, b: &Self) -> Ordering {
-        // Step 1: numeric prefix, zero-padded to the longer length.
+        // Step 1: numeric prefix (zero-padded).
         let max_len = a.prefix.len().max(b.prefix.len());
         for i in 0..max_len {
             let ai = a.prefix.get(i).copied().unwrap_or(0);
@@ -73,7 +72,7 @@ impl TagVersion {
             }
         }
 
-        // Step 2: suffix presence. Empty suffix wins.
+        // Step 2: suffix presence (empty suffix wins).
         match (a.suffix.is_empty(), b.suffix.is_empty()) {
             (true, true) => return Ordering::Equal,
             (true, false) => return Ordering::Greater,
@@ -81,7 +80,7 @@ impl TagVersion {
             (false, false) => {}
         }
 
-        // Step 3: token-by-token comparison.
+        // Step 3: token-by-token.
         for (at, bt) in a.suffix.iter().zip(b.suffix.iter()) {
             let ord = compare_tokens(at, bt);
             if ord != Ordering::Equal {
@@ -94,7 +93,8 @@ impl TagVersion {
     }
 }
 
-/// Compare two suffix tokens. Numeric < Alpha at the same position (`SemVer` rule).
+/// Compare two suffix tokens. Numeric is less than Alpha at the same
+/// position; tokens of the same kind compare by their inner value.
 fn compare_tokens(a: &Token, b: &Token) -> Ordering {
     match (a, b) {
         (Token::Numeric(x), Token::Numeric(y)) => x.cmp(y),
@@ -110,10 +110,6 @@ fn parse_prefix(s: &str) -> Option<Vec<u64>> {
     let mut components = Vec::new();
     for part in s.split(['.', '_']) {
         if part.is_empty() {
-            return None;
-        }
-        // Reject if any non-digit character is present.
-        if !part.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
         let n: u64 = part.parse().ok()?;
@@ -226,7 +222,9 @@ impl Range {
         Ok(Range { constraints })
     }
 
-    /// Returns `true` if `v` satisfies all constraints in the range.
+    /// `true` if every constraint matches against `v.prefix`. Constraints
+    /// zero-pad both sides to the longer length before comparing, so a
+    /// two-part bound (`>=15.0`) matches a three-part prefix (`15.10.5`).
     pub(crate) fn matches(&self, v: &TagVersion) -> bool {
         self.constraints.iter().all(|c| c.matches(&v.prefix))
     }
@@ -301,18 +299,20 @@ fn parse_bound(s: &str) -> Result<Vec<u64>, RangeParseError> {
 impl Constraint {
     fn matches(&self, prefix: &[u64]) -> bool {
         let max_len = prefix.len().max(self.bound.len());
-        let lhs: Vec<u64> = (0..max_len)
-            .map(|i| prefix.get(i).copied().unwrap_or(0))
-            .collect();
-        let rhs: Vec<u64> = (0..max_len)
-            .map(|i| self.bound.get(i).copied().unwrap_or(0))
-            .collect();
+        let cmp = (0..max_len)
+            .map(|i| {
+                let l = prefix.get(i).copied().unwrap_or(0);
+                let r = self.bound.get(i).copied().unwrap_or(0);
+                l.cmp(&r)
+            })
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or(Ordering::Equal);
         match self.op {
-            Op::Ge => lhs >= rhs,
-            Op::Le => lhs <= rhs,
-            Op::Gt => lhs > rhs,
-            Op::Lt => lhs < rhs,
-            Op::Eq => lhs == rhs,
+            Op::Ge => cmp != Ordering::Less,
+            Op::Le => cmp != Ordering::Greater,
+            Op::Gt => cmp == Ordering::Greater,
+            Op::Lt => cmp == Ordering::Less,
+            Op::Eq => cmp == Ordering::Equal,
         }
     }
 }
@@ -567,60 +567,60 @@ mod compare_tests {
         TagVersion::parse(s).expect("valid tag")
     }
 
-    fn cmp(a: &str, b: &str) -> Ordering {
+    fn compare(a: &str, b: &str) -> Ordering {
         TagVersion::compare(&p(a), &p(b))
     }
 
     #[test]
     fn three_part_numeric_descending() {
-        assert_eq!(cmp("1.0.0", "2.0.0"), Ordering::Less);
-        assert_eq!(cmp("2.0.0", "1.0.0"), Ordering::Greater);
-        assert_eq!(cmp("1.21.5", "1.21.5"), Ordering::Equal);
+        assert_eq!(compare("1.0.0", "2.0.0"), Ordering::Less);
+        assert_eq!(compare("2.0.0", "1.0.0"), Ordering::Greater);
+        assert_eq!(compare("1.21.5", "1.21.5"), Ordering::Equal);
     }
 
     #[test]
     fn zero_pad_one_dot_zero_equals_one_zero_zero() {
-        assert_eq!(cmp("1.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare("1.0", "1.0.0"), Ordering::Equal);
     }
 
     #[test]
     fn zero_pad_three_part_beats_two_part() {
         // 1.0.5 > 1.0 (which pads to 1.0.0)
-        assert_eq!(cmp("1.0.5", "1.0"), Ordering::Greater);
+        assert_eq!(compare("1.0.5", "1.0"), Ordering::Greater);
     }
 
     #[test]
     fn suffix_less_wins() {
-        assert_eq!(cmp("1.0.0", "1.0.0-rc1"), Ordering::Greater);
-        assert_eq!(cmp("1.0.0-alpha", "1.0.0"), Ordering::Less);
+        assert_eq!(compare("1.0.0", "1.0.0-rc1"), Ordering::Greater);
+        assert_eq!(compare("1.0.0-alpha", "1.0.0"), Ordering::Less);
     }
 
     #[test]
     fn temurin_underscore_build_orders() {
-        assert_eq!(cmp("25.0.3_10", "25.0.3_9"), Ordering::Greater);
+        assert_eq!(compare("25.0.3_10", "25.0.3_9"), Ordering::Greater);
         // 25.0.3 > 25.0.2_999: prefix [25,0,3,0] > [25,0,2,999] after padding.
-        assert_eq!(cmp("25.0.3", "25.0.2_999"), Ordering::Greater);
+        assert_eq!(compare("25.0.3", "25.0.2_999"), Ordering::Greater);
     }
 
     #[test]
     fn rc10_above_rc9_via_letter_digit_split() {
-        assert_eq!(cmp("1.0.0-rc10", "1.0.0-rc9"), Ordering::Greater);
+        assert_eq!(compare("1.0.0-rc10", "1.0.0-rc9"), Ordering::Greater);
     }
 
     #[test]
     fn rc1_and_rc_dot_1_compare_equal() {
-        assert_eq!(cmp("1.0.0-rc1", "1.0.0-rc.1"), Ordering::Equal);
+        assert_eq!(compare("1.0.0-rc1", "1.0.0-rc.1"), Ordering::Equal);
     }
 
     #[test]
     fn rc_dot_2_above_rc_dot_1() {
-        assert_eq!(cmp("1.0.0-rc.1", "1.0.0-rc.2"), Ordering::Less);
+        assert_eq!(compare("1.0.0-rc.1", "1.0.0-rc.2"), Ordering::Less);
     }
 
     #[test]
     fn eks_distro_compound_suffix_orders() {
         assert_eq!(
-            cmp("v1.27.6-eks-1-27-14", "v1.27.6-eks-1-27-9"),
+            compare("v1.27.6-eks-1-27-14", "v1.27.6-eks-1-27-9"),
             Ordering::Greater
         );
     }
@@ -628,7 +628,7 @@ mod compare_tests {
     #[test]
     fn bitnami_release_counter_orders() {
         assert_eq!(
-            cmp("1.31.3-debian-12-r3", "1.31.3-debian-12-r2"),
+            compare("1.31.3-debian-12-r3", "1.31.3-debian-12-r2"),
             Ordering::Greater
         );
     }
@@ -636,7 +636,7 @@ mod compare_tests {
     #[test]
     fn case_significant_alpha() {
         // ASCII: 'R' (0x52) < 'r' (0x72), so RC1 sorts before rc1.
-        assert_eq!(cmp("1.0.0-RC1", "1.0.0-rc1"), Ordering::Less);
+        assert_eq!(compare("1.0.0-RC1", "1.0.0-rc1"), Ordering::Less);
     }
 
     #[test]
@@ -652,8 +652,11 @@ mod compare_tests {
         // Exercises the length tie-breaker: [rc, 1] vs [rc, 1, "hotfix"].
         // Tokens compare equal at positions 0 and 1; falls through to
         // length comparison.
-        assert_eq!(cmp("1.0.0-rc.1", "1.0.0-rc.1.hotfix"), Ordering::Less);
+        assert_eq!(compare("1.0.0-rc.1", "1.0.0-rc.1.hotfix"), Ordering::Less);
         // Antisymmetry: the reverse comparison must yield Greater.
-        assert_eq!(cmp("1.0.0-rc.1.hotfix", "1.0.0-rc.1"), Ordering::Greater);
+        assert_eq!(
+            compare("1.0.0-rc.1.hotfix", "1.0.0-rc.1"),
+            Ordering::Greater
+        );
     }
 }

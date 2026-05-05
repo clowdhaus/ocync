@@ -37,7 +37,6 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
         exclude: args.exclude.clone(),
         sort: args.sort.map(|s| s.into()),
         latest: args.latest,
-        min_tags: None,
         ..FilterConfig::default()
     };
 

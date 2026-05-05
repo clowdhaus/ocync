@@ -1,5 +1,7 @@
 //! Tag filtering pipeline: glob -> semver -> exclude -> sort + latest.
 
+use std::sync::OnceLock;
+
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -29,7 +31,7 @@ const SYSTEM_EXCLUDE: &[&str] = &[
 ];
 
 fn system_exclude_set() -> &'static GlobSet {
-    static SET: std::sync::OnceLock<GlobSet> = std::sync::OnceLock::new();
+    static SET: OnceLock<GlobSet> = OnceLock::new();
     SET.get_or_init(|| {
         let mut builder = GlobSetBuilder::new();
         for pat in SYSTEM_EXCLUDE {
@@ -132,7 +134,7 @@ impl FilterConfig {
         // 5. Union: include first (preserves include input order), then
         //    pipeline tags not already in include.
         let mut seen: std::collections::HashSet<&str> = include_kept.iter().copied().collect();
-        let mut final_set: Vec<&str> = include_kept.clone();
+        let mut final_set: Vec<&str> = include_kept;
         for t in pipeline {
             if seen.insert(t) {
                 final_set.push(t);
@@ -208,16 +210,18 @@ fn sort_tags_in_place(tags: &mut [&str], order: SortOrder) {
 
     match order {
         SortOrder::Semver => {
-            tags.sort_by(|a, b| {
-                let va = TagVersion::parse(a);
-                let vb = TagVersion::parse(b);
-                match (va, vb) {
-                    (Some(va), Some(vb)) => TagVersion::compare(&vb, &va), // descending
-                    (Some(_), None) => Ordering::Less,
-                    (None, Some(_)) => Ordering::Greater,
-                    (None, None) => b.cmp(a), // alpha-descending fallback
-                }
+            // Parse each tag once, sort on the parsed value, then write back.
+            let mut decorated: Vec<(Option<TagVersion>, &str)> =
+                tags.iter().map(|t| (TagVersion::parse(t), *t)).collect();
+            decorated.sort_by(|(va, ta), (vb, tb)| match (va, vb) {
+                (Some(a), Some(b)) => TagVersion::compare(b, a), // descending
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => tb.cmp(ta), // alpha-descending fallback
             });
+            for (i, (_, tag)) in decorated.into_iter().enumerate() {
+                tags[i] = tag;
+            }
         }
         SortOrder::Alpha => {
             tags.sort_by(|a, b| b.cmp(a));
