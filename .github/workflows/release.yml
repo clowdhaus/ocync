@@ -246,3 +246,87 @@ jobs:
           files: |
             artifacts/ocync-*
             artifacts/sha256sums.txt
+
+  homebrew:
+    name: Homebrew tap
+    runs-on: ubuntu-24.04
+    needs: release
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: clowdhaus/homebrew-taps
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Download checksums from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: gh release download "$TAG" --repo "$REPO" --pattern sha256sums.txt
+      - name: Render formula
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          macos_arm=$(awk '$2 == "ocync-macos-arm64" { print $1 }' sha256sums.txt)
+          linux_amd64=$(awk '$2 == "ocync-fips-linux-amd64" { print $1 }' sha256sums.txt)
+          linux_arm64=$(awk '$2 == "ocync-fips-linux-arm64" { print $1 }' sha256sums.txt)
+          for sha in "$macos_arm" "$linux_amd64" "$linux_arm64"; do
+            [ -n "$sha" ] || { echo "missing sha in sha256sums.txt" >&2; exit 1; }
+          done
+          cat > Formula/ocync.rb <<EOF
+          class Ocync < Formula
+            desc "OCI registry sync tool"
+            homepage "https://github.com/clowdhaus/ocync"
+            version "${VERSION}"
+            license "Apache-2.0"
+
+            if OS.mac? && Hardware::CPU.arm?
+              url "https://github.com/clowdhaus/ocync/releases/download/v#{version}/ocync-macos-arm64"
+              sha256 "${macos_arm}"
+            end
+
+            if OS.linux? && Hardware::CPU.intel?
+              url "https://github.com/clowdhaus/ocync/releases/download/v#{version}/ocync-fips-linux-amd64"
+              sha256 "${linux_amd64}"
+            end
+
+            if OS.linux? && Hardware::CPU.arm?
+              url "https://github.com/clowdhaus/ocync/releases/download/v#{version}/ocync-fips-linux-arm64"
+              sha256 "${linux_arm64}"
+            end
+
+            def install
+              if OS.mac? && Hardware::CPU.arm?
+                bin.install "ocync-macos-arm64" => "ocync"
+              elsif OS.linux? && Hardware::CPU.intel?
+                bin.install "ocync-fips-linux-amd64" => "ocync"
+              elsif OS.linux? && Hardware::CPU.arm?
+                bin.install "ocync-fips-linux-arm64" => "ocync"
+              end
+            end
+
+            def caveats
+              <<~CAVEATS
+                Linux builds use FIPS-validated AWS-LC.
+              CAVEATS
+            end
+          end
+          EOF
+          rm sha256sums.txt
+      - name: Commit and push
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/ocync.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged, skipping commit"
+            exit 0
+          fi
+          git commit -m "ocync: ${VERSION}"
+          git push

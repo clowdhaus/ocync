@@ -114,6 +114,17 @@ Linux binaries are statically linked with FIPS 140-3 validated cryptography.
 </details>
 
 <details>
+<summary>Homebrew</summary>
+
+```bash
+brew install clowdhaus/taps/ocync
+```
+
+macOS (arm64) and Linux (amd64, arm64). Linux builds use FIPS-validated AWS-LC.
+
+</details>
+
+<details>
 <summary>Docker</summary>
 
 ```bash

@@ -19,6 +19,14 @@ Download from [GitHub Releases](https://github.com/clowdhaus/ocync/releases):
 
 Linux binaries are statically linked with FIPS 140-3 validated cryptography. macOS and Windows use aws-lc-rs without FIPS mode.
 
+### Homebrew
+
+```bash
+brew install clowdhaus/taps/ocync
+```
+
+macOS (arm64) and Linux (amd64, arm64). Linux builds use FIPS-validated AWS-LC.
+
 ### Docker
 
 ```bash
