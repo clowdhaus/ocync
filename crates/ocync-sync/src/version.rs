@@ -470,6 +470,55 @@ mod parse_tests {
         assert_eq!(a.suffix, b.suffix);
         assert_eq!(a.suffix, vec![Token::Alpha("rc"), Token::Numeric(1)]);
     }
+
+    /// dotnet major-only with multi-part dashed variant: `8.0-bookworm-slim`
+    /// (mcr.microsoft.com/dotnet/aspnet).
+    #[test]
+    fn parses_suffix_dotnet_compound_variant() {
+        let v = TagVersion::parse("8.0-bookworm-slim").unwrap();
+        assert_eq!(v.prefix, vec![8, 0]);
+        assert_eq!(
+            v.suffix,
+            vec![Token::Alpha("bookworm"), Token::Alpha("slim")]
+        );
+    }
+
+    /// `HashiCorp` alpha date-stamp: `1.10.0-alpha20241016`
+    /// (terraform pre-release with embedded YYYYMMDD).
+    #[test]
+    fn parses_suffix_hashicorp_alpha_date_stamp() {
+        let v = TagVersion::parse("1.10.0-alpha20241016").unwrap();
+        assert_eq!(v.prefix, vec![1, 10, 0]);
+        assert_eq!(
+            v.suffix,
+            vec![Token::Alpha("alpha"), Token::Numeric(20241016)]
+        );
+    }
+
+    /// ARM variant suffix: `2.21.0-arm64v8` (aws-cli).
+    #[test]
+    fn parses_suffix_arm_variant() {
+        let v = TagVersion::parse("2.21.0-arm64v8").unwrap();
+        assert_eq!(v.prefix, vec![2, 21, 0]);
+        assert_eq!(
+            v.suffix,
+            vec![
+                Token::Alpha("arm"),
+                Token::Numeric(64),
+                Token::Alpha("v"),
+                Token::Numeric(8),
+            ]
+        );
+    }
+
+    /// Date as a single 8-digit integer: `20240115` (some image tag schemes).
+    /// Should parse as a one-component prefix and sort numerically.
+    #[test]
+    fn parses_date_as_single_integer() {
+        let v = TagVersion::parse("20240115").unwrap();
+        assert_eq!(v.prefix, vec![20240115]);
+        assert!(v.suffix.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -658,5 +707,25 @@ mod compare_tests {
             compare("1.0.0-rc.1.hotfix", "1.0.0-rc.1"),
             Ordering::Greater
         );
+    }
+
+    /// Maven/Java uppercase RC tokens are NOT equivalent to lowercase under
+    /// `compare` -- the suffix comparison is byte-wise. The system-exclude
+    /// glob layer is case-insensitive (handled separately), but the parse
+    /// and compare layers preserve case.
+    #[test]
+    fn maven_uppercase_rc_distinct_from_lowercase() {
+        // 'R' (0x52) < 'r' (0x72) by ASCII byte order.
+        assert_eq!(compare("5.0.0-RC1", "5.0.0-rc1"), Ordering::Less);
+        // SNAPSHOT vs snapshot: same property.
+        assert_eq!(compare("5.0.0-SNAPSHOT", "5.0.0-snapshot"), Ordering::Less);
+    }
+
+    /// Single-integer date sorts as a number, not lex: `20240115 > 2024.1.15`
+    /// (the single integer 20240115 is much greater than the [2024,1,15]
+    /// list under zero-pad).
+    #[test]
+    fn date_single_integer_sorts_above_date_components() {
+        assert_eq!(compare("20240115", "2024.01.15"), Ordering::Greater);
     }
 }

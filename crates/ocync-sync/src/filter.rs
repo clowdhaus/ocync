@@ -366,9 +366,10 @@ mod tests {
         assert_eq!(tags, vec!["v3.0.0", "v2.0.0", "v1.0.0"]);
     }
 
-    /// Pre-release tags sort below their base version: `1.0.0-rc1 < 1.0.0`.
+    /// Tags with `-rc1`/`-alpha`/`-beta` suffixes sort below their base
+    /// version and in descending suffix order within the same base.
     #[test]
-    fn sort_semver_prerelease_ordering() {
+    fn sort_semver_suffix_tags_descending() {
         let mut tags = vec!["1.0.0", "1.0.0-rc1", "1.0.0-alpha", "1.1.0-beta1", "1.1.0"];
         sort_tags_in_place(&mut tags, SortOrder::Semver);
         assert_eq!(
@@ -813,5 +814,19 @@ mod tests {
         };
         let result = config.apply(&tags).unwrap();
         assert_eq!(result.len(), 5);
+    }
+
+    /// `HashiCorp` `alpha20241016` tags drop via system-exclude `*-alpha*`
+    /// (the wildcard catches the embedded date stamp).
+    #[test]
+    fn system_exclude_drops_alpha_with_date_stamp() {
+        let tags = vec!["1.10.0", "1.10.0-alpha20241016", "1.9.0-alpha20240501"];
+        let config = FilterConfig {
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["1.10.0"]);
+        assert!(!result.contains(&"1.10.0-alpha20241016".to_string()));
     }
 }
