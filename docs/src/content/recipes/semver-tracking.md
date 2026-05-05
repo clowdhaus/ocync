@@ -46,6 +46,8 @@ mappings:
 
 `latest: 10` keeps only the top 10 of the pipeline side. Include-pinned floats pass through uncapped.
 
+> **Always set `latest:` for long-running mirrors.** If you omit `latest:`, every tag in the version range is synced -- popular images publish hundreds of variant tags (`-alpine`, `-bullseye-slim`, `-r0`, `-debian-12-r3`, etc.), and a `semver: ">=1.0"` mirror without a cap can sync hundreds of tags on the first run. Caps prevent the mirror from blowing up under variant proliferation.
+
 `min_tags: 1` is a safety net for long-running mirrors. Counts the union of include and pipeline.
 
 ## Variations

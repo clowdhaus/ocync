@@ -36,12 +36,12 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
     for mapping in &config.mappings {
         validate_mapping(mapping, has_default_tags)?;
         if let Some(ref tags) = mapping.tags {
-            validate_tags(tags)?;
+            validate_tags(&format!("mapping '{}'", mapping.from), tags)?;
         }
     }
     if let Some(ref defaults) = config.defaults {
         if let Some(ref tags) = defaults.tags {
-            validate_tags(tags)?;
+            validate_tags("defaults", tags)?;
         }
         if let Some(ref platforms) = defaults.platforms {
             validate_platforms("defaults", platforms)?;
@@ -762,11 +762,19 @@ fn validate_artifacts(context: &str, artifacts: &ArtifactsConfig) -> Result<(), 
     Ok(())
 }
 
-fn validate_tags(tags: &TagsConfig) -> Result<(), ConfigError> {
+fn validate_tags(context: &str, tags: &TagsConfig) -> Result<(), ConfigError> {
     if tags.latest.is_some() && tags.sort.is_none() {
         return Err(ConfigError::Validation(
             "tags.latest requires tags.sort to be set".to_string(),
         ));
+    }
+    if tags.semver.is_some() && tags.latest.is_none() {
+        tracing::warn!(
+            context,
+            "tags.semver is set without tags.latest: every tag matching the version range will sync. \
+             For long-running mirrors of images with many tags, consider adding 'latest: N' (with 'sort: semver') \
+             to cap output size and reduce bytes transferred"
+        );
     }
     Ok(())
 }
@@ -1250,7 +1258,7 @@ mappings:
             sort: None,
             ..Default::default()
         };
-        let err = validate_tags(&tags).unwrap_err();
+        let err = validate_tags("test", &tags).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
     }
 

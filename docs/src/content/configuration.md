@@ -288,6 +288,10 @@ All filters are optional. Without any filters, all tags are synced.
 **Validation constraints:**
 - `latest` requires `sort` to be set
 
+### Capping output size
+
+`latest:` is optional, but mirrors with `semver:` and no `latest:` cap will sync every tag matching the version range. Under the lenient parser, popular images often publish hundreds of variant tags (`-alpine`, `-r0`, `-debian-12-rN`, `-bookworm-slim`, etc.). For long-running mirrors, set `latest: N` (with `sort: semver`) to cap output size. ocync emits a startup warning when `semver:` is set without `latest:`.
+
 **Override semantics:** when a mapping defines `tags:`, the entire block replaces `defaults.tags` - fields are not merged. If you want a mapping to inherit some default fields and override others, repeat the inherited fields in the mapping's `tags:` block.
 
 ### Default-exclude patterns
