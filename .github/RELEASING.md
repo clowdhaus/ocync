@@ -37,7 +37,7 @@ cargo release 0.2.0 --execute    # explicit version
 `cargo-release` will:
 
 1. Bump `[workspace.package].version` in the root `Cargo.toml`. All five workspace crates (`ocync`, `ocync-distribution`, `ocync-sync`, `bench-proxy`, `xtask`) inherit via `version.workspace = true` and move together.
-2. Rewrite `version` and `appVersion` in `charts/ocync/Chart.yaml` to the new value (driven by `pre-release-replacements` in the root `[package.metadata.release]`).
+2. Rewrite `version` and `appVersion` in `charts/ocync/Chart.yaml`, the `helm install --version` snippet in `README.md` and `docs/src/content/{getting-started,helm}.md`, and the `ocync version` example output in `docs/src/content/fips.md` (all driven by `pre-release-replacements` in the root `[package.metadata.release]`).
 3. Run `helm-docs --chart-search-root charts` to regenerate `charts/ocync/README.md` against the new chart version (driven by `pre-release-hook`).
 4. Regenerate `Cargo.lock` so `cargo build --locked` keeps working.
 5. Create a single commit with all of the above.
@@ -56,6 +56,8 @@ If `cargo-release` is unavailable, the same outcome by hand:
 sed -i '' 's/^version = "0.3.0"/version = "0.4.0"/' Cargo.toml
 sed -i '' 's/^version: 0.3.0/version: 0.4.0/' charts/ocync/Chart.yaml
 sed -i '' 's/^appVersion: "0.3.0"/appVersion: "0.4.0"/' charts/ocync/Chart.yaml
+sed -i '' 's/--version 0.3.0/--version 0.4.0/' README.md docs/src/content/getting-started.md docs/src/content/helm.md
+sed -i '' 's/^ocync 0.3.0$/ocync 0.4.0/' docs/src/content/fips.md
 helm-docs --chart-search-root charts
 cargo generate-lockfile
 git commit -am "chore(release): v0.4.0"
@@ -104,7 +106,7 @@ The `helm` job depends on `docker-manifest`, so a failed image build short-circu
 Run the CI gate locally before tagging:
 
 ```
-cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test && cargo deny check
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked && cargo deny check
 ```
 
 For chart-only sanity:

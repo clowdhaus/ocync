@@ -61,6 +61,10 @@ publish = false
 pre-release-replacements = [
   { file = "charts/ocync/Chart.yaml", search = "^version: .*$", replace = "version: {{version}}", exactly = 1 },
   { file = "charts/ocync/Chart.yaml", search = '^appVersion: ".*"$', replace = 'appVersion: "{{version}}"', exactly = 1 },
+  { file = "README.md", search = '^helm install ocync oci://public\.ecr\.aws/clowdhaus/ocync --version .*$', replace = "helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version {{version}}", exactly = 1 },
+  { file = "docs/src/content/getting-started.md", search = '^helm install ocync oci://public\.ecr\.aws/clowdhaus/ocync --version .*$', replace = "helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version {{version}}", exactly = 1 },
+  { file = "docs/src/content/helm.md", search = '^helm install ocync oci://public\.ecr\.aws/clowdhaus/ocync --version .*$', replace = "helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version {{version}}", exactly = 1 },
+  { file = "docs/src/content/fips.md", search = '^ocync [0-9]+\.[0-9]+\.[0-9]+$', replace = "ocync {{version}}", exactly = 1 },
 ]
 pre-release-hook = ["helm-docs", "--chart-search-root", "charts"]
 

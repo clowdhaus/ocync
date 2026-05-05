@@ -9,7 +9,7 @@ The `ocync` Helm chart supports three deployment modes, selected via the `mode` 
 ## Installation
 
 ```bash
-helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.1.0
+helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.4.0
 ```
 
 ## Deployment modes

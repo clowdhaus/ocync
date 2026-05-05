@@ -139,7 +139,7 @@ Multi-arch image (`linux/amd64`, `linux/arm64`) based on `chainguard/static`.
 <summary>Helm</summary>
 
 ```bash
-helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.1.0
+helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.4.0
 ```
 
 Supports Deployment (watch), CronJob, and Job modes. See the [Helm chart docs](https://clowdhaus.github.io/ocync/helm).
