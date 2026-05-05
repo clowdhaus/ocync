@@ -10,6 +10,7 @@ ocync auto-detects ECR private from the hostname (`*.dkr.ecr.*.amazonaws.com`) a
 
 - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
 - Shared credentials file (`~/.aws/credentials`)
+- SSO profiles in `~/.aws/config` (run `aws sso login` first to populate the OIDC token cache)
 - Container or instance role (ECS task role, EC2 instance profile, Lambda execution role)
 - IRSA or EKS Pod Identity (cluster-side identity binding)
 

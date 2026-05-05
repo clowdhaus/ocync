@@ -10,7 +10,7 @@ license = "Apache-2.0"
 repository = "https://github.com/clowdhaus/ocync"
 
 [workspace.dependencies]
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "rt-tokio", "rustls"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "rt-tokio", "rustls", "sso"] }
 aws-lc-rs = { version = "1", default-features = false }
 aws-sdk-ecr = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
 aws-sdk-ecrpublic = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
