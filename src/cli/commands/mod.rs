@@ -3,6 +3,7 @@
 pub(crate) mod analyze;
 pub(crate) mod auth;
 pub(crate) mod copy;
+pub(crate) mod dry_run;
 pub(crate) mod expand;
 pub(crate) mod synchronize;
 pub(crate) mod tags;

@@ -48,6 +48,7 @@ See the [Helm chart documentation](https://clowdhaus.github.io/ocync/helm) and [
 | image.tag | string | `<chart-app-version>-fips` | Container image tag. Overriding to a tag older than the chart's appVersion is not recommended: the chart may pass binary flags that older images do not recognize, causing the container to fail at startup. |
 | imagePullSecrets | list | `[]` | Image pull secrets for the workload pods. |
 | jobAnnotations | object | `{}` | Annotations applied to the Job's `metadata.annotations` when `mode: job`. Common uses: Helm lifecycle hooks (`helm.sh/hook: post-install` etc.), Argo CD sync-wave / hook annotations on one-shot Jobs, policy-controller selectors. Pod-template annotations belong under `podAnnotations`. |
+| logging.format | string | `"text"` | Log output format: `text` (human-readable, the default) or `json` (structured fields). Most operators read syncs via `kubectl logs`, where text is easier to scan. Set to `json` if you pipe ocync's stdout into a structured log store that parses JSON. |
 | mode | string | `"watch"` | Deployment mode: `watch` (Deployment with sync interval), `cronjob` (CronJob), or `job` (one-shot Job). |
 | nameOverride | string | `""` | Override the chart name used in resource names and labels. |
 | nodeSelector | object | `{}` | Node selector for the pod. |

@@ -26,7 +26,7 @@ ocync version                           Print version and build info
 |---|---|
 | `-v` / `--verbose` | Increase log verbosity (`-v` debug, `-vv` or higher trace) |
 | `-q`, `--quiet` | Suppress all output except errors |
-| `--log-format` | Set log format: `text` (default) or `json` (auto-detected in Kubernetes) |
+| `--log-format` | Set log format: `text` (default) or `json` |
 
 ## sync
 
@@ -43,6 +43,17 @@ ocync sync -c config.yaml --json
 | `-c`, `--config` | Path to sync config file (required) |
 | `--dry-run` | Preview what would sync without making changes |
 | `--json` | Output sync report as JSON to stdout |
+
+### Dry-run output
+
+`--dry-run` runs the full filter pipeline against each mapping's source tags and prints, per mapping:
+
+- **`source candidates: N`** -- the number of tags fetched from the source.
+- **`include path:`** -- tags rescued via `include:` (bypasses `glob:`/`semver:` and the system-exclude defaults). Default cap is 5 names; `-v` removes the cap.
+- **`pipeline:`** -- per-stage attrition (`glob`, `semver`, `exclude`, `latest`). Each row shows count_in -> count_out and the drop count.
+- **`kept (N):`** -- the final tags. When `include:` is used, rescued tags are listed first and tagged `[via include]` so the rescue path is visible.
+- **`dropped N:`** -- Pareto-sorted drop attribution (largest cause first), with sample tag names per reason. Default cap is 5 names per reason; `-v` removes the cap.
+- **`min_tags: N`** -- when `min_tags:` is configured, the line prints `kept M, satisfied` or `kept M, real sync will FAIL with BelowMinTags`. Real-sync (no `--dry-run`) errors out below `min_tags`; dry-run shows the report and surfaces the gap so the configuration can be fixed before running.
 
 ## copy
 

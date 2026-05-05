@@ -104,6 +104,8 @@ pub fn resolved_mapping(
         head_first: false,
         immutable_glob: None,
         artifacts_config: Rc::new(ResolvedArtifacts::default()),
+        candidate_count: None,
+        filter_report: None,
     }
 }
 

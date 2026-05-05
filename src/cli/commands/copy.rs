@@ -82,6 +82,8 @@ pub(crate) async fn run(
             enabled: false,
             ..ResolvedArtifacts::default()
         }),
+        candidate_count: None,
+        filter_report: None,
     };
 
     let engine = SyncEngine::new(RetryConfig::default(), DEFAULT_MAX_CONCURRENT_TRANSFERS);

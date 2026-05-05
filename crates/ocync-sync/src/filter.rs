@@ -1,6 +1,7 @@
 //! Tag filtering pipeline: glob -> semver -> exclude -> sort + latest.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::OnceLock;
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
@@ -81,14 +82,47 @@ impl FilterConfig {
     ///
     /// Returns an error if any pattern is invalid, `latest` is set without
     /// `sort`, or fewer tags survive than [`min_tags`](Self::min_tags)
-    /// requires.
+    /// requires. For per-stage attribution and drop reasons (used by
+    /// `--dry-run`), call [`apply_with_report`](Self::apply_with_report).
     pub fn apply(&self, tags: &[&str]) -> Result<Vec<String>, Error> {
-        // 0. Config validation.
+        // The hot path skips drop attribution to avoid allocating per-stage
+        // `Vec<String>` of dropped tag names every watch-mode cycle.
+        let filtered = self.run_pipeline(tags, false)?;
+        if let Some(min) = self.min_tags {
+            if filtered.kept.len() < min {
+                return Err(Error::BelowMinTags {
+                    matched: filtered.kept.len(),
+                    minimum: min,
+                });
+            }
+        }
+        Ok(filtered.kept)
+    }
+
+    /// Run the full filter pipeline and return both the kept tags and a
+    /// trace of how the pipeline arrived at them.
+    ///
+    /// Does NOT enforce [`min_tags`](Self::min_tags); the caller checks it
+    /// against `filtered.kept.len()`. This lets `--dry-run` show what
+    /// survived even when `min_tags` would otherwise turn the run into an
+    /// error. The report carries `min_tags` so callers can render the
+    /// configured limit alongside the actual count.
+    pub fn apply_with_report(&self, tags: &[&str]) -> Result<Filtered, Error> {
+        self.run_pipeline(tags, true)
+    }
+
+    /// Shared pipeline implementation. When `track` is false (the real-sync
+    /// hot path), per-stage `StageDelta` and per-reason `DropReason` are not
+    /// constructed; the resulting `Filtered.report` carries empty vectors.
+    fn run_pipeline(&self, tags: &[&str], track: bool) -> Result<Filtered, Error> {
         if self.latest.is_some() && self.sort.is_none() {
             return Err(Error::LatestWithoutSort);
         }
 
-        // Build user-exclude (optional) and system-exclude.
+        let candidate_count = tags.len();
+        let mut pipeline_stages: Vec<StageDelta> = Vec::new();
+        let mut drop_reasons: Vec<DropReason> = Vec::new();
+
         let user_exclude_set = if self.exclude.is_empty() {
             None
         } else {
@@ -96,8 +130,7 @@ impl FilterConfig {
         };
         let sys_exclude = system_exclude_set();
 
-        // 1. include_set: tags matching any include: pattern, minus user-exclude.
-        let include_kept: Vec<&str> = if self.include.is_empty() {
+        let include_kept_refs: Vec<&str> = if self.include.is_empty() {
             Vec::new()
         } else {
             let inc_set = build_glob_set(&self.include)?;
@@ -108,50 +141,335 @@ impl FilterConfig {
                 .collect()
         };
 
-        // 2. pipeline_input: glob (default *) AND semver.
         let mut pipeline: Vec<&str> = if self.glob.is_empty() {
             tags.to_vec()
         } else {
-            filter_glob(tags, &self.glob)?
+            let glob_set = build_glob_set(&self.glob)?;
+            let (kept, dropped) = partition_with_drop(tags, track, |t| glob_set.is_match(t));
+            push_drop_reason(
+                &mut drop_reasons,
+                track,
+                DropKind::Glob {
+                    patterns: self.glob.clone(),
+                },
+                dropped,
+            );
+            kept
         };
-        if let Some(ref range) = self.semver {
-            pipeline = filter_semver(&pipeline, range)?;
+        if track && !self.glob.is_empty() {
+            pipeline_stages.push(StageDelta {
+                label: format!("glob {}", patterns_label(&self.glob)),
+                count_in: candidate_count,
+                count_out: pipeline.len(),
+            });
         }
 
-        // 3. pipeline minus user-exclude minus system-exclude (one pass).
-        pipeline.retain(|t| {
-            user_exclude_set.as_ref().is_none_or(|s| !s.is_match(t)) && !sys_exclude.is_match(t)
-        });
+        if let Some(ref range) = self.semver {
+            let before = pipeline.len();
+            let req =
+                crate::version::Range::parse(range).map_err(|e| Error::InvalidVersionRange {
+                    range: range.to_owned(),
+                    reason: e.to_string(),
+                })?;
+            let (kept, dropped) =
+                partition_with_drop(
+                    &pipeline,
+                    track,
+                    |t| match crate::version::TagVersion::parse(t) {
+                        Some(ver) => req.matches(&ver),
+                        None => {
+                            warn!(tag = t, "tag is not parseable as a version, dropping");
+                            false
+                        }
+                    },
+                );
+            push_drop_reason(
+                &mut drop_reasons,
+                track,
+                DropKind::Semver {
+                    range: range.clone(),
+                },
+                dropped,
+            );
+            pipeline = kept;
+            if track {
+                pipeline_stages.push(StageDelta {
+                    label: format!("semver \"{range}\""),
+                    count_in: before,
+                    count_out: pipeline.len(),
+                });
+            }
+        }
 
-        // 4. sort + latest cap (pipeline only).
+        let before_exclude = pipeline.len();
+        let mut user_dropped: Vec<String> = Vec::new();
+        let mut sys_dropped: Vec<String> = Vec::new();
+        pipeline.retain(|t| {
+            if let Some(ref s) = user_exclude_set {
+                if s.is_match(t) {
+                    if track {
+                        user_dropped.push((*t).to_owned());
+                    }
+                    return false;
+                }
+            }
+            if sys_exclude.is_match(t) {
+                if track {
+                    sys_dropped.push((*t).to_owned());
+                }
+                return false;
+            }
+            true
+        });
+        if track {
+            if !user_dropped.is_empty() {
+                drop_reasons.push(DropReason {
+                    kind: DropKind::UserExclude {
+                        patterns: self.exclude.clone(),
+                    },
+                    count: user_dropped.len(),
+                    samples: user_dropped,
+                });
+            }
+            if !sys_dropped.is_empty() {
+                drop_reasons.push(DropReason {
+                    kind: DropKind::SystemExclude,
+                    count: sys_dropped.len(),
+                    samples: sys_dropped,
+                });
+            }
+            if before_exclude != pipeline.len() {
+                pipeline_stages.push(StageDelta {
+                    label: "exclude (user + system)".to_string(),
+                    count_in: before_exclude,
+                    count_out: pipeline.len(),
+                });
+            }
+        }
+
         if let Some(order) = self.sort {
             sort_tags_in_place(&mut pipeline, order);
         }
         if let Some(n) = self.latest {
-            pipeline.truncate(n);
+            let before = pipeline.len();
+            if pipeline.len() > n {
+                if track {
+                    let dropped: Vec<String> =
+                        pipeline[n..].iter().map(|t| (*t).to_owned()).collect();
+                    drop_reasons.push(DropReason {
+                        kind: DropKind::LatestCap { limit: n },
+                        count: dropped.len(),
+                        samples: dropped,
+                    });
+                }
+                pipeline.truncate(n);
+            }
+            if track {
+                let label = match self.sort {
+                    Some(SortOrder::Semver) => format!("sort semver desc, latest {n}"),
+                    Some(SortOrder::Alpha) => format!("sort alpha desc, latest {n}"),
+                    None => format!("latest {n}"),
+                };
+                pipeline_stages.push(StageDelta {
+                    label,
+                    count_in: before,
+                    count_out: pipeline.len(),
+                });
+            }
         }
 
-        // 5. Union: include first (preserves include input order), then
-        //    pipeline tags not already in include.
-        let mut seen: HashSet<&str> = include_kept.iter().copied().collect();
-        let mut final_set: Vec<&str> = include_kept;
+        // Union: include first (preserves include input order), then pipeline
+        // tags not already in include. The order matters for the dry-run
+        // formatter's "include first, then pipeline" header.
+        let mut seen: HashSet<&str> = include_kept_refs.iter().copied().collect();
+        let mut final_set: Vec<&str> = include_kept_refs.clone();
         for t in pipeline {
             if seen.insert(t) {
                 final_set.push(t);
             }
         }
 
-        // 6. min_tags validation against the union.
-        if let Some(min) = self.min_tags {
-            if final_set.len() < min {
-                return Err(Error::BelowMinTags {
-                    matched: final_set.len(),
-                    minimum: min,
-                });
-            }
+        if track {
+            drop_reasons.sort_by(|a, b| b.count.cmp(&a.count));
         }
 
-        Ok(final_set.into_iter().map(String::from).collect())
+        // Track-only: hot path discards the report, so don't allocate names.
+        let include_kept: Vec<String> = if track {
+            include_kept_refs.iter().map(|s| (*s).to_owned()).collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(Filtered {
+            kept: final_set.into_iter().map(String::from).collect(),
+            report: FilterReport {
+                candidate_count,
+                include_kept,
+                pipeline: pipeline_stages,
+                dropped: drop_reasons,
+                min_tags: self.min_tags,
+            },
+        })
+    }
+}
+
+/// Result of applying a [`FilterConfig`] with reporting attached.
+///
+/// `kept` is the same `Vec<String>` that [`FilterConfig::apply`] returns.
+/// `report` describes how the pipeline arrived at it.
+#[derive(Debug)]
+pub struct Filtered {
+    /// Tags that survive the full pipeline.
+    pub kept: Vec<String>,
+    /// Stage-by-stage attrition and per-reason drop attribution.
+    pub report: FilterReport,
+}
+
+/// Per-mapping filter pipeline trace.
+///
+/// `candidate_count` is the source-tag count fed in. `pipeline` lists each
+/// stage (label + `count_in` -> `count_out`). `dropped` is Pareto-sorted by
+/// drop count across all stages, suitable for "where did most of my tags go"
+/// output. `include_kept` carries the names of tags rescued via the
+/// `include:` path so the formatter can call them out by name.
+///
+/// Distinct from `ocync_sync::SyncReport` (the run-level engine report);
+/// this is the per-mapping filter trace consumed by `--dry-run`.
+#[derive(Debug)]
+pub struct FilterReport {
+    /// Number of source tags fed into the pipeline.
+    pub candidate_count: usize,
+    /// Tag names admitted via the `include:` path. Empty when `include:` is
+    /// not configured or no tag matched. These tags bypass the
+    /// glob/semver/sort/latest pipeline (but are still subject to user
+    /// `exclude:`).
+    pub include_kept: Vec<String>,
+    /// Stage-by-stage attrition along the pipeline (top-down order).
+    pub pipeline: Vec<StageDelta>,
+    /// Drop reasons sorted by count descending (Pareto).
+    pub dropped: Vec<DropReason>,
+    /// Configured `min_tags:` value, if set. The dry-run formatter compares
+    /// this against `kept.len()` so the user sees whether real-sync would
+    /// fail with `BelowMinTags`. `apply()` enforces this directly;
+    /// `apply_with_report()` does not (the report is the point of dry-run).
+    pub min_tags: Option<usize>,
+}
+
+/// One pipeline stage's count delta.
+#[derive(Debug)]
+pub struct StageDelta {
+    /// Human-readable label, e.g. `glob "3.*"` or `semver ">=3.18"`.
+    pub label: String,
+    /// Tag count entering this stage.
+    pub count_in: usize,
+    /// Tag count leaving this stage.
+    pub count_out: usize,
+}
+
+/// What rejected the dropped tags. Carries enough structure for both human
+/// rendering and downstream pattern-matching (e.g., the dry-run formatter
+/// prefixes most reasons with "by " but renders [`LatestCap`](Self::LatestCap)
+/// as a self-contained clause).
+#[derive(Debug, Clone)]
+pub enum DropKind {
+    /// Tag did not match any configured `glob:` pattern.
+    Glob {
+        /// Configured glob patterns (one or more).
+        patterns: Vec<String>,
+    },
+    /// Tag did not satisfy the configured `semver:` range.
+    Semver {
+        /// The configured version range string, e.g. `">=1.18.0"`.
+        range: String,
+    },
+    /// Tag matched a user-configured `exclude:` pattern.
+    UserExclude {
+        /// User-configured exclude patterns (one or more).
+        patterns: Vec<String>,
+    },
+    /// Tag matched the built-in prerelease exclude list.
+    SystemExclude,
+    /// Tag fell off the end of the `latest: N` truncation.
+    LatestCap {
+        /// The configured `latest: N` value.
+        limit: usize,
+    },
+}
+
+impl fmt::Display for DropKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Glob { patterns } => write!(f, "glob {}", patterns_label(patterns)),
+            Self::Semver { range } => write!(f, "semver \"{range}\""),
+            Self::UserExclude { patterns } => {
+                write!(f, "user-exclude {}", patterns_label(patterns))
+            }
+            Self::SystemExclude => f.write_str("system-exclude"),
+            Self::LatestCap { limit } => write!(f, "over latest={limit} limit"),
+        }
+    }
+}
+
+/// One drop reason with sample tag names.
+#[derive(Debug)]
+pub struct DropReason {
+    /// Which pipeline stage rejected these tags.
+    pub kind: DropKind,
+    /// How many tags this stage dropped.
+    pub count: usize,
+    /// All dropped tag names. Stored uncapped so `--dry-run -v` can render
+    /// the full list; the default formatter caps display at 5 (display-only,
+    /// not stored).
+    pub samples: Vec<String>,
+}
+
+/// Format a list of patterns for stage/drop labels.
+fn patterns_label(patterns: &[String]) -> String {
+    match patterns.len() {
+        1 => format!("\"{}\"", patterns[0]),
+        _ => {
+            let quoted: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+            quoted.join(", ")
+        }
+    }
+}
+
+/// Single-pass partition of `input` into kept references and (when `track`)
+/// owned dropped names. The `else if track` skips `to_owned` allocation on
+/// the watch-mode hot path. Used by the glob and semver stages; the exclude
+/// stage is structured differently because it splits drops between
+/// user- and system-attributed buckets.
+fn partition_with_drop<'a>(
+    input: &[&'a str],
+    track: bool,
+    keep: impl Fn(&'a str) -> bool,
+) -> (Vec<&'a str>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for &t in input {
+        if keep(t) {
+            kept.push(t);
+        } else if track {
+            dropped.push(t.to_owned());
+        }
+    }
+    (kept, dropped)
+}
+
+/// Append a `DropReason` to `drop_reasons` when both `track` is true and
+/// at least one tag was dropped at this stage.
+fn push_drop_reason(
+    drop_reasons: &mut Vec<DropReason>,
+    track: bool,
+    kind: DropKind,
+    samples: Vec<String>,
+) {
+    if track && !samples.is_empty() {
+        drop_reasons.push(DropReason {
+            count: samples.len(),
+            kind,
+            samples,
+        });
     }
 }
 
@@ -176,6 +494,11 @@ pub fn build_glob_set(patterns: &[String]) -> Result<GlobSet, Error> {
 }
 
 /// Filter tags by glob patterns (OR: any pattern match keeps the tag).
+///
+/// Test-only convenience over [`build_glob_set`] + [`Iterator::filter`].
+/// Production callers go through [`FilterConfig::apply`], which inlines
+/// the same logic with single-pass drop attribution.
+#[cfg(test)]
 fn filter_glob<'a>(tags: &[&'a str], patterns: &[String]) -> Result<Vec<&'a str>, Error> {
     let set = build_glob_set(patterns)?;
     Ok(tags.iter().copied().filter(|t| set.is_match(t)).collect())
@@ -184,6 +507,9 @@ fn filter_glob<'a>(tags: &[&'a str], patterns: &[String]) -> Result<Vec<&'a str>
 /// Filter tags by a version range.
 ///
 /// Tags that cannot be parsed as a version are dropped with a warning.
+/// Test-only; production callers go through [`FilterConfig::apply`], which
+/// inlines the same logic with single-pass drop attribution.
+#[cfg(test)]
 fn filter_semver<'a>(tags: &[&'a str], range: &str) -> Result<Vec<&'a str>, Error> {
     let req = crate::version::Range::parse(range).map_err(|e| Error::InvalidVersionRange {
         range: range.to_owned(),
@@ -828,5 +1154,228 @@ mod tests {
         let result = config.apply(&tags).unwrap();
         assert_eq!(result, vec!["1.10.0"]);
         assert!(!result.contains(&"1.10.0-alpha20241016".to_string()));
+    }
+
+    // - apply_with_report tests --------------------------------------------
+
+    #[test]
+    fn report_invariant_kept_plus_dropped_equals_candidates() {
+        let tags = vec![
+            "1.18.0",
+            "1.19.0",
+            "1.20.0",
+            "1.20.1-rc1",
+            "1.17.0",
+            "latest",
+            "nightly",
+        ];
+        let config = FilterConfig {
+            glob: vec!["1.*".into()],
+            semver: Some(">=1.18.0".into()),
+            sort: Some(SortOrder::Semver),
+            latest: Some(2),
+            ..FilterConfig::default()
+        };
+        let filtered = config.apply_with_report(&tags).unwrap();
+        let total_dropped: usize = filtered.report.dropped.iter().map(|d| d.count).sum();
+        assert_eq!(
+            filtered.kept.len() + total_dropped,
+            filtered.report.candidate_count
+        );
+    }
+
+    #[test]
+    fn report_invariant_with_include_path() {
+        let tags = vec!["latest", "1.0.0", "1.1.0", "1.2.0", "0.9.0-rc1"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            semver: Some(">=1.0".into()),
+            sort: Some(SortOrder::Semver),
+            latest: Some(2),
+            ..FilterConfig::default()
+        };
+        let filtered = config.apply_with_report(&tags).unwrap();
+
+        // include_kept now carries names: just `latest` was rescued.
+        assert_eq!(filtered.report.include_kept, vec!["latest".to_string()]);
+
+        // Pipeline accounting (closed): every candidate either survives the
+        // pipeline or appears in `dropped`. Tags rescued only via `include:`
+        // still count as dropped here -- they reach `kept` via the include
+        // path, not the pipeline.
+        let total_dropped: usize = filtered.report.dropped.iter().map(|d| d.count).sum();
+        let pipeline_survivors = filtered.report.candidate_count - total_dropped;
+
+        // Union semantics: final kept is `include_kept + pipeline_survivors`
+        // minus their overlap (tags that both include and the pipeline kept).
+        // So `kept` is bounded above by the unduplicated sum and below by
+        // pipeline survivors alone.
+        assert!(
+            filtered.kept.len() <= filtered.report.include_kept.len() + pipeline_survivors,
+            "kept={} > include_kept={} + pipeline_survivors={}",
+            filtered.kept.len(),
+            filtered.report.include_kept.len(),
+            pipeline_survivors,
+        );
+        assert!(
+            filtered.kept.len() >= pipeline_survivors,
+            "kept={} < pipeline_survivors={}",
+            filtered.kept.len(),
+            pipeline_survivors,
+        );
+
+        // Concrete shape for this fixture: latest is dropped by semver but
+        // rescued by include; 1.0.0 falls off via latest=2; 0.9.0-rc1 fails
+        // semver. Final kept = {latest, 1.2.0, 1.1.0}.
+        assert_eq!(filtered.kept.len(), 3);
+        assert!(filtered.kept.contains(&"latest".to_string()));
+        assert!(filtered.kept.contains(&"1.2.0".to_string()));
+        assert!(filtered.kept.contains(&"1.1.0".to_string()));
+        assert!(!filtered.kept.contains(&"1.0.0".to_string()));
+        assert!(!filtered.kept.contains(&"0.9.0-rc1".to_string()));
+    }
+
+    #[test]
+    fn report_pareto_sorted_by_drop_count() {
+        let tags: Vec<String> = (0..20).map(|i| format!("1.{i}.0")).collect();
+        let mut tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+        tag_refs.extend(["edge", "latest", "nightly", "1.0.0-rc1", "1.0.0-alpha"]);
+        let config = FilterConfig {
+            glob: vec!["1.*".into()],
+            semver: Some(">=1.10".into()),
+            sort: Some(SortOrder::Semver),
+            latest: Some(3),
+            ..FilterConfig::default()
+        };
+        let filtered = config.apply_with_report(&tag_refs).unwrap();
+        for window in filtered.report.dropped.windows(2) {
+            assert!(
+                window[0].count >= window[1].count,
+                "not Pareto-sorted: {:?}",
+                filtered.report.dropped
+            );
+        }
+    }
+
+    #[test]
+    fn report_min_tags_does_not_block_apply_with_report() {
+        // apply() returns BelowMinTags; apply_with_report() returns Filtered anyway.
+        let tags = vec!["1.0.0", "1.1.0"];
+        let config = FilterConfig {
+            sort: Some(SortOrder::Semver),
+            min_tags: Some(10),
+            ..FilterConfig::default()
+        };
+        // apply errors:
+        assert!(matches!(
+            config.apply(&tags),
+            Err(Error::BelowMinTags { .. })
+        ));
+        // apply_with_report succeeds with partial data, and surfaces min_tags
+        // in the report so the caller can render the gap to the user.
+        let filtered = config.apply_with_report(&tags).unwrap();
+        assert_eq!(filtered.kept.len(), 2);
+        assert_eq!(filtered.report.min_tags, Some(10));
+    }
+
+    #[test]
+    fn report_min_tags_satisfied_round_trip() {
+        // When min_tags is satisfied, apply_with_report still surfaces the
+        // configured value so the formatter can show "satisfied" status.
+        let tags = vec!["1.0.0", "1.1.0", "1.2.0"];
+        let config = FilterConfig {
+            sort: Some(SortOrder::Semver),
+            min_tags: Some(2),
+            ..FilterConfig::default()
+        };
+        let filtered = config.apply_with_report(&tags).unwrap();
+        assert_eq!(filtered.report.min_tags, Some(2));
+        assert!(filtered.kept.len() >= 2);
+        // And apply() succeeds (kept >= min):
+        assert!(config.apply(&tags).is_ok());
+    }
+
+    #[test]
+    fn report_min_tags_absent_when_not_configured() {
+        let tags = vec!["1.0.0", "1.1.0"];
+        let config = FilterConfig::default();
+        let filtered = config.apply_with_report(&tags).unwrap();
+        assert_eq!(filtered.report.min_tags, None);
+    }
+
+    #[test]
+    fn report_drop_reasons_split_user_and_system_exclude() {
+        let tags = vec!["1.0.0", "1.0.0-musl", "1.1.0-rc1", "1.2.0"];
+        let config = FilterConfig {
+            exclude: vec!["*-musl".into()],
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let filtered = config.apply_with_report(&tags).unwrap();
+        let kinds: Vec<&DropKind> = filtered.report.dropped.iter().map(|d| &d.kind).collect();
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, DropKind::UserExclude { .. })),
+            "missing UserExclude in {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, DropKind::SystemExclude)),
+            "missing SystemExclude in {kinds:?}"
+        );
+    }
+
+    /// `include_kept` carries the actual rescued tag names so the dry-run
+    /// formatter can call them out by name. Order matches input order
+    /// (preserved by the union step).
+    #[test]
+    fn report_include_kept_carries_rescued_names() {
+        let tags = vec!["latest", "latest-dev", "1.0.0", "1.1.0", "0.9.0-rc1"];
+        let config = FilterConfig {
+            include: vec!["latest".into(), "latest-dev".into()],
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let filtered = config.apply_with_report(&tags).unwrap();
+        assert_eq!(
+            filtered.report.include_kept,
+            vec!["latest".to_string(), "latest-dev".to_string()]
+        );
+    }
+
+    /// Tags matched by user-exclude do not show up in `include_kept` even
+    /// when an include pattern would have rescued them: user-exclude wins.
+    #[test]
+    fn report_include_kept_omits_user_excluded() {
+        let tags = vec!["latest", "1.0.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            exclude: vec!["latest".into()],
+            ..FilterConfig::default()
+        };
+        let filtered = config.apply_with_report(&tags).unwrap();
+        assert!(filtered.report.include_kept.is_empty());
+    }
+
+    /// Single-pass attribution invariant: every drop attributed to a stage
+    /// has a non-zero count. A stage that drops nothing must not appear in
+    /// `dropped` at all.
+    #[test]
+    fn report_drop_reasons_have_non_zero_counts() {
+        let tags = vec!["1.0.0", "1.1.0", "1.2.0"];
+        let config = FilterConfig {
+            glob: vec!["*".into()],
+            semver: Some(">=1.0".into()),
+            ..FilterConfig::default()
+        };
+        let filtered = config.apply_with_report(&tags).unwrap();
+        // Nothing dropped: no entries.
+        assert!(filtered.report.dropped.is_empty());
+        // Sanity: nothing dropped means counts add up to candidate_count.
+        assert_eq!(filtered.kept.len(), filtered.report.candidate_count);
+        for reason in &filtered.report.dropped {
+            assert!(reason.count > 0, "stage attributed zero drops: {reason:?}");
+            assert_eq!(reason.count, reason.samples.len());
+        }
     }
 }

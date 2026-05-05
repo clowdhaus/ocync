@@ -104,7 +104,7 @@ pub(crate) struct Cli {
     #[arg(short, long, global = true, help_heading = "Global options")]
     pub(crate) quiet: bool,
 
-    /// Set the log output format (auto-detected in Kubernetes).
+    /// Set the log output format. Defaults to `text`.
     #[arg(long, global = true, value_enum, help_heading = "Global options")]
     pub(crate) log_format: Option<LogFormat>,
 }
@@ -338,9 +338,13 @@ async fn main() -> std::process::ExitCode {
         ))
     };
 
+    // Dry-run / log-emission verbose toggle: any -v level removes the sample
+    // cap. Distinct from `effective_verbosity` above which drives progress
+    // detail level.
+    let verbose = cli.verbose >= 1;
     let result = match cli.command {
         Commands::Sync(args) => {
-            cli::commands::synchronize::run(&args, &*progress, Some(&shutdown), None).await
+            cli::commands::synchronize::run(&args, &*progress, Some(&shutdown), None, verbose).await
         }
         Commands::Copy(args) => cli::commands::copy::run(&args, &*progress, Some(&shutdown)).await,
         Commands::Tags(args) => cli::commands::tags::run(&args).await,
@@ -350,7 +354,7 @@ async fn main() -> std::process::ExitCode {
         Commands::Validate(args) => cli::commands::validate::run(&args),
         Commands::Expand(args) => cli::commands::expand::run(&args),
         Commands::Watch(args) => {
-            cli::commands::watch::run(&args, &*progress, shutdown.clone()).await
+            cli::commands::watch::run(&args, &*progress, shutdown.clone(), verbose).await
         }
         Commands::Analyze(args) => cli::commands::analyze::run(&args, &shutdown).await,
         Commands::Version => Ok(cli::commands::version::run()),
