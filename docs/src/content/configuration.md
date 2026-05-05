@@ -55,7 +55,6 @@ defaults:
     - linux/arm64
   tags:
     semver: ">=1.0"
-    semver_prerelease: include   # cgr.dev tags carry -rN build suffixes
     sort: semver
     latest: 10
 
@@ -162,7 +161,6 @@ defaults:
   tags:
     glob: "*"                  # Glob pattern
     semver: ">=1.0"            # Semver range
-    semver_prerelease: exclude # Pre-release handling
     exclude:                   # Exclude patterns
       - "*-debug"
     sort: semver               # Sort order: semver, alpha

@@ -28,18 +28,21 @@ const SYSTEM_EXCLUDE: &[&str] = &[
     "*-nightly*",
 ];
 
-fn build_system_exclude_set() -> GlobSet {
-    let mut builder = GlobSetBuilder::new();
-    for pat in SYSTEM_EXCLUDE {
-        let g = GlobBuilder::new(pat)
-            .case_insensitive(true)
+fn system_exclude_set() -> &'static GlobSet {
+    static SET: std::sync::OnceLock<GlobSet> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let mut builder = GlobSetBuilder::new();
+        for pat in SYSTEM_EXCLUDE {
+            let g = GlobBuilder::new(pat)
+                .case_insensitive(true)
+                .build()
+                .expect("system-exclude pattern is statically valid");
+            builder.add(g);
+        }
+        builder
             .build()
-            .expect("system-exclude pattern is statically valid");
-        builder.add(g);
-    }
-    builder
-        .build()
-        .expect("system-exclude GlobSet is statically valid")
+            .expect("system-exclude GlobSet is statically valid")
+    })
 }
 
 /// Configuration for the tag filter pipeline.
@@ -88,7 +91,7 @@ impl FilterConfig {
         } else {
             Some(build_glob_set(&self.exclude)?)
         };
-        let system_exclude_set = build_system_exclude_set();
+        let sys_exclude = system_exclude_set();
 
         // 1. include_set: tags matching any include: pattern, minus user-exclude.
         let include_kept: Vec<&str> = if self.include.is_empty() {
@@ -116,7 +119,7 @@ impl FilterConfig {
         if let Some(ref s) = user_exclude_set {
             pipeline.retain(|t| !s.is_match(t));
         }
-        pipeline.retain(|t| !system_exclude_set.is_match(t));
+        pipeline.retain(|t| !sys_exclude.is_match(t));
 
         // 4. sort + latest cap (pipeline only).
         if let Some(order) = self.sort {

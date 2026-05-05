@@ -505,7 +505,11 @@ impl<'de> Deserialize<'de> for RemovedSemverPrerelease {
         // Consume the value so the deserializer is in a clean state.
         let _: serde::de::IgnoredAny = Deserialize::deserialize(deserializer)?;
         Err(<D::Error as serde::de::Error>::custom(
-            "tags.semver_prerelease has been removed. The default behavior matches the old 'exclude' mode (system-exclude drops *-rc*, *-alpha*, *-beta*, *-pre*, *-snapshot*, *-nightly*). To restore 'include' mode, add: include: [\"*-rc*\", \"*-alpha*\", \"*-beta*\", \"*-pre*\", \"*-snapshot*\", \"*-nightly*\"]",
+            "tags.semver_prerelease has been removed. \
+             For the previous 'exclude' default (the common case), simply delete this field; \
+             the system-exclude default drops *-rc*, *-alpha*, *-beta*, *-pre*, *-snapshot*, *-nightly* automatically. \
+             For 'include' mode, replace this field with: include: [\"*-rc*\", \"*-alpha*\", \"*-beta*\", \"*-pre*\", \"*-snapshot*\", \"*-nightly*\"]. \
+             For 'only' mode, restrict via glob: e.g., glob: [\"*-rc*\", \"*-alpha*\", \"*-beta*\"] plus include: with the same patterns.",
         ))
     }
 }
@@ -991,6 +995,14 @@ mappings:
         assert!(
             msg.contains("semver_prerelease has been removed"),
             "expected migration hint in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("delete this field"),
+            "expected delete-this-field guidance in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("system-exclude default"),
+            "expected system-exclude default mention in error, got: {msg}"
         );
         assert!(
             msg.contains("include:"),
