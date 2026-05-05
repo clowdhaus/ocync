@@ -8,10 +8,10 @@
 use std::cmp::Ordering;
 
 /// A token in a tokenized tag suffix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Token {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Token<'a> {
     Numeric(u64),
-    Alpha(String),
+    Alpha(&'a str),
 }
 
 /// A tag parsed into a numeric prefix and a tokenized suffix.
@@ -19,15 +19,15 @@ pub(crate) enum Token {
 /// Empty `suffix` means the tag had no `-suffix` region (or the suffix
 /// tokenized to nothing, e.g. `1.0-` or `1.0---`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TagVersion {
+pub(crate) struct TagVersion<'a> {
     pub(crate) prefix: Vec<u64>,
-    pub(crate) suffix: Vec<Token>,
+    pub(crate) suffix: Vec<Token<'a>>,
 }
 
-impl TagVersion {
+impl<'a> TagVersion<'a> {
     /// Parse a tag string into a `TagVersion`.
     /// Returns `None` if the tag has no parseable numeric prefix.
-    pub(crate) fn parse(tag: &str) -> Option<Self> {
+    pub(crate) fn parse(tag: &'a str) -> Option<Self> {
         if tag.is_empty() {
             return None;
         }
@@ -60,7 +60,7 @@ impl TagVersion {
     /// `impl Ord` because zero-padding equality (`1.0` and `1.0.0` compare
     /// Equal) is incompatible with `Ord`'s contract that
     /// `cmp(a, b) == Equal` implies `a == b`.
-    pub(crate) fn compare(a: &Self, b: &Self) -> Ordering {
+    pub(crate) fn compare(a: &TagVersion<'_>, b: &TagVersion<'_>) -> Ordering {
         // Step 1: numeric prefix (zero-padded).
         let max_len = a.prefix.len().max(b.prefix.len());
         for i in 0..max_len {
@@ -95,7 +95,7 @@ impl TagVersion {
 
 /// Compare two suffix tokens. Numeric is less than Alpha at the same
 /// position; tokens of the same kind compare by their inner value.
-fn compare_tokens(a: &Token, b: &Token) -> Ordering {
+fn compare_tokens(a: &Token<'_>, b: &Token<'_>) -> Ordering {
     match (a, b) {
         (Token::Numeric(x), Token::Numeric(y)) => x.cmp(y),
         (Token::Alpha(x), Token::Alpha(y)) => x.cmp(y),
@@ -127,8 +127,8 @@ fn parse_prefix(s: &str) -> Option<Vec<u64>> {
 ///   2. For each token, split at letter-digit boundaries.
 ///
 /// Empty strings are dropped. Each surviving string becomes Numeric(u64) if
-/// all-digit, otherwise Alpha(String).
-fn tokenize_suffix(s: &str) -> Vec<Token> {
+/// all-digit, otherwise Alpha(&str).
+fn tokenize_suffix(s: &str) -> Vec<Token<'_>> {
     let mut tokens = Vec::new();
     for part in s.split(['.', '-', '_']) {
         if part.is_empty() {
@@ -141,7 +141,7 @@ fn tokenize_suffix(s: &str) -> Vec<Token> {
             if let Ok(n) = sub.parse::<u64>() {
                 tokens.push(Token::Numeric(n));
             } else {
-                tokens.push(Token::Alpha(sub.to_string()));
+                tokens.push(Token::Alpha(sub));
             }
         }
     }
@@ -225,7 +225,7 @@ impl Range {
     /// `true` if every constraint matches against `v.prefix`. Constraints
     /// zero-pad both sides to the longer length before comparing, so a
     /// two-part bound (`>=15.0`) matches a three-part prefix (`15.10.5`).
-    pub(crate) fn matches(&self, v: &TagVersion) -> bool {
+    pub(crate) fn matches(&self, v: &TagVersion<'_>) -> bool {
         self.constraints.iter().all(|c| c.matches(&v.prefix))
     }
 }
@@ -408,14 +408,14 @@ mod parse_tests {
     fn parses_suffix_alpine() {
         let v = TagVersion::parse("15.10-alpine").unwrap();
         assert_eq!(v.prefix, vec![15, 10]);
-        assert_eq!(v.suffix, vec![Token::Alpha("alpine".into())]);
+        assert_eq!(v.suffix, vec![Token::Alpha("alpine")]);
     }
 
     #[test]
     fn parses_suffix_chainguard_revision() {
         let v = TagVersion::parse("1.25.5-r0").unwrap();
         assert_eq!(v.prefix, vec![1, 25, 5]);
-        assert_eq!(v.suffix, vec![Token::Alpha("r".into()), Token::Numeric(0)]);
+        assert_eq!(v.suffix, vec![Token::Alpha("r"), Token::Numeric(0)]);
     }
 
     #[test]
@@ -425,8 +425,8 @@ mod parse_tests {
         assert_eq!(
             v.suffix,
             vec![
-                Token::Alpha("jre".into()),
-                Token::Alpha("alpine".into()),
+                Token::Alpha("jre"),
+                Token::Alpha("alpine"),
                 Token::Numeric(3),
                 Token::Numeric(23),
             ]
@@ -440,7 +440,7 @@ mod parse_tests {
         assert_eq!(
             v.suffix,
             vec![
-                Token::Alpha("eks".into()),
+                Token::Alpha("eks"),
                 Token::Numeric(1),
                 Token::Numeric(27),
                 Token::Numeric(14),
@@ -455,7 +455,7 @@ mod parse_tests {
         assert_eq!(
             v.suffix,
             vec![
-                Token::Alpha("alpine".into()),
+                Token::Alpha("alpine"),
                 Token::Numeric(3),
                 Token::Numeric(20),
             ]
@@ -468,7 +468,7 @@ mod parse_tests {
         let a = TagVersion::parse("1.0.0-rc1").unwrap();
         let b = TagVersion::parse("1.0.0-rc.1").unwrap();
         assert_eq!(a.suffix, b.suffix);
-        assert_eq!(a.suffix, vec![Token::Alpha("rc".into()), Token::Numeric(1)]);
+        assert_eq!(a.suffix, vec![Token::Alpha("rc"), Token::Numeric(1)]);
     }
 }
 
@@ -563,7 +563,7 @@ mod range_tests {
 mod compare_tests {
     use super::*;
 
-    fn p(s: &str) -> TagVersion {
+    fn p(s: &str) -> TagVersion<'_> {
         TagVersion::parse(s).expect("valid tag")
     }
 

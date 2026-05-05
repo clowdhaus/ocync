@@ -1,5 +1,6 @@
 //! Tag filtering pipeline: glob -> semver -> exclude -> sort + latest.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
@@ -117,11 +118,10 @@ impl FilterConfig {
             pipeline = filter_semver(&pipeline, range)?;
         }
 
-        // 3. pipeline minus user-exclude minus system-exclude.
-        if let Some(ref s) = user_exclude_set {
-            pipeline.retain(|t| !s.is_match(t));
-        }
-        pipeline.retain(|t| !sys_exclude.is_match(t));
+        // 3. pipeline minus user-exclude minus system-exclude (one pass).
+        pipeline.retain(|t| {
+            user_exclude_set.as_ref().is_none_or(|s| !s.is_match(t)) && !sys_exclude.is_match(t)
+        });
 
         // 4. sort + latest cap (pipeline only).
         if let Some(order) = self.sort {
@@ -133,7 +133,7 @@ impl FilterConfig {
 
         // 5. Union: include first (preserves include input order), then
         //    pipeline tags not already in include.
-        let mut seen: std::collections::HashSet<&str> = include_kept.iter().copied().collect();
+        let mut seen: HashSet<&str> = include_kept.iter().copied().collect();
         let mut final_set: Vec<&str> = include_kept;
         for t in pipeline {
             if seen.insert(t) {
@@ -211,7 +211,7 @@ fn sort_tags_in_place(tags: &mut [&str], order: SortOrder) {
     match order {
         SortOrder::Semver => {
             // Parse each tag once, sort on the parsed value, then write back.
-            let mut decorated: Vec<(Option<TagVersion>, &str)> =
+            let mut decorated: Vec<(Option<TagVersion<'_>>, &str)> =
                 tags.iter().map(|t| (TagVersion::parse(t), *t)).collect();
             decorated.sort_by(|(va, ta), (vb, tb)| match (va, vb) {
                 (Some(a), Some(b)) => TagVersion::compare(b, a), // descending
