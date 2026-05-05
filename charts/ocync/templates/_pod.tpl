@@ -65,6 +65,8 @@ spec:
         - --config
         - /etc/ocync/config.yaml
         {{- end }}
+        - --log-format
+        - {{ .Values.logging.format | quote }}
         {{- range .Values.extraArgs }}
         - {{ . | quote }}
         {{- end }}

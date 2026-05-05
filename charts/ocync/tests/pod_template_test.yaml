@@ -26,6 +26,8 @@ tests:
             - "8080"
             - --health-bind
             - "0.0.0.0"
+            - --log-format
+            - text
 
   - it: watch.healthBind override flows through to container args
     set:
@@ -46,10 +48,10 @@ tests:
         - 127.0.0.1
     template: deployment.yaml
     asserts:
-      # Total args = 7 watch defaults (no --health-bind) + 2 extraArgs.
+      # Total args = 9 watch defaults including --log-format (no --health-bind) + 2 extraArgs.
       - lengthEqual:
           path: spec.template.spec.containers[0].args
-          count: 9
+          count: 11
       - contains:
           path: spec.template.spec.containers[0].args
           content: "127.0.0.1"
@@ -65,6 +67,8 @@ tests:
             - sync
             - --config
             - /etc/ocync/config.yaml
+            - --log-format
+            - text
 
   - it: job mode renders the full container args list
     set:
@@ -77,6 +81,8 @@ tests:
             - sync
             - --config
             - /etc/ocync/config.yaml
+            - --log-format
+            - text
 
   - it: watch mode has health port and probes
     set:
@@ -253,4 +259,30 @@ tests:
     asserts:
       - notExists:
           path: metadata.annotations
+
+  - it: logging.format json renders the full args list with --log-format json
+    set:
+      mode: watch
+      logging:
+        format: json
+    template: deployment.yaml
+    asserts:
+      # Tight assertion (full args list with `equal`) so a regression that
+      # appended `json` somewhere else, or omitted `--log-format`, would fail.
+      # Default-text coverage lives in "watch mode renders the full container
+      # args list" above; no need for a redundant text-default assertion here.
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value:
+            - watch
+            - --config
+            - /etc/ocync/config.yaml
+            - --interval
+            - "300"
+            - --health-port
+            - "8080"
+            - --health-bind
+            - "0.0.0.0"
+            - --log-format
+            - json
 

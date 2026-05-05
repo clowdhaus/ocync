@@ -20,6 +20,7 @@ pub(crate) async fn run(
     args: &WatchArgs,
     progress: &dyn ocync_sync::progress::ProgressReporter,
     shutdown: ShutdownSignal,
+    verbose: bool,
 ) -> Result<ExitCode, CliError> {
     let interval = Duration::from_secs(args.interval);
     tracing::info!(interval_secs = args.interval, "starting watch mode");
@@ -143,6 +144,7 @@ pub(crate) async fn run(
                     progress,
                     Some(&shutdown),
                     Some(Rc::clone(&cache)),
+                    verbose,
                 )
                 .await
                 {

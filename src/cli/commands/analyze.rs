@@ -66,10 +66,11 @@ pub(crate) async fn run(
             break;
         }
 
-        let resolved = match resolve_mapping(mapping, &config, &clients, &no_checkers).await? {
-            Some(r) => r,
-            None => continue,
-        };
+        let resolved =
+            match resolve_mapping(mapping, &config, &clients, &no_checkers, false).await? {
+                Some(r) => r,
+                None => continue,
+            };
 
         for tag_pair in &resolved.tags {
             if shutdown.is_triggered() {

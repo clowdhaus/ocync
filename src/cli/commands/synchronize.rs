@@ -77,6 +77,7 @@ pub(crate) async fn run(
     progress: &dyn ocync_sync::progress::ProgressReporter,
     shutdown: Option<&ShutdownSignal>,
     external_cache: Option<Rc<RefCell<TransferStateCache>>>,
+    verbose: bool,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
 
@@ -85,15 +86,17 @@ pub(crate) async fn run(
 
     let mut mappings = Vec::new();
     for mapping in &config.mappings {
-        match resolve_mapping(mapping, &config, &clients, &batch_checkers).await {
+        match resolve_mapping(mapping, &config, &clients, &batch_checkers, args.dry_run).await {
             Ok(Some(resolved)) => mappings.push(resolved),
             Ok(None) => {} // no tags after filtering, logged inside
             Err(err) => return Err(err),
         }
     }
 
+    log_resolved_mappings(&mappings);
+
     if args.dry_run {
-        print_dry_run(&mappings);
+        crate::cli::commands::dry_run::print(&mappings, verbose);
         return Ok(ExitCode::Success);
     }
 
@@ -280,6 +283,7 @@ pub(crate) async fn resolve_mapping(
     config: &Config,
     clients: &HashMap<String, Arc<RegistryClient>>,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
+    with_report: bool,
 ) -> Result<Option<ResolvedMapping>, CliError> {
     // --- Source registry ---
     let source_name = mapping
@@ -349,14 +353,25 @@ pub(crate) async fn resolve_mapping(
     // enumerating all tags from the source registry. This avoids
     // hundreds of paginated tags/list requests for repos with thousands
     // of tags.
-    let filtered = if let Some(exact) = tags_config.and_then(|t| t.exact_tags()) {
-        exact
-    } else {
-        let all_tags = source_client.list_tags(&source_repo_path).await?;
-        let filter = build_filter(tags_config);
-        let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-        filter.apply(&tag_refs)?
-    };
+    let (filtered, candidates, filter_report) =
+        if let Some(exact) = tags_config.and_then(|t| t.exact_tags()) {
+            (exact, None, None)
+        } else {
+            let all_tags = source_client.list_tags(&source_repo_path).await?;
+            let candidates_count = all_tags.len();
+            let filter = build_filter(tags_config);
+            let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
+            if with_report {
+                // Dry-run path: do NOT enforce min_tags here. The report is the
+                // point of dry-run; failing here would suppress it. The user
+                // compares `kept` against their `min_tags:` setting themselves.
+                // Real-sync (`with_report = false`) below still enforces via apply().
+                let outcome = filter.apply_with_report(&tag_refs)?;
+                (outcome.kept, Some(candidates_count), Some(outcome.report))
+            } else {
+                (filter.apply(&tag_refs)?, Some(candidates_count), None)
+            }
+        };
 
     if filtered.is_empty() {
         tracing::warn!(
@@ -441,6 +456,8 @@ pub(crate) async fn resolve_mapping(
         head_first,
         immutable_glob,
         artifacts_config: Rc::new(artifacts),
+        candidates,
+        filter_report,
     }))
 }
 
@@ -470,29 +487,42 @@ fn glob_or_list_to_vec(g: Option<&GlobOrList>) -> Vec<String> {
     }
 }
 
-/// Print dry-run output showing what would be synced.
-fn print_dry_run(mappings: &[ResolvedMapping]) {
-    if mappings.is_empty() {
-        println!("dry-run: no mappings to sync");
-        return;
-    }
+/// Format one per-mapping plan line for `INFO`-level emission.
+///
+/// `{source} -> {target}: {kept} of {candidates} tags  =>  [t1, t2]` when
+/// candidates is known, or `{kept} tags` on the exact-tag fast path.
+fn format_plan_line(
+    source_repo: &str,
+    target_repo: &str,
+    kept: usize,
+    candidates: Option<usize>,
+    target_names: &[&str],
+) -> String {
+    let count_phrase = match candidates {
+        Some(n) => format!("{kept} of {n} tags"),
+        None => format!("{kept} tags"),
+    };
+    format!(
+        "{source_repo} -> {target_repo}: {count_phrase}  =>  [{}]",
+        target_names.join(", ")
+    )
+}
 
-    for mapping in mappings {
-        let target_names: Vec<&str> = mapping.targets.iter().map(|t| &*t.name).collect();
-        println!(
-            "dry-run: {} -> {} ({} tag(s)) => [{}]",
-            mapping.source_repo,
-            mapping.target_repo,
-            mapping.tags.len(),
-            target_names.join(", "),
+/// Emit one INFO log line per resolved mapping summarizing kept/considered
+/// tag counts and target list.
+fn log_resolved_mappings(mappings: &[ResolvedMapping]) {
+    for m in mappings {
+        let target_names: Vec<&str> = m.targets.iter().map(|t| &*t.name).collect();
+        tracing::info!(
+            "{}",
+            format_plan_line(
+                m.source_repo.as_str(),
+                m.target_repo.as_str(),
+                m.tags.len(),
+                m.candidates,
+                &target_names,
+            )
         );
-        for tag_pair in &mapping.tags {
-            if tag_pair.source == tag_pair.target {
-                println!("  {}", tag_pair.source);
-            } else {
-                println!("  {} -> {}", tag_pair.source, tag_pair.target);
-            }
-        }
     }
 }
 
@@ -766,5 +796,35 @@ latest: 5
     fn parse_size_trims_whitespace() {
         assert_eq!(parse_size("  500MB  "), Some(500_000_000));
         assert_eq!(parse_size(" 2GB "), Some(2_000_000_000));
+    }
+
+    #[test]
+    fn format_plan_line_filtered_path_includes_of_n() {
+        let line = format_plan_line(
+            "docker.io/library/alpine",
+            "alpine",
+            3,
+            Some(50),
+            &["ecr-prod", "ghcr-mirror"],
+        );
+        assert_eq!(
+            line,
+            "docker.io/library/alpine -> alpine: 3 of 50 tags  =>  [ecr-prod, ghcr-mirror]"
+        );
+    }
+
+    #[test]
+    fn format_plan_line_exact_tag_path_omits_of_n() {
+        let line = format_plan_line("ghcr.io/foo/bar", "bar", 3, None, &["ghcr-mirror"]);
+        assert_eq!(line, "ghcr.io/foo/bar -> bar: 3 tags  =>  [ghcr-mirror]");
+    }
+
+    #[test]
+    fn format_plan_line_single_target() {
+        let line = format_plan_line("src/repo", "dst/repo", 5, Some(80), &["only-target"]);
+        assert_eq!(
+            line,
+            "src/repo -> dst/repo: 5 of 80 tags  =>  [only-target]"
+        );
     }
 }

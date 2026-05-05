@@ -26,7 +26,7 @@ ocync version                           Print version and build info
 |---|---|
 | `-v` / `--verbose` | Increase log verbosity (`-v` debug, `-vv` or higher trace) |
 | `-q`, `--quiet` | Suppress all output except errors |
-| `--log-format` | Set log format: `text` (default) or `json` (auto-detected in Kubernetes) |
+| `--log-format` | Set log format: `text` (default) or `json` |
 
 ## sync
 

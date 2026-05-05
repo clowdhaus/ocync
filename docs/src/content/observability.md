@@ -70,14 +70,14 @@ Control verbosity with `-v` flags:
 ### Log format
 
 ```bash
-# Human-readable (default)
+# Human-readable (default everywhere, including Kubernetes)
 ocync sync -c config.yaml -vv
 
-# JSON (auto-detected in Kubernetes, or explicit)
+# JSON for log-aggregation pipelines that parse structured fields
 ocync sync -c config.yaml -vv --log-format json
 ```
 
-JSON log format is auto-detected when running inside Kubernetes (via `KUBERNETES_SERVICE_HOST` environment variable).
+When deployed via the chart, set `logging.format: json` in helm values to opt into JSON output.
 
 Override with the `RUST_LOG` environment variable for fine-grained filter directives.
 

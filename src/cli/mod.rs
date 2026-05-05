@@ -344,14 +344,13 @@ pub(crate) async fn build_registry_client(
 // Logging setup
 // ---------------------------------------------------------------------------
 
-/// Initialize the tracing subscriber based on CLI flags and environment.
+/// Initialize the tracing subscriber based on CLI flags.
 ///
-/// Priority: `RUST_LOG` env var > CLI flags > auto-detection (Kubernetes → JSON).
-/// Sensitive HTTP transport crates are capped at `warn` to prevent credential
-/// leakage in request/response headers at trace level.
+/// Priority: `RUST_LOG` env var > `--log-format` > text default. Sensitive
+/// HTTP transport crates are capped at `warn` to prevent credential leakage
+/// in request/response headers at trace level.
 pub(crate) fn setup_logging(cli: &Cli) {
-    let detected = detect_log_format();
-    let format = cli.log_format.or(detected).unwrap_or(LogFormat::Text);
+    let format = cli.log_format.unwrap_or(LogFormat::Text);
 
     let filter = verbosity_filter(cli.quiet, cli.verbose);
 
@@ -393,18 +392,6 @@ fn verbosity_filter(quiet: bool, verbose: u8) -> &'static str {
     }
 }
 
-/// Auto-detect log format from the environment.
-///
-/// Returns `Some(LogFormat::Json)` when running inside Kubernetes
-/// (detected via `KUBERNETES_SERVICE_HOST`).
-fn detect_log_format() -> Option<LogFormat> {
-    if std::env::var("KUBERNETES_SERVICE_HOST").is_ok() {
-        Some(LogFormat::Json)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,18 +416,6 @@ mod tests {
     fn verbosity_two_plus_is_trace() {
         assert_eq!(verbosity_filter(false, 2), "trace");
         assert_eq!(verbosity_filter(false, 3), "trace");
-    }
-
-    #[test]
-    fn detect_log_format_no_kubernetes() {
-        let original = std::env::var("KUBERNETES_SERVICE_HOST").ok();
-        // SAFETY: test is single-threaded and restores the original value.
-        unsafe { std::env::remove_var("KUBERNETES_SERVICE_HOST") };
-        assert!(detect_log_format().is_none());
-        if let Some(val) = original {
-            // SAFETY: restoring original value.
-            unsafe { std::env::set_var("KUBERNETES_SERVICE_HOST", val) };
-        }
     }
 
     #[test]

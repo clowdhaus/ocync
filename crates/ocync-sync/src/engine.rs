@@ -230,6 +230,11 @@ pub struct ResolvedMapping {
     pub immutable_glob: Option<globset::GlobSet>,
     /// Artifact sync configuration (shared across all tasks for this mapping).
     pub artifacts_config: Rc<ResolvedArtifacts>,
+    /// Number of source tags considered before filtering. `None` on the
+    /// exact-tag fast path where source tags are not enumerated.
+    pub candidates: Option<usize>,
+    /// Filter pipeline trace. `Some` only when `--dry-run` requested a report.
+    pub filter_report: Option<crate::filter::FilterReport>,
 }
 
 impl ResolvedMapping {
@@ -329,6 +334,18 @@ impl TagPair {
         Self {
             source: source.into(),
             target: target.into(),
+        }
+    }
+}
+
+impl fmt::Display for TagPair {
+    /// Renders as the bare tag when source and target match, otherwise
+    /// `source -> target`. Suitable for human-facing tag lists.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.source == self.target {
+            f.write_str(&self.source)
+        } else {
+            write!(f, "{} -> {}", self.source, self.target)
         }
     }
 }

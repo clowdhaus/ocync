@@ -52,6 +52,13 @@ cronjob:
   # -- CronJob concurrency policy: `Allow` | `Forbid` | `Replace`.
   concurrencyPolicy: Forbid
 
+# Logging configuration applied via `--log-format` on the container args.
+logging:
+  # -- Log output format: `text` (human-readable, the default) or `json` (structured fields).
+  # Most operators read syncs via `kubectl logs`, where text is easier to scan. Set to `json`
+  # if you pipe ocync's stdout into a structured log store that parses JSON.
+  format: text
+
 # -- Additional CLI arguments appended to the container args after the mode-specific defaults.
 extraArgs: []
 
