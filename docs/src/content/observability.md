@@ -67,6 +67,8 @@ Control verbosity with `-v` flags:
 | Trace | `-vv` | HTTP requests, detailed internals |
 | Error | `-q` / `--quiet` | Errors only |
 
+`-v` also uncaps the per-reason sample list in `--dry-run` output (default cap: 5 tags per drop reason and per include rescue).
+
 ### Log format
 
 ```bash

@@ -353,24 +353,12 @@ pub(crate) async fn resolve_mapping(
     // enumerating all tags from the source registry. This avoids
     // hundreds of paginated tags/list requests for repos with thousands
     // of tags.
-    let (filtered, candidates, filter_report) =
+    let (filtered, candidate_count, filter_report) =
         if let Some(exact) = tags_config.and_then(|t| t.exact_tags()) {
             (exact, None, None)
         } else {
             let all_tags = source_client.list_tags(&source_repo_path).await?;
-            let candidates_count = all_tags.len();
-            let filter = build_filter(tags_config);
-            let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-            if with_report {
-                // Dry-run path: do NOT enforce min_tags here. The report is the
-                // point of dry-run; failing here would suppress it. The user
-                // compares `kept` against their `min_tags:` setting themselves.
-                // Real-sync (`with_report = false`) below still enforces via apply().
-                let outcome = filter.apply_with_report(&tag_refs)?;
-                (outcome.kept, Some(candidates_count), Some(outcome.report))
-            } else {
-                (filter.apply(&tag_refs)?, Some(candidates_count), None)
-            }
+            select_filtered_tags(tags_config, all_tags, with_report)?
         };
 
     if filtered.is_empty() {
@@ -456,7 +444,7 @@ pub(crate) async fn resolve_mapping(
         head_first,
         immutable_glob,
         artifacts_config: Rc::new(artifacts),
-        candidates,
+        candidate_count,
         filter_report,
     }))
 }
@@ -487,18 +475,54 @@ fn glob_or_list_to_vec(g: Option<&GlobOrList>) -> Vec<String> {
     }
 }
 
+/// Result of [`select_filtered_tags`]: kept tags, candidate count, and the
+/// optional filter trace consumed by `--dry-run`.
+type SelectionResult = (
+    Vec<String>,
+    Option<usize>,
+    Option<ocync_sync::filter::FilterReport>,
+);
+
+/// Apply the filter pipeline to `all_tags` from `tags_config`, returning the
+/// kept tags, the candidate count, and an optional `FilterReport`.
+///
+/// `with_report = true` (dry-run) calls
+/// [`FilterConfig::apply_with_report`], which does NOT enforce `min_tags` --
+/// the report carries the configured value so the formatter can render the
+/// gap to the user. `with_report = false` (real-sync) calls
+/// [`FilterConfig::apply`], which enforces `min_tags` and returns a
+/// `BelowMinTags` error when violated.
+///
+/// Extracted from [`resolve_mapping`] so the report wire-up is testable
+/// without spinning up a registry mock.
+fn select_filtered_tags(
+    tags_config: Option<&TagsConfig>,
+    all_tags: Vec<String>,
+    with_report: bool,
+) -> Result<SelectionResult, CliError> {
+    let n_candidates = all_tags.len();
+    let filter = build_filter(tags_config);
+    let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
+    if with_report {
+        let result = filter.apply_with_report(&tag_refs)?;
+        Ok((result.kept, Some(n_candidates), Some(result.report)))
+    } else {
+        Ok((filter.apply(&tag_refs)?, Some(n_candidates), None))
+    }
+}
+
 /// Format one per-mapping plan line for `INFO`-level emission.
 ///
-/// `{source} -> {target}: {kept} of {candidates} tags  =>  [t1, t2]` when
-/// candidates is known, or `{kept} tags` on the exact-tag fast path.
+/// `{source} -> {target}: {kept} of {N} tags  =>  [t1, t2]` when the
+/// candidate count is known, or `{kept} tags` on the exact-tag fast path.
 fn format_plan_line(
     source_repo: &str,
     target_repo: &str,
     kept: usize,
-    candidates: Option<usize>,
+    candidate_count: Option<usize>,
     target_names: &[&str],
 ) -> String {
-    let count_phrase = match candidates {
+    let count_phrase = match candidate_count {
         Some(n) => format!("{kept} of {n} tags"),
         None => format!("{kept} tags"),
     };
@@ -519,7 +543,7 @@ fn log_resolved_mappings(mappings: &[ResolvedMapping]) {
                 m.source_repo.as_str(),
                 m.target_repo.as_str(),
                 m.tags.len(),
-                m.candidates,
+                m.candidate_count,
                 &target_names,
             )
         );
@@ -826,5 +850,159 @@ latest: 5
             line,
             "src/repo -> dst/repo: 5 of 80 tags  =>  [only-target]"
         );
+    }
+
+    // -- select_filtered_tags wire-up tests ---------------------------------
+
+    /// `with_report = true` produces a `Some(FilterReport)` whose
+    /// `min_tags` and `include_kept` match the configured input. This is
+    /// the wire-up that `--dry-run` depends on; a regression where
+    /// `with_report` is hardcoded to `false` would fail this test.
+    #[test]
+    fn select_filtered_tags_with_report_populates_min_tags_and_include() {
+        use ocync_sync::filter::SortOrder;
+
+        let tags_config = TagsConfig {
+            include: Some(GlobOrList::List(vec!["latest".into()])),
+            semver: Some(">=1.0".into()),
+            sort: Some(SortOrder::Semver),
+            latest: Some(2),
+            min_tags: Some(5),
+            ..Default::default()
+        };
+        let all_tags = vec![
+            "latest".into(),
+            "1.0.0".into(),
+            "1.1.0".into(),
+            "1.2.0".into(),
+            "0.9.0-rc1".into(),
+        ];
+        let (kept, candidate_count, report) =
+            select_filtered_tags(Some(&tags_config), all_tags, true).unwrap();
+
+        // Wire-up: candidate count flows through.
+        assert_eq!(candidate_count, Some(5));
+        // Wire-up: report is Some.
+        let report = report.expect("report present when with_report=true");
+        // Report carries min_tags so the formatter can render the gap.
+        assert_eq!(report.min_tags, Some(5));
+        // Include rescued by name (latest fails semver but is in include:).
+        assert_eq!(report.include_kept, vec!["latest".to_string()]);
+        // Kept reflects union semantics: include + top-2 of pipeline
+        // (1.2.0 and 1.1.0). 1.0.0 falls off via latest=2; 0.9.0-rc1 fails
+        // semver and is dropped. 3 < min_tags=5, so real-sync would error.
+        assert_eq!(kept.len(), 3);
+        assert!(kept.contains(&"latest".to_string()));
+    }
+
+    /// `with_report = false` (real-sync hot path) produces `None` for the
+    /// report so we don't pay drop-attribution cost on every watch cycle.
+    #[test]
+    fn select_filtered_tags_without_report_returns_none() {
+        let tags_config = TagsConfig {
+            glob: Some(GlobOrList::Single("*".into())),
+            ..Default::default()
+        };
+        let all_tags = vec!["1.0".into(), "2.0".into()];
+        let (kept, candidate_count, report) =
+            select_filtered_tags(Some(&tags_config), all_tags, false).unwrap();
+        assert_eq!(candidate_count, Some(2));
+        assert_eq!(kept.len(), 2);
+        assert!(report.is_none());
+    }
+
+    /// `with_report = false` enforces `min_tags` (real-sync errors when
+    /// the filter doesn't yield enough tags). The dry-run path does NOT
+    /// (covered separately).
+    #[test]
+    fn select_filtered_tags_without_report_enforces_min_tags() {
+        let tags_config = TagsConfig {
+            min_tags: Some(10),
+            ..Default::default()
+        };
+        let all_tags = vec!["1.0".into(), "2.0".into()];
+        let result = select_filtered_tags(Some(&tags_config), all_tags, false);
+        assert!(
+            result.is_err(),
+            "expected BelowMinTags error from real-sync path"
+        );
+    }
+
+    /// `with_report = true` does NOT enforce `min_tags`. The dry-run formatter
+    /// surfaces the gap in its output instead of suppressing the report.
+    #[test]
+    fn select_filtered_tags_with_report_does_not_enforce_min_tags() {
+        let tags_config = TagsConfig {
+            min_tags: Some(10),
+            ..Default::default()
+        };
+        let all_tags = vec!["1.0".into(), "2.0".into()];
+        let (kept, candidate_count, report) =
+            select_filtered_tags(Some(&tags_config), all_tags, true).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(candidate_count, Some(2));
+        let report = report.expect("dry-run path returns report even when min_tags would error");
+        assert_eq!(report.min_tags, Some(10));
+    }
+
+    /// Full wire-up: `select_filtered_tags` + `ResolvedMapping` construction +
+    /// `dry_run::write_to`, ensuring the report flows from filter through to
+    /// printed output. A regression where `filter_report` drops on the floor
+    /// between `resolve_mapping` and the formatter would fail this test.
+    #[test]
+    fn dry_run_full_wire_up_renders_min_tags_failure() {
+        use ocync_distribution::spec::RegistryAuthority;
+        use ocync_sync::engine::{RegistryAlias, ResolvedArtifacts, ResolvedMapping, TargetEntry};
+        use std::collections::HashSet as Set;
+
+        let tags_config = TagsConfig {
+            semver: Some(">=2.0".into()),
+            min_tags: Some(5),
+            ..Default::default()
+        };
+        let all_tags: Vec<String> = (0..10).map(|i| format!("1.{i}.0")).collect();
+        let (kept, candidate_count, filter_report) =
+            select_filtered_tags(Some(&tags_config), all_tags, true).unwrap();
+        assert_eq!(kept.len(), 0); // all dropped by semver >=2.0
+        assert!(filter_report.is_some());
+
+        let client = Arc::new(
+            ocync_distribution::RegistryClientBuilder::new(
+                url::Url::parse("http://127.0.0.1").unwrap(),
+            )
+            .build()
+            .unwrap(),
+        );
+        let mapping = ResolvedMapping {
+            source_authority: RegistryAuthority::new("source.test:443"),
+            source_client: client.clone(),
+            source_repo: RepositoryName::new("repo").unwrap(),
+            target_repo: RepositoryName::new("repo").unwrap(),
+            targets: vec![TargetEntry {
+                name: RegistryAlias::new("target"),
+                client,
+                batch_checker: None,
+                existing_tags: Set::new(),
+            }],
+            tags: kept.into_iter().map(TagPair::same).collect(),
+            platforms: None,
+            head_first: false,
+            immutable_glob: None,
+            artifacts_config: Rc::new(ResolvedArtifacts::default()),
+            candidate_count,
+            filter_report,
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        crate::cli::commands::dry_run::write_to(&mut buf, &[mapping], false).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        // The end-to-end output surfaces the BelowMinTags warning.
+        assert!(out.contains("min_tags: 5"), "{out}");
+        assert!(out.contains("FAIL"), "{out}");
+        assert!(out.contains("BelowMinTags"), "{out}");
+        // And carries the full pipeline trace.
+        assert!(out.contains("source candidates: 10"), "{out}");
+        assert!(out.contains("dropped 10:"), "{out}");
     }
 }

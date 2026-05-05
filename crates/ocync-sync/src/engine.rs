@@ -231,8 +231,10 @@ pub struct ResolvedMapping {
     /// Artifact sync configuration (shared across all tasks for this mapping).
     pub artifacts_config: Rc<ResolvedArtifacts>,
     /// Number of source tags considered before filtering. `None` on the
-    /// exact-tag fast path where source tags are not enumerated.
-    pub candidates: Option<usize>,
+    /// exact-tag fast path where source tags are not enumerated. Populated
+    /// on both real-sync and dry-run paths; `filter_report` is only Some on
+    /// dry-run.
+    pub candidate_count: Option<usize>,
     /// Filter pipeline trace. `Some` only when `--dry-run` requested a report.
     pub filter_report: Option<crate::filter::FilterReport>,
 }

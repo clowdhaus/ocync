@@ -82,7 +82,7 @@ pub(crate) async fn run(
             enabled: false,
             ..ResolvedArtifacts::default()
         }),
-        candidates: None,
+        candidate_count: None,
         filter_report: None,
     };
 

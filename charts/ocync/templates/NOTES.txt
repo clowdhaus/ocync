@@ -1,0 +1,29 @@
+ocync {{ .Chart.AppVersion }} installed in mode: {{ .Values.mode }}
+
+Log format: {{ .Values.logging.format }}
+{{- if eq .Values.logging.format "text" }}
+
+  The chart now defaults to `text` (human-readable) for `kubectl logs`.
+  Earlier chart versions auto-detected Kubernetes via
+  `KUBERNETES_SERVICE_HOST` and emitted JSON. If your log pipeline parses
+  structured fields, set `logging.format: json` in your helm values.
+{{- end }}
+
+Documentation:
+  https://clowdhaus.github.io/ocync/
+
+{{- if eq .Values.mode "watch" }}
+
+Tail the watch loop:
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "ocync.name" . }} -f
+{{- else if eq .Values.mode "cronjob" }}
+
+CronJob schedule: {{ .Values.cronjob.schedule }}
+
+Trigger an out-of-cycle run:
+  kubectl create job -n {{ .Release.Namespace }} --from=cronjob/{{ include "ocync.fullname" . }} {{ include "ocync.fullname" . }}-manual
+{{- else if eq .Values.mode "job" }}
+
+Watch the one-shot Job:
+  kubectl logs -n {{ .Release.Namespace }} job/{{ include "ocync.fullname" . }} -f
+{{- end }}
