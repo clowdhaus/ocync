@@ -235,8 +235,6 @@ pub(crate) async fn run(
         return Ok(ExitCode::Success);
     }
 
-    log_resolved_mappings(&mappings);
-
     let (cache_dir, cache_path) = resolve_cache_path(&config, &args.config);
     let cache_ttl = resolve_cache_ttl(&config)?;
     let (cache, should_persist) = match external_cache {
@@ -692,55 +690,14 @@ fn select_filtered_tags(
     }
 }
 
-/// Format one per-mapping plan line for `INFO`-level emission.
-///
-/// Filtered path: `{source} -> {target} [t1, t2]: {kept} tags match for sync
-/// out of {N} possible`. Exact-tag fast path (no enumeration): `{kept} tags
-/// (exact)`.
-fn format_plan_line(
-    source_repo: &str,
-    target_repo: &str,
-    kept: usize,
-    candidate_count: Option<usize>,
-    target_names: &[&str],
-) -> String {
-    let targets = target_names.join(", ");
-    match candidate_count {
-        Some(n) => format!(
-            "{source_repo} -> {target_repo} [{targets}]: {kept} tags match for sync out of {n} possible"
-        ),
-        None => {
-            format!("{source_repo} -> {target_repo} [{targets}]: {kept} tags (specified directly)")
-        }
-    }
-}
-
 /// One-line summary of a [`TagsConfig`] suitable for log emission, e.g.
 /// `semver >=1.0.0, latest=5`. Returns `None` when no filter applies.
 ///
 /// Single source of truth: delegates to [`FilterConfig::describe`] after
-/// the same conversion the engine uses, so stage labels in the dry-run
-/// pipeline and the INFO/WARN filter rationale cannot drift.
+/// the same conversion the engine uses, so dry-run stage labels and the
+/// no-tags-matched WARN rationale cannot drift.
 fn describe_filter(tags: Option<&TagsConfig>) -> Option<String> {
     build_filter(tags).describe()
-}
-
-/// Emit one INFO log line per resolved mapping summarizing kept/considered
-/// tag counts and target list.
-fn log_resolved_mappings(mappings: &[ResolvedMapping]) {
-    for m in mappings {
-        let target_names: Vec<&str> = m.targets.iter().map(|t| &*t.name).collect();
-        tracing::info!(
-            "{}",
-            format_plan_line(
-                m.source_repo.as_str(),
-                m.target_repo.as_str(),
-                m.tags.len(),
-                m.candidate_count,
-                &target_names,
-            )
-        );
-    }
 }
 
 /// Write sync output as JSON when `--json` is passed.
@@ -1013,39 +970,6 @@ latest: 5
     fn parse_size_trims_whitespace() {
         assert_eq!(parse_size("  500MB  "), Some(500_000_000));
         assert_eq!(parse_size(" 2GB "), Some(2_000_000_000));
-    }
-
-    #[test]
-    fn format_plan_line_filtered_path_phrasing() {
-        let line = format_plan_line(
-            "docker.io/library/alpine",
-            "alpine",
-            3,
-            Some(50),
-            &["ecr-prod", "ghcr-mirror"],
-        );
-        assert_eq!(
-            line,
-            "docker.io/library/alpine -> alpine [ecr-prod, ghcr-mirror]: 3 tags match for sync out of 50 possible"
-        );
-    }
-
-    #[test]
-    fn format_plan_line_exact_tag_path_marks_exact() {
-        let line = format_plan_line("ghcr.io/foo/bar", "bar", 3, None, &["ghcr-mirror"]);
-        assert_eq!(
-            line,
-            "ghcr.io/foo/bar -> bar [ghcr-mirror]: 3 tags (specified directly)"
-        );
-    }
-
-    #[test]
-    fn format_plan_line_single_target() {
-        let line = format_plan_line("src/repo", "dst/repo", 5, Some(80), &["only-target"]);
-        assert_eq!(
-            line,
-            "src/repo -> dst/repo [only-target]: 5 tags match for sync out of 80 possible"
-        );
     }
 
     #[test]
