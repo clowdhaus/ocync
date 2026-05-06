@@ -25,6 +25,7 @@ use crate::SyncArgs;
 use crate::cli::config::{
     AuthType, Config, GlobOrList, MappingConfig, TagsConfig, load_config, resolve_target_names,
 };
+use crate::cli::output::{format_bytes, format_duration};
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
 /// Default cache TTL: 12 hours.
@@ -115,27 +116,18 @@ impl std::fmt::Display for NoTagsInfo {
     }
 }
 
-/// Result of recording a per-mapping outcome observation. The caller uses
-/// `changed` to decide whether to emit and `prior` to detect failure ->
-/// not-failure recovery transitions.
-pub(crate) struct OutcomeObservation {
-    pub changed: bool,
-    pub prior: Option<MappingOutcome>,
-}
-
 /// Per-process state that lets watch-mode log on transitions instead of
 /// every cycle. Sync mode passes `None`. State lives in `watch::run` so it
 /// spans loop iterations.
 ///
 /// Tracks three pieces of cross-cycle context:
 ///
-/// 1. **No-tags failure set**: mappings whose filter rejected every source
-///    tag, used to emit one WARN per failure run instead of per cycle.
-/// 2. **Per-mapping outcomes**: the prior cycle's [`MappingOutcome`] keyed
-///    by `mapping.from`, used to suppress identical follow-up cycles in
-///    the per-mapping INFO/WARN stream and to detect recovery transitions.
-/// 3. **Per-cycle emit counter**: how many lines were emitted this cycle,
-///    consumed by the watch loop to gate the idle heartbeat.
+/// 1. No-tags failure set: mappings whose filter rejected every source tag.
+/// 2. Per-mapping outcomes: the prior cycle's [`MappingOutcome`] keyed by
+///    `mapping.from`, used to detect both repeated and recovery transitions.
+/// 3. Per-cycle emit counter: bumped by every `observe_*` method that
+///    reports a transition; the watch loop reads it to gate the idle
+///    heartbeat.
 #[derive(Debug, Default)]
 pub(crate) struct WatchLogState {
     warned_no_tags: HashSet<String>,
@@ -144,20 +136,16 @@ pub(crate) struct WatchLogState {
 }
 
 impl WatchLogState {
-    /// Reset the per-cycle emit counter. Call at the top of each watch cycle.
     pub(crate) fn begin_cycle(&mut self) {
         self.cycle_emit_count = 0;
     }
 
-    /// Number of lines emitted in the cycle that just ran. Read after the
-    /// cycle to decide whether to emit the idle heartbeat.
     pub(crate) fn cycle_emit_count(&self) -> u32 {
         self.cycle_emit_count
     }
 
-    /// Record a no-match observation for `from`. Returns `true` when this is
-    /// a transition into the failure state (caller should emit a WARN);
-    /// `false` when the mapping was already in the failure set (suppress).
+    /// Record a no-match observation. Returns `true` on transition into the
+    /// failure state (caller emits a WARN); `false` when already failing.
     fn observe_no_match(&mut self, from: &str) -> bool {
         let changed = self.warned_no_tags.insert(from.to_string());
         if changed {
@@ -166,9 +154,8 @@ impl WatchLogState {
         changed
     }
 
-    /// Record a successful resolution for `from`. Returns `true` when the
-    /// mapping was previously in the failure set (caller should emit a
-    /// "recovered" INFO); `false` when there was no transition.
+    /// Record a successful resolution. Returns `true` when the mapping was
+    /// previously in the failure set (caller emits a recovery INFO).
     fn observe_resolved(&mut self, from: &str) -> bool {
         let changed = self.warned_no_tags.remove(from);
         if changed {
@@ -177,32 +164,35 @@ impl WatchLogState {
         changed
     }
 
-    /// Record `outcome` as the latest result for `from`. Returns the prior
-    /// observation (if any) alongside whether the outcome changed. The
-    /// caller uses `prior` to detect failure -> not-failure recovery so it
-    /// can attach a `[recovered]` marker on the resulting log line.
-    fn observe_mapping_outcome(
-        &mut self,
-        from: &str,
-        outcome: &MappingOutcome,
-    ) -> OutcomeObservation {
-        let prior = self.last_outcomes.get(from).cloned();
-        let changed = !matches!(&prior, Some(p) if p == outcome);
-        if changed {
-            self.last_outcomes.insert(from.to_string(), outcome.clone());
-            self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
+    /// Record `outcome` as the latest result for `from`.
+    ///
+    /// Returns:
+    /// - `None` when the outcome is identical to the prior cycle (suppress).
+    /// - `Some(false)` on a non-recovery transition (emit normally).
+    /// - `Some(true)` when transitioning from `failed > 0` to `failed == 0`
+    ///   (emit with `[recovered]` marker).
+    fn observe_mapping_outcome(&mut self, from: &str, outcome: &MappingOutcome) -> Option<bool> {
+        use std::collections::hash_map::Entry;
+        match self.last_outcomes.entry(from.to_string()) {
+            Entry::Occupied(mut slot) => {
+                let prev = *slot.get();
+                if &prev == outcome {
+                    return None;
+                }
+                slot.insert(*outcome);
+                self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
+                Some(prev.failed > 0 && outcome.failed == 0)
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(*outcome);
+                self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
+                Some(false)
+            }
         }
-        OutcomeObservation { changed, prior }
     }
 
-    /// Bump the cycle emit counter directly. Used for the cycle-tail line
-    /// (which has no per-mapping observation to attribute it to).
-    fn note_emit(&mut self) {
-        self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
-    }
-
-    /// Drop entries for mappings no longer present in the active set so the
-    /// state does not grow unbounded across edits to the config.
+    /// Drop entries for mappings no longer in the active set so the state
+    /// does not grow unbounded across edits to the config.
     fn retain_active<'a>(&mut self, active: impl IntoIterator<Item = &'a str>) {
         let active_set: HashSet<&str> = active.into_iter().collect();
         self.warned_no_tags
@@ -380,7 +370,14 @@ pub(crate) async fn run(
     }
 
     emit_mapping_outcomes(&descriptors, &report, watch_log.as_deref_mut());
-    emit_cycle_tail(&descriptors, &report, watch_log);
+    // Watch mode: suppress the cycle tail when no per-mapping line emitted
+    // (steady-state idle); sync mode: always emit as the final marker.
+    let cycle_had_activity = watch_log
+        .as_deref()
+        .is_none_or(|s| s.cycle_emit_count() > 0);
+    if cycle_had_activity {
+        emit_cycle_tail(&descriptors, &report);
+    }
 
     write_output(&report, args.json)?;
 
@@ -398,7 +395,7 @@ struct MappingDescriptor {
 
 /// Per-mapping aggregated outcome derived from [`SyncReport.images`].
 /// Used for log emission and watch-mode change detection.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MappingOutcome {
     pub synced: u64,
     pub skipped: u64,
@@ -429,21 +426,18 @@ fn emit_mapping_outcomes(
         if outcome.is_empty() {
             continue;
         }
-        // Detect failure -> not-failure recovery so the line can advertise
-        // it explicitly instead of relying on a level-change between cycles.
         let recovered = match watch_log.as_deref_mut() {
-            Some(state) => {
-                let obs = state.observe_mapping_outcome(&d.from, &outcome);
-                if !obs.changed {
-                    continue;
-                }
-                obs.prior
-                    .as_ref()
-                    .is_some_and(|p| p.failed > 0 && outcome.failed == 0)
-            }
+            Some(state) => match state.observe_mapping_outcome(&d.from, &outcome) {
+                Some(r) => r,
+                None => continue,
+            },
             None => false,
         };
         let line = format_mapping_outcome(d, &outcome, recovered);
+        // The `tracing::event!` macro requires a const-expression level, so
+        // each per-mapping line goes through one of two near-identical
+        // arms. Keep the structured field set in sync between them so log
+        // aggregators don't see different shapes for warn vs info.
         if outcome.failed > 0 {
             tracing::warn!(
                 from = %d.from,
@@ -452,6 +446,7 @@ fn emit_mapping_outcomes(
                 skipped = outcome.skipped,
                 failed = outcome.failed,
                 bytes = outcome.bytes,
+                recovered,
                 "{line}"
             );
         } else {
@@ -460,6 +455,7 @@ fn emit_mapping_outcomes(
                 to = %d.target_repo,
                 synced = outcome.synced,
                 skipped = outcome.skipped,
+                failed = outcome.failed,
                 bytes = outcome.bytes,
                 recovered,
                 "{line}"
@@ -506,7 +502,7 @@ fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: 
     }
     let counts = parts.join(", ");
     let bytes_clause = if o.bytes > 0 {
-        format!(" ({})", crate::cli::output::format_bytes(o.bytes))
+        format!(" ({})", format_bytes(o.bytes))
     } else {
         String::new()
     };
@@ -517,33 +513,19 @@ fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: 
     )
 }
 
-/// One-line cycle tail rolling up totals across all mappings. Only emitted
-/// when at least one per-mapping line fired this cycle (or always in sync
-/// mode); the tail itself is part of the cycle's emit count, so it's
-/// suppressed in idle watch cycles alongside the per-mapping lines.
-fn emit_cycle_tail(
-    descriptors: &[MappingDescriptor],
-    report: &SyncReport,
-    watch_log: Option<&mut WatchLogState>,
-) {
-    if let Some(state) = watch_log.as_deref() {
-        if state.cycle_emit_count() == 0 {
-            return;
-        }
-    }
+/// One-line cycle tail rolling up totals across all mappings. The caller
+/// is responsible for gating this in watch mode (skip on idle cycles).
+fn emit_cycle_tail(descriptors: &[MappingDescriptor], report: &SyncReport) {
     let s = &report.stats;
-    let bytes = crate::cli::output::format_bytes(s.bytes_transferred);
-    let dur = crate::cli::output::format_duration(report.duration);
     let line = format!(
-        "summary: {} mappings | {} synced, {} skipped, {} failed | {bytes} in {dur}",
+        "summary: {} mappings | {} synced, {} skipped, {} failed | {} in {}",
         descriptors.len(),
         s.images_synced,
         s.images_skipped,
         s.images_failed,
+        format_bytes(s.bytes_transferred),
+        format_duration(report.duration),
     );
-    if let Some(state) = watch_log {
-        state.note_emit();
-    }
     if s.images_failed > 0 {
         tracing::warn!(
             mappings = descriptors.len(),
@@ -558,6 +540,7 @@ fn emit_cycle_tail(
             mappings = descriptors.len(),
             synced = s.images_synced,
             skipped = s.images_skipped,
+            failed = s.images_failed,
             bytes = s.bytes_transferred,
             "{line}"
         );
@@ -1453,17 +1436,31 @@ latest: 5
             ..MappingOutcome::default()
         };
 
-        assert!(state.observe_mapping_outcome("repo-a", &steady).changed);
-        assert!(!state.observe_mapping_outcome("repo-a", &steady).changed);
-        assert!(!state.observe_mapping_outcome("repo-a", &steady).changed);
-        assert!(state.observe_mapping_outcome("repo-a", &active).changed);
-        assert!(!state.observe_mapping_outcome("repo-a", &active).changed);
-        assert!(state.observe_mapping_outcome("repo-a", &steady).changed);
+        // First observation: emit, no prior so not a recovery.
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &steady),
+            Some(false)
+        );
+        // Same outcome twice: suppress.
+        assert_eq!(state.observe_mapping_outcome("repo-a", &steady), None);
+        assert_eq!(state.observe_mapping_outcome("repo-a", &steady), None);
+        // Different outcome: emit, neither prior nor current was a failure
+        // so not a recovery either.
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &active),
+            Some(false)
+        );
+        assert_eq!(state.observe_mapping_outcome("repo-a", &active), None);
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &steady),
+            Some(false)
+        );
     }
 
     /// Recovery detection: prior outcome with `failed > 0` followed by an
-    /// outcome with `failed == 0` is an explicit recovery transition the
-    /// caller can mark with `[recovered]`.
+    /// outcome with `failed == 0` returns `Some(true)` so the caller can
+    /// attach the `[recovered]` marker. Cycle counter advances on each
+    /// transition so the watch loop sees activity.
     #[test]
     fn watch_log_state_surfaces_failure_to_clean_transition() {
         let mut state = WatchLogState::default();
@@ -1476,19 +1473,15 @@ latest: 5
             ..MappingOutcome::default()
         };
 
-        let first = state.observe_mapping_outcome("r", &failing);
-        assert!(first.changed && first.prior.is_none());
-
-        let recovery = state.observe_mapping_outcome("r", &healthy);
-        assert!(recovery.changed);
-        assert_eq!(recovery.prior.as_ref().unwrap().failed, 1);
-
-        // Cycle counter increments on each transition.
+        // First observation can never be a recovery (no prior).
+        assert_eq!(state.observe_mapping_outcome("r", &failing), Some(false));
+        assert_eq!(state.observe_mapping_outcome("r", &healthy), Some(true));
         assert_eq!(state.cycle_emit_count(), 2);
     }
 
     /// `retain_active` also prunes per-mapping outcome cache so a removed
-    /// mapping doesn't keep its stale entry forever.
+    /// mapping doesn't keep its stale entry forever. Re-observation after
+    /// pruning emits as a fresh first-observation.
     #[test]
     fn watch_log_state_retain_active_also_prunes_outcomes() {
         let mut state = WatchLogState::default();
@@ -1501,33 +1494,8 @@ latest: 5
 
         state.retain_active(["keep"]);
 
-        // Re-observation of "drop" emits because its prior entry was pruned.
-        assert!(state.observe_mapping_outcome("drop", &outcome).changed);
-        // "keep" still suppresses identical follow-up.
-        assert!(!state.observe_mapping_outcome("keep", &outcome).changed);
-    }
-
-    /// `begin_cycle` resets the per-cycle emit counter; transitions during
-    /// the cycle bump it; the watch loop reads it after the cycle to gate
-    /// the idle heartbeat.
-    #[test]
-    fn watch_log_state_cycle_emit_counter_resets_and_increments() {
-        let mut state = WatchLogState::default();
-        state.begin_cycle();
-        assert_eq!(state.cycle_emit_count(), 0);
-
-        let o = MappingOutcome {
-            skipped: 1,
-            ..MappingOutcome::default()
-        };
-        state.observe_mapping_outcome("r1", &o);
-        state.observe_mapping_outcome("r2", &o);
-        assert_eq!(state.cycle_emit_count(), 2);
-
-        state.begin_cycle();
-        // Identical follow-up suppresses; counter stays at 0.
-        state.observe_mapping_outcome("r1", &o);
-        assert_eq!(state.cycle_emit_count(), 0);
+        assert_eq!(state.observe_mapping_outcome("drop", &outcome), Some(false));
+        assert_eq!(state.observe_mapping_outcome("keep", &outcome), None);
     }
 
     /// `format_mapping_outcome` omits zero counts so the line stays terse,
