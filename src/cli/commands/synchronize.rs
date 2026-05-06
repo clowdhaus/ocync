@@ -16,7 +16,7 @@ use ocync_sync::engine::{
     DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedArtifacts, ResolvedMapping,
     SyncEngine, TagPair, TargetEntry,
 };
-use ocync_sync::filter::{FilterConfig, build_glob_set};
+use ocync_sync::filter::{FilterConfig, build_glob_set, is_referrers_fallback_tag};
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
@@ -25,6 +25,7 @@ use crate::SyncArgs;
 use crate::cli::config::{
     AuthType, Config, GlobOrList, MappingConfig, TagsConfig, load_config, resolve_target_names,
 };
+use crate::cli::output::{format_bytes, format_duration};
 use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
 
 /// Default cache TTL: 12 hours.
@@ -32,6 +33,174 @@ pub(crate) const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
 
 /// Default cache file name within the cache directory.
 const CACHE_FILE_NAME: &str = "transfer_state.bin";
+
+/// Sample cap for the source-tag list shown in the no-tags-matched WARN.
+/// Mirrors `dry_run::SAMPLE_CAP` so both surfaces show the same depth of
+/// example data without overwhelming the log line.
+const NO_TAGS_SAMPLE_CAP: usize = 5;
+
+/// Outcome of resolving a single mapping. Either the mapping is ready for the
+/// engine, or no source tag survived filtering and the caller decides whether
+/// to log a WARN (sync mode: always; watch mode: only on transition).
+///
+/// The size disparity between variants is intentional: `ResolvedMapping` flows
+/// directly into `Vec<ResolvedMapping>` for the engine, so boxing it would
+/// just add a heap round-trip per success. The error variant is rare; we pay
+/// the disparity instead of the allocation traffic.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum MappingResolution {
+    Resolved(ResolvedMapping),
+    NoMatchingTags(NoTagsInfo),
+}
+
+/// Diagnostic context for a mapping whose filter rejected every source tag.
+///
+/// Fields together let an operator see, in one log line, the size and
+/// composition of the source repo (image tags vs OCI 1.1 referrer fallbacks),
+/// the active filter clauses, and example image tag names so the cause is
+/// obvious without spelunking.
+pub(crate) struct NoTagsInfo {
+    pub from: String,
+    pub image_count: usize,
+    pub artifact_count: usize,
+    /// Active filter clauses (e.g. `semver >=1.0.0, latest=5`). `None` only
+    /// when no filter is configured -- distinct from "filter description
+    /// missing" so the formatter can render an explicit fallback string.
+    pub filter_desc: Option<String>,
+    /// Up to [`NO_TAGS_SAMPLE_CAP`] image-tag names. Excludes referrer
+    /// fallback tags so the example list is meaningful on cosign-heavy
+    /// repos like `cgr.dev/chainguard/*` (otherwise dominated by
+    /// `sha256-<hex>(.sig|.sbom|.att)` entries).
+    pub samples: Vec<String>,
+}
+
+impl NoTagsInfo {
+    /// Total tags returned by `/v2/<repo>/tags/list`. Derived: image + artifact.
+    fn source_total(&self) -> usize {
+        self.image_count + self.artifact_count
+    }
+
+    /// True when the source had more image tags than `samples` shows.
+    fn samples_truncated(&self) -> bool {
+        self.image_count > self.samples.len()
+    }
+}
+
+impl std::fmt::Display for NoTagsInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total = self.source_total();
+        let total_phrase = if self.artifact_count > 0 {
+            format!(
+                "{total} source tags ({} image tags, {} referrer artifacts)",
+                self.image_count, self.artifact_count
+            )
+        } else {
+            format!("{total} source tags")
+        };
+        let filter = self
+            .filter_desc
+            .as_deref()
+            .unwrap_or("no filter configured");
+        let samples = if self.samples.is_empty() {
+            "<empty>".to_string()
+        } else if self.samples_truncated() {
+            format!("[{}, ...]", self.samples.join(", "))
+        } else {
+            format!("[{}]", self.samples.join(", "))
+        };
+        write!(
+            f,
+            "{}: 0 of {total_phrase} matched filter ({filter}); skipping. Source: {samples}",
+            self.from
+        )
+    }
+}
+
+/// Per-process state that lets watch-mode log on transitions instead of
+/// every cycle. Sync mode passes `None`. State lives in `watch::run` so it
+/// spans loop iterations.
+///
+/// Tracks three pieces of cross-cycle context:
+///
+/// 1. No-tags failure set: mappings whose filter rejected every source tag.
+/// 2. Per-mapping outcomes: the prior cycle's [`MappingOutcome`] keyed by
+///    `mapping.from`, used to detect both repeated and recovery transitions.
+/// 3. Per-cycle emit counter: bumped by every `observe_*` method that
+///    reports a transition; the watch loop reads it to gate the idle
+///    heartbeat.
+#[derive(Debug, Default)]
+pub(crate) struct WatchLogState {
+    warned_no_tags: HashSet<String>,
+    last_outcomes: HashMap<String, MappingOutcome>,
+    cycle_emit_count: u32,
+}
+
+impl WatchLogState {
+    pub(crate) fn begin_cycle(&mut self) {
+        self.cycle_emit_count = 0;
+    }
+
+    pub(crate) fn cycle_emit_count(&self) -> u32 {
+        self.cycle_emit_count
+    }
+
+    /// Record a no-match observation. Returns `true` on transition into the
+    /// failure state (caller emits a WARN); `false` when already failing.
+    fn observe_no_match(&mut self, from: &str) -> bool {
+        let changed = self.warned_no_tags.insert(from.to_string());
+        if changed {
+            self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
+        }
+        changed
+    }
+
+    /// Record a successful resolution. Returns `true` when the mapping was
+    /// previously in the failure set (caller emits a recovery INFO).
+    fn observe_resolved(&mut self, from: &str) -> bool {
+        let changed = self.warned_no_tags.remove(from);
+        if changed {
+            self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
+        }
+        changed
+    }
+
+    /// Record `outcome` as the latest result for `from`.
+    ///
+    /// Returns:
+    /// - `None` when the outcome is identical to the prior cycle (suppress).
+    /// - `Some(false)` on a non-recovery transition (emit normally).
+    /// - `Some(true)` when transitioning from `failed > 0` to `failed == 0`
+    ///   (emit with `[recovered]` marker).
+    fn observe_mapping_outcome(&mut self, from: &str, outcome: &MappingOutcome) -> Option<bool> {
+        use std::collections::hash_map::Entry;
+        match self.last_outcomes.entry(from.to_string()) {
+            Entry::Occupied(mut slot) => {
+                let prev = *slot.get();
+                if &prev == outcome {
+                    return None;
+                }
+                slot.insert(*outcome);
+                self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
+                Some(prev.failed > 0 && outcome.failed == 0)
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(*outcome);
+                self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
+                Some(false)
+            }
+        }
+    }
+
+    /// Drop entries for mappings no longer in the active set so the state
+    /// does not grow unbounded across edits to the config.
+    fn retain_active<'a>(&mut self, active: impl IntoIterator<Item = &'a str>) {
+        let active_set: HashSet<&str> = active.into_iter().collect();
+        self.warned_no_tags
+            .retain(|k| active_set.contains(k.as_str()));
+        self.last_outcomes
+            .retain(|k, _| active_set.contains(k.as_str()));
+    }
+}
 
 /// Resolve the cache directory and file path from config.
 ///
@@ -78,6 +247,7 @@ pub(crate) async fn run(
     shutdown: Option<&ShutdownSignal>,
     external_cache: Option<Rc<RefCell<TransferStateCache>>>,
     verbose: bool,
+    mut watch_log: Option<&mut WatchLogState>,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
 
@@ -86,14 +256,32 @@ pub(crate) async fn run(
 
     let mut mappings = Vec::new();
     for mapping in &config.mappings {
-        match resolve_mapping(mapping, &config, &clients, &batch_checkers, args.dry_run).await {
-            Ok(Some(resolved)) => mappings.push(resolved),
-            Ok(None) => {} // no tags after filtering, logged inside
-            Err(err) => return Err(err),
+        match resolve_mapping(mapping, &config, &clients, &batch_checkers, args.dry_run).await? {
+            MappingResolution::Resolved(resolved) => mappings.push(resolved),
+            MappingResolution::NoMatchingTags(info) => {
+                let should_warn = match watch_log.as_mut() {
+                    Some(state) => state.observe_no_match(&info.from),
+                    None => true,
+                };
+                if should_warn {
+                    emit_no_tags_warn(&info);
+                }
+            }
         }
     }
 
-    log_resolved_mappings(&mappings);
+    if let Some(state) = watch_log.as_mut() {
+        for resolved in &mappings {
+            let from = resolved.source_repo.as_str();
+            if state.observe_resolved(from) {
+                tracing::info!(
+                    from = %from,
+                    "{from}: filter now matches at least one tag; resuming sync"
+                );
+            }
+        }
+        state.retain_active(config.mappings.iter().map(|m| m.from.as_str()));
+    }
 
     if args.dry_run {
         crate::cli::commands::dry_run::print(&mappings, verbose);
@@ -157,6 +345,18 @@ pub(crate) async fn run(
         .map_or(DEFAULT_MAX_CONCURRENT_TRANSFERS, |g| {
             g.max_concurrent_transfers
         });
+    // Capture per-mapping metadata before the engine consumes `mappings`.
+    // Used to emit one INFO line per mapping after the engine returns,
+    // grouped from the report's per-image outcomes.
+    let descriptors: Vec<MappingDescriptor> = mappings
+        .iter()
+        .map(|m| MappingDescriptor {
+            from: m.source_repo.as_str().to_string(),
+            target_repo: m.target_repo.as_str().to_string(),
+            target_names: m.targets.iter().map(|t| (*t.name).to_string()).collect(),
+        })
+        .collect();
+
     let engine = SyncEngine::new(RetryConfig::default(), max_concurrent);
     let report = engine
         .run(mappings, cache.clone(), staging, progress, shutdown)
@@ -169,9 +369,178 @@ pub(crate) async fn run(
         }
     }
 
+    emit_mapping_outcomes(&descriptors, &report, watch_log.as_deref_mut());
+    // Watch mode: suppress the cycle tail when no per-mapping line emitted
+    // (steady-state idle); sync mode: always emit as the final marker.
+    let cycle_had_activity = watch_log
+        .as_deref()
+        .is_none_or(|s| s.cycle_emit_count() > 0);
+    if cycle_had_activity {
+        emit_cycle_tail(&descriptors, &report);
+    }
+
     write_output(&report, args.json)?;
 
     Ok(ExitCode::from_report(report.exit_code()))
+}
+
+/// Per-mapping metadata captured before the engine consumes `mappings`,
+/// so we can join it with the engine's per-image report after the fact
+/// to emit one log line per mapping (with source/target context).
+struct MappingDescriptor {
+    from: String,
+    target_repo: String,
+    target_names: Vec<String>,
+}
+
+/// Per-mapping aggregated outcome derived from [`SyncReport.images`].
+/// Used for log emission and watch-mode change detection.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MappingOutcome {
+    pub synced: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub bytes: u64,
+}
+
+impl MappingOutcome {
+    fn is_empty(&self) -> bool {
+        self.synced == 0 && self.skipped == 0 && self.failed == 0
+    }
+}
+
+/// Emit one INFO (or WARN, on failures) per mapping summarizing what its
+/// configured tags did this cycle. In watch mode (when `watch_log` is
+/// `Some`), suppress mappings whose outcome is unchanged from the prior
+/// cycle so steady-state pods log only on transition.
+fn emit_mapping_outcomes(
+    descriptors: &[MappingDescriptor],
+    report: &SyncReport,
+    mut watch_log: Option<&mut WatchLogState>,
+) {
+    for d in descriptors {
+        let outcome = aggregate_mapping_outcome(&d.from, &d.target_repo, report);
+        // No images for this mapping in the report (e.g. the mapping was
+        // resolved to zero tags by an upstream filter that the engine
+        // never saw). The no-tags WARN already covered it; skip here.
+        if outcome.is_empty() {
+            continue;
+        }
+        let recovered = match watch_log.as_deref_mut() {
+            Some(state) => match state.observe_mapping_outcome(&d.from, &outcome) {
+                Some(r) => r,
+                None => continue,
+            },
+            None => false,
+        };
+        let line = format_mapping_outcome(d, &outcome, recovered);
+        // `from` / `to` are intentionally NOT structured fields here -- the
+        // message already names them as `from -> to`, and tracing's text
+        // formatter would otherwise tail the line with a redundant
+        // `from=... to=...` block. The count fields remain because they
+        // carry zero values the terse message elides.
+        //
+        // The two arms differ only in level. `tracing::event!` would let
+        // us pick at runtime, but it requires a const-expression level.
+        if outcome.failed > 0 {
+            tracing::warn!(
+                synced = outcome.synced,
+                skipped = outcome.skipped,
+                failed = outcome.failed,
+                bytes = outcome.bytes,
+                recovered,
+                "{line}"
+            );
+        } else {
+            tracing::info!(
+                synced = outcome.synced,
+                skipped = outcome.skipped,
+                failed = outcome.failed,
+                bytes = outcome.bytes,
+                recovered,
+                "{line}"
+            );
+        }
+    }
+}
+
+fn aggregate_mapping_outcome(
+    source_repo: &str,
+    target_repo: &str,
+    report: &SyncReport,
+) -> MappingOutcome {
+    let src_prefix = format!("{source_repo}:");
+    let tgt_prefix = format!("{target_repo}:");
+    let mut o = MappingOutcome::default();
+    for r in &report.images {
+        if !(r.source.starts_with(&src_prefix) && r.target.starts_with(&tgt_prefix)) {
+            continue;
+        }
+        match r.status {
+            ocync_sync::ImageStatus::Synced => {
+                o.synced += 1;
+                o.bytes += r.bytes_transferred;
+            }
+            ocync_sync::ImageStatus::Skipped { .. } => o.skipped += 1,
+            ocync_sync::ImageStatus::Failed { .. } => o.failed += 1,
+        }
+    }
+    o
+}
+
+fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: bool) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if o.synced > 0 {
+        parts.push(format!("synced {}", o.synced));
+    }
+    if o.skipped > 0 {
+        parts.push(format!("skipped {}", o.skipped));
+    }
+    if o.failed > 0 {
+        parts.push(format!("failed {}", o.failed));
+    }
+    let counts = parts.join(", ");
+    let bytes_clause = if o.bytes > 0 {
+        format!(" ({})", format_bytes(o.bytes))
+    } else {
+        String::new()
+    };
+    let recovered_clause = if recovered { " [recovered]" } else { "" };
+    // Multi-target mappings need the bracket to disambiguate which targets
+    // the line refers to. Single-target mappings: omit -- the destination
+    // is already in the `from -> to` arrow.
+    let targets_clause = if d.target_names.len() > 1 {
+        format!(" [{}]", d.target_names.join(", "))
+    } else {
+        String::new()
+    };
+    format!(
+        "{} -> {}{targets_clause}: {counts}{bytes_clause}{recovered_clause}",
+        d.from, d.target_repo
+    )
+}
+
+/// One-line cycle tail rolling up totals across all mappings. The caller
+/// is responsible for gating this in watch mode (skip on idle cycles).
+fn emit_cycle_tail(descriptors: &[MappingDescriptor], report: &SyncReport) {
+    let s = &report.stats;
+    let line = format!(
+        "summary: {} mappings | {} synced, {} skipped, {} failed | {} in {}",
+        descriptors.len(),
+        s.images_synced,
+        s.images_skipped,
+        s.images_failed,
+        format_bytes(s.bytes_transferred),
+        format_duration(report.duration),
+    );
+    // Counts are already in the message; structured fields would be a
+    // verbatim restatement in text output. JSON aggregators parse the
+    // message (or use the SyncReport via `--json`).
+    if s.images_failed > 0 {
+        tracing::warn!("{line}");
+    } else {
+        tracing::info!("{line}");
+    }
 }
 
 /// Parse a human-readable duration string into a [`Duration`].
@@ -273,18 +642,19 @@ async fn build_batch_checkers(
     Ok(checkers)
 }
 
-/// Resolve a single mapping config into a `ResolvedMapping`, or `None` if no
-/// tags survive filtering.
+/// Resolve a single mapping config into a [`MappingResolution`].
 ///
-/// Falls back to `defaults.source`, `defaults.targets`, and `defaults.tags`
-/// when the mapping does not specify its own values.
+/// Returns [`MappingResolution::Resolved`] when at least one tag survives the
+/// filter pipeline, or [`MappingResolution::NoMatchingTags`] carrying the
+/// diagnostic context the caller needs to render a WARN. Pulls fallbacks from
+/// `defaults.source`, `defaults.targets`, and `defaults.tags`.
 pub(crate) async fn resolve_mapping(
     mapping: &MappingConfig,
     config: &Config,
     clients: &HashMap<String, Arc<RegistryClient>>,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
     with_report: bool,
-) -> Result<Option<ResolvedMapping>, CliError> {
+) -> Result<MappingResolution, CliError> {
     // --- Source registry ---
     let source_name = mapping
         .source
@@ -353,20 +723,49 @@ pub(crate) async fn resolve_mapping(
     // enumerating all tags from the source registry. This avoids
     // hundreds of paginated tags/list requests for repos with thousands
     // of tags.
-    let (filtered, candidate_count, filter_report) =
-        if let Some(exact) = tags_config.and_then(|t| t.exact_tags()) {
-            (exact, None, None)
-        } else {
-            let all_tags = source_client.list_tags(&source_repo_path).await?;
-            select_filtered_tags(tags_config, all_tags, with_report)?
+    // The image/artifact partition + sample collection happen in the same
+    // pass that prepares input for `select_filtered_tags`, so the filter and
+    // the no-match WARN both see consistent counts. The pre-built `NoTagsInfo`
+    // is only consumed when filtering yields zero tags.
+    let (filtered, candidate_count, filter_report, no_tags_template): (
+        Vec<String>,
+        Option<usize>,
+        Option<ocync_sync::filter::FilterReport>,
+        Option<NoTagsInfo>,
+    ) = if let Some(exact) = tags_config.and_then(|t| t.exact_tags()) {
+        (exact, None, None, None)
+    } else {
+        let all_tags = source_client.list_tags(&source_repo_path).await?;
+        let mut samples: Vec<String> = Vec::with_capacity(NO_TAGS_SAMPLE_CAP);
+        let mut image_count = 0usize;
+        for t in &all_tags {
+            if !is_referrers_fallback_tag(t) {
+                image_count += 1;
+                if samples.len() < NO_TAGS_SAMPLE_CAP {
+                    samples.push(t.clone());
+                }
+            }
+        }
+        let template = NoTagsInfo {
+            from: mapping.from.clone(),
+            image_count,
+            artifact_count: all_tags.len() - image_count,
+            filter_desc: describe_filter(tags_config),
+            samples,
         };
+        let (kept, count, report) = select_filtered_tags(tags_config, all_tags, with_report)?;
+        (kept, count, report, Some(template))
+    };
 
     if filtered.is_empty() {
-        tracing::warn!(
-            from = %mapping.from,
-            "no tags matched after filtering, skipping mapping"
-        );
-        return Ok(None);
+        let info = no_tags_template.unwrap_or_else(|| NoTagsInfo {
+            from: mapping.from.clone(),
+            image_count: 0,
+            artifact_count: 0,
+            filter_desc: describe_filter(tags_config),
+            samples: Vec::new(),
+        });
+        return Ok(MappingResolution::NoMatchingTags(info));
     }
 
     // --- Target repo ---
@@ -433,7 +832,7 @@ pub(crate) async fn resolve_mapping(
         None => ResolvedArtifacts::default(),
     };
 
-    Ok(Some(ResolvedMapping {
+    Ok(MappingResolution::Resolved(ResolvedMapping {
         source_authority,
         source_client,
         source_repo: RepositoryName::new(mapping.from.clone())?,
@@ -447,6 +846,23 @@ pub(crate) async fn resolve_mapping(
         candidate_count,
         filter_report,
     }))
+}
+
+/// Emit a tracing WARN for a [`NoTagsInfo`] with both a human-readable
+/// message (via [`Display`](std::fmt::Display)) and structured fields for
+/// log aggregators.
+fn emit_no_tags_warn(info: &NoTagsInfo) {
+    // `from` is omitted as a structured field -- the message renders it
+    // first, so the text formatter would otherwise tail with a redundant
+    // `from=...`. Counts and filter remain (numeric, terse, useful for
+    // both grep and JSON aggregation).
+    tracing::warn!(
+        source_total = info.source_total(),
+        image_count = info.image_count,
+        artifact_count = info.artifact_count,
+        filter = info.filter_desc.as_deref().unwrap_or(""),
+        "{info}"
+    );
 }
 
 /// Build a `FilterConfig` from a `TagsConfig`, falling back to defaults.
@@ -511,43 +927,14 @@ fn select_filtered_tags(
     }
 }
 
-/// Format one per-mapping plan line for `INFO`-level emission.
+/// One-line summary of a [`TagsConfig`] suitable for log emission, e.g.
+/// `semver >=1.0.0, latest=5`. Returns `None` when no filter applies.
 ///
-/// `{source} -> {target}: {kept} of {N} tags  =>  [t1, t2]` when the
-/// candidate count is known, or `{kept} tags` on the exact-tag fast path.
-fn format_plan_line(
-    source_repo: &str,
-    target_repo: &str,
-    kept: usize,
-    candidate_count: Option<usize>,
-    target_names: &[&str],
-) -> String {
-    let count_phrase = match candidate_count {
-        Some(n) => format!("{kept} of {n} tags"),
-        None => format!("{kept} tags"),
-    };
-    format!(
-        "{source_repo} -> {target_repo}: {count_phrase}  =>  [{}]",
-        target_names.join(", ")
-    )
-}
-
-/// Emit one INFO log line per resolved mapping summarizing kept/considered
-/// tag counts and target list.
-fn log_resolved_mappings(mappings: &[ResolvedMapping]) {
-    for m in mappings {
-        let target_names: Vec<&str> = m.targets.iter().map(|t| &*t.name).collect();
-        tracing::info!(
-            "{}",
-            format_plan_line(
-                m.source_repo.as_str(),
-                m.target_repo.as_str(),
-                m.tags.len(),
-                m.candidate_count,
-                &target_names,
-            )
-        );
-    }
+/// Single source of truth: delegates to [`FilterConfig::describe`] after
+/// the same conversion the engine uses, so dry-run stage labels and the
+/// no-tags-matched WARN rationale cannot drift.
+fn describe_filter(tags: Option<&TagsConfig>) -> Option<String> {
+    build_filter(tags).describe()
 }
 
 /// Write sync output as JSON when `--json` is passed.
@@ -823,32 +1210,354 @@ latest: 5
     }
 
     #[test]
-    fn format_plan_line_filtered_path_includes_of_n() {
-        let line = format_plan_line(
-            "docker.io/library/alpine",
-            "alpine",
-            3,
-            Some(50),
-            &["ecr-prod", "ghcr-mirror"],
-        );
+    fn describe_filter_combines_semver_and_latest() {
+        let tags = TagsConfig {
+            semver: Some(">=1.0.0".into()),
+            latest: Some(5),
+            ..TagsConfig::default()
+        };
         assert_eq!(
-            line,
-            "docker.io/library/alpine -> alpine: 3 of 50 tags  =>  [ecr-prod, ghcr-mirror]"
+            describe_filter(Some(&tags)).as_deref(),
+            Some("semver >=1.0.0, latest=5")
         );
     }
 
     #[test]
-    fn format_plan_line_exact_tag_path_omits_of_n() {
-        let line = format_plan_line("ghcr.io/foo/bar", "bar", 3, None, &["ghcr-mirror"]);
-        assert_eq!(line, "ghcr.io/foo/bar -> bar: 3 tags  =>  [ghcr-mirror]");
+    fn describe_filter_returns_none_when_empty() {
+        let tags = TagsConfig::default();
+        assert!(describe_filter(Some(&tags)).is_none());
+        assert!(describe_filter(None).is_none());
+    }
+
+    // -- NoTagsInfo Display ---------------------------------------------
+
+    fn no_tags_info(
+        from: &str,
+        image_count: usize,
+        artifact_count: usize,
+        filter_desc: Option<&str>,
+        samples: &[&str],
+    ) -> NoTagsInfo {
+        NoTagsInfo {
+            from: from.into(),
+            image_count,
+            artifact_count,
+            filter_desc: filter_desc.map(String::from),
+            samples: samples.iter().map(|s| (*s).into()).collect(),
+        }
     }
 
     #[test]
-    fn format_plan_line_single_target() {
-        let line = format_plan_line("src/repo", "dst/repo", 5, Some(80), &["only-target"]);
+    fn no_tags_warn_renders_simple_repo() {
+        // 2 image tags, both shown -- no truncation, no artifact split.
+        let info = no_tags_info(
+            "library/nginx",
+            2,
+            0,
+            Some("semver >=2.0"),
+            &["v1.0", "v1.1"],
+        );
         assert_eq!(
-            line,
-            "src/repo -> dst/repo: 5 of 80 tags  =>  [only-target]"
+            info.to_string(),
+            "library/nginx: 0 of 2 source tags matched filter (semver >=2.0); skipping. Source: [v1.0, v1.1]"
+        );
+    }
+
+    /// Cosign-heavy repos: WARN must split image vs referrer counts so the
+    /// 14289-tag chainguard case is not misread as 14289 missing image tags.
+    #[test]
+    fn no_tags_warn_splits_image_and_artifact_counts() {
+        let info = no_tags_info(
+            "chainguard/nginx",
+            2,
+            14287,
+            Some("semver >=1.0.0, latest=5"),
+            &["latest", "latest-dev"],
+        );
+        let msg = info.to_string();
+        assert!(
+            msg.contains(
+                "0 of 14289 source tags (2 image tags, 14287 referrer artifacts) matched filter"
+            ),
+            "{msg}"
+        );
+    }
+
+    /// Truncation appends `, ...` so the user knows the list is sampled.
+    #[test]
+    fn no_tags_warn_appends_ellipsis_when_truncated() {
+        let info = NoTagsInfo {
+            from: "library/alpine".into(),
+            // image_count > samples.len() drives the truncation marker.
+            image_count: 100,
+            artifact_count: 0,
+            filter_desc: Some("semver >=99.0".into()),
+            samples: (0..5).map(|i| format!("v{i}")).collect(),
+        };
+        assert!(info.samples_truncated());
+        let msg = info.to_string();
+        assert!(msg.ends_with("Source: [v0, v1, v2, v3, v4, ...]"), "{msg}");
+    }
+
+    /// Empty samples render as `<empty>` and a missing filter description
+    /// renders as `no filter configured` -- both ensure the message never
+    /// has bare parens or `[]`.
+    #[test]
+    fn no_tags_warn_renders_empty_markers() {
+        let info = no_tags_info("x/y", 0, 0, None, &[]);
+        let msg = info.to_string();
+        assert!(msg.contains("(no filter configured)"), "{msg}");
+        assert!(msg.ends_with("Source: <empty>"), "{msg}");
+    }
+
+    // -- WatchLogState transitions --------------------------------------
+
+    /// First observation triggers a WARN; repeats within the same failure
+    /// run are suppressed; recovery clears the entry so a relapse warns
+    /// again. Encodes the contract `run()` depends on.
+    #[test]
+    fn watch_log_state_emits_once_per_transition() {
+        let mut state = WatchLogState::default();
+        assert!(state.observe_no_match("repo-a"));
+        assert!(!state.observe_no_match("repo-a"));
+        assert!(state.observe_resolved("repo-a"));
+        assert!(!state.observe_resolved("repo-a"));
+        assert!(state.observe_no_match("repo-a"));
+    }
+
+    /// `retain_active` drops entries for mappings no longer in the config
+    /// so the set does not grow unbounded across the watch process.
+    #[test]
+    fn watch_log_state_prunes_removed_mappings() {
+        let mut state = WatchLogState::default();
+        state.observe_no_match("repo-a");
+        state.observe_no_match("repo-b");
+        state.observe_no_match("repo-removed");
+
+        state.retain_active(["repo-a", "repo-b"]);
+
+        // After pruning, `repo-removed` re-warns (gap means transition);
+        // surviving entries continue to suppress.
+        assert!(!state.observe_no_match("repo-a"));
+        assert!(!state.observe_no_match("repo-b"));
+        assert!(state.observe_no_match("repo-removed"));
+    }
+
+    // -- per-mapping outcome aggregation + dedup ---------------------------
+
+    fn img(
+        source: &str,
+        target: &str,
+        status: ocync_sync::ImageStatus,
+        bytes: u64,
+    ) -> ocync_sync::ImageResult {
+        use ocync_sync::{BlobTransferStats, ImageResult};
+        ImageResult {
+            image_id: uuid::Uuid::now_v7(),
+            source: source.into(),
+            target: target.into(),
+            status,
+            bytes_transferred: bytes,
+            blob_stats: BlobTransferStats::default(),
+            duration: Duration::from_secs(1),
+            artifacts_skipped: false,
+        }
+    }
+
+    fn report_with(images: Vec<ocync_sync::ImageResult>) -> SyncReport {
+        SyncReport {
+            run_id: uuid::Uuid::now_v7(),
+            images,
+            stats: ocync_sync::SyncStats::default(),
+            duration: Duration::from_secs(1),
+        }
+    }
+
+    /// Aggregation groups by `source_repo:` + `target_repo:` prefix so
+    /// images from a different mapping (same source repo, different target)
+    /// don't bleed into this mapping's counts.
+    #[test]
+    fn aggregate_mapping_outcome_groups_by_source_and_target() {
+        let report = report_with(vec![
+            img(
+                "library/alpine:3.20",
+                "mirror/a:3.20",
+                ocync_sync::ImageStatus::Synced,
+                100,
+            ),
+            img(
+                "library/alpine:3.21",
+                "mirror/a:3.21",
+                ocync_sync::ImageStatus::Synced,
+                200,
+            ),
+            img(
+                "library/alpine:3.21",
+                "mirror/b:3.21",
+                ocync_sync::ImageStatus::Skipped {
+                    reason: ocync_sync::SkipReason::DigestMatch,
+                },
+                0,
+            ),
+        ]);
+        let o = aggregate_mapping_outcome("library/alpine", "mirror/a", &report);
+        assert_eq!(o.synced, 2);
+        assert_eq!(o.skipped, 0);
+        assert_eq!(o.bytes, 300);
+    }
+
+    /// Empty mappings (no images in the report) skip silently -- the
+    /// no-tags WARN is the right surface for that case, not this one.
+    #[test]
+    fn empty_outcome_is_recognized() {
+        let outcome = MappingOutcome::default();
+        assert!(outcome.is_empty());
+        let with_skip = MappingOutcome {
+            skipped: 1,
+            ..MappingOutcome::default()
+        };
+        assert!(!with_skip.is_empty());
+    }
+
+    /// First observation emits; identical follow-up suppresses; outcome
+    /// change emits again. Mirrors the no-tags transition contract.
+    #[test]
+    fn watch_log_state_dedupes_identical_mapping_outcomes() {
+        let mut state = WatchLogState::default();
+        let steady = MappingOutcome {
+            skipped: 5,
+            ..MappingOutcome::default()
+        };
+        let active = MappingOutcome {
+            synced: 1,
+            skipped: 4,
+            bytes: 1024,
+            ..MappingOutcome::default()
+        };
+
+        // First observation: emit, no prior so not a recovery.
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &steady),
+            Some(false)
+        );
+        // Same outcome twice: suppress.
+        assert_eq!(state.observe_mapping_outcome("repo-a", &steady), None);
+        assert_eq!(state.observe_mapping_outcome("repo-a", &steady), None);
+        // Different outcome: emit, neither prior nor current was a failure
+        // so not a recovery either.
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &active),
+            Some(false)
+        );
+        assert_eq!(state.observe_mapping_outcome("repo-a", &active), None);
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &steady),
+            Some(false)
+        );
+    }
+
+    /// Recovery detection: prior outcome with `failed > 0` followed by an
+    /// outcome with `failed == 0` returns `Some(true)` so the caller can
+    /// attach the `[recovered]` marker. Cycle counter advances on each
+    /// transition so the watch loop sees activity.
+    #[test]
+    fn watch_log_state_surfaces_failure_to_clean_transition() {
+        let mut state = WatchLogState::default();
+        let failing = MappingOutcome {
+            failed: 1,
+            ..MappingOutcome::default()
+        };
+        let healthy = MappingOutcome {
+            synced: 1,
+            ..MappingOutcome::default()
+        };
+
+        // First observation can never be a recovery (no prior).
+        assert_eq!(state.observe_mapping_outcome("r", &failing), Some(false));
+        assert_eq!(state.observe_mapping_outcome("r", &healthy), Some(true));
+        assert_eq!(state.cycle_emit_count(), 2);
+    }
+
+    /// `retain_active` also prunes per-mapping outcome cache so a removed
+    /// mapping doesn't keep its stale entry forever. Re-observation after
+    /// pruning emits as a fresh first-observation.
+    #[test]
+    fn watch_log_state_retain_active_also_prunes_outcomes() {
+        let mut state = WatchLogState::default();
+        let outcome = MappingOutcome {
+            skipped: 1,
+            ..MappingOutcome::default()
+        };
+        state.observe_mapping_outcome("keep", &outcome);
+        state.observe_mapping_outcome("drop", &outcome);
+
+        state.retain_active(["keep"]);
+
+        assert_eq!(state.observe_mapping_outcome("drop", &outcome), Some(false));
+        assert_eq!(state.observe_mapping_outcome("keep", &outcome), None);
+    }
+
+    /// `format_mapping_outcome` omits zero counts, elides the bytes clause
+    /// when nothing transferred, tags recovery transitions, and drops the
+    /// `[targets]` bracket on single-target mappings (the destination is
+    /// already in the `from -> to` arrow).
+    #[test]
+    fn format_mapping_outcome_single_target_omits_bracket() {
+        let d = MappingDescriptor {
+            from: "library/alpine".into(),
+            target_repo: "mirror/alpine".into(),
+            target_names: vec!["ttl".into()],
+        };
+        let synced_only = MappingOutcome {
+            synced: 3,
+            bytes: 1024,
+            ..MappingOutcome::default()
+        };
+        assert_eq!(
+            format_mapping_outcome(&d, &synced_only, false),
+            "library/alpine -> mirror/alpine: synced 3 (1.0 KB)"
+        );
+        let skipped_only = MappingOutcome {
+            skipped: 5,
+            ..MappingOutcome::default()
+        };
+        assert_eq!(
+            format_mapping_outcome(&d, &skipped_only, false),
+            "library/alpine -> mirror/alpine: skipped 5"
+        );
+        let mixed = MappingOutcome {
+            synced: 1,
+            skipped: 2,
+            failed: 1,
+            bytes: 2048,
+        };
+        assert_eq!(
+            format_mapping_outcome(&d, &mixed, false),
+            "library/alpine -> mirror/alpine: synced 1, skipped 2, failed 1 (2.0 KB)"
+        );
+        assert_eq!(
+            format_mapping_outcome(&d, &synced_only, true),
+            "library/alpine -> mirror/alpine: synced 3 (1.0 KB) [recovered]"
+        );
+    }
+
+    /// Multi-target mappings keep the `[targets]` bracket so the operator
+    /// can see which destinations the outcome covers.
+    #[test]
+    fn format_mapping_outcome_multi_target_keeps_bracket() {
+        let d = MappingDescriptor {
+            from: "library/alpine".into(),
+            target_repo: "mirror/alpine".into(),
+            target_names: vec!["ecr-prod".into(), "ghcr-mirror".into()],
+        };
+        let synced = MappingOutcome {
+            synced: 1,
+            bytes: 1024,
+            ..MappingOutcome::default()
+        };
+        assert_eq!(
+            format_mapping_outcome(&d, &synced, false),
+            "library/alpine -> mirror/alpine [ecr-prod, ghcr-mirror]: synced 1 (1.0 KB)"
         );
     }
 
@@ -1002,7 +1711,7 @@ latest: 5
         assert!(out.contains("FAIL"), "{out}");
         assert!(out.contains("BelowMinTags"), "{out}");
         // And carries the full pipeline trace.
-        assert!(out.contains("source candidates: 10"), "{out}");
-        assert!(out.contains("dropped 10:"), "{out}");
+        assert!(out.contains("source tags: 10"), "{out}");
+        assert!(out.contains("dropped (10):"), "{out}");
     }
 }

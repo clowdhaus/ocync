@@ -238,7 +238,7 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
-            tracing::warn!(helper = %program, registry, error = %e, "credential helper failed to execute");
+            tracing::debug!(helper = %program, registry, error = %e, "credential helper failed to execute");
             Error::CredentialHelperFailed {
                 helper: program.clone(),
                 reason: format!("failed to execute: {e}"),
@@ -263,6 +263,8 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
     )
     .await
     .map_err(|_| {
+        // Timeout is a real operational problem (hung helper, locked keychain).
+        // Distinct from the noisy fallback paths around it -- keep at WARN.
         tracing::warn!(helper = %program, registry, "credential helper timed out after 30s");
         Error::CredentialHelperFailed {
             helper: program.clone(),
@@ -270,7 +272,7 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
         }
     })?
     .map_err(|e| {
-        tracing::warn!(helper = %program, registry, error = %e, "credential helper failed to execute");
+        tracing::debug!(helper = %program, registry, error = %e, "credential helper failed to execute");
         Error::CredentialHelperFailed {
             helper: program.clone(),
             reason: format!("failed to execute: {e}"),
@@ -279,7 +281,7 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(helper = %program, registry, status = %output.status, "credential helper exited with error");
+        tracing::debug!(helper = %program, registry, status = %output.status, "credential helper exited with error");
         return Err(Error::CredentialHelperFailed {
             helper: program,
             reason: format!("exited with {}: {}", output.status, stderr.trim()),

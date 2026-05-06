@@ -2,12 +2,12 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ocync_sync::cache::TransferStateCache;
 use tokio::net::TcpListener;
 
-use crate::cli::commands::synchronize;
+use crate::cli::commands::synchronize::{self, WatchLogState};
 use crate::cli::config::load_config;
 use crate::cli::health::HealthState;
 use crate::cli::shutdown::ShutdownSignal;
@@ -68,6 +68,18 @@ pub(crate) async fn run(
                     crate::cli::health::serve(health_listener, state).await;
                 })
             };
+
+            // Watch-mode log state: tracks which mappings have already
+            // emitted a no-tags-matched WARN so we emit one per transition,
+            // not one per cycle. Pruned each cycle to mappings still in config.
+            let mut watch_log = WatchLogState::default();
+
+            // Heartbeat: when no log line has been emitted for an extended
+            // period (idle steady-state watch), emit a "still alive" INFO
+            // so log scrapers have a recent anchor confirming the process
+            // is doing its job. Cadence is decoupled from the sync interval.
+            const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3600);
+            let mut last_emit_at = Instant::now();
 
             // Track consecutive config reload failures for backoff.
             let mut config_failures: u32 = 0;
@@ -139,17 +151,21 @@ pub(crate) async fn run(
                     json: args.json,
                 };
 
+                watch_log.begin_cycle();
                 match synchronize::run(
                     &sync_args,
                     progress,
                     Some(&shutdown),
                     Some(Rc::clone(&cache)),
                     verbose,
+                    Some(&mut watch_log),
                 )
                 .await
                 {
                     Ok(code) => {
-                        tracing::info!(exit_code = ?code, "sync cycle complete");
+                        // Cycle completion is conveyed by the dedup-aware
+                        // per-mapping line + cycle tail (when stats change)
+                        // and by /healthz; no separate INFO needed.
                         if matches!(code, ExitCode::Success | ExitCode::PartialFailure) {
                             health_state.borrow_mut().record_success();
                         }
@@ -157,6 +173,21 @@ pub(crate) async fn run(
                     Err(err) => {
                         tracing::error!(error = %err, "sync cycle failed");
                     }
+                }
+
+                // Heartbeat gate: if anything emitted this cycle, the user
+                // already has a recent log anchor; reset the timer. Else
+                // check the elapsed-since-last-emit and fire the heartbeat
+                // when we've been silent past the threshold.
+                if watch_log.cycle_emit_count() > 0 {
+                    last_emit_at = Instant::now();
+                } else if last_emit_at.elapsed() >= HEARTBEAT_INTERVAL {
+                    let idle_secs = last_emit_at.elapsed().as_secs();
+                    tracing::info!(
+                        idle_secs,
+                        "watch alive: no state changes; sync loop healthy"
+                    );
+                    last_emit_at = Instant::now();
                 }
 
                 // Wait for the interval to elapse, or return early on shutdown.

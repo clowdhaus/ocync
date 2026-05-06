@@ -313,16 +313,6 @@ async fn main() -> std::process::ExitCode {
     let shutdown = cli::shutdown::ShutdownSignal::new();
     cli::shutdown::install_signal_handlers(shutdown.clone());
 
-    // Suppress the text summary on stdout when JSON owns stdout or when
-    // the summary is redundant (single-image copy).
-    let suppress_summary = match &cli.command {
-        Commands::Sync(args) => args.json,
-        Commands::Watch(args) => args.json,
-        Commands::Analyze(args) => args.json,
-        Commands::Copy(_) => true,
-        _ => false,
-    };
-
     let effective_verbosity = match &cli.command {
         // Copy always shows per-image output -- users expect to see what was copied.
         Commands::Copy(_) => cli.verbose.max(1),
@@ -332,10 +322,7 @@ async fn main() -> std::process::ExitCode {
     let progress: Box<dyn ocync_sync::progress::ProgressReporter> = if cli.quiet {
         Box::new(NullProgress)
     } else {
-        Box::new(cli::progress::TextProgress::new(
-            effective_verbosity,
-            suppress_summary,
-        ))
+        Box::new(cli::progress::TextProgress::new(effective_verbosity))
     };
 
     // Dry-run / log-emission verbose toggle: any -v level removes the sample
@@ -344,7 +331,8 @@ async fn main() -> std::process::ExitCode {
     let verbose = cli.verbose >= 1;
     let result = match cli.command {
         Commands::Sync(args) => {
-            cli::commands::synchronize::run(&args, &*progress, Some(&shutdown), None, verbose).await
+            cli::commands::synchronize::run(&args, &*progress, Some(&shutdown), None, verbose, None)
+                .await
         }
         Commands::Copy(args) => cli::commands::copy::run(&args, &*progress, Some(&shutdown)).await,
         Commands::Tags(args) => cli::commands::tags::run(&args).await,

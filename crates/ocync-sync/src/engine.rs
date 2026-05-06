@@ -862,7 +862,7 @@ impl SyncEngine {
             for tag_pair in &mapping.tags {
                 // Tier 1: immutable tag skip (0 API calls).
                 if mapping.should_skip_immutable(&tag_pair.target) {
-                    info!(
+                    debug!(
                         source_repo = %mapping.source_repo,
                         tag = %tag_pair.target,
                         "skipping -- immutable tag exists at all targets"
@@ -1430,7 +1430,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
     while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
             Ok(Some(head)) if head.digest == *compare_digest => {
-                info!(
+                debug!(
                     source_repo = %source.repo,
                     source_tag = %source.tag,
                     target_repo = %target.repo,
@@ -1574,7 +1574,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
     while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
             Ok(Some(head)) if head.digest == *source_digest => {
-                info!(
+                debug!(
                     source_repo = %source.repo,
                     source_tag = %source.tag,
                     target_repo = %target.repo,
@@ -1763,7 +1763,7 @@ async fn execute_item(
                 .notify_repo_failed(&item.target_name, &item.target.repo);
 
             if is_immutable_tag_error(&err) {
-                info!(
+                debug!(
                     source_repo = %item.source.repo,
                     target_repo = %item.target.repo,
                     target_tag = %item.target.tag,
@@ -2868,7 +2868,7 @@ async fn discover_referrers(
                     }
                 },
                 Err(e) if e.is_not_found() => {
-                    info!(
+                    debug!(
                         repo = %source_repo,
                         digest = %parent_digest,
                         "no referrers found (API 404, tag fallback 404)"
@@ -2877,7 +2877,7 @@ async fn discover_referrers(
                 }
                 Err(e) => {
                     // Non-404 error on fallback is not fatal; log and continue.
-                    info!(
+                    debug!(
                         repo = %source_repo,
                         digest = %parent_digest,
                         error = %e,
@@ -2891,7 +2891,7 @@ async fn discover_referrers(
         Err(e) => {
             // Non-404 error from referrers API. Log and continue rather
             // than failing the entire image sync for an artifact query.
-            info!(
+            debug!(
                 repo = %source_repo,
                 digest = %parent_digest,
                 error = %e,

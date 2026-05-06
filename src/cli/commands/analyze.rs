@@ -18,7 +18,7 @@ use ocync_distribution::{Digest, RepositoryName};
 
 use ocync_sync::ShutdownSignal;
 
-use crate::cli::commands::synchronize::{build_clients, resolve_mapping};
+use crate::cli::commands::synchronize::{MappingResolution, build_clients, resolve_mapping};
 use crate::cli::config::load_config;
 use crate::cli::output::format_bytes;
 use crate::cli::{CliError, ExitCode};
@@ -68,8 +68,8 @@ pub(crate) async fn run(
 
         let resolved =
             match resolve_mapping(mapping, &config, &clients, &no_checkers, false).await? {
-                Some(r) => r,
-                None => continue,
+                MappingResolution::Resolved(r) => r,
+                MappingResolution::NoMatchingTags(_) => continue,
             };
 
         for tag_pair in &resolved.tags {
