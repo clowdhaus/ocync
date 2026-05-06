@@ -434,14 +434,16 @@ fn emit_mapping_outcomes(
             None => false,
         };
         let line = format_mapping_outcome(d, &outcome, recovered);
-        // The `tracing::event!` macro requires a const-expression level, so
-        // each per-mapping line goes through one of two near-identical
-        // arms. Keep the structured field set in sync between them so log
-        // aggregators don't see different shapes for warn vs info.
+        // `from` / `to` are intentionally NOT structured fields here -- the
+        // message already names them as `from -> to`, and tracing's text
+        // formatter would otherwise tail the line with a redundant
+        // `from=... to=...` block. The count fields remain because they
+        // carry zero values the terse message elides.
+        //
+        // The two arms differ only in level. `tracing::event!` would let
+        // us pick at runtime, but it requires a const-expression level.
         if outcome.failed > 0 {
             tracing::warn!(
-                from = %d.from,
-                to = %d.target_repo,
                 synced = outcome.synced,
                 skipped = outcome.skipped,
                 failed = outcome.failed,
@@ -451,8 +453,6 @@ fn emit_mapping_outcomes(
             );
         } else {
             tracing::info!(
-                from = %d.from,
-                to = %d.target_repo,
                 synced = outcome.synced,
                 skipped = outcome.skipped,
                 failed = outcome.failed,
@@ -533,24 +533,13 @@ fn emit_cycle_tail(descriptors: &[MappingDescriptor], report: &SyncReport) {
         format_bytes(s.bytes_transferred),
         format_duration(report.duration),
     );
+    // Counts are already in the message; structured fields would be a
+    // verbatim restatement in text output. JSON aggregators parse the
+    // message (or use the SyncReport via `--json`).
     if s.images_failed > 0 {
-        tracing::warn!(
-            mappings = descriptors.len(),
-            synced = s.images_synced,
-            skipped = s.images_skipped,
-            failed = s.images_failed,
-            bytes = s.bytes_transferred,
-            "{line}"
-        );
+        tracing::warn!("{line}");
     } else {
-        tracing::info!(
-            mappings = descriptors.len(),
-            synced = s.images_synced,
-            skipped = s.images_skipped,
-            failed = s.images_failed,
-            bytes = s.bytes_transferred,
-            "{line}"
-        );
+        tracing::info!("{line}");
     }
 }
 
@@ -863,8 +852,11 @@ pub(crate) async fn resolve_mapping(
 /// message (via [`Display`](std::fmt::Display)) and structured fields for
 /// log aggregators.
 fn emit_no_tags_warn(info: &NoTagsInfo) {
+    // `from` is omitted as a structured field -- the message renders it
+    // first, so the text formatter would otherwise tail with a redundant
+    // `from=...`. Counts and filter remain (numeric, terse, useful for
+    // both grep and JSON aggregation).
     tracing::warn!(
-        from = %info.from,
         source_total = info.source_total(),
         image_count = info.image_count,
         artifact_count = info.artifact_count,
