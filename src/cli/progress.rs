@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 
 use ocync_sync::progress::ProgressReporter;
-use ocync_sync::{ImageResult, ImageStatus, SyncReport};
+use ocync_sync::{ImageResult, ImageStatus, SyncReport, SyncStats};
 
 use crate::cli::output::{format_bytes, format_duration};
 
@@ -173,6 +173,48 @@ impl ProgressReporter for TextProgress {
 
     fn run_completed(&self, report: &SyncReport) {
         write_run_summary(&self.stdout, report, self.suppress_summary);
+    }
+}
+
+/// Watch-mode wrapper that dedupes the per-cycle summary so an idle pod
+/// stops re-emitting the same `sync complete: 0 synced, N skipped, ...`
+/// line once per cycle. Per-image events still flow through the inner
+/// reporter unchanged.
+///
+/// The first cycle always emits. Subsequent cycles emit only when the
+/// aggregate [`SyncStats`] differ from the prior cycle's -- so a transfer,
+/// failure, or count change is visible, but a steady-state all-skip cycle
+/// is silent.
+pub(crate) struct DedupingWatchProgress<'a> {
+    inner: &'a dyn ProgressReporter,
+    last_stats: RefCell<Option<SyncStats>>,
+}
+
+impl<'a> DedupingWatchProgress<'a> {
+    pub(crate) fn new(inner: &'a dyn ProgressReporter) -> Self {
+        Self {
+            inner,
+            last_stats: RefCell::new(None),
+        }
+    }
+}
+
+impl ProgressReporter for DedupingWatchProgress<'_> {
+    fn image_started(&self, source: &str, target: &str) {
+        self.inner.image_started(source, target);
+    }
+
+    fn image_completed(&self, result: &ImageResult) {
+        self.inner.image_completed(result);
+    }
+
+    fn run_completed(&self, report: &SyncReport) {
+        let mut last = self.last_stats.borrow_mut();
+        let changed = last.as_ref().is_none_or(|prev| prev != &report.stats);
+        if changed {
+            self.inner.run_completed(report);
+            *last = Some(report.stats.clone());
+        }
     }
 }
 
@@ -844,5 +886,115 @@ mod tests {
             stdout.borrow().is_empty(),
             "suppress_summary should suppress stdout"
         );
+    }
+
+    // -- DedupingWatchProgress -------------------------------------------
+
+    /// Counting progress reporter that records each `run_completed` call.
+    /// Used to assert how many times the wrapper passes through.
+    #[derive(Default)]
+    struct CountingProgress {
+        runs: RefCell<usize>,
+    }
+    impl ProgressReporter for CountingProgress {
+        fn image_started(&self, _: &str, _: &str) {}
+        fn image_completed(&self, _: &ImageResult) {}
+        fn run_completed(&self, _: &SyncReport) {
+            *self.runs.borrow_mut() += 1;
+        }
+    }
+
+    fn report_with(stats: SyncStats) -> SyncReport {
+        SyncReport {
+            run_id: Uuid::now_v7(),
+            images: Vec::new(),
+            stats,
+            // Duration intentionally varies cycle-to-cycle in production;
+            // pick non-zero here so tests notice if the dedup keys on it.
+            duration: Duration::from_secs(1),
+        }
+    }
+
+    /// First cycle always passes through; identical follow-up cycles are
+    /// suppressed; a third cycle that differs passes through again.
+    #[test]
+    fn deduping_watch_emits_only_when_stats_change() {
+        let inner = CountingProgress::default();
+        let dedup = DedupingWatchProgress::new(&inner as &dyn ProgressReporter);
+
+        let steady = SyncStats {
+            images_skipped: 250,
+            ..SyncStats::default()
+        };
+        let active = SyncStats {
+            images_synced: 1,
+            images_skipped: 249,
+            ..SyncStats::default()
+        };
+
+        dedup.run_completed(&report_with(steady.clone())); // cycle 1: emit
+        dedup.run_completed(&report_with(steady.clone())); // cycle 2: suppress
+        dedup.run_completed(&report_with(steady.clone())); // cycle 3: suppress
+        dedup.run_completed(&report_with(active.clone())); // cycle 4: emit (changed)
+        dedup.run_completed(&report_with(active)); //         cycle 5: suppress
+        dedup.run_completed(&report_with(steady)); //         cycle 6: emit (changed)
+
+        assert_eq!(*inner.runs.borrow(), 3);
+    }
+
+    /// Wall-clock duration varies cycle-to-cycle even in steady state; the
+    /// dedup must key on stats only, not on the report's `duration`.
+    #[test]
+    fn deduping_watch_ignores_duration_drift() {
+        let inner = CountingProgress::default();
+        let dedup = DedupingWatchProgress::new(&inner as &dyn ProgressReporter);
+
+        let stats = SyncStats {
+            images_skipped: 5,
+            ..SyncStats::default()
+        };
+
+        let mut report1 = report_with(stats.clone());
+        report1.duration = Duration::from_millis(800);
+        let mut report2 = report_with(stats);
+        report2.duration = Duration::from_millis(1_400);
+
+        dedup.run_completed(&report1);
+        dedup.run_completed(&report2);
+
+        assert_eq!(*inner.runs.borrow(), 1, "duration drift must not re-emit");
+    }
+
+    /// Per-image events are never deduped -- they describe distinct
+    /// transfers and must always reach the inner reporter.
+    #[test]
+    fn deduping_watch_passes_image_events_through() {
+        struct ImageCounter {
+            started: RefCell<usize>,
+            completed: RefCell<usize>,
+        }
+        impl ProgressReporter for ImageCounter {
+            fn image_started(&self, _: &str, _: &str) {
+                *self.started.borrow_mut() += 1;
+            }
+            fn image_completed(&self, _: &ImageResult) {
+                *self.completed.borrow_mut() += 1;
+            }
+            fn run_completed(&self, _: &SyncReport) {}
+        }
+        let inner = ImageCounter {
+            started: RefCell::new(0),
+            completed: RefCell::new(0),
+        };
+        let dedup = DedupingWatchProgress::new(&inner as &dyn ProgressReporter);
+
+        dedup.image_started("a", "b");
+        dedup.image_started("c", "d");
+        dedup.image_completed(&make_result(ImageStatus::Synced, 1));
+        dedup.image_completed(&make_result(ImageStatus::Synced, 2));
+        dedup.image_completed(&make_result(ImageStatus::Synced, 3));
+
+        assert_eq!(*inner.started.borrow(), 2);
+        assert_eq!(*inner.completed.borrow(), 3);
     }
 }

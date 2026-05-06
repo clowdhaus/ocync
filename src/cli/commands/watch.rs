@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use crate::cli::commands::synchronize::{self, WatchLogState};
 use crate::cli::config::load_config;
 use crate::cli::health::HealthState;
+use crate::cli::progress::DedupingWatchProgress;
 use crate::cli::shutdown::ShutdownSignal;
 use crate::cli::{CliError, ExitCode};
 use crate::{SyncArgs, WatchArgs};
@@ -24,6 +25,11 @@ pub(crate) async fn run(
 ) -> Result<ExitCode, CliError> {
     let interval = Duration::from_secs(args.interval);
     tracing::info!(interval_secs = args.interval, "starting watch mode");
+
+    // Wrap the caller's progress reporter so the per-cycle "sync complete"
+    // line is emitted only when the aggregate stats actually change. An
+    // all-skip steady-state watch goes silent after the first cycle.
+    let dedup_progress = DedupingWatchProgress::new(progress);
 
     let health_state = Rc::new(RefCell::new(HealthState::new(interval)));
 
@@ -146,7 +152,7 @@ pub(crate) async fn run(
 
                 match synchronize::run(
                     &sync_args,
-                    progress,
+                    &dedup_progress,
                     Some(&shutdown),
                     Some(Rc::clone(&cache)),
                     verbose,
@@ -155,7 +161,9 @@ pub(crate) async fn run(
                 .await
                 {
                     Ok(code) => {
-                        tracing::info!(exit_code = ?code, "sync cycle complete");
+                        // Cycle completion is conveyed by the dedup-aware
+                        // "sync complete: ..." line on stdout (when stats
+                        // change) and by /healthz; no separate INFO needed.
                         if matches!(code, ExitCode::Success | ExitCode::PartialFailure) {
                             health_state.borrow_mut().record_success();
                         }

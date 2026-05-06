@@ -184,7 +184,7 @@ impl std::fmt::Display for ErrorKind {
 }
 
 /// Aggregate statistics for a sync run.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct SyncStats {
     /// Number of images successfully synced.
     pub images_synced: u64,
