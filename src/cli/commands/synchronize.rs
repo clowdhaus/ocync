@@ -489,7 +489,6 @@ fn aggregate_mapping_outcome(
 }
 
 fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: bool) -> String {
-    let targets = d.target_names.join(", ");
     let mut parts = Vec::with_capacity(3);
     if o.synced > 0 {
         parts.push(format!("synced {}", o.synced));
@@ -507,8 +506,16 @@ fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: 
         String::new()
     };
     let recovered_clause = if recovered { " [recovered]" } else { "" };
+    // Multi-target mappings need the bracket to disambiguate which targets
+    // the line refers to. Single-target mappings: omit -- the destination
+    // is already in the `from -> to` arrow.
+    let targets_clause = if d.target_names.len() > 1 {
+        format!(" [{}]", d.target_names.join(", "))
+    } else {
+        String::new()
+    };
     format!(
-        "{} -> {} [{targets}]: {counts}{bytes_clause}{recovered_clause}",
+        "{} -> {}{targets_clause}: {counts}{bytes_clause}{recovered_clause}",
         d.from, d.target_repo
     )
 }
@@ -1498,11 +1505,12 @@ latest: 5
         assert_eq!(state.observe_mapping_outcome("keep", &outcome), None);
     }
 
-    /// `format_mapping_outcome` omits zero counts so the line stays terse,
-    /// elides the bytes clause when nothing transferred, and tags the
-    /// recovery transition explicitly.
+    /// `format_mapping_outcome` omits zero counts, elides the bytes clause
+    /// when nothing transferred, tags recovery transitions, and drops the
+    /// `[targets]` bracket on single-target mappings (the destination is
+    /// already in the `from -> to` arrow).
     #[test]
-    fn format_mapping_outcome_omits_zero_counts() {
+    fn format_mapping_outcome_single_target_omits_bracket() {
         let d = MappingDescriptor {
             from: "library/alpine".into(),
             target_repo: "mirror/alpine".into(),
@@ -1515,7 +1523,7 @@ latest: 5
         };
         assert_eq!(
             format_mapping_outcome(&d, &synced_only, false),
-            "library/alpine -> mirror/alpine [ttl]: synced 3 (1.0 KB)"
+            "library/alpine -> mirror/alpine: synced 3 (1.0 KB)"
         );
         let skipped_only = MappingOutcome {
             skipped: 5,
@@ -1523,7 +1531,7 @@ latest: 5
         };
         assert_eq!(
             format_mapping_outcome(&d, &skipped_only, false),
-            "library/alpine -> mirror/alpine [ttl]: skipped 5"
+            "library/alpine -> mirror/alpine: skipped 5"
         );
         let mixed = MappingOutcome {
             synced: 1,
@@ -1533,13 +1541,31 @@ latest: 5
         };
         assert_eq!(
             format_mapping_outcome(&d, &mixed, false),
-            "library/alpine -> mirror/alpine [ttl]: synced 1, skipped 2, failed 1 (2.0 KB)"
+            "library/alpine -> mirror/alpine: synced 1, skipped 2, failed 1 (2.0 KB)"
         );
-        // Recovery marker appears at the end so the line still reads
-        // outcome-first.
         assert_eq!(
             format_mapping_outcome(&d, &synced_only, true),
-            "library/alpine -> mirror/alpine [ttl]: synced 3 (1.0 KB) [recovered]"
+            "library/alpine -> mirror/alpine: synced 3 (1.0 KB) [recovered]"
+        );
+    }
+
+    /// Multi-target mappings keep the `[targets]` bracket so the operator
+    /// can see which destinations the outcome covers.
+    #[test]
+    fn format_mapping_outcome_multi_target_keeps_bracket() {
+        let d = MappingDescriptor {
+            from: "library/alpine".into(),
+            target_repo: "mirror/alpine".into(),
+            target_names: vec!["ecr-prod".into(), "ghcr-mirror".into()],
+        };
+        let synced = MappingOutcome {
+            synced: 1,
+            bytes: 1024,
+            ..MappingOutcome::default()
+        };
+        assert_eq!(
+            format_mapping_outcome(&d, &synced, false),
+            "library/alpine -> mirror/alpine [ecr-prod, ghcr-mirror]: synced 1 (1.0 KB)"
         );
     }
 
