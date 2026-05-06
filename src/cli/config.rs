@@ -754,7 +754,7 @@ fn validate_artifacts(context: &str, artifacts: &ArtifactsConfig) -> Result<(), 
         )));
     }
     if !artifacts.enabled {
-        tracing::warn!(
+        tracing::debug!(
             context,
             "artifacts.enabled is false: signatures and SBOMs will be stripped from synced images"
         );
@@ -769,7 +769,7 @@ fn validate_tags(context: &str, tags: &TagsConfig) -> Result<(), ConfigError> {
         ));
     }
     if tags.semver.is_some() && tags.latest.is_none() {
-        tracing::warn!(
+        tracing::debug!(
             context,
             "tags.semver is set without tags.latest: every tag matching the version range will sync. \
              For long-running mirrors of images with many tags, consider adding 'latest: N' (with 'sort: semver') \

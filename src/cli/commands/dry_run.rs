@@ -49,7 +49,7 @@ fn write_mapping<W: Write>(w: &mut W, m: &ResolvedMapping, verbose: bool) -> io:
     let target_names: Vec<&str> = m.targets.iter().map(|t| &*t.name).collect();
     writeln!(
         w,
-        "dry-run: {} -> {}  =>  [{}]",
+        "dry-run: {} -> {} [{}]",
         m.source_repo,
         m.target_repo,
         target_names.join(", ")
@@ -61,7 +61,7 @@ fn write_mapping<W: Write>(w: &mut W, m: &ResolvedMapping, verbose: bool) -> io:
         return write_simple_tag_list(w, &m.tags);
     };
 
-    writeln!(w, "  source candidates: {}", report.candidate_count)?;
+    writeln!(w, "  source tags: {}", report.candidate_count)?;
     writeln!(w)?;
 
     if !report.include_kept.is_empty() {
@@ -107,7 +107,7 @@ fn write_include_path<W: Write>(w: &mut W, report: &FilterReport, verbose: bool)
 }
 
 fn write_pipeline<W: Write>(w: &mut W, report: &FilterReport) -> io::Result<()> {
-    writeln!(w, "  pipeline:")?;
+    writeln!(w, "  filter:")?;
     for stage in &report.pipeline {
         let delta = stage.count_in as isize - stage.count_out as isize;
         let delta_str = if delta != 0 {
@@ -115,11 +115,11 @@ fn write_pipeline<W: Write>(w: &mut W, report: &FilterReport) -> io::Result<()> 
         } else {
             String::new()
         };
-        writeln!(
-            w,
+        let line = format!(
             "    {:<28} {:>4} -> {:<4}{}",
             stage.label, stage.count_in, stage.count_out, delta_str
-        )?;
+        );
+        writeln!(w, "{}", line.trim_end())?;
     }
     Ok(())
 }
@@ -150,7 +150,7 @@ fn write_dropped<W: Write>(w: &mut W, report: &FilterReport, verbose: bool) -> i
     if total == 0 {
         return Ok(false);
     }
-    writeln!(w, "  dropped {total}:")?;
+    writeln!(w, "  dropped ({total}):")?;
     for reason in &report.dropped {
         let samples_display = render_samples(&reason.samples, verbose);
         // `LatestCap` reads as a complete clause ("over latest=N limit"); every
@@ -167,8 +167,7 @@ fn write_dropped<W: Write>(w: &mut W, report: &FilterReport, verbose: bool) -> i
         if matches!(reason.kind, DropKind::SystemExclude) {
             writeln!(
                 w,
-                "          {:<28}to keep prereleases, list patterns under include: (globs supported)",
-                ""
+                "          hint: to keep prereleases, list patterns under include: (globs supported)"
             )?;
         }
     }
@@ -394,8 +393,8 @@ mod tests {
         assert!(out.contains("tags (2):"), "{out}");
         assert!(out.contains("    v1.0.0\n"), "{out}");
         assert!(out.contains("    v1.1.0\n"), "{out}");
-        // No pipeline/kept/dropped sections appear.
-        assert!(!out.contains("pipeline:"), "{out}");
+        // No filter/kept/dropped sections appear.
+        assert!(!out.contains("filter:"), "{out}");
         assert!(!out.contains("kept ("), "{out}");
         assert!(!out.contains("dropped"), "{out}");
     }

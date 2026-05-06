@@ -7,7 +7,7 @@ use std::time::Duration;
 use ocync_sync::cache::TransferStateCache;
 use tokio::net::TcpListener;
 
-use crate::cli::commands::synchronize;
+use crate::cli::commands::synchronize::{self, WatchLogState};
 use crate::cli::config::load_config;
 use crate::cli::health::HealthState;
 use crate::cli::shutdown::ShutdownSignal;
@@ -68,6 +68,11 @@ pub(crate) async fn run(
                     crate::cli::health::serve(health_listener, state).await;
                 })
             };
+
+            // Watch-mode log state: tracks which mappings have already
+            // emitted a no-tags-matched WARN so we emit one per transition,
+            // not one per cycle. Pruned each cycle to mappings still in config.
+            let mut watch_log = WatchLogState::default();
 
             // Track consecutive config reload failures for backoff.
             let mut config_failures: u32 = 0;
@@ -145,6 +150,7 @@ pub(crate) async fn run(
                     Some(&shutdown),
                     Some(Rc::clone(&cache)),
                     verbose,
+                    Some(&mut watch_log),
                 )
                 .await
                 {

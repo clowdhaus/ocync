@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::debug;
 
 use crate::Error;
 
@@ -111,6 +111,48 @@ impl FilterConfig {
         self.run_pipeline(tags, true)
     }
 
+    /// One-line summary of the active filter clauses, e.g.
+    /// `semver >=1.0.0, latest=5`. Returns `None` when no filtering applies.
+    ///
+    /// Sole formatter for filter rationale shown in non-dry-run logs; uses
+    /// the same `FilterConfig` fields the pipeline operates on so adding a
+    /// new field to the config will fail tests here before it ships.
+    pub fn describe(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.glob.is_empty() {
+            parts.push(format!("glob {}", self.glob.join(",")));
+        }
+        if let Some(ref s) = self.semver {
+            parts.push(format!("semver {s}"));
+        }
+        if !self.exclude.is_empty() {
+            parts.push(format!("exclude {}", self.exclude.join(",")));
+        }
+        if !self.include.is_empty() {
+            parts.push(format!("include {}", self.include.join(",")));
+        }
+        if let Some(order) = self.sort {
+            parts.push(format!(
+                "sort {}",
+                match order {
+                    SortOrder::Semver => "semver",
+                    SortOrder::Alpha => "alpha",
+                }
+            ));
+        }
+        if let Some(n) = self.latest {
+            parts.push(format!("latest={n}"));
+        }
+        if let Some(n) = self.min_tags {
+            parts.push(format!("min_tags={n}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    }
+
     /// Shared pipeline implementation. When `track` is false (the real-sync
     /// hot path), per-stage `StageDelta` and per-reason `DropReason` are not
     /// constructed; the resulting `Filtered.report` carries empty vectors.
@@ -171,18 +213,18 @@ impl FilterConfig {
                     range: range.to_owned(),
                     reason: e.to_string(),
                 })?;
-            let (kept, dropped) =
-                partition_with_drop(
-                    &pipeline,
-                    track,
-                    |t| match crate::version::TagVersion::parse(t) {
-                        Some(ver) => req.matches(&ver),
-                        None => {
-                            warn!(tag = t, "tag is not parseable as a version, dropping");
-                            false
-                        }
-                    },
-                );
+            let (kept, dropped) = partition_with_drop(&pipeline, track, |t| {
+                if is_referrers_fallback_tag(t) {
+                    return false;
+                }
+                match crate::version::TagVersion::parse(t) {
+                    Some(ver) => req.matches(&ver),
+                    None => {
+                        debug!(tag = t, "tag is not parseable as a version, dropping");
+                        false
+                    }
+                }
+            });
             push_drop_reason(
                 &mut drop_reasons,
                 track,
@@ -248,7 +290,19 @@ impl FilterConfig {
         }
 
         if let Some(order) = self.sort {
+            let before = pipeline.len();
             sort_tags_in_place(&mut pipeline, order);
+            if track {
+                let label = match order {
+                    SortOrder::Semver => "sort semver desc",
+                    SortOrder::Alpha => "sort alpha desc",
+                };
+                pipeline_stages.push(StageDelta {
+                    label: label.to_string(),
+                    count_in: before,
+                    count_out: pipeline.len(),
+                });
+            }
         }
         if let Some(n) = self.latest {
             let before = pipeline.len();
@@ -265,13 +319,8 @@ impl FilterConfig {
                 pipeline.truncate(n);
             }
             if track {
-                let label = match self.sort {
-                    Some(SortOrder::Semver) => format!("sort semver desc, latest {n}"),
-                    Some(SortOrder::Alpha) => format!("sort alpha desc, latest {n}"),
-                    None => format!("latest {n}"),
-                };
                 pipeline_stages.push(StageDelta {
-                    label,
+                    label: format!("keep latest {n}"),
                     count_in: before,
                     count_out: pipeline.len(),
                 });
@@ -477,6 +526,18 @@ fn push_drop_reason(
 // Individual stages
 // ---------------------------------------------------------------------------
 
+/// True for OCI 1.1 referrers fallback tags (`<algo>-<hex>` and the cosign
+/// `.sig`/`.sbom`/`.att` variants). These are pointers to artifacts, not image
+/// versions, and will never satisfy a semver range -- skip parsing so they do
+/// not appear in the unparseable-tag log channel.
+///
+/// Public so that observability/UX code outside the filter pipeline (e.g. the
+/// CLI's "no tags matched" warn) can partition source tag lists without
+/// reintroducing a duplicate prefix check that would drift over time.
+pub fn is_referrers_fallback_tag(tag: &str) -> bool {
+    tag.starts_with("sha256-") || tag.starts_with("sha512-")
+}
+
 /// Build a [`GlobSet`] from patterns, returning an error on invalid patterns.
 pub fn build_glob_set(patterns: &[String]) -> Result<GlobSet, Error> {
     let mut builder = GlobSetBuilder::new();
@@ -520,8 +581,11 @@ fn filter_semver<'a>(tags: &[&'a str], range: &str) -> Result<Vec<&'a str>, Erro
         .iter()
         .copied()
         .filter(|tag| {
+            if is_referrers_fallback_tag(tag) {
+                return false;
+            }
             let Some(ver) = crate::version::TagVersion::parse(tag) else {
-                warn!(tag, "tag is not parseable as a version, dropping");
+                debug!(tag, "tag is not parseable as a version, dropping");
                 return false;
             };
             req.matches(&ver)
@@ -726,6 +790,24 @@ mod tests {
         let tags = vec!["", "v", "1.0.0"];
         let result = filter_semver(&tags, ">=1.0.0").unwrap();
         assert_eq!(result, vec!["1.0.0"]);
+    }
+
+    /// Referrers fallback tags (cosign signatures, SBOMs, attestations) bypass
+    /// the version parser. They drop silently so noisy unparseable-tag logs do
+    /// not fire once per artifact tag per image.
+    #[test]
+    fn semver_skips_referrers_fallback_tags() {
+        let tags = vec![
+            "1.0.0",
+            "sha256-abc123def456.sig",
+            "sha256-abc123def456.sbom",
+            "sha256-abc123def456.att",
+            "sha256-abc123def456",
+            "sha512-deadbeef.sig",
+            "2.0.0",
+        ];
+        let result = filter_semver(&tags, ">=1.0.0").unwrap();
+        assert_eq!(result, vec!["1.0.0", "2.0.0"]);
     }
 
     // - pipeline tests ----------------------------------------------------
@@ -1377,5 +1459,69 @@ mod tests {
             assert!(reason.count > 0, "stage attributed zero drops: {reason:?}");
             assert_eq!(reason.count, reason.samples.len());
         }
+    }
+
+    // - describe ----------------------------------------------------------
+
+    #[test]
+    fn describe_default_returns_none() {
+        assert!(FilterConfig::default().describe().is_none());
+    }
+
+    #[test]
+    fn describe_combines_clauses_in_pipeline_order() {
+        let config = FilterConfig {
+            glob: vec!["1.*".into()],
+            semver: Some(">=1.0.0".into()),
+            exclude: vec!["*-rc*".into()],
+            sort: Some(SortOrder::Semver),
+            latest: Some(5),
+            min_tags: Some(1),
+            ..FilterConfig::default()
+        };
+        assert_eq!(
+            config.describe().as_deref(),
+            Some("glob 1.*, semver >=1.0.0, exclude *-rc*, sort semver, latest=5, min_tags=1")
+        );
+    }
+
+    /// Regression guard: every `FilterConfig` field that influences selection
+    /// must contribute to `describe()`. Adding a new field without updating
+    /// `describe()` would silently leave INFO-line filter rationale stale.
+    #[test]
+    fn describe_covers_every_selection_field() {
+        let cfg = FilterConfig {
+            include: vec!["latest".into()],
+            glob: vec!["v*".into()],
+            semver: Some("^1".into()),
+            exclude: vec!["nightly".into()],
+            sort: Some(SortOrder::Alpha),
+            latest: Some(3),
+            min_tags: Some(2),
+        };
+        let desc = cfg.describe().expect("non-empty config describes");
+        for needle in [
+            "include latest",
+            "glob v*",
+            "semver ^1",
+            "exclude nightly",
+            "sort alpha",
+            "latest=3",
+            "min_tags=2",
+        ] {
+            assert!(desc.contains(needle), "missing {needle:?} in {desc:?}");
+        }
+    }
+
+    // - is_referrers_fallback_tag ----------------------------------------
+
+    #[test]
+    fn referrers_fallback_detection() {
+        assert!(is_referrers_fallback_tag("sha256-abcdef"));
+        assert!(is_referrers_fallback_tag("sha256-deadbeef.sig"));
+        assert!(is_referrers_fallback_tag("sha512-cafef00d.sbom"));
+        assert!(!is_referrers_fallback_tag("v1.0.0"));
+        assert!(!is_referrers_fallback_tag("latest"));
+        assert!(!is_referrers_fallback_tag("sha256")); // no dash
     }
 }

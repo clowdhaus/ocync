@@ -16,7 +16,7 @@ use ocync_sync::engine::{
     DEFAULT_MAX_CONCURRENT_TRANSFERS, RegistryAlias, ResolvedArtifacts, ResolvedMapping,
     SyncEngine, TagPair, TargetEntry,
 };
-use ocync_sync::filter::{FilterConfig, build_glob_set};
+use ocync_sync::filter::{FilterConfig, build_glob_set, is_referrers_fallback_tag};
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
@@ -32,6 +32,122 @@ pub(crate) const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
 
 /// Default cache file name within the cache directory.
 const CACHE_FILE_NAME: &str = "transfer_state.bin";
+
+/// Sample cap for the source-tag list shown in the no-tags-matched WARN.
+/// Mirrors `dry_run::SAMPLE_CAP` so both surfaces show the same depth of
+/// example data without overwhelming the log line.
+const NO_TAGS_SAMPLE_CAP: usize = 5;
+
+/// Outcome of resolving a single mapping. Either the mapping is ready for the
+/// engine, or no source tag survived filtering and the caller decides whether
+/// to log a WARN (sync mode: always; watch mode: only on transition).
+///
+/// The size disparity between variants is intentional: `ResolvedMapping` flows
+/// directly into `Vec<ResolvedMapping>` for the engine, so boxing it would
+/// just add a heap round-trip per success. The error variant is rare; we pay
+/// the disparity instead of the allocation traffic.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum MappingResolution {
+    Resolved(ResolvedMapping),
+    NoMatchingTags(NoTagsInfo),
+}
+
+/// Diagnostic context for a mapping whose filter rejected every source tag.
+///
+/// Fields together let an operator see, in one log line, the size and
+/// composition of the source repo (image tags vs OCI 1.1 referrer fallbacks),
+/// the active filter clauses, and example image tag names so the cause is
+/// obvious without spelunking.
+pub(crate) struct NoTagsInfo {
+    pub from: String,
+    pub image_count: usize,
+    pub artifact_count: usize,
+    /// Active filter clauses (e.g. `semver >=1.0.0, latest=5`). `None` only
+    /// when no filter is configured -- distinct from "filter description
+    /// missing" so the formatter can render an explicit fallback string.
+    pub filter_desc: Option<String>,
+    /// Up to [`NO_TAGS_SAMPLE_CAP`] image-tag names. Excludes referrer
+    /// fallback tags so the example list is meaningful on cosign-heavy
+    /// repos like `cgr.dev/chainguard/*` (otherwise dominated by
+    /// `sha256-<hex>(.sig|.sbom|.att)` entries).
+    pub samples: Vec<String>,
+}
+
+impl NoTagsInfo {
+    /// Total tags returned by `/v2/<repo>/tags/list`. Derived: image + artifact.
+    fn source_total(&self) -> usize {
+        self.image_count + self.artifact_count
+    }
+
+    /// True when the source had more image tags than `samples` shows.
+    fn samples_truncated(&self) -> bool {
+        self.image_count > self.samples.len()
+    }
+}
+
+impl std::fmt::Display for NoTagsInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total = self.source_total();
+        let total_phrase = if self.artifact_count > 0 {
+            format!(
+                "{total} source tags ({} image tags, {} referrer artifacts)",
+                self.image_count, self.artifact_count
+            )
+        } else {
+            format!("{total} source tags")
+        };
+        let filter = self
+            .filter_desc
+            .as_deref()
+            .unwrap_or("no filter configured");
+        let samples = if self.samples.is_empty() {
+            "<empty>".to_string()
+        } else if self.samples_truncated() {
+            format!("[{}, ...]", self.samples.join(", "))
+        } else {
+            format!("[{}]", self.samples.join(", "))
+        };
+        write!(
+            f,
+            "{}: 0 of {total_phrase} matched filter ({filter}); skipping. Source: {samples}",
+            self.from
+        )
+    }
+}
+
+/// Per-process state that lets watch-mode emit one no-tags WARN per
+/// transition into the failure state rather than one per cycle. Sync mode
+/// passes `None`. State lives in `watch::run` so it spans loop iterations.
+#[derive(Debug, Default)]
+pub(crate) struct WatchLogState {
+    /// Mappings (keyed by `mapping.from`) that emitted a no-tags WARN in a
+    /// prior cycle and have not since recovered.
+    warned_no_tags: HashSet<String>,
+}
+
+impl WatchLogState {
+    /// Record a no-match observation for `from`. Returns `true` when this is
+    /// a transition into the failure state (caller should emit a WARN);
+    /// `false` when the mapping was already in the failure set (suppress).
+    fn observe_no_match(&mut self, from: &str) -> bool {
+        self.warned_no_tags.insert(from.to_string())
+    }
+
+    /// Record a successful resolution for `from`. Returns `true` when the
+    /// mapping was previously in the failure set (caller should emit a
+    /// "recovered" INFO); `false` when there was no transition.
+    fn observe_resolved(&mut self, from: &str) -> bool {
+        self.warned_no_tags.remove(from)
+    }
+
+    /// Drop entries for mappings no longer present in the active set so the
+    /// state does not grow unbounded across edits to the config.
+    fn retain_active<'a>(&mut self, active: impl IntoIterator<Item = &'a str>) {
+        let active_set: HashSet<&str> = active.into_iter().collect();
+        self.warned_no_tags
+            .retain(|k| active_set.contains(k.as_str()));
+    }
+}
 
 /// Resolve the cache directory and file path from config.
 ///
@@ -78,6 +194,7 @@ pub(crate) async fn run(
     shutdown: Option<&ShutdownSignal>,
     external_cache: Option<Rc<RefCell<TransferStateCache>>>,
     verbose: bool,
+    mut watch_log: Option<&mut WatchLogState>,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
 
@@ -86,19 +203,39 @@ pub(crate) async fn run(
 
     let mut mappings = Vec::new();
     for mapping in &config.mappings {
-        match resolve_mapping(mapping, &config, &clients, &batch_checkers, args.dry_run).await {
-            Ok(Some(resolved)) => mappings.push(resolved),
-            Ok(None) => {} // no tags after filtering, logged inside
-            Err(err) => return Err(err),
+        match resolve_mapping(mapping, &config, &clients, &batch_checkers, args.dry_run).await? {
+            MappingResolution::Resolved(resolved) => mappings.push(resolved),
+            MappingResolution::NoMatchingTags(info) => {
+                let should_warn = match watch_log.as_mut() {
+                    Some(state) => state.observe_no_match(&info.from),
+                    None => true,
+                };
+                if should_warn {
+                    emit_no_tags_warn(&info);
+                }
+            }
         }
     }
 
-    log_resolved_mappings(&mappings);
+    if let Some(state) = watch_log.as_mut() {
+        for resolved in &mappings {
+            let from = resolved.source_repo.as_str();
+            if state.observe_resolved(from) {
+                tracing::info!(
+                    from = %from,
+                    "{from}: filter now matches at least one tag; resuming sync"
+                );
+            }
+        }
+        state.retain_active(config.mappings.iter().map(|m| m.from.as_str()));
+    }
 
     if args.dry_run {
         crate::cli::commands::dry_run::print(&mappings, verbose);
         return Ok(ExitCode::Success);
     }
+
+    log_resolved_mappings(&mappings);
 
     let (cache_dir, cache_path) = resolve_cache_path(&config, &args.config);
     let cache_ttl = resolve_cache_ttl(&config)?;
@@ -273,18 +410,19 @@ async fn build_batch_checkers(
     Ok(checkers)
 }
 
-/// Resolve a single mapping config into a `ResolvedMapping`, or `None` if no
-/// tags survive filtering.
+/// Resolve a single mapping config into a [`MappingResolution`].
 ///
-/// Falls back to `defaults.source`, `defaults.targets`, and `defaults.tags`
-/// when the mapping does not specify its own values.
+/// Returns [`MappingResolution::Resolved`] when at least one tag survives the
+/// filter pipeline, or [`MappingResolution::NoMatchingTags`] carrying the
+/// diagnostic context the caller needs to render a WARN. Pulls fallbacks from
+/// `defaults.source`, `defaults.targets`, and `defaults.tags`.
 pub(crate) async fn resolve_mapping(
     mapping: &MappingConfig,
     config: &Config,
     clients: &HashMap<String, Arc<RegistryClient>>,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
     with_report: bool,
-) -> Result<Option<ResolvedMapping>, CliError> {
+) -> Result<MappingResolution, CliError> {
     // --- Source registry ---
     let source_name = mapping
         .source
@@ -353,20 +491,49 @@ pub(crate) async fn resolve_mapping(
     // enumerating all tags from the source registry. This avoids
     // hundreds of paginated tags/list requests for repos with thousands
     // of tags.
-    let (filtered, candidate_count, filter_report) =
-        if let Some(exact) = tags_config.and_then(|t| t.exact_tags()) {
-            (exact, None, None)
-        } else {
-            let all_tags = source_client.list_tags(&source_repo_path).await?;
-            select_filtered_tags(tags_config, all_tags, with_report)?
+    // The image/artifact partition + sample collection happen in the same
+    // pass that prepares input for `select_filtered_tags`, so the filter and
+    // the no-match WARN both see consistent counts. The pre-built `NoTagsInfo`
+    // is only consumed when filtering yields zero tags.
+    let (filtered, candidate_count, filter_report, no_tags_template): (
+        Vec<String>,
+        Option<usize>,
+        Option<ocync_sync::filter::FilterReport>,
+        Option<NoTagsInfo>,
+    ) = if let Some(exact) = tags_config.and_then(|t| t.exact_tags()) {
+        (exact, None, None, None)
+    } else {
+        let all_tags = source_client.list_tags(&source_repo_path).await?;
+        let mut samples: Vec<String> = Vec::with_capacity(NO_TAGS_SAMPLE_CAP);
+        let mut image_count = 0usize;
+        for t in &all_tags {
+            if !is_referrers_fallback_tag(t) {
+                image_count += 1;
+                if samples.len() < NO_TAGS_SAMPLE_CAP {
+                    samples.push(t.clone());
+                }
+            }
+        }
+        let template = NoTagsInfo {
+            from: mapping.from.clone(),
+            image_count,
+            artifact_count: all_tags.len() - image_count,
+            filter_desc: describe_filter(tags_config),
+            samples,
         };
+        let (kept, count, report) = select_filtered_tags(tags_config, all_tags, with_report)?;
+        (kept, count, report, Some(template))
+    };
 
     if filtered.is_empty() {
-        tracing::warn!(
-            from = %mapping.from,
-            "no tags matched after filtering, skipping mapping"
-        );
-        return Ok(None);
+        let info = no_tags_template.unwrap_or_else(|| NoTagsInfo {
+            from: mapping.from.clone(),
+            image_count: 0,
+            artifact_count: 0,
+            filter_desc: describe_filter(tags_config),
+            samples: Vec::new(),
+        });
+        return Ok(MappingResolution::NoMatchingTags(info));
     }
 
     // --- Target repo ---
@@ -433,7 +600,7 @@ pub(crate) async fn resolve_mapping(
         None => ResolvedArtifacts::default(),
     };
 
-    Ok(Some(ResolvedMapping {
+    Ok(MappingResolution::Resolved(ResolvedMapping {
         source_authority,
         source_client,
         source_repo: RepositoryName::new(mapping.from.clone())?,
@@ -447,6 +614,20 @@ pub(crate) async fn resolve_mapping(
         candidate_count,
         filter_report,
     }))
+}
+
+/// Emit a tracing WARN for a [`NoTagsInfo`] with both a human-readable
+/// message (via [`Display`](std::fmt::Display)) and structured fields for
+/// log aggregators.
+fn emit_no_tags_warn(info: &NoTagsInfo) {
+    tracing::warn!(
+        from = %info.from,
+        source_total = info.source_total(),
+        image_count = info.image_count,
+        artifact_count = info.artifact_count,
+        filter = info.filter_desc.as_deref().unwrap_or(""),
+        "{info}"
+    );
 }
 
 /// Build a `FilterConfig` from a `TagsConfig`, falling back to defaults.
@@ -513,8 +694,9 @@ fn select_filtered_tags(
 
 /// Format one per-mapping plan line for `INFO`-level emission.
 ///
-/// `{source} -> {target}: {kept} of {N} tags  =>  [t1, t2]` when the
-/// candidate count is known, or `{kept} tags` on the exact-tag fast path.
+/// Filtered path: `{source} -> {target} [t1, t2]: {kept} tags match for sync
+/// out of {N} possible`. Exact-tag fast path (no enumeration): `{kept} tags
+/// (exact)`.
 fn format_plan_line(
     source_repo: &str,
     target_repo: &str,
@@ -522,14 +704,25 @@ fn format_plan_line(
     candidate_count: Option<usize>,
     target_names: &[&str],
 ) -> String {
-    let count_phrase = match candidate_count {
-        Some(n) => format!("{kept} of {n} tags"),
-        None => format!("{kept} tags"),
-    };
-    format!(
-        "{source_repo} -> {target_repo}: {count_phrase}  =>  [{}]",
-        target_names.join(", ")
-    )
+    let targets = target_names.join(", ");
+    match candidate_count {
+        Some(n) => format!(
+            "{source_repo} -> {target_repo} [{targets}]: {kept} tags match for sync out of {n} possible"
+        ),
+        None => {
+            format!("{source_repo} -> {target_repo} [{targets}]: {kept} tags (specified directly)")
+        }
+    }
+}
+
+/// One-line summary of a [`TagsConfig`] suitable for log emission, e.g.
+/// `semver >=1.0.0, latest=5`. Returns `None` when no filter applies.
+///
+/// Single source of truth: delegates to [`FilterConfig::describe`] after
+/// the same conversion the engine uses, so stage labels in the dry-run
+/// pipeline and the INFO/WARN filter rationale cannot drift.
+fn describe_filter(tags: Option<&TagsConfig>) -> Option<String> {
+    build_filter(tags).describe()
 }
 
 /// Emit one INFO log line per resolved mapping summarizing kept/considered
@@ -823,7 +1016,7 @@ latest: 5
     }
 
     #[test]
-    fn format_plan_line_filtered_path_includes_of_n() {
+    fn format_plan_line_filtered_path_phrasing() {
         let line = format_plan_line(
             "docker.io/library/alpine",
             "alpine",
@@ -833,14 +1026,17 @@ latest: 5
         );
         assert_eq!(
             line,
-            "docker.io/library/alpine -> alpine: 3 of 50 tags  =>  [ecr-prod, ghcr-mirror]"
+            "docker.io/library/alpine -> alpine [ecr-prod, ghcr-mirror]: 3 tags match for sync out of 50 possible"
         );
     }
 
     #[test]
-    fn format_plan_line_exact_tag_path_omits_of_n() {
+    fn format_plan_line_exact_tag_path_marks_exact() {
         let line = format_plan_line("ghcr.io/foo/bar", "bar", 3, None, &["ghcr-mirror"]);
-        assert_eq!(line, "ghcr.io/foo/bar -> bar: 3 tags  =>  [ghcr-mirror]");
+        assert_eq!(
+            line,
+            "ghcr.io/foo/bar -> bar [ghcr-mirror]: 3 tags (specified directly)"
+        );
     }
 
     #[test]
@@ -848,8 +1044,142 @@ latest: 5
         let line = format_plan_line("src/repo", "dst/repo", 5, Some(80), &["only-target"]);
         assert_eq!(
             line,
-            "src/repo -> dst/repo: 5 of 80 tags  =>  [only-target]"
+            "src/repo -> dst/repo [only-target]: 5 tags match for sync out of 80 possible"
         );
+    }
+
+    #[test]
+    fn describe_filter_combines_semver_and_latest() {
+        let tags = TagsConfig {
+            semver: Some(">=1.0.0".into()),
+            latest: Some(5),
+            ..TagsConfig::default()
+        };
+        assert_eq!(
+            describe_filter(Some(&tags)).as_deref(),
+            Some("semver >=1.0.0, latest=5")
+        );
+    }
+
+    #[test]
+    fn describe_filter_returns_none_when_empty() {
+        let tags = TagsConfig::default();
+        assert!(describe_filter(Some(&tags)).is_none());
+        assert!(describe_filter(None).is_none());
+    }
+
+    // -- NoTagsInfo Display ---------------------------------------------
+
+    fn no_tags_info(
+        from: &str,
+        image_count: usize,
+        artifact_count: usize,
+        filter_desc: Option<&str>,
+        samples: &[&str],
+    ) -> NoTagsInfo {
+        NoTagsInfo {
+            from: from.into(),
+            image_count,
+            artifact_count,
+            filter_desc: filter_desc.map(String::from),
+            samples: samples.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn no_tags_warn_renders_simple_repo() {
+        // 2 image tags, both shown -- no truncation, no artifact split.
+        let info = no_tags_info(
+            "library/nginx",
+            2,
+            0,
+            Some("semver >=2.0"),
+            &["v1.0", "v1.1"],
+        );
+        assert_eq!(
+            info.to_string(),
+            "library/nginx: 0 of 2 source tags matched filter (semver >=2.0); skipping. Source: [v1.0, v1.1]"
+        );
+    }
+
+    /// Cosign-heavy repos: WARN must split image vs referrer counts so the
+    /// 14289-tag chainguard case is not misread as 14289 missing image tags.
+    #[test]
+    fn no_tags_warn_splits_image_and_artifact_counts() {
+        let info = no_tags_info(
+            "chainguard/nginx",
+            2,
+            14287,
+            Some("semver >=1.0.0, latest=5"),
+            &["latest", "latest-dev"],
+        );
+        let msg = info.to_string();
+        assert!(
+            msg.contains(
+                "0 of 14289 source tags (2 image tags, 14287 referrer artifacts) matched filter"
+            ),
+            "{msg}"
+        );
+    }
+
+    /// Truncation appends `, ...` so the user knows the list is sampled.
+    #[test]
+    fn no_tags_warn_appends_ellipsis_when_truncated() {
+        let info = NoTagsInfo {
+            from: "library/alpine".into(),
+            // image_count > samples.len() drives the truncation marker.
+            image_count: 100,
+            artifact_count: 0,
+            filter_desc: Some("semver >=99.0".into()),
+            samples: (0..5).map(|i| format!("v{i}")).collect(),
+        };
+        assert!(info.samples_truncated());
+        let msg = info.to_string();
+        assert!(msg.ends_with("Source: [v0, v1, v2, v3, v4, ...]"), "{msg}");
+    }
+
+    /// Empty samples render as `<empty>` and a missing filter description
+    /// renders as `no filter configured` -- both ensure the message never
+    /// has bare parens or `[]`.
+    #[test]
+    fn no_tags_warn_renders_empty_markers() {
+        let info = no_tags_info("x/y", 0, 0, None, &[]);
+        let msg = info.to_string();
+        assert!(msg.contains("(no filter configured)"), "{msg}");
+        assert!(msg.ends_with("Source: <empty>"), "{msg}");
+    }
+
+    // -- WatchLogState transitions --------------------------------------
+
+    /// First observation triggers a WARN; repeats within the same failure
+    /// run are suppressed; recovery clears the entry so a relapse warns
+    /// again. Encodes the contract `run()` depends on.
+    #[test]
+    fn watch_log_state_emits_once_per_transition() {
+        let mut state = WatchLogState::default();
+        assert!(state.observe_no_match("repo-a"));
+        assert!(!state.observe_no_match("repo-a"));
+        assert!(state.observe_resolved("repo-a"));
+        assert!(!state.observe_resolved("repo-a"));
+        assert!(state.observe_no_match("repo-a"));
+    }
+
+    /// `retain_active` drops entries for mappings no longer in the config
+    /// so the set does not grow unbounded across the watch process.
+    #[test]
+    fn watch_log_state_prunes_removed_mappings() {
+        let mut state = WatchLogState::default();
+        state.observe_no_match("repo-a");
+        state.observe_no_match("repo-b");
+        state.observe_no_match("repo-removed");
+
+        state.retain_active(["repo-a", "repo-b"]);
+
+        // After pruning, `repo-removed` re-warns (gap means transition);
+        // surviving entries continue to suppress.
+        assert!(!state.observe_no_match("repo-a"));
+        assert!(!state.observe_no_match("repo-b"));
+        assert!(state.observe_no_match("repo-removed"));
     }
 
     // -- select_filtered_tags wire-up tests ---------------------------------
@@ -1002,7 +1332,7 @@ latest: 5
         assert!(out.contains("FAIL"), "{out}");
         assert!(out.contains("BelowMinTags"), "{out}");
         // And carries the full pipeline trace.
-        assert!(out.contains("source candidates: 10"), "{out}");
-        assert!(out.contains("dropped 10:"), "{out}");
+        assert!(out.contains("source tags: 10"), "{out}");
+        assert!(out.contains("dropped (10):"), "{out}");
     }
 }
