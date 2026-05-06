@@ -115,14 +115,21 @@ impl std::fmt::Display for NoTagsInfo {
     }
 }
 
-/// Per-process state that lets watch-mode emit one no-tags WARN per
-/// transition into the failure state rather than one per cycle. Sync mode
-/// passes `None`. State lives in `watch::run` so it spans loop iterations.
+/// Per-process state that lets watch-mode log on transitions instead of
+/// every cycle. Sync mode passes `None`. State lives in `watch::run` so it
+/// spans loop iterations.
+///
+/// Tracks two pieces of cross-cycle context:
+///
+/// 1. **No-tags failure set**: mappings whose filter rejected every source
+///    tag, used to emit one WARN per failure run instead of per cycle.
+/// 2. **Per-mapping outcomes**: the prior cycle's [`MappingOutcome`] keyed
+///    by `mapping.from`, used to suppress identical follow-up cycles in
+///    the per-mapping INFO/WARN stream.
 #[derive(Debug, Default)]
 pub(crate) struct WatchLogState {
-    /// Mappings (keyed by `mapping.from`) that emitted a no-tags WARN in a
-    /// prior cycle and have not since recovered.
     warned_no_tags: HashSet<String>,
+    last_outcomes: HashMap<String, MappingOutcome>,
 }
 
 impl WatchLogState {
@@ -140,12 +147,27 @@ impl WatchLogState {
         self.warned_no_tags.remove(from)
     }
 
+    /// Record `outcome` as the latest result for `from`. Returns `true` when
+    /// the caller should emit (first observation, or outcome differs from
+    /// the prior cycle); `false` when identical to the last seen value.
+    fn observe_mapping_outcome(&mut self, from: &str, outcome: &MappingOutcome) -> bool {
+        match self.last_outcomes.get(from) {
+            Some(prev) if prev == outcome => false,
+            _ => {
+                self.last_outcomes.insert(from.to_string(), outcome.clone());
+                true
+            }
+        }
+    }
+
     /// Drop entries for mappings no longer present in the active set so the
     /// state does not grow unbounded across edits to the config.
     fn retain_active<'a>(&mut self, active: impl IntoIterator<Item = &'a str>) {
         let active_set: HashSet<&str> = active.into_iter().collect();
         self.warned_no_tags
             .retain(|k| active_set.contains(k.as_str()));
+        self.last_outcomes
+            .retain(|k, _| active_set.contains(k.as_str()));
     }
 }
 
@@ -292,6 +314,18 @@ pub(crate) async fn run(
         .map_or(DEFAULT_MAX_CONCURRENT_TRANSFERS, |g| {
             g.max_concurrent_transfers
         });
+    // Capture per-mapping metadata before the engine consumes `mappings`.
+    // Used to emit one INFO line per mapping after the engine returns,
+    // grouped from the report's per-image outcomes.
+    let descriptors: Vec<MappingDescriptor> = mappings
+        .iter()
+        .map(|m| MappingDescriptor {
+            from: m.source_repo.as_str().to_string(),
+            target_repo: m.target_repo.as_str().to_string(),
+            target_names: m.targets.iter().map(|t| (*t.name).to_string()).collect(),
+        })
+        .collect();
+
     let engine = SyncEngine::new(RetryConfig::default(), max_concurrent);
     let report = engine
         .run(mappings, cache.clone(), staging, progress, shutdown)
@@ -304,9 +338,132 @@ pub(crate) async fn run(
         }
     }
 
+    emit_mapping_outcomes(&descriptors, &report, watch_log);
+
     write_output(&report, args.json)?;
 
     Ok(ExitCode::from_report(report.exit_code()))
+}
+
+/// Per-mapping metadata captured before the engine consumes `mappings`,
+/// so we can join it with the engine's per-image report after the fact
+/// to emit one log line per mapping (with source/target context).
+struct MappingDescriptor {
+    from: String,
+    target_repo: String,
+    target_names: Vec<String>,
+}
+
+/// Per-mapping aggregated outcome derived from [`SyncReport.images`].
+/// Used for log emission and watch-mode change detection.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct MappingOutcome {
+    pub synced: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub bytes: u64,
+}
+
+impl MappingOutcome {
+    fn is_empty(&self) -> bool {
+        self.synced == 0 && self.skipped == 0 && self.failed == 0
+    }
+}
+
+/// Emit one INFO (or WARN, on failures) per mapping summarizing what its
+/// configured tags did this cycle. In watch mode (when `watch_log` is
+/// `Some`), suppress mappings whose outcome is unchanged from the prior
+/// cycle so steady-state pods log only on transition.
+fn emit_mapping_outcomes(
+    descriptors: &[MappingDescriptor],
+    report: &SyncReport,
+    mut watch_log: Option<&mut WatchLogState>,
+) {
+    for d in descriptors {
+        let outcome = aggregate_mapping_outcome(&d.from, &d.target_repo, report);
+        // No images for this mapping in the report (e.g. the mapping was
+        // resolved to zero tags by an upstream filter that the engine
+        // never saw). The no-tags WARN already covered it; skip here.
+        if outcome.is_empty() {
+            continue;
+        }
+        let should_emit = match watch_log.as_deref_mut() {
+            Some(state) => state.observe_mapping_outcome(&d.from, &outcome),
+            None => true,
+        };
+        if !should_emit {
+            continue;
+        }
+        let line = format_mapping_outcome(d, &outcome);
+        if outcome.failed > 0 {
+            tracing::warn!(
+                from = %d.from,
+                to = %d.target_repo,
+                synced = outcome.synced,
+                skipped = outcome.skipped,
+                failed = outcome.failed,
+                bytes = outcome.bytes,
+                "{line}"
+            );
+        } else {
+            tracing::info!(
+                from = %d.from,
+                to = %d.target_repo,
+                synced = outcome.synced,
+                skipped = outcome.skipped,
+                bytes = outcome.bytes,
+                "{line}"
+            );
+        }
+    }
+}
+
+fn aggregate_mapping_outcome(
+    source_repo: &str,
+    target_repo: &str,
+    report: &SyncReport,
+) -> MappingOutcome {
+    let src_prefix = format!("{source_repo}:");
+    let tgt_prefix = format!("{target_repo}:");
+    let mut o = MappingOutcome::default();
+    for r in &report.images {
+        if !(r.source.starts_with(&src_prefix) && r.target.starts_with(&tgt_prefix)) {
+            continue;
+        }
+        match r.status {
+            ocync_sync::ImageStatus::Synced => {
+                o.synced += 1;
+                o.bytes += r.bytes_transferred;
+            }
+            ocync_sync::ImageStatus::Skipped { .. } => o.skipped += 1,
+            ocync_sync::ImageStatus::Failed { .. } => o.failed += 1,
+        }
+    }
+    o
+}
+
+fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome) -> String {
+    let targets = d.target_names.join(", ");
+    let mut parts = Vec::with_capacity(3);
+    if o.synced > 0 {
+        parts.push(format!("synced {}", o.synced));
+    }
+    if o.skipped > 0 {
+        parts.push(format!("skipped {}", o.skipped));
+    }
+    if o.failed > 0 {
+        parts.push(format!("failed {}", o.failed));
+    }
+    let counts = parts.join(", ");
+    let bytes_clause = if o.bytes > 0 {
+        format!(" ({})", crate::cli::output::format_bytes(o.bytes))
+    } else {
+        String::new()
+    };
+    format!(
+        "{} -> {} [{targets}]: {counts}{bytes_clause}",
+        d.from, d.target_repo
+    )
 }
 
 /// Parse a human-readable duration string into a [`Duration`].
@@ -1104,6 +1261,164 @@ latest: 5
         assert!(!state.observe_no_match("repo-a"));
         assert!(!state.observe_no_match("repo-b"));
         assert!(state.observe_no_match("repo-removed"));
+    }
+
+    // -- per-mapping outcome aggregation + dedup ---------------------------
+
+    fn img(
+        source: &str,
+        target: &str,
+        status: ocync_sync::ImageStatus,
+        bytes: u64,
+    ) -> ocync_sync::ImageResult {
+        use ocync_sync::{BlobTransferStats, ImageResult};
+        ImageResult {
+            image_id: uuid::Uuid::now_v7(),
+            source: source.into(),
+            target: target.into(),
+            status,
+            bytes_transferred: bytes,
+            blob_stats: BlobTransferStats::default(),
+            duration: Duration::from_secs(1),
+            artifacts_skipped: false,
+        }
+    }
+
+    fn report_with(images: Vec<ocync_sync::ImageResult>) -> SyncReport {
+        SyncReport {
+            run_id: uuid::Uuid::now_v7(),
+            images,
+            stats: ocync_sync::SyncStats::default(),
+            duration: Duration::from_secs(1),
+        }
+    }
+
+    /// Aggregation groups by `source_repo:` + `target_repo:` prefix so
+    /// images from a different mapping (same source repo, different target)
+    /// don't bleed into this mapping's counts.
+    #[test]
+    fn aggregate_mapping_outcome_groups_by_source_and_target() {
+        let report = report_with(vec![
+            img(
+                "library/alpine:3.20",
+                "mirror/a:3.20",
+                ocync_sync::ImageStatus::Synced,
+                100,
+            ),
+            img(
+                "library/alpine:3.21",
+                "mirror/a:3.21",
+                ocync_sync::ImageStatus::Synced,
+                200,
+            ),
+            img(
+                "library/alpine:3.21",
+                "mirror/b:3.21",
+                ocync_sync::ImageStatus::Skipped {
+                    reason: ocync_sync::SkipReason::DigestMatch,
+                },
+                0,
+            ),
+        ]);
+        let o = aggregate_mapping_outcome("library/alpine", "mirror/a", &report);
+        assert_eq!(o.synced, 2);
+        assert_eq!(o.skipped, 0);
+        assert_eq!(o.bytes, 300);
+    }
+
+    /// Empty mappings (no images in the report) skip silently -- the
+    /// no-tags WARN is the right surface for that case, not this one.
+    #[test]
+    fn empty_outcome_is_recognized() {
+        let outcome = MappingOutcome::default();
+        assert!(outcome.is_empty());
+        let with_skip = MappingOutcome {
+            skipped: 1,
+            ..MappingOutcome::default()
+        };
+        assert!(!with_skip.is_empty());
+    }
+
+    /// First observation emits; identical follow-up suppresses; outcome
+    /// change emits again. Mirrors the no-tags transition contract.
+    #[test]
+    fn watch_log_state_dedupes_identical_mapping_outcomes() {
+        let mut state = WatchLogState::default();
+        let steady = MappingOutcome {
+            skipped: 5,
+            ..MappingOutcome::default()
+        };
+        let active = MappingOutcome {
+            synced: 1,
+            skipped: 4,
+            bytes: 1024,
+            ..MappingOutcome::default()
+        };
+
+        assert!(state.observe_mapping_outcome("repo-a", &steady)); // first: emit
+        assert!(!state.observe_mapping_outcome("repo-a", &steady)); // same: suppress
+        assert!(!state.observe_mapping_outcome("repo-a", &steady)); // same: suppress
+        assert!(state.observe_mapping_outcome("repo-a", &active)); // changed: emit
+        assert!(!state.observe_mapping_outcome("repo-a", &active)); // same: suppress
+        assert!(state.observe_mapping_outcome("repo-a", &steady)); // changed back: emit
+    }
+
+    /// `retain_active` also prunes per-mapping outcome cache so a removed
+    /// mapping doesn't keep its stale entry forever.
+    #[test]
+    fn watch_log_state_retain_active_also_prunes_outcomes() {
+        let mut state = WatchLogState::default();
+        let outcome = MappingOutcome {
+            skipped: 1,
+            ..MappingOutcome::default()
+        };
+        state.observe_mapping_outcome("keep", &outcome);
+        state.observe_mapping_outcome("drop", &outcome);
+
+        state.retain_active(["keep"]);
+
+        // Re-observation of "drop" emits because its prior entry was pruned.
+        assert!(state.observe_mapping_outcome("drop", &outcome));
+        // "keep" still suppresses identical follow-up.
+        assert!(!state.observe_mapping_outcome("keep", &outcome));
+    }
+
+    /// `format_mapping_outcome` omits zero counts so the line stays terse,
+    /// and elides the bytes clause when nothing transferred.
+    #[test]
+    fn format_mapping_outcome_omits_zero_counts() {
+        let d = MappingDescriptor {
+            from: "library/alpine".into(),
+            target_repo: "mirror/alpine".into(),
+            target_names: vec!["ttl".into()],
+        };
+        let synced_only = MappingOutcome {
+            synced: 3,
+            bytes: 1024,
+            ..MappingOutcome::default()
+        };
+        assert_eq!(
+            format_mapping_outcome(&d, &synced_only),
+            "library/alpine -> mirror/alpine [ttl]: synced 3 (1.0 KB)"
+        );
+        let skipped_only = MappingOutcome {
+            skipped: 5,
+            ..MappingOutcome::default()
+        };
+        assert_eq!(
+            format_mapping_outcome(&d, &skipped_only),
+            "library/alpine -> mirror/alpine [ttl]: skipped 5"
+        );
+        let mixed = MappingOutcome {
+            synced: 1,
+            skipped: 2,
+            failed: 1,
+            bytes: 2048,
+        };
+        assert_eq!(
+            format_mapping_outcome(&d, &mixed),
+            "library/alpine -> mirror/alpine [ttl]: synced 1, skipped 2, failed 1 (2.0 KB)"
+        );
     }
 
     // -- select_filtered_tags wire-up tests ---------------------------------
