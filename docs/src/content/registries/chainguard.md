@@ -89,6 +89,56 @@ ocync copy \
   ghcr.io/myorg/python:3.12
 ```
 
+## Tag filtering
+
+The Chainguard catalog publishes `-dev` build variants and `-rN` build counters alongside stable releases. ocync treats these as stable artifacts, not prereleases like `-rc1`, so a default Chainguard mirror syncs every variant. Two patterns cover the common cases.
+
+### Stable releases only
+
+Deny `*-dev` and `*-rN` once at the top level. Every mapping inherits without extra config:
+
+```yaml
+defaults:
+  source: cgr
+  targets: ecr
+  tags:
+    exclude: ["*-dev", "*-r[0-9]*"]
+    sort: semver
+    latest: 10
+
+mappings:
+  - from: chainguard/static
+    to: static
+  - from: chainguard/nginx
+    to: nginx
+```
+
+### Build + runtime on one mapping
+
+For SDK and language images where you need both the runtime tag (`3.12.5`) and the build layer (`3.12.5-dev`), add an `include:` on just that mapping:
+
+```yaml
+defaults:
+  tags:
+    exclude: ["*-dev", "*-r[0-9]*"]
+    sort: semver
+    latest: 10
+
+mappings:
+  - from: chainguard/python
+    to: python
+    tags:
+      semver: ">=3.12, <3.13"
+      include: ["latest", "latest-dev", "*-dev"]
+
+  - from: chainguard/static
+    to: static                          # stable only
+```
+
+The `*-dev` glob brings dev tags back through the version filter, so 3.12 dev tags sync and 3.13 ones drop. `latest` and `latest-dev` always sync because they are not version numbers and would be skipped otherwise.
+
+See [include patterns](/configuration#include-patterns) and [build + runtime variants](/recipes/semver-tracking#build--runtime-variants).
+
 ## Kubernetes deployment
 
 The recommended K8s path is the same `auth_type: basic` flow as CI, with the pull-token's username/password injected via `envFrom`:

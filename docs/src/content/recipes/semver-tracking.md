@@ -61,7 +61,7 @@ tags:
   latest: 10
 ```
 
-To opt back into all prereleases, add the patterns to `include:` (which overrides the system default):
+To opt back into prereleases for in-range versions, add the patterns to `include:`. As glob patterns, they rescue tags from the system default and then run through `semver:` like any other pipeline tag, so prereleases below the range still drop:
 
 ```yaml
 tags:
@@ -71,7 +71,7 @@ tags:
   latest: 10
 ```
 
-To pin a specific RC alongside stable releases:
+To pin a specific RC alongside stable releases, write the exact tag as a literal in `include:`. Literal patterns bypass the pipeline entirely, so the literal is kept even if it would be rejected by `semver:`:
 
 ```yaml
 tags:
@@ -90,6 +90,27 @@ tags:
   sort: semver
   latest: 10
 ```
+
+### Build + runtime variants
+
+Some images publish a build variant alongside each release -- for example `3.12.5` and `3.12.5-dev`. To mirror both within a version range, add `include: ["*-dev"]` to the mapping:
+
+```yaml
+defaults:
+  tags:
+    exclude: ["*-dev", "*-r[0-9]*"]
+
+mappings:
+  - from: chainguard/python
+    to: python
+    tags:
+      semver: ">=3.12, <3.13"
+      include: ["*-dev"]
+      sort: semver
+      latest: 10
+```
+
+The `*-dev` glob overrides the project-wide deny, but the version range still applies, so 3.12 dev tags sync and 3.13 dev tags drop. `latest: 10` counts stable and dev tags together. Mappings without their own `include:` inherit the deny and stay stable-only.
 
 ## Related
 

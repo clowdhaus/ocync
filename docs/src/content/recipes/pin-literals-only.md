@@ -67,11 +67,11 @@ defaults:
 
 ## When to use `glob:` vs `include:`
 
-`glob:` is the *filter* mechanism: it narrows the candidate pool. Use it when you want only specific tags, with no `semver:` range driving the pipeline.
+`glob:` filters: it narrows the candidate pool. Use it when you want specific tags and no `semver:` range.
 
-`include:` is the *augment* mechanism: it always-adds tags alongside a `semver:`-driven pipeline. Use it when you want literal pins (`latest`, `latest-dev`) plus a version range in the same mapping.
+`include:` adds tags on top of whatever the rest of the pipeline produces. Exact names always sync -- use these to pin floats like `latest` or `latest-dev`. Glob patterns add a tag family while still respecting `semver:`, `sort:`, and `latest:` -- use these for paired variants like `*-dev`.
 
-For pin-only use cases (this recipe), `glob:` is the right field. For pin-plus-range, see [semver tracking](/recipes/semver-tracking).
+For pin-only use cases (this recipe), `glob:` is the right field. For pin-plus-range, see [semver tracking](/recipes/semver-tracking). For paired-variant mirrors, see [build + runtime variants](/recipes/semver-tracking#build--runtime-variants).
 
 ## Related
 
