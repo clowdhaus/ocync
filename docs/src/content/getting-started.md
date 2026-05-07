@@ -38,7 +38,7 @@ Multi-arch image (`linux/amd64`, `linux/arm64`) based on `chainguard/static` wit
 ### Helm
 
 ```bash
-helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.5.1
+helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.5.2
 ```
 
 See the [Helm chart guide](/helm) for deployment modes and configuration.
