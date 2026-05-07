@@ -200,10 +200,25 @@ impl FilterConfig {
         };
         let sys_exclude = system_exclude_set();
 
-        let include_kept_refs: Vec<&str> = if self.include.is_empty() {
+        // Partition include patterns by shape. Literals bypass the entire
+        // pipeline (union after). Globs rescue from `glob:` and the soft-tier
+        // excludes, then run through the rest of the pipeline.
+        let (include_literals, include_globs): (Vec<String>, Vec<String>) = self
+            .include
+            .iter()
+            .cloned()
+            .partition(|p| is_literal_pattern(p));
+
+        let include_glob_set = if include_globs.is_empty() {
+            None
+        } else {
+            Some(build_glob_set(&include_globs)?)
+        };
+
+        let include_kept_refs: Vec<&str> = if include_literals.is_empty() {
             Vec::new()
         } else {
-            let inc_set = build_glob_set(&self.include)?;
+            let inc_set = build_glob_set(&include_literals)?;
             tags.iter()
                 .copied()
                 .filter(|t| inc_set.is_match(t))
@@ -215,7 +230,9 @@ impl FilterConfig {
             tags.to_vec()
         } else {
             let glob_set = build_glob_set(&self.glob)?;
-            let (kept, dropped) = partition_with_drop(tags, track, |t| glob_set.is_match(t));
+            let (kept, dropped) = partition_with_drop(tags, track, |t| {
+                glob_set.is_match(t) || include_glob_set.as_ref().is_some_and(|s| s.is_match(t))
+            });
             push_drop_reason(
                 &mut drop_reasons,
                 track,
@@ -281,6 +298,8 @@ impl FilterConfig {
         let mut defaults_dropped: Vec<String> = Vec::new();
         let mut builtin_dropped: Vec<String> = Vec::new();
         pipeline.retain(|t| {
+            // Hard tier (mapping `exclude:`) always applies, including to
+            // include-glob matches. Most-specific user intent wins.
             if let Some(ref s) = user_exclude_set {
                 if s.is_match(t) {
                     if track {
@@ -289,19 +308,25 @@ impl FilterConfig {
                     return false;
                 }
             }
-            if let Some(ref s) = defaults_exclude_set {
-                if s.is_match(t) {
+            // Soft tier (defaults + built-in) is bypassed when a glob `include:`
+            // pattern matches. Literal `include:` matches never reach this path
+            // (they bypass the pipeline entirely via the literal union).
+            let rescued_from_soft_tier = include_glob_set.as_ref().is_some_and(|s| s.is_match(t));
+            if !rescued_from_soft_tier {
+                if let Some(ref s) = defaults_exclude_set {
+                    if s.is_match(t) {
+                        if track {
+                            defaults_dropped.push((*t).to_owned());
+                        }
+                        return false;
+                    }
+                }
+                if sys_exclude.is_match(t) {
                     if track {
-                        defaults_dropped.push((*t).to_owned());
+                        builtin_dropped.push((*t).to_owned());
                     }
                     return false;
                 }
-            }
-            if sys_exclude.is_match(t) {
-                if track {
-                    builtin_dropped.push((*t).to_owned());
-                }
-                return false;
             }
             true
         });
@@ -598,6 +623,12 @@ fn push_drop_reason(
 /// reintroducing a duplicate prefix check that would drift over time.
 pub fn is_referrers_fallback_tag(tag: &str) -> bool {
     tag.starts_with("sha256-") || tag.starts_with("sha512-")
+}
+
+/// Returns `true` when `pattern` contains no glob metacharacters
+/// (`*`, `?`, `[`).
+pub fn is_literal_pattern(pattern: &str) -> bool {
+    !pattern.contains(['*', '?', '['])
 }
 
 /// Build a [`GlobSet`] from patterns, returning an error on invalid patterns.
@@ -1310,6 +1341,198 @@ mod tests {
         assert_eq!(result, vec!["1.0.0".to_string()]);
     }
 
+    /// `include:` is glob-matched, not literal-matched: `include: ["*-dev"]`
+    /// rescues every `-dev` tag from a `defaults_exclude: ["*-dev"]` soft
+    /// tier. Companion to `include_overrides_defaults_exclude`, which only
+    /// covers the literal-include case.
+    #[test]
+    fn include_glob_rescues_all_matching_from_defaults_exclude() {
+        let tags = vec![
+            "latest",
+            "latest-dev",
+            "1.0.0",
+            "1.0.0-dev",
+            "2.0.0-dev",
+            "1.0.0-rc1", // built-in soft tier, not matched by `*-dev` include
+        ];
+        let config = FilterConfig {
+            include: vec!["*-dev".into()],
+            defaults_exclude: vec!["*-dev".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"latest-dev".to_string()));
+        assert!(result.contains(&"1.0.0-dev".to_string()));
+        assert!(result.contains(&"2.0.0-dev".to_string()));
+        assert!(result.contains(&"latest".to_string()));
+        assert!(result.contains(&"1.0.0".to_string()));
+        assert!(
+            !result.contains(&"1.0.0-rc1".to_string()),
+            "soft-tier patterns the include glob does NOT match are still dropped"
+        );
+    }
+
+    /// Glob character classes work against real tag strings. `*-r[0-9]*`
+    /// drops Chainguard/Bitnami `-r<N>` build counters at any digit width.
+    /// Documents the recipe shape suggested in `configuration.md` for
+    /// suffixes deliberately absent from the built-in soft tier.
+    #[test]
+    fn defaults_exclude_character_class_drops_r_counters() {
+        let tags = vec![
+            "1.25.5",
+            "1.25.5-r0",
+            "1.25.5-r9",
+            "1.25.5-r10",
+            "1.25.5-r123",
+        ];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-r[0-9]*".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["1.25.5".to_string()]);
+    }
+
+    /// Glob `include:` is constrained by the pipeline. Stable + dev tags share
+    /// one pipeline; `sort:` orders them together; `latest:` caps the union.
+    /// Same suffix-presence ordering as `version::TagVersion::compare`: empty
+    /// suffix wins, so `3.12.2` sorts before `3.12.2-dev` at the same prefix.
+    #[test]
+    fn include_glob_constrained_by_semver_sort_latest() {
+        let tags = vec![
+            "3.12.0",
+            "3.12.1",
+            "3.12.2",
+            "3.12.0-dev",
+            "3.12.1-dev",
+            "3.12.2-dev",
+            "3.12.0-r0",
+            "3.12.0-r10",
+        ];
+        let config = FilterConfig {
+            include: vec!["*-dev".into()],
+            defaults_exclude: vec!["*-dev".into(), "*-r[0-9]*".into()],
+            semver: Some(">=3.12.0".into()),
+            sort: Some(SortOrder::Semver),
+            latest: Some(2),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        // Top 2 by semver desc with empty-suffix winning: 3.12.2 then 3.12.2-dev.
+        assert_eq!(result, vec!["3.12.2".to_string(), "3.12.2-dev".to_string()]);
+    }
+
+    /// Prescription 1: drop `*-dev` from `defaults_exclude` and let
+    /// `semver:` constrain the dev tags through the pipeline. The lenient
+    /// parser admits `8.5.0-dev` as prefix `[8,5,0]` (suffix opaque), so
+    /// the range `>=8.0.0, <9.0.0` keeps `8.5.0-dev` and rejects
+    /// `10.0.0-dev`. No `include:` involved.
+    #[test]
+    fn semver_constrains_dev_tags_when_not_in_defaults_exclude() {
+        let tags = vec!["8.0.0", "8.5.0", "8.5.0-dev", "10.0.0", "10.0.0-dev"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-r[0-9]*".into()],
+            semver: Some(">=8.0.0, <9.0.0".into()),
+            sort: Some(SortOrder::Semver),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"8.0.0".to_string()));
+        assert!(result.contains(&"8.5.0".to_string()));
+        assert!(
+            result.contains(&"8.5.0-dev".to_string()),
+            "8.5.0-dev should pass: prefix [8,5,0] matches >=8.0.0, <9.0.0"
+        );
+        assert!(
+            !result.contains(&"10.0.0".to_string()),
+            "10.0.0 should be rejected by <9.0.0"
+        );
+        assert!(
+            !result.contains(&"10.0.0-dev".to_string()),
+            "10.0.0-dev should be rejected: prefix [10,0,0] fails <9.0.0"
+        );
+    }
+
+    /// `glob:` does NOT rescue from soft-tier excludes. The `glob:` stage
+    /// is upstream of the exclude stage; even when `glob:` admits a tag,
+    /// `defaults_exclude` drops it downstream. Only `include:` rescues
+    /// from soft tier (literal halves bypass the entire pipeline; glob
+    /// halves bypass `glob:` and soft tier and then run through the rest
+    /// of the pipeline).
+    #[test]
+    fn glob_does_not_rescue_dev_from_defaults_exclude() {
+        let tags = vec!["8.0.0", "8.5.0-dev", "10.0.0-dev"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-dev".into()],
+            glob: vec!["*-dev".into()],
+            semver: Some(">=8.0.0, <9.0.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(
+            !result.contains(&"8.5.0-dev".to_string()),
+            "soft tier still drops -dev even when glob admits it"
+        );
+        assert!(
+            !result.contains(&"10.0.0-dev".to_string()),
+            "soft tier still drops -dev regardless of semver intent"
+        );
+        assert_eq!(
+            result,
+            Vec::<String>::new(),
+            "two-mapping pattern produces empty result, not a bounded -dev set"
+        );
+    }
+
+    /// End-to-end Chainguard-style mirror: stable releases + dev variants
+    /// both constrained to a semver range, with `-r<N>` build counters
+    /// always denied. The only working shape, per the surrounding tests:
+    /// `*-dev` is NOT in `defaults_exclude`, `semver:` does the work for
+    /// both stable and dev tags, and per-mapping hard-tier `exclude:` on
+    /// other mappings denies `-dev` where unwanted.
+    ///
+    /// This test models the dev-wanting mapping. The companion stable-only
+    /// mapping is covered by `defaults_and_mapping_exclude_stack` plus a
+    /// mapping-level `exclude: ["*-dev"]`.
+    #[test]
+    fn dev_constrained_by_semver_end_to_end() {
+        let tags = vec![
+            "8.0.0",
+            "8.5.0",
+            "8.9.9",
+            "8.5.0-dev",
+            "8.9.9-dev",
+            "9.0.0",
+            "9.0.0-dev",
+            "10.0.0",
+            "10.0.0-dev",
+            "8.5.0-r0",
+            "8.5.0-r12",
+        ];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-r[0-9]*".into()],
+            semver: Some(">=8.0.0, <9.0.0".into()),
+            sort: Some(SortOrder::Semver),
+            latest: Some(10),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+
+        for t in ["8.0.0", "8.5.0", "8.9.9", "8.5.0-dev", "8.9.9-dev"] {
+            assert!(result.contains(&t.to_string()), "{t} should be kept");
+        }
+        for t in [
+            "9.0.0",
+            "9.0.0-dev",
+            "10.0.0",
+            "10.0.0-dev",
+            "8.5.0-r0",
+            "8.5.0-r12",
+        ] {
+            assert!(!result.contains(&t.to_string()), "{t} should be dropped");
+        }
+    }
+
     /// Dry-run attribution: defaults-tier drops surface as
     /// `DropKind::DefaultsExclude`, distinct from `MappingExclude` and
     /// `BuiltinExclude`. The formatter relies on the variant to render
@@ -1688,5 +1911,293 @@ mod tests {
         assert!(!is_referrers_fallback_tag("v1.0.0"));
         assert!(!is_referrers_fallback_tag("latest"));
         assert!(!is_referrers_fallback_tag("sha256")); // no dash
+    }
+
+    /// Glob `include:` rescues tags from the soft tier (built-in
+    /// `SYSTEM_EXCLUDE` plus `defaults_exclude`). Hard tier (`exclude:`) is
+    /// unchanged: it still blocks include.
+    #[test]
+    fn include_glob_rescues_from_soft_tier_only() {
+        let tags = vec!["1.0.0-rc1", "1.0.0-dev", "1.0.0-debug-dev"];
+        let config = FilterConfig {
+            // `*-rc*` is in built-in SYSTEM_EXCLUDE; `*-dev` we add as defaults.
+            defaults_exclude: vec!["*-dev".into()],
+            // Hard tier denies one specific dev variant.
+            exclude: vec!["*-debug-dev".into()],
+            include: vec!["*-rc*".into(), "*-dev".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(
+            result.contains(&"1.0.0-rc1".to_string()),
+            "rescued from built-in soft tier"
+        );
+        assert!(
+            result.contains(&"1.0.0-dev".to_string()),
+            "rescued from defaults soft tier"
+        );
+        assert!(
+            !result.contains(&"1.0.0-debug-dev".to_string()),
+            "hard tier still blocks include"
+        );
+    }
+
+    /// Glob `include:` rescues tags from the `glob:` positive filter. Without
+    /// this bypass, dev tags would be dropped at the `glob:` stage before
+    /// soft-tier exemption could apply.
+    #[test]
+    fn include_glob_rescues_from_glob_filter() {
+        let tags = vec!["1.0.0-alpine", "1.0.0-dev", "1.0.0"];
+        let config = FilterConfig {
+            glob: vec!["*-alpine".into()],
+            include: vec!["*-dev".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"1.0.0-alpine".to_string()));
+        assert!(
+            result.contains(&"1.0.0-dev".to_string()),
+            "include glob bypasses the glob: positive filter"
+        );
+        assert!(
+            !result.contains(&"1.0.0".to_string()),
+            "tags matching neither glob nor include glob are dropped"
+        );
+    }
+
+    /// Partition is internal but observable through the apply path: a pure
+    /// literal include retains today's bypass-everything semantics, including
+    /// surviving a `semver:` filter that the literal does not parse against.
+    #[test]
+    fn literal_include_partition_bypasses_semver() {
+        let tags = vec!["latest", "1.0.0", "2.0.0"];
+        let config = FilterConfig {
+            include: vec!["latest".into()],
+            semver: Some(">=2.0.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"latest".to_string()));
+        assert!(result.contains(&"2.0.0".to_string()));
+        assert!(!result.contains(&"1.0.0".to_string()));
+    }
+
+    /// Glob include constrained by semver: rescues tags from soft tier, then
+    /// drops them if `semver:` rejects. The case-6 fix in concrete form.
+    #[test]
+    fn include_glob_dropped_by_semver_when_out_of_range() {
+        let tags = vec!["8.5.0", "8.5.0-dev", "10.0.0", "10.0.0-dev"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-dev".into()],
+            include: vec!["*-dev".into()],
+            semver: Some(">=8.0.0, <9.0.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"8.5.0".to_string()));
+        assert!(result.contains(&"8.5.0-dev".to_string()));
+        assert!(!result.contains(&"10.0.0".to_string()));
+        assert!(
+            !result.contains(&"10.0.0-dev".to_string()),
+            "include glob is constrained by semver"
+        );
+    }
+
+    /// Mixed include: literal halves bypass everything, glob halves go
+    /// through the pipeline. The two halves union into the final result
+    /// and are handled independently from each other.
+    #[test]
+    fn mixed_include_handles_literals_and_globs_independently() {
+        let tags = vec!["latest", "8.5.0", "8.5.0-dev", "10.0.0-dev"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-dev".into()],
+            include: vec!["latest".into(), "*-dev".into()],
+            semver: Some(">=8.0.0, <9.0.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(
+            result.contains(&"latest".to_string()),
+            "literal include bypasses semver"
+        );
+        assert!(result.contains(&"8.5.0".to_string()));
+        assert!(
+            result.contains(&"8.5.0-dev".to_string()),
+            "glob include rescued and admitted by semver"
+        );
+        assert!(
+            !result.contains(&"10.0.0-dev".to_string()),
+            "glob include rejected by semver"
+        );
+    }
+
+    /// Glob include matching a non-parseable tag is dropped at semver --
+    /// globs go through the pipeline, and the pipeline drops anything the
+    /// version parser cannot read. Companion test
+    /// `literal_include_pins_non_parseable_tag` shows how to keep such a
+    /// tag (promote to a literal).
+    #[test]
+    fn include_glob_drops_non_parseable_tag_at_semver() {
+        let tags = vec!["latest-dev", "8.5.0-dev"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-dev".into()],
+            include: vec!["*-dev".into()],
+            semver: Some(">=2.0.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(
+            result.contains(&"8.5.0-dev".to_string()),
+            "parseable in-range tag survives"
+        );
+        assert!(
+            !result.contains(&"latest-dev".to_string()),
+            "non-parseable tag drops at semver even when matched by include glob"
+        );
+    }
+
+    /// Literal include pins a non-parseable tag through `semver:`. The
+    /// literal half of include bypasses the entire pipeline, so a tag
+    /// like `latest-dev` that the version parser cannot read still lands
+    /// in the result. Workaround for the case covered by
+    /// `include_glob_drops_non_parseable_tag_at_semver`.
+    #[test]
+    fn literal_include_pins_non_parseable_tag() {
+        let tags = vec!["latest-dev", "8.5.0-dev"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-dev".into()],
+            include: vec!["latest-dev".into(), "*-dev".into()],
+            semver: Some(">=2.0.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(
+            result.contains(&"latest-dev".to_string()),
+            "literal include bypasses semver, pinning the non-parseable tag"
+        );
+        assert!(
+            result.contains(&"8.5.0-dev".to_string()),
+            "glob include still admits parseable in-range tags alongside the literal"
+        );
+    }
+
+    /// Literal include pins a parseable tag that `semver:` would otherwise
+    /// reject (out-of-range RC). Matches the recipe at
+    /// `recipes/semver-tracking.md` "To pin a specific RC alongside stable
+    /// releases" -- proves the literal-bypass contract for tags that DO
+    /// parse as semver but fail the range constraint.
+    #[test]
+    fn literal_include_pins_parseable_rc_against_semver_range() {
+        let tags = vec!["1.0.0-rc1", "2.5.0", "3.0.0"];
+        let config = FilterConfig {
+            include: vec!["1.0.0-rc1".into()],
+            semver: Some(">=2.0.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(
+            result.contains(&"1.0.0-rc1".to_string()),
+            "literal RC pinned via include bypasses the semver range"
+        );
+        assert!(result.contains(&"2.5.0".to_string()));
+        assert!(result.contains(&"3.0.0".to_string()));
+        // Sanity: with a glob include of the same RC pattern, the bypass is
+        // gone and the RC drops at semver.
+        let glob_config = FilterConfig {
+            include: vec!["1.0.0-*".into()],
+            semver: Some(">=2.0.0".into()),
+            ..FilterConfig::default()
+        };
+        let glob_result = glob_config.apply(&tags).unwrap();
+        assert!(
+            !glob_result.contains(&"1.0.0-rc1".to_string()),
+            "glob include runs through semver; the RC drops"
+        );
+    }
+
+    /// Glob include for prerelease patterns + `semver:` keeps in-range
+    /// prereleases and drops out-of-range ones. Matches the corrected
+    /// prose in `recipes/semver-tracking.md` ("opt back into prereleases
+    /// for in-range versions") -- the docs claim that out-of-range
+    /// prereleases drop. This test pins that claim.
+    #[test]
+    fn include_glob_drops_out_of_range_prereleases_through_semver() {
+        let tags = vec![
+            "1.5.0-rc1", // below range, even though include pattern matches
+            "2.0.0-rc1", // in range, in pattern -> kept
+            "2.5.0-alpha1",
+            "2.5.0",
+            "1.5.0",
+        ];
+        let config = FilterConfig {
+            include: vec![
+                "*-rc*".into(),
+                "*-alpha*".into(),
+                "*-beta*".into(),
+                "*-pre*".into(),
+                "*-snapshot*".into(),
+                "*-nightly*".into(),
+            ],
+            semver: Some(">=2.0".into()),
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(
+            result.contains(&"2.0.0-rc1".to_string()),
+            "in-range RC rescued from built-in soft tier and admitted by semver"
+        );
+        assert!(
+            result.contains(&"2.5.0-alpha1".to_string()),
+            "in-range alpha rescued and admitted"
+        );
+        assert!(result.contains(&"2.5.0".to_string()));
+        assert!(
+            !result.contains(&"1.5.0-rc1".to_string()),
+            "out-of-range RC rescued from built-in soft tier but dropped by semver"
+        );
+        assert!(
+            !result.contains(&"1.5.0".to_string()),
+            "out-of-range stable still drops as usual"
+        );
+    }
+
+    /// Empty `include:` produces no rescue and no literal union. Regression
+    /// coverage for the partition logic returning empty halves.
+    #[test]
+    fn empty_include_behaves_like_no_include() {
+        let tags = vec!["1.0.0", "1.0.0-dev"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-dev".into()],
+            include: vec![],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["1.0.0".to_string()]);
+    }
+
+    // - is_literal_pattern ------------------------------------------------
+
+    #[test]
+    fn is_literal_pattern_detects_literals() {
+        assert!(is_literal_pattern("latest"));
+        assert!(is_literal_pattern("1.25.5"));
+        assert!(is_literal_pattern("latest-dev"));
+        assert!(is_literal_pattern("v1.2.3-rc1"));
+    }
+
+    #[test]
+    fn is_literal_pattern_detects_globs() {
+        assert!(!is_literal_pattern("*-dev"));
+        assert!(!is_literal_pattern("v?.*.*"));
+        assert!(!is_literal_pattern("*-r[0-9]*"));
+        assert!(!is_literal_pattern("foo[abc]bar"));
+    }
+
+    #[test]
+    fn is_literal_pattern_empty_is_literal() {
+        // Empty string has no glob metacharacters; treat as literal.
+        // The pipeline will never see this in practice (parser rejects empty),
+        // but pin down the contract for future edits.
+        assert!(is_literal_pattern(""));
     }
 }

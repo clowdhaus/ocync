@@ -269,7 +269,7 @@ Tags are filtered through a pipeline:
 2. **exclude**: remove tags matching any of three exclude tiers -- mapping `exclude:` (hard, blocks `include:`), `defaults.tags.exclude:` (soft, bypassable by `include:`), or the built-in prerelease list (soft, bypassable by `include:`)
 3. **sort**: order the pool (`semver` or `alpha`)
 4. **latest**: keep only the N most recent of the pool
-5. **include**: union always-include tag matches into the result (not subject to `glob`, `semver`, default-excludes, `sort`, or `latest`); still subject to user `exclude`
+5. **include**: pattern-shape dispatch. Literals union into the result after the pipeline (not subject to `glob`, `semver`, default-excludes, `sort`, or `latest`; still subject to user `exclude`). Globs are rescued from `glob:` and the soft tier upstream and flow through the rest of the pipeline like any other tag; they ARE subject to `semver:`, mapping `exclude:`, `sort:`, and `latest:`.
 6. **min_tags**: validate the final union has at least N tags (error if fewer)
 
 All filters are optional. Without any filters, all tags are synced.
@@ -277,7 +277,7 @@ All filters are optional. Without any filters, all tags are synced.
 | Field | Type | Description |
 |---|---|---|
 | `glob` | string or list | Include tags matching glob pattern(s). A single string or a list of patterns |
-| `include` | string or list | Always-include glob pattern(s). Tags matching any pattern survive `glob:`/`semver:` filters and the soft exclude tier (built-in defaults + `defaults.tags.exclude:`). Subject to mapping `exclude:` (hard tier). Same syntax as `exclude:` |
+| `include` | string or list | Always-include pattern(s). Behavior depends on pattern shape: **literals** (no `*`, `?`, `[`) bypass the entire pipeline and are kept verbatim. **Globs** rescue matching tags from `glob:` and the soft exclude tier (built-in defaults + `defaults.tags.exclude:`), then run through `semver:`, hard `exclude:`, `sort:`, and `latest:` like any other pipeline tag. Same syntax as `exclude:` |
 | `semver` | string | Include tags satisfying a version range. Operators: `>=`, `<=`, `>`, `<`, `=`. Comma-joined for AND-narrowing. Example: `">=1.0, <2.0"` |
 | `exclude` | string or list | Remove tags matching these glob pattern(s) |
 | `sort` | string | Sort order for remaining tags: `semver` or `alpha` |
@@ -298,6 +298,20 @@ All filters are optional. Without any filters, all tags are synced.
 - `mapping.tags.exclude:` is the **hard tier**. It applies only to that mapping and is NOT overridden by `include:` on the same mapping. Use this for absolute per-mapping denies.
 
 Both tiers apply (concat). To rescue a tag the soft tier would drop on a specific mapping, add the tag to that mapping's `include:`.
+
+```yaml
+defaults:
+  tags:
+    exclude: ["*-rc*", "*-alpha*"]   # applies to every mapping
+
+mappings:
+  - from: my-org/auth-service
+    to: auth-service
+    tags:
+      exclude: ["*-debug"]           # also applies on this mapping
+```
+
+All four patterns drop on `auth-service`. An `include:` on this mapping could rescue `*-rc*` or `*-alpha*` (the project-wide list) but not `*-debug` (the per-mapping list).
 
 > **Behavior change.** Earlier versions replaced the whole `tags:` block when a mapping defined its own, so `defaults.tags.exclude:` was silently dropped for mappings with any per-mapping tag config. It now always applies (as the soft tier). If you were relying on `defaults.tags.exclude:` blocking an `include:` somewhere, switch that pattern to `mapping.tags.exclude:` (the hard tier, which still blocks `include:` on the same mapping).
 
@@ -320,6 +334,37 @@ Patterns deliberately NOT in the built-in list (still admitted unless your `defa
 - `-r<N>` -- Chainguard/Bitnami build counters
 
 To opt back into prereleases, add them to `include:` (which overrides the built-in list and `defaults.tags.exclude:`). To pin a single prerelease tag for testing, add the exact tag string to `include:`. To add project-wide exclude patterns, use `defaults.tags.exclude:`. To deny a tag absolutely on one mapping, use `mapping.tags.exclude:`.
+
+### Include patterns
+
+`include:` accepts exact tag names and glob patterns. The two behave differently.
+
+An exact name (no `*`, `?`, or `[`) always syncs, regardless of `glob:`, `semver:`, `sort:`, `latest:`, or any exclude. Use this to pin floating tags like `latest` and `latest-dev` that are not valid version numbers and would otherwise be skipped:
+
+```yaml
+tags:
+  include: ["latest", "latest-dev"]
+  semver: ">=2.0"
+```
+
+A glob pattern (with `*`, `?`, or `[`) acts as an opt-in that overrides `glob:` and the project-wide excludes. Tags matching the pattern still go through `semver:`, the per-mapping `exclude:`, `sort:`, and `latest:`. Use this to add a family of tags without giving up the version range:
+
+```yaml
+defaults:
+  tags:
+    exclude: ["*-dev", "*-r[0-9]*"]
+
+mappings:
+  - from: chainguard/python
+    to: python
+    tags:
+      semver: ">=3.12, <3.13"
+      include: ["latest", "latest-dev", "*-dev"]
+      sort: semver
+      latest: 10
+```
+
+On this mapping, `latest` and `latest-dev` always sync. Stable releases in the 3.12 line sync (`3.12.5`, `3.12.6`), and so do their dev variants (`3.12.5-dev`, `3.12.6-dev`). A `3.13.0-dev` drops because the version range rejects it. A `3.12.5-r3` drops because nothing in `include:` matches it.
 
 ## Environment variables
 

@@ -1494,6 +1494,93 @@ exclude: ["*-slim"]
         assert_eq!(kept, vec!["1.27".to_string()]);
     }
 
+    /// End-to-end YAML proof of the build+runtime case: project-wide
+    /// `defaults.tags.exclude` denies `*-dev` and `*-r[0-9]*`; one mapping
+    /// uses a glob `include:` to rescue `-dev` for a bounded semver range.
+    /// Catches regressions in either the filter pipeline or the merge layer.
+    #[test]
+    fn merge_glob_include_with_semver_yaml_e2e() {
+        let defaults_yaml = r#"
+exclude: ["*-dev", "*-r[0-9]*"]
+sort: semver
+latest: 10
+"#;
+        let mapping_yaml = r#"
+semver: ">=8.0.0, <9.0.0"
+include: ["*-dev"]
+"#;
+        let defaults: TagsConfig =
+            serde_yaml::from_str(defaults_yaml).expect("defaults yaml parses");
+        let mapping: TagsConfig = serde_yaml::from_str(mapping_yaml).expect("mapping yaml parses");
+
+        let filter = build_filter(Some(&mapping), Some(&defaults));
+
+        // Mapping include reaches the FilterConfig; defaults exclude lands
+        // in the soft tier; semver/sort/latest inherit from defaults.
+        assert_eq!(filter.include, vec!["*-dev"]);
+        assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
+        assert_eq!(filter.semver.as_deref(), Some(">=8.0.0, <9.0.0"));
+        assert_eq!(filter.latest, Some(10));
+
+        let tags = vec![
+            "8.0.0",
+            "8.5.0",
+            "8.5.0-dev",  // rescued by include glob, in semver range -> kept
+            "8.5.0-r3",   // not in include; soft tier drops -> dropped
+            "10.0.0",     // out of semver range -> dropped
+            "10.0.0-dev", // rescued by include glob, but out of semver -> dropped
+            "7.0.0",      // below semver -> dropped
+        ];
+        let kept = filter.apply(&tags).expect("filter applies");
+        assert!(kept.contains(&"8.0.0".to_string()));
+        assert!(kept.contains(&"8.5.0".to_string()));
+        assert!(
+            kept.contains(&"8.5.0-dev".to_string()),
+            "in-range -dev rescued from soft tier and admitted by semver"
+        );
+        assert!(
+            !kept.contains(&"8.5.0-r3".to_string()),
+            "-r counter still dropped by defaults soft tier"
+        );
+        assert!(
+            !kept.contains(&"10.0.0-dev".to_string()),
+            "out-of-range -dev rescued but dropped by semver"
+        );
+        assert!(!kept.contains(&"10.0.0".to_string()));
+        assert!(!kept.contains(&"7.0.0".to_string()));
+    }
+
+    /// Per-mapping `include:` REPLACES `defaults.tags.include`, not concat.
+    /// The merge resolution at `build_filter` picks the mapping value if
+    /// set, else falls through to defaults. This pins the field-replace
+    /// semantics so a future regression cannot quietly stack the lists.
+    #[test]
+    fn merge_mapping_include_replaces_defaults_include() {
+        let defaults_yaml = r#"
+include: ["latest", "latest-dev"]
+"#;
+        let mapping_yaml = r#"
+include: ["1.25.0-rc1"]
+"#;
+        let defaults: TagsConfig =
+            serde_yaml::from_str(defaults_yaml).expect("defaults yaml parses");
+        let mapping: TagsConfig = serde_yaml::from_str(mapping_yaml).expect("mapping yaml parses");
+
+        let filter_inherited = build_filter(None, Some(&defaults));
+        assert_eq!(
+            filter_inherited.include,
+            vec!["latest", "latest-dev"],
+            "no mapping -> defaults include flows through"
+        );
+
+        let filter_overridden = build_filter(Some(&mapping), Some(&defaults));
+        assert_eq!(
+            filter_overridden.include,
+            vec!["1.25.0-rc1"],
+            "mapping include replaces defaults include; the two are NOT concat"
+        );
+    }
+
     #[test]
     fn glob_or_list_to_vec_owned_single() {
         let g = GlobOrList::Single("pattern".into());

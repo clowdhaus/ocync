@@ -49,7 +49,7 @@ ocync sync -c config.yaml --json
 `--dry-run` runs the full filter pipeline against each mapping's source tags and prints, per mapping:
 
 - **`source tags: N`** -- the number of tags fetched from the source.
-- **`include path:`** -- tags rescued via `include:` (bypasses `glob:`/`semver:` and the system-exclude defaults). Default cap is 5 names; `-v` removes the cap.
+- **`include path:`** -- exact tag names from `include:` synced without going through the rest of the pipeline. Glob patterns in `include:` (like `*-dev`) flow through the regular pipeline and show up in the rows below, not here. Default cap is 5 names; `-v` removes the cap.
 - **`filter:`** -- per-stage attrition (`glob`, `semver`, `exclude`, `sort`, `keep latest`). Each row shows count_in -> count_out and the drop count.
 - **`kept (N):`** -- the final tags. When `include:` is used, rescued tags are listed first and tagged `[via include]` so the rescue path is visible.
 - **`dropped (N):`** -- Pareto-sorted drop attribution (largest cause first), with sample tag names per reason. Default cap is 5 names per reason; `-v` removes the cap.

@@ -409,9 +409,13 @@ pub(crate) struct TagsConfig {
     #[serde(default)]
     pub semver: Option<String>,
 
-    /// Always-include glob patterns. Tags matching any pattern survive
-    /// `glob:`/`semver:` filters and the system-exclude defaults. Same syntax
-    /// as `exclude:`. Not subject to `sort:` or `latest:` truncation.
+    /// Always-include patterns. Behavior depends on pattern shape: literals
+    /// (no `*`, `?`, `[`) bypass the entire pipeline and are kept verbatim
+    /// (use to pin floating tags like `latest` or specific RCs). Globs
+    /// rescue matching tags from `glob:` and the soft-tier excludes
+    /// (built-in defaults + `defaults.tags.exclude:`), then run through
+    /// `semver:`, hard `exclude:`, `sort:`, and `latest:` like any other
+    /// pipeline tag. Same syntax as `exclude:`.
     #[serde(default)]
     pub include: Option<GlobOrList>,
 
@@ -469,9 +473,7 @@ impl TagsConfig {
             Some(GlobOrList::List(v)) => v.clone(),
             None => return None, // No glob = sync all tags = must enumerate.
         };
-        // A pattern is "exact" if it contains no glob metacharacters.
-        let is_exact = |s: &str| !s.contains('*') && !s.contains('?') && !s.contains('[');
-        if patterns.iter().all(|p| is_exact(p)) {
+        if patterns.iter().all(|p| is_literal_pattern(p)) {
             Some(patterns)
         } else {
             None
@@ -489,7 +491,7 @@ pub(crate) enum GlobOrList {
     List(Vec<String>),
 }
 
-use ocync_sync::filter::SortOrder;
+use ocync_sync::filter::{SortOrder, is_literal_pattern};
 
 /// Placeholder type for the removed `tags.semver_prerelease` field. Triggers
 /// a custom Deserialize error if the field appears in user config, with a
