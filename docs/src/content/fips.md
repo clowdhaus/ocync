@@ -56,7 +56,7 @@ The `ocync version` command reports whether the binary was compiled with FIPS:
 
 ```
 $ ocync version
-ocync 0.5.0
+ocync 0.5.1
 FIPS 140-3: compiled=yes
 ```
 
