@@ -266,7 +266,7 @@ defaults:
 Tags are filtered through a pipeline:
 
 1. **glob + semver**: build the candidate pool by intersecting the glob match set (default `*`) with the version range
-2. **exclude**: remove tags matching any user `exclude` pattern OR any default-exclude pattern (see below)
+2. **exclude**: remove tags matching any of three exclude tiers -- mapping `exclude:` (hard, blocks `include:`), `defaults.tags.exclude:` (soft, bypassable by `include:`), or the built-in prerelease list (soft, bypassable by `include:`)
 3. **sort**: order the pool (`semver` or `alpha`)
 4. **latest**: keep only the N most recent of the pool
 5. **include**: union always-include tag matches into the result (not subject to `glob`, `semver`, default-excludes, `sort`, or `latest`); still subject to user `exclude`
@@ -277,7 +277,7 @@ All filters are optional. Without any filters, all tags are synced.
 | Field | Type | Description |
 |---|---|---|
 | `glob` | string or list | Include tags matching glob pattern(s). A single string or a list of patterns |
-| `include` | string or list | Always-include glob pattern(s). Tags matching any pattern survive `glob:`/`semver:` filters and the system-exclude defaults. Same syntax as `exclude:` |
+| `include` | string or list | Always-include glob pattern(s). Tags matching any pattern survive `glob:`/`semver:` filters and the soft exclude tier (built-in defaults + `defaults.tags.exclude:`). Subject to mapping `exclude:` (hard tier). Same syntax as `exclude:` |
 | `semver` | string | Include tags satisfying a version range. Operators: `>=`, `<=`, `>`, `<`, `=`. Comma-joined for AND-narrowing. Example: `">=1.0, <2.0"` |
 | `exclude` | string or list | Remove tags matching these glob pattern(s) |
 | `sort` | string | Sort order for remaining tags: `semver` or `alpha` |
@@ -292,11 +292,18 @@ All filters are optional. Without any filters, all tags are synced.
 
 `latest:` is optional, but mirrors with `semver:` and no `latest:` cap will sync every tag matching the version range. Under the lenient parser, popular images often publish hundreds of variant tags (`-alpine`, `-r0`, `-debian-12-rN`, `-bookworm-slim`, etc.). For long-running mirrors, set `latest: N` (with `sort: semver`) to cap output size. ocync emits a startup warning when `semver:` is set without `latest:`.
 
-**Override semantics:** when a mapping defines `tags:`, the entire block replaces `defaults.tags` - fields are not merged. If you want a mapping to inherit some default fields and override others, repeat the inherited fields in the mapping's `tags:` block.
+**Override semantics:** mapping fields override `defaults.tags` field by field. Any field unset on a mapping falls through to the corresponding field on `defaults.tags` (if present). The two `exclude` lists are kept on separate tiers, not merged into one:
 
-### Default-exclude patterns
+- `defaults.tags.exclude:` is the **soft tier**. It applies to every mapping that inherits from defaults, and `include:` on any mapping can override it. Use this for project-wide opinions ("drop `*-dev` unless I say otherwise").
+- `mapping.tags.exclude:` is the **hard tier**. It applies only to that mapping and is NOT overridden by `include:` on the same mapping. Use this for absolute per-mapping denies.
 
-ocync drops common prerelease-marker tag patterns by default to keep mirrors focused on stable releases. The default-exclude list (case-insensitive) is:
+Both tiers apply (concat). To rescue a tag the soft tier would drop on a specific mapping, add the tag to that mapping's `include:`.
+
+> **Behavior change.** Earlier versions replaced the whole `tags:` block when a mapping defined its own, so `defaults.tags.exclude:` was silently dropped for mappings with any per-mapping tag config. It now always applies (as the soft tier). If you were relying on `defaults.tags.exclude:` blocking an `include:` somewhere, switch that pattern to `mapping.tags.exclude:` (the hard tier, which still blocks `include:` on the same mapping).
+
+### Built-in exclude patterns
+
+ocync ships with a baked-in glob list that drops common prerelease-marker tag patterns to keep mirrors focused on stable releases. These patterns are part of the soft tier alongside `defaults.tags.exclude:`, so `include:` bypasses them. The list (case-insensitive) is:
 
 - `*-rc*`
 - `*-alpha*`
@@ -305,14 +312,14 @@ ocync drops common prerelease-marker tag patterns by default to keep mirrors foc
 - `*-snapshot*`
 - `*-nightly*`
 
-Patterns deliberately NOT in the default list (still admitted unless you exclude them yourself):
+Patterns deliberately NOT in the built-in list (still admitted unless your `defaults.tags.exclude:` or `mapping.tags.exclude:` lists them):
 
 - `*-dev*` -- Chainguard publishes `latest-dev` and `1.25.5-dev` as stable variants
 - `*-edge*` -- Alpine rolling stable channel
 - `*-final*` -- Java stable marker
 - `-r<N>` -- Chainguard/Bitnami build counters
 
-To opt back into prereleases, add them to `include:` (which overrides the default-exclude). To pin a single prerelease tag for testing, add the exact tag string to `include:`. To add custom exclude patterns on top of the defaults, use `exclude:`.
+To opt back into prereleases, add them to `include:` (which overrides the built-in list and `defaults.tags.exclude:`). To pin a single prerelease tag for testing, add the exact tag string to `include:`. To add project-wide exclude patterns, use `defaults.tags.exclude:`. To deny a tag absolutely on one mapping, use `mapping.tags.exclude:`.
 
 ## Environment variables
 
@@ -410,15 +417,10 @@ mappings:
   - from: library/postgres
     to: postgres
     tags:
-      # Mapping tags: replaces defaults.tags entirely. Repeat the
-      # inherited fields explicitly when a mapping needs both.
+      # Mapping fields override defaults field by field. Unset fields
+      # (sort, min_tags, exclude soft tier) inherit from defaults.tags.
       semver: ">=15"
-      exclude:
-        - "*-debug"
-        - "*-rc*"
-      sort: semver
       latest: 3
-      min_tags: 1
 ```
 
 ### GHCR to ECR with glob filtering

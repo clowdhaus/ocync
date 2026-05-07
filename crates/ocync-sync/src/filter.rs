@@ -53,21 +53,39 @@ fn system_exclude_set() -> &'static GlobSet {
 ///
 /// All stages are AND (narrowing). Each stage reduces the set:
 /// `glob → semver → exclude → sort → latest → min_tags`.
-/// Tags matching `include:` bypass the glob/semver pipeline (but are still
-/// subject to user `exclude:`).
+/// Tags matching `include:` bypass the glob/semver pipeline AND the soft
+/// exclude tier (built-in + defaults). They are still subject to mapping
+/// `exclude:` (the hard tier).
+///
+/// # Exclude tiers
+///
+/// Exclusion has two tiers:
+///
+/// - **Soft tier** (built-in `SYSTEM_EXCLUDE` + caller-provided
+///   [`defaults_exclude`](Self::defaults_exclude)): bypassable by
+///   `include:`. Use for project-wide opinions like "drop `*-dev` unless
+///   I say otherwise on a specific mapping."
+/// - **Hard tier** ([`exclude`](Self::exclude)): blocks `include:` on the
+///   same config. Use for absolute per-mapping denies.
 #[derive(Debug, Default)]
 pub struct FilterConfig {
     /// Always-include glob patterns. Tags matching any pattern survive
-    /// `glob:`/`semver:` filters and the system-exclude defaults. Not
-    /// subject to `sort:` or `latest:` truncation (those only cap the
-    /// `glob:`/`semver:` pipeline side). Subject to user `exclude:`. Same
-    /// syntax as `exclude:`.
+    /// `glob:`/`semver:` filters and the soft exclude tier (system + defaults).
+    /// Not subject to `sort:` or `latest:` truncation (those only cap the
+    /// `glob:`/`semver:` pipeline side). Subject to mapping
+    /// [`exclude`](Self::exclude). Same glob syntax as `exclude:`.
     pub include: Vec<String>,
     /// Glob patterns (OR semantics). An empty list passes all tags through.
     pub glob: Vec<String>,
     /// Semver version range constraint (e.g. `>=1.18.0`).
     pub semver: Option<String>,
-    /// Exclude patterns (OR deny).
+    /// Soft-tier exclude patterns inherited from a `defaults:` block.
+    /// Bypassed by [`include`](Self::include), unlike
+    /// [`exclude`](Self::exclude). Behaves the same as the built-in
+    /// `SYSTEM_EXCLUDE` list.
+    pub defaults_exclude: Vec<String>,
+    /// Hard-tier exclude patterns (OR deny). Blocks
+    /// [`include`](Self::include) on the same config.
     pub exclude: Vec<String>,
     /// Sort order.
     pub sort: Option<SortOrder>,
@@ -125,8 +143,13 @@ impl FilterConfig {
         if let Some(ref s) = self.semver {
             parts.push(format!("semver {s}"));
         }
-        if !self.exclude.is_empty() {
-            parts.push(format!("exclude {}", self.exclude.join(",")));
+        if !self.exclude.is_empty() || !self.defaults_exclude.is_empty() {
+            // Defaults- and mapping-tier patterns share one summary clause.
+            // Dry-run carries the tier attribution; the INFO line stays tight.
+            let mut combined: Vec<&str> =
+                self.defaults_exclude.iter().map(String::as_str).collect();
+            combined.extend(self.exclude.iter().map(String::as_str));
+            parts.push(format!("exclude {}", combined.join(",")));
         }
         if !self.include.is_empty() {
             parts.push(format!("include {}", self.include.join(",")));
@@ -169,6 +192,11 @@ impl FilterConfig {
             None
         } else {
             Some(build_glob_set(&self.exclude)?)
+        };
+        let defaults_exclude_set = if self.defaults_exclude.is_empty() {
+            None
+        } else {
+            Some(build_glob_set(&self.defaults_exclude)?)
         };
         let sys_exclude = system_exclude_set();
 
@@ -243,46 +271,69 @@ impl FilterConfig {
             }
         }
 
+        // Exclude stage: three tiers, evaluated in order so the first match
+        // attributes the drop. Order doesn't change kept tags (they're all
+        // OR-deny); it only decides which DropKind a tag is reported under.
+        // Mapping (hard) is checked first because it represents the most
+        // specific user intent.
         let before_exclude = pipeline.len();
-        let mut user_dropped: Vec<String> = Vec::new();
-        let mut sys_dropped: Vec<String> = Vec::new();
+        let mut mapping_dropped: Vec<String> = Vec::new();
+        let mut defaults_dropped: Vec<String> = Vec::new();
+        let mut builtin_dropped: Vec<String> = Vec::new();
         pipeline.retain(|t| {
             if let Some(ref s) = user_exclude_set {
                 if s.is_match(t) {
                     if track {
-                        user_dropped.push((*t).to_owned());
+                        mapping_dropped.push((*t).to_owned());
+                    }
+                    return false;
+                }
+            }
+            if let Some(ref s) = defaults_exclude_set {
+                if s.is_match(t) {
+                    if track {
+                        defaults_dropped.push((*t).to_owned());
                     }
                     return false;
                 }
             }
             if sys_exclude.is_match(t) {
                 if track {
-                    sys_dropped.push((*t).to_owned());
+                    builtin_dropped.push((*t).to_owned());
                 }
                 return false;
             }
             true
         });
         if track {
-            if !user_dropped.is_empty() {
+            if !mapping_dropped.is_empty() {
                 drop_reasons.push(DropReason {
-                    kind: DropKind::UserExclude {
+                    kind: DropKind::MappingExclude {
                         patterns: self.exclude.clone(),
                     },
-                    count: user_dropped.len(),
-                    samples: user_dropped,
+                    count: mapping_dropped.len(),
+                    samples: mapping_dropped,
                 });
             }
-            if !sys_dropped.is_empty() {
+            if !defaults_dropped.is_empty() {
                 drop_reasons.push(DropReason {
-                    kind: DropKind::SystemExclude,
-                    count: sys_dropped.len(),
-                    samples: sys_dropped,
+                    kind: DropKind::DefaultsExclude {
+                        patterns: self.defaults_exclude.clone(),
+                    },
+                    count: defaults_dropped.len(),
+                    samples: defaults_dropped,
+                });
+            }
+            if !builtin_dropped.is_empty() {
+                drop_reasons.push(DropReason {
+                    kind: DropKind::BuiltinExclude,
+                    count: builtin_dropped.len(),
+                    samples: builtin_dropped,
                 });
             }
             if before_exclude != pipeline.len() {
                 pipeline_stages.push(StageDelta {
-                    label: "exclude (user + system)".to_string(),
+                    label: "exclude (mapping + defaults + built-in)".to_string(),
                     count_in: before_exclude,
                     count_out: pipeline.len(),
                 });
@@ -431,13 +482,21 @@ pub enum DropKind {
         /// The configured version range string, e.g. `">=1.18.0"`.
         range: String,
     },
-    /// Tag matched a user-configured `exclude:` pattern.
-    UserExclude {
-        /// User-configured exclude patterns (one or more).
+    /// Tag matched a per-mapping `exclude:` pattern (hard tier; blocks
+    /// `include:` on the same mapping).
+    MappingExclude {
+        /// Mapping-level exclude patterns (one or more).
         patterns: Vec<String>,
     },
-    /// Tag matched the built-in prerelease exclude list.
-    SystemExclude,
+    /// Tag matched a `defaults.tags.exclude:` pattern (soft tier; bypassable
+    /// by `include:`).
+    DefaultsExclude {
+        /// Defaults-level exclude patterns (one or more).
+        patterns: Vec<String>,
+    },
+    /// Tag matched the built-in prerelease exclude list (soft tier;
+    /// bypassable by `include:`).
+    BuiltinExclude,
     /// Tag fell off the end of the `latest: N` truncation.
     LatestCap {
         /// The configured `latest: N` value.
@@ -450,10 +509,13 @@ impl fmt::Display for DropKind {
         match self {
             Self::Glob { patterns } => write!(f, "glob {}", patterns_label(patterns)),
             Self::Semver { range } => write!(f, "semver \"{range}\""),
-            Self::UserExclude { patterns } => {
-                write!(f, "user-exclude {}", patterns_label(patterns))
+            Self::MappingExclude { patterns } => {
+                write!(f, "exclude (mapping) {}", patterns_label(patterns))
             }
-            Self::SystemExclude => f.write_str("system-exclude"),
+            Self::DefaultsExclude { patterns } => {
+                write!(f, "exclude (defaults) {}", patterns_label(patterns))
+            }
+            Self::BuiltinExclude => f.write_str("exclude (built-in)"),
             Self::LatestCap { limit } => write!(f, "over latest={limit} limit"),
         }
     }
@@ -1178,6 +1240,108 @@ mod tests {
         assert!(!result.contains(&"latest".to_string()));
     }
 
+    // - defaults_exclude tier --------------------------------------------
+
+    /// `defaults_exclude` drops tags from the pipeline just like the
+    /// built-in system exclude. The mapping has no `exclude:` of its own,
+    /// so this proves defaults flow through.
+    #[test]
+    fn defaults_exclude_drops_tags() {
+        let tags = vec!["1.0.0", "1.0.0-dev", "1.0.0-r0"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-dev".into(), "*-r[0-9]*".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["1.0.0".to_string()]);
+    }
+
+    /// `include:` rescues a tag that `defaults_exclude` would drop. This is
+    /// the user-facing escape hatch for the project-wide exclude floor.
+    #[test]
+    fn include_overrides_defaults_exclude() {
+        let tags = vec!["latest", "latest-dev", "1.0.0", "1.0.0-dev"];
+        let config = FilterConfig {
+            include: vec!["latest-dev".into()],
+            defaults_exclude: vec!["*-dev".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert!(result.contains(&"latest".to_string()));
+        assert!(
+            result.contains(&"latest-dev".to_string()),
+            "include should rescue latest-dev from defaults_exclude"
+        );
+        assert!(result.contains(&"1.0.0".to_string()));
+        // 1.0.0-dev does not match include and is dropped by defaults_exclude.
+        assert!(!result.contains(&"1.0.0-dev".to_string()));
+    }
+
+    /// Mapping-level `exclude:` is the hard tier: it blocks `include:` even
+    /// when a `defaults_exclude` is also configured. Negative assertion
+    /// preserving existing semantics.
+    #[test]
+    fn mapping_exclude_blocks_include_with_defaults_set() {
+        let tags = vec!["latest", "latest-dev"];
+        let config = FilterConfig {
+            include: vec!["latest".into(), "latest-dev".into()],
+            defaults_exclude: vec!["*-dev".into()],
+            exclude: vec!["latest".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        // mapping.exclude = ["latest"] blocks include of "latest"
+        assert!(!result.contains(&"latest".to_string()));
+        // include still rescues latest-dev (matches defaults_exclude soft tier only)
+        assert!(result.contains(&"latest-dev".to_string()));
+    }
+
+    /// `defaults_exclude` and `exclude` (mapping) both apply: their union
+    /// drops tags. Stacking, not replacement.
+    #[test]
+    fn defaults_and_mapping_exclude_stack() {
+        let tags = vec!["1.0.0", "1.0.0-dev", "1.0.0-slim"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-dev".into()],
+            exclude: vec!["*-slim".into()],
+            ..FilterConfig::default()
+        };
+        let result = config.apply(&tags).unwrap();
+        assert_eq!(result, vec!["1.0.0".to_string()]);
+    }
+
+    /// Dry-run attribution: defaults-tier drops surface as
+    /// `DropKind::DefaultsExclude`, distinct from `MappingExclude` and
+    /// `BuiltinExclude`. The formatter relies on the variant to render
+    /// `(defaults)` / `(mapping)` / `(built-in)`.
+    #[test]
+    fn report_attributes_defaults_exclude_separately() {
+        let tags = vec!["1.0.0", "1.0.0-dev", "1.0.0-rc1", "1.0.0-slim"];
+        let config = FilterConfig {
+            defaults_exclude: vec!["*-dev".into()],
+            exclude: vec!["*-slim".into()],
+            ..FilterConfig::default()
+        };
+        let filtered = config.apply_with_report(&tags).unwrap();
+        let kinds: Vec<&DropKind> = filtered.report.dropped.iter().map(|d| &d.kind).collect();
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, DropKind::DefaultsExclude { .. })),
+            "missing DefaultsExclude in {kinds:?}"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, DropKind::MappingExclude { .. })),
+            "missing MappingExclude in {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| matches!(k, DropKind::BuiltinExclude)),
+            "missing BuiltinExclude (1.0.0-rc1 should hit it) in {kinds:?}"
+        );
+    }
+
     #[test]
     fn latest_n_does_not_cap_include() {
         // Pipeline has 5 candidates; latest:2 should keep only the top 2 of
@@ -1398,12 +1562,12 @@ mod tests {
         assert!(
             kinds
                 .iter()
-                .any(|k| matches!(k, DropKind::UserExclude { .. })),
-            "missing UserExclude in {kinds:?}"
+                .any(|k| matches!(k, DropKind::MappingExclude { .. })),
+            "missing MappingExclude in {kinds:?}"
         );
         assert!(
-            kinds.iter().any(|k| matches!(k, DropKind::SystemExclude)),
-            "missing SystemExclude in {kinds:?}"
+            kinds.iter().any(|k| matches!(k, DropKind::BuiltinExclude)),
+            "missing BuiltinExclude in {kinds:?}"
         );
     }
 
@@ -1494,6 +1658,7 @@ mod tests {
             include: vec!["latest".into()],
             glob: vec!["v*".into()],
             semver: Some("^1".into()),
+            defaults_exclude: vec!["*-dev".into()],
             exclude: vec!["nightly".into()],
             sort: Some(SortOrder::Alpha),
             latest: Some(3),
@@ -1504,7 +1669,7 @@ mod tests {
             "include latest",
             "glob v*",
             "semver ^1",
-            "exclude nightly",
+            "exclude *-dev,nightly",
             "sort alpha",
             "latest=3",
             "min_tags=2",

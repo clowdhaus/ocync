@@ -713,16 +713,15 @@ pub(crate) async fn resolve_mapping(
     // --- Fetch and filter tags ---
     let source_repo_path = RepositoryName::new(&mapping.from)?;
 
-    let tags_config = mapping
-        .tags
-        .as_ref()
-        .or(config.defaults.as_ref().and_then(|d| d.tags.as_ref()));
+    let mapping_tags = mapping.tags.as_ref();
+    let defaults_tags = config.defaults.as_ref().and_then(|d| d.tags.as_ref());
 
     // Fast path: when the config specifies only exact tag names (no
     // wildcards, semver, latest, exclude), use them directly without
-    // enumerating all tags from the source registry. This avoids
-    // hundreds of paginated tags/list requests for repos with thousands
-    // of tags.
+    // enumerating all tags from the source registry. The fast path is
+    // gated on the mapping having no `defaults.tags` block in play --
+    // otherwise inherited filters (notably `defaults.exclude`) would be
+    // skipped silently.
     // The image/artifact partition + sample collection happen in the same
     // pass that prepares input for `select_filtered_tags`, so the filter and
     // the no-match WARN both see consistent counts. The pre-built `NoTagsInfo`
@@ -732,7 +731,10 @@ pub(crate) async fn resolve_mapping(
         Option<usize>,
         Option<ocync_sync::filter::FilterReport>,
         Option<NoTagsInfo>,
-    ) = if let Some(exact) = tags_config.and_then(|t| t.exact_tags()) {
+    ) = if let Some(exact) = mapping_tags
+        .filter(|_| defaults_tags.is_none())
+        .and_then(|t| t.exact_tags())
+    {
         (exact, None, None, None)
     } else {
         let all_tags = source_client.list_tags(&source_repo_path).await?;
@@ -750,10 +752,11 @@ pub(crate) async fn resolve_mapping(
             from: mapping.from.clone(),
             image_count,
             artifact_count: all_tags.len() - image_count,
-            filter_desc: describe_filter(tags_config),
+            filter_desc: describe_filter(mapping_tags, defaults_tags),
             samples,
         };
-        let (kept, count, report) = select_filtered_tags(tags_config, all_tags, with_report)?;
+        let (kept, count, report) =
+            select_filtered_tags(mapping_tags, defaults_tags, all_tags, with_report)?;
         (kept, count, report, Some(template))
     };
 
@@ -762,7 +765,7 @@ pub(crate) async fn resolve_mapping(
             from: mapping.from.clone(),
             image_count: 0,
             artifact_count: 0,
-            filter_desc: describe_filter(tags_config),
+            filter_desc: describe_filter(mapping_tags, defaults_tags),
             samples: Vec::new(),
         });
         return Ok(MappingResolution::NoMatchingTags(info));
@@ -795,7 +798,7 @@ pub(crate) async fn resolve_mapping(
         .unwrap_or(false);
 
     // --- Immutable tags optimization ---
-    let immutable_pattern = tags_config.and_then(|t| t.immutable_tags.as_deref());
+    let immutable_pattern = resolve_immutable_pattern(mapping_tags, defaults_tags);
     let immutable_glob = if let Some(pattern) = immutable_pattern {
         let glob_set = build_glob_set(&[pattern.to_owned()])?;
 
@@ -865,29 +868,65 @@ fn emit_no_tags_warn(info: &NoTagsInfo) {
     );
 }
 
-/// Build a `FilterConfig` from a `TagsConfig`, falling back to defaults.
-fn build_filter(tags: Option<&TagsConfig>) -> FilterConfig {
-    let Some(tags) = tags else {
-        return FilterConfig::default();
+/// Build a `FilterConfig` from a mapping `TagsConfig` plus an optional
+/// `defaults.tags` block. Field-level merge: any field set on the mapping
+/// wins; unset fields fall through to `defaults`. The exclude lists are
+/// kept separate by source -- mapping exclude is the hard tier (blocks
+/// `include:`), defaults exclude is the soft tier (bypassable by `include:`).
+fn build_filter(mapping: Option<&TagsConfig>, defaults: Option<&TagsConfig>) -> FilterConfig {
+    let pick_glob = |get: fn(&TagsConfig) -> Option<&GlobOrList>| -> Vec<String> {
+        mapping
+            .and_then(get)
+            .or_else(|| defaults.and_then(get))
+            .map(glob_or_list_to_vec_owned)
+            .unwrap_or_default()
     };
 
     FilterConfig {
-        include: glob_or_list_to_vec(tags.include.as_ref()),
-        glob: glob_or_list_to_vec(tags.glob.as_ref()),
-        semver: tags.semver.clone(),
-        exclude: glob_or_list_to_vec(tags.exclude.as_ref()),
-        sort: tags.sort,
-        latest: tags.latest,
-        min_tags: tags.min_tags,
+        include: pick_glob(|t| t.include.as_ref()),
+        glob: pick_glob(|t| t.glob.as_ref()),
+        semver: mapping
+            .and_then(|t| t.semver.clone())
+            .or_else(|| defaults.and_then(|t| t.semver.clone())),
+        defaults_exclude: defaults
+            .and_then(|t| t.exclude.as_ref())
+            .map(glob_or_list_to_vec_owned)
+            .unwrap_or_default(),
+        exclude: mapping
+            .and_then(|t| t.exclude.as_ref())
+            .map(glob_or_list_to_vec_owned)
+            .unwrap_or_default(),
+        sort: mapping
+            .and_then(|t| t.sort)
+            .or_else(|| defaults.and_then(|t| t.sort)),
+        latest: mapping
+            .and_then(|t| t.latest)
+            .or_else(|| defaults.and_then(|t| t.latest)),
+        min_tags: mapping
+            .and_then(|t| t.min_tags)
+            .or_else(|| defaults.and_then(|t| t.min_tags)),
     }
 }
 
-/// Flatten a `GlobOrList` into a `Vec<String>`.
-fn glob_or_list_to_vec(g: Option<&GlobOrList>) -> Vec<String> {
+/// Resolve `immutable_tags` from a mapping + defaults pair: mapping wins,
+/// then falls through to defaults. Lives outside [`build_filter`] because
+/// `immutable_tags` is consumed by the skip-optimization path, not the
+/// filter pipeline.
+fn resolve_immutable_pattern<'a>(
+    mapping: Option<&'a TagsConfig>,
+    defaults: Option<&'a TagsConfig>,
+) -> Option<&'a str> {
+    mapping
+        .and_then(|t| t.immutable_tags.as_deref())
+        .or_else(|| defaults.and_then(|t| t.immutable_tags.as_deref()))
+}
+
+/// Flatten a [`GlobOrList`] into an owned `Vec<String>`. Used by the
+/// merge path which already holds a borrow.
+fn glob_or_list_to_vec_owned(g: &GlobOrList) -> Vec<String> {
     match g {
-        Some(GlobOrList::Single(s)) => vec![s.clone()],
-        Some(GlobOrList::List(v)) => v.clone(),
-        None => Vec::new(),
+        GlobOrList::Single(s) => vec![s.clone()],
+        GlobOrList::List(v) => v.clone(),
     }
 }
 
@@ -912,12 +951,13 @@ type SelectionResult = (
 /// Extracted from [`resolve_mapping`] so the report wire-up is testable
 /// without spinning up a registry mock.
 fn select_filtered_tags(
-    tags_config: Option<&TagsConfig>,
+    mapping_tags: Option<&TagsConfig>,
+    defaults_tags: Option<&TagsConfig>,
     all_tags: Vec<String>,
     with_report: bool,
 ) -> Result<SelectionResult, CliError> {
     let n_candidates = all_tags.len();
-    let filter = build_filter(tags_config);
+    let filter = build_filter(mapping_tags, defaults_tags);
     let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
     if with_report {
         let result = filter.apply_with_report(&tag_refs)?;
@@ -927,14 +967,17 @@ fn select_filtered_tags(
     }
 }
 
-/// One-line summary of a [`TagsConfig`] suitable for log emission, e.g.
-/// `semver >=1.0.0, latest=5`. Returns `None` when no filter applies.
+/// One-line summary of mapping + defaults tags suitable for log emission,
+/// e.g. `semver >=1.0.0, latest=5`. Returns `None` when no filter applies.
 ///
 /// Single source of truth: delegates to [`FilterConfig::describe`] after
-/// the same conversion the engine uses, so dry-run stage labels and the
+/// the same merge the engine uses, so dry-run stage labels and the
 /// no-tags-matched WARN rationale cannot drift.
-fn describe_filter(tags: Option<&TagsConfig>) -> Option<String> {
-    build_filter(tags).describe()
+fn describe_filter(
+    mapping_tags: Option<&TagsConfig>,
+    defaults_tags: Option<&TagsConfig>,
+) -> Option<String> {
+    build_filter(mapping_tags, defaults_tags).describe()
 }
 
 /// Write sync output as JSON when `--json` is passed.
@@ -1034,13 +1077,66 @@ mod tests {
 
     #[test]
     fn build_filter_none_returns_default() {
-        let filter = build_filter(None);
+        let filter = build_filter(None, None);
         assert!(filter.glob.is_empty());
         assert!(filter.semver.is_none());
         assert!(filter.exclude.is_empty());
+        assert!(filter.defaults_exclude.is_empty());
         assert!(filter.sort.is_none());
         assert!(filter.latest.is_none());
         assert!(filter.min_tags.is_none());
+    }
+
+    /// `defaults.tags.exclude:` reaches a mapping that has its own `tags:`
+    /// block. Today's `or` resolution would drop it. After the merge, the
+    /// patterns land in `FilterConfig.defaults_exclude` (the soft tier).
+    #[test]
+    fn build_filter_defaults_exclude_reaches_mapping_with_own_tags() {
+        let mapping = TagsConfig {
+            semver: Some(">=1.0".into()),
+            ..Default::default()
+        };
+        let defaults = TagsConfig {
+            exclude: Some(GlobOrList::List(vec!["*-dev".into(), "*-r[0-9]*".into()])),
+            ..Default::default()
+        };
+        let filter = build_filter(Some(&mapping), Some(&defaults));
+        assert_eq!(filter.semver.as_deref(), Some(">=1.0"));
+        assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
+        assert!(filter.exclude.is_empty(), "mapping had no exclude");
+    }
+
+    /// `mapping.tags.exclude:` lands in the hard tier; `defaults.exclude`
+    /// lands in the soft tier. Both apply (concat semantics).
+    #[test]
+    fn build_filter_mapping_exclude_is_hard_tier() {
+        let mapping = TagsConfig {
+            exclude: Some(GlobOrList::Single("*-slim".into())),
+            ..Default::default()
+        };
+        let defaults = TagsConfig {
+            exclude: Some(GlobOrList::Single("*-dev".into())),
+            ..Default::default()
+        };
+        let filter = build_filter(Some(&mapping), Some(&defaults));
+        assert_eq!(filter.exclude, vec!["*-slim"]);
+        assert_eq!(filter.defaults_exclude, vec!["*-dev"]);
+    }
+
+    /// When mapping has no `tags:` block at all, defaults' filter fields
+    /// flow through. `defaults.exclude` still goes to the soft tier --
+    /// the source decides the tier, not whether the mapping was set.
+    #[test]
+    fn build_filter_inherits_defaults_when_mapping_unset() {
+        let defaults = TagsConfig {
+            semver: Some(">=2.0".into()),
+            exclude: Some(GlobOrList::Single("*-dev".into())),
+            ..Default::default()
+        };
+        let filter = build_filter(None, Some(&defaults));
+        assert_eq!(filter.semver.as_deref(), Some(">=2.0"));
+        assert_eq!(filter.defaults_exclude, vec!["*-dev"]);
+        assert!(filter.exclude.is_empty());
     }
 
     #[test]
@@ -1049,7 +1145,7 @@ mod tests {
             glob: Some(GlobOrList::Single("v1.*".into())),
             ..Default::default()
         };
-        let filter = build_filter(Some(&tags));
+        let filter = build_filter(Some(&tags), None);
         assert_eq!(filter.glob, vec!["v1.*"]);
     }
 
@@ -1059,7 +1155,7 @@ mod tests {
             glob: Some(GlobOrList::List(vec!["v1.*".into(), "v2.*".into()])),
             ..Default::default()
         };
-        let filter = build_filter(Some(&tags));
+        let filter = build_filter(Some(&tags), None);
         assert_eq!(filter.glob, vec!["v1.*", "v2.*"]);
     }
 
@@ -1069,7 +1165,7 @@ mod tests {
             exclude: Some(GlobOrList::List(vec!["*-rc*".into(), "*-beta*".into()])),
             ..Default::default()
         };
-        let filter = build_filter(Some(&tags));
+        let filter = build_filter(Some(&tags), None);
         assert_eq!(filter.exclude, vec!["*-rc*", "*-beta*"]);
     }
 
@@ -1088,7 +1184,7 @@ mod tests {
             immutable_tags: None,
             ..Default::default()
         };
-        let filter = build_filter(Some(&tags));
+        let filter = build_filter(Some(&tags), None);
         assert_eq!(filter.include, vec!["latest"]);
         assert_eq!(filter.glob, vec!["*"]);
         assert_eq!(filter.semver.as_deref(), Some(">=1.0.0"));
@@ -1110,7 +1206,7 @@ sort: semver
 latest: 5
 "#;
         let tags: TagsConfig = serde_yaml::from_str(tags_yaml).expect("yaml parses");
-        let filter = build_filter(Some(&tags));
+        let filter = build_filter(Some(&tags), None);
 
         // Confirm the FilterConfig was built with the right include patterns.
         assert_eq!(
@@ -1147,21 +1243,267 @@ latest: 5
         assert_eq!(result.len(), 7);
     }
 
+    /// Every fall-through field on the merge model: `sort`, `latest`,
+    /// `min_tags`, `include`, `glob`, `semver`. When the mapping leaves
+    /// each unset, the value comes from `defaults.tags`; when set, the
+    /// mapping wins. One test, six pairs of assertions, no scaffolding.
     #[test]
-    fn glob_or_list_to_vec_none() {
-        assert!(glob_or_list_to_vec(None).is_empty());
+    fn merge_inherits_all_fall_through_fields() {
+        use ocync_sync::filter::SortOrder;
+
+        let defaults = TagsConfig {
+            include: Some(GlobOrList::Single("latest".into())),
+            glob: Some(GlobOrList::Single("v*".into())),
+            semver: Some(">=1.0".into()),
+            sort: Some(SortOrder::Semver),
+            latest: Some(10),
+            min_tags: Some(2),
+            immutable_tags: Some("v?[0-9]*.[0-9]*.[0-9]*".into()),
+            ..Default::default()
+        };
+
+        // 1. Mapping unset on everything: defaults flow through.
+        let empty_mapping = TagsConfig::default();
+        let inherited = build_filter(Some(&empty_mapping), Some(&defaults));
+        assert_eq!(inherited.include, vec!["latest"]);
+        assert_eq!(inherited.glob, vec!["v*"]);
+        assert_eq!(inherited.semver.as_deref(), Some(">=1.0"));
+        assert_eq!(inherited.sort, Some(SortOrder::Semver));
+        assert_eq!(inherited.latest, Some(10));
+        assert_eq!(inherited.min_tags, Some(2));
+        assert_eq!(
+            resolve_immutable_pattern(Some(&empty_mapping), Some(&defaults)),
+            Some("v?[0-9]*.[0-9]*.[0-9]*"),
+        );
+
+        // 2. Mapping sets every field: mapping wins on every field.
+        let override_mapping = TagsConfig {
+            include: Some(GlobOrList::Single("override".into())),
+            glob: Some(GlobOrList::Single("override*".into())),
+            semver: Some(">=2.0".into()),
+            sort: Some(SortOrder::Alpha),
+            latest: Some(3),
+            min_tags: Some(1),
+            immutable_tags: Some("override-pattern".into()),
+            ..Default::default()
+        };
+        let overridden = build_filter(Some(&override_mapping), Some(&defaults));
+        assert_eq!(overridden.include, vec!["override"]);
+        assert_eq!(overridden.glob, vec!["override*"]);
+        assert_eq!(overridden.semver.as_deref(), Some(">=2.0"));
+        assert_eq!(overridden.sort, Some(SortOrder::Alpha));
+        assert_eq!(overridden.latest, Some(3));
+        assert_eq!(overridden.min_tags, Some(1));
+        assert_eq!(
+            resolve_immutable_pattern(Some(&override_mapping), Some(&defaults)),
+            Some("override-pattern"),
+        );
+    }
+
+    /// `resolve_immutable_pattern` falls back when only one side carries
+    /// a pattern, and returns `None` when neither does.
+    #[test]
+    fn resolve_immutable_pattern_handles_partial_set() {
+        let with_immutable = TagsConfig {
+            immutable_tags: Some("v?[0-9]*".into()),
+            ..Default::default()
+        };
+        let empty = TagsConfig::default();
+
+        assert_eq!(
+            resolve_immutable_pattern(Some(&with_immutable), None),
+            Some("v?[0-9]*")
+        );
+        assert_eq!(
+            resolve_immutable_pattern(None, Some(&with_immutable)),
+            Some("v?[0-9]*")
+        );
+        assert_eq!(
+            resolve_immutable_pattern(Some(&empty), Some(&with_immutable)),
+            Some("v?[0-9]*")
+        );
+        assert_eq!(resolve_immutable_pattern(Some(&empty), Some(&empty)), None);
+        assert_eq!(resolve_immutable_pattern(None, None), None);
+    }
+
+    /// Realistic Chainguard scenario: `defaults.exclude` filters dev and
+    /// `-rN` revisions across the project, one mapping uses `include:` to
+    /// rescue `latest-dev`, another adds a hard-tier mapping `exclude:`
+    /// for `-slim` variants. Asserts the final keep set + dry-run drop
+    /// attribution by tier.
+    #[test]
+    fn merge_chainguard_scenario_end_to_end() {
+        let defaults_yaml = r#"
+exclude: ["*-dev", "*-r[0-9]*"]
+"#;
+        let defaults: TagsConfig =
+            serde_yaml::from_str(defaults_yaml).expect("defaults yaml parses");
+
+        // Realistic cgr.dev tag list for a single repo: stable releases,
+        // dev variants, package revisions, slim variants, an RC.
+        let tags = vec![
+            "1.27",
+            "1.27-r0",
+            "1.27-r1",
+            "1.27-dev",
+            "1.27-slim",
+            "1.27-rc1",
+            "latest",
+            "latest-dev",
+        ];
+
+        // --- Mapping A: pure inheritance (no `tags:` block) ---
+        // Today's bug: this mapping silently lost `defaults.exclude`. After
+        // the fix, all dev/-rN variants drop, RC drops via built-in.
+        let no_mapping_filter = build_filter(None, Some(&defaults));
+        let kept_a = no_mapping_filter
+            .apply(&tags)
+            .expect("filter applies (mapping A)");
+        assert_eq!(
+            kept_a,
+            vec![
+                "1.27".to_string(),
+                "1.27-slim".to_string(),
+                "latest".to_string()
+            ],
+            "mapping A should keep stable + slim + latest only",
+        );
+
+        // --- Mapping B: `include: ["latest-dev"]` rescues from soft tier ---
+        let mapping_b: TagsConfig = serde_yaml::from_str(
+            r#"
+include: ["latest-dev"]
+"#,
+        )
+        .expect("mapping B yaml parses");
+        let filter_b = build_filter(Some(&mapping_b), Some(&defaults));
+        let kept_b = filter_b.apply(&tags).expect("filter applies (mapping B)");
+        assert!(
+            kept_b.contains(&"latest-dev".to_string()),
+            "include: should rescue latest-dev from defaults.exclude"
+        );
+        assert!(
+            !kept_b.contains(&"1.27-dev".to_string()),
+            "non-included dev variants still drop"
+        );
+        assert!(
+            !kept_b.contains(&"1.27-r0".to_string()),
+            "include: doesn't rescue what it doesn't list"
+        );
+
+        // --- Mapping C: hard-tier `exclude: ["*-slim"]` stacks on defaults ---
+        let mapping_c: TagsConfig = serde_yaml::from_str(
+            r#"
+exclude: ["*-slim"]
+"#,
+        )
+        .expect("mapping C yaml parses");
+        let filter_c = build_filter(Some(&mapping_c), Some(&defaults));
+        let kept_c = filter_c.apply(&tags).expect("filter applies (mapping C)");
+        assert_eq!(
+            kept_c,
+            vec!["1.27".to_string(), "latest".to_string()],
+            "mapping C drops slim (hard tier) + dev/-rN (soft tier) + rc (built-in)",
+        );
+
+        // --- Mapping D: dry-run attribution proves the tier breakdown ---
+        // Use mapping C's filter and verify each drop carries the right
+        // DropKind. This is the operator-facing observability check.
+        let report = filter_c
+            .apply_with_report(&tags)
+            .expect("apply_with_report succeeds");
+
+        let mapping_drops: Vec<&String> = report
+            .report
+            .dropped
+            .iter()
+            .filter(|d| matches!(d.kind, ocync_sync::filter::DropKind::MappingExclude { .. }))
+            .flat_map(|d| d.samples.iter())
+            .collect();
+        assert_eq!(
+            mapping_drops,
+            vec![&"1.27-slim".to_string()],
+            "MappingExclude bucket carries only the slim variant",
+        );
+
+        let defaults_drops: HashSet<String> = report
+            .report
+            .dropped
+            .iter()
+            .filter(|d| matches!(d.kind, ocync_sync::filter::DropKind::DefaultsExclude { .. }))
+            .flat_map(|d| d.samples.iter().cloned())
+            .collect();
+        let expected_defaults: HashSet<String> = ["1.27-r0", "1.27-r1", "1.27-dev", "latest-dev"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            defaults_drops, expected_defaults,
+            "DefaultsExclude bucket carries dev + -rN variants"
+        );
+
+        let builtin_drops: Vec<&String> = report
+            .report
+            .dropped
+            .iter()
+            .filter(|d| matches!(d.kind, ocync_sync::filter::DropKind::BuiltinExclude))
+            .flat_map(|d| d.samples.iter())
+            .collect();
+        assert_eq!(
+            builtin_drops,
+            vec![&"1.27-rc1".to_string()],
+            "BuiltinExclude bucket carries the RC tag"
+        );
+    }
+
+    /// YAML round-trip: parse a `defaults.tags` block + a per-mapping
+    /// `tags:` block via the production deserializer and confirm the merge
+    /// puts `defaults.exclude` patterns into the soft tier and mapping
+    /// patterns into the hard tier. Catches future serde-aliasing or
+    /// field-renaming regressions that bypass `build_filter`'s logic.
+    #[test]
+    fn merge_yaml_round_trip_separates_exclude_tiers() {
+        let defaults_yaml = r#"
+exclude: ["*-dev", "*-r[0-9]*"]
+sort: semver
+latest: 5
+"#;
+        let mapping_yaml = r#"
+semver: ">=1.0"
+exclude: ["*-slim"]
+"#;
+        let defaults: TagsConfig =
+            serde_yaml::from_str(defaults_yaml).expect("defaults yaml parses");
+        let mapping: TagsConfig = serde_yaml::from_str(mapping_yaml).expect("mapping yaml parses");
+
+        let filter = build_filter(Some(&mapping), Some(&defaults));
+
+        // defaults.exclude reaches the soft tier verbatim.
+        assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
+        // mapping.exclude is the hard tier, separate from defaults.
+        assert_eq!(filter.exclude, vec!["*-slim"]);
+        // mapping fields override; unset fields inherit from defaults.
+        assert_eq!(filter.semver.as_deref(), Some(">=1.0"));
+        assert_eq!(filter.sort, Some(ocync_sync::filter::SortOrder::Semver));
+        assert_eq!(filter.latest, Some(5));
+
+        // End-to-end behavior: 1.27-r0 dropped by defaults soft tier,
+        // 1.27-slim dropped by mapping hard tier, 1.27 survives.
+        let tags = vec!["1.27", "1.27-r0", "1.27-dev", "1.27-slim"];
+        let kept = filter.apply(&tags).expect("filter applies");
+        assert_eq!(kept, vec!["1.27".to_string()]);
     }
 
     #[test]
-    fn glob_or_list_to_vec_single() {
+    fn glob_or_list_to_vec_owned_single() {
         let g = GlobOrList::Single("pattern".into());
-        assert_eq!(glob_or_list_to_vec(Some(&g)), vec!["pattern"]);
+        assert_eq!(glob_or_list_to_vec_owned(&g), vec!["pattern"]);
     }
 
     #[test]
-    fn glob_or_list_to_vec_list() {
+    fn glob_or_list_to_vec_owned_list() {
         let g = GlobOrList::List(vec!["a".into(), "b".into()]);
-        assert_eq!(glob_or_list_to_vec(Some(&g)), vec!["a", "b"]);
+        assert_eq!(glob_or_list_to_vec_owned(&g), vec!["a", "b"]);
     }
 
     // - parse_size -----------------------------------------------------------
@@ -1217,7 +1559,7 @@ latest: 5
             ..TagsConfig::default()
         };
         assert_eq!(
-            describe_filter(Some(&tags)).as_deref(),
+            describe_filter(Some(&tags), None).as_deref(),
             Some("semver >=1.0.0, latest=5")
         );
     }
@@ -1225,8 +1567,8 @@ latest: 5
     #[test]
     fn describe_filter_returns_none_when_empty() {
         let tags = TagsConfig::default();
-        assert!(describe_filter(Some(&tags)).is_none());
-        assert!(describe_filter(None).is_none());
+        assert!(describe_filter(Some(&tags), None).is_none());
+        assert!(describe_filter(None, None).is_none());
     }
 
     // -- NoTagsInfo Display ---------------------------------------------
@@ -1587,7 +1929,7 @@ latest: 5
             "0.9.0-rc1".into(),
         ];
         let (kept, candidate_count, report) =
-            select_filtered_tags(Some(&tags_config), all_tags, true).unwrap();
+            select_filtered_tags(Some(&tags_config), None, all_tags, true).unwrap();
 
         // Wire-up: candidate count flows through.
         assert_eq!(candidate_count, Some(5));
@@ -1614,7 +1956,7 @@ latest: 5
         };
         let all_tags = vec!["1.0".into(), "2.0".into()];
         let (kept, candidate_count, report) =
-            select_filtered_tags(Some(&tags_config), all_tags, false).unwrap();
+            select_filtered_tags(Some(&tags_config), None, all_tags, false).unwrap();
         assert_eq!(candidate_count, Some(2));
         assert_eq!(kept.len(), 2);
         assert!(report.is_none());
@@ -1630,7 +1972,7 @@ latest: 5
             ..Default::default()
         };
         let all_tags = vec!["1.0".into(), "2.0".into()];
-        let result = select_filtered_tags(Some(&tags_config), all_tags, false);
+        let result = select_filtered_tags(Some(&tags_config), None, all_tags, false);
         assert!(
             result.is_err(),
             "expected BelowMinTags error from real-sync path"
@@ -1647,7 +1989,7 @@ latest: 5
         };
         let all_tags = vec!["1.0".into(), "2.0".into()];
         let (kept, candidate_count, report) =
-            select_filtered_tags(Some(&tags_config), all_tags, true).unwrap();
+            select_filtered_tags(Some(&tags_config), None, all_tags, true).unwrap();
         assert_eq!(kept.len(), 2);
         assert_eq!(candidate_count, Some(2));
         let report = report.expect("dry-run path returns report even when min_tags would error");
@@ -1671,7 +2013,7 @@ latest: 5
         };
         let all_tags: Vec<String> = (0..10).map(|i| format!("1.{i}.0")).collect();
         let (kept, candidate_count, filter_report) =
-            select_filtered_tags(Some(&tags_config), all_tags, true).unwrap();
+            select_filtered_tags(Some(&tags_config), None, all_tags, true).unwrap();
         assert_eq!(kept.len(), 0); // all dropped by semver >=2.0
         assert!(filter_report.is_some());
 

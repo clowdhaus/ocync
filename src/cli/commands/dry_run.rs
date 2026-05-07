@@ -164,10 +164,13 @@ fn write_dropped<W: Write>(w: &mut W, report: &FilterReport, verbose: bool) -> i
             "    {:>4}  {:<28}{}",
             reason.count, display_label, samples_display
         )?;
-        if matches!(reason.kind, DropKind::SystemExclude) {
+        if matches!(
+            reason.kind,
+            DropKind::BuiltinExclude | DropKind::DefaultsExclude { .. }
+        ) {
             writeln!(
                 w,
-                "          hint: to keep prereleases, list patterns under include: (globs supported)"
+                "          hint: to keep these tags, list them under include: (globs supported)"
             )?;
         }
     }
@@ -247,7 +250,7 @@ mod tests {
                     ],
                 },
                 DropReason {
-                    kind: DropKind::SystemExclude,
+                    kind: DropKind::BuiltinExclude,
                     count: 2,
                     samples: vec!["3.18.0-rc.1".into(), "3.19.0-beta.1".into()],
                 },
@@ -301,7 +304,7 @@ mod tests {
             Ok(())
         });
         assert!(
-            out.contains("to keep prereleases, list patterns under include:"),
+            out.contains("hint: to keep these tags, list them under include:"),
             "{out}"
         );
     }
