@@ -12,22 +12,20 @@
 //! Sovereign clouds (China `.azurecr.cn`, US Gov `.azurecr.us`) are
 //! supported via AAD authority and resource endpoint mapping.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::Deserialize;
-use tokio::sync::Mutex;
-
 use super::ecr::SdkCredentialCache;
+use super::token_cache::TokenCache;
 use super::token_exchange::no_redirect_http_client;
 use super::{AuthProvider, Scope, Token, scopes_cache_key};
 use crate::error::Error;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::Deserialize;
 
 /// Decode the payload segment of a JWT token as JSON.
 fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, Error> {
@@ -554,14 +552,16 @@ const ACR_ACCESS_TOKEN_DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
 ///
 /// Acquires an Azure AD token via [`AzureTokenSource`], exchanges it for an
 /// ACR refresh token (~3h TTL), then exchanges the refresh token for a
-/// scoped ACR access token per registry scope.
+/// scoped ACR access token per registry scope. Access tokens are coalesced
+/// per scope via [`TokenCache`]: concurrent fetches for the same scope
+/// produce one exchange while distinct scopes run in parallel.
 pub struct AcrAuth {
     base_url: String,
     service: String,
     exchange_http: reqwest::Client,
     api: Box<dyn AzureTokenSource>,
     refresh_cache: SdkCredentialCache<String>,
-    token_cache: Mutex<HashMap<String, Token>>,
+    tokens: TokenCache,
 }
 
 impl fmt::Debug for AcrAuth {
@@ -583,7 +583,7 @@ impl AcrAuth {
             exchange_http: no_redirect_http_client(),
             api,
             refresh_cache: SdkCredentialCache::new(),
-            token_cache: Mutex::new(HashMap::new()),
+            tokens: TokenCache::new(),
         })
     }
 
@@ -596,7 +596,7 @@ impl AcrAuth {
             exchange_http: no_redirect_http_client(),
             api: Box::new(api),
             refresh_cache: SdkCredentialCache::new(),
-            token_cache: Mutex::new(HashMap::new()),
+            tokens: TokenCache::new(),
         }
     }
 
@@ -635,42 +635,38 @@ impl AuthProvider for AcrAuth {
         let scopes = scopes.to_vec();
         Box::pin(async move {
             let key = scopes_cache_key(&scopes);
-            let mut cache = self.token_cache.lock().await;
-            if let Some(token) = cache.get(&key).filter(|t| t.is_valid()) {
-                tracing::debug!(service = %self.service, scope = %key, "ACR token cache hit");
-                return Ok(token.clone());
-            }
-            let refresh_token = self.ensure_refresh_token().await?;
-            let scope_str = scopes
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-            tracing::debug!(service = %self.service, scope = %key, "ACR token cache miss, exchanging");
-            let access_token = exchange_access_token(
-                &self.exchange_http,
-                &self.base_url,
-                &self.service,
-                &refresh_token,
-                &scope_str,
-            )
-            .await?;
-            let ttl = extract_jwt_exp(&access_token)
-                .ok()
-                .map(ttl_from_unix_exp)
-                .unwrap_or(ACR_ACCESS_TOKEN_DEFAULT_TTL);
-            let token = Token::with_ttl(access_token, ttl);
-            cache.insert(key, token.clone());
-            Ok(token)
+            self.tokens
+                .get_or_fetch(key.clone(), || async {
+                    let refresh_token = self.ensure_refresh_token().await?;
+                    let scope_str = scopes
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tracing::debug!(service = %self.service, scope = %key, "ACR token cache miss, exchanging");
+                    let access_token = exchange_access_token(
+                        &self.exchange_http,
+                        &self.base_url,
+                        &self.service,
+                        &refresh_token,
+                        &scope_str,
+                    )
+                    .await?;
+                    let ttl = extract_jwt_exp(&access_token)
+                        .ok()
+                        .map(ttl_from_unix_exp)
+                        .unwrap_or(ACR_ACCESS_TOKEN_DEFAULT_TTL);
+                    Ok(Token::with_ttl(access_token, ttl))
+                })
+                .await
         })
     }
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let mut cache = self.token_cache.lock().await;
-            tracing::debug!(service = %self.service, entries = cache.len(), "invalidating ACR token cache");
-            cache.clear();
-            drop(cache);
+            let entries = self.tokens.len().await;
+            tracing::debug!(service = %self.service, entries, "invalidating ACR token cache");
+            self.tokens.clear().await;
             self.refresh_cache.clear().await;
             self.api.reset();
         })
@@ -682,6 +678,8 @@ mod tests {
     use super::*;
 
     use std::collections::VecDeque;
+
+    use tokio::sync::Mutex;
 
     /// Build a fake JWT with a given JSON payload (no signature verification).
     fn fake_jwt(payload_json: &str) -> String {

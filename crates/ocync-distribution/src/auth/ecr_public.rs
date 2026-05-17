@@ -16,7 +16,6 @@
 //! when they approach expiry, matching [`super::ecr::EcrAuth`]'s
 //! behavior for long-running processes (watch mode).
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -24,11 +23,11 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use tokio::sync::Mutex;
 
 use super::ecr::{
     EcrApi, EcrTokenResponse, SdkCredentialCache, ttl_from_expiry, validate_ecr_token,
 };
+use super::token_cache::TokenCache;
 use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::error::Error;
@@ -138,8 +137,9 @@ fn decode_ecr_credentials(
 /// read-lock fast path / write-lock refresh pattern as
 /// [`super::ecr::EcrAuth`], supporting long-running processes (watch mode).
 ///
-/// Bearer tokens are cached per-scope with the same challenge-cache
-/// optimization as [`super::basic::BasicAuth`].
+/// Bearer tokens are coalesced per scope via [`TokenCache`]: concurrent
+/// fetches for the same scope produce one token exchange while distinct
+/// scopes run in parallel.
 pub struct EcrPublicAuth {
     /// The registry base URL.
     base_url: String,
@@ -149,8 +149,8 @@ pub struct EcrPublicAuth {
     api: Box<dyn EcrApi>,
     /// Cached SDK credentials (username/password) with TTL-based refresh.
     sdk_credential_cache: SdkCredentialCache<Credentials>,
-    /// Cached Bearer tokens keyed by sorted scope strings.
-    cache: Mutex<HashMap<String, Token>>,
+    /// Per-scope coalescing Bearer token cache.
+    tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
     challenge_cache: token_exchange::ChallengeCache,
 }
@@ -182,7 +182,7 @@ impl EcrPublicAuth {
                 client: aws_sdk_ecrpublic::Client::new(&config),
             }),
             sdk_credential_cache: SdkCredentialCache::new(),
-            cache: Mutex::new(HashMap::new()),
+            tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         })
     }
@@ -199,7 +199,7 @@ impl EcrPublicAuth {
             http,
             api: Box::new(api),
             sdk_credential_cache: SdkCredentialCache::new(),
-            cache: Mutex::new(HashMap::new()),
+            tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
@@ -237,49 +237,37 @@ impl AuthProvider for EcrPublicAuth {
         let scopes = scopes.to_vec();
         Box::pin(async move {
             let key = scopes_cache_key(&scopes);
-
-            let mut cache = self.cache.lock().await;
-
-            if let Some(token) = cache.get(&key).filter(|t| t.is_valid()) {
-                tracing::debug!(base_url = %self.base_url, scope = %key, "token cache hit");
-                return Ok(token.clone());
-            }
-
-            // Ensure SDK credentials are fresh before token exchange.
-            let credentials = self.ensure_credentials().await?;
-
-            tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-            let cached_challenge = self.challenge_cache.get().await;
-            let (token, challenge) = token_exchange::exchange(
-                &self.http,
-                &self.base_url,
-                &scopes,
-                Some(&credentials),
-                cached_challenge.as_ref(),
-            )
-            .await
-            .map_err(|e| {
-                tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                e
-            })?;
-
-            self.challenge_cache.set(challenge).await;
-
-            cache.insert(key, token.clone());
-
-            Ok(token)
+            self.tokens
+                .get_or_fetch(key.clone(), || async {
+                    // Ensure SDK credentials are fresh before token exchange.
+                    let credentials = self.ensure_credentials().await?;
+                    tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
+                    let cached_challenge = self.challenge_cache.get().await;
+                    let (token, challenge) = token_exchange::exchange(
+                        &self.http,
+                        &self.base_url,
+                        &scopes,
+                        Some(&credentials),
+                        cached_challenge.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                        e
+                    })?;
+                    self.challenge_cache.set(challenge).await;
+                    Ok(token)
+                })
+                .await
         })
     }
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let mut cache = self.cache.lock().await;
-            tracing::debug!(base_url = %self.base_url, entries = cache.len(), "invalidating ECR Public token cache");
-            cache.clear();
-            drop(cache);
-
+            let entries = self.tokens.len().await;
+            tracing::debug!(base_url = %self.base_url, entries, "invalidating ECR Public token cache");
+            self.tokens.clear().await;
             self.challenge_cache.clear().await;
-
             // Also clear SDK credentials so they are re-fetched on next use.
             self.sdk_credential_cache.clear().await;
         })
@@ -292,6 +280,7 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use tokio::sync::Mutex;
     use wiremock::MockServer;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};

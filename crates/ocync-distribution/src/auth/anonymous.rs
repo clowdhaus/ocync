@@ -1,12 +1,10 @@
 //! Anonymous auth provider using the Docker token-exchange flow.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use tokio::sync::Mutex;
-
+use super::token_cache::TokenCache;
 use super::token_exchange;
 use super::{AuthProvider, Scope, Token, scopes_cache_key};
 use crate::error::Error;
@@ -15,15 +13,15 @@ use crate::error::Error;
 ///
 /// When a registry responds with `401 Unauthorized` and a `WWW-Authenticate: Bearer ...`
 /// header, this provider extracts the realm/service and exchanges them for an anonymous
-/// token. Tokens are cached per-scope and coalesced under a mutex to prevent thundering
-/// herd.
+/// token. Tokens are coalesced per scope: concurrent fetches for the same scope produce
+/// one token exchange while distinct scopes run in parallel.
 pub struct AnonymousAuth {
     /// The registry base URL (e.g. `https://registry-1.docker.io`).
     base_url: String,
     /// HTTP client for token requests.
     http: reqwest::Client,
-    /// Cached tokens keyed by sorted scope strings.
-    cache: Mutex<HashMap<String, Token>>,
+    /// Per-scope coalescing token cache.
+    tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
     challenge_cache: token_exchange::ChallengeCache,
 }
@@ -46,7 +44,7 @@ impl AnonymousAuth {
         Self {
             base_url: format!("https://{registry}"),
             http,
-            cache: Mutex::new(HashMap::new()),
+            tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
@@ -58,7 +56,7 @@ impl AnonymousAuth {
         Self {
             base_url: base_url.into(),
             http,
-            cache: Mutex::new(HashMap::new()),
+            tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
@@ -76,45 +74,34 @@ impl AuthProvider for AnonymousAuth {
         let scopes = scopes.to_vec();
         Box::pin(async move {
             let key = scopes_cache_key(&scopes);
-
-            // Hold the mutex for the entire check-then-fetch to prevent thundering herd.
-            let mut cache = self.cache.lock().await;
-
-            if let Some(token) = cache.get(&key).filter(|t| t.is_valid()) {
-                tracing::debug!(base_url = %self.base_url, scope = %key, "token cache hit");
-                return Ok(token.clone());
-            }
-
-            tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-            let cached_challenge = self.challenge_cache.get().await;
-            let (token, challenge) = token_exchange::exchange(
-                &self.http,
-                &self.base_url,
-                &scopes,
-                None,
-                cached_challenge.as_ref(),
-            )
-            .await
-            .map_err(|e| {
-                tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                e
-            })?;
-
-            self.challenge_cache.set(challenge).await;
-
-            cache.insert(key, token.clone());
-
-            Ok(token)
+            self.tokens
+                .get_or_fetch(key.clone(), || async {
+                    tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
+                    let cached_challenge = self.challenge_cache.get().await;
+                    let (token, challenge) = token_exchange::exchange(
+                        &self.http,
+                        &self.base_url,
+                        &scopes,
+                        None,
+                        cached_challenge.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                        e
+                    })?;
+                    self.challenge_cache.set(challenge).await;
+                    Ok(token)
+                })
+                .await
         })
     }
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let mut cache = self.cache.lock().await;
-            tracing::debug!(base_url = %self.base_url, entries = cache.len(), "invalidating token cache");
-            cache.clear();
-            drop(cache);
-
+            let entries = self.tokens.len().await;
+            tracing::debug!(base_url = %self.base_url, entries, "invalidating token cache");
+            self.tokens.clear().await;
             self.challenge_cache.clear().await;
         })
     }
@@ -122,7 +109,9 @@ impl AuthProvider for AnonymousAuth {
 
 #[cfg(test)]
 mod tests {
-    use wiremock::matchers::{method, path};
+    use std::sync::Arc;
+
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -252,6 +241,64 @@ mod tests {
         assert_eq!(t1.value(), "reused");
         assert_eq!(t2.value(), "reused");
         // expect(1) on /v2/ proves the challenge was cached and reused.
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn anonymous_auth_distinct_scopes_fetch_concurrently() {
+        // Two distinct scopes must be able to fetch tokens concurrently.
+        // Each token endpoint mock sleeps 300ms; serialized fetches take
+        // ~600ms while per-scope coalescing parallelizes them at ~300ms.
+        // The 500ms threshold leaves ~200ms margin on both sides.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token",service="test""#, server.uri()),
+            ))
+            .mount(&server)
+            .await;
+        let slow_for = |scope: &str, token_value: &str| {
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .and(query_param("scope", scope))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_millis(300))
+                        .set_body_json(serde_json::json!({
+                            "token": token_value,
+                            "expires_in": 3600,
+                        })),
+                )
+                .expect(1)
+        };
+        slow_for("repository:repo-a:pull", "tok-a")
+            .mount(&server)
+            .await;
+        slow_for("repository:repo-b:pull", "tok-b")
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(AnonymousAuth::with_base_url(
+            server.uri(),
+            crate::test_http_client(),
+        ));
+        let auth_a = Arc::clone(&auth);
+        let auth_b = Arc::clone(&auth);
+
+        let start = std::time::Instant::now();
+        let (t_a, t_b) = tokio::join!(
+            async move { auth_a.get_token(&[Scope::pull("repo-a")]).await.unwrap() },
+            async move { auth_b.get_token(&[Scope::pull("repo-b")]).await.unwrap() },
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(t_a.value(), "tok-a");
+        assert_eq!(t_b.value(), "tok-b");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "expected concurrent fetch (~300ms), got {elapsed:?}; distinct scopes must not serialize on a shared provider mutex",
+        );
     }
 
     #[test]
