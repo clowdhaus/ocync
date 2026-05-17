@@ -519,9 +519,23 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
     // maximizes marginal shared-blob coverage: for each remaining
     // (non-leader) image, count blobs shared with the candidate that are
     // not already in a previous leader's blob set.
+    //
+    // Implementation uses an inverted index `blob_remaining_count` that
+    // maps each blob to the number of remaining groups containing it.
+    // A candidate i's marginal contribution from a blob d (where d is
+    // not in `leader_blob_union`) is `count[d] - 1` -- the count of
+    // other remaining groups that share d with i. Total cost per round
+    // is O(n * b_avg) instead of the O(n^2 * b) of a pairwise scan.
     let mut leader_set: Vec<usize> = Vec::new();
     let mut leader_blob_union: HashSet<Digest> = HashSet::new();
     let mut remaining: Vec<usize> = (0..num_groups).collect();
+
+    let mut blob_remaining_count: HashMap<Digest, usize> = HashMap::new();
+    for &i in &remaining {
+        for d in &group_blobs[i] {
+            *blob_remaining_count.entry(d.clone()).or_insert(0) += 1;
+        }
+    }
 
     loop {
         if remaining.len() <= 1 {
@@ -531,15 +545,10 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
         let best = remaining
             .iter()
             .map(|&i| {
-                let marginal: usize = remaining
+                let marginal: usize = group_blobs[i]
                     .iter()
-                    .filter(|&&j| j != i)
-                    .map(|&j| {
-                        group_blobs[i]
-                            .intersection(&group_blobs[j])
-                            .filter(|b| !leader_blob_union.contains(*b))
-                            .count()
-                    })
+                    .filter(|d| !leader_blob_union.contains(*d))
+                    .map(|d| blob_remaining_count.get(d).copied().unwrap_or(0) - 1)
                     .sum();
                 (i, marginal)
             })
@@ -547,6 +556,11 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
 
         match best {
             Some((idx, marginal)) if marginal > 0 => {
+                for d in &group_blobs[idx] {
+                    if let Some(c) = blob_remaining_count.get_mut(d) {
+                        *c -= 1;
+                    }
+                }
                 leader_blob_union.extend(group_blobs[idx].iter().cloned());
                 leader_set.push(idx);
                 remaining.retain(|&i| i != idx);
@@ -3651,6 +3665,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn elect_leaders_scales_subcubically() {
+        // Regression test for the cubic blow-up that caused production
+        // sync runs to hang silently at 100% CPU after the discovery
+        // phase. With 75 disjoint pairs (n=150 distinct source manifests)
+        // the greedy loop runs one round per pair; an O(n^3) version
+        // takes hundreds of milliseconds, while a sub-cubic version
+        // finishes in under 50ms.
+        let n_pairs: usize = 75;
+        let mut counter: usize = 0;
+        let mut next = || {
+            let s = format!("{counter:x}");
+            counter += 1;
+            s
+        };
+
+        let mut pending = VecDeque::new();
+        for pair_idx in 0..n_pairs {
+            let shared = next();
+            let cfg_a = next();
+            let lay_a1 = next();
+            let lay_a2 = next();
+            let data_a = Rc::new(test_pulled_manifest(&[&cfg_a, &shared, &lay_a1, &lay_a2]));
+            pending.push_back(test_task(data_a, &format!("a{pair_idx}")));
+
+            let cfg_b = next();
+            let lay_b1 = next();
+            let lay_b2 = next();
+            let data_b = Rc::new(test_pulled_manifest(&[&cfg_b, &shared, &lay_b1, &lay_b2]));
+            pending.push_back(test_task(data_b, &format!("b{pair_idx}")));
+        }
+
+        let start = Instant::now();
+        let leader_count = elect_leaders(&mut pending);
+        let elapsed = start.elapsed();
+
+        // One leader per pair: after the first member of a pair is
+        // elected, the other member's marginal coverage drops to 0.
+        assert_eq!(leader_count, n_pairs, "expected one leader per pair");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "elect_leaders took {elapsed:?} for n=150 (75 pairs); expected sub-500ms on a non-cubic implementation",
+        );
     }
 
     // --- ResolvedArtifacts::type_matches tests ---
