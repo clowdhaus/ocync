@@ -3,13 +3,11 @@
 //! Performs the same challenge-response token exchange as [`super::anonymous::AnonymousAuth`],
 //! but includes an `Authorization: Basic base64(user:pass)` header on the token request.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use tokio::sync::Mutex;
-
+use super::token_cache::TokenCache;
 use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::error::Error;
@@ -18,8 +16,8 @@ use crate::error::Error;
 ///
 /// When a registry responds with `401 Unauthorized` and a `WWW-Authenticate: Bearer ...`
 /// header, this provider extracts the realm/service and exchanges them for a token using
-/// HTTP Basic authentication. Tokens are cached per-scope and coalesced under a mutex to
-/// prevent thundering herd.
+/// HTTP Basic authentication. Tokens are coalesced per scope: concurrent fetches for the
+/// same scope produce one token exchange while distinct scopes run in parallel.
 pub struct BasicAuth {
     /// The registry base URL (e.g. `https://registry-1.docker.io`).
     base_url: String,
@@ -27,8 +25,8 @@ pub struct BasicAuth {
     http: reqwest::Client,
     /// Credentials for the Basic auth header.
     credentials: Credentials,
-    /// Cached tokens keyed by sorted scope strings.
-    cache: Mutex<HashMap<String, Token>>,
+    /// Per-scope coalescing token cache.
+    tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
     challenge_cache: token_exchange::ChallengeCache,
 }
@@ -57,7 +55,7 @@ impl BasicAuth {
             base_url: format!("https://{registry}"),
             http,
             credentials,
-            cache: Mutex::new(HashMap::new()),
+            tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
@@ -74,7 +72,7 @@ impl BasicAuth {
             base_url: base_url.into(),
             http,
             credentials,
-            cache: Mutex::new(HashMap::new()),
+            tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
@@ -92,45 +90,34 @@ impl AuthProvider for BasicAuth {
         let scopes = scopes.to_vec();
         Box::pin(async move {
             let key = scopes_cache_key(&scopes);
-
-            // Hold the mutex for the entire check-then-fetch to prevent thundering herd.
-            let mut cache = self.cache.lock().await;
-
-            if let Some(token) = cache.get(&key).filter(|t| t.is_valid()) {
-                tracing::debug!(base_url = %self.base_url, scope = %key, "token cache hit");
-                return Ok(token.clone());
-            }
-
-            tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-            let cached_challenge = self.challenge_cache.get().await;
-            let (token, challenge) = token_exchange::exchange(
-                &self.http,
-                &self.base_url,
-                &scopes,
-                Some(&self.credentials),
-                cached_challenge.as_ref(),
-            )
-            .await
-            .map_err(|e| {
-                tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                e
-            })?;
-
-            self.challenge_cache.set(challenge).await;
-
-            cache.insert(key, token.clone());
-
-            Ok(token)
+            self.tokens
+                .get_or_fetch(key.clone(), || async {
+                    tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
+                    let cached_challenge = self.challenge_cache.get().await;
+                    let (token, challenge) = token_exchange::exchange(
+                        &self.http,
+                        &self.base_url,
+                        &scopes,
+                        Some(&self.credentials),
+                        cached_challenge.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                        e
+                    })?;
+                    self.challenge_cache.set(challenge).await;
+                    Ok(token)
+                })
+                .await
         })
     }
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let mut cache = self.cache.lock().await;
-            tracing::debug!(base_url = %self.base_url, entries = cache.len(), "invalidating token cache");
-            cache.clear();
-            drop(cache);
-
+            let entries = self.tokens.len().await;
+            tracing::debug!(base_url = %self.base_url, entries, "invalidating token cache");
+            self.tokens.clear().await;
             self.challenge_cache.clear().await;
         })
     }
@@ -138,6 +125,9 @@ impl AuthProvider for BasicAuth {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use wiremock::matchers::{header, method, path, query_param};
@@ -395,7 +385,7 @@ mod tests {
         mount_v2_challenge(&server, 1).await;
         mount_token_endpoint(&server, "single-tok", 1).await;
 
-        let auth = std::sync::Arc::new(BasicAuth::with_base_url(
+        let auth = Arc::new(BasicAuth::with_base_url(
             server.uri(),
             crate::test_http_client(),
             test_credentials(),
@@ -414,6 +404,125 @@ mod tests {
         }
         // expect(1) on /token (in mount_token_endpoint) is verified on
         // MockServer drop; fan-out without coalescing would trip it.
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn basic_auth_distinct_scopes_fetch_concurrently() {
+        // Two distinct scopes must be able to fetch tokens concurrently.
+        // The original implementation held the per-provider cache mutex
+        // for the entire check-then-fetch path, so two distinct scopes
+        // serialized through the registry even when their cache entries
+        // were independent. With per-scope coalescing they parallelize:
+        // each token endpoint mock sleeps 300ms, so sequential fetches
+        // take ~600ms and concurrent fetches take ~300ms. The 500ms
+        // threshold leaves ~200ms margin on both sides for slow CI.
+        let server = MockServer::start().await;
+        // The challenge response is not bounded by `expect` because the
+        // number of hits depends on which task wins the parallel race.
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="test-registry""#,
+                    server.uri()
+                ),
+            ))
+            .mount(&server)
+            .await;
+        let slow_for = |scope: &str, token_value: &str| {
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .and(query_param("scope", scope))
+                .and(header("Authorization", expected_basic_header().as_str()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_millis(300))
+                        .set_body_json(serde_json::json!({
+                            "token": token_value,
+                            "expires_in": 3600,
+                        })),
+                )
+                .expect(1)
+        };
+        slow_for("repository:repo-a:pull", "tok-a")
+            .mount(&server)
+            .await;
+        slow_for("repository:repo-b:pull", "tok-b")
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(BasicAuth::with_base_url(
+            server.uri(),
+            crate::test_http_client(),
+            test_credentials(),
+        ));
+        let auth_a = Arc::clone(&auth);
+        let auth_b = Arc::clone(&auth);
+
+        let start = std::time::Instant::now();
+        let (t_a, t_b) = tokio::join!(
+            async move { auth_a.get_token(&[Scope::pull("repo-a")]).await.unwrap() },
+            async move { auth_b.get_token(&[Scope::pull("repo-b")]).await.unwrap() },
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(t_a.value(), "tok-a");
+        assert_eq!(t_b.value(), "tok-b");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "expected concurrent fetch (~300ms), got {elapsed:?}; distinct scopes must not serialize on a shared provider mutex",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn basic_auth_concurrent_same_scope_share_one_error_then_retry() {
+        // Five concurrent callers for the same scope race a failing
+        // token endpoint. The first to acquire the per-scope coalescing
+        // slot fails, drops the slot, and the next caller retries; no
+        // caller is left dangling waiting on a stale slot. The
+        // challenge cache is not populated on error, so every retry
+        // re-runs the `/v2/` ping -- documenting current behavior, not
+        // asserting on the exact count.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="test-registry""#,
+                    server.uri()
+                ),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(header("Authorization", expected_basic_header().as_str()))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let auth = Arc::new(BasicAuth::with_base_url(
+            server.uri(),
+            crate::test_http_client(),
+            test_credentials(),
+        ));
+
+        let mut tasks = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let auth = Arc::clone(&auth);
+            tasks.push(tokio::spawn(async move {
+                auth.get_token(&[Scope::pull("repo")]).await
+            }));
+        }
+        for task in tasks {
+            let err = task
+                .await
+                .expect("task did not panic")
+                .expect_err("concurrent waiters must each surface the auth error");
+            assert!(matches!(err, Error::AuthFailed { .. }));
+        }
     }
 
     #[test]

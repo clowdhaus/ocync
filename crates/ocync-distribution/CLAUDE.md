@@ -15,8 +15,9 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 - Realm URL validation: `validate_realm_url()` in `token_exchange.rs` validates realm URLs before sending credentials. Four layers: structural (scheme, userinfo, host), IP denylist (link-local, cloud metadata, unspecified, localhost, conditional loopback, IPv4-translated/NAT64), no-redirect client, domain binding (realm host must match or share parent domain with registry). Runs on both fresh and cached challenges.
 - Parse `WWW-Authenticate` header dynamically; never hardcode token exchange endpoints.
 - Token caching: `EARLY_REFRESH_WINDOW` = 30s. Docker Hub issues 300s tokens; a 15m window was a bug that bypassed the cache entirely.
-- Per-scope tokens: format `repository:<name>:<actions>` where actions = `pull`, `push`, or `pull,push`. Per-scope caching (`scopes_cache_key` in `auth/mod.rs`) is universal across every Bearer-issuing provider (anonymous, basic, docker-config, ecr-public, gcp). It is NOT a Chainguard-specific feature.
+- Per-scope tokens: format `repository:<name>:<actions>` where actions = `pull`, `push`, or `pull,push`. Per-scope caching (`scopes_cache_key` in `auth/mod.rs`) is universal across every Bearer-issuing provider (anonymous, basic, docker-config, ecr-public, gcp, acr). It is NOT a Chainguard-specific feature.
 - cgr.dev's specific quirk is *enforcement*: it returns 403 on cross-scope token reuse where some registries silently accept it. The scope-keyed cache is what makes ocync correct against this enforcement -- but the cache itself exists for every Bearer flow.
+- Per-scope coalescing: every Bearer provider routes its cache through `TokenCache` in `auth/token_cache.rs`. The helper holds the cache mutex only for brief reads and writes; the actual token exchange runs under an `Arc<Mutex<()>>` keyed by scope, so concurrent fetches for the same scope coalesce to one exchange while distinct scopes proceed in parallel. The helper owns the contract; per-provider tests verify wiring, not the contract.
 
 ## Provider dispatch (auto-detection)
 

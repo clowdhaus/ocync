@@ -18,6 +18,8 @@ pub mod ecr_public;
 pub mod gcp;
 /// Static bearer token authentication provider.
 pub mod static_token;
+/// Coalescing token cache used by every Bearer-token auth provider.
+mod token_cache;
 /// Shared Docker v2 token-exchange protocol.
 pub(crate) mod token_exchange;
 
