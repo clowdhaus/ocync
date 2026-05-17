@@ -2,10 +2,10 @@
 
 OCI container image sync tool
 
-![Version: 0.5.2](https://img.shields.io/badge/Version-0.5.2-informational?style=flat-square)  ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)  ![AppVersion: 0.5.2](https://img.shields.io/badge/AppVersion-0.5.2-informational?style=flat-square)
+![Version: 0.5.3](https://img.shields.io/badge/Version-0.5.3-informational?style=flat-square)  ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)  ![AppVersion: 0.5.3](https://img.shields.io/badge/AppVersion-0.5.3-informational?style=flat-square)
 
 ```bash
-helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.5.2
+helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.5.3
 ```
 
 See the [Helm chart documentation](https://clowdhaus.github.io/ocync/helm) and [`docs/src/content/registries/secrets.md`](../../docs/src/content/registries/secrets.md) for configuration, deployment modes, and the four supported secret-injection patterns.
