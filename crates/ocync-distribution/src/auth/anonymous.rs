@@ -109,10 +109,10 @@ impl AuthProvider for AnonymousAuth {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use wiremock::matchers::{method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::*;
 
@@ -245,10 +245,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn anonymous_auth_distinct_scopes_fetch_concurrently() {
-        // Two distinct scopes must be able to fetch tokens concurrently.
-        // Each token endpoint mock sleeps 300ms; serialized fetches take
-        // ~600ms while per-scope coalescing parallelizes them at ~300ms.
-        // The 500ms threshold leaves ~200ms margin on both sides.
+        // Two distinct scopes must reach the token endpoint concurrently --
+        // a shared provider mutex would serialize the second request behind
+        // the first's 300ms response delay. We assert on the arrival-diff at
+        // the mock (parallel: ~ms, serialized: >= 300ms) rather than total
+        // wall-clock so CI runner jitter cannot flake the test.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v2/"))
@@ -258,10 +259,16 @@ mod tests {
             ))
             .mount(&server)
             .await;
+        let arrivals: Arc<Mutex<Vec<std::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
         let slow_for = |scope: &str, token_value: &str| {
+            let arrivals = Arc::clone(&arrivals);
             Mock::given(method("GET"))
                 .and(path("/token"))
                 .and(query_param("scope", scope))
+                .and(move |_req: &Request| {
+                    arrivals.lock().unwrap().push(std::time::Instant::now());
+                    true
+                })
                 .respond_with(
                     ResponseTemplate::new(200)
                         .set_delay(std::time::Duration::from_millis(300))
@@ -286,18 +293,30 @@ mod tests {
         let auth_a = Arc::clone(&auth);
         let auth_b = Arc::clone(&auth);
 
-        let start = std::time::Instant::now();
         let (t_a, t_b) = tokio::join!(
             async move { auth_a.get_token(&[Scope::pull("repo-a")]).await.unwrap() },
             async move { auth_b.get_token(&[Scope::pull("repo-b")]).await.unwrap() },
         );
-        let elapsed = start.elapsed();
 
         assert_eq!(t_a.value(), "tok-a");
         assert_eq!(t_b.value(), "tok-b");
+
+        let times = arrivals.lock().unwrap();
+        assert_eq!(
+            times.len(),
+            2,
+            "expected 2 token requests, got {}",
+            times.len()
+        );
+        let (first, second) = if times[0] <= times[1] {
+            (times[0], times[1])
+        } else {
+            (times[1], times[0])
+        };
+        let diff = second.duration_since(first);
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "expected concurrent fetch (~300ms), got {elapsed:?}; distinct scopes must not serialize on a shared provider mutex",
+            diff < std::time::Duration::from_millis(250),
+            "expected near-simultaneous arrival, got {diff:?}; distinct scopes must not serialize on a shared provider mutex",
         );
     }
 
