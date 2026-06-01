@@ -39,6 +39,10 @@ pub struct RegistryClientBuilder {
     /// HTTP/2 via ALPN. Test-only -- see
     /// [`RegistryClientBuilder::force_http1`].
     force_http1: bool,
+    /// When `true`, the internal reqwest client enables HTTP/2
+    /// adaptive-window sizing. Defaults to `true` -- see the comment in
+    /// [`RegistryClientBuilder::build`] for the motivation.
+    h2_adaptive_window: bool,
 }
 
 impl std::fmt::Debug for RegistryClientBuilder {
@@ -63,6 +67,9 @@ impl RegistryClientBuilder {
             dns_overrides: Vec::new(),
             accept_invalid_certs: false,
             force_http1: false,
+            // Default-on: see note in `build`. The builder method below
+            // can be used to disable for A/B testing.
+            h2_adaptive_window: true,
         }
     }
 
@@ -100,6 +107,16 @@ impl RegistryClientBuilder {
         self
     }
 
+    /// Configure HTTP/2 adaptive-window sizing via reqwest's
+    /// `http2_adaptive_window`. Defaults to enabled -- see the note in
+    /// `build` for motivation. This setter is for A/B testing the
+    /// disabled path; production callers should not need to touch it.
+    #[doc(hidden)]
+    pub fn http2_adaptive_window(mut self, enable: bool) -> Self {
+        self.h2_adaptive_window = enable;
+        self
+    }
+
     /// Pin DNS resolution for `host` to `addr`, bypassing the system
     /// resolver for that hostname only.
     ///
@@ -124,6 +141,20 @@ impl RegistryClientBuilder {
         }
         if self.force_http1 {
             http_builder = http_builder.http1_only();
+        }
+        // Enable HTTP/2 adaptive flow-control window sizing. Hyper's
+        // default starts each stream at a 64KB receive window and grows
+        // it only after `WINDOW_UPDATE` frames; at high stream
+        // concurrency (e.g. `max_concurrent_transfers` of 50 streaming
+        // large blobs) this starves throughput and against some
+        // registries surfaces as a stall. Adaptive window sizes the
+        // window dynamically based on observed throughput. Off by
+        // default in reqwest; we want it on by default for the registry
+        // client.
+        //
+        // Test hook: `http2_adaptive_window(false)` disables for A/B.
+        if self.h2_adaptive_window {
+            http_builder = http_builder.http2_adaptive_window(true);
         }
         let http = http_builder.build()?;
 

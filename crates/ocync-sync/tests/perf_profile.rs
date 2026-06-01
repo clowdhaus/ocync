@@ -114,13 +114,16 @@ async fn start_registry_tls() -> (ContainerAsync<GenericImage>, Url) {
 
 fn make_client(url: Url, accept_invalid_certs: bool) -> Arc<RegistryClient> {
     let force_http1 = std::env::var("OCYNC_PROFILE_HTTP1").ok().as_deref() == Some("1");
-    Arc::new(
-        RegistryClientBuilder::new(url)
-            .allow_invalid_certs(accept_invalid_certs)
-            .force_http1(force_http1)
-            .build()
-            .expect("RegistryClient"),
-    )
+    // Adaptive window is on by default in the builder. Set
+    // OCYNC_PROFILE_H2_ADAPTIVE=0 to disable for A/B testing the
+    // pre-fix behavior.
+    let mut builder = RegistryClientBuilder::new(url)
+        .allow_invalid_certs(accept_invalid_certs)
+        .force_http1(force_http1);
+    if std::env::var("OCYNC_PROFILE_H2_ADAPTIVE").ok().as_deref() == Some("0") {
+        builder = builder.http2_adaptive_window(false);
+    }
+    Arc::new(builder.build().expect("RegistryClient"))
 }
 
 async fn run_profile(src: Arc<RegistryClient>, dst: Arc<RegistryClient>, label: &str) {
