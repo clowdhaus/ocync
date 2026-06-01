@@ -3,7 +3,7 @@
 
 mod helpers;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
 use ocync_sync::ImageStatus;
@@ -12,7 +12,7 @@ use ocync_sync::progress::NullProgress;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
 use wiremock::matchers::{method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use helpers::*;
 
@@ -506,7 +506,10 @@ async fn sync_wave_promotion_three_images_shared_layer() {
 
 /// Verify that `transfer_image_blobs` processes blobs concurrently, not
 /// sequentially. An image with 8 blobs, each delayed 100ms on source pull,
-/// should complete well under 8 * 100ms = 800ms given `BLOB_CONCURRENCY=6`.
+/// runs under `BLOB_CONCURRENCY=6`. We assert on the arrival span of the 8
+/// blob GETs at the source mock (parallel: first 6 cluster at ~0, last 2 at
+/// ~100ms; serialized: 8 spread across ~700ms) rather than total wall-clock,
+/// so CI runner jitter cannot flake the test.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_blob_concurrency_processes_multiple_blobs() {
     let source_server = MockServer::start().await;
@@ -534,10 +537,19 @@ async fn sync_blob_concurrency_processes_multiple_blobs() {
     };
     let (manifest_bytes, _) = serialize_manifest(&manifest);
 
-    // Source: serve manifest immediately; each blob with a 100ms delay.
+    // Source: serve manifest immediately; each blob GET is recorded on
+    // arrival, then delayed 100ms.
     mount_source_manifest(&source_server, "repo", "v1", &manifest_bytes).await;
+    let arrivals: Arc<Mutex<Vec<std::time::Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    let record_arrival = |arrivals: Arc<Mutex<Vec<std::time::Instant>>>| {
+        move |_req: &Request| {
+            arrivals.lock().unwrap().push(std::time::Instant::now());
+            true
+        }
+    };
     Mock::given(method("GET"))
         .and(path(format!("/v2/repo/blobs/{}", config_desc.digest)))
+        .and(record_arrival(Arc::clone(&arrivals)))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(config_data.to_vec())
@@ -549,6 +561,7 @@ async fn sync_blob_concurrency_processes_multiple_blobs() {
     for (i, desc) in layer_descs.iter().enumerate() {
         Mock::given(method("GET"))
             .and(path(format!("/v2/repo/blobs/{}", desc.digest)))
+            .and(record_arrival(Arc::clone(&arrivals)))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(layer_data[i].clone())
@@ -576,7 +589,6 @@ async fn sync_blob_concurrency_processes_multiple_blobs() {
     );
 
     let engine = SyncEngine::new(fast_retry(), 1);
-    let start = std::time::Instant::now();
     let report = engine
         .run(
             vec![mapping],
@@ -586,7 +598,6 @@ async fn sync_blob_concurrency_processes_multiple_blobs() {
             Some(&ShutdownSignal::new()),
         )
         .await;
-    let elapsed = start.elapsed();
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
@@ -594,11 +605,24 @@ async fn sync_blob_concurrency_processes_multiple_blobs() {
         report.stats.blobs_transferred, 8,
         "all 8 blobs should be transferred"
     );
-    // With BLOB_CONCURRENCY=6, 8 blobs at 100ms each need ~2 batches (~200ms).
-    // 1200ms is generous for CI runners; still proves concurrency (sequential >= 800ms).
+
+    let times = arrivals.lock().unwrap();
+    assert_eq!(
+        times.len(),
+        8,
+        "expected 8 blob GETs at source, got {}",
+        times.len()
+    );
+    let min = times.iter().min().unwrap();
+    let max = times.iter().max().unwrap();
+    let span = max.duration_since(*min);
+    // With BLOB_CONCURRENCY=6 and 100ms per-blob delay, arrivals cluster
+    // into ~2 batches (first 6 at ~0, last 2 at ~100ms) for a ~100ms span.
+    // Serialized would span ~700ms. 400ms threshold leaves ~300ms margin
+    // on both sides.
     assert!(
-        elapsed < std::time::Duration::from_millis(1200),
-        "elapsed {elapsed:?} should be < 1200ms (sequential would be >= 800ms)"
+        span < std::time::Duration::from_millis(400),
+        "expected blob GETs to cluster (parallel: ~100ms span), got {span:?}; sequential would span ~700ms",
     );
 }
 

@@ -1,4 +1,5 @@
 import { defineConfig } from "astro/config";
+import { unified } from "@astrojs/markdown-remark";
 import sitemap from "@astrojs/sitemap";
 import rehypeSlug from "rehype-slug";
 import rehypeAutolinkHeadings from "rehype-autolink-headings";
@@ -16,23 +17,25 @@ export default defineConfig({
   trailingSlash: "never",
   integrations: [sitemap()],
   markdown: {
-    remarkPlugins: [
-      [rewriteInternalLinks, { base }],
-    ],
-    rehypePlugins: [
-      rehypeSlug,
-      [rehypeAutolinkHeadings, {
-        behavior: "append",
-        properties: { class: "heading-anchor" },
-        content: {
-          type: "element",
-          tagName: "span",
-          properties: { class: "icon icon-link" },
-          children: [],
-        },
-      }],
-      [rehypeExternalLinks, { rel: ["noopener"], target: false }],
-    ],
+    processor: unified({
+      remarkPlugins: [
+        [rewriteInternalLinks, { base }],
+      ],
+      rehypePlugins: [
+        rehypeSlug,
+        [rehypeAutolinkHeadings, {
+          behavior: "append",
+          properties: { class: "heading-anchor" },
+          content: {
+            type: "element",
+            tagName: "span",
+            properties: { class: "icon icon-link" },
+            children: [],
+          },
+        }],
+        [rehypeExternalLinks, { rel: ["noopener"], target: false }],
+      ],
+    }),
     shikiConfig: {
       themes: {
         light: ocyncLight,
