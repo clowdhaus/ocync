@@ -2397,6 +2397,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "testcontainers",
  "thiserror",
  "tokio",
  "tracing",
