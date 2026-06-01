@@ -57,6 +57,30 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
         || status.is_server_error()
 }
 
+/// ECR (and possibly other registries) can return 404 with the OCI error
+/// code `BLOB_UPLOAD_UNKNOWN` when a manifest push references blobs
+/// whose PUT-201 came back but haven't been promoted to the
+/// manifest-validation index yet. The OCI distribution spec describes
+/// `BLOB_UPLOAD_UNKNOWN` as a state that "may be returned" for upload
+/// sessions in flux, leaving room for transient interpretation.
+///
+/// Returns `true` only when the error is a `RegistryError` with status
+/// 404 whose body contains the `BLOB_UPLOAD_UNKNOWN` error code.
+///
+/// Known limitation: retrying alone is not always sufficient. Against
+/// ECR at high `max_concurrent_transfers` (~20+), the consistency
+/// window can extend beyond practical backoff budgets and HEAD against
+/// the blob digest will report "exists" while manifest validation
+/// still rejects. A real fix likely needs to either bound blob-level
+/// concurrency separately from image-level concurrency or wait on
+/// ECR's `BatchCheckLayerAvailability` before manifest commit.
+pub fn is_blob_upload_unknown(error: &ocync_distribution::Error) -> bool {
+    let ocync_distribution::Error::RegistryError { status, message } = error else {
+        return false;
+    };
+    *status == StatusCode::NOT_FOUND && message.contains("BLOB_UPLOAD_UNKNOWN")
+}
+
 /// Determine whether a transport-level (non-HTTP) error should be retried.
 ///
 /// Returns `true` for connection failures, request timeouts, mid-stream
@@ -236,6 +260,46 @@ mod tests {
         assert!(!should_retry(StatusCode::UNAUTHORIZED, 0, 3));
         assert!(!should_retry(StatusCode::FORBIDDEN, 0, 3));
         assert!(!should_retry(StatusCode::NOT_FOUND, 0, 3));
+    }
+
+    #[test]
+    fn is_blob_upload_unknown_matches_404_with_marker() {
+        let err = ocync_distribution::Error::RegistryError {
+            status: StatusCode::NOT_FOUND,
+            message: r#"{"errors":[{"code":"BLOB_UPLOAD_UNKNOWN","message":"Layers with digests do not exist"}]}"#.into(),
+        };
+        assert!(is_blob_upload_unknown(&err));
+    }
+
+    #[test]
+    fn is_blob_upload_unknown_rejects_other_404() {
+        let err = ocync_distribution::Error::RegistryError {
+            status: StatusCode::NOT_FOUND,
+            message: r#"{"errors":[{"code":"NAME_UNKNOWN"}]}"#.into(),
+        };
+        assert!(!is_blob_upload_unknown(&err));
+    }
+
+    #[test]
+    fn is_blob_upload_unknown_rejects_non_404() {
+        let err = ocync_distribution::Error::RegistryError {
+            status: StatusCode::BAD_REQUEST,
+            message: r#"{"errors":[{"code":"BLOB_UPLOAD_UNKNOWN"}]}"#.into(),
+        };
+        assert!(!is_blob_upload_unknown(&err));
+    }
+
+    #[test]
+    fn is_blob_upload_unknown_rejects_non_registry_error() {
+        let err = ocync_distribution::Error::DigestMismatch {
+            expected: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap(),
+            actual: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+        };
+        assert!(!is_blob_upload_unknown(&err));
     }
 
     #[test]

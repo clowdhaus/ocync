@@ -2969,6 +2969,7 @@ where
             Err(e) => {
                 let retryable = if let Some(status) = e.status_code() {
                     retry::should_retry(status, attempt, config.max_retries)
+                        || (attempt < config.max_retries && retry::is_blob_upload_unknown(&e))
                 } else {
                     // Transport-level errors (connection refused, DNS failure,
                     // request timeout) are retryable when attempts remain.
