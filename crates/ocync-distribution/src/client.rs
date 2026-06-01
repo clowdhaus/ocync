@@ -35,6 +35,10 @@ pub struct RegistryClientBuilder {
     /// certificate without validation. Test-only -- see
     /// [`RegistryClientBuilder::allow_invalid_certs`].
     accept_invalid_certs: bool,
+    /// When `true`, the internal reqwest client refuses to negotiate
+    /// HTTP/2 via ALPN. Test-only -- see
+    /// [`RegistryClientBuilder::force_http1`].
+    force_http1: bool,
 }
 
 impl std::fmt::Debug for RegistryClientBuilder {
@@ -58,6 +62,7 @@ impl RegistryClientBuilder {
             max_concurrent: DEFAULT_MAX_CONCURRENT_REQUESTS,
             dns_overrides: Vec::new(),
             accept_invalid_certs: false,
+            force_http1: false,
         }
     }
 
@@ -85,6 +90,16 @@ impl RegistryClientBuilder {
         self
     }
 
+    /// Refuse to negotiate HTTP/2 via ALPN. Test-only escape hatch for the
+    /// perf profile harness, used to isolate HTTP/2-multiplexing stalls
+    /// from the rest of the streaming path. Hidden from public docs;
+    /// never use in production code.
+    #[doc(hidden)]
+    pub fn force_http1(mut self, force: bool) -> Self {
+        self.force_http1 = force;
+        self
+    }
+
     /// Pin DNS resolution for `host` to `addr`, bypassing the system
     /// resolver for that hostname only.
     ///
@@ -106,6 +121,9 @@ impl RegistryClientBuilder {
         }
         if self.accept_invalid_certs {
             http_builder = http_builder.danger_accept_invalid_certs(true);
+        }
+        if self.force_http1 {
+            http_builder = http_builder.http1_only();
         }
         let http = http_builder.build()?;
 

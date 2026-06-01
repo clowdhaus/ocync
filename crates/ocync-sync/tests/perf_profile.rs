@@ -32,14 +32,19 @@
 //! - `OCYNC_PROFILE_BYTES`    bytes per layer (default: 16384). Bump to
 //!   ~5 MB to amplify SHA-256 cost like a real container layer.
 //! - `OCYNC_PROFILE_WORKERS`  `max_concurrent_transfers` (default: 50)
+//! - `OCYNC_PROFILE_HTTP1=1`   refuse to negotiate HTTP/2 via ALPN. Used
+//!   to isolate HTTP/2 multiplexing stalls from the rest of the path.
 
 mod helpers;
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
+use futures_util::stream;
+use ocync_distribution::sha256::Sha256;
 use ocync_distribution::spec::{MediaType, RepositoryName};
-use ocync_distribution::{RegistryClient, RegistryClientBuilder};
+use ocync_distribution::{Digest, RegistryClient, RegistryClientBuilder};
 use ocync_sync::engine::{SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::staging::BlobStage;
@@ -108,9 +113,11 @@ async fn start_registry_tls() -> (ContainerAsync<GenericImage>, Url) {
 }
 
 fn make_client(url: Url, accept_invalid_certs: bool) -> Arc<RegistryClient> {
+    let force_http1 = std::env::var("OCYNC_PROFILE_HTTP1").ok().as_deref() == Some("1");
     Arc::new(
         RegistryClientBuilder::new(url)
             .allow_invalid_certs(accept_invalid_certs)
+            .force_http1(force_http1)
             .build()
             .expect("RegistryClient"),
     )
@@ -193,6 +200,17 @@ async fn profile_small_images_tls() {
     run_profile(src, dst, "tls").await;
 }
 
+async fn push_blob_stream(client: &RegistryClient, repo: &RepositoryName, data: Vec<u8>) {
+    let digest = Digest::from_sha256(Sha256::digest(&data));
+    let size = data.len() as u64;
+    let body = Bytes::from(data);
+    let s = stream::once(async move { Ok::<_, ocync_distribution::Error>(body) });
+    client
+        .blob_push_stream(repo, &digest, Some(size), s)
+        .await
+        .expect("blob_push_stream");
+}
+
 async fn populate_source(
     client: &RegistryClient,
     n_images: usize,
@@ -203,10 +221,10 @@ async fn populate_source(
     for i in 0..n_images {
         let repo = RepositoryName::new(format!("perf/img-{i:04}")).unwrap();
         let config_data = format!("{{\"image\":{i}}}").into_bytes();
-        client
-            .blob_push(&repo, config_data.as_slice())
-            .await
-            .expect("config push");
+        // Stream the corpus into the source registry the same way the
+        // engine does during sync; otherwise the harness's setup-time SHA
+        // dominates the profile and the actual streaming path is invisible.
+        push_blob_stream(client, &repo, config_data.clone()).await;
 
         let mut builder = ManifestBuilder::new(&config_data);
         for l in 0..n_layers {
@@ -214,7 +232,7 @@ async fn populate_source(
             // Vary content per (image, layer) so digests are unique.
             layer[0] = (i & 0xff) as u8;
             layer[1] = (l & 0xff) as u8;
-            client.blob_push(&repo, &layer).await.expect("layer push");
+            push_blob_stream(client, &repo, layer.clone()).await;
             builder = builder.layer(&layer);
         }
         let parts = builder.build();
