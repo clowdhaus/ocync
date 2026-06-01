@@ -1,93 +1,93 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Config",
   "description": "Top-level configuration defining registries, mappings, and sync behavior.",
   "type": "object",
-  "required": [
-    "mappings"
-  ],
   "properties": {
     "defaults": {
       "description": "Default source, targets, tags, and platforms inherited by all mappings.",
-      "default": null,
       "anyOf": [
         {
-          "$ref": "#/definitions/DefaultsConfig"
+          "$ref": "#/$defs/DefaultsConfig"
         },
         {
           "type": "null"
         }
-      ]
+      ],
+      "default": null
     },
     "global": {
       "description": "Global engine settings applied across all syncs.",
-      "default": null,
       "anyOf": [
         {
-          "$ref": "#/definitions/GlobalConfig"
+          "$ref": "#/$defs/GlobalConfig"
         },
         {
           "type": "null"
         }
-      ]
+      ],
+      "default": null
     },
     "mappings": {
       "description": "Image mapping rules defining what to sync and where.",
       "type": "array",
       "items": {
-        "$ref": "#/definitions/MappingConfig"
+        "$ref": "#/$defs/MappingConfig"
       }
     },
     "registries": {
       "description": "Named registry definitions keyed by alias.",
-      "default": {},
       "type": "object",
       "additionalProperties": {
-        "$ref": "#/definitions/RegistryConfig"
-      }
+        "$ref": "#/$defs/RegistryConfig"
+      },
+      "default": {}
     },
     "target_groups": {
       "description": "Named groups of registry aliases for multi-target fanout.",
-      "default": {},
       "type": "object",
       "additionalProperties": {
         "type": "array",
         "items": {
           "type": "string"
         }
-      }
+      },
+      "default": {}
     }
   },
-  "definitions": {
+  "required": [
+    "mappings"
+  ],
+  "$defs": {
     "ArtifactsConfig": {
-      "description": "Configuration for OCI artifact (signatures, SBOMs, attestations) sync.\n\nControls whether referrers are discovered and transferred alongside their parent image manifests.",
+      "description": "Configuration for OCI artifact (signatures, SBOMs, attestations) sync.\n\nControls whether referrers are discovered and transferred alongside their\nparent image manifests.",
       "type": "object",
       "properties": {
         "enabled": {
           "description": "Whether artifact sync is enabled (default: true).",
-          "default": true,
-          "type": "boolean"
+          "type": "boolean",
+          "default": true
         },
         "exclude": {
           "description": "Exclude artifacts whose artifact type matches one of these MIME types.",
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
         },
         "include": {
           "description": "Only sync artifacts whose artifact type matches one of these MIME types.",
-          "default": [],
           "type": "array",
+          "default": [],
           "items": {
             "type": "string"
           }
         },
         "require_artifacts": {
-          "description": "When true, every synced image must have at least one referrer. Images without referrers cause a sync failure instead of silently producing unsigned images at the target.",
-          "default": false,
-          "type": "boolean"
+          "description": "When true, every synced image must have at least one referrer.\nImages without referrers cause a sync failure instead of silently\nproducing unsigned images at the target.",
+          "type": "boolean",
+          "default": false
         }
       }
     },
@@ -97,75 +97,53 @@
         {
           "description": "AWS ECR token exchange.",
           "type": "string",
-          "enum": [
-            "ecr"
-          ]
+          "const": "ecr"
         },
         {
           "description": "Google Artifact Registry native auth (ADC).",
           "type": "string",
-          "enum": [
-            "gar"
-          ]
+          "const": "gar"
         },
         {
           "description": "Google Container Registry native auth (ADC).",
           "type": "string",
-          "enum": [
-            "gcr"
-          ]
+          "const": "gcr"
         },
         {
           "description": "Azure Container Registry native auth (AAD).",
           "type": "string",
-          "enum": [
-            "acr"
-          ]
+          "const": "acr"
         },
         {
           "description": "GitHub Container Registry (`GITHUB_TOKEN`).",
           "type": "string",
-          "enum": [
-            "ghcr"
-          ]
+          "const": "ghcr"
         },
         {
           "description": "Anonymous (token exchange only).",
           "type": "string",
-          "enum": [
-            "anonymous"
-          ]
+          "const": "anonymous"
         },
         {
           "description": "HTTP basic auth.",
           "type": "string",
-          "enum": [
-            "basic"
-          ]
+          "const": "basic"
         },
         {
           "description": "Pre-obtained bearer token (PAT, CI token).",
           "type": "string",
-          "enum": [
-            "static_token"
-          ]
+          "const": "static_token"
         },
         {
           "description": "Docker config.json credential store.",
           "type": "string",
-          "enum": [
-            "docker_config"
-          ]
+          "const": "docker_config"
         }
       ]
     },
     "BasicCredentials": {
       "description": "Credentials for HTTP Basic authentication.",
       "type": "object",
-      "required": [
-        "password",
-        "username"
-      ],
       "properties": {
         "password": {
           "description": "Password or access token.",
@@ -175,7 +153,11 @@
           "description": "Username for authentication.",
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "username",
+        "password"
+      ]
     },
     "DefaultsConfig": {
       "description": "Default values inherited by all mappings unless individually overridden.",
@@ -183,58 +165,58 @@
       "properties": {
         "artifacts": {
           "description": "Artifact sync configuration applied to all mappings unless overridden.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/ArtifactsConfig"
+              "$ref": "#/$defs/ArtifactsConfig"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "platforms": {
-          "description": "Platform filter applied to all mappings unless overridden.\n\nEach entry must be `os/arch` or `os/arch/variant` (e.g. `linux/amd64`, `linux/arm/v7`).",
-          "default": null,
+          "description": "Platform filter applied to all mappings unless overridden.\n\nEach entry must be `os/arch` or `os/arch/variant` (e.g. `linux/amd64`,\n`linux/arm/v7`).",
           "type": [
             "array",
             "null"
           ],
+          "default": null,
           "items": {
             "type": "string"
           }
         },
         "source": {
           "description": "Default source registry alias for all mappings.",
-          "default": null,
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         },
         "tags": {
           "description": "Default tag filter rules inherited by mappings without their own.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/TagsConfig"
+              "$ref": "#/$defs/TagsConfig"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "targets": {
           "description": "Default target registry alias or group for all mappings.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/TargetsValue"
+              "$ref": "#/$defs/TargetsValue"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         }
       }
     },
@@ -266,7 +248,7 @@
           ]
         },
         "cache_ttl": {
-          "description": "Warm cache TTL as a human-readable duration (e.g. \"12h\", \"30m\").\n\n`\"0\"` disables TTL-based expiry (cache never expires by age; lazy invalidation only). Defaults to `\"12h\"` when not specified.",
+          "description": "Warm cache TTL as a human-readable duration (e.g. \"12h\", \"30m\").\n\n`\"0\"` disables TTL-based expiry (cache never expires by age; lazy\ninvalidation only). Defaults to `\"12h\"` when not specified.",
           "type": [
             "string",
             "null"
@@ -274,13 +256,13 @@
         },
         "max_concurrent_transfers": {
           "description": "Maximum concurrent image syncs (default: 50).",
-          "default": 50,
           "type": "integer",
           "format": "uint",
-          "minimum": 0.0
+          "default": 50,
+          "minimum": 0
         },
         "staging_size_limit": {
-          "description": "Disk staging size limit as a human-readable size (e.g. \"2GB\", \"500MB\").\n\nUses SI decimal prefixes: 1 GB = 1,000,000,000 bytes. `0` disables disk staging. When absent, no eviction is performed.",
+          "description": "Disk staging size limit as a human-readable size (e.g. \"2GB\", \"500MB\").\n\nUses SI decimal prefixes: 1 GB = 1,000,000,000 bytes.\n`0` disables disk staging. When absent, no eviction is performed.",
           "type": [
             "string",
             "null"
@@ -291,145 +273,145 @@
     "MappingConfig": {
       "description": "A single image mapping rule: source repo, target registries, and tag filters.",
       "type": "object",
-      "required": [
-        "from"
-      ],
       "properties": {
         "artifacts": {
           "description": "Artifact sync configuration for this mapping, overriding `defaults.artifacts`.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/ArtifactsConfig"
+              "$ref": "#/$defs/ArtifactsConfig"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "from": {
           "description": "Source repository path (e.g. `library/nginx`).",
           "type": "string"
         },
         "platforms": {
-          "description": "Platform filter for this mapping, overriding any value in `defaults`.\n\nEach entry must be `os/arch` or `os/arch/variant` (e.g. `linux/amd64`, `linux/arm/v7`).",
-          "default": null,
+          "description": "Platform filter for this mapping, overriding any value in `defaults`.\n\nEach entry must be `os/arch` or `os/arch/variant` (e.g. `linux/amd64`,\n`linux/arm/v7`).",
           "type": [
             "array",
             "null"
           ],
+          "default": null,
           "items": {
             "type": "string"
           }
         },
         "source": {
           "description": "Source registry alias, overriding `defaults.source`.",
-          "default": null,
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         },
         "tags": {
           "description": "Tag filter rules for this mapping, overriding `defaults.tags`.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/TagsConfig"
+              "$ref": "#/$defs/TagsConfig"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "targets": {
           "description": "Target registry alias or group, overriding `defaults.targets`.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/TargetsValue"
+              "$ref": "#/$defs/TargetsValue"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "to": {
           "description": "Destination repository path; defaults to `from` when absent.",
-          "default": null,
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         }
-      }
+      },
+      "required": [
+        "from"
+      ]
     },
     "RegistryConfig": {
       "description": "Per-registry settings: URL, auth method, concurrency, and credentials.",
       "type": "object",
-      "required": [
-        "url"
-      ],
       "properties": {
         "auth_type": {
           "description": "Authentication method to use for this registry.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/AuthType"
+              "$ref": "#/$defs/AuthType"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "aws_profile": {
-          "description": "Named AWS profile for ECR credential resolution.\n\nWhen set, ECR auth for this registry uses `aws_config::ConfigLoader::profile_name(p)` instead of the ambient credential chain. Only valid with explicit `auth_type: ecr`.\n\nUse this when the registry requires credentials distinct from the ambient identity (for example, a third-party ECR accessed with static IAM-user keys while the ambient chain serves the rest of the workload).",
-          "default": null,
+          "description": "Named AWS profile for ECR credential resolution.\n\nWhen set, ECR auth for this registry uses\n`aws_config::ConfigLoader::profile_name(p)` instead of the ambient\ncredential chain. Only valid with explicit `auth_type: ecr`.\n\nUse this when the registry requires credentials distinct from the\nambient identity (for example, a third-party ECR accessed with static\nIAM-user keys while the ambient chain serves the rest of the workload).",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         },
         "credentials": {
           "description": "Credentials for Basic auth (`auth_type: basic`).",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/BasicCredentials"
+              "$ref": "#/$defs/BasicCredentials"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "head_first": {
-          "description": "HEAD-check targets before pulling full source manifests on cache miss.\n\nWhen enabled, the engine issues a manifest HEAD against all targets before performing a full source manifest GET. If every target already holds the same digest as the source HEAD, the expensive GET is skipped. This conserves rate-limit tokens on source registries with aggressive quotas (e.g., Docker Hub).",
-          "default": false,
-          "type": "boolean"
+          "description": "HEAD-check targets before pulling full source manifests on cache miss.\n\nWhen enabled, the engine issues a manifest HEAD against all targets\nbefore performing a full source manifest GET. If every target already\nholds the same digest as the source HEAD, the expensive GET is skipped.\nThis conserves rate-limit tokens on source registries with aggressive\nquotas (e.g., Docker Hub).",
+          "type": "boolean",
+          "default": false
         },
         "max_concurrent": {
-          "description": "Per-registry aggregate concurrency cap (default: 50).\n\nLimits the total number of simultaneous in-flight HTTP requests to this registry across all action types. This is independent of the global `max_concurrent_transfers` (which caps image-level parallelism).",
+          "description": "Per-registry aggregate concurrency cap (default: 50).\n\nLimits the total number of simultaneous in-flight HTTP requests to this\nregistry across all action types. This is independent of the global\n`max_concurrent_transfers` (which caps image-level parallelism).",
           "type": [
             "integer",
             "null"
           ],
           "format": "uint",
-          "minimum": 0.0
+          "minimum": 0
         },
         "token": {
           "description": "Bearer token for static token auth (`auth_type: static_token`).",
-          "default": null,
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         },
         "url": {
           "description": "Registry base URL (e.g. `registry-1.docker.io`, `123456789012.dkr.ecr.us-east-1.amazonaws.com`).",
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "url"
+      ]
     },
     "RemovedSemverPrerelease": false,
     "SortOrder": {
@@ -438,16 +420,12 @@
         {
           "description": "Sort by semantic version (highest first).",
           "type": "string",
-          "enum": [
-            "semver"
-          ]
+          "const": "semver"
         },
         {
           "description": "Sort alphabetically (highest first).",
           "type": "string",
-          "enum": [
-            "alpha"
-          ]
+          "const": "alpha"
         }
       ]
     },
@@ -457,99 +435,99 @@
       "properties": {
         "exclude": {
           "description": "Exclude tags matching one or more glob patterns.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/GlobOrList"
+              "$ref": "#/$defs/GlobOrList"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "glob": {
           "description": "Include tags matching one or more glob patterns.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/GlobOrList"
+              "$ref": "#/$defs/GlobOrList"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "immutable_tags": {
-          "description": "Glob pattern for immutable tags (e.g. `\"v?[0-9]*.[0-9]*.[0-9]*\"`).\n\nWhen a tag matches this pattern AND already exists in the target's tag list, the tag is skipped with zero API calls. Semver tags are conventionally immutable; this avoids redundant HEAD checks.",
-          "default": null,
+          "description": "Glob pattern for immutable tags (e.g. `\"v?[0-9]*.[0-9]*.[0-9]*\"`).\n\nWhen a tag matches this pattern AND already exists in the target's tag\nlist, the tag is skipped with zero API calls. Semver tags are\nconventionally immutable; this avoids redundant HEAD checks.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         },
         "include": {
-          "description": "Always-include patterns. Behavior depends on pattern shape: literals (no `*`, `?`, `[`) bypass the entire pipeline and are kept verbatim (use to pin floating tags like `latest` or specific RCs). Globs rescue matching tags from `glob:` and the soft-tier excludes (built-in defaults + `defaults.tags.exclude:`), then run through `semver:`, hard `exclude:`, `sort:`, and `latest:` like any other pipeline tag. Same syntax as `exclude:`.",
-          "default": null,
+          "description": "Always-include patterns. Behavior depends on pattern shape: literals\n(no `*`, `?`, `[`) bypass the entire pipeline and are kept verbatim\n(use to pin floating tags like `latest` or specific RCs). Globs\nrescue matching tags from `glob:` and the soft-tier excludes\n(built-in defaults + `defaults.tags.exclude:`), then run through\n`semver:`, hard `exclude:`, `sort:`, and `latest:` like any other\npipeline tag. Same syntax as `exclude:`.",
           "anyOf": [
             {
-              "$ref": "#/definitions/GlobOrList"
+              "$ref": "#/$defs/GlobOrList"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "latest": {
           "description": "Keep only the N most recent tags after sorting.",
-          "default": null,
           "type": [
             "integer",
             "null"
           ],
           "format": "uint",
-          "minimum": 0.0
+          "default": null,
+          "minimum": 0
         },
         "min_tags": {
           "description": "Minimum number of tags to retain regardless of filters.",
-          "default": null,
           "type": [
             "integer",
             "null"
           ],
           "format": "uint",
-          "minimum": 0.0
+          "default": null,
+          "minimum": 0
         },
         "semver": {
           "description": "Include tags matching a semver range (e.g. `>=1.0, <2.0`).",
-          "default": null,
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         },
         "semver_prerelease": {
-          "description": "Removed in 2026-05; deserializing a config that still sets this field triggers a fail-loud migration error pointing at `include:`.",
-          "writeOnly": true,
+          "description": "Removed in 2026-05; deserializing a config that still sets this field\ntriggers a fail-loud migration error pointing at `include:`.",
           "anyOf": [
             {
-              "$ref": "#/definitions/RemovedSemverPrerelease"
+              "$ref": "#/$defs/RemovedSemverPrerelease"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "writeOnly": true
         },
         "sort": {
           "description": "Sort order applied before `latest` truncation.",
-          "default": null,
           "anyOf": [
             {
-              "$ref": "#/definitions/SortOrder"
+              "$ref": "#/$defs/SortOrder"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         }
       }
     },

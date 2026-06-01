@@ -517,12 +517,12 @@ impl<'de> Deserialize<'de> for RemovedSemverPrerelease {
 }
 
 impl JsonSchema for RemovedSemverPrerelease {
-    fn schema_name() -> String {
-        "RemovedSemverPrerelease".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RemovedSemverPrerelease".into()
     }
 
-    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        schemars::schema::Schema::Bool(false)
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!(false)
     }
 }
 
