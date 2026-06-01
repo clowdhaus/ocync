@@ -19,7 +19,7 @@ google-cloud-auth = { version = "1.10", default-features = false }
 bytes = { version = "1", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 http = { version = "1", default-features = false }
-schemars = { version = "0.8", default-features = false, features = ["derive"] }
+schemars = { version = "1.2", default-features = false, features = ["derive", "std"] }
 futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
@@ -28,7 +28,7 @@ tempfile = { version = "3", default-features = false }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false }
-reqwest = { git = "https://github.com/seanmonstar/reqwest", rev = "03db63a48f35135c2f2c8b7aaa578217d5f678fe", default-features = false, features = ["query", "system-proxy"] }
+reqwest = { git = "https://github.com/seanmonstar/reqwest", rev = "11489b34eda6d32b15ad4033e62beba2ee401350", default-features = false, features = ["query", "system-proxy"] }
 url = { version = "2", default-features = false }
 uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
 ocync-distribution = { path = "crates/ocync-distribution", default-features = false }
@@ -100,7 +100,7 @@ uuid.workspace = true
 # Redirect crates.io reqwest to our git pin so transitive deps
 # (google-cloud-auth) resolve to the same version as workspace deps.
 [patch.crates-io]
-reqwest = { git = "https://github.com/seanmonstar/reqwest", rev = "03db63a48f35135c2f2c8b7aaa578217d5f678fe" }
+reqwest = { git = "https://github.com/seanmonstar/reqwest", rev = "11489b34eda6d32b15ad4033e62beba2ee401350" }
 
 [profile.release]
 strip = true
