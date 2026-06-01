@@ -46,6 +46,3 @@ skip = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = [
-  "https://github.com/seanmonstar/reqwest",  # pinned to post-0.13.2 for rustls-platform-verifier 0.7 (removes jni dups); revert to crates.io on 0.13.3
-]

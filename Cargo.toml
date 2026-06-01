@@ -28,7 +28,7 @@ tempfile = { version = "3", default-features = false }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false }
-reqwest = { git = "https://github.com/seanmonstar/reqwest", rev = "11489b34eda6d32b15ad4033e62beba2ee401350", default-features = false, features = ["query", "system-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["query", "system-proxy"] }
 url = { version = "2", default-features = false }
 uuid = { version = "1", default-features = false, features = ["v7", "serde"] }
 ocync-distribution = { path = "crates/ocync-distribution", default-features = false }
@@ -96,11 +96,6 @@ url.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 uuid.workspace = true
-
-# Redirect crates.io reqwest to our git pin so transitive deps
-# (google-cloud-auth) resolve to the same version as workspace deps.
-[patch.crates-io]
-reqwest = { git = "https://github.com/seanmonstar/reqwest", rev = "11489b34eda6d32b15ad4033e62beba2ee401350" }
 
 [profile.release]
 strip = true
