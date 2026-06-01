@@ -102,3 +102,10 @@ strip = true
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Release-equivalent codegen with symbols preserved for `samply` /
+# flamegraph work. Use via `cargo {test,build} --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = false
