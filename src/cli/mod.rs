@@ -335,6 +335,14 @@ pub(crate) async fn build_registry_client(
         builder = builder.max_concurrent(n);
     }
 
+    // Diagnostic escape hatch -- refuse to negotiate HTTP/2 via ALPN when
+    // OCYNC_FORCE_HTTP1=1. Used to A/B the HTTP/2 stream-multiplexing
+    // stall observed at high `max_concurrent_transfers` against TLS
+    // registries. Not a supported production toggle.
+    if std::env::var("OCYNC_FORCE_HTTP1").ok().as_deref() == Some("1") {
+        builder = builder.force_http1(true);
+    }
+
     builder
         .build()
         .map_err(|e| CliError::Input(format!("failed to build client for '{bare_host}': {e}")))
