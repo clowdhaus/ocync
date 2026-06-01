@@ -2392,6 +2392,7 @@ dependencies = [
  "http 1.4.1",
  "ocync-distribution",
  "postcard",
+ "rcgen",
  "reqwest",
  "schemars 1.2.1",
  "serde",

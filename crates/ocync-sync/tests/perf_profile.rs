@@ -2,32 +2,36 @@
 //!
 //! Pushes a deterministic corpus of small images to one local `registry:2`,
 //! then syncs it to a second local `registry:2` so a profiler can sample
-//! `SyncEngine::run`. The test is `#[ignore]`'d -- it spins up Docker
-//! containers and runs in the seconds-range, so it is for ad-hoc profiling,
-//! not CI.
+//! `SyncEngine::run`. Tests are `#[ignore]`'d -- they spin up Docker
+//! containers and run in the seconds-range, intended for ad-hoc profiling.
+//!
+//! ## Tests
+//!
+//! - `profile_small_images` -- HTTP-only. Baseline. Useful for SHA-256,
+//!   JSON parsing, and task-scheduling cost.
+//! - `profile_small_images_tls` -- TLS-terminated via `registry:2`'s
+//!   built-in HTTPS support with a self-signed cert generated at test
+//!   start. Surfaces rustls handshake + AEAD cost.
 //!
 //! ## Usage
 //!
 //! ```bash
 //! samply record --output /tmp/sync.profile -- \
-//!   cargo test --release --test perf_profile -- \
+//!   cargo test --profile profiling --test perf_profile -- \
 //!   --ignored --nocapture --exact profile_small_images
 //! ```
 //!
-//! Then open `/tmp/sync.profile` in samply's web UI.
+//! Then `samply load /tmp/sync.profile` to view the trace. Look for the
+//! `[profile] PROFILE BEGIN` / `[profile] PROFILE END` stderr markers to
+//! scope the analysis window in the UI.
 //!
-//! Tune via env vars:
+//! ## Tunables
+//!
 //! - `OCYNC_PROFILE_IMAGES`   number of images (default: 200)
 //! - `OCYNC_PROFILE_LAYERS`   layers per image (default: 2)
-//! - `OCYNC_PROFILE_BYTES`    bytes per layer (default: 16384)
+//! - `OCYNC_PROFILE_BYTES`    bytes per layer (default: 16384). Bump to
+//!   ~5 MB to amplify SHA-256 cost like a real container layer.
 //! - `OCYNC_PROFILE_WORKERS`  `max_concurrent_transfers` (default: 50)
-//!
-//! ## Known limitation
-//!
-//! `registry:2` is HTTP-only. If the production CPU bottleneck is TLS
-//! handshakes or rustls work, this harness will under-report it. Treat the
-//! profile as authoritative for SHA-256, JSON parsing, and task-scheduling
-//! cost; treat it as a lower bound for any per-connection overhead.
 
 mod helpers;
 
@@ -39,14 +43,22 @@ use ocync_distribution::{RegistryClient, RegistryClientBuilder};
 use ocync_sync::engine::{SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::staging::BlobStage;
+use rcgen::{CertificateParams, DnType, KeyPair};
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage};
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use url::Url;
 
 use helpers::*;
 
-async fn start_registry() -> (ContainerAsync<GenericImage>, Url) {
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+async fn start_registry_http() -> (ContainerAsync<GenericImage>, Url) {
     let container = GenericImage::new("registry", "2")
         .with_exposed_port(5000.into())
         .with_wait_for(WaitFor::message_on_stderr("listening on"))
@@ -61,41 +73,61 @@ async fn start_registry() -> (ContainerAsync<GenericImage>, Url) {
     (container, url)
 }
 
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// Self-signed cert covering `localhost` + `127.0.0.1`, valid for the
+/// run of the test. Generated per test invocation so there's no
+/// on-disk artifact to manage.
+fn self_signed_localhost() -> (Vec<u8>, Vec<u8>) {
+    let key = KeyPair::generate().expect("rcgen KeyPair::generate");
+    let mut params = CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+        .expect("rcgen CertificateParams::new");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "ocync-perf-profile");
+    let cert = params.self_signed(&key).expect("rcgen self_signed");
+    (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "spins up Docker containers; run via samply, not in CI"]
-async fn profile_small_images() {
+async fn start_registry_tls() -> (ContainerAsync<GenericImage>, Url) {
+    let (cert_pem, key_pem) = self_signed_localhost();
+    let container = GenericImage::new("registry", "2")
+        .with_exposed_port(5000.into())
+        .with_wait_for(WaitFor::message_on_stderr("listening on"))
+        .with_env_var("REGISTRY_HTTP_TLS_CERTIFICATE", "/certs/tls.crt")
+        .with_env_var("REGISTRY_HTTP_TLS_KEY", "/certs/tls.key")
+        .with_copy_to("/certs/tls.crt", cert_pem)
+        .with_copy_to("/certs/tls.key", key_pem)
+        .start()
+        .await
+        .expect("registry:2 (TLS) container failed to start");
+    let port = container
+        .get_host_port_ipv4(5000)
+        .await
+        .expect("get_host_port_ipv4 failed");
+    let url = Url::parse(&format!("https://127.0.0.1:{port}")).unwrap();
+    (container, url)
+}
+
+fn make_client(url: Url, accept_invalid_certs: bool) -> Arc<RegistryClient> {
+    Arc::new(
+        RegistryClientBuilder::new(url)
+            .allow_invalid_certs(accept_invalid_certs)
+            .build()
+            .expect("RegistryClient"),
+    )
+}
+
+async fn run_profile(src: Arc<RegistryClient>, dst: Arc<RegistryClient>, label: &str) {
     let n_images = env_usize("OCYNC_PROFILE_IMAGES", 200);
     let n_layers = env_usize("OCYNC_PROFILE_LAYERS", 2);
     let layer_bytes = env_usize("OCYNC_PROFILE_BYTES", 16 * 1024);
     let workers = env_usize("OCYNC_PROFILE_WORKERS", 50);
 
-    let (_src_ctr, src_url) = start_registry().await;
-    let (_dst_ctr, dst_url) = start_registry().await;
-
-    let src = Arc::new(
-        RegistryClientBuilder::new(src_url.clone())
-            .build()
-            .expect("source RegistryClient"),
-    );
-    let dst = Arc::new(
-        RegistryClientBuilder::new(dst_url.clone())
-            .build()
-            .expect("target RegistryClient"),
-    );
-
     eprintln!(
-        "[profile] populating source: {n_images} images x {n_layers} layers x {layer_bytes} B"
+        "[profile] {label}: populating source: {n_images} images x {n_layers} layers x {layer_bytes} B"
     );
     let pop_start = Instant::now();
     let repos = populate_source(&src, n_images, n_layers, layer_bytes).await;
-    eprintln!("[profile] populate took {:?}", pop_start.elapsed());
+    eprintln!("[profile] {label}: populate took {:?}", pop_start.elapsed());
 
     let mappings = repos
         .iter()
@@ -112,10 +144,7 @@ async fn profile_small_images() {
 
     let engine = SyncEngine::new(fast_retry(), workers);
 
-    // Everything above this line is setup. Everything below is what we want
-    // the profiler to capture. samply records the whole process, so trimming
-    // happens in the UI -- use the eprintln markers as anchors.
-    eprintln!("[profile] PROFILE BEGIN workers={workers}");
+    eprintln!("[profile] PROFILE BEGIN {label} workers={workers}");
     let sync_start = Instant::now();
     let report = engine
         .run(
@@ -127,7 +156,7 @@ async fn profile_small_images() {
         )
         .await;
     let sync_elapsed = sync_start.elapsed();
-    eprintln!("[profile] PROFILE END elapsed={sync_elapsed:?}");
+    eprintln!("[profile] PROFILE END {label} elapsed={sync_elapsed:?}");
 
     let synced = report
         .images
@@ -135,13 +164,33 @@ async fn profile_small_images() {
         .filter(|r| matches!(r.status, ocync_sync::ImageStatus::Synced))
         .count();
     eprintln!(
-        "[profile] images={n_images} synced={synced} blobs_transferred={} bytes={}",
+        "[profile] {label}: images={n_images} synced={synced} blobs_transferred={} bytes={}",
         report.stats.blobs_transferred, report.stats.bytes_transferred,
     );
     assert_eq!(
         synced, n_images,
         "expected all {n_images} images to sync; got {synced}",
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "spins up Docker containers; run via samply, not in CI"]
+async fn profile_small_images() {
+    let (_src_ctr, src_url) = start_registry_http().await;
+    let (_dst_ctr, dst_url) = start_registry_http().await;
+    let src = make_client(src_url, false);
+    let dst = make_client(dst_url, false);
+    run_profile(src, dst, "http").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "spins up Docker containers; run via samply, not in CI"]
+async fn profile_small_images_tls() {
+    let (_src_ctr, src_url) = start_registry_tls().await;
+    let (_dst_ctr, dst_url) = start_registry_tls().await;
+    let src = make_client(src_url, true);
+    let dst = make_client(dst_url, true);
+    run_profile(src, dst, "tls").await;
 }
 
 async fn populate_source(

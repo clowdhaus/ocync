@@ -31,6 +31,10 @@ pub struct RegistryClientBuilder {
     /// requests at a local mock server without leaking `reqwest::Client`
     /// into the public API.
     dns_overrides: Vec<(String, std::net::SocketAddr)>,
+    /// When `true`, the internal reqwest client accepts any server
+    /// certificate without validation. Test-only -- see
+    /// [`RegistryClientBuilder::allow_invalid_certs`].
+    accept_invalid_certs: bool,
 }
 
 impl std::fmt::Debug for RegistryClientBuilder {
@@ -53,6 +57,7 @@ impl RegistryClientBuilder {
             auth: None,
             max_concurrent: DEFAULT_MAX_CONCURRENT_REQUESTS,
             dns_overrides: Vec::new(),
+            accept_invalid_certs: false,
         }
     }
 
@@ -65,6 +70,18 @@ impl RegistryClientBuilder {
     /// Set the maximum number of concurrent requests.
     pub fn max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = n;
+        self
+    }
+
+    /// Accept any server certificate without validation.
+    ///
+    /// Test-only escape hatch for the perf profile harness, which
+    /// terminates TLS at a local `registry:2` instance with a generated
+    /// self-signed cert. Hidden from public docs; never use in
+    /// production code.
+    #[doc(hidden)]
+    pub fn allow_invalid_certs(mut self, allow: bool) -> Self {
+        self.accept_invalid_certs = allow;
         self
     }
 
@@ -86,6 +103,9 @@ impl RegistryClientBuilder {
         let mut http_builder = reqwest::Client::builder().user_agent(USER_AGENT_VALUE);
         for (host, addr) in &self.dns_overrides {
             http_builder = http_builder.resolve(host, *addr);
+        }
+        if self.accept_invalid_certs {
+            http_builder = http_builder.danger_accept_invalid_certs(true);
         }
         let http = http_builder.build()?;
 
