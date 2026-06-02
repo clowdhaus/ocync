@@ -90,9 +90,16 @@ pub(crate) async fn run(
         None
     };
 
-    // head_first is a source-side optimization (HEAD targets before pulling
-    // the full source manifest). Read from the source registry's config; if
-    // no config is loaded or the source isn't named in it, default false.
+    // head_first is a source-side optimization: HEAD-check the target
+    // before pulling the source manifest, skipping the source GET when
+    // the destination already holds the same digest. Defined on the
+    // source registry's config because the optimization conserves the
+    // source registry's rate-limit budget; applies to both `sync` and
+    // `copy` because the savings shape is the same.
+    //
+    // When `--config` is not supplied (one-shot copy by image ref) the
+    // default is false -- no per-invocation override flag yet; see
+    // RegistryConfig::head_first for the field doc.
     let head_first = src_reg_config.map(|r| r.head_first).unwrap_or(false);
 
     let mapping = ResolvedMapping {

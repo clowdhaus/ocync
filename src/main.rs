@@ -107,6 +107,23 @@ pub(crate) struct Cli {
     /// Set the log output format. Defaults to `text`.
     #[arg(long, global = true, value_enum, help_heading = "Global options")]
     pub(crate) log_format: Option<LogFormat>,
+
+    /// Refuse to negotiate HTTP/2 via ALPN.
+    ///
+    /// Diagnostic-only escape hatch for A/B-testing against registries
+    /// where HTTP/2 misbehaves. Hidden from `--help` because it
+    /// degrades throughput; expose only with `--help --hide-flags=none`
+    /// or by knowing the flag name.
+    #[arg(long, global = true, hide = true)]
+    pub(crate) force_http1: bool,
+
+    /// Disable HTTP/2 adaptive flow-control window sizing.
+    ///
+    /// Diagnostic-only A/B knob. Hidden because the adaptive window is
+    /// strictly better for typical workloads (doubled throughput
+    /// against ECR in our measurements).
+    #[arg(long, global = true, hide = true)]
+    pub(crate) no_h2_adaptive_window: bool,
 }
 
 /// Log output format.
@@ -308,6 +325,13 @@ async fn main() -> std::process::ExitCode {
 
     let cli = Cli::parse();
     cli::setup_logging(&cli);
+
+    // Install diagnostic HTTP toggles before any RegistryClient is built.
+    // The set is silent if it fires more than once (only `main` calls it).
+    let _ = cli::CLIENT_DIAG.set(cli::ClientDiag {
+        force_http1: cli.force_http1,
+        h2_adaptive_window: !cli.no_h2_adaptive_window,
+    });
 
     // Install signal handlers for graceful shutdown.
     let shutdown = cli::shutdown::ShutdownSignal::new();

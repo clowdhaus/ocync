@@ -383,7 +383,7 @@
           "default": null
         },
         "head_first": {
-          "description": "HEAD-check targets before pulling full source manifests on cache miss.\n\nWhen enabled, the engine issues a manifest HEAD against all targets\nbefore performing a full source manifest GET. If every target already\nholds the same digest as the source HEAD, the expensive GET is skipped.\nThis conserves rate-limit tokens on source registries with aggressive\nquotas (e.g., Docker Hub).",
+          "description": "HEAD-check targets before pulling full source manifests on cache miss.\n\nWhen enabled, the engine issues a manifest HEAD against all targets\nbefore performing a full source manifest GET. If every target already\nholds the same digest as the source HEAD, the expensive GET is skipped.\nThis conserves rate-limit tokens on source registries with aggressive\nquotas (e.g., Docker Hub).\n\nApplies to both `sync` (which is the original target) and `copy`\n(single-image variant); in `copy` the optimization fires when the\ndestination tag already resolves to the same source digest.",
           "type": "boolean",
           "default": false
         },

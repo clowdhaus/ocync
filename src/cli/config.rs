@@ -240,6 +240,10 @@ pub(crate) struct RegistryConfig {
     /// holds the same digest as the source HEAD, the expensive GET is skipped.
     /// This conserves rate-limit tokens on source registries with aggressive
     /// quotas (e.g., Docker Hub).
+    ///
+    /// Applies to both `sync` (which is the original target) and `copy`
+    /// (single-image variant); in `copy` the optimization fires when the
+    /// destination tag already resolves to the same source digest.
     #[serde(default)]
     pub head_first: bool,
 

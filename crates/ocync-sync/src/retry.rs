@@ -65,7 +65,11 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
 /// sessions in flux, leaving room for transient interpretation.
 ///
 /// Returns `true` only when the error is a `RegistryError` with status
-/// 404 whose body contains the `BLOB_UPLOAD_UNKNOWN` error code.
+/// 404 whose body is structured-OCI-error JSON and contains an
+/// `errors[].code == "BLOB_UPLOAD_UNKNOWN"` entry. A free-text mention
+/// of the string in some other shape (or a body that fails to parse) is
+/// NOT classified as retryable -- substring matching would otherwise
+/// false-positive on bodies that reference the code in prose.
 ///
 /// Known limitation: retrying alone is not always sufficient. Against
 /// ECR at high `max_concurrent_transfers` (~20+), the consistency
@@ -78,7 +82,24 @@ pub fn is_blob_upload_unknown(error: &ocync_distribution::Error) -> bool {
     let ocync_distribution::Error::RegistryError { status, message } = error else {
         return false;
     };
-    *status == StatusCode::NOT_FOUND && message.contains("BLOB_UPLOAD_UNKNOWN")
+    if *status != StatusCode::NOT_FOUND {
+        return false;
+    }
+    let Ok(body) = serde_json::from_str::<OciErrorBody>(message) else {
+        return false;
+    };
+    body.errors.iter().any(|e| e.code == "BLOB_UPLOAD_UNKNOWN")
+}
+
+/// OCI distribution-spec error response body shape.
+#[derive(serde::Deserialize)]
+struct OciErrorBody {
+    errors: Vec<OciError>,
+}
+
+#[derive(serde::Deserialize)]
+struct OciError {
+    code: String,
 }
 
 /// Determine whether a transport-level (non-HTTP) error should be retried.
@@ -276,6 +297,29 @@ mod tests {
         let err = ocync_distribution::Error::RegistryError {
             status: StatusCode::NOT_FOUND,
             message: r#"{"errors":[{"code":"NAME_UNKNOWN"}]}"#.into(),
+        };
+        assert!(!is_blob_upload_unknown(&err));
+    }
+
+    /// Free-text mention of the code outside of `errors[].code` must NOT
+    /// classify as retryable -- the old substring match would have
+    /// false-positived here.
+    #[test]
+    fn is_blob_upload_unknown_rejects_free_text_mention_of_code() {
+        let err = ocync_distribution::Error::RegistryError {
+            status: StatusCode::NOT_FOUND,
+            message: r#"{"errors":[{"code":"NAME_UNKNOWN","message":"related to BLOB_UPLOAD_UNKNOWN flow"}]}"#.into(),
+        };
+        assert!(!is_blob_upload_unknown(&err));
+    }
+
+    /// A malformed body (not parseable as the OCI error shape) is NOT
+    /// retried. Substring matching would have been ambiguous here.
+    #[test]
+    fn is_blob_upload_unknown_rejects_malformed_body() {
+        let err = ocync_distribution::Error::RegistryError {
+            status: StatusCode::NOT_FOUND,
+            message: "BLOB_UPLOAD_UNKNOWN".into(),
         };
         assert!(!is_blob_upload_unknown(&err));
     }

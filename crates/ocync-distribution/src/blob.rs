@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
+use pin_project_lite::pin_project;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LOCATION};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, warn};
@@ -19,20 +20,36 @@ use crate::error::Error;
 use crate::sha256::Sha256;
 use crate::spec::RepositoryName;
 
-/// Stream wrapper that holds a streaming-blob semaphore permit for the
-/// lifetime of the inner stream. Used by [`RegistryClient::blob_pull`] to
-/// release the permit when the caller has fully consumed the response
-/// body, not when `blob_pull` itself returns.
-struct PermitStream<S> {
-    inner: S,
-    _permit: OwnedSemaphorePermit,
+pin_project! {
+    /// Stream wrapper that holds a streaming-blob semaphore permit for the
+    /// lifetime of the inner stream. Used by [`RegistryClient::blob_pull`] to
+    /// release the permit when the caller has fully consumed the response
+    /// body, not when `blob_pull` itself returns.
+    ///
+    /// `pin_project_lite` lets the projection work for any `S: Stream`,
+    /// including streams that are not `Unpin` (a future change in
+    /// reqwest's stream impl would otherwise silently bypass this
+    /// wrapper).
+    struct PermitStream<S> {
+        #[pin]
+        inner: S,
+        _permit: OwnedSemaphorePermit,
+    }
 }
 
-impl<S: Stream + Unpin> Stream for PermitStream<S> {
+impl<S: Stream> Stream for PermitStream<S> {
     type Item = S::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+        self.project().inner.poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // Forward the inner stream's hint so consumers that pre-allocate
+        // (e.g. `reqwest::Body::wrap_stream` setting Content-Length, or
+        // any `collect::<Vec<_>>()`) see the same information as the raw
+        // `bytes_stream()`.
+        self.inner.size_hint()
     }
 }
 

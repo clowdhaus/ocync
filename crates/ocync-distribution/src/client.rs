@@ -104,8 +104,12 @@ impl RegistryClientBuilder {
     }
 
     /// Set the maximum number of concurrent requests.
+    ///
+    /// Values of `0` are clamped to `1` so the resulting semaphore can
+    /// always make forward progress. Pass at least `1` to opt out of the
+    /// clamp.
     pub fn max_concurrent(mut self, n: usize) -> Self {
-        self.max_concurrent = n;
+        self.max_concurrent = n.max(1);
         self
     }
 

@@ -22,9 +22,9 @@ use ocync_distribution::auth::ecr_public::EcrPublicAuth;
 use ocync_distribution::auth::gcp::GcpAuth;
 use ocync_distribution::auth::static_token::StaticTokenAuth;
 
-use std::sync::Once;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Once, OnceLock};
 
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
@@ -335,15 +335,18 @@ pub(crate) async fn build_registry_client(
         builder = builder.max_concurrent(n);
     }
 
-    // Diagnostic escape hatches -- not supported production toggles.
-    // Used to A/B the HTTP/2 stream-multiplexing stall observed at high
-    // `max_concurrent_transfers` against TLS registries.
-    if std::env::var("OCYNC_FORCE_HTTP1").ok().as_deref() == Some("1") {
+    // Diagnostic escape hatches set via the hidden CLI flags
+    // `--force-http1` and `--no-h2-adaptive-window`. See `Cli` in
+    // `src/main.rs`. Values are installed once by `main()` and read here
+    // via a process-wide `OnceLock` so every `RegistryClient` built by
+    // any subcommand sees the same diagnostic toggles. Tests that
+    // bypass `main` (e.g. dispatch unit tests) read the default
+    // (`force_http1: false`, `h2_adaptive_window: true`).
+    let diag = CLIENT_DIAG.get().copied().unwrap_or_default();
+    if diag.force_http1 {
         builder = builder.force_http1(true);
     }
-    // `OCYNC_H2_ADAPTIVE_WINDOW=0` disables the production default
-    // (on) so the regression can be reproduced for testing.
-    if std::env::var("OCYNC_H2_ADAPTIVE_WINDOW").ok().as_deref() == Some("0") {
+    if !diag.h2_adaptive_window {
         builder = builder.http2_adaptive_window(false);
     }
 
@@ -351,6 +354,29 @@ pub(crate) async fn build_registry_client(
         .build()
         .map_err(|e| CliError::Input(format!("failed to build client for '{bare_host}': {e}")))
 }
+
+/// Diagnostic HTTP-layer toggles installed by `main()` from the hidden
+/// CLI flags `--force-http1` and `--no-h2-adaptive-window`.
+///
+/// Stored in a `OnceLock` rather than threaded through every command's
+/// signature because the only consumer is `build_registry_client`, and
+/// the only producer is `main()`. Tests get the `Default` values.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientDiag {
+    pub(crate) force_http1: bool,
+    pub(crate) h2_adaptive_window: bool,
+}
+
+impl Default for ClientDiag {
+    fn default() -> Self {
+        Self {
+            force_http1: false,
+            h2_adaptive_window: true,
+        }
+    }
+}
+
+pub(crate) static CLIENT_DIAG: OnceLock<ClientDiag> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Logging setup
