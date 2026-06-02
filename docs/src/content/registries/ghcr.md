@@ -23,6 +23,8 @@ Notable behaviors:
 - Multi-PATCH chunked upload is broken on GHCR (last PATCH overwrites previous). ocync falls back to POST + single PATCH + PUT (3 requests/blob instead of 2) automatically.
 - Cross-repo blob mounting is fulfilled within the same org or user namespace. Mount POSTs returning 202 (not fulfilled) fall through to upload.
 - Single 2000 RPM aggregate cap across all reads and writes per authenticated principal. ocync uses one AIMD window so the token-bucket layer cannot exceed the cap by spending read and write budgets concurrently.
+- **10-minute server-side upload timeout** per layer (community-documented, [github.com/orgs/community/discussions/77429](https://github.com/orgs/community/discussions/77429)). Because GHCR's single-PATCH path requires sending the whole blob in one request, a multi-GB layer over a slow link can be cut off mid-body. ocync's `with_retry` classifies the resulting connection reset as transport-retryable and starts a fresh upload session (POST + PATCH + PUT from scratch), but each retry has the same 10-minute budget. For very large layers on constrained networks, pre-stage to a faster mirror or set a higher `RetryConfig.max_retries`.
+- 10 GB per-layer cap. Layers larger than this fail at finalize regardless of the timeout above; split the image or use a different registry.
 
 ## CLI example
 
