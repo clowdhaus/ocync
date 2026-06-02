@@ -132,7 +132,12 @@ pub(crate) struct Config {
 /// Global engine settings that apply across all sync operations.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct GlobalConfig {
-    /// Maximum concurrent image syncs (default: 50).
+    /// Maximum concurrent image syncs (default: 10).
+    ///
+    /// Default derived as `streaming_blob_concurrency / BLOB_CONCURRENCY = 64
+    /// / 6`, sized so the per-target HTTP/2 stream budget is not exhausted
+    /// (typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is 100-128
+    /// across major container registries).
     #[serde(default = "default_max_concurrent_transfers")]
     pub max_concurrent_transfers: usize,
 
@@ -155,7 +160,12 @@ pub(crate) struct GlobalConfig {
 }
 
 fn default_max_concurrent_transfers() -> usize {
-    50
+    // Mirror the engine's DEFAULT_MAX_CONCURRENT_TRANSFERS. The previous
+    // value of 50 multiplied by BLOB_CONCURRENCY=6 (= 300 streams) blew
+    // past the per-connection HTTP/2 stream budget on every major
+    // registry; see DEFAULT_STREAMING_BLOB_CONCURRENCY in
+    // ocync-distribution for the derivation. Keep these two in lockstep.
+    ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS
 }
 
 impl Default for GlobalConfig {
@@ -1599,7 +1609,10 @@ mappings:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let global = config.global.as_ref().unwrap();
-        assert_eq!(global.max_concurrent_transfers, 50);
+        assert_eq!(
+            global.max_concurrent_transfers,
+            ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS,
+        );
     }
 
     #[test]

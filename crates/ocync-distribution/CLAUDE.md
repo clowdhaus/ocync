@@ -57,10 +57,10 @@ When `auth_type` IS set in config, it overrides detection. Valid values: `ecr`, 
 
 ## Upload protocol quirks
 
-- Default: POST + streaming PUT with `Transfer-Encoding: chunked` (2 requests/blob).
-- GHCR: multi-PATCH chunked broken (last PATCH overwrites previous). Client falls back to POST + single PATCH + PUT (3 requests/blob).
-- GAR: no chunked uploads. Client buffers full blob, monolithic PUT.
-- ACR: known ~20 MB streaming PUT body limit. Chunked PATCH fallback not yet implemented.
+- Default: POST + streaming PUT with `Transfer-Encoding: chunked` (2 requests/blob). Streaming PUT body is gated by a per-`RegistryClient` semaphore (`streaming_blob_sem`, default cap 64) to stay under the per-h2-connection `SETTINGS_MAX_CONCURRENT_STREAMS` budget (100-128 across major registries probed 2026-06-01).
+- GHCR: multi-PATCH chunked broken (last PATCH overwrites previous). Client falls back to POST + single PATCH + PUT (3 requests/blob), `blob_push_stream_ghcr`.
+- GAR: no chunked uploads. Client buffers full blob, monolithic PUT, `blob_push_stream_gar`.
+- ACR: ~20 MB streaming PUT body limit. Client buffers the full blob, verifies digest, then uploads in 16 MB PATCH chunks (OCI `{start}-{end}` Content-Range, NOT RFC 7233) followed by a finalize PUT, `blob_push_stream_acr`. Zero-byte blobs (e.g. signature empty-config) skip the PATCH loop and go straight to finalize PUT. Each PATCH response's `Location` header is checked against the initiate host to prevent cross-host credential forwarding via a compromised proxy.
 
 ## Cross-repo mount
 

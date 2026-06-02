@@ -27,13 +27,20 @@
 //!
 //! ## Tunables
 //!
-//! - `OCYNC_PROFILE_IMAGES`   number of images (default: 200)
-//! - `OCYNC_PROFILE_LAYERS`   layers per image (default: 2)
-//! - `OCYNC_PROFILE_BYTES`    bytes per layer (default: 16384). Bump to
+//! - `OCYNC_PROFILE_IMAGES`        number of images (default: 200)
+//! - `OCYNC_PROFILE_LAYERS`        layers per image (default: 2)
+//! - `OCYNC_PROFILE_BYTES`         bytes per layer (default: 16384). Bump to
 //!   ~5 MB to amplify SHA-256 cost like a real container layer.
-//! - `OCYNC_PROFILE_WORKERS`  `max_concurrent_transfers` (default: 50)
-//! - `OCYNC_PROFILE_HTTP1=1`   refuse to negotiate HTTP/2 via ALPN. Used
-//!   to isolate HTTP/2 multiplexing stalls from the rest of the path.
+//! - `OCYNC_PROFILE_WORKERS`       `max_concurrent_transfers` (default: 50;
+//!   note the engine default is 10 -- the harness deliberately oversubscribes
+//!   to stress h2 stream budgeting).
+//! - `OCYNC_PROFILE_HTTP1=1`       refuse to negotiate HTTP/2 via ALPN.
+//!   Used to isolate HTTP/2 multiplexing stalls from the rest of the path.
+//! - `OCYNC_PROFILE_H2_ADAPTIVE=0` disable HTTP/2 adaptive-window sizing
+//!   for A/B testing the pre-fix behavior.
+//! - `OCYNC_PROFILE_STREAM_CAP`    override per-`RegistryClient`
+//!   `streaming_blob_concurrency` (default: 64). Lower to verify the
+//!   per-target stream cap binds.
 
 mod helpers;
 

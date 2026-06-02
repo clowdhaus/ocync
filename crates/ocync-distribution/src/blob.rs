@@ -44,6 +44,15 @@ const OCTET_STREAM: &str = "application/octet-stream";
 /// while keeping the round-trip count low.
 const ACR_PATCH_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
+/// Upper bound on the `Vec::with_capacity` hint used by [`buffer_stream`].
+///
+/// The hint comes from a manifest's declared blob size, which is
+/// attacker-controllable. Without a cap, a single malicious manifest can
+/// trigger a multi-GB allocation per concurrent fallback upload. Capping
+/// at 16 MB keeps the up-front allocation modest; larger streams grow the
+/// Vec organically through amortised doubling.
+const MAX_BUFFER_PREALLOC: usize = 16 * 1024 * 1024;
+
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
 pub enum MountResult {
@@ -96,10 +105,14 @@ async fn buffer_stream(
     stream: impl Stream<Item = Result<Bytes, Error>>,
     capacity_hint: Option<u64>,
 ) -> Result<Vec<u8>, Error> {
-    let mut body = match capacity_hint {
-        Some(s) => Vec::with_capacity(s as usize),
-        None => Vec::new(),
-    };
+    // Cap the pre-allocation. capacity_hint comes from the manifest's
+    // declared blob size, which is attacker-controllable; an unbounded
+    // `with_capacity` plus the per-target streaming-blob concurrency
+    // budget multiplies into arbitrary memory pressure.
+    let cap = capacity_hint
+        .map(|s| std::cmp::min(s as usize, MAX_BUFFER_PREALLOC))
+        .unwrap_or(0);
+    let mut body = Vec::with_capacity(cap);
     futures_util::pin_mut!(stream);
     while let Some(chunk) = stream.next().await {
         body.extend_from_slice(&chunk?);
@@ -214,19 +227,10 @@ impl RegistryClient {
         let hash = Sha256::digest(data);
         let digest = Digest::from_sha256(hash);
 
-        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let scopes = [Scope::pull_push(repository.as_str())];
-
-        let resp = self
-            .send_with_aimd(
-                RegistryAction::BlobUploadInit,
-                &scopes,
-                "blob push initiate",
-                |headers| self.http.post(url.clone()).headers(headers),
-            )
+        let put_url = self
+            .initiate_blob_upload(repository, &scopes, "blob push initiate")
             .await?;
-        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
-        let put_url = extract_location(&resp, &self.base_url)?;
 
         let digest_str = digest.to_string();
         let resp = self
@@ -280,11 +284,6 @@ impl RegistryClient {
     where
         E: Into<Error> + Send,
     {
-        // Bound concurrent long-lived h2 streams. Held for the entire
-        // function (POST + PUT/PATCH); the POST is fast so the dominant
-        // hold time is the streaming PUT body. Dropped at function return.
-        let _stream_permit = self.acquire_streaming_blob_permit().await;
-
         // Map stream errors to our Error type at the boundary so all
         // internal code works uniformly with `Result<Bytes, Error>`.
         let stream = stream.map(|r| r.map_err(Into::into));
@@ -306,7 +305,7 @@ impl RegistryClient {
         // gcr.io hosts support it fine, so only Gar triggers this path.
         if provider == Some(ProviderKind::Gar) {
             return self
-                .blob_push_stream_gar_fallback(repository, expected_digest, known_size, stream)
+                .blob_push_stream_gar(repository, expected_digest, known_size, stream)
                 .await;
         }
 
@@ -326,20 +325,14 @@ impl RegistryClient {
             "starting streaming blob upload"
         );
 
-        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let scopes = [Scope::pull_push(repository.as_str())];
-
-        // POST to initiate the upload session.
-        let resp = self
-            .send_with_aimd(
-                RegistryAction::BlobUploadInit,
-                &scopes,
-                "blob push stream initiate",
-                |headers| self.http.post(url.clone()).headers(headers),
-            )
+        let upload_url = self
+            .initiate_blob_upload(repository, &scopes, "blob push stream initiate")
             .await?;
-        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
-        let upload_url = extract_location(&resp, &self.base_url)?;
+
+        // Bound concurrent long-lived h2 streams. The streaming PUT body
+        // is the long-lived part; the POST above completes quickly.
+        let _stream_permit = self.acquire_streaming_blob_permit().await;
 
         // Streaming PUT - send the blob body through a single HTTP request.
         // Uses Transfer-Encoding: chunked (no Content-Length), so the body
@@ -370,13 +363,35 @@ impl RegistryClient {
         Ok(expected_digest.clone())
     }
 
+    /// POST `/v2/{repository}/blobs/uploads/` to initiate an upload session.
+    ///
+    /// Returns the upload URL extracted from the response's `Location` header.
+    /// Shared by every blob upload path (monolithic, streaming, GHCR/GAR/ACR
+    /// fallbacks) so the response-classification, expected-status, and
+    /// Location-extraction sequence has a single implementation.
+    async fn initiate_blob_upload(
+        &self,
+        repository: &RepositoryName,
+        scopes: &[Scope],
+        log_context: &str,
+    ) -> Result<String, Error> {
+        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
+        let resp = self
+            .send_with_aimd(RegistryAction::BlobUploadInit, scopes, log_context, |h| {
+                self.http.post(url.clone()).headers(h)
+            })
+            .await?;
+        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
+        extract_location(&resp, &self.base_url)
+    }
+
     /// GAR fallback: buffer the entire stream and delegate to monolithic push.
     ///
     /// Google Artifact Registry does not support chunked uploads, so the
     /// entire stream is buffered in memory and sent as a monolithic upload.
     /// The digest returned by the monolithic push is verified against the
     /// caller's expected digest to catch data corruption.
-    async fn blob_push_stream_gar_fallback(
+    async fn blob_push_stream_gar(
         &self,
         repository: &RepositoryName,
         expected_digest: &Digest,
@@ -388,6 +403,11 @@ impl RegistryClient {
             host = self.base_url.host_str().unwrap_or("unknown"),
             "GAR does not support chunked uploads; buffering entire blob in memory"
         );
+        // The streaming-blob permit caps how many in-flight buffered blobs
+        // hold memory for this target -- functions both as an h2-stream cap
+        // for short PATCH/PUT requests and as a memory-pressure cap for the
+        // buffered blob body.
+        let _stream_permit = self.acquire_streaming_blob_permit().await;
         let body = buffer_stream(stream, known_size).await?;
         let actual_digest = self.blob_push(repository, &body).await?;
 
@@ -419,20 +439,13 @@ impl RegistryClient {
             "GHCR multi-PATCH chunked upload is broken; buffering blob for single-PATCH upload"
         );
 
-        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
+        // Bounds both h2-stream concurrency (PATCH+PUT are short streams)
+        // and buffered-body memory pressure for this target.
+        let _stream_permit = self.acquire_streaming_blob_permit().await;
         let scopes = [Scope::pull_push(repository.as_str())];
-
-        // Initiate upload.
-        let resp = self
-            .send_with_aimd(
-                RegistryAction::BlobUploadInit,
-                &scopes,
-                "blob push ghcr initiate",
-                |headers| self.http.post(url.clone()).headers(headers),
-            )
+        let upload_url = self
+            .initiate_blob_upload(repository, &scopes, "blob push ghcr initiate")
             .await?;
-        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
-        let upload_url = extract_location(&resp, &self.base_url)?;
 
         // Buffer entire stream and verify digest before uploading.
         let raw = buffer_stream(stream, known_size).await?;
@@ -509,6 +522,10 @@ impl RegistryClient {
             "ACR rejects streaming PUT above ~20 MB; buffering blob for chunked PATCH upload"
         );
 
+        // Bounds both h2-stream concurrency (each PATCH is its own short
+        // stream) and buffered-body memory pressure for this target.
+        let _stream_permit = self.acquire_streaming_blob_permit().await;
+
         let raw = buffer_stream(stream, known_size).await?;
         let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
         if &actual_digest != expected_digest {
@@ -520,22 +537,19 @@ impl RegistryClient {
         let total_len = raw.len() as u64;
         let body = Bytes::from(raw);
 
-        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let scopes = [Scope::pull_push(repository.as_str())];
-
-        // Initiate.
-        let resp = self
-            .send_with_aimd(
-                RegistryAction::BlobUploadInit,
-                &scopes,
-                "blob push acr initiate",
-                |headers| self.http.post(url.clone()).headers(headers),
-            )
+        let mut upload_url = self
+            .initiate_blob_upload(repository, &scopes, "blob push acr initiate")
             .await?;
-        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
-        let mut upload_url = extract_location(&resp, &self.base_url)?;
+        // `extract_location` enforces same-origin against base_url on
+        // every upload-chain response (POST initiate, each PATCH, and
+        // the finalize PUT), so no separate per-PATCH host check is
+        // needed here.
 
-        // Chunked PATCH.
+        // Chunked PATCH. For a zero-byte blob the loop never executes; the
+        // finalize PUT below carries the digest of the empty blob and
+        // completes the upload session per the OCI distribution spec
+        // (PUT-without-prior-PATCH on an empty blob is valid).
         let mut offset: u64 = 0;
         while offset < total_len {
             let chunk_len = std::cmp::min(ACR_PATCH_CHUNK_SIZE as u64, total_len - offset);
@@ -590,7 +604,14 @@ impl RegistryClient {
     }
 }
 
-/// Extract and resolve the Location header from an upload response.
+/// Extract and resolve the `Location` header from an upload response,
+/// enforcing same-origin against `base_url`.
+///
+/// Used at every step of the blob-upload chain (POST initiate, PATCH
+/// chunk, finalize PUT). The chain is authenticated with the registry's
+/// bearer token; a `Location` pointing to a different host would leak
+/// the bearer on the next request. Reject any cross-host hand-off
+/// regardless of which step returned it.
 fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<String, Error> {
     let raw = resp
         .headers()
@@ -600,16 +621,31 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Str
             reason: "missing Location header in upload response".into(),
         })?;
 
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        Ok(raw.to_owned())
+    let resolved = if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_owned()
     } else {
         base_url
             .join(raw)
             .map(|u| u.to_string())
             .map_err(|e| Error::UploadProtocol {
                 reason: format!("failed to resolve upload URL: {e}"),
-            })
+            })?
+    };
+
+    let resolved_url = url::Url::parse(&resolved).map_err(|e| Error::UploadProtocol {
+        reason: format!("upload Location is not a valid URL: {e}"),
+    })?;
+    if resolved_url.host_str() != base_url.host_str() {
+        return Err(Error::UploadProtocol {
+            reason: format!(
+                "upload Location host {:?} differs from base host {:?}; refusing to forward credentials cross-host",
+                resolved_url.host_str(),
+                base_url.host_str(),
+            ),
+        });
     }
+
+    Ok(resolved)
 }
 
 /// Classify a mount response into [`MountResult`].
@@ -762,7 +798,7 @@ mod tests {
     fn data_stream(
         data: &[u8],
         chunk_size: usize,
-    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + 'static + use<> {
         let chunks: Vec<Result<Bytes, reqwest::Error>> = data
             .chunks(chunk_size)
             .map(|c| Ok(Bytes::copy_from_slice(c)))
@@ -877,23 +913,6 @@ mod tests {
         assert_eq!(result, digest);
     }
 
-    /// Stream that owns its bytes (vs. [`data_stream`] which borrows). Used
-    /// by ACR chunked-PATCH tests that allocate larger blobs locally.
-    fn owned_data_stream(
-        data: Vec<u8>,
-        chunk_size: usize,
-    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + 'static {
-        let body = Bytes::from(data);
-        let mut chunks = Vec::new();
-        let mut offset = 0;
-        while offset < body.len() {
-            let end = std::cmp::min(offset + chunk_size, body.len());
-            chunks.push(Ok(body.slice(offset..end)));
-            offset = end;
-        }
-        futures_util::stream::iter(chunks)
-    }
-
     /// ACR: small blob (under chunk size) takes the ACR path with one
     /// PATCH carrying an OCI-format `Content-Range` header
     /// (`{start}-{end}`, not RFC 7233).
@@ -915,15 +934,17 @@ mod tests {
             .await;
 
         // PATCH must carry a Content-Range header in OCI `{start}-{end}`
-        // format. The regex catches off-by-ones and rejects RFC 7233 syntax
-        // (which uses `bytes 0-N/total`).
+        // format. Exact match catches off-by-one (matches the precise
+        // `0-{len-1}` value -- a regex like `^0-\d+$` would silently accept
+        // an off-by-one in `range_end`).
+        let expected_range = format!("0-{}", data.len() - 1);
         wiremock::Mock::given(wiremock::matchers::method("PATCH"))
             .and(wiremock::matchers::path(
                 "/v2/myreg/myimg/blobs/uploads/acr-uuid",
             ))
-            .and(wiremock::matchers::header_regex(
+            .and(wiremock::matchers::header(
                 "content-range",
-                r"^0-\d+$",
+                expected_range.as_str(),
             ))
             .respond_with(wiremock::ResponseTemplate::new(202).append_header(
                 "Location",
@@ -1021,15 +1042,119 @@ mod tests {
         let client = build_test_client("myacr.azurecr.io", port);
         let repo = RepositoryName::new("proj/img").unwrap();
         let result = client
-            .blob_push_stream(
-                &repo,
-                &digest,
-                Some(total_len),
-                owned_data_stream(data, 65536),
-            )
+            .blob_push_stream(&repo, &digest, Some(total_len), data_stream(&data, 65536))
             .await
             .unwrap();
         assert_eq!(result, digest);
+    }
+
+    /// ACR: zero-byte blob (e.g. the OCI empty config used by signature
+    /// referrers) skips the PATCH loop and goes straight to finalize PUT.
+    #[tokio::test]
+    async fn blob_push_stream_acr_zero_byte_blob_skips_patch_loop() {
+        let server = wiremock::MockServer::start().await;
+        let data: &[u8] = b"";
+        let digest = test_digest(data);
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/repo/blobs/uploads/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/repo/blobs/uploads/empty-id"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PATCH must NOT be issued for a zero-byte blob.
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        // Finalize PUT carries the empty-blob digest and Content-Length: 0.
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/v2/repo/blobs/uploads/empty-id"))
+            .and(wiremock::matchers::query_param(
+                "digest",
+                digest.to_string(),
+            ))
+            .and(wiremock::matchers::header("content-length", "0"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_test_client("myacr.azurecr.io", port);
+        let repo = RepositoryName::new("repo").unwrap();
+        let result = client
+            .blob_push_stream(&repo, &digest, Some(0), data_stream(data, 4))
+            .await
+            .unwrap();
+        assert_eq!(result, digest);
+    }
+
+    /// Cross-host `Location` returned at any step of the upload chain (POST
+    /// initiate, PATCH chunk, finalize PUT) must be rejected by
+    /// `extract_location`'s same-origin check. The registry bearer would
+    /// otherwise be forwarded to an attacker host on the next request.
+    #[tokio::test]
+    async fn blob_push_stream_acr_cross_host_patch_location_is_rejected() {
+        let registry = wiremock::MockServer::start().await;
+        let attacker = wiremock::MockServer::start().await;
+        let data = b"acr cross-host rejection test bytes";
+        let digest = test_digest(data);
+        let registry_port = url::Url::parse(&registry.uri()).unwrap().port().unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/r/i/blobs/uploads/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/r/i/blobs/uploads/acr-1"),
+            )
+            .expect(1)
+            .mount(&registry)
+            .await;
+
+        // First PATCH returns a Location at the attacker host. The client
+        // must reject this before issuing any subsequent request.
+        let attacker_url = format!("{}/v2/r/i/blobs/uploads/exfil", attacker.uri());
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/r/i/blobs/uploads/acr-1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202).append_header("Location", attacker_url),
+            )
+            .expect(1)
+            .mount(&registry)
+            .await;
+
+        // Attacker host MUST receive no requests.
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&attacker)
+            .await;
+
+        // Finalize PUT MUST NOT be issued at the registry either.
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&registry)
+            .await;
+
+        let client = build_test_client("myacr.azurecr.io", registry_port);
+        let repo = RepositoryName::new("r/i").unwrap();
+        let err = client
+            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
+            .await
+            .expect_err("cross-host PATCH Location must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("differs from base host"),
+            "expected same-origin rejection error, got: {msg}"
+        );
     }
 
     /// `blob_pull` follows 3xx redirects through reqwest's default policy.

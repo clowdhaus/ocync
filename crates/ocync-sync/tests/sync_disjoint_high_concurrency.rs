@@ -192,7 +192,10 @@ async fn run_engine_default(
         })
         .collect();
 
-    // Production default: max_concurrent_transfers=50.
+    // Engine default is 10 (DEFAULT_MAX_CONCURRENT_TRANSFERS); the test
+    // deliberately oversubscribes at 50 to exercise the per-target
+    // streaming-blob semaphore (cap 64) under a workload that would
+    // otherwise demand 50 * BLOB_CONCURRENCY=6 = 300 concurrent streams.
     let engine = SyncEngine::new(fast_retry(), 50);
     tokio::time::timeout(
         Duration::from_secs(30),

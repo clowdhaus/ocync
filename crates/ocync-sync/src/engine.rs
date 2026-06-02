@@ -2961,8 +2961,11 @@ fn file_read_stream(
 
 /// Retry an async operation with exponential backoff on transient errors.
 ///
-/// Calls `f()` in a loop. Retries on HTTP 408/429/5xx status codes and on
-/// transport-level errors (connection refused, DNS failure, request timeout).
+/// Calls `f()` in a loop. Retries on HTTP 408/429/5xx, transport-level
+/// errors (connection refused, DNS failure, request timeout), and the
+/// ECR-specific 404 `BLOB_UPLOAD_UNKNOWN` body marker via
+/// [`retry::is_blob_upload_unknown`] (ECR returns this code on manifest
+/// push when blob upload PUT-201s haven't fully propagated).
 /// Waits with jittered exponential backoff up to `config.max_retries` times.
 /// Returns the first `Ok` or the final `Err`.
 async fn with_retry<T, F, Fut>(

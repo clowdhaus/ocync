@@ -626,8 +626,15 @@ async fn build_batch_checkers(
 
     for (name, reg) in &config.registries {
         let hostname = bare_hostname(&reg.url);
-        let is_ecr = reg.auth_type.as_ref().is_some_and(|a| *a == AuthType::Ecr)
-            || detect_provider_kind(hostname) == Some(ProviderKind::Ecr);
+        // Explicit non-Ecr auth_type is a hard opt-out: don't try to build an
+        // AWS-SDK-backed batch checker for a registry the user has declared
+        // is not ECR, even if the hostname pattern matches. Only fall
+        // through to hostname auto-detection when no `auth_type` is set.
+        let is_ecr = match reg.auth_type.as_ref() {
+            Some(AuthType::Ecr) => true,
+            Some(_) => false,
+            None => detect_provider_kind(hostname) == Some(ProviderKind::Ecr),
+        };
 
         if !is_ecr {
             continue;

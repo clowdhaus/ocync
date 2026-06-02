@@ -69,11 +69,17 @@ pub(crate) async fn run(
     // this, single-image copy falls back to per-blob HEAD against ECR, whose
     // HEAD returns false-positive 200s under concurrency; only
     // `BatchCheckLayerAvailability` is authoritative.
+    //
+    // Resolution: an explicit non-Ecr `auth_type` in registry config is a
+    // hard opt-out -- the user has told us this destination is not ECR even
+    // though the hostname pattern matches. Only fall through to hostname
+    // detection when no `auth_type` is set.
     let dst_hostname = bare_hostname(args.destination.registry());
-    let dst_is_ecr = dst_reg_config
-        .and_then(|r| r.auth_type.as_ref())
-        .is_some_and(|a| *a == AuthType::Ecr)
-        || detect_provider_kind(dst_hostname) == Some(ProviderKind::Ecr);
+    let dst_is_ecr = match dst_reg_config.and_then(|r| r.auth_type.as_ref()) {
+        Some(AuthType::Ecr) => true,
+        Some(_) => false,
+        None => detect_provider_kind(dst_hostname) == Some(ProviderKind::Ecr),
+    };
     let batch_checker: Option<Rc<dyn BatchBlobChecker>> = if dst_is_ecr {
         let profile = dst_reg_config.and_then(|r| r.aws_profile.as_deref());
         let checker = BatchChecker::from_hostname(dst_hostname, profile)
