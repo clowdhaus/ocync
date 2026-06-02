@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use aws_config::BehaviorVersion;
 use aws_sdk_ecr::types::LayerAvailability;
@@ -89,12 +90,26 @@ const MAX_DIGESTS_PER_BATCH: usize = 100;
 /// Boxed future returned by [`BatchBlobChecker::check_blob_existence`].
 type CheckFuture<'a> = Pin<Box<dyn Future<Output = Result<HashSet<Digest>, Error>> + 'a>>;
 
+/// Boxed future returned by [`BatchBlobChecker::wait_for_blobs_available`].
+type WaitFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>;
+
+/// Initial poll interval when waiting for an ECR consistency view to
+/// converge. Doubles on each subsequent poll up to [`MAX_POLL_INTERVAL`].
+const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Upper bound on the poll interval used while waiting on the ECR
+/// consistency view. Keeps the worst-case stale period bounded so a
+/// blob that becomes available right after a long sleep is picked up
+/// quickly.
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Async trait for batch blob existence checking.
 ///
 /// Used by the sync engine to efficiently determine which blobs already exist
-/// at an ECR target registry before initiating transfers. Implementations are
-/// intended to be held as `Rc<dyn BatchBlobChecker>` on a single-threaded
-/// tokio runtime, so no `Send` or `Sync` bounds are required.
+/// at an ECR target registry before initiating transfers, and to gate manifest
+/// commits on blob visibility (see [`Self::wait_for_blobs_available`]).
+/// Implementations are intended to be held as `Rc<dyn BatchBlobChecker>` on a
+/// single-threaded tokio runtime, so no `Send` or `Sync` bounds are required.
 pub trait BatchBlobChecker {
     /// Check which blobs exist in the given repository.
     ///
@@ -106,6 +121,112 @@ pub trait BatchBlobChecker {
         repo: &'a RepositoryName,
         digests: &'a [Digest],
     ) -> CheckFuture<'a>;
+
+    /// Wait until all `digests` are reported available by the target.
+    ///
+    /// Polls [`Self::check_blob_existence`] with exponential backoff
+    /// (starting at [`INITIAL_POLL_INTERVAL`], doubling up to
+    /// [`MAX_POLL_INTERVAL`]) until either every digest is reported
+    /// available or `deadline` is reached.
+    ///
+    /// # Why this exists
+    ///
+    /// ECR's manifest-validation index is eventually consistent with
+    /// blob upload state. A blob `PUT /v2/.../blobs/...` returns
+    /// 201 Created while the validator's view can lag for hundreds of
+    /// milliseconds to several seconds at high concurrency. A manifest
+    /// `PUT` issued during this window fails with HTTP 404 carrying
+    /// `BLOB_UPLOAD_UNKNOWN`. Calling this method before manifest push
+    /// gates the commit on the consistency view directly rather than
+    /// relying on retry budget alone.
+    ///
+    /// # Error semantics
+    ///
+    /// Returns `Ok(())` once every digest is available. Returns an
+    /// `Err` with [`Error::EcrApi`] carrying the count of still-missing
+    /// digests when `deadline` expires; the caller is expected to log
+    /// and proceed with the standard retry path. Individual poll
+    /// failures (transient ECR API errors) are logged as warnings and
+    /// treated as "no progress this iteration" -- the loop continues
+    /// until `deadline`.
+    ///
+    /// # Default implementation
+    ///
+    /// The default polls `check_blob_existence` and returns early on
+    /// full availability. Tests may override to avoid real sleeping.
+    fn wait_for_blobs_available<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+        deadline: Duration,
+    ) -> WaitFuture<'a> {
+        Box::pin(default_wait_for_blobs_available(
+            self, repo, digests, deadline,
+        ))
+    }
+}
+
+/// Default polling loop shared by every [`BatchBlobChecker`] impl.
+///
+/// Free function so the trait remains object-safe under `Rc<dyn ...>`
+/// while still factoring out the polling logic.
+async fn default_wait_for_blobs_available<T>(
+    checker: &T,
+    repo: &RepositoryName,
+    digests: &[Digest],
+    deadline: Duration,
+) -> Result<(), Error>
+where
+    T: BatchBlobChecker + ?Sized,
+{
+    if digests.is_empty() {
+        return Ok(());
+    }
+
+    let start = tokio::time::Instant::now();
+    let mut interval = INITIAL_POLL_INTERVAL;
+    // Track the surface of "still missing" so we only re-query the
+    // shrinking remainder, not the full input on every poll. ECR
+    // BatchCheckLayerAvailability counts toward an account-level quota
+    // (10 TPS), so trimming the request size reduces blast radius when
+    // the wait spans several seconds.
+    let mut remaining: Vec<Digest> = digests.to_vec();
+
+    loop {
+        match checker.check_blob_existence(repo, &remaining).await {
+            Ok(available) => {
+                remaining.retain(|d| !available.contains(d));
+                if remaining.is_empty() {
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                warn!(
+                    repo = %repo,
+                    error = %e,
+                    "BatchCheckLayerAvailability poll failed; retrying until deadline"
+                );
+            }
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            return Err(Error::EcrApi {
+                reason: format!(
+                    "BatchCheckLayerAvailability timed out for {repo} after {:?} with {} digest(s) still missing",
+                    elapsed,
+                    remaining.len()
+                ),
+            });
+        }
+
+        // Cap sleep so we never overshoot the deadline by more than one
+        // interval, which would be observable as a wait noticeably
+        // longer than requested.
+        let sleep_for = interval.min(deadline.saturating_sub(elapsed));
+        tokio::time::sleep(sleep_for).await;
+        interval = interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
+    }
 }
 
 /// Abstraction over ECR batch API calls for testability.
@@ -752,6 +873,164 @@ mod tests {
     fn batch_blob_checker_is_object_safe() {
         // Verify the trait can be used as Rc<dyn BatchBlobChecker>.
         fn _assert_object_safe(_: std::rc::Rc<dyn BatchBlobChecker>) {}
+    }
+
+    // --- wait_for_blobs_available tests ---
+
+    /// Empty input must short-circuit without any API call.
+    #[tokio::test]
+    async fn wait_empty_digests_short_circuits() {
+        let counts = CallCounts::default();
+        let mock = MockEcrBatchApi::new("repo", counts.clone());
+        let checker = BatchChecker::with_api(mock);
+        let result = checker
+            .wait_for_blobs_available(
+                &RepositoryName::new("repo").unwrap(),
+                &[],
+                Duration::from_secs(1),
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            counts.check.load(Ordering::Relaxed),
+            0,
+            "empty input must NOT trigger an ECR API call"
+        );
+    }
+
+    /// First poll reports all blobs available -- single call, no polling.
+    #[tokio::test]
+    async fn wait_all_available_on_first_poll() {
+        let d1 = test_digest(1);
+        let d2 = test_digest(2);
+        let counts = CallCounts::default();
+        let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(vec![Ok(
+            BatchCheckResponse {
+                layers: vec![(d1.to_string(), true), (d2.to_string(), true)],
+                failures: vec![],
+            },
+        )]);
+        let checker = BatchChecker::with_api(mock);
+        let result = checker
+            .wait_for_blobs_available(
+                &RepositoryName::new("repo").unwrap(),
+                &[d1, d2],
+                Duration::from_secs(10),
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            counts.check.load(Ordering::Relaxed),
+            1,
+            "all-available on first poll must NOT loop"
+        );
+    }
+
+    /// First poll reports partial availability, second reports the rest.
+    /// The second call must request only the previously-missing digest
+    /// (request trimming optimisation -- otherwise we re-query the
+    /// already-available digest on every poll).
+    #[tokio::test(start_paused = true)]
+    async fn wait_polls_until_all_available_and_trims_requests() {
+        let d1 = test_digest(1);
+        let d2 = test_digest(2);
+
+        let counts = CallCounts::default();
+        let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(vec![
+            // Poll 1: only d1 is available.
+            Ok(BatchCheckResponse {
+                layers: vec![(d1.to_string(), true), (d2.to_string(), false)],
+                failures: vec![],
+            }),
+            // Poll 2: d2 now available.
+            // The trimming optimisation means we expect only d2 to be
+            // requested; if d1 were re-requested, the mock would still
+            // accept it but the count test below pins the intent.
+            Ok(BatchCheckResponse {
+                layers: vec![(d2.to_string(), true)],
+                failures: vec![],
+            }),
+        ]);
+        let checker = BatchChecker::with_api(mock);
+        let result = checker
+            .wait_for_blobs_available(
+                &RepositoryName::new("repo").unwrap(),
+                &[d1.clone(), d2.clone()],
+                Duration::from_secs(10),
+            )
+            .await;
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(counts.check.load(Ordering::Relaxed), 2);
+    }
+
+    /// Polls keep reporting blob missing until deadline expires.
+    /// Returns `Err(EcrApi)` carrying a useful diagnostic.
+    #[tokio::test(start_paused = true)]
+    async fn wait_times_out_when_blob_never_appears() {
+        let d1 = test_digest(1);
+        // Mock returns "missing" forever. Use a long response queue so
+        // the test isn't flaky on number of polls.
+        let counts = CallCounts::default();
+        let responses: Vec<Result<BatchCheckResponse, Error>> = (0..50)
+            .map(|_| {
+                Ok(BatchCheckResponse {
+                    layers: vec![(d1.to_string(), false)],
+                    failures: vec![],
+                })
+            })
+            .collect();
+        let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(responses);
+        let checker = BatchChecker::with_api(mock);
+
+        let result = checker
+            .wait_for_blobs_available(
+                &RepositoryName::new("repo").unwrap(),
+                &[d1],
+                Duration::from_secs(2),
+            )
+            .await;
+        match result {
+            Err(Error::EcrApi { reason }) => {
+                assert!(
+                    reason.contains("timed out") && reason.contains("1 digest"),
+                    "unexpected timeout reason: {reason}"
+                );
+            }
+            other => panic!("expected EcrApi timeout, got {other:?}"),
+        }
+    }
+
+    /// Poll failure does NOT abort the wait -- the loop continues until
+    /// the deadline expires.
+    #[tokio::test(start_paused = true)]
+    async fn wait_continues_through_transient_api_errors() {
+        let d1 = test_digest(1);
+        let counts = CallCounts::default();
+        let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(vec![
+            // Transient API failure on first poll.
+            Err(Error::EcrApi {
+                reason: "throttled".into(),
+            }),
+            // Second poll succeeds with blob now available.
+            Ok(BatchCheckResponse {
+                layers: vec![(d1.to_string(), true)],
+                failures: vec![],
+            }),
+        ]);
+        let checker = BatchChecker::with_api(mock);
+        let result = checker
+            .wait_for_blobs_available(
+                &RepositoryName::new("repo").unwrap(),
+                &[d1],
+                Duration::from_secs(10),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "transient errors must not abort the wait: {:?}",
+            result.err()
+        );
+        assert_eq!(counts.check.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

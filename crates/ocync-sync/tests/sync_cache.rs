@@ -121,6 +121,78 @@ impl BatchBlobChecker for FailingBatchChecker {
     }
 }
 
+/// Mock that overrides `wait_for_blobs_available` directly so the test can
+/// count *commit-gate* invocations separately from pre-discovery
+/// `check_blob_existence` calls.
+struct WaitTrackingChecker {
+    expected_repo: String,
+    existing: HashSet<Digest>,
+    /// Count of pre-discovery `check_blob_existence` calls.
+    check_count: Arc<AtomicUsize>,
+    /// Count of commit-gate `wait_for_blobs_available` calls. Set by the
+    /// engine's `push_manifests` exactly when the wait fires.
+    wait_count: Arc<AtomicUsize>,
+}
+
+impl WaitTrackingChecker {
+    fn new(
+        expected_repo: &str,
+        existing: HashSet<Digest>,
+    ) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let check_count = Arc::new(AtomicUsize::new(0));
+        let wait_count = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                expected_repo: expected_repo.to_owned(),
+                existing,
+                check_count: Arc::clone(&check_count),
+                wait_count: Arc::clone(&wait_count),
+            },
+            check_count,
+            wait_count,
+        )
+    }
+}
+
+impl BatchBlobChecker for WaitTrackingChecker {
+    fn check_blob_existence<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
+    {
+        assert_eq!(repo.as_str(), self.expected_repo);
+        Box::pin(async move {
+            self.check_count.fetch_add(1, Ordering::Relaxed);
+            Ok(digests
+                .iter()
+                .filter(|d| self.existing.contains(d))
+                .cloned()
+                .collect())
+        })
+    }
+
+    fn wait_for_blobs_available<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+        _deadline: std::time::Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ocync_distribution::Error>> + 'a>> {
+        assert_eq!(repo.as_str(), self.expected_repo);
+        let all_known = digests.iter().all(|d| self.existing.contains(d));
+        Box::pin(async move {
+            self.wait_count.fetch_add(1, Ordering::Relaxed);
+            if all_known {
+                Ok(())
+            } else {
+                Err(ocync_distribution::Error::EcrApi {
+                    reason: "test: some digests still missing".into(),
+                })
+            }
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests: progressive cache population, cross-repo mount, monolithic upload,
 // lazy invalidation, and cache persistence round-trip.
@@ -1723,4 +1795,102 @@ async fn sync_batch_checker_with_prewarmed_cache() {
     assert_eq!(report.stats.blobs_transferred, 0);
     assert_eq!(report.stats.bytes_transferred, 0);
     // wiremock expect(0) on blob HEADs verifies no fallback path was used.
+}
+
+// ---------------------------------------------------------------------------
+// Tests: manifest-commit blob-visibility gating (ECR consistency window)
+// ---------------------------------------------------------------------------
+
+/// With a non-zero `manifest_commit_wait`, the engine calls the target's
+/// `BatchBlobChecker::wait_for_blobs_available` exactly once per manifest
+/// commit (before the manifest `PUT`). With the wait disabled
+/// (`Duration::ZERO`, the test-default), the wait is NOT called.
+///
+/// This is the gating check for ECR's consistency window: blob `PUT-201`s
+/// can land before the manifest validator's view catches up, so a
+/// manifest `PUT` issued immediately after blob upload would fail with
+/// `BLOB_UPLOAD_UNKNOWN`. The wait converts that race into a
+/// deterministic gate on the authoritative blob-visibility API.
+///
+/// The mock pre-marks all blobs as existing so blob uploads are skipped
+/// (Step 1 cache hit); the manifest `PUT` still fires and is the
+/// observable trigger for the wait.
+#[tokio::test]
+async fn manifest_commit_wait_fires_only_when_enabled() {
+    use ocync_sync::engine::SyncEngine;
+    use ocync_sync::progress::NullProgress;
+    use ocync_sync::retry::RetryConfig;
+    use ocync_sync::staging::BlobStage;
+
+    async fn run_one(commit_wait: std::time::Duration) -> (usize, usize) {
+        let source_server = MockServer::start().await;
+        let target_server = MockServer::start().await;
+
+        let parts = ManifestBuilder::new(b"cfg-mw").layer(b"layer-mw").build();
+        // Source serves the manifest under `src/repo`. The mapping below
+        // pulls from `src/repo` and pushes to `tgt/repo`.
+        mount_source_manifest(&source_server, "src/repo", "v1", &parts.bytes).await;
+        mount_manifest_head_not_found(&target_server, "tgt/repo", "v1").await;
+        mount_manifest_push(&target_server, "tgt/repo", "v1").await;
+
+        let existing = HashSet::from([
+            parts.config_desc.digest.clone(),
+            parts.layer_descs[0].digest.clone(),
+        ]);
+        let (checker, check_count, wait_count) = WaitTrackingChecker::new("tgt/repo", existing);
+
+        let mapping = resolved_mapping(
+            mock_client(&source_server),
+            "src/repo",
+            "tgt/repo",
+            vec![TargetEntry {
+                name: RegistryAlias::new("target"),
+                client: mock_client(&target_server),
+                batch_checker: Some(Rc::new(checker)),
+                existing_tags: HashSet::new(),
+            }],
+            vec![TagPair::same("v1")],
+        );
+
+        // Build the engine with the test's chosen manifest_commit_wait.
+        let retry = RetryConfig {
+            max_retries: 2,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(10),
+            backoff_multiplier: 2,
+            manifest_commit_wait: commit_wait,
+        };
+        let report = SyncEngine::new(retry, 4)
+            .run(
+                vec![mapping],
+                empty_cache(),
+                BlobStage::disabled(),
+                &NullProgress,
+                None,
+            )
+            .await;
+        assert_status!(report, 0, ImageStatus::Synced);
+
+        (
+            check_count.load(Ordering::Relaxed),
+            wait_count.load(Ordering::Relaxed),
+        )
+    }
+
+    // Wait DISABLED: wait_for_blobs_available must NOT be invoked.
+    let (checks_off, waits_off) = run_one(std::time::Duration::ZERO).await;
+    assert!(
+        waits_off == 0,
+        "with manifest_commit_wait=0 the commit-gate wait must not fire (got {waits_off})"
+    );
+    // Pre-discovery still uses check_blob_existence at least once.
+    assert!(checks_off >= 1, "pre-discovery batch check expected");
+
+    // Wait ENABLED: wait_for_blobs_available must fire exactly once
+    // per manifest commit (one image in this test).
+    let (_checks_on, waits_on) = run_one(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        waits_on, 1,
+        "with manifest_commit_wait>0 the commit-gate wait must fire once per manifest"
+    );
 }

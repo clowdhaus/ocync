@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 bytes.workspace = true
 crc32fast = { version = "1", default-features = false }
+fastrand.workspace = true
 futures-util.workspace = true
 globset = { version = "0.4", default-features = false }
 http.workspace = true
@@ -32,7 +33,9 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 tempfile = { version = "3", default-features = false }
+testcontainers = { version = "0.27", default-features = false }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 url.workspace = true
 wiremock = { version = "0.6", default-features = false }

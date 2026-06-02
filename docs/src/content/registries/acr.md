@@ -19,7 +19,7 @@ Notable behaviors:
 
 - Two-step OAuth2 exchange: AAD access token -> `POST /oauth2/exchange` -> ACR refresh token (~3h) -> `POST /oauth2/token` with scope -> ACR access token (~75min). TTLs are driven by the JWT `exp` claim.
 - Sovereign cloud routing: `*.azurecr.cn` uses `login.chinacloudapi.cn`; `*.azurecr.us` uses `login.microsoftonline.us`. The hostname suffix selects both the AAD authority and the ACR resource endpoint.
-- **~20 MB streaming PUT body limit.** ACR rejects streaming uploads above ~20 MB with a connection reset or 413; chunked PATCH fallback is not yet implemented. Blobs exceeding this limit cannot currently be pushed to ACR.
+- **~20 MB streaming PUT body limit.** ACR rejects streaming uploads above ~20 MB with a connection reset or 413. ocync detects `*.azurecr.io` / `*.azurecr.cn` / `*.azurecr.us` hosts and routes blob pushes through a chunked-PATCH fallback (`blob_push_stream_acr`): the stream is buffered, the digest is verified up front, then the blob is split into 16 MiB PATCH chunks (Content-Range in the OCI `{start}-{end}` form, not RFC 7233) and finalised with a PUT. Each PATCH response's `Location` header is checked against the original upload host so a compromised proxy cannot redirect later chunks (and the bearer-bearing finalize PUT) to an attacker.
 - Two rate-limit windows: ACR enforces separate ReadOps and WriteOps quotas; ocync tracks them as two AIMD windows.
 
 ## CLI example

@@ -28,6 +28,18 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
   1. Per-blob `Notify` via `ClaimAction::Wait`: followers wait for leader's blob upload.
   2. Per-repo `watch<bool>` via `repo_committed_watch`: followers wait for leader's manifest commit before mounting. ECR requires a committed manifest in the source repo for mount to succeed (201); without this wait, mounts hit Tier 3 and get 202 (Not Fulfilled). Uses `watch` (not `Notify`) because committed status is boolean state, not an event -- `watch` retains the last value so late subscribers always see it.
 
+## Manifest commit gating (ECR consistency window)
+
+ECR's manifest-validation index is eventually consistent with blob upload state. A blob `PUT-201` can land before the validator's view catches up; a manifest `PUT` issued during that window fails with HTTP 404 carrying `BLOB_UPLOAD_UNKNOWN`. The retry path in `with_retry` catches this code as a defence-in-depth, but the structural fix is to gate the manifest commit on the authoritative blob-visibility API.
+
+`push_manifests` calls `BatchBlobChecker::wait_for_blobs_available` before issuing the manifest `PUT` when both:
+1. The target has a configured `batch_checker` (production: only ECR), AND
+2. `RetryConfig::manifest_commit_wait` is non-zero.
+
+The wait polls `BatchCheckLayerAvailability` with exponential backoff (`200ms -> 400ms -> ... -> 5s`) until every referenced layer is visible, or `manifest_commit_wait` is reached. On timeout the engine falls through to the standard manifest PUT and any residual `BLOB_UPLOAD_UNKNOWN` is caught by `with_retry`.
+
+Production default: 30s. Tests default to `Duration::ZERO` via `fast_retry()` so the wait does not fire (mock checkers don't reflect engine uploads). Tests that need to exercise the wait construct their own `RetryConfig` with `manifest_commit_wait > 0`.
+
 ## Synchronization contracts (critical)
 
 - Per-blob `Notify::notify_waiters()` does NOT store permits. Every code path that transitions a blob out of `InProgress` MUST call `notify_blob`. Same applies to `BlobStage::notify_staged` / `notify_failed` for source-pull dedup. Missing notify = deadlock for concurrent waiters.

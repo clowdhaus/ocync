@@ -30,6 +30,7 @@ futures-util = { version = "0.3", default-features = false }
 google-cloud-auth.workspace = true
 http.workspace = true
 hex.workspace = true
+pin-project-lite.workspace = true
 regex-lite = { version = "0.1", default-features = false }
 reqwest = { workspace = true, features = ["http2", "rustls-no-provider", "stream", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }

@@ -17,10 +17,12 @@ aws-sdk-ecrpublic = { version = "1", default-features = false, features = ["beha
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 google-cloud-auth = { version = "1.10", default-features = false }
 bytes = { version = "1", default-features = false }
+fastrand = { version = "2", default-features = false, features = ["std"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 http = { version = "1", default-features = false }
 schemars = { version = "1.2", default-features = false, features = ["derive", "std"] }
 futures-util = { version = "0.3", default-features = false }
+pin-project-lite = { version = "0.2", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 serde_yaml = { package = "serde_yaml_ng", version = "0.10", default-features = false }
@@ -102,3 +104,10 @@ strip = true
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Release-equivalent codegen with symbols preserved for `samply` /
+# flamegraph work. Use via `cargo {test,build} --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = false

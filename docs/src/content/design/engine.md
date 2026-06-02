@@ -72,7 +72,7 @@ Concurrency is controlled at four levels that compose naturally, replacing any n
 
 ### Four-level hierarchy
 
-**Level 1, global image semaphore** (default: 50). Bounds how many `(tag, target)` pairs are in-flight simultaneously, preventing memory explosion. This is the engine-level `max_concurrent_transfers` config.
+**Level 1, global image semaphore** (default: 10). Bounds how many `(tag, target)` pairs are in-flight simultaneously, preventing memory explosion. This is the engine-level `max_concurrent_transfers` config. The default is derived as `streaming_blob_concurrency / BLOB_CONCURRENCY = 64 / 6`, sized so the per-target HTTP/2 stream budget is not exhausted (typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is 100-128 across major registries).
 
 **Level 2, per-registry aggregate semaphore** (`max_concurrent` per registry, default: 50). Bounds total concurrent HTTP requests to a single registry host across all action types. This is a safety ceiling for connection/memory pressure, not a rate-limit mechanism. With HTTP/2 multiplexing, 100+ concurrent requests share ~6-8 TCP connections, so the aggregate cap is conservative. A request must acquire a permit from this semaphore before proceeding to the per-action AIMD check.
 
