@@ -1699,6 +1699,7 @@ async fn execute_item(
         &item.target.repo,
         &item.target.tag,
         &item.source_data,
+        item.batch_checker.as_deref(),
     )
     .await
     {
@@ -1720,6 +1721,7 @@ async fn execute_item(
                 &item.artifacts_config,
                 retry,
                 referrers_cache,
+                item.batch_checker.as_deref(),
             )
             .await
             {
@@ -2611,13 +2613,69 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
 }
 
 /// Push all manifests (children for indexes, then top-level) to one target.
+///
+/// When `batch_checker` is `Some` AND `retry.manifest_commit_wait` is
+/// non-zero, calls
+/// [`BatchBlobChecker::wait_for_blobs_available`] on every blob the
+/// manifest tree references BEFORE issuing any manifest `PUT`. This
+/// eliminates the `BLOB_UPLOAD_UNKNOWN` race for targets whose consistency
+/// view lags blob upload (ECR specifically) -- it gates the commit on
+/// the authoritative blob-visibility API rather than relying on retry
+/// budget alone. Targets without a batch checker (everything except
+/// ECR) skip the wait entirely; setting `manifest_commit_wait` to
+/// `Duration::ZERO` also skips the wait.
 async fn push_manifests(
     retry: &RetryConfig,
     target_client: &RegistryClient,
     target_repo: &RepositoryName,
     target_tag: &str,
     source_data: &PulledManifest,
+    batch_checker: Option<&dyn BatchBlobChecker>,
 ) -> Result<(), crate::Error> {
+    if let Some(checker) = batch_checker
+        && !retry.manifest_commit_wait.is_zero()
+    {
+        // Extract every leaf-blob digest the manifest references
+        // (config + layers across all children for indexes). Collect
+        // through a HashSet to deduplicate (one clone per digest);
+        // BatchCheckLayerAvailability does not care about order.
+        let digests: Vec<Digest> = blobs_from_manifest(source_data)
+            .iter()
+            .map(|d| d.digest.clone())
+            .collect::<HashSet<Digest>>()
+            .into_iter()
+            .collect();
+
+        if !digests.is_empty() {
+            match checker
+                .wait_for_blobs_available(target_repo, &digests, retry.manifest_commit_wait)
+                .await
+            {
+                Ok(()) => {
+                    debug!(
+                        target_repo = %target_repo,
+                        blob_count = digests.len(),
+                        "BatchCheckLayerAvailability confirms all blobs visible; proceeding with manifest push"
+                    );
+                }
+                Err(e) => {
+                    // Falling through to the retry path is the design
+                    // choice: a stuck consistency view is a real
+                    // condition we want surfaced via the same retry
+                    // accounting as any other transient failure, not a
+                    // hard error here. with_retry will catch any
+                    // residual BLOB_UPLOAD_UNKNOWN below.
+                    warn!(
+                        target_repo = %target_repo,
+                        blob_count = digests.len(),
+                        error = %e,
+                        "BatchCheckLayerAvailability wait did not converge before deadline; proceeding (retry path will catch any BLOB_UPLOAD_UNKNOWN)"
+                    );
+                }
+            }
+        }
+    }
+
     // For index manifests, push all children concurrently by digest.
     // The target registry's AIMD controller gates concurrency naturally.
     // Uses join_all (not try_join_all) so that a transient failure on one
@@ -2678,6 +2736,19 @@ async fn push_manifests(
 /// For each matching artifact: push blobs, then push manifest (preserving
 /// the `subject` reference to the parent).
 ///
+/// When `batch_checker` is present (production: ECR targets), each artifact
+/// runs the same two-phase batch-check protocol as `transfer_image_blobs`
+/// and `push_manifests`:
+/// - Pre-blob: `check_blob_existence` over all artifact blob digests to
+///   skip per-blob HEAD round-trips.
+/// - Pre-manifest: `wait_for_blobs_available` to gate the artifact
+///   manifest PUT on the same ECR consistency view that protects the
+///   main image manifest PUT.
+///
+/// Within an artifact, blobs are pulled+pushed concurrently capped at
+/// [`BLOB_CONCURRENCY`] so multi-blob artifacts (config + layers) don't
+/// serialise unnecessarily.
+///
 /// Returns `Ok(true)` when artifact discovery was skipped due to a transient
 /// error (the image synced but artifacts may be missing at the target).
 #[allow(clippy::too_many_arguments)]
@@ -2690,6 +2761,7 @@ async fn discover_and_sync_artifacts(
     artifacts_config: &ResolvedArtifacts,
     retry: &RetryConfig,
     referrers_cache: &ReferrersCache,
+    batch_checker: Option<&dyn BatchBlobChecker>,
 ) -> Result<bool, crate::Error> {
     if !artifacts_config.enabled {
         return Ok(false);
@@ -2778,38 +2850,126 @@ async fn discover_and_sync_artifacts(
         })?;
 
         // Push artifact blobs.
+        let mut blob_digests: Vec<Digest> = Vec::new();
         if let ManifestKind::Image(ref manifest) = artifact_pull.manifest {
-            let blobs = collect_image_blobs(manifest);
-            for blob in blobs {
-                // HEAD check target first.
-                let exists = target_client
-                    .blob_exists(target_repo, &blob.digest)
+            let blobs: Vec<&Descriptor> = collect_image_blobs(manifest);
+            blob_digests = blobs.iter().map(|b| b.digest.clone()).collect();
+
+            // Batch-check pre-population (mirrors `transfer_image_blobs`).
+            // When a batch checker is configured (production: ECR),
+            // skip per-blob HEAD calls for blobs the batch API already
+            // reports present at the target.
+            let already_present: HashSet<Digest> = match batch_checker {
+                Some(checker) => match checker
+                    .check_blob_existence(target_repo, &blob_digests)
                     .await
-                    .unwrap_or(None);
+                {
+                    Ok(existing) => existing,
+                    Err(e) => {
+                        warn!(
+                            target_repo = %target_repo,
+                            artifact_digest = %artifact_digest_str,
+                            error = %e,
+                            "artifact batch check failed, falling back to per-blob HEAD"
+                        );
+                        HashSet::new()
+                    }
+                },
+                None => HashSet::new(),
+            };
 
-                if exists.is_some() {
-                    continue;
-                }
-
-                // Pull from source, push to target.
+            // Pull+push missing blobs concurrently, capped by BLOB_CONCURRENCY.
+            let blob_sem = Semaphore::new(BLOB_CONCURRENCY);
+            let mut blob_futures = FuturesUnordered::new();
+            for blob in blobs {
                 let blob_digest = blob.digest.clone();
                 let blob_size = blob.size;
-                let stream = with_retry(retry, "artifact blob pull", || {
-                    source_client.blob_pull(source_repo, &blob_digest)
-                })
-                .await
-                .map_err(|e| crate::Error::ArtifactSync {
-                    reference: artifact_digest_str.clone(),
-                    reason: format!("blob pull failed for {blob_digest}: {e}"),
-                })?;
+                let blob_already_present = already_present.contains(&blob.digest);
+                let sem = &blob_sem;
+                let artifact_digest_str = artifact_digest_str.clone();
+                blob_futures.push(async move {
+                    // For batch-already-present blobs, skip the HEAD and
+                    // any pull/push: the batch API already confirmed
+                    // visibility. Otherwise do a HEAD check (covers
+                    // non-batch-checker targets) and only pull+push on
+                    // 404.
+                    if !blob_already_present {
+                        let exists = target_client
+                            .blob_exists(target_repo, &blob_digest)
+                            .await
+                            .unwrap_or(None);
+                        if exists.is_none() {
+                            let _permit = sem.acquire().await.expect("sem closed");
+                            let stream = with_retry(retry, "artifact blob pull", || {
+                                source_client.blob_pull(source_repo, &blob_digest)
+                            })
+                            .await
+                            .map_err(|e| {
+                                crate::Error::ArtifactSync {
+                                    reference: artifact_digest_str.clone(),
+                                    reason: format!("blob pull failed for {blob_digest}: {e}"),
+                                }
+                            })?;
+                            target_client
+                                .blob_push_stream(
+                                    target_repo,
+                                    &blob_digest,
+                                    Some(blob_size),
+                                    stream,
+                                )
+                                .await
+                                .map_err(|e| crate::Error::ArtifactSync {
+                                    reference: artifact_digest_str.clone(),
+                                    reason: format!("blob push failed for {blob_digest}: {e}"),
+                                })?;
+                        }
+                    }
+                    Ok::<(), crate::Error>(())
+                });
+            }
+            // Fail-fast on first error: dropping `blob_futures` cancels
+            // in-flight blob HTTP. This is deliberately asymmetric with
+            // `transfer_image_blobs` (which uses a `cancel: Cell<bool>`
+            // flag so all blobs finish for stats / notify-failed
+            // bookkeeping). Artifacts have no per-blob stats or
+            // cross-image dedup to maintain, and the caller at
+            // `process_one_target` already treats artifact-sync errors
+            // as a non-fatal warning -- so cancelling the rest is
+            // cheaper than draining them after we've already decided
+            // to fail the artifact.
+            while let Some(result) = blob_futures.next().await {
+                result?;
+            }
+        }
 
-                target_client
-                    .blob_push_stream(target_repo, &blob_digest, Some(blob_size), stream)
-                    .await
-                    .map_err(|e| crate::Error::ArtifactSync {
-                        reference: artifact_digest_str.clone(),
-                        reason: format!("blob push failed for {blob_digest}: {e}"),
-                    })?;
+        // Gate the artifact manifest PUT on the target's blob-visibility
+        // view, mirroring `push_manifests`. Same rationale: ECR's
+        // manifest validator can lag blob PUT-201s by hundreds of ms.
+        if let Some(checker) = batch_checker
+            && !retry.manifest_commit_wait.is_zero()
+            && !blob_digests.is_empty()
+        {
+            match checker
+                .wait_for_blobs_available(target_repo, &blob_digests, retry.manifest_commit_wait)
+                .await
+            {
+                Ok(()) => {
+                    debug!(
+                        target_repo = %target_repo,
+                        artifact_digest = %artifact_digest_str,
+                        blob_count = blob_digests.len(),
+                        "BatchCheckLayerAvailability confirms artifact blobs visible; proceeding with manifest push"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        target_repo = %target_repo,
+                        artifact_digest = %artifact_digest_str,
+                        blob_count = blob_digests.len(),
+                        error = %e,
+                        "BatchCheckLayerAvailability wait did not converge before deadline; proceeding (retry path will catch any BLOB_UPLOAD_UNKNOWN)"
+                    );
+                }
             }
         }
 

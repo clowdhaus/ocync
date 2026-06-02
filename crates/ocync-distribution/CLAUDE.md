@@ -96,6 +96,18 @@ Provider names:
 
 `build_registry_client` (`src/cli/mod.rs`) calls `ocync_distribution::install_crypto_provider()` at the top -- production main does this too, but the dispatch entry point is also reached from tests that bypass main, so the install must be idempotent there.
 
+## Perf-harness test hooks on `RegistryClientBuilder`
+
+Three `#[doc(hidden)] pub` builder methods exist on `RegistryClientBuilder` solely for in-repo perf and A/B harnesses (primarily `crates/ocync-sync/tests/perf_profile.rs`):
+
+- `allow_invalid_certs(bool)` -- terminates TLS at a `testcontainers` `registry:2` with a self-signed cert.
+- `force_http1(bool)` -- compares HTTP/2 vs HTTP/1.1 throughput.
+- `http2_adaptive_window(bool)` -- A/Bs HTTP/2 adaptive flow-control window sizing.
+
+These are **intentionally retained**. They look unused from a production-code grep because production code never reaches them (no CLI flag, no env var, no config setting). Removing them as "dead code" deletes load-bearing diagnostic infrastructure: any future perf investigation that needs to reproduce the HTTP/2 stall investigation (or any successor) would have to re-introduce the same plumbing from scratch.
+
+If you're tempted to delete them, search `tests/perf_profile.rs` first -- it references all three by name.
+
 ## Commands
 
 ```bash

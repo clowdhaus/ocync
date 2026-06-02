@@ -59,6 +59,11 @@ pub fn fast_retry() -> RetryConfig {
         initial_backoff: std::time::Duration::from_millis(1),
         max_backoff: std::time::Duration::from_millis(10),
         backoff_multiplier: 2,
+        // Disable the manifest-commit blob-visibility wait in tests so
+        // the engine's behaviour matches what existed before the wait
+        // was introduced. Tests targeting the wait itself construct
+        // their own RetryConfig with a non-zero value.
+        manifest_commit_wait: std::time::Duration::ZERO,
     }
 }
 

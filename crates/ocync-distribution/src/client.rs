@@ -34,6 +34,27 @@ const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
 /// overshoots the budget by 3x and the connection stalls indefinitely.
 const DEFAULT_STREAMING_BLOB_CONCURRENCY: usize = 64;
 
+/// Default per-target byte budget for in-flight buffered blob bodies.
+///
+/// The fallback upload paths (GHCR single-PATCH, GAR monolithic PUT, ACR
+/// chunked PATCH) all buffer the entire blob in memory because the target
+/// registry cannot accept a streaming body. With
+/// [`DEFAULT_STREAMING_BLOB_CONCURRENCY`] = 64 and no byte cap, 64
+/// concurrent 1 GB layers (common for CUDA/ML images) would hold ~64 GB
+/// resident -- enough to OOM most hosts.
+///
+/// A 512 MB budget gives the engine ~32x the steady-state working set of
+/// a typical 16 MB layer image while keeping worst-case memory bounded.
+/// Sized large enough that uploads of multiple modest layers do not
+/// serialise on the semaphore, small enough that a single oversized layer
+/// (e.g. 2 GB GPU runtime) cannot run alongside any other buffered upload.
+const DEFAULT_BUFFERED_BLOB_BYTES: usize = 512 * 1024 * 1024;
+
+/// Fallback acquisition size when a fallback upload has no `known_size`
+/// hint. Equals `blob::MAX_BUFFER_PREALLOC` (the same defensive cap
+/// applied to the initial buffer allocation in `blob::buffer_stream`).
+const BUFFERED_BLOB_BYTES_FALLBACK_RESERVE: u32 = 16 * 1024 * 1024;
+
 /// Sentinel value stored in [`RegistryClient::rate_limit_remaining`] when no
 /// rate-limit header has been observed yet.
 const RATE_LIMIT_UNKNOWN: u64 = u64::MAX;
@@ -48,6 +69,9 @@ pub struct RegistryClientBuilder {
     /// Cap on concurrent long-lived blob streams (push PUTs, pull GETs).
     /// Defaults to [`DEFAULT_STREAMING_BLOB_CONCURRENCY`].
     streaming_blob_concurrency: usize,
+    /// Byte budget for in-flight buffered blob bodies on fallback upload
+    /// paths (GHCR / GAR / ACR). Defaults to [`DEFAULT_BUFFERED_BLOB_BYTES`].
+    buffered_blob_bytes: usize,
     /// Static DNS overrides applied to the internal reqwest client.
     /// Each entry maps a hostname to a fixed socket address, bypassing
     /// DNS resolution. Used by integration tests to route ECR-hostname
@@ -88,6 +112,7 @@ impl RegistryClientBuilder {
             auth: None,
             max_concurrent: DEFAULT_MAX_CONCURRENT_REQUESTS,
             streaming_blob_concurrency: DEFAULT_STREAMING_BLOB_CONCURRENCY,
+            buffered_blob_bytes: DEFAULT_BUFFERED_BLOB_BYTES,
             dns_overrides: Vec::new(),
             accept_invalid_certs: false,
             force_http1: false,
@@ -127,6 +152,53 @@ impl RegistryClientBuilder {
         self.streaming_blob_concurrency = n.max(1);
         self
     }
+
+    /// Set the byte budget for in-flight buffered blob bodies.
+    ///
+    /// Caps total resident memory across the fallback upload paths
+    /// (GHCR / GAR / ACR) that must buffer a blob before sending. Each
+    /// fallback upload acquires permits equal to its declared blob size
+    /// (capped at the budget) and releases them when the upload
+    /// completes; concurrent uploads that would exceed the budget queue.
+    ///
+    /// The streaming PUT default path does not buffer and is unaffected.
+    ///
+    /// `n` is clamped to a minimum of 1 (so the semaphore can always
+    /// make forward progress) but is otherwise honored verbatim. Values
+    /// smaller than [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`] are valid:
+    /// the permit acquisition logic caps requests at the configured
+    /// budget, so unknown-size uploads (which would otherwise request
+    /// the full fallback reserve) still admit on a small-budget client.
+    ///
+    /// Default: [`DEFAULT_BUFFERED_BLOB_BYTES`] (512 MB).
+    pub fn buffered_blob_bytes(mut self, n: usize) -> Self {
+        self.buffered_blob_bytes = n.max(1);
+        self
+    }
+
+    // -----------------------------------------------------------------
+    // Diagnostic / perf-harness test hooks
+    //
+    // The three builder methods below (`allow_invalid_certs`,
+    // `force_http1`, `http2_adaptive_window`) are deliberately kept on
+    // the public builder surface even though no production code path
+    // reaches them. They exist for in-repo perf and A/B harnesses --
+    // primarily `crates/ocync-sync/tests/perf_profile.rs`, which:
+    //   - terminates TLS at a `testcontainers` `registry:2` instance
+    //     with a generated self-signed cert (needs `allow_invalid_certs`),
+    //   - compares HTTP/2 vs HTTP/1.1 throughput by toggling
+    //     `force_http1` between runs,
+    //   - and A/Bs the HTTP/2 adaptive flow-control window via
+    //     `http2_adaptive_window(false)`.
+    //
+    // Each is `#[doc(hidden)]` so it never appears in published rustdoc,
+    // and the production CLI deliberately does NOT expose any flag or
+    // env var that toggles them. They are **intentionally retained** so
+    // future perf investigations can reproduce the experiments without
+    // re-introducing the plumbing from scratch. DO NOT delete as
+    // "unused" -- they are referenced from the perf harness and are
+    // load-bearing for repeatability.
+    // -----------------------------------------------------------------
 
     /// Accept any server certificate without validation.
     ///
@@ -211,6 +283,8 @@ impl RegistryClientBuilder {
             auth: self.auth,
             aimd,
             streaming_blob_sem: Arc::new(Semaphore::new(self.streaming_blob_concurrency)),
+            buffered_blob_bytes_sem: Arc::new(Semaphore::new(self.buffered_blob_bytes)),
+            buffered_blob_bytes_budget: self.buffered_blob_bytes,
             rate_limit_remaining: AtomicU64::new(RATE_LIMIT_UNKNOWN),
         })
     }
@@ -232,6 +306,20 @@ pub struct RegistryClient {
     /// `DEFAULT_STREAMING_BLOB_CONCURRENCY` for the rationale and probed
     /// numbers per registry.
     pub(crate) streaming_blob_sem: Arc<Semaphore>,
+    /// Byte-budget semaphore for in-flight buffered blob bodies. One
+    /// permit == one byte. Acquired by the GHCR / GAR / ACR fallback
+    /// upload paths (which buffer the entire blob) before
+    /// `buffer_stream`, released when the buffered upload completes. The
+    /// total permit count caps cross-call resident bytes regardless of
+    /// per-call concurrency.
+    pub(crate) buffered_blob_bytes_sem: Arc<Semaphore>,
+    /// Configured byte budget passed to `buffered_blob_bytes_sem`. Held
+    /// so [`Self::acquire_buffered_bytes_permit`] can cap a single
+    /// oversized blob at the entire budget instead of permanently
+    /// blocking; without this cap, a blob larger than the configured
+    /// budget would request more permits than the semaphore can ever
+    /// hold.
+    pub(crate) buffered_blob_bytes_budget: usize,
     /// Last observed rate-limit remaining value from response headers.
     ///
     /// Updated atomically on every response that carries a `ratelimit-remaining`
@@ -255,6 +343,68 @@ impl RegistryClient {
             .acquire_owned()
             .await
             .expect("streaming blob semaphore closed")
+    }
+
+    /// Acquire both the per-target count permit and the byte-budget
+    /// permit for a fallback (buffered) blob upload, in the right order.
+    ///
+    /// Returns `(bytes_permit, stream_permit)`. Both are held by the
+    /// caller for the duration of the buffered upload; Rust tuples drop
+    /// fields in declaration order, so `bytes_permit` is released
+    /// FIRST on scope exit. Releasing the contested byte budget ahead
+    /// of the count cap is the right order: a fallback that completes
+    /// freeing 6 MB lets queued buffered uploads admit immediately,
+    /// while the stream-count cap (default 64) is rarely the bottleneck
+    /// at typical workloads. See the per-cap docs on
+    /// [`Self::acquire_streaming_blob_permit`] and
+    /// [`Self::acquire_buffered_bytes_permit`] for the semantics of
+    /// each.
+    pub(crate) async fn acquire_buffered_upload_permits(
+        &self,
+        known_size: Option<u64>,
+    ) -> (OwnedSemaphorePermit, OwnedSemaphorePermit) {
+        let stream_permit = self.acquire_streaming_blob_permit().await;
+        let bytes_permit = self.acquire_buffered_bytes_permit(known_size).await;
+        (bytes_permit, stream_permit)
+    }
+
+    /// Acquire a byte-budget permit for a fallback (buffered) blob upload.
+    ///
+    /// `expected` is the manifest-declared blob size when known, or
+    /// `None` when the upload is driven by an opaque stream (rare in
+    /// practice; manifests always declare layer size). Acquisition rules:
+    ///
+    /// - If `expected` is `Some(n)`: acquire `min(n, budget, u32::MAX)`
+    ///   permits. The cap at `budget` ensures a single oversized blob
+    ///   never requests more permits than the semaphore can hold
+    ///   (which would deadlock the entire fallback path). When this
+    ///   cap fires, the oversized blob occupies the entire budget and
+    ///   other fallback uploads queue until it completes -- correct
+    ///   semantics, even though the actual memory used exceeds the
+    ///   budget for that one upload.
+    /// - If `expected` is `None`: acquire
+    ///   [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`] permits as a defensive
+    ///   reserve. This matches `blob::MAX_BUFFER_PREALLOC` so we
+    ///   conservatively budget the same up-front allocation the buffer
+    ///   itself reserves; actual buffered bytes may exceed this if the
+    ///   blob is larger than the reserve, but the count cap
+    ///   (`streaming_blob_sem`) still bounds total in-flight count.
+    pub(crate) async fn acquire_buffered_bytes_permit(
+        &self,
+        expected: Option<u64>,
+    ) -> OwnedSemaphorePermit {
+        let request = expected.unwrap_or(BUFFERED_BLOB_BYTES_FALLBACK_RESERVE as u64);
+        let budget = self.buffered_blob_bytes_budget as u64;
+        // Cap at the configured budget so a single oversized blob never
+        // requests more permits than the semaphore can hold (which
+        // would deadlock the fallback path). Cap at u32::MAX because
+        // `acquire_many_owned` takes a u32. `.max(1)` guarantees forward
+        // progress when both request and budget round to zero.
+        let permits: u32 = request.min(budget).min(u32::MAX as u64).max(1) as u32;
+        Arc::clone(&self.buffered_blob_bytes_sem)
+            .acquire_many_owned(permits)
+            .await
+            .expect("buffered blob bytes semaphore closed")
     }
 }
 

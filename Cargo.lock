@@ -2388,6 +2388,7 @@ version = "0.5.3"
 dependencies = [
  "bytes",
  "crc32fast",
+ "fastrand",
  "futures-util",
  "globset",
  "http 1.4.1",

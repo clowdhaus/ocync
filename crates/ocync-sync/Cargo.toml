@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 bytes.workspace = true
 crc32fast = { version = "1", default-features = false }
+fastrand.workspace = true
 futures-util.workspace = true
 globset = { version = "0.4", default-features = false }
 http.workspace = true

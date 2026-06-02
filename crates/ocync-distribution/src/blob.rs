@@ -115,9 +115,12 @@ async fn expect_status(
 
 /// Buffer an entire byte stream into a `Vec<u8>`.
 ///
-/// When `capacity_hint` is `Some(n)`, the buffer is pre-allocated to `n` bytes
-/// to avoid reallocations. Used by fallback upload paths (GAR, GHCR, monolithic
-/// threshold) that cannot stream chunks to the registry.
+/// When `capacity_hint` is `Some(n)`, the buffer is pre-allocated to
+/// `min(n, MAX_BUFFER_PREALLOC)` bytes -- the manifest-declared size
+/// is capped at [`MAX_BUFFER_PREALLOC`] because the hint is
+/// attacker-controllable; larger streams grow the `Vec` organically via
+/// amortised doubling. Used by fallback upload paths (GAR, GHCR, ACR)
+/// that cannot stream chunks to the registry.
 async fn buffer_stream(
     stream: impl Stream<Item = Result<Bytes, Error>>,
     capacity_hint: Option<u64>,
@@ -127,7 +130,7 @@ async fn buffer_stream(
     // `with_capacity` plus the per-target streaming-blob concurrency
     // budget multiplies into arbitrary memory pressure.
     let cap = capacity_hint
-        .map(|s| std::cmp::min(s as usize, MAX_BUFFER_PREALLOC))
+        .map(|s| (s as usize).min(MAX_BUFFER_PREALLOC))
         .unwrap_or(0);
     let mut body = Vec::with_capacity(cap);
     futures_util::pin_mut!(stream);
@@ -307,33 +310,49 @@ impl RegistryClient {
 
         // Registry-specific upload fallbacks, detected via the canonical
         // provider detection (handles case-insensitivity, ports, trailing dots).
+        //
+        // A `match` (rather than an `if`-chain) so that adding a new
+        // `ProviderKind` with its own upload quirks fails to compile until
+        // the dispatch is updated, instead of silently falling into the
+        // default streaming-PUT path.
         let provider = self.base_url.host_str().and_then(detect_provider_kind);
-
-        // GHCR fallback: single PATCH (no Content-Range) to avoid the
-        // multi-PATCH corruption bug.
-        if provider == Some(ProviderKind::Ghcr) {
-            return self
-                .blob_push_stream_ghcr(repository, expected_digest, known_size, stream)
-                .await;
-        }
-
-        // GAR fallback: buffer entire stream and use monolithic push.
-        // GAR (Artifact Registry) does not support chunked uploads; legacy
-        // gcr.io hosts support it fine, so only Gar triggers this path.
-        if provider == Some(ProviderKind::Gar) {
-            return self
-                .blob_push_stream_gar(repository, expected_digest, known_size, stream)
-                .await;
-        }
-
-        // ACR fallback: chunked PATCH under ACR's ~20 MB streaming-PUT body
-        // limit. Buffers the stream so the digest can be verified before any
-        // PATCH fires (avoids wasted upload bandwidth on corruption), then
-        // splits into ACR_PATCH_CHUNK_SIZE chunks.
-        if provider == Some(ProviderKind::Acr) {
-            return self
-                .blob_push_stream_acr(repository, expected_digest, known_size, stream)
-                .await;
+        match provider {
+            // GHCR: single PATCH (no Content-Range) to avoid the
+            // multi-PATCH corruption bug.
+            Some(ProviderKind::Ghcr) => {
+                return self
+                    .blob_push_stream_ghcr(repository, expected_digest, known_size, stream)
+                    .await;
+            }
+            // GAR: buffer entire stream and use monolithic push.
+            // GAR (Artifact Registry) does not support chunked uploads;
+            // legacy gcr.io hosts support it fine, so only Gar triggers
+            // this path.
+            Some(ProviderKind::Gar) => {
+                return self
+                    .blob_push_stream_gar(repository, expected_digest, known_size, stream)
+                    .await;
+            }
+            // ACR: chunked PATCH under ACR's ~20 MB streaming-PUT body
+            // limit. Buffers the stream so the digest can be verified
+            // before any PATCH fires (avoids wasted upload bandwidth on
+            // corruption), then splits into ACR_PATCH_CHUNK_SIZE chunks.
+            Some(ProviderKind::Acr) => {
+                return self
+                    .blob_push_stream_acr(repository, expected_digest, known_size, stream)
+                    .await;
+            }
+            // Default: streaming PUT below. Every other ProviderKind
+            // (Ecr, EcrPublic, Gcr, DockerHub, Chainguard) uses the
+            // default path; new variants must be added here explicitly.
+            Some(
+                ProviderKind::Ecr
+                | ProviderKind::EcrPublic
+                | ProviderKind::Gcr
+                | ProviderKind::DockerHub
+                | ProviderKind::Chainguard,
+            )
+            | None => {}
         }
 
         debug!(
@@ -420,11 +439,14 @@ impl RegistryClient {
             host = self.base_url.host_str().unwrap_or("unknown"),
             "GAR does not support chunked uploads; buffering entire blob in memory"
         );
-        // The streaming-blob permit caps how many in-flight buffered blobs
-        // hold memory for this target -- functions both as an h2-stream cap
-        // for short PATCH/PUT requests and as a memory-pressure cap for the
-        // buffered blob body.
-        let _stream_permit = self.acquire_streaming_blob_permit().await;
+        // Two complementary caps for buffered fallback uploads:
+        //   1. `streaming_blob_sem` bounds the *count* of in-flight
+        //      buffered uploads (also doubles as h2-stream cap).
+        //   2. `buffered_blob_bytes_sem` bounds total *bytes* held
+        //      across in-flight buffered uploads.
+        // The helper acquires both in the right order; the returned
+        // tuple drops bytes_permit before stream_permit on scope exit.
+        let _permits = self.acquire_buffered_upload_permits(known_size).await;
         let body = buffer_stream(stream, known_size).await?;
         let actual_digest = self.blob_push(repository, &body).await?;
 
@@ -456,9 +478,9 @@ impl RegistryClient {
             "GHCR multi-PATCH chunked upload is broken; buffering blob for single-PATCH upload"
         );
 
-        // Bounds both h2-stream concurrency (PATCH+PUT are short streams)
-        // and buffered-body memory pressure for this target.
-        let _stream_permit = self.acquire_streaming_blob_permit().await;
+        // Count cap (h2-stream) + byte cap (cross-call memory budget).
+        // See `blob_push_stream_gar` for the layering rationale.
+        let _permits = self.acquire_buffered_upload_permits(known_size).await;
         let scopes = [Scope::pull_push(repository.as_str())];
         let upload_url = self
             .initiate_blob_upload(repository, &scopes, "blob push ghcr initiate")
@@ -539,9 +561,9 @@ impl RegistryClient {
             "ACR rejects streaming PUT above ~20 MB; buffering blob for chunked PATCH upload"
         );
 
-        // Bounds both h2-stream concurrency (each PATCH is its own short
-        // stream) and buffered-body memory pressure for this target.
-        let _stream_permit = self.acquire_streaming_blob_permit().await;
+        // Count cap (h2-stream) + byte cap (cross-call memory budget).
+        // See `blob_push_stream_gar` for the layering rationale.
+        let _permits = self.acquire_buffered_upload_permits(known_size).await;
 
         let raw = buffer_stream(stream, known_size).await?;
         let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
@@ -569,7 +591,7 @@ impl RegistryClient {
         // (PUT-without-prior-PATCH on an empty blob is valid).
         let mut offset: u64 = 0;
         while offset < total_len {
-            let chunk_len = std::cmp::min(ACR_PATCH_CHUNK_SIZE as u64, total_len - offset);
+            let chunk_len = (ACR_PATCH_CHUNK_SIZE as u64).min(total_len - offset);
             let chunk = body.slice((offset as usize)..((offset + chunk_len) as usize));
             let range_end = offset + chunk_len - 1;
             // OCI spec Content-Range format: `{start}-{end}` (NOT RFC 7233).
@@ -1470,5 +1492,155 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, digest);
+    }
+
+    /// Pins the byte-budget queueing contract for the buffered fallback
+    /// paths (GHCR / GAR / ACR).
+    ///
+    /// Two concurrent GHCR uploads, each declaring half the budget plus
+    /// a few bytes, would together exceed the byte budget if they ran
+    /// fully overlapped. The first upload is delayed by the wiremock
+    /// mock (200 ms PATCH/PUT response delay) so the second must wait
+    /// on the byte-budget permit before its own POST initiates.
+    ///
+    /// Asserts: the second upload's POST start time is at least
+    /// `delay` after the first upload's POST start time. This is the
+    /// observable signal that the byte-budget semaphore actually queued
+    /// the second upload behind the first.
+    #[tokio::test]
+    async fn buffered_upload_byte_budget_queues_concurrent_uploads() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use std::time::Instant;
+        use tokio::time::Duration;
+        use url::Url;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+
+        let server = MockServer::start().await;
+        let port = Url::parse(&server.uri()).unwrap().port().unwrap();
+        let post_times: Arc<StdMutex<Vec<Instant>>> = Arc::new(StdMutex::new(Vec::new()));
+        let post_times_clone = Arc::clone(&post_times);
+
+        // Two distinct repos so the POST paths don't collide; record the
+        // POST timestamps so we can verify the ordering after the fact.
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path_regex(r"^/v2/repo-[ab]/blobs/uploads/$"))
+            .respond_with(move |req: &wiremock::Request| {
+                post_times_clone.lock().unwrap().push(Instant::now());
+                // Return a Location pointing back at the same upload path so
+                // the PATCH+PUT chain can complete.
+                let uri_path = req.url.path();
+                let upload_path = format!("{uri_path}upload-id");
+                ResponseTemplate::new(202).append_header("Location", upload_path)
+            })
+            .mount(&server)
+            .await;
+
+        // PATCH delays 200ms so the first upload holds its byte permit
+        // long enough for the second to definitively wait. PUT is fast.
+        let patch_delay = Duration::from_millis(200);
+        Mock::given(matchers::method("PATCH"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/done")
+                    .set_delay(patch_delay),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        // 6 MB blobs: large enough that two together (12 MB) exceed an
+        // 8 MB budget. Use distinct contents per upload so the digests
+        // differ.
+        let blob_a = vec![0xAAu8; 6 * 1024 * 1024];
+        let blob_b = vec![0xBBu8; 6 * 1024 * 1024];
+        let digest_a = test_digest(&blob_a);
+        let digest_b = test_digest(&blob_b);
+
+        // Use the GHCR fallback path (single-PATCH then PUT, buffered),
+        // with a small 8 MB byte budget. Two 6 MB uploads must serialize.
+        let base_url = Url::parse(&format!("http://ghcr.io:{port}")).unwrap();
+        let client = Arc::new(
+            crate::client::RegistryClientBuilder::new(base_url)
+                .resolve(
+                    "ghcr.io",
+                    std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                )
+                .buffered_blob_bytes(8 * 1024 * 1024)
+                .build()
+                .unwrap(),
+        );
+
+        let repo_a = RepositoryName::new("repo-a").unwrap();
+        let repo_b = RepositoryName::new("repo-b").unwrap();
+
+        let client_1 = Arc::clone(&client);
+        let blob_a_clone = blob_a.clone();
+        let digest_a_clone = digest_a.clone();
+        let h1 = tokio::spawn(async move {
+            client_1
+                .blob_push_stream(
+                    &repo_a,
+                    &digest_a_clone,
+                    Some(blob_a_clone.len() as u64),
+                    data_stream(&blob_a_clone, 65536),
+                )
+                .await
+        });
+
+        // Deterministic synchronization (no head-start race): wait until
+        // task 1's POST has been recorded -- by that point task 1 has
+        // already acquired the byte permit, so task 2 is guaranteed to
+        // see the budget pressure when it tries. Polls a shared
+        // `post_times` Mutex on a short cadence and bails out after a
+        // generous deadline if task 1 never makes progress (treating
+        // that as a separate test failure).
+        let wait_for_first_post = async {
+            loop {
+                if !post_times.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait_for_first_post)
+            .await
+            .expect("first upload POST must fire within 5s (task 1 likely stuck)");
+
+        let client_2 = Arc::clone(&client);
+        let blob_b_clone = blob_b.clone();
+        let digest_b_clone = digest_b.clone();
+        let h2 = tokio::spawn(async move {
+            client_2
+                .blob_push_stream(
+                    &repo_b,
+                    &digest_b_clone,
+                    Some(blob_b_clone.len() as u64),
+                    data_stream(&blob_b_clone, 65536),
+                )
+                .await
+        });
+
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+        assert!(r1.is_ok(), "first upload should succeed: {:?}", r1.err());
+        assert!(r2.is_ok(), "second upload should succeed: {:?}", r2.err());
+
+        let times = post_times.lock().unwrap();
+        assert_eq!(times.len(), 2, "both POSTs must have fired");
+        let gap = times[1].duration_since(times[0]);
+        // Task 2 cannot POST until task 1 releases the byte permit,
+        // which happens when task 1's `blob_push_stream` returns
+        // (after PATCH-delay + fast PUT). The lower bound is
+        // patch_delay minus a generous CI margin (100 ms) since we
+        // already eliminated the head-start race above.
+        let lower_bound = patch_delay.saturating_sub(Duration::from_millis(100));
+        assert!(
+            gap >= lower_bound,
+            "second POST started after only {gap:?}; expected the byte budget to queue it for at least ~{lower_bound:?} behind the first (patch_delay = {patch_delay:?})"
+        );
     }
 }
