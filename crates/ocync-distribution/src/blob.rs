@@ -1,9 +1,13 @@
 //! Blob operations - existence checks, pull, push, mount, and upload management.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, LOCATION};
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, warn};
 
 use crate::aimd::RegistryAction;
@@ -14,6 +18,23 @@ use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
 use crate::spec::RepositoryName;
+
+/// Stream wrapper that holds a streaming-blob semaphore permit for the
+/// lifetime of the inner stream. Used by [`RegistryClient::blob_pull`] to
+/// release the permit when the caller has fully consumed the response
+/// body, not when `blob_pull` itself returns.
+struct PermitStream<S> {
+    inner: S,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<S: Stream + Unpin> Stream for PermitStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
 
 /// Content type for raw blob data in OCI upload requests.
 const OCTET_STREAM: &str = "application/octet-stream";
@@ -119,17 +140,23 @@ impl RegistryClient {
     /// Pull a blob as a streaming response.
     ///
     /// Issues a GET request to `/v2/{repository}/blobs/{digest}` and returns
-    /// a byte stream for the response body.
+    /// a byte stream for the response body. The streaming-blob semaphore
+    /// is acquired before the GET and held by the returned stream until it
+    /// is fully consumed, bounding concurrent long-lived h2 streams.
     pub async fn blob_pull(
         &self,
         repository: &RepositoryName,
         digest: &Digest,
     ) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>> + 'static, Error> {
+        let permit = self.acquire_streaming_blob_permit().await;
         let path = blob_path(digest);
         let resp = self
             .get(repository, &path, None, RegistryAction::BlobRead)
             .await?;
-        Ok(resp.bytes_stream())
+        Ok(PermitStream {
+            inner: resp.bytes_stream(),
+            _permit: permit,
+        })
     }
 
     /// Attempt a cross-repository blob mount.
@@ -243,6 +270,11 @@ impl RegistryClient {
     where
         E: Into<Error> + Send,
     {
+        // Bound concurrent long-lived h2 streams. Held for the entire
+        // function (POST + PUT/PATCH); the POST is fast so the dominant
+        // hold time is the streaming PUT body. Dropped at function return.
+        let _stream_permit = self.acquire_streaming_blob_permit().await;
+
         // Map stream errors to our Error type at the boundary so all
         // internal code works uniformly with `Result<Bytes, Error>`.
         let stream = stream.map(|r| r.map_err(Into::into));

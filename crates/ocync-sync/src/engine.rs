@@ -717,7 +717,20 @@ struct PromoteContext<'a> {
 }
 
 /// Default cap for concurrent image transfers (Level 1: global image semaphore).
-pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 50;
+///
+/// Derivation: per-target `RegistryClient::streaming_blob_sem` caps long-lived
+/// HTTP/2 blob streams at 64 (the lowest-common-denominator under registry
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` of 100-128 minus metadata headroom).
+/// With [`BLOB_CONCURRENCY`] = 6 per image, an image-level cap of 10 gives
+/// 10 * 6 = 60 streaming attempts at saturation -- fits the 64-stream budget
+/// without thrashing on the semaphore. Higher image counts only help when
+/// most images skip / mount (no streaming), which is a workload-specific
+/// override the user can set in config.
+///
+/// Prior value of 50 was picked before we measured registry stream limits;
+/// at 50 * 6 = 300 streams it deadlocks HTTP/2 against every registry we
+/// probed (see `DEFAULT_STREAMING_BLOB_CONCURRENCY` in `ocync-distribution`).
+pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 10;
 
 /// Maximum concurrent blob transfers within a single image.
 ///
@@ -726,9 +739,8 @@ pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 50;
 /// simultaneous blob uploads/downloads per image while allowing the global
 /// semaphore to independently control total in-flight image tasks.
 ///
-/// Matches skopeo's default (6). Higher values risk approaching ECR's
-/// `InitiateLayerUpload` limit (100 TPS shared across all images).
-/// Candidate for `SyncEngine` builder configuration if workloads need tuning.
+/// Matches skopeo's default (6). The cross-image streaming budget is bounded
+/// independently by `RegistryClient::streaming_blob_sem` (default 64).
 const BLOB_CONCURRENCY: usize = 6;
 
 /// Default shutdown drain deadline in seconds.

@@ -123,6 +123,12 @@ fn make_client(url: Url, accept_invalid_certs: bool) -> Arc<RegistryClient> {
     if std::env::var("OCYNC_PROFILE_H2_ADAPTIVE").ok().as_deref() == Some("0") {
         builder = builder.http2_adaptive_window(false);
     }
+    if let Some(cap) = std::env::var("OCYNC_PROFILE_STREAM_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        builder = builder.streaming_blob_concurrency(cap);
+    }
     Arc::new(builder.build().expect("RegistryClient"))
 }
 

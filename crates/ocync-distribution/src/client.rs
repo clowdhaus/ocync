@@ -1,9 +1,11 @@
 //! HTTP client for a single OCI registry endpoint.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::StatusCode;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::aimd::{AimdController, RegistryAction};
@@ -13,6 +15,24 @@ use crate::spec::{RegistryAuthority, RepositoryName};
 
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
 const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
+
+/// Default cap on concurrent long-lived blob streams per registry.
+///
+/// reqwest/hyper opens one HTTP/2 connection per origin and multiplexes
+/// streams over it. Each blob upload (POST + streaming PUT) or pull
+/// (streaming GET) holds an h2 stream open for the duration of the
+/// transfer. Major container registries advertise
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` in the range 100-128
+/// (registry-1.docker.io: 128, ghcr.io: 100, cgr.dev: 100,
+/// us-docker.pkg.dev: 100, public.ecr.aws: 128, quay.io: 128,
+/// mcr.microsoft.com: 100, probed 2026-06-01).
+///
+/// Capping concurrent streaming blobs at 64 leaves 36-64 stream slots
+/// for short-lived metadata operations (manifest HEAD/GET, blob mount POST,
+/// auth refresh) on every registry we've probed. Without this cap, default
+/// `max_concurrent_transfers * BLOB_CONCURRENCY` of 50 * 6 = 300 streams
+/// overshoots the budget by 3x and the connection stalls indefinitely.
+const DEFAULT_STREAMING_BLOB_CONCURRENCY: usize = 64;
 
 /// Sentinel value stored in [`RegistryClient::rate_limit_remaining`] when no
 /// rate-limit header has been observed yet.
@@ -25,6 +45,9 @@ pub struct RegistryClientBuilder {
     url: Url,
     auth: Option<Box<dyn AuthProvider>>,
     max_concurrent: usize,
+    /// Cap on concurrent long-lived blob streams (push PUTs, pull GETs).
+    /// Defaults to [`DEFAULT_STREAMING_BLOB_CONCURRENCY`].
+    streaming_blob_concurrency: usize,
     /// Static DNS overrides applied to the internal reqwest client.
     /// Each entry maps a hostname to a fixed socket address, bypassing
     /// DNS resolution. Used by integration tests to route ECR-hostname
@@ -64,6 +87,7 @@ impl RegistryClientBuilder {
             url,
             auth: None,
             max_concurrent: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            streaming_blob_concurrency: DEFAULT_STREAMING_BLOB_CONCURRENCY,
             dns_overrides: Vec::new(),
             accept_invalid_certs: false,
             force_http1: false,
@@ -82,6 +106,21 @@ impl RegistryClientBuilder {
     /// Set the maximum number of concurrent requests.
     pub fn max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = n;
+        self
+    }
+
+    /// Set the cap on concurrent long-lived blob streams (push / pull).
+    ///
+    /// Each blob upload PUT and blob pull GET holds an HTTP/2 stream open
+    /// for the duration of the transfer. Reqwest/hyper uses one h2
+    /// connection per origin, so this cap must stay under the server's
+    /// advertised `SETTINGS_MAX_CONCURRENT_STREAMS` (typically 100-128 on
+    /// major registries) minus headroom for metadata operations
+    /// (manifest HEAD/GET, blob mount, auth refresh).
+    ///
+    /// Default: [`DEFAULT_STREAMING_BLOB_CONCURRENCY`] (64).
+    pub fn streaming_blob_concurrency(mut self, n: usize) -> Self {
+        self.streaming_blob_concurrency = n.max(1);
         self
     }
 
@@ -167,6 +206,7 @@ impl RegistryClientBuilder {
             http,
             auth: self.auth,
             aimd,
+            streaming_blob_sem: Arc::new(Semaphore::new(self.streaming_blob_concurrency)),
             rate_limit_remaining: AtomicU64::new(RATE_LIMIT_UNKNOWN),
         })
     }
@@ -181,6 +221,13 @@ pub struct RegistryClient {
     pub(crate) http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
+    /// Cap on concurrent long-lived blob streams (push / pull). Acquired
+    /// at the start of [`Self::blob_push_stream`] and [`Self::blob_pull`]
+    /// to keep the per-connection HTTP/2 stream usage below the server's
+    /// advertised `SETTINGS_MAX_CONCURRENT_STREAMS`. See the constant
+    /// `DEFAULT_STREAMING_BLOB_CONCURRENCY` for the rationale and probed
+    /// numbers per registry.
+    pub(crate) streaming_blob_sem: Arc<Semaphore>,
     /// Last observed rate-limit remaining value from response headers.
     ///
     /// Updated atomically on every response that carries a `ratelimit-remaining`
@@ -188,6 +235,23 @@ pub struct RegistryClient {
     /// [`RATE_LIMIT_UNKNOWN`] until the first such header is seen. The engine
     /// reads this to decide whether to pause discovery (budget circuit breaker).
     rate_limit_remaining: AtomicU64,
+}
+
+impl RegistryClient {
+    /// Acquire a permit gating concurrent long-lived blob streams.
+    ///
+    /// Held by blob push / pull paths for the duration of the streaming
+    /// HTTP/2 body. Released automatically when the returned permit is
+    /// dropped. See [`DEFAULT_STREAMING_BLOB_CONCURRENCY`] for the
+    /// rationale.
+    pub(crate) async fn acquire_streaming_blob_permit(&self) -> OwnedSemaphorePermit {
+        // Sema is never closed for the lifetime of the client; unwrap is
+        // sound.
+        Arc::clone(&self.streaming_blob_sem)
+            .acquire_owned()
+            .await
+            .expect("streaming blob semaphore closed")
+    }
 }
 
 impl std::fmt::Debug for RegistryClient {
