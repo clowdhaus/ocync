@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, LOCATION};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LOCATION};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, warn};
 
@@ -38,6 +38,11 @@ impl<S: Stream + Unpin> Stream for PermitStream<S> {
 
 /// Content type for raw blob data in OCI upload requests.
 const OCTET_STREAM: &str = "application/octet-stream";
+
+/// Per-PATCH chunk size for the ACR upload fallback. ACR rejects
+/// streaming PUT bodies above ~20 MB; 16 MB stays comfortably under that
+/// while keeping the round-trip count low.
+const ACR_PATCH_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
@@ -260,6 +265,11 @@ impl RegistryClient {
     /// **GAR fallback**: Google Artifact Registry does not support chunked
     /// uploads, so hosts ending in `-docker.pkg.dev` buffer the entire stream
     /// and delegate to [`blob_push`](Self::blob_push).
+    ///
+    /// **ACR fallback**: Azure Container Registry rejects streaming PUT bodies
+    /// above ~20 MB. Hosts on `*.azurecr.io` buffer the stream and upload via
+    /// multiple chunked `PATCHes` under [`ACR_PATCH_CHUNK_SIZE`] each, then PUT
+    /// to finalize.
     pub async fn blob_push_stream<E>(
         &self,
         repository: &RepositoryName,
@@ -297,6 +307,16 @@ impl RegistryClient {
         if provider == Some(ProviderKind::Gar) {
             return self
                 .blob_push_stream_gar_fallback(repository, expected_digest, known_size, stream)
+                .await;
+        }
+
+        // ACR fallback: chunked PATCH under ACR's ~20 MB streaming-PUT body
+        // limit. Buffers the stream so the digest can be verified before any
+        // PATCH fires (avoids wasted upload bandwidth on corruption), then
+        // splits into ACR_PATCH_CHUNK_SIZE chunks.
+        if provider == Some(ProviderKind::Acr) {
+            return self
+                .blob_push_stream_acr(repository, expected_digest, known_size, stream)
                 .await;
         }
 
@@ -455,6 +475,108 @@ impl RegistryClient {
                 |headers| {
                     self.http
                         .put(&finalize_url)
+                        .headers(headers)
+                        .query(&[("digest", &digest_str)])
+                        .header(CONTENT_LENGTH, "0")
+                        .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
+                },
+            )
+            .await?;
+        expect_status(resp, StatusCode::CREATED, &self.base_url, repository).await?;
+
+        Ok(expected_digest.clone())
+    }
+
+    /// ACR fallback: chunked PATCH under Azure Container Registry's
+    /// ~20 MB streaming-PUT body limit.
+    ///
+    /// Buffers the full stream so the digest can be verified before any
+    /// PATCH is sent (avoiding wasted bandwidth on corruption), then
+    /// uploads via [`ACR_PATCH_CHUNK_SIZE`]-byte PATCH requests with the
+    /// OCI Content-Range format `{start}-{end}` (NOT RFC 7233), followed
+    /// by a PUT to finalize with the digest query param. Each PATCH
+    /// response carries a fresh `Location` header that is used as the
+    /// upload URL for the next PATCH (or the finalize PUT).
+    async fn blob_push_stream_acr(
+        &self,
+        repository: &RepositoryName,
+        expected_digest: &Digest,
+        known_size: Option<u64>,
+        stream: impl Stream<Item = Result<Bytes, Error>>,
+    ) -> Result<Digest, Error> {
+        warn!(
+            repository = repository.as_str(),
+            "ACR rejects streaming PUT above ~20 MB; buffering blob for chunked PATCH upload"
+        );
+
+        let raw = buffer_stream(stream, known_size).await?;
+        let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
+        if &actual_digest != expected_digest {
+            return Err(Error::DigestMismatch {
+                expected: expected_digest.clone(),
+                actual: actual_digest,
+            });
+        }
+        let total_len = raw.len() as u64;
+        let body = Bytes::from(raw);
+
+        let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
+        let scopes = [Scope::pull_push(repository.as_str())];
+
+        // Initiate.
+        let resp = self
+            .send_with_aimd(
+                RegistryAction::BlobUploadInit,
+                &scopes,
+                "blob push acr initiate",
+                |headers| self.http.post(url.clone()).headers(headers),
+            )
+            .await?;
+        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
+        let mut upload_url = extract_location(&resp, &self.base_url)?;
+
+        // Chunked PATCH.
+        let mut offset: u64 = 0;
+        while offset < total_len {
+            let chunk_len = std::cmp::min(ACR_PATCH_CHUNK_SIZE as u64, total_len - offset);
+            let chunk = body.slice((offset as usize)..((offset + chunk_len) as usize));
+            let range_end = offset + chunk_len - 1;
+            // OCI spec Content-Range format: `{start}-{end}` (NOT RFC 7233).
+            let range_header = format!("{offset}-{range_end}");
+            let chunk_len_str = chunk_len.to_string();
+
+            let resp = self
+                .send_with_aimd(
+                    RegistryAction::BlobUploadChunk,
+                    &scopes,
+                    "blob push acr patch",
+                    |headers| {
+                        self.http
+                            .patch(&upload_url)
+                            .headers(headers)
+                            .header(CONTENT_LENGTH, &chunk_len_str)
+                            .header(CONTENT_RANGE, &range_header)
+                            .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
+                            .body(chunk.clone())
+                    },
+                )
+                .await?;
+            let resp =
+                expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
+            upload_url = extract_location(&resp, &self.base_url)?;
+            offset += chunk_len;
+        }
+
+        // Finalize.
+        let digest_str = expected_digest.to_string();
+        let resp = self
+            .send_with_aimd(
+                RegistryAction::BlobUploadComplete,
+                &scopes,
+                "blob push acr finalize",
+                |headers| {
+                    self.http
+                        .put(&upload_url)
                         .headers(headers)
                         .query(&[("digest", &digest_str)])
                         .header(CONTENT_LENGTH, "0")
@@ -753,6 +875,276 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, digest);
+    }
+
+    /// Stream that owns its bytes (vs. [`data_stream`] which borrows). Used
+    /// by ACR chunked-PATCH tests that allocate larger blobs locally.
+    fn owned_data_stream(
+        data: Vec<u8>,
+        chunk_size: usize,
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + 'static {
+        let body = Bytes::from(data);
+        let mut chunks = Vec::new();
+        let mut offset = 0;
+        while offset < body.len() {
+            let end = std::cmp::min(offset + chunk_size, body.len());
+            chunks.push(Ok(body.slice(offset..end)));
+            offset = end;
+        }
+        futures_util::stream::iter(chunks)
+    }
+
+    /// ACR: small blob (under chunk size) takes the ACR path with one
+    /// PATCH carrying an OCI-format `Content-Range` header
+    /// (`{start}-{end}`, not RFC 7233).
+    #[tokio::test]
+    async fn blob_push_stream_acr_small_blob_single_patch_with_content_range() {
+        let server = wiremock::MockServer::start().await;
+        let data = b"acr blob content fits in one patch";
+        let digest = test_digest(data);
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/myreg/myimg/blobs/uploads/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/myreg/myimg/blobs/uploads/acr-uuid"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // PATCH must carry a Content-Range header in OCI `{start}-{end}`
+        // format. The regex catches off-by-ones and rejects RFC 7233 syntax
+        // (which uses `bytes 0-N/total`).
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path(
+                "/v2/myreg/myimg/blobs/uploads/acr-uuid",
+            ))
+            .and(wiremock::matchers::header_regex(
+                "content-range",
+                r"^0-\d+$",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(202).append_header(
+                "Location",
+                "/v2/myreg/myimg/blobs/uploads/acr-uuid?after-patch",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::query_param(
+                "digest",
+                digest.to_string(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_test_client("myacr.azurecr.io", port);
+        let repo = RepositoryName::new("myreg/myimg").unwrap();
+        let result = client
+            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
+            .await
+            .unwrap();
+        assert_eq!(result, digest);
+    }
+
+    /// ACR: blob larger than `ACR_PATCH_CHUNK_SIZE` splits into multiple
+    /// `PATCHes`, each under the 20 MB ceiling, with increasing
+    /// `Content-Range` offsets.
+    #[tokio::test]
+    async fn blob_push_stream_acr_large_blob_splits_into_chunks() {
+        // 17 MB -- just over the 16 MB chunk size, so we get 2 PATCHes
+        // (one full 16 MB chunk + one 1 MB tail).
+        let data = vec![0xABu8; 17 * 1024 * 1024];
+        let total_len = data.len() as u64;
+        let server = wiremock::MockServer::start().await;
+        let digest = test_digest(&data);
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/proj/img/blobs/uploads/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/proj/img/blobs/uploads/acr-1"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // First chunk: 16 MB at offset 0. Content-Range: 0-16777215.
+        let first_end = ACR_PATCH_CHUNK_SIZE as u64 - 1;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/proj/img/blobs/uploads/acr-1"))
+            .and(wiremock::matchers::header(
+                "content-range",
+                format!("0-{first_end}").as_str(),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/proj/img/blobs/uploads/acr-2"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Second chunk: 1 MB at offset 16 MB.
+        let total_end = total_len - 1;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/proj/img/blobs/uploads/acr-2"))
+            .and(wiremock::matchers::header(
+                "content-range",
+                format!("{}-{total_end}", ACR_PATCH_CHUNK_SIZE).as_str(),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/proj/img/blobs/uploads/acr-3"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/v2/proj/img/blobs/uploads/acr-3"))
+            .and(wiremock::matchers::query_param(
+                "digest",
+                digest.to_string(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_test_client("myacr.azurecr.io", port);
+        let repo = RepositoryName::new("proj/img").unwrap();
+        let result = client
+            .blob_push_stream(
+                &repo,
+                &digest,
+                Some(total_len),
+                owned_data_stream(data, 65536),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, digest);
+    }
+
+    /// `blob_pull` follows 3xx redirects through reqwest's default policy.
+    /// ECR private serves blob bytes via a 307 to a presigned S3 URL; this
+    /// test exercises the same redirect-following path locally.
+    #[tokio::test]
+    async fn blob_pull_follows_307_redirect_to_blob_bytes() {
+        let server = wiremock::MockServer::start().await;
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+        let payload = b"final blob bytes from redirected location";
+        let digest = test_digest(payload);
+        let blob_path_str = format!("/v2/some/repo/blobs/{digest}");
+
+        // First request: 307 with Location pointing at the data path.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(blob_path_str.clone()))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307).append_header("Location", "/blob-data"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Redirected request: serves the actual bytes.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/blob-data"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(payload.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_test_client("localhost", port);
+        let repo = RepositoryName::new("some/repo").unwrap();
+        let stream = client.blob_pull(&repo, &digest).await.unwrap();
+        let body: Vec<u8> = StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .flat_map(|b| b.to_vec())
+            .collect();
+        assert_eq!(body, payload);
+    }
+
+    /// `blob_pull` follows cross-host 307 (e.g. ECR -> S3 presigned URL) and
+    /// reqwest strips the `Authorization` header on the redirected request.
+    /// The S3 URL's signature lives in the query string, so missing Authorization
+    /// is the correct outcome -- forwarding registry credentials to a third-party
+    /// host would leak them.
+    #[tokio::test]
+    async fn blob_pull_cross_host_redirect_strips_authorization() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let registry = wiremock::MockServer::start().await;
+        let backend = wiremock::MockServer::start().await;
+        let registry_port = url::Url::parse(&registry.uri()).unwrap().port().unwrap();
+
+        let payload = b"cross-host bytes";
+        let digest = test_digest(payload);
+        let blob_path_str = format!("/v2/repo/blobs/{digest}");
+
+        // Registry: 307 redirect to the backend's full URL.
+        let backend_url = format!("{}/blob-data", backend.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(blob_path_str.clone()))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307).append_header("Location", backend_url),
+            )
+            .expect(1)
+            .mount(&registry)
+            .await;
+
+        // Backend: assert NO Authorization header present, serve the bytes.
+        let saw_auth = Arc::new(AtomicBool::new(false));
+        let saw_auth_clone = Arc::clone(&saw_auth);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/blob-data"))
+            .respond_with(move |req: &wiremock::Request| {
+                if req.headers.contains_key("authorization") {
+                    saw_auth_clone.store(true, Ordering::SeqCst);
+                }
+                wiremock::ResponseTemplate::new(200).set_body_bytes(payload.to_vec())
+            })
+            .expect(1)
+            .mount(&backend)
+            .await;
+
+        // Use a client with a fake bearer to confirm the header would have
+        // been on the original request had reqwest forwarded it.
+        let base = url::Url::parse(&format!("http://localhost:{registry_port}")).unwrap();
+        let client = crate::client::RegistryClientBuilder::new(base)
+            .resolve(
+                "localhost",
+                std::net::SocketAddr::from(([127, 0, 0, 1], registry_port)),
+            )
+            .auth(crate::auth::static_token::StaticTokenAuth::new(
+                "localhost",
+                "fake-leak-canary-token",
+            ))
+            .build()
+            .unwrap();
+
+        let repo = RepositoryName::new("repo").unwrap();
+        let stream = client.blob_pull(&repo, &digest).await.unwrap();
+        let body: Vec<u8> = StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .flat_map(|b| b.to_vec())
+            .collect();
+        assert_eq!(body, payload);
+        assert!(
+            !saw_auth.load(Ordering::SeqCst),
+            "Authorization header must NOT be forwarded across hosts -- would leak registry credentials to the redirect target"
+        );
     }
 
     /// GHCR: exactly one PATCH regardless of blob size vs `chunk_size`.
