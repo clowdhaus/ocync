@@ -27,7 +27,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - id: filter
         uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         with:
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - if: needs.changes.outputs.rust == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - if: needs.changes.outputs.rust == 'true'
         uses: ./.github/actions/setup-rust
         with:
@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - if: needs.changes.outputs.rust == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - if: needs.changes.outputs.rust == 'true'
         uses: ./.github/actions/setup-rust
         with:
@@ -79,7 +79,7 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
       - if: needs.changes.outputs.rust == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - if: needs.changes.outputs.rust == 'true'
         uses: ./.github/actions/setup-rust
       - if: needs.changes.outputs.rust == 'true'
@@ -98,7 +98,7 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - if: needs.changes.outputs.rust == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - if: needs.changes.outputs.rust == 'true'
         uses: ./.github/actions/setup-rust
       - name: Build release binary
@@ -117,7 +117,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - if: needs.changes.outputs.rust == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - if: needs.changes.outputs.rust == 'true'
         uses: ./.github/actions/setup-rust
       - if: needs.changes.outputs.rust == 'true'
@@ -129,6 +129,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - if: needs.changes.outputs.rust == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - if: needs.changes.outputs.rust == 'true'
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20

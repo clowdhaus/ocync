@@ -40,7 +40,6 @@ skip = [
   { crate = "http-body@0.4" },        # AWS SDK smithy internals still on http-body 0.4
   { crate = "r-efi@5" },              # getrandom 0.3 vs 0.4
   { crate = "shlex@1" },              # aws-lc-fips-sys bindgen (1.3) vs cc 1.2 (2.0)
-  { crate = "wit-bindgen@0.51" },     # getrandom 0.4 (wasip3) vs wit-bindgen 0.57
 ]
 
 [sources]
