@@ -107,7 +107,7 @@ module "tags" {
 
 module "key_pair" {
   source  = "terraform-aws-modules/key-pair/aws"
-  version = "~> 2.0"
+  version = "~> 3.0"
 
   key_name_prefix       = "ocync-bench-"
   create_private_key    = true

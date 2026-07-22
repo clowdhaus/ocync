@@ -35,11 +35,10 @@ skip = [
   { crate = "cpufeatures@0.2" },      # aws-config sso (sha1 0.10) vs chacha20 (RustCrypto 0.11)
   { crate = "crypto-common@0.1" },    # aws-config sso (sha1 0.10) vs chacha20 (RustCrypto 0.11)
   { crate = "digest@0.10" },          # aws-config sso (sha1 0.10) vs chacha20 (RustCrypto 0.11)
-  { crate = "getrandom@0.3" },        # cc/jobserver vs uuid/rand 0.10
   { crate = "http@0.2" },             # AWS SDK smithy internals still on http 0.2
   { crate = "http-body@0.4" },        # AWS SDK smithy internals still on http-body 0.4
-  { crate = "r-efi@5" },              # getrandom 0.3 vs 0.4
   { crate = "shlex@1" },              # aws-lc-fips-sys bindgen (1.3) vs cc 1.2 (2.0)
+  { crate = "syn@2" },                # async-stream / aws-smithy macros (syn 2) vs serde/clap/schemars derives (syn 3)
 ]
 
 [sources]
