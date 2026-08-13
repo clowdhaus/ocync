@@ -6,12 +6,8 @@ FROM cgr.dev/chainguard/rust:latest-dev AS builder
 USER root
 
 # FIPS build dependencies: Go, CMake, Perl (required by aws-lc-fips-sys).
-# GCC 13 is required because aws-lc-fips-sys@0.13.14 (FIPS branch
-# fips-2024-09-27) has a delocator that rejects .data.rel.ro.local sections
-# emitted by GCC 14+. The fix exists upstream (aws/aws-lc#2455) but cannot
-# be cherry-picked without NIST re-certification. Tracked in aws/aws-lc-rs#569.
-RUN apk add --no-cache cmake go perl gcc-13
-ENV CC=gcc-13 CXX=g++-13
+# Go builds the delocator that assembles the FIPS module.
+RUN apk add --no-cache cmake go perl
 
 WORKDIR /src
 COPY . .
