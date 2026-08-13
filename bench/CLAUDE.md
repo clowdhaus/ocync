@@ -127,6 +127,8 @@ cargo xtask bench --tools ocync,dregsy,regsync sync
 
 Managed by Terraform in `bench/terraform/aws/`. `user_data_replace_on_change = true` -- bootstrap changes recreate the instance.
 
+Competitor tool versions are pinned at the top of `user-data.sh`. Bumping one means editing that block, which recreates the instance, so treat the first run afterward as a new baseline rather than comparing it against older records. Two of them are awkward: skopeo's module path is `go.podman.io/skopeo` since v1.23.0, and dregsy tags releases without a `v` prefix so it can only be pinned by pseudo-version.
+
 ```bash
 cd bench/terraform/aws && terraform init && terraform apply   # create
 cd bench/terraform/aws && terraform destroy                    # destroy
