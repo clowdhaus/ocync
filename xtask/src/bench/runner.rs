@@ -59,10 +59,14 @@ pub(crate) struct RunResult {
     pub(crate) timing_path: Option<PathBuf>,
 }
 
+/// Version string recorded when a tool cannot report its own version.
+const UNKNOWN_VERSION: &str = "unknown";
+
 /// Returns the version argument(s) for a given tool.
 ///
-/// `dregsy` uses `--version` (Go flag convention); `regsync` and `ocync`
-/// use the `version` subcommand.
+/// `regsync` and `ocync` use a `version` subcommand. `dregsy` has no version
+/// flag, so it is probed with `--version` purely to confirm the binary runs,
+/// and the probe is expected to exit non-zero.
 fn version_args(tool: Tool) -> &'static [&'static str] {
     match tool {
         Tool::Dregsy => &["--version"],
@@ -70,7 +74,67 @@ fn version_args(tool: Tool) -> &'static [&'static str] {
     }
 }
 
-/// Runs a tool with its version flag and returns a single-line version string.
+/// Whether a tool reports its own version.
+///
+/// `dregsy` has none to report: it takes no version flag, and its release
+/// version is injected by ldflags that `go install` does not set. Every other
+/// tool exits zero from its version subcommand, so a failure there means the
+/// binary is broken rather than merely quiet.
+fn reports_version(tool: Tool) -> bool {
+    match tool {
+        Tool::Dregsy => false,
+        Tool::Regsync | Tool::Ocync => true,
+    }
+}
+
+/// Extracts a single-line version string from a completed version probe.
+///
+/// A non-zero exit yields diagnostic text rather than a version, so it is
+/// never recorded as one. For a tool that reports a version this is an error,
+/// since `check_tool` is the only gate run before the benchmark starts. For a
+/// tool that reports none it is expected, and the probe served only to confirm
+/// the binary runs.
+fn version_from_probe(
+    tool: Tool,
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Result<String, String> {
+    if !success {
+        if reports_version(tool) {
+            let detail = stderr
+                .lines()
+                .chain(stdout.lines())
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("no output")
+                .trim();
+            return Err(format!("{tool} version probe failed: {detail}"));
+        }
+        return Ok(UNKNOWN_VERSION.to_string());
+    }
+
+    // Some tools write the version to stderr, so fall back to it.
+    let raw = if stdout.trim().is_empty() {
+        stderr
+    } else {
+        stdout
+    };
+
+    // Take only the first non-empty line to keep the summary clean.
+    Ok(raw
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(UNKNOWN_VERSION)
+        .trim()
+        .to_string())
+}
+
+/// Runs a tool's version probe and returns a single-line version string.
+///
+/// Errors when the binary cannot be executed, which means it is missing, and
+/// when a tool that reports a version fails to. [`UNKNOWN_VERSION`] is returned
+/// only for a tool that has no version to report, whose pinned version is
+/// recorded in the benchmark instance bootstrap instead.
 pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
     let args = version_args(tool);
     let output = tokio::process::Command::new(tool.binary())
@@ -79,22 +143,10 @@ pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
         .await
         .map_err(|e| format!("failed to run {} {:?}: {}", tool.binary(), args, e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let raw = if !stdout.trim().is_empty() {
-        stdout
-    } else {
-        stderr
-    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Take only the first non-empty line to keep the summary clean.
-    let version = raw
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("unknown")
-        .trim();
-
-    Ok(version.to_string())
+    version_from_probe(tool, output.status.success(), &stdout, &stderr)
 }
 
 /// Builds ocync and bench-proxy in release mode from the given workspace root.
@@ -375,6 +427,65 @@ mod tests {
         assert_eq!(version_args(Tool::Dregsy), &["--version"]);
         assert_eq!(version_args(Tool::Regsync), &["version"]);
         assert_eq!(version_args(Tool::Ocync), &["version"]);
+    }
+
+    /// The exact stderr a `go install` build of dregsy writes for `--version`,
+    /// which earlier runs stored as its version string.
+    const DREGSY_PROBE_STDERR: &str = "time=\"2026-04-26T13:17:46Z\" level=error \
+         msg=\"flag provided but not defined: -version\"\nUsage of dregsy:";
+
+    #[test]
+    fn failed_probe_is_not_recorded_as_a_version() {
+        let version = version_from_probe(Tool::Dregsy, false, "", DREGSY_PROBE_STDERR).unwrap();
+
+        assert_eq!(version, "unknown");
+        assert!(
+            !version.contains("flag provided but not defined"),
+            "diagnostic output leaked into the recorded version: {version}"
+        );
+    }
+
+    #[test]
+    fn failed_probe_errors_for_a_tool_that_reports_a_version() {
+        // check_tool is the only gate before the benchmark runs, so a broken
+        // ocync or regsync must not pass it as an absent version.
+        for tool in [Tool::Ocync, Tool::Regsync] {
+            let err = version_from_probe(tool, false, "", "error: linker not found")
+                .expect_err("a tool that reports a version must fail loudly");
+            assert!(
+                err.contains("version probe failed") && err.contains("linker not found"),
+                "unhelpful error for {tool}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_probe_reads_the_version() {
+        assert_eq!(
+            version_from_probe(Tool::Ocync, true, "ocync 0.6.0\n", "").unwrap(),
+            "ocync 0.6.0"
+        );
+        // regsync pads its output and precedes the tag with a blank line.
+        assert_eq!(
+            version_from_probe(Tool::Regsync, true, "\nVCSTag:     v0.11.5\n", "").unwrap(),
+            "VCSTag:     v0.11.5"
+        );
+    }
+
+    #[test]
+    fn successful_probe_falls_back_to_stderr() {
+        assert_eq!(
+            version_from_probe(Tool::Ocync, true, "   ", "ocync 0.6.0").unwrap(),
+            "ocync 0.6.0"
+        );
+    }
+
+    #[test]
+    fn successful_probe_with_no_output_is_unknown() {
+        assert_eq!(
+            version_from_probe(Tool::Ocync, true, "", "").unwrap(),
+            "unknown"
+        );
     }
 
     #[test]
