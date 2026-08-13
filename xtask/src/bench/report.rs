@@ -305,6 +305,13 @@ pub(crate) struct BenchReport {
     pub(crate) total_tags: usize,
     /// Tool version strings keyed by tool name.
     pub(crate) tool_versions: BTreeMap<String, String>,
+    /// Versions of binaries a tool relays its transfers through, keyed by
+    /// binary name.
+    ///
+    /// Kept apart from [`Self::tool_versions`] because these are not
+    /// benchmarked tools and must not become columns in the metric tables.
+    #[serde(default)]
+    pub(crate) relay_versions: BTreeMap<String, String>,
     /// Per-scenario results.
     pub(crate) scenarios: Vec<ScenarioResult>,
     /// Scaling curve data points (empty when the scale scenario was not run).
@@ -420,6 +427,9 @@ fn summary_markdown(report: &BenchReport) -> String {
     out.push_str("## Tool Versions\n\n");
     for (tool, version) in &report.tool_versions {
         out.push_str(&format!("- **{tool}**: {version}\n"));
+    }
+    for (binary, version) in &report.relay_versions {
+        out.push_str(&format!("- **{binary}**: {version} (relay)\n"));
     }
     out.push('\n');
 
@@ -862,6 +872,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
@@ -992,12 +1003,35 @@ mod tests {
     }
 
     #[test]
+    fn relay_versions_are_reported_but_never_become_columns() {
+        let mut report = sample_report();
+        report
+            .relay_versions
+            .insert("skopeo".to_string(), "skopeo version 1.24.0".to_string());
+
+        // A relay is not benchmarked, so it has no run data. Letting it reach
+        // the column list renders an empty column in every metric table.
+        assert!(
+            !tool_columns(&report).contains(&"skopeo".to_string()),
+            "relay binary leaked into metric table columns: {:?}",
+            tool_columns(&report)
+        );
+
+        let md = summary_markdown(&report);
+        assert!(
+            md.contains("**skopeo**: skopeo version 1.24.0 (relay)"),
+            "relay version missing from the versions section"
+        );
+    }
+
+    #[test]
     fn summary_markdown_empty_scenarios_omits_table() {
         let report = BenchReport {
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
             scenarios: vec![],
             scale: vec![],
@@ -1013,6 +1047,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
@@ -1180,6 +1215,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
             scenarios: vec![ScenarioResult {
                 scenario: "Cold sync".to_string(),
@@ -1225,6 +1261,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
             scenarios: vec![ScenarioResult {
                 scenario: "Warm sync (no-op)".to_string(),
@@ -1298,6 +1335,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 42,
             total_tags: 55,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
@@ -1393,6 +1431,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 42,
             total_tags: 55,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
@@ -1452,6 +1491,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 42,
             total_tags: 55,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
@@ -1534,6 +1574,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 39,
             total_tags: 51,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
             scenarios: vec![
                 ScenarioResult {
@@ -1593,6 +1634,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 39,
             total_tags: 51,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
             scenarios: vec![ScenarioResult {
                 scenario: "Warm sync (no-op)".to_string(),
@@ -1626,6 +1668,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([
                 ("ocync".into(), "0.1.0".into()),
                 ("dregsy".into(), "0.5.0".into()),
@@ -1684,6 +1727,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("dregsy".into(), "0.5.0".into())]),
             scenarios: vec![ScenarioResult {
                 scenario: "Cold sync".into(),
@@ -1717,6 +1761,7 @@ mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".into(), "0.1.0".into())]),
             scenarios: vec![ScenarioResult {
                 scenario: "Cold sync".into(),
