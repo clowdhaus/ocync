@@ -74,6 +74,22 @@ fn unknown_string() -> String {
     "unknown".to_string()
 }
 
+/// Reads an instance metadata field, warning when it cannot be resolved.
+///
+/// `read_imds` returns `None` for an absent curl, an unreachable metadata
+/// service and a non-UTF-8 body alike, and the run log is never persisted, so
+/// the warning is the operator's only signal that a comparability anchor is
+/// missing from the record.
+fn imds_or_unknown(path: &str) -> String {
+    read_imds(path).unwrap_or_else(|| {
+        eprintln!(
+            "WARNING: instance metadata {path} unavailable, recording \"unknown\". \
+             Runs cannot be compared on it."
+        );
+        unknown_string()
+    })
+}
+
 /// Corpus size metadata.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct CorpusInfo {
@@ -192,9 +208,13 @@ impl InstanceInfo {
     /// `describe-instance-types` provides authoritative CPU, memory,
     /// and network specs. Falls back to `"unknown"` / 0 outside EC2.
     pub(crate) fn collect() -> Self {
-        let instance_type = read_imds("instance-type").unwrap_or_else(|| "unknown".into());
-        let region = read_imds("placement/region").unwrap_or_else(|| "unknown".into());
-        let image_id = read_imds("ami-id").unwrap_or_else(|| "unknown".into());
+        // Announced rather than silently recorded: the image and instance type
+        // are what decide whether two runs are comparable, and a bare
+        // "unknown" in the archive is indistinguishable from an older record
+        // that predates the field.
+        let instance_type = imds_or_unknown("instance-type");
+        let region = imds_or_unknown("placement/region");
+        let image_id = imds_or_unknown("ami-id");
 
         // Query DescribeInstanceTypes for authoritative hardware specs.
         let (arch, cpu_manufacturer, vcpus, memory_mib, network_performance) =
@@ -453,8 +473,10 @@ fn summary_markdown(report: &BenchReport) -> String {
     for (tool, version) in &report.tool_versions {
         out.push_str(&format!("- **{tool}**: {version}\n"));
     }
+    // The marker leads, since a version can now carry a parenthesised reason
+    // and a trailing "(relay)" would read as part of it.
     for (binary, version) in &report.relay_versions {
-        out.push_str(&format!("- **{binary}**: {version} (relay)\n"));
+        out.push_str(&format!("- **{binary}** (relay): {version}\n"));
     }
     out.push('\n');
 
@@ -1043,9 +1065,11 @@ mod tests {
             tool_columns(&report)
         );
 
+        // The marker leads, so a version carrying a parenthesised reason does
+        // not read as though "(relay)" were part of that reason.
         let md = summary_markdown(&report);
         assert!(
-            md.contains("**skopeo**: skopeo version 1.24.0 (relay)"),
+            md.contains("**skopeo** (relay): skopeo version 1.24.0"),
             "relay version missing from the versions section"
         );
     }
