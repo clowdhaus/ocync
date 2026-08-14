@@ -299,12 +299,19 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let ecr_client = ecr::client().await;
     ecr::validate_credentials(&ecr_client).await?;
 
-    // Check each tool binary and collect versions.
+    // Check each tool binary and collect versions, along with any binary a tool
+    // relays its transfers through, whose version moves that tool's numbers.
     let mut tool_versions: BTreeMap<String, String> = BTreeMap::new();
+    let mut relay_versions: BTreeMap<String, String> = BTreeMap::new();
     for &tool in &tools {
         let version = runner::check_tool(tool).await?;
         eprintln!("  {}: {version}", tool);
         tool_versions.insert(tool.to_string(), version);
+
+        for (binary, version) in runner::check_relays(tool).await? {
+            eprintln!("  {binary}: {version} (relay)");
+            relay_versions.insert(binary, version);
+        }
     }
 
     // Build ocync from workspace if it is one of the tools.
@@ -338,6 +345,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         corpus_size: corpus.images.len(),
         total_tags: corpus.total_tags(),
         tool_versions,
+        relay_versions,
         scenarios: Vec::new(),
         scale: Vec::new(),
     };

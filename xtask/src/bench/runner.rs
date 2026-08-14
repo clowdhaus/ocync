@@ -87,28 +87,42 @@ fn reports_version(tool: Tool) -> bool {
     }
 }
 
+/// Binaries a tool delegates its transfers to, whose versions move its numbers.
+///
+/// `dregsy` transfers nothing itself. Its generated config sets `relay: skopeo`,
+/// so skopeo moves every byte dregsy is credited with, and a skopeo change
+/// shifts dregsy's measurements with nothing in dregsy's own version to explain
+/// it. Recorded alongside the benchmarked tools for that reason.
+fn relay_binaries(tool: Tool) -> &'static [&'static str] {
+    match tool {
+        Tool::Dregsy => &["skopeo"],
+        Tool::Regsync | Tool::Ocync => &[],
+    }
+}
+
 /// Extracts a single-line version string from a completed version probe.
 ///
 /// A non-zero exit yields diagnostic text rather than a version, so it is
-/// never recorded as one. For a tool that reports a version this is an error,
-/// since `check_tool` is the only gate run before the benchmark starts. For a
-/// tool that reports none it is expected, and the probe served only to confirm
-/// the binary runs.
+/// never recorded as one. Where the binary reports a version this is an error,
+/// since these probes are the only gate run before the benchmark starts. Where
+/// it reports none it is expected, and the probe served only to confirm the
+/// binary runs.
 fn version_from_probe(
-    tool: Tool,
+    name: &str,
+    reports_version: bool,
     success: bool,
     stdout: &str,
     stderr: &str,
 ) -> Result<String, String> {
     if !success {
-        if reports_version(tool) {
+        if reports_version {
             let detail = stderr
                 .lines()
                 .chain(stdout.lines())
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or("no output")
                 .trim();
-            return Err(format!("{tool} version probe failed: {detail}"));
+            return Err(format!("{name} version probe failed: {detail}"));
         }
         return Ok(UNKNOWN_VERSION.to_string());
     }
@@ -129,24 +143,50 @@ fn version_from_probe(
         .to_string())
 }
 
-/// Runs a tool's version probe and returns a single-line version string.
+/// Runs a version probe and returns a single-line version string.
 ///
 /// Errors when the binary cannot be executed, which means it is missing, and
-/// when a tool that reports a version fails to. [`UNKNOWN_VERSION`] is returned
-/// only for a tool that has no version to report, whose pinned version is
-/// recorded in the benchmark instance bootstrap instead.
-pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
-    let args = version_args(tool);
-    let output = tokio::process::Command::new(tool.binary())
+/// when a binary that reports a version fails to. [`UNKNOWN_VERSION`] is
+/// returned only where there is no version to report, in which case the pinned
+/// version is recorded in the benchmark instance bootstrap instead.
+async fn probe_version(
+    binary: &str,
+    args: &[&str],
+    reports_version: bool,
+) -> Result<String, String> {
+    let output = tokio::process::Command::new(binary)
         .args(args)
         .output()
         .await
-        .map_err(|e| format!("failed to run {} {:?}: {}", tool.binary(), args, e))?;
+        .map_err(|e| format!("failed to run {binary} {args:?}: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    version_from_probe(tool, output.status.success(), &stdout, &stderr)
+    version_from_probe(
+        binary,
+        reports_version,
+        output.status.success(),
+        &stdout,
+        &stderr,
+    )
+}
+
+/// Runs a benchmarked tool's version probe.
+pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
+    probe_version(tool.binary(), version_args(tool), reports_version(tool)).await
+}
+
+/// Returns the version of every binary `tool` relays its transfers through.
+///
+/// Keyed by binary name so the run record names what actually moved the bytes.
+pub(crate) async fn check_relays(tool: Tool) -> Result<Vec<(String, String)>, String> {
+    let mut versions = Vec::new();
+    for &binary in relay_binaries(tool) {
+        let version = probe_version(binary, &["--version"], true).await?;
+        versions.push((binary.to_string(), version));
+    }
+    Ok(versions)
 }
 
 /// Builds ocync and bench-proxy in release mode from the given workspace root.
@@ -436,7 +476,14 @@ mod tests {
 
     #[test]
     fn failed_probe_is_not_recorded_as_a_version() {
-        let version = version_from_probe(Tool::Dregsy, false, "", DREGSY_PROBE_STDERR).unwrap();
+        let version = version_from_probe(
+            "dregsy",
+            reports_version(Tool::Dregsy),
+            false,
+            "",
+            DREGSY_PROBE_STDERR,
+        )
+        .unwrap();
 
         assert_eq!(version, "unknown");
         assert!(
@@ -447,11 +494,17 @@ mod tests {
 
     #[test]
     fn failed_probe_errors_for_a_tool_that_reports_a_version() {
-        // check_tool is the only gate before the benchmark runs, so a broken
-        // ocync or regsync must not pass it as an absent version.
+        // These probes are the only gate before the benchmark runs, so a broken
+        // ocync or regsync must not pass as an absent version.
         for tool in [Tool::Ocync, Tool::Regsync] {
-            let err = version_from_probe(tool, false, "", "error: linker not found")
-                .expect_err("a tool that reports a version must fail loudly");
+            let err = version_from_probe(
+                tool.binary(),
+                reports_version(tool),
+                false,
+                "",
+                "error: linker not found",
+            )
+            .expect_err("a tool that reports a version must fail loudly");
             assert!(
                 err.contains("version probe failed") && err.contains("linker not found"),
                 "unhelpful error for {tool}: {err}"
@@ -460,22 +513,43 @@ mod tests {
     }
 
     #[test]
+    fn relay_probe_failure_is_an_error() {
+        // skopeo moves every byte dregsy is credited with, so a broken skopeo
+        // must not be recorded as an absent version either.
+        let err = version_from_probe("skopeo", true, false, "", "skopeo: command failed")
+            .expect_err("a relay binary must fail loudly");
+        assert!(err.contains("skopeo version probe failed"), "{err}");
+    }
+
+    #[test]
+    fn dregsy_relays_through_skopeo() {
+        assert_eq!(relay_binaries(Tool::Dregsy), &["skopeo"]);
+        assert!(relay_binaries(Tool::Ocync).is_empty());
+        assert!(relay_binaries(Tool::Regsync).is_empty());
+    }
+
+    #[test]
     fn successful_probe_reads_the_version() {
         assert_eq!(
-            version_from_probe(Tool::Ocync, true, "ocync 0.6.0\n", "").unwrap(),
+            version_from_probe("ocync", true, true, "ocync 0.6.0\n", "").unwrap(),
             "ocync 0.6.0"
         );
         // regsync pads its output and precedes the tag with a blank line.
         assert_eq!(
-            version_from_probe(Tool::Regsync, true, "\nVCSTag:     v0.11.5\n", "").unwrap(),
+            version_from_probe("regsync", true, true, "\nVCSTag:     v0.11.5\n", "").unwrap(),
             "VCSTag:     v0.11.5"
+        );
+        // skopeo reports cleanly on stdout with a zero exit.
+        assert_eq!(
+            version_from_probe("skopeo", true, true, "skopeo version 1.24.0\n", "").unwrap(),
+            "skopeo version 1.24.0"
         );
     }
 
     #[test]
     fn successful_probe_falls_back_to_stderr() {
         assert_eq!(
-            version_from_probe(Tool::Ocync, true, "   ", "ocync 0.6.0").unwrap(),
+            version_from_probe("ocync", true, true, "   ", "ocync 0.6.0").unwrap(),
             "ocync 0.6.0"
         );
     }
@@ -483,7 +557,7 @@ mod tests {
     #[test]
     fn successful_probe_with_no_output_is_unknown() {
         assert_eq!(
-            version_from_probe(Tool::Ocync, true, "", "").unwrap(),
+            version_from_probe("ocync", true, true, "", "").unwrap(),
             "unknown"
         );
     }
