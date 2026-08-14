@@ -179,10 +179,16 @@ async fn probe_version(
     )
 }
 
+/// Version Go stamps into a binary built from a local working tree.
+///
+/// It names no released artifact, so it is not a usable record of what ran.
+const DEVEL_VERSION: &str = "(devel)";
+
 /// Extracts the module version from `go version -m` output.
 ///
 /// The build info lists one `mod` line holding the main module's path and
-/// version, followed by a `dep` line per dependency.
+/// version, followed by a `dep` line per dependency. Returns `None` for a
+/// binary built from a working tree, whose stamped version identifies nothing.
 fn module_version_from_build_info(output: &str) -> Option<&str> {
     output.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -190,30 +196,71 @@ fn module_version_from_build_info(output: &str) -> Option<&str> {
             return None;
         }
         fields.next()?; // module path
-        fields.next()
+        fields.next().filter(|v| *v != DEVEL_VERSION)
     })
+}
+
+/// Explains why a `go version -m` probe yielded no module version.
+///
+/// The probe runs under `sh`, so a missing Go toolchain and a binary missing
+/// from `PATH` both surface as a non-zero exit rather than a spawn failure.
+/// The tool's own text separates them, so it is passed through verbatim.
+fn no_module_version_reason(success: bool, stdout: &str, stderr: &str) -> String {
+    if success {
+        return "build info carries no released module version".to_string();
+    }
+
+    let detail = stderr
+        .lines()
+        .chain(stdout.lines())
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("no output")
+        .trim();
+    format!("go version -m failed: {detail}")
 }
 
 /// Reads the module version stamped into a Go binary on `PATH`.
 ///
-/// This is the only version several of these tools carry. `go install` sets
-/// none of the ldflags a project's release build uses, so a tool that reports
-/// its version from a linker-injected variable reports a placeholder, and
-/// dregsy has no version flag at all.
-async fn go_module_version(binary: &str) -> Option<String> {
+/// Returns the reason on failure rather than swallowing it, so a caller can
+/// say what it recorded instead. Callers differ: one falls back to asking the
+/// binary, the other records that no version is known.
+async fn go_module_version(binary: &str) -> Result<String, String> {
     let output = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(format!("go version -m \"$(command -v {binary})\""))
         .output()
         .await
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
+        .map_err(|e| format!("could not run sh: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    module_version_from_build_info(&stdout).map(str::to_string)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    match module_version_from_build_info(&stdout) {
+        Some(version) => Ok(version.to_string()),
+        None => Err(no_module_version_reason(
+            output.status.success(),
+            &stdout,
+            &stderr,
+        )),
+    }
+}
+
+/// Resolves the binary a tool is executed as.
+///
+/// ocync runs from the workspace release build rather than `PATH`, since that
+/// is what `build_ocync` just produced. A `PATH` lookup would find whatever
+/// was installed when the instance was created, which can be months older, so
+/// version probes must resolve the same way runs do or the record names a
+/// binary that produced none of the numbers.
+fn tool_path(tool: Tool, workspace_root: &Path) -> std::borrow::Cow<'static, str> {
+    match tool {
+        Tool::Ocync => workspace_root
+            .join("target/release/ocync")
+            .to_string_lossy()
+            .into_owned()
+            .into(),
+        Tool::Dregsy | Tool::Regsync => tool.binary().into(),
+    }
 }
 
 /// Runs a benchmarked tool's version probe.
@@ -223,16 +270,23 @@ async fn go_module_version(binary: &str) -> Option<String> {
 /// fallback keys off the probe reporting nothing rather than off a sentinel
 /// string, so a tool that prints the word `unknown` is still recorded as
 /// having reported it.
-pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
-    if let Some(version) =
-        probe_version(tool.binary(), version_args(tool), reports_version(tool)).await?
+pub(crate) async fn check_tool(tool: Tool, workspace_root: &Path) -> Result<String, String> {
+    let binary = tool_path(tool, workspace_root);
+
+    if let Some(version) = probe_version(&binary, version_args(tool), reports_version(tool)).await?
     {
         return Ok(version);
     }
 
-    Ok(go_module_version(tool.binary())
-        .await
-        .unwrap_or_else(|| UNKNOWN_VERSION.to_string()))
+    match go_module_version(&binary).await {
+        Ok(version) => Ok(version),
+        Err(reason) => {
+            eprintln!(
+                "WARNING: no version for {binary}: {reason}. Recording \"{UNKNOWN_VERSION}\"."
+            );
+            Ok(UNKNOWN_VERSION.to_string())
+        }
+    }
 }
 
 /// Returns the version of every binary `tool` relays its transfers through.
@@ -246,13 +300,20 @@ pub(crate) async fn check_relays(tool: Tool) -> Result<Vec<(String, String)>, St
         // credential helper prints "development" whatever it was built from,
         // because `go install` sets none of its Makefile's ldflags.
         let version = match go_module_version(binary).await {
-            Some(version) => version,
-            // Still probe, so a missing binary fails here rather than midway
-            // through a run. A relay need not accept `--version`, so a
-            // non-zero exit is not itself an error.
-            None => probe_version(binary, &["--version"], false)
-                .await?
-                .unwrap_or_else(|| UNKNOWN_VERSION.to_string()),
+            Ok(version) => version,
+            Err(reason) => {
+                // Still probe, so a missing binary fails here rather than
+                // midway through a run. A relay need not accept `--version`,
+                // so a non-zero exit is not itself an error. Announced,
+                // because this is the weaker source and may be a placeholder.
+                eprintln!(
+                    "WARNING: no module version for {binary}: {reason}. \
+                     Falling back to asking the binary."
+                );
+                probe_version(binary, &["--version"], false)
+                    .await?
+                    .unwrap_or_else(|| UNKNOWN_VERSION.to_string())
+            }
         };
         versions.push((binary.to_string(), version));
     }
@@ -351,16 +412,7 @@ pub(crate) async fn run_tool(
         Tool::Regsync => vec!["once", "-c", &config_str],
     };
 
-    // Use the workspace release binary for ocync (just built by build_ocync),
-    // PATH lookup for external tools (dregsy, regsync).
-    let binary: std::borrow::Cow<'_, str> = match tool {
-        Tool::Ocync => workspace_root
-            .join("target/release/ocync")
-            .to_string_lossy()
-            .into_owned()
-            .into(),
-        _ => tool.binary().into(),
-    };
+    let binary = tool_path(tool, workspace_root);
 
     // For ocync, set OCYNC_TIMING_FILE so the engine writes phase timing JSONL.
     let timing_path = if tool == Tool::Ocync {
@@ -609,6 +661,46 @@ mod tests {
     }
 
     #[test]
+    fn failure_reason_passes_through_the_tools_own_text() {
+        // The probe runs under sh, so a missing Go toolchain and a binary
+        // missing from PATH both arrive as a non-zero exit. Only the tool's
+        // text tells them apart, so it must survive verbatim.
+        let missing_go = no_module_version_reason(false, "", "sh: go: command not found");
+        assert!(missing_go.contains("command not found"), "{missing_go}");
+
+        let missing_binary =
+            no_module_version_reason(false, "", "stat : no such file or directory");
+        assert!(
+            missing_binary.contains("no such file or directory"),
+            "{missing_binary}"
+        );
+
+        // Go writing its diagnostic to stdout must not read as "no output".
+        let on_stdout = no_module_version_reason(false, "some diagnostic", "");
+        assert!(on_stdout.contains("some diagnostic"), "{on_stdout}");
+    }
+
+    #[test]
+    fn failure_reason_distinguishes_a_binary_without_build_info() {
+        let reason = no_module_version_reason(true, "", "");
+        assert!(
+            reason.contains("no released module version"),
+            "a zero-exit probe with no mod line is not a probe failure: {reason}"
+        );
+    }
+
+    #[test]
+    fn locally_built_binary_reports_no_module_version() {
+        // Go stamps (devel) for a build from a working tree. It names no
+        // released artifact, so recording it would give a run's provenance the
+        // same authority as a real version.
+        let devel = "/usr/local/bin/dregsy: go1.26.2\n\
+             \tmod\tgithub.com/xelalexv/dregsy\t(devel)\t\n";
+
+        assert_eq!(module_version_from_build_info(devel), None);
+    }
+
+    #[test]
     fn module_version_absent_without_a_mod_line() {
         // `go version -m` writes nothing to stdout for a non-Go binary, and
         // go_module_version discards stderr, so an empty input is the only
@@ -620,6 +712,21 @@ mod tests {
         let deps_only = "/usr/local/bin/x: go1.26.2\n\
              \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n";
         assert_eq!(module_version_from_build_info(deps_only), None);
+    }
+
+    #[test]
+    fn ocync_is_probed_at_the_binary_the_run_executes() {
+        // A PATH lookup would find the ocync installed when the instance was
+        // built, which can be months older than the one just compiled, and
+        // the record would credit it with HEAD's numbers.
+        let root = Path::new("/w");
+        assert_eq!(
+            tool_path(Tool::Ocync, root),
+            "/w/target/release/ocync",
+            "ocync must resolve to the workspace build, matching run_tool"
+        );
+        assert_eq!(tool_path(Tool::Dregsy, root), "dregsy");
+        assert_eq!(tool_path(Tool::Regsync, root), "regsync");
     }
 
     #[test]
