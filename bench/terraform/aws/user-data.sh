@@ -92,25 +92,16 @@ echo "Go: $(go version)"
 export HOME=/root GOPATH=/root/go GOCACHE=/root/.cache/go-build
 export PATH="/usr/local/go/bin:$GOPATH/bin:$PATH"
 
-# Competitor tool versions. These are pinned rather than floating because
-# bench/results/{registry}.json is compared across runs: a tool that changes
-# version between instance rebuilds makes a metric shift unattributable.
-# Bump deliberately, and treat the first run afterward as a new baseline.
-ECR_CREDENTIAL_HELPER_VERSION="v0.12.0"
-REGCLIENT_VERSION="v0.11.5"
-# skopeo moved its module path to go.podman.io/skopeo at v1.23.0. The github.com
-# path still serves tags, but their go.mod declares the new path, so installing
-# from it fails on a module path mismatch rather than a missing version.
-SKOPEO_VERSION="v1.24.0"
-# dregsy tags releases without the v prefix, so the module proxy cannot resolve
-# them and only serves pseudo-versions. This one is release 0.5.2, whose tag
-# points at commit e92e79a. Re-derive it from the tag when bumping.
-DREGSY_VERSION="v0.0.0-20250317074629-e92e79a50145"
+# Competitor tools install at @latest, so a run compares ocync against what
+# was current when this instance was built. These resolve once, here, not per
+# run: to measure against newer releases, replace the instance. What makes two
+# runs comparable is the record of what each used, which the harness writes
+# into bench/results/{registry}.json.
 
 # ── ECR credential helper ────────────────────────────────────────────────────
 
 echo "--- Installing ECR credential helper"
-go install "github.com/awslabs/amazon-ecr-credential-helper/ecr-login/cli/docker-credential-ecr-login@$${ECR_CREDENTIAL_HELPER_VERSION}"
+go install github.com/awslabs/amazon-ecr-credential-helper/ecr-login/cli/docker-credential-ecr-login@latest
 cp /root/go/bin/docker-credential-ecr-login /usr/local/bin/
 
 mkdir -p /home/ec2-user/.docker
@@ -119,16 +110,21 @@ cat > /home/ec2-user/.docker/config.json <<'DCEOF'
 DCEOF
 chown -R ec2-user:ec2-user /home/ec2-user/.docker
 
-# go install sets none of the ldflags the project's Makefile uses, so the binary
-# reports "development" whatever is pinned. Echo the pin instead.
-echo "ecr-credential-helper: $${ECR_CREDENTIAL_HELPER_VERSION}"
+# `go version -m` reads the module version stamped into the binary, which is
+# the only version several of these report. The credential helper leaves its
+# own version at "development" because go install sets none of the ldflags its
+# Makefile uses, and dregsy has no version flag at all.
+echo "ecr-credential-helper: $(go version -m /usr/local/bin/docker-credential-ecr-login | awk '$1 == "mod" { print $3; exit }')"
 
 # ── skopeo (dregsy transfer backend) ─────────────────────────────────────────
 
 echo "--- Installing skopeo"
+# skopeo moved its module path to go.podman.io/skopeo at v1.23.0. The github.com
+# path still serves tags, but their go.mod declares the new path, so installing
+# from it fails on a module path mismatch rather than a missing version.
 CGO_ENABLED=1 go install \
   -tags "exclude_graphdriver_btrfs containers_image_openpgp" \
-  "go.podman.io/skopeo/cmd/skopeo@$${SKOPEO_VERSION}"
+  go.podman.io/skopeo/cmd/skopeo@latest
 cp /root/go/bin/skopeo /usr/local/bin/skopeo
 
 echo "skopeo: $(skopeo --version 2>&1)"
@@ -136,17 +132,18 @@ echo "skopeo: $(skopeo --version 2>&1)"
 # ── dregsy ────────────────────────────────────────────────────────────────────
 
 echo "--- Installing dregsy"
-go install "github.com/xelalexv/dregsy/cmd/dregsy@$${DREGSY_VERSION}"
+# dregsy tags releases without the v prefix, so the module proxy cannot read
+# them as versions and @latest resolves to a pseudo-version off the default
+# branch rather than to a release.
+go install github.com/xelalexv/dregsy/cmd/dregsy@latest
 cp /root/go/bin/dregsy /usr/local/bin/dregsy
 
-# dregsy has no version flag and injects its version via release-build ldflags,
-# so probing the binary prints a usage dump. Echo the pin instead.
-echo "dregsy: $${DREGSY_VERSION}"
+echo "dregsy: $(go version -m /usr/local/bin/dregsy | awk '$1 == "mod" { print $3; exit }')"
 
 # ── regsync ───────────────────────────────────────────────────────────────────
 
 echo "--- Installing regsync"
-go install "github.com/regclient/regclient/cmd/regsync@$${REGCLIENT_VERSION}"
+go install github.com/regclient/regclient/cmd/regsync@latest
 cp /root/go/bin/regsync /usr/local/bin/regsync
 
 echo "regsync: $(regsync version 2>&1 || true)"

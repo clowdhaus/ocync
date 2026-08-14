@@ -443,7 +443,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             memory_gib: report.instance.memory_mib as f64 / 1024.0,
             network: report.instance.network_performance.clone(),
             region: report.instance.region.clone(),
+            image_id: report.instance.image_id.clone(),
         },
+        relays: report.relay_versions.clone(),
         corpus: report::CorpusInfo {
             images: report.corpus_size,
             tags: report.total_tags,

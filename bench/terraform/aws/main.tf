@@ -35,24 +35,6 @@ locals {
   ebs_iops        = 6000
   ebs_throughput  = 400 # MB/s
   my_ip           = "${trimspace(data.http.my_ip.response_body)}/32"
-
-  # Pinned to an exact image so the kernel and OS packages cannot move between
-  # rebuilds, which would make a benchmark shift unattributable. AL2023
-  # publishes several kernel variants under one release with near-identical
-  # creation timestamps, so matching a release prefix selects between them
-  # arbitrarily rather than merely tracking the newest release.
-  #
-  # kernel-6.1 is the variant AWS ships as the AL2023 default, which the SSM
-  # parameter al2023-ami-kernel-default-x86_64 resolves to. The 6.12 and 6.18
-  # builds are opt-in. Moving to one is a deliberate change to what is measured
-  # on a network-bound benchmark, not a routine refresh.
-  #
-  # AWS deprecates AL2023 images after roughly three months and hides them from
-  # describe-images, so this eventually stops resolving and apply fails. That
-  # failure is the prompt to move to a current image rather than keep launching
-  # one with unpatched kernel and glibc updates. Treat the run after a bump as
-  # a new baseline.
-  ami_name = "al2023-ami-2023.12.20260803.3-kernel-6.1-x86_64"
 }
 
 ################################################################################
@@ -69,20 +51,6 @@ data "http" "my_ip" {
 
 data "aws_availability_zones" "available" {
   state = "available"
-}
-
-data "aws_ami" "al2023" {
-  owners = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = [local.ami_name]
-  }
-
-  filter {
-    name   = "architecture"
-    values = ["x86_64"]
-  }
 }
 
 data "aws_caller_identity" "current" {}
@@ -245,7 +213,18 @@ module "ec2" {
 
   name = "ocync-bench"
 
-  ami           = data.aws_ami.al2023.id
+  # The module resolves the current AL2023 default-kernel release from its own
+  # ami_ssm_parameter default. A name glob is not equivalent: AL2023 ships
+  # several kernel variants under one release with near-identical creation
+  # timestamps, so most_recent over a prefix selects between kernels arbitrarily.
+  #
+  # ami is ForceNew, and AWS advances that parameter as it publishes. Without
+  # this the next apply for any unrelated reason, an operator IP change is
+  # enough, destroys a running instance and its results. New images are picked
+  # up when the instance is next replaced deliberately, and the run record
+  # names the image each run used.
+  ignore_ami_changes = true
+
   instance_type = local.instance_type
   subnet_id     = module.vpc.public_subnets[0]
   key_name      = module.key_pair.key_pair_name
