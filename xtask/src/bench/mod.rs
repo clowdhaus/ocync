@@ -299,12 +299,20 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let ecr_client = ecr::client().await;
     ecr::validate_credentials(&ecr_client).await?;
 
+    // Build ocync first, so its version probe reads the binary the run will
+    // actually execute rather than whatever is on PATH from instance setup.
+    let workspace_root = Path::new(".");
+    if tools.contains(&Tool::Ocync) {
+        eprintln!("bench: building ocync in release mode...");
+        runner::build_ocync(workspace_root).await?;
+    }
+
     // Check each tool binary and collect versions, along with any binary a tool
     // relays its transfers through, whose version moves that tool's numbers.
     let mut tool_versions: BTreeMap<String, String> = BTreeMap::new();
     let mut relay_versions: BTreeMap<String, String> = BTreeMap::new();
     for &tool in &tools {
-        let version = runner::check_tool(tool).await?;
+        let version = runner::check_tool(tool, workspace_root).await?;
         eprintln!("  {}: {version}", tool);
         tool_versions.insert(tool.to_string(), version);
 
@@ -312,12 +320,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             eprintln!("  {binary}: {version} (relay)");
             relay_versions.insert(binary, version);
         }
-    }
-
-    // Build ocync from workspace if it is one of the tools.
-    if tools.contains(&Tool::Ocync) {
-        eprintln!("bench: building ocync in release mode...");
-        runner::build_ocync(Path::new(".")).await?;
     }
 
     // 4. Determine output directory.

@@ -17,10 +17,36 @@ if ! swapon --show | grep -q '/swapfile'; then
   echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
 
+# ── Retry helper ──────────────────────────────────────────────────────────────
+
+# Every network fetch below goes through this. Exhausting the attempts is a
+# hard failure: nothing waits on cloud-init, so `terraform apply` reports
+# success either way, and continuing past a failed fetch turns a clear error
+# here into a confusing missing-binary error when bench-remote runs later.
+retry() {
+  local what="$1"
+  shift
+  local attempt
+  for attempt in 1 2 3; do
+    if "$@"; then
+      return 0
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      echo "  $what attempt $attempt failed, retrying in 15s..."
+      sleep 15
+    fi
+  done
+  echo "ERROR: $what failed after 3 attempts, aborting bootstrap" >&2
+  return 1
+}
+
 # ── System packages ───────────────────────────────────────────────────────────
 
-dnf update -y
-dnf install -y \
+# A cold instance's first mirror contact is the most transient-failure-prone
+# fetch here, and gpgme-devel and openssl-devel are what skopeo's cgo build
+# needs later.
+retry "dnf update" dnf update -y
+retry "dnf install" dnf install -y \
   git \
   cmake \
   gcc \
@@ -47,17 +73,15 @@ chown ec2-user:ec2-user /home/ec2-user/.bashrc
 
 echo "--- Installing Rust via rustup (as ec2-user)"
 
-for attempt in 1 2 3; do
-  if su - ec2-user -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path'; then
-    break
-  fi
-  echo "  rustup attempt $attempt failed, retrying in 15s..."
-  sleep 15
-done
+# pipefail is set inside the su, not inherited from this shell: without it the
+# pipeline's status is the installer's, and curl failing feeds it EOF, which it
+# exits zero on. retry would then report success having installed nothing.
+retry rustup su - ec2-user -c 'set -o pipefail; curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path'
 
 su - ec2-user -c 'echo "export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >> ~/.bashrc'
 
-echo "Rust: $(su - ec2-user -c '/home/ec2-user/.cargo/bin/rustc --version')"
+RUSTC_VERSION="$(su - ec2-user -c '/home/ec2-user/.cargo/bin/rustc --version')"
+echo "Rust: $${RUSTC_VERSION}"
 
 # ── Go ────────────────────────────────────────────────────────────────────────
 
@@ -65,13 +89,7 @@ echo "--- Installing Go 1.26.x"
 GO_VERSION="1.26.2"
 GO_ARCHIVE="go$${GO_VERSION}.linux-amd64.tar.gz"
 
-for attempt in 1 2 3; do
-  if curl -fsSL "https://go.dev/dl/$${GO_ARCHIVE}" -o "/tmp/$${GO_ARCHIVE}"; then
-    break
-  fi
-  echo "  Go download attempt $attempt failed, retrying in 15s..."
-  sleep 15
-done
+retry "Go download" curl -fsSL "https://go.dev/dl/$${GO_ARCHIVE}" -o "/tmp/$${GO_ARCHIVE}"
 tar -C /usr/local -xzf "/tmp/$${GO_ARCHIVE}"
 rm -f "/tmp/$${GO_ARCHIVE}"
 
@@ -86,7 +104,8 @@ EOF
 
 chown ec2-user:ec2-user /home/ec2-user/.bashrc
 
-echo "Go: $(go version)"
+GO_VERSION_LINE="$(go version)"
+echo "Go: $${GO_VERSION_LINE}"
 
 # Go env for root builds (dregsy, regsync, skopeo, ecr-credential-helper)
 export HOME=/root GOPATH=/root/go GOCACHE=/root/.cache/go-build
@@ -101,7 +120,7 @@ export PATH="/usr/local/go/bin:$GOPATH/bin:$PATH"
 # ── ECR credential helper ────────────────────────────────────────────────────
 
 echo "--- Installing ECR credential helper"
-go install github.com/awslabs/amazon-ecr-credential-helper/ecr-login/cli/docker-credential-ecr-login@latest
+retry "ecr-credential-helper install" go install github.com/awslabs/amazon-ecr-credential-helper/ecr-login/cli/docker-credential-ecr-login@latest
 cp /root/go/bin/docker-credential-ecr-login /usr/local/bin/
 
 mkdir -p /home/ec2-user/.docker
@@ -114,7 +133,8 @@ chown -R ec2-user:ec2-user /home/ec2-user/.docker
 # the only version several of these report. The credential helper leaves its
 # own version at "development" because go install sets none of the ldflags its
 # Makefile uses, and dregsy has no version flag at all.
-echo "ecr-credential-helper: $(go version -m /usr/local/bin/docker-credential-ecr-login | awk '$1 == "mod" { print $3; exit }')"
+ECR_HELPER_MOD="$(go version -m /usr/local/bin/docker-credential-ecr-login | grep -m1 -E '^[[:space:]]*mod[[:space:]]' || echo 'build info unavailable')"
+echo "ecr-credential-helper: $${ECR_HELPER_MOD}"
 
 # ── skopeo (dregsy transfer backend) ─────────────────────────────────────────
 
@@ -122,12 +142,13 @@ echo "--- Installing skopeo"
 # skopeo moved its module path to go.podman.io/skopeo at v1.23.0. The github.com
 # path still serves tags, but their go.mod declares the new path, so installing
 # from it fails on a module path mismatch rather than a missing version.
-CGO_ENABLED=1 go install \
+retry "skopeo install" env CGO_ENABLED=1 go install \
   -tags "exclude_graphdriver_btrfs containers_image_openpgp" \
   go.podman.io/skopeo/cmd/skopeo@latest
 cp /root/go/bin/skopeo /usr/local/bin/skopeo
 
-echo "skopeo: $(skopeo --version 2>&1)"
+SKOPEO_VERSION_LINE="$(skopeo --version)"
+echo "skopeo: $${SKOPEO_VERSION_LINE}"
 
 # ── dregsy ────────────────────────────────────────────────────────────────────
 
@@ -135,18 +156,20 @@ echo "--- Installing dregsy"
 # dregsy tags releases without the v prefix, so the module proxy cannot read
 # them as versions and @latest resolves to a pseudo-version off the default
 # branch rather than to a release.
-go install github.com/xelalexv/dregsy/cmd/dregsy@latest
+retry "dregsy install" go install github.com/xelalexv/dregsy/cmd/dregsy@latest
 cp /root/go/bin/dregsy /usr/local/bin/dregsy
 
-echo "dregsy: $(go version -m /usr/local/bin/dregsy | awk '$1 == "mod" { print $3; exit }')"
+DREGSY_MOD="$(go version -m /usr/local/bin/dregsy | grep -m1 -E '^[[:space:]]*mod[[:space:]]' || echo 'build info unavailable')"
+echo "dregsy: $${DREGSY_MOD}"
 
 # ── regsync ───────────────────────────────────────────────────────────────────
 
 echo "--- Installing regsync"
-go install github.com/regclient/regclient/cmd/regsync@latest
+retry "regsync install" go install github.com/regclient/regclient/cmd/regsync@latest
 cp /root/go/bin/regsync /usr/local/bin/regsync
 
-echo "regsync: $(regsync version 2>&1 || true)"
+REGSYNC_VERSION_LINE="$(regsync version)"
+echo "regsync: $${REGSYNC_VERSION_LINE}"
 
 # ── Clean up Go build cache ──────────────────────────────────────────────────
 
@@ -156,17 +179,37 @@ rm -rf /root/go/pkg/mod/cache /root/.cache/go-build
 
 echo "--- Cloning and building ocync (as ec2-user)"
 
+# Cloning is separate from building so it can retry. It clones to a scratch
+# path and moves it into place, so a retry after a partial clone is idempotent
+# without ever deleting an existing checkout: that path holds the git-tracked
+# run-record archive, and re-running this script through `cloud-init clean`
+# is a normal way to retry a bootstrap. The build is not retried, since a
+# compile failure is deterministic and cargo retries its own fetches.
+retry "ocync clone" su - ec2-user -c '
+  set -e
+  rm -rf $HOME/.ocync-clone
+  git clone https://github.com/clowdhaus/ocync.git $HOME/.ocync-clone
+  [ -e $HOME/ocync ] || mv $HOME/.ocync-clone $HOME/ocync
+  rm -rf $HOME/.ocync-clone
+'
+
+# set -e inside the block: without it only the last command's status escapes,
+# so a failed cargo build would be masked by the cp that follows it.
 su - ec2-user -c "
+  set -e
   source \$HOME/.cargo/env
-  git clone https://github.com/clowdhaus/ocync.git \$HOME/ocync
   cd \$HOME/ocync
   cargo build --release --package ocync --package bench-proxy
   cp target/release/ocync \$HOME/.cargo/bin/ocync
   cp target/release/bench-proxy \$HOME/.cargo/bin/bench-proxy
 "
 
-echo "ocync: $(su - ec2-user -c '/home/ec2-user/.cargo/bin/ocync version')"
-echo "bench-proxy: built"
+# Assigned rather than echoed inline: a command substitution inside an echo
+# argument yields echo's status, so set -e can never fire on a failed probe.
+OCYNC_VERSION="$(su - ec2-user -c '/home/ec2-user/.cargo/bin/ocync version')"
+echo "ocync: $${OCYNC_VERSION}"
+BENCH_PROXY_PATH="$(su - ec2-user -c 'command -v /home/ec2-user/.cargo/bin/bench-proxy')"
+echo "bench-proxy: $${BENCH_PROXY_PATH}"
 
 # ── Generate bench-proxy CA and install into system trust store ──────────────
 

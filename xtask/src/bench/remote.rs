@@ -240,8 +240,8 @@ if command -v cloud-init &>/dev/null; then
 fi
 
 if [ ! -d ~/ocync ]; then
-  echo "bench-remote: error: ~/ocync not found after cloud-init. Check user-data logs:"
-  echo "  ssh $USER@$(hostname -I | awk '{{print $1}}') 'sudo cat /var/log/cloud-init-output.log | tail -50'"
+  echo "bench-remote: error: ~/ocync not found after cloud-init. Check the bootstrap log:"
+  echo "  ssh $USER@$(hostname -I | awk '{{print $1}}') 'sudo tail -50 /var/log/user-data.log'"
   exit 1
 fi
 
