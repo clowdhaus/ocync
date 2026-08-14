@@ -77,9 +77,10 @@ fn version_args(tool: Tool) -> &'static [&'static str] {
 /// Whether a tool reports its own version.
 ///
 /// `dregsy` has none to report: it takes no version flag, and its release
-/// version is injected by ldflags that `go install` does not set. Every other
-/// tool exits zero from its version subcommand, so a failure there means the
-/// binary is broken rather than merely quiet.
+/// version is injected by ldflags that `go install` does not set. Its version
+/// comes from the module stamped into the binary instead. Every other tool
+/// exits zero from its version subcommand, so a failure there means the binary
+/// is broken rather than merely quiet.
 fn reports_version(tool: Tool) -> bool {
     match tool {
         Tool::Dregsy => false,
@@ -87,20 +88,29 @@ fn reports_version(tool: Tool) -> bool {
     }
 }
 
-/// Binaries a tool delegates its transfers to, whose versions move its numbers.
+/// Binaries a tool delegates to, whose versions move its numbers.
 ///
 /// `dregsy` transfers nothing itself. Its generated config sets `relay: skopeo`,
 /// so skopeo moves every byte dregsy is credited with, and a skopeo change
 /// shifts dregsy's measurements with nothing in dregsy's own version to explain
-/// it. Recorded alongside the benchmarked tools for that reason.
+/// it.
+///
+/// Both Go tools authenticate to ECR through the credential helper, so a
+/// release of it that changes token caching moves their request counts. ocync
+/// calls the AWS SDK directly and does not use it.
 fn relay_binaries(tool: Tool) -> &'static [&'static str] {
     match tool {
-        Tool::Dregsy => &["skopeo"],
-        Tool::Regsync | Tool::Ocync => &[],
+        Tool::Dregsy => &["skopeo", "docker-credential-ecr-login"],
+        Tool::Regsync => &["docker-credential-ecr-login"],
+        Tool::Ocync => &[],
     }
 }
 
 /// Extracts a single-line version string from a completed version probe.
+///
+/// `Ok(None)` means the binary ran but reported no version, which callers
+/// resolve from the module version stamped into it. That is distinct from the
+/// literal string `unknown`, which a tool could legitimately print.
 ///
 /// A non-zero exit yields diagnostic text rather than a version, so it is
 /// never recorded as one. Where the binary reports a version this is an error,
@@ -113,7 +123,7 @@ fn version_from_probe(
     success: bool,
     stdout: &str,
     stderr: &str,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     if !success {
         if reports_version {
             let detail = stderr
@@ -124,7 +134,7 @@ fn version_from_probe(
                 .trim();
             return Err(format!("{name} version probe failed: {detail}"));
         }
-        return Ok(UNKNOWN_VERSION.to_string());
+        return Ok(None);
     }
 
     // Some tools write the version to stderr, so fall back to it.
@@ -138,22 +148,19 @@ fn version_from_probe(
     Ok(raw
         .lines()
         .find(|l| !l.trim().is_empty())
-        .unwrap_or(UNKNOWN_VERSION)
-        .trim()
-        .to_string())
+        .map(|l| l.trim().to_string()))
 }
 
 /// Runs a version probe and returns a single-line version string.
 ///
 /// Errors when the binary cannot be executed, which means it is missing, and
-/// when a binary that reports a version fails to. [`UNKNOWN_VERSION`] is
-/// returned only where there is no version to report, in which case the pinned
-/// version is recorded in the benchmark instance bootstrap instead.
+/// when a binary that reports a version fails to. `Ok(None)` means the binary
+/// ran but reported no version of its own.
 async fn probe_version(
     binary: &str,
     args: &[&str],
     reports_version: bool,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let output = tokio::process::Command::new(binary)
         .args(args)
         .output()
@@ -172,9 +179,60 @@ async fn probe_version(
     )
 }
 
+/// Extracts the module version from `go version -m` output.
+///
+/// The build info lists one `mod` line holding the main module's path and
+/// version, followed by a `dep` line per dependency.
+fn module_version_from_build_info(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "mod" {
+            return None;
+        }
+        fields.next()?; // module path
+        fields.next()
+    })
+}
+
+/// Reads the module version stamped into a Go binary on `PATH`.
+///
+/// This is the only version several of these tools carry. `go install` sets
+/// none of the ldflags a project's release build uses, so a tool that reports
+/// its version from a linker-injected variable reports a placeholder, and
+/// dregsy has no version flag at all.
+async fn go_module_version(binary: &str) -> Option<String> {
+    let output = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("go version -m \"$(command -v {binary})\""))
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    module_version_from_build_info(&stdout).map(str::to_string)
+}
+
 /// Runs a benchmarked tool's version probe.
+///
+/// Falls back to the binary's stamped module version where the tool reports
+/// none, so a run record names the version that produced its numbers. The
+/// fallback keys off the probe reporting nothing rather than off a sentinel
+/// string, so a tool that prints the word `unknown` is still recorded as
+/// having reported it.
 pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
-    probe_version(tool.binary(), version_args(tool), reports_version(tool)).await
+    if let Some(version) =
+        probe_version(tool.binary(), version_args(tool), reports_version(tool)).await?
+    {
+        return Ok(version);
+    }
+
+    Ok(go_module_version(tool.binary())
+        .await
+        .unwrap_or_else(|| UNKNOWN_VERSION.to_string()))
 }
 
 /// Returns the version of every binary `tool` relays its transfers through.
@@ -183,7 +241,19 @@ pub(crate) async fn check_tool(tool: Tool) -> Result<String, String> {
 pub(crate) async fn check_relays(tool: Tool) -> Result<Vec<(String, String)>, String> {
     let mut versions = Vec::new();
     for &binary in relay_binaries(tool) {
-        let version = probe_version(binary, &["--version"], true).await?;
+        // These are all Go binaries, and the stamped module version names the
+        // artifact exactly. Asking the binary is the weaker source: the
+        // credential helper prints "development" whatever it was built from,
+        // because `go install` sets none of its Makefile's ldflags.
+        let version = match go_module_version(binary).await {
+            Some(version) => version,
+            // Still probe, so a missing binary fails here rather than midway
+            // through a run. A relay need not accept `--version`, so a
+            // non-zero exit is not itself an error.
+            None => probe_version(binary, &["--version"], false)
+                .await?
+                .unwrap_or_else(|| UNKNOWN_VERSION.to_string()),
+        };
         versions.push((binary.to_string(), version));
     }
     Ok(versions)
@@ -485,11 +555,22 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(version, "unknown");
-        assert!(
-            !version.contains("flag provided but not defined"),
-            "diagnostic output leaked into the recorded version: {version}"
+        assert_eq!(
+            version, None,
+            "a failed probe must report no version, not diagnostic text"
         );
+    }
+
+    #[test]
+    fn zero_exit_probe_output_is_taken_verbatim() {
+        // dregsy builds from an unpinned commit, so nothing fixes its exit
+        // code. Were it to start exiting zero, its log line must not be
+        // rescued by a sentinel comparison and recorded as a version.
+        let logged = "time=\"2026-04-26T13:17:46Z\" level=info msg=\"dregsy \"";
+        let version =
+            version_from_probe("dregsy", reports_version(Tool::Dregsy), true, logged, "").unwrap();
+
+        assert_eq!(version, Some(logged.to_string()));
     }
 
     #[test]
@@ -513,36 +594,84 @@ mod tests {
     }
 
     #[test]
-    fn relay_probe_failure_is_an_error() {
-        // skopeo moves every byte dregsy is credited with, so a broken skopeo
-        // must not be recorded as an absent version either.
-        let err = version_from_probe("skopeo", true, false, "", "skopeo: command failed")
-            .expect_err("a relay binary must fail loudly");
-        assert!(err.contains("skopeo version probe failed"), "{err}");
+    fn module_version_is_read_from_build_info() {
+        // Real `go version -m` output. The mod line carries the main module,
+        // and every dep line after it must be ignored.
+        let output = "/usr/local/bin/dregsy: go1.26.2\n\
+             \tpath\tgithub.com/xelalexv/dregsy/cmd/dregsy\n\
+             \tmod\tgithub.com/xelalexv/dregsy\tv0.0.0-20250317074629-e92e79a50145\th1:abc=\n\
+             \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n";
+
+        assert_eq!(
+            module_version_from_build_info(output),
+            Some("v0.0.0-20250317074629-e92e79a50145")
+        );
     }
 
     #[test]
-    fn dregsy_relays_through_skopeo() {
-        assert_eq!(relay_binaries(Tool::Dregsy), &["skopeo"]);
+    fn module_version_absent_without_a_mod_line() {
+        // `go version -m` writes nothing to stdout for a non-Go binary, and
+        // go_module_version discards stderr, so an empty input is the only
+        // shape the parser sees in that case.
+        assert_eq!(module_version_from_build_info(""), None);
+
+        // A Go binary whose build info carries no main module still lists its
+        // dependencies, which must not be mistaken for the module version.
+        let deps_only = "/usr/local/bin/x: go1.26.2\n\
+             \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n";
+        assert_eq!(module_version_from_build_info(deps_only), None);
+    }
+
+    #[test]
+    fn relays_cover_every_binary_that_moves_a_tools_numbers() {
+        // dregsy delegates every transfer to skopeo, and both Go tools reach
+        // ECR through the credential helper. ocync calls the AWS SDK directly.
+        assert_eq!(
+            relay_binaries(Tool::Dregsy),
+            &["skopeo", "docker-credential-ecr-login"]
+        );
+        assert_eq!(
+            relay_binaries(Tool::Regsync),
+            &["docker-credential-ecr-login"]
+        );
         assert!(relay_binaries(Tool::Ocync).is_empty());
-        assert!(relay_binaries(Tool::Regsync).is_empty());
+    }
+
+    #[test]
+    fn a_placeholder_reporting_relay_still_needs_its_module_version() {
+        // The credential helper exits zero and prints "development" whatever
+        // it was built from, so the probe alone would record that as a version
+        // and the module lookup must take precedence.
+        let probed = version_from_probe(
+            "docker-credential-ecr-login",
+            false,
+            true,
+            "docker-credential-ecr-login (github.com/awslabs/amazon-ecr-credential-helper/ecr-login) development\n",
+            "",
+        )
+        .unwrap();
+
+        assert!(
+            probed.is_some_and(|v| v.contains("development")),
+            "probe is expected to yield a placeholder, which is why relays prefer the module version"
+        );
     }
 
     #[test]
     fn successful_probe_reads_the_version() {
         assert_eq!(
             version_from_probe("ocync", true, true, "ocync 0.6.0\n", "").unwrap(),
-            "ocync 0.6.0"
+            Some("ocync 0.6.0".to_string())
         );
         // regsync pads its output and precedes the tag with a blank line.
         assert_eq!(
             version_from_probe("regsync", true, true, "\nVCSTag:     v0.11.5\n", "").unwrap(),
-            "VCSTag:     v0.11.5"
+            Some("VCSTag:     v0.11.5".to_string())
         );
         // skopeo reports cleanly on stdout with a zero exit.
         assert_eq!(
             version_from_probe("skopeo", true, true, "skopeo version 1.24.0\n", "").unwrap(),
-            "skopeo version 1.24.0"
+            Some("skopeo version 1.24.0".to_string())
         );
     }
 
@@ -550,15 +679,15 @@ mod tests {
     fn successful_probe_falls_back_to_stderr() {
         assert_eq!(
             version_from_probe("ocync", true, true, "   ", "ocync 0.6.0").unwrap(),
-            "ocync 0.6.0"
+            Some("ocync 0.6.0".to_string())
         );
     }
 
     #[test]
-    fn successful_probe_with_no_output_is_unknown() {
+    fn successful_probe_with_no_output_reports_nothing() {
         assert_eq!(
             version_from_probe("ocync", true, true, "", "").unwrap(),
-            "unknown"
+            None
         );
     }
 

@@ -127,9 +127,17 @@ cargo xtask bench --tools ocync,dregsy,regsync sync
 
 Managed by Terraform in `bench/terraform/aws/`. `user_data_replace_on_change = true` -- bootstrap changes recreate the instance.
 
-Competitor tool versions are pinned at the top of `user-data.sh`, and the AMI is pinned to an exact name in `locals`. Bumping either means editing that value, which recreates the instance, so treat the first run afterward as a new baseline rather than comparing it against older records. Three of these are awkward: skopeo's module path is `go.podman.io/skopeo` since v1.23.0, dregsy tags releases without a `v` prefix so it can only be pinned by pseudo-version, and AL2023 publishes several kernel variants under one release with near-identical timestamps, so matching a release prefix picks between them arbitrarily rather than tracking the newest release.
+A benchmark run is a point in time, not a fixed rig. Nothing is pinned: competitor tools install at `@latest` and the image is the current AL2023 default release. What makes two runs comparable is the record of what each used, so the run record carries the tool versions, the relay versions and the image id.
+
+**Versions are fixed at instance creation, not per run.** The `go install` calls live in user-data, and `bench-remote` only rebuilds ocync. An instance built in March still runs March's dregsy in September. To benchmark against current competitor releases, replace the instance. Read the versions out of the run record rather than assuming they match what is current today.
+
+Three resolution details are easy to get wrong. skopeo's module path is `go.podman.io/skopeo` since v1.23.0, and the old `github.com/containers/skopeo` path still serves tags whose `go.mod` declares the new path, so installing from it fails on a path mismatch rather than a missing version. `@latest` never crosses a major version boundary under semantic import versioning, so when one of these tags v2 the install silently sticks on the highest v1 until the path gains a `/v2` suffix. And dregsy tags releases without a `v` prefix, so the proxy reads no valid semver and `@latest` resolves to a pseudo-version off the default branch rather than to a release.
+
+Versions are read from the binaries rather than assumed. `go install` sets none of the ldflags a release build uses, so the ECR credential helper reports `development` and dregsy has no version flag at all. Both are recovered with `go version -m`, which reads the module version stamped into the binary.
 
 dregsy transfers nothing itself. Its config sets `relay: skopeo`, so skopeo moves every byte dregsy is credited with, and the run record captures skopeo's version alongside dregsy's for that reason.
+
+The image floats but `ignore_ami_changes` is set, because `ami` is ForceNew: without it, AWS advancing the AL2023 parameter means the next apply for any unrelated reason destroys a running instance and its results. New images arrive when the instance is next replaced deliberately.
 
 ```bash
 cd bench/terraform/aws && terraform init && terraform apply   # create

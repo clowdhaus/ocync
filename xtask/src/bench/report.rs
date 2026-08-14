@@ -28,6 +28,14 @@ pub(crate) struct RunRecord {
     pub(crate) git_ref: String,
     /// Machine and cloud provider metadata.
     pub(crate) machine: MachineInfo,
+    /// Versions of binaries the benchmarked tools relay their transfers
+    /// through, keyed by binary name.
+    ///
+    /// dregsy transfers nothing itself, so skopeo's version moves dregsy's
+    /// numbers. Recorded here rather than only in the per-run summary, which
+    /// is not tracked in git and dies with the instance.
+    #[serde(default)]
+    pub(crate) relays: BTreeMap<String, String>,
     /// Corpus size context.
     pub(crate) corpus: CorpusInfo,
     /// Per-scenario results.
@@ -51,6 +59,19 @@ pub(crate) struct MachineInfo {
     pub(crate) network: String,
     /// Cloud region (e.g. `us-east-1`).
     pub(crate) region: String,
+    /// Machine image the instance booted (e.g. `ami-0742fcde83639b335`), or
+    /// `"unknown"` outside a cloud instance.
+    ///
+    /// The image carries the kernel, glibc and NIC driver, so two runs on
+    /// different images are not directly comparable however identical the rest
+    /// of the metadata looks.
+    #[serde(default = "unknown_string")]
+    pub(crate) image_id: String,
+}
+
+/// Default for record fields added after runs were already archived.
+fn unknown_string() -> String {
+    "unknown".to_string()
 }
 
 /// Corpus size metadata.
@@ -160,6 +181,8 @@ pub(crate) struct InstanceInfo {
     pub(crate) network_performance: String,
     /// AWS region (e.g. `us-east-1`), or `"unknown"` outside EC2.
     pub(crate) region: String,
+    /// AMI the instance booted, or `"unknown"` outside EC2.
+    pub(crate) image_id: String,
 }
 
 impl InstanceInfo {
@@ -171,6 +194,7 @@ impl InstanceInfo {
     pub(crate) fn collect() -> Self {
         let instance_type = read_imds("instance-type").unwrap_or_else(|| "unknown".into());
         let region = read_imds("placement/region").unwrap_or_else(|| "unknown".into());
+        let image_id = read_imds("ami-id").unwrap_or_else(|| "unknown".into());
 
         // Query DescribeInstanceTypes for authoritative hardware specs.
         let (arch, cpu_manufacturer, vcpus, memory_mib, network_performance) =
@@ -210,6 +234,7 @@ impl InstanceInfo {
                 network_performance
             },
             region,
+            image_id,
         }
     }
 }
@@ -863,6 +888,7 @@ mod tests {
             memory_mib: 8192,
             network_performance: "Up to 12.5 Gigabit".into(),
             region: "us-east-1".into(),
+            image_id: "unknown".into(),
         }
     }
 
@@ -1087,7 +1113,9 @@ mod tests {
                 memory_gib: 32.0,
                 network: "Up to 50 Gigabit".into(),
                 region: "us-east-1".into(),
+                image_id: "unknown".into(),
             },
+            relays: BTreeMap::new(),
             corpus: CorpusInfo {
                 images: 42,
                 tags: 55,
@@ -1138,7 +1166,9 @@ mod tests {
                 memory_gib: 32.0,
                 network: "Up to 50 Gigabit".into(),
                 region: "us-east-1".into(),
+                image_id: "unknown".into(),
             },
+            relays: BTreeMap::new(),
             corpus: CorpusInfo {
                 images: 10,
                 tags: 15,
@@ -1172,7 +1202,9 @@ mod tests {
                 memory_gib: 8.0,
                 network: "Up to 12.5 Gigabit".into(),
                 region: "us-east-1".into(),
+                image_id: "unknown".into(),
             },
+            relays: BTreeMap::new(),
             corpus: CorpusInfo { images: 5, tags: 8 },
             scenarios: vec![],
         };
@@ -1201,7 +1233,9 @@ mod tests {
                 memory_gib: 0.0,
                 network: "unknown".into(),
                 region: "unknown".into(),
+                image_id: "unknown".into(),
             },
+            relays: BTreeMap::new(),
             corpus: CorpusInfo { images: 0, tags: 0 },
             scenarios: vec![],
         };
