@@ -218,15 +218,27 @@ fn registry_key(target_registry: &str) -> &'static str {
 }
 
 /// Returns the short git commit hash of HEAD.
+///
+/// This is the record's only anchor from numbers back to the code that
+/// produced them, so a failure is announced rather than silently recorded as
+/// `unknown`. The run log is streamed to the operator and never persisted, so
+/// this warning is the only chance to notice.
 fn git_ref() -> String {
-    std::process::Command::new("git")
+    let resolved = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".into())
+        .map(|s| s.trim().to_string());
+
+    resolved.unwrap_or_else(|| {
+        eprintln!(
+            "WARNING: could not resolve HEAD, so this run cannot be tied to a commit. \
+             Recording the git ref as \"unknown\"."
+        );
+        "unknown".into()
+    })
 }
 
 /// Derives the cloud provider name from a registry key.
@@ -315,11 +327,13 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         let version = runner::check_tool(tool, workspace_root).await?;
         eprintln!("  {}: {version}", tool);
         tool_versions.insert(tool.to_string(), version);
+    }
 
-        for (binary, version) in runner::check_relays(tool).await? {
-            eprintln!("  {binary}: {version} (relay)");
-            relay_versions.insert(binary, version);
-        }
+    // Relays are shared between tools, so they are resolved once over the whole
+    // set rather than per tool.
+    for (binary, version) in runner::check_relays(&tools).await? {
+        eprintln!("  {binary} (relay): {version}");
+        relay_versions.insert(binary, version);
     }
 
     // 4. Determine output directory.

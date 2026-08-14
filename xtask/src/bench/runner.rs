@@ -1,5 +1,6 @@
 //! Tool execution: spawn benchmark tool processes with timing and output capture.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -59,8 +60,70 @@ pub(crate) struct RunResult {
     pub(crate) timing_path: Option<PathBuf>,
 }
 
-/// Version string recorded when a tool cannot report its own version.
+/// Prefix of a recorded version where none could be determined.
+///
+/// Never recorded bare: [`unknown_version`] always appends why, so a check for
+/// a lost-provenance run tests this as a prefix rather than for equality.
 const UNKNOWN_VERSION: &str = "unknown";
+
+/// Longest subprocess diagnostic carried into a recorded version.
+const MAX_REASON_LEN: usize = 160;
+
+/// Trims a subprocess diagnostic to something safe to commit.
+///
+/// These reasons come from local tooling and land in a git-tracked file, so an
+/// absolute path would commit one machine's directory layout to the repository
+/// and an unbounded line would fight the archive's stated aim of staying small
+/// enough to accumulate. Paths are reduced to their final component.
+fn sanitize_reason(reason: &str) -> String {
+    let cleaned: Vec<String> = reason
+        .split_whitespace()
+        .map(|token| match token.rsplit_once('/') {
+            Some((_, name)) if token.starts_with('/') && !name.is_empty() => name.to_string(),
+            _ => token.to_string(),
+        })
+        .collect();
+
+    let mut out = cleaned.join(" ");
+    if out.chars().count() > MAX_REASON_LEN {
+        out = out.chars().take(MAX_REASON_LEN).collect::<String>() + "...";
+    }
+    out
+}
+
+/// Records that no version could be determined, and why.
+///
+/// The reason belongs in the record rather than only on stderr. The archive
+/// outlives the instance, the run log is streamed to the operator's terminal
+/// and never persisted, and a bare `unknown` reads the same for a binary with
+/// no build info, an absent Go toolchain and a working-tree build. A run whose
+/// provenance was lost should say so where the numbers are.
+fn unknown_version(reason: &str) -> String {
+    format!("{UNKNOWN_VERSION} ({})", sanitize_reason(reason))
+}
+
+/// Records a version the binary reported while the authoritative lookup failed.
+///
+/// Several of these print a placeholder when built without their release
+/// ldflags, and a placeholder is indistinguishable from a healthy release build
+/// once it reaches the archive. Carrying the reason keeps that distinguishable.
+fn reported_version(reported: &str, reason: &str) -> String {
+    format!(
+        "{reported} (module version unavailable: {})",
+        sanitize_reason(reason)
+    )
+}
+
+/// Chooses what to record for a relay whose module lookup failed.
+///
+/// Both outcomes carry the lookup failure. Neither may read as a plain
+/// version, since that is what makes a lost record look like a healthy one.
+fn relay_version_after_failed_lookup(reported: Option<String>, reason: &str) -> String {
+    match reported {
+        Some(reported) => reported_version(&reported, reason),
+        None => unknown_version(&format!("{reason}, and --version reported nothing")),
+    }
+}
 
 /// Returns the version argument(s) for a given tool.
 ///
@@ -106,6 +169,18 @@ fn relay_binaries(tool: Tool) -> &'static [&'static str] {
     }
 }
 
+/// First non-blank line of a process's output, trimmed.
+///
+/// Tools pad their output and split it across streams, and only the first
+/// meaningful line is wanted whether it is a version or a diagnostic.
+fn first_line<'a>(primary: &'a str, fallback: &'a str) -> Option<&'a str> {
+    primary
+        .lines()
+        .chain(fallback.lines())
+        .find(|l| !l.trim().is_empty())
+        .map(str::trim)
+}
+
 /// Extracts a single-line version string from a completed version probe.
 ///
 /// `Ok(None)` means the binary ran but reported no version, which callers
@@ -126,29 +201,14 @@ fn version_from_probe(
 ) -> Result<Option<String>, String> {
     if !success {
         if reports_version {
-            let detail = stderr
-                .lines()
-                .chain(stdout.lines())
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("no output")
-                .trim();
+            let detail = first_line(stderr, stdout).unwrap_or("no output");
             return Err(format!("{name} version probe failed: {detail}"));
         }
         return Ok(None);
     }
 
     // Some tools write the version to stderr, so fall back to it.
-    let raw = if stdout.trim().is_empty() {
-        stderr
-    } else {
-        stdout
-    };
-
-    // Take only the first non-empty line to keep the summary clean.
-    Ok(raw
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| l.trim().to_string()))
+    Ok(first_line(stdout, stderr).map(str::to_string))
 }
 
 /// Runs a version probe and returns a single-line version string.
@@ -210,12 +270,7 @@ fn no_module_version_reason(success: bool, stdout: &str, stderr: &str) -> String
         return "build info carries no released module version".to_string();
     }
 
-    let detail = stderr
-        .lines()
-        .chain(stdout.lines())
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("no output")
-        .trim();
+    let detail = first_line(stderr, stdout).unwrap_or("no output");
     format!("go version -m failed: {detail}")
 }
 
@@ -281,20 +336,25 @@ pub(crate) async fn check_tool(tool: Tool, workspace_root: &Path) -> Result<Stri
     match go_module_version(&binary).await {
         Ok(version) => Ok(version),
         Err(reason) => {
-            eprintln!(
-                "WARNING: no version for {binary}: {reason}. Recording \"{UNKNOWN_VERSION}\"."
-            );
-            Ok(UNKNOWN_VERSION.to_string())
+            eprintln!("WARNING: no version for {binary}: {reason}");
+            Ok(unknown_version(&reason))
         }
     }
 }
 
-/// Returns the version of every binary `tool` relays its transfers through.
+/// Returns the version of every binary the given tools relay through.
 ///
 /// Keyed by binary name so the run record names what actually moved the bytes.
-pub(crate) async fn check_relays(tool: Tool) -> Result<Vec<(String, String)>, String> {
+/// Takes the whole tool set because relays are shared: probing per tool would
+/// read the credential helper's build info twice and warn twice about it.
+pub(crate) async fn check_relays(tools: &[Tool]) -> Result<Vec<(String, String)>, String> {
+    let binaries: BTreeSet<&'static str> = tools
+        .iter()
+        .flat_map(|&tool| relay_binaries(tool).iter().copied())
+        .collect();
+
     let mut versions = Vec::new();
-    for &binary in relay_binaries(tool) {
+    for binary in binaries {
         // These are all Go binaries, and the stamped module version names the
         // artifact exactly. Asking the binary is the weaker source: the
         // credential helper prints "development" whatever it was built from,
@@ -302,17 +362,15 @@ pub(crate) async fn check_relays(tool: Tool) -> Result<Vec<(String, String)>, St
         let version = match go_module_version(binary).await {
             Ok(version) => version,
             Err(reason) => {
+                eprintln!("WARNING: no module version for {binary}: {reason}");
+
                 // Still probe, so a missing binary fails here rather than
                 // midway through a run. A relay need not accept `--version`,
-                // so a non-zero exit is not itself an error. Announced,
-                // because this is the weaker source and may be a placeholder.
-                eprintln!(
-                    "WARNING: no module version for {binary}: {reason}. \
-                     Falling back to asking the binary."
-                );
-                probe_version(binary, &["--version"], false)
-                    .await?
-                    .unwrap_or_else(|| UNKNOWN_VERSION.to_string())
+                // so a non-zero exit is not itself an error. Either way the
+                // reason is carried, since what the binary reports may be a
+                // placeholder that reads like a healthy release build.
+                let reported = probe_version(binary, &["--version"], false).await?;
+                relay_version_after_failed_lookup(reported, &reason)
             }
         };
         versions.push((binary.to_string(), version));
@@ -658,6 +716,96 @@ mod tests {
             module_version_from_build_info(output),
             Some("v0.0.0-20250317074629-e92e79a50145")
         );
+    }
+
+    #[test]
+    fn an_unknown_version_records_why() {
+        // The archive outlives the instance and the run log is never
+        // persisted, so a bare "unknown" would leave a lost-provenance run
+        // indistinguishable from an absent Go toolchain months later. The
+        // exact shape is asserted because bench/CLAUDE.md documents it.
+        assert_eq!(
+            unknown_version("sh: go: command not found"),
+            "unknown (sh: go: command not found)"
+        );
+    }
+
+    #[test]
+    fn neither_relay_outcome_reads_as_a_plain_version() {
+        // Whichever way the fallback goes, the record must show that the
+        // authoritative lookup failed. A bare "development" is what makes a
+        // lost record indistinguishable from a healthy release build.
+        let reason = "sh: go: command not found";
+
+        let answered = relay_version_after_failed_lookup(
+            Some("docker-credential-ecr-login (...) development".to_string()),
+            reason,
+        );
+        assert!(
+            answered.contains("module version unavailable"),
+            "{answered}"
+        );
+        assert!(answered.contains("command not found"), "{answered}");
+
+        let silent = relay_version_after_failed_lookup(None, reason);
+        assert!(silent.starts_with(UNKNOWN_VERSION), "{silent}");
+        assert!(silent.contains("command not found"), "{silent}");
+        assert!(
+            silent.contains("--version reported nothing"),
+            "the second failure is also part of why: {silent}"
+        );
+    }
+
+    #[test]
+    fn a_reported_version_carries_a_failed_module_lookup() {
+        // The credential helper prints this placeholder whatever it was built
+        // from, so without the reason the record reads like a healthy release.
+        let recorded = reported_version(
+            "docker-credential-ecr-login (github.com/awslabs/...) development",
+            "sh: go: command not found",
+        );
+
+        assert!(
+            recorded.starts_with("docker-credential-ecr-login"),
+            "{recorded}"
+        );
+        assert!(
+            recorded.contains("module version unavailable"),
+            "{recorded}"
+        );
+        assert!(recorded.contains("command not found"), "{recorded}");
+    }
+
+    #[test]
+    fn a_recorded_reason_carries_no_local_paths_and_is_bounded() {
+        // These land in a git-tracked file, so an absolute path would commit
+        // one machine's directory layout to the repository.
+        let recorded =
+            unknown_version("could not read Go build info from /Users/someone/go/bin/skopeo");
+        assert!(!recorded.contains("/Users/"), "{recorded}");
+        assert!(recorded.contains("skopeo"), "{recorded}");
+
+        let long = unknown_version(&"x".repeat(500));
+        assert!(
+            long.chars().count() < 200,
+            "unbounded reason: {}",
+            long.len()
+        );
+    }
+
+    #[test]
+    fn first_line_prefers_the_primary_stream() {
+        // The two-argument shape exists only to encode this precedence, so a
+        // swap must fail here rather than silently archive a warning as a
+        // version.
+        assert_eq!(
+            first_line("from stdout", "from stderr"),
+            Some("from stdout")
+        );
+        assert_eq!(first_line("\n  \nreal line\n", ""), Some("real line"));
+        // Some tools report only on stderr, which is why a fallback exists.
+        assert_eq!(first_line("   ", "from stderr"), Some("from stderr"));
+        assert_eq!(first_line("", ""), None);
     }
 
     #[test]

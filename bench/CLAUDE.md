@@ -133,9 +133,18 @@ A benchmark run is a point in time, not a fixed rig. Nothing is pinned: competit
 
 Three resolution details are easy to get wrong. skopeo's module path is `go.podman.io/skopeo` since v1.23.0, and the old `github.com/containers/skopeo` path still serves tags whose `go.mod` declares the new path, so installing from it fails on a path mismatch rather than a missing version. `@latest` never crosses a major version boundary under semantic import versioning, so when one of these tags v2 the install silently sticks on the highest v1 until the path gains a `/v2` suffix. And dregsy tags releases without a `v` prefix, so the proxy reads no valid semver and `@latest` resolves to a pseudo-version off the default branch rather than to a release.
 
-Versions are read from the binaries rather than assumed. `go install` sets none of the ldflags a release build uses, so the ECR credential helper reports `development` and dregsy has no version flag at all. Both are recovered with `go version -m`, which reads the module version stamped into the binary. That can still come up empty, for a binary built from a working tree (Go stamps `(devel)`, which names no release) or where Go is absent, and the record then reads `unknown` with the reason on stderr. Treat an `unknown` as a run whose provenance was lost rather than as a harness bug.
+Versions are read from the binaries rather than assumed. `go install` sets none of the ldflags a release build uses, so the ECR credential helper reports `development` and dregsy has no version flag at all. Both are recovered with `go version -m`, which reads the module version stamped into the binary.
 
-The bootstrap log is `/var/log/user-data.log` on the instance, not `cloud-init-output.log`: `user-data.sh` redirects its own output there.
+That lookup can still come up empty, for a binary built from a working tree (Go stamps `(devel)`, which names no release) or where Go is absent. What the record then holds depends on which path asked:
+
+- A benchmarked tool records `unknown (<reason>)`.
+- A relay falls back to asking the binary, so it records either that answer plus `(module version unavailable: <reason>)`, or, if the binary reported nothing either, `unknown (<reason>, and --version reported nothing)`.
+
+So a relay never reads as a plain version when its lookup failed, which matters most for the credential helper: its `development` placeholder is otherwise indistinguishable from a healthy release build. Grep the archive for `unavailable` as well as `unknown (` to find runs whose provenance is incomplete, and treat either as a lost record rather than a harness bug.
+
+Reasons carry no absolute paths and are length-capped, because they are committed to `bench/results/{registry}.json`.
+
+The bootstrap log is `/var/log/user-data.log` on the instance, not `cloud-init-output.log`: `user-data.sh` redirects its own output there. The benchmark run log is streamed to the operator's terminal live and never persisted, and under `--fetch` not even streamed, so a warning it emits is seen once or not at all. That is why anything affecting a run's provenance is written into the record rather than only logged.
 
 dregsy transfers nothing itself. Its config sets `relay: skopeo`, so skopeo moves every byte dregsy is credited with, and the run record captures skopeo's version alongside dregsy's for that reason.
 
