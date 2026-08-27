@@ -24,7 +24,7 @@ aws-config.workspace = true
 aws-lc-rs = { workspace = true }
 aws-sdk-ecr = { workspace = true }
 aws-sdk-ecrpublic = { workspace = true }
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 bytes.workspace = true
 futures-util = { version = "0.3", default-features = false }
 google-cloud-auth.workspace = true
@@ -42,6 +42,6 @@ tracing.workspace = true
 url = { workspace = true }
 
 [dev-dependencies]
-testcontainers = { version = "0.27", default-features = false }
+testcontainers = { version = "0.28", default-features = false }
 tokio = { workspace = true, features = ["sync", "time", "test-util", "macros", "rt-multi-thread"] }
 wiremock = { version = "0.6", default-features = false }
