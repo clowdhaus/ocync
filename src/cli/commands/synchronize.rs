@@ -313,7 +313,7 @@ pub(crate) async fn run(
 
     if args.dry_run {
         crate::cli::commands::dry_run::print(&mappings, verbose);
-        return Ok(dry_run_exit_code(mappings.len(), unresolved.len()));
+        return Ok(dry_run_exit_code(mappings.len(), &unresolved));
     }
 
     let (cache_dir, cache_path) = resolve_cache_path(&config, &args.config);
@@ -416,11 +416,26 @@ pub(crate) async fn run(
 }
 
 /// Exit code for a dry run, which produces no [`SyncReport`] to fold into.
-fn dry_run_exit_code(resolved: usize, unresolved: usize) -> ExitCode {
-    match (resolved, unresolved) {
-        (_, 0) => ExitCode::Success,
-        (0, _) => ExitCode::Failure,
-        _ => ExitCode::PartialFailure,
+fn dry_run_exit_code(resolved: usize, unresolved: &[MappingFailure]) -> ExitCode {
+    if unresolved.is_empty() {
+        return ExitCode::Success;
+    }
+    if resolved > 0 {
+        return ExitCode::PartialFailure;
+    }
+    total_failure_code(unresolved)
+}
+
+/// Exit code for a run where nothing succeeded.
+///
+/// Keeps the dedicated auth code when every mapping was denied. Before
+/// failures were isolated the first 403 aborted with that code, and dropping
+/// to the generic failure code would silently retire it.
+fn total_failure_code(unresolved: &[MappingFailure]) -> ExitCode {
+    if !unresolved.is_empty() && unresolved.iter().all(|f| f.auth) {
+        ExitCode::AuthError
+    } else {
+        ExitCode::Failure
     }
 }
 
@@ -442,13 +457,12 @@ fn combined_exit_code(report: &SyncReport, unresolved: &[MappingFailure]) -> Exi
     if has_success {
         return ExitCode::PartialFailure;
     }
-    // Nothing ran and every mapping was denied. Before failures were isolated
-    // the first 403 aborted the run with the dedicated auth code; keep that
-    // code here so pipelines alerting on it still fire.
-    if report.images.is_empty() && unresolved.iter().all(|f| f.auth) {
-        return ExitCode::AuthError;
+    // Images that ran and failed for non-auth reasons make this a generic
+    // failure regardless of why the unresolved mappings were dropped.
+    if !report.images.is_empty() {
+        return ExitCode::Failure;
     }
-    ExitCode::Failure
+    total_failure_code(unresolved)
 }
 
 /// Per-mapping metadata captured before the engine consumes `mappings`,
@@ -2507,9 +2521,26 @@ mappings:
 
     #[test]
     fn dry_run_exit_code_maps_resolution_counts() {
-        assert_eq!(dry_run_exit_code(3, 0), ExitCode::Success);
-        assert_eq!(dry_run_exit_code(2, 1), ExitCode::PartialFailure);
-        assert_eq!(dry_run_exit_code(0, 1), ExitCode::Failure);
+        assert_eq!(dry_run_exit_code(3, &[]), ExitCode::Success);
+        assert_eq!(
+            dry_run_exit_code(2, &[failure("repo/two", false)]),
+            ExitCode::PartialFailure
+        );
+        assert_eq!(
+            dry_run_exit_code(0, &[failure("repo/two", false)]),
+            ExitCode::Failure
+        );
+    }
+
+    /// `--dry-run` returns before the engine, so it never sees a `SyncReport`
+    /// and has to apply the auth rule itself. Missing that here silently
+    /// downgraded a denied dry run from 4 to 2.
+    #[test]
+    fn dry_run_exit_code_keeps_the_auth_code_when_every_mapping_was_denied() {
+        let denied = [failure("repo/one", true), failure("repo/two", true)];
+        assert_eq!(dry_run_exit_code(0, &denied), ExitCode::AuthError);
+        // Something resolved, so the run was only partly denied.
+        assert_eq!(dry_run_exit_code(1, &denied), ExitCode::PartialFailure);
     }
 
     // -----------------------------------------------------------------
