@@ -173,6 +173,8 @@ ocync auth check -c config.yaml -c config2.yaml
 | `3` | Invalid configuration |
 | `4` | Authentication or authorization failure |
 
+A mapping that fails to resolve is skipped rather than aborting the run, and counts as a failure for the exit code: `1` when other mappings still synced or skipped images, `2` when none did, and `4` when nothing ran and every mapping was denied.
+
 ## Structured output
 
 Use `--json` to get machine-readable sync reports for CI/CD pipelines:

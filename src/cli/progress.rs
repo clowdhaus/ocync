@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::io::{self, Write};
 
-use ocync_sync::progress::ProgressReporter;
+use ocync_sync::progress::{ProgressReporter, RunProgress};
 use ocync_sync::{ImageResult, ImageStatus, SyncReport};
 
 use crate::cli::output::{format_bytes, format_duration};
@@ -89,6 +89,22 @@ impl ProgressReporter for TextProgress {
                 tracing::warn!(error = %e, "failed to write progress to stderr");
             }
         }
+    }
+
+    fn run_progress(&self, p: RunProgress) {
+        // Goes through tracing rather than the stderr writer above: this is a
+        // periodic status line, not per-image output, so it belongs in the log
+        // stream where `--log-format json` and the level filter apply. At
+        // verbosity 0 the per-image lines are suppressed, which makes this the
+        // only thing distinguishing a long run from a hung one.
+        tracing::info!(
+            discovering = p.discovering,
+            pending = p.pending,
+            in_flight = p.in_flight,
+            completed = p.completed,
+            elapsed_secs = p.elapsed.as_secs(),
+            "sync in progress"
+        );
     }
 
     fn run_completed(&self, _report: &SyncReport) {

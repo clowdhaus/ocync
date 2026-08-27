@@ -53,7 +53,7 @@ pub(crate) async fn run(
     shutdown: &ShutdownSignal,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
-    let clients = build_clients(&config).await?;
+    let clients = build_clients(&config).await;
     // Analyze doesn't push anything, so no batch checkers needed.
     let no_checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
@@ -66,11 +66,21 @@ pub(crate) async fn run(
             break;
         }
 
-        let resolved =
-            match resolve_mapping(mapping, &config, &clients, &no_checkers, false).await? {
-                MappingResolution::Resolved(r) => r,
-                MappingResolution::NoMatchingTags(_) => continue,
-            };
+        // One unresolvable mapping must not cost the analysis every mapping
+        // behind it, same as `sync`.
+        let resolved = match resolve_mapping(mapping, &config, &clients, &no_checkers, false).await
+        {
+            Ok(MappingResolution::Resolved(r)) => r,
+            Ok(MappingResolution::NoMatchingTags(_)) => continue,
+            Err(err) => {
+                tracing::error!(
+                    from = %mapping.from,
+                    error = %err,
+                    "mapping could not be resolved; skipping"
+                );
+                continue;
+            }
+        };
 
         for tag_pair in &resolved.tags {
             if shutdown.is_triggered() {

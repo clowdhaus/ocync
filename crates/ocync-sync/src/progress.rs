@@ -1,6 +1,27 @@
 //! Progress reporting trait and no-op implementation.
 
+use std::time::Duration;
+
 use crate::{ImageResult, SyncReport};
+
+/// Snapshot of a run that is still in flight.
+///
+/// Passed to [`ProgressReporter::run_progress`] on a fixed cadence so a long
+/// sync emits a liveness signal instead of going silent between the first
+/// image starting and the last one finishing.
+#[derive(Debug, Clone, Copy)]
+pub struct RunProgress {
+    /// Tags still in discovery (source HEAD or manifest pull).
+    pub discovering: usize,
+    /// Discovered transfers waiting for a concurrency permit.
+    pub pending: usize,
+    /// Transfers currently executing.
+    pub in_flight: usize,
+    /// Images that have reached a terminal state.
+    pub completed: usize,
+    /// Wall-clock time since the run started.
+    pub elapsed: Duration,
+}
 
 /// Reports progress during a sync run.
 ///
@@ -12,6 +33,12 @@ pub trait ProgressReporter {
     fn image_started(&self, source: &str, target: &str);
     /// Called when an individual image transfer completes.
     fn image_completed(&self, result: &ImageResult);
+    /// Called on a fixed cadence while the run still has work in flight.
+    ///
+    /// Discovery and execution can both run for minutes without an image
+    /// reaching a terminal state, so this is the only signal a caller has
+    /// that the run is progressing rather than wedged.
+    fn run_progress(&self, progress: RunProgress);
     /// Called when the entire sync run completes.
     fn run_completed(&self, report: &SyncReport);
 }
@@ -23,6 +50,7 @@ pub struct NullProgress;
 impl ProgressReporter for NullProgress {
     fn image_started(&self, _: &str, _: &str) {}
     fn image_completed(&self, _: &ImageResult) {}
+    fn run_progress(&self, _: RunProgress) {}
     fn run_completed(&self, _: &SyncReport) {}
 }
 
@@ -51,6 +79,14 @@ mod tests {
             artifacts_skipped: false,
         };
         p.image_completed(&result);
+
+        p.run_progress(RunProgress {
+            discovering: 3,
+            pending: 2,
+            in_flight: 1,
+            completed: 4,
+            elapsed: Duration::from_secs(30),
+        });
 
         let report = SyncReport {
             run_id: Uuid::now_v7(),

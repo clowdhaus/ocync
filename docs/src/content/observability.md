@@ -14,6 +14,8 @@ ocync sync -c config.yaml --json
 
 Reports include per-image results and aggregate statistics: blobs transferred, bytes moved, mounts performed, cache hits, and errors.
 
+A mapping that could not be resolved at all -- unreachable registry, denied tag listing, bad repository name -- never reaches the engine and so produces no per-image entry. Those mappings are listed separately under `unresolved_mappings`, which is omitted entirely when every mapping resolved. The rest of the run still proceeds; one failing mapping does not cancel the others.
+
 Abbreviated example:
 
 ```json
@@ -43,7 +45,13 @@ Abbreviated example:
     "discovery_head_failures": 0,
     "discovery_target_stale": 0
   },
-  "duration": { "secs": 4, "nanos": 210000000 }
+  "duration": { "secs": 4, "nanos": 210000000 },
+  "unresolved_mappings": [
+    {
+      "from": "cgr.dev/chainguard/private",
+      "error": "mapping 'cgr.dev/chainguard/private': registry error: 403 Forbidden"
+    }
+  ]
 }
 ```
 
@@ -53,6 +61,13 @@ Abbreviated example:
 
 - **TTY**: real-time progress bars with per-image and aggregate stats
 - **Non-TTY / CI**: periodic heartbeat lines with summary counts
+
+At the default verbosity, per-image lines are suppressed, so a long run would otherwise be silent from start to finish. Two periodic lines fill that gap:
+
+- `resolving mappings` during mapping resolution, once the phase has run for more than five seconds
+- `sync in progress` every 30 seconds while discovery or transfers are still in flight, carrying `discovering`, `pending`, `in_flight`, `completed`, and `elapsed_secs`
+
+Both are timer-gated, so a run that finishes quickly emits neither.
 
 Disable all progress output with `--quiet`.
 
