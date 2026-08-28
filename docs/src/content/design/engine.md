@@ -4,6 +4,58 @@ description: Pipeline architecture, adaptive concurrency, transfer state cache, 
 order: 2
 ---
 
+## Prepare phase
+
+Everything before the engine starts is preparation: build one client per referenced registry, build the ECR batch checkers, then resolve every mapping into the tags it will sync. Resolution is the expensive part. Each mapping lists its source repository's tags, and a mapping with `immutable_tags` also lists each target's existing tags.
+
+This work is network-bound and independent per mapping, so it runs concurrently, bounded at 16 mappings in flight. The bound is a ceiling on open mappings, not on how hard any registry is hit: every request underneath still passes that registry's AIMD window, which starts at one in flight and widens only as the registry keeps answering. A config whose mappings all share one source therefore self-limits at whatever AIMD has earned, and a config spread across registries goes wider.
+
+Measured on 95 mappings against a single source at 60 ms per tag listing:
+
+| Mappings in flight | Elapsed | Speedup | Peak requests in flight |
+|--------------------|---------|---------|-------------------------|
+| 1 (sequential)     | 6.02s   | 1.0x    | 1                       |
+| 4                  | 1.68s   | 3.6x    | 4                       |
+| 8                  | 1.02s   | 5.9x    | 8                       |
+| 16                 | 0.89s   | 6.8x    | 13                      |
+| 32                 | 0.89s   | 6.7x    | 13                      |
+
+The last two rows are identical because a single registry's AIMD window tops out near 13 over 95 requests. That is where the bound of 16 comes from: high enough that AIMD is the constraint for a single-source config, low enough that a wide multi-registry config cannot open an unbounded number of connections at once.
+
+Results are collected in config order regardless of which registry answered first, so per-mapping warnings, the watch-mode state, and the run's counters stay deterministic. A config error still stops the run at the first offending mapping in config order, though mappings behind it may already have run and logged.
+
+Tag listings deliberately send no `n`. Asking for a page size looks like an optimization and is the opposite of one: a request without `n` is answered at least as generously as one with it, so `n` can only add round trips.
+
+- Docker Hub returns every tag in a single response with no `Link` header. `library/python` is 3,911 tags in 1 request; with `n=1000` the same listing costs 4.
+- `distribution/distribution` sets its internal limit to -1 when `n` is absent and lists everything. Its `maxtags` cap applies only to an explicit `n`. Harbor, GitLab, Quay and self-hosted `registry:2` inherit that behavior.
+- ECR Public already pages at 1000 without being asked, and ECR rejects an `n` above 1000, so the largest value it would accept changes nothing.
+
+The `Link` loop still follows pagination for registries that impose it unasked. Measured 2026-08-28.
+
+While preparation runs, a progress line is emitted every 5 seconds naming the longest-running item:
+
+```
+preparing sync phase=mappings done=75 total=95 in_flight=16 slowest=repo/foo slowest_secs=160 elapsed_secs=490
+```
+
+Without `slowest`, a step that sits at the same `done` count for minutes is unattributable, and an operator cannot tell a huge tag listing from a wedged registry.
+
+### `analyze`
+
+`analyze` has the same shape and the same bound. It resolves mappings concurrently, then pulls image manifests from a single list flattened across every mapping. The flattening is what makes the second walk worth anything: a config of many mappings holding a handful of tags each would otherwise stay serial, because each mapping's walk is only a request or two long. Index children stay sequential within an image, since the images already overlap and AIMD saturates well below the number in flight.
+
+Aggregation stays sequential and in config order. `analysis.blobs` has one owner, and the report must read the same way whichever registry answered first. Shutdown is checked inside each task rather than once before the fan-out, so a signal part way through stops work that has not started while in-flight work finishes.
+
+Measured on 95 mappings holding one tag each, 30 ms per request:
+
+| Concurrency | Elapsed | Speedup |
+|-------------|---------|---------|
+| 1 (sequential) | 6.24s | 1.0x |
+| 4  | 1.71s | 3.7x |
+| 8  | 1.06s | 5.9x |
+| 16 | 0.93s | 6.7x |
+| 32 | 0.94s | 6.7x |
+
 ## Pipeline architecture
 
 The sync engine uses a pipelined architecture where discovery and execution run concurrently in a single `tokio::select!` loop over two `FuturesUnordered` pools. Execution starts the moment the first image is discovered, with no waiting for all discovery to complete. The engine should never be idle when useful work exists.

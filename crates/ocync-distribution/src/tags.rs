@@ -11,6 +11,26 @@ use crate::spec::RepositoryName;
 /// as broken (e.g. a registry returning a self-referencing `Link: rel="next"`).
 const MAX_TAG_PAGES: usize = 10_000;
 
+// The tag listing deliberately sends no `n`.
+//
+// Asking for a page size can only cost round trips, never save them, because
+// the registries answer a request without `n` at least as generously as one
+// with it. Measured 2026-08-28:
+//
+// - Docker Hub returns every tag in one response with no `Link` header
+//   (`library/python`, 3,911 tags, 1 request). With `n=1000` the same
+//   listing takes 4.
+// - `distribution/distribution` sets its internal limit to -1 when `n` is
+//   absent and lists all tags; `maxtags` is applied only to an explicit `n`.
+//   Harbor, GitLab, Quay and self-hosted `registry:2` inherit that.
+// - ECR Public already pages at 1000 without being asked
+//   (`docker/library/python`), and ECR rejects an `n` above 1000, so the
+//   largest value it would accept changes nothing.
+//
+// So there is no registry where sending `n` helps and two large families
+// where it multiplies the request count. The `Link` loop below still follows
+// pagination for the registries that choose to impose it.
+
 /// Response body from the tag listing API.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TagListResponse {

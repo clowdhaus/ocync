@@ -2394,6 +2394,7 @@ version = "0.7.0"
 dependencies = [
  "anstyle",
  "clap",
+ "futures-util",
  "http 1.5.0",
  "ocync-distribution",
  "ocync-sync",
@@ -2409,6 +2410,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
