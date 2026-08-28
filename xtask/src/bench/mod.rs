@@ -266,7 +266,14 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // Guard: refuse to run if TMPDIR resolves to tmpfs. Staging writes
     // multi-GB blobs and tmpfs is RAM-backed, causing OOM/ENOSPC.
     // The bench-remote xtask sets TMPDIR=$HOME/ocync/bench/.tmp (on EBS).
-    reject_tmpfs_tmpdir()?;
+    //
+    // The prepare scenario is exempt because it stages nothing: `--dry-run`
+    // resolves mappings and stops, so there is no blob to write anywhere.
+    // Applying the guard to it would refuse the one scenario cheap enough to
+    // run on a laptop, for a disk cost it does not have.
+    if !matches!(args.scenario, Scenario::Prepare) {
+        reject_tmpfs_tmpdir()?;
+    }
 
     // 1. Parse corpus (apply skip-registries filter, then limit).
     let loaded = corpus::load(&args.corpus)?;
@@ -388,8 +395,16 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
 
     // Pre-warm CDN so all tools see identically cached source manifests.
+    //
+    // The prepare scenario needs none of it. It runs one tool, pulls no blobs,
+    // and reads a different corpus than the one warmed here, so warming for it
+    // is hundreds of pointless requests against registries that rate-limit.
+    // A mixed run still warms, because the scenarios beside it do transfer.
+    let transfers = scenarios.iter().any(|s| !matches!(s, Scenario::Prepare));
     if args.skip_prewarm {
         eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
+    } else if !transfers {
+        eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
     } else {
         cdn_prewarm(&corpus).await;
     }
@@ -518,9 +533,22 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             })
             .collect(),
     };
+    // The archive is tracked in git and read as a history of comparable runs.
+    // A run whose machine could not be identified is not comparable to one on
+    // a known instance, and the harness already says so with a WARNING per
+    // missing field. Appending it anyway puts a laptop's numbers next to the
+    // rig's under the same key, where nothing downstream can tell them apart.
+    // The summary is still written; only the shared history is protected.
     let results_dir = Path::new("bench/results");
-    report::append_record(results_dir, reg_key, record)?;
-    eprintln!("bench: run record appended to bench/results/{reg_key}.json");
+    if record.machine.instance_type == "unknown" {
+        eprintln!(
+            "bench: run record NOT appended (instance metadata unknown, so this \
+             run is not comparable to the archived ones); summary only"
+        );
+    } else {
+        report::append_record(results_dir, reg_key, record)?;
+        eprintln!("bench: run record appended to bench/results/{reg_key}.json");
+    }
 
     // 9. Handle regression mode.
     if args.regression {

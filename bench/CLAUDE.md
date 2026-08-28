@@ -66,6 +66,13 @@ The main corpus is 39 entries chosen for blob sharing. The prepare phase costs o
 
 None of the sync scenario's fairness machinery applies here. Nothing is transferred, so there are no blobs to fall out of page cache, no ECR repos to reset, and no CDN edge to pre-warm. Skipping all of it is what keeps this scenario cheap enough to run often.
 
+Two of those exemptions are explicit in the harness rather than automatic, and both were found by running the scenario rather than by reading the code:
+
+- The tmpfs guard is skipped for `prepare`. It exists because staging writes multi-GB blobs, which a dry-run never does, and applying it refuses the one scenario that can run on a laptop.
+- CDN pre-warm is skipped when `prepare` is the only scenario. Pre-warm buys cross-tool fairness for a workload that pulls blobs; for a single-tool dry-run reading a different corpus it is hundreds of pointless requests against rate-limited registries. A mixed run (`--scenario all`) still warms, because the scenarios beside it do transfer.
+
+**A run whose instance metadata is unknown does not append to `bench/results/{registry}.json`.** That archive is tracked in git and read as a history of comparable runs; a laptop run landing in it puts uncomparable numbers under the same key. The timestamped summary is still written. This matters here more than elsewhere, because `prepare` is the scenario most likely to be run off the rig.
+
 ## Metrics captured per tool per scenario
 
 | Metric | Source | Winner = |
