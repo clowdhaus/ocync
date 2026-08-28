@@ -32,9 +32,10 @@ impl ProgressReporter for RecordingProgress {
 
 /// Run a two-image sync with the given heartbeat cadence.
 ///
-/// `source_delay` is applied to the source manifest GET. Under `start_paused`
-/// wiremock's delay is a `tokio::time::sleep`, so it advances with virtual
-/// time and gives the run a known duration to measure the cadence against.
+/// `source_delay` is applied to the source manifest GET, giving discovery a
+/// known duration for the cadence assertion to measure against. Real time, not
+/// a paused clock: virtual time auto-advances to any pending deadline, which
+/// would make a heartbeat fire for any interval at all.
 async fn run_with_heartbeat(
     interval: Duration,
     source_delay: Duration,
@@ -125,9 +126,9 @@ async fn heartbeat_fires_while_work_is_in_flight() {
 /// The heartbeat is timer-gated, not emitted unconditionally: a run that
 /// finishes well inside one interval reports nothing.
 ///
-/// Deliberately NOT `start_paused`: virtual time auto-advances to any pending
-/// deadline, which would fire even a ten-minute interval and make this pass
-/// for the wrong reason.
+/// Real time for the same reason as the test above: a paused clock advances to
+/// any pending deadline, so even a ten-minute interval would fire and this
+/// would pass for the wrong reason.
 #[tokio::test]
 async fn heartbeat_stays_silent_for_a_short_run() {
     let (report, snapshots) = run_with_heartbeat(Duration::from_secs(600), Duration::ZERO).await;

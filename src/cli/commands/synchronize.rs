@@ -7,7 +7,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
@@ -103,6 +103,11 @@ impl PrepareTracker {
         });
     }
 
+    /// The current step and its counts.
+    fn snapshot(&self) -> PrepareProgress {
+        self.state.get()
+    }
+
     /// Record one item finished in the current step.
     pub(crate) fn advance(&self) {
         let mut p = self.state.get();
@@ -119,6 +124,7 @@ impl PrepareTracker {
 /// three-mapping config it emitted nothing across an 8.6 second run.
 pub(crate) async fn with_prepare_progress<F: Future>(
     tracker: &PrepareTracker,
+    what: &'static str,
     work: F,
 ) -> F::Output {
     tick_while(tracker, PREPARE_PROGRESS_INTERVAL, work, |p, elapsed| {
@@ -127,7 +133,7 @@ pub(crate) async fn with_prepare_progress<F: Future>(
             done = p.done,
             total = p.total,
             elapsed_secs = elapsed.as_secs(),
-            "preparing sync"
+            "preparing {what}"
         );
     })
     .await
@@ -145,7 +151,9 @@ async fn tick_while<F: Future>(
     mut emit: impl FnMut(PrepareProgress, Duration),
 ) -> F::Output {
     let mut work = std::pin::pin!(work);
-    let started = Instant::now();
+    // tokio's clock, not `std`: under a paused runtime `std::time::Instant`
+    // does not advance, so the elapsed value would always read zero in tests.
+    let started = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `interval` yields immediately; push the first tick out a full period so
@@ -157,7 +165,7 @@ async fn tick_while<F: Future>(
             // finished future is dropped rather than logged after the fact.
             biased;
             out = &mut work => return out,
-            _ = ticker.tick() => emit(tracker.state.get(), started.elapsed()),
+            _ = ticker.tick() => emit(tracker.snapshot(), started.elapsed()),
         }
     }
 }
@@ -171,16 +179,11 @@ pub(crate) type ClientMap = HashMap<String, Result<Arc<RegistryClient>, ClientIn
 
 /// Why a registry's client could not be built.
 ///
-/// Carries the classification alongside the message: recovering it later from
-/// a stringified error is impossible, and losing it downgrades a wholly denied
-/// run from the auth exit code to the generic failure code.
+/// Holds the error itself rather than its text: the classification cannot be
+/// recovered from a string, and losing it downgrades a wholly denied run from
+/// the auth exit code to the generic failure code.
 #[derive(Debug)]
-pub(crate) struct ClientInitError {
-    /// The original error, already formatted.
-    message: String,
-    /// Whether the cause was a credential failure.
-    auth: bool,
-}
+pub(crate) struct ClientInitError(CliError);
 
 /// Which side of a mapping a registry sits on, for error messages.
 #[derive(Debug, Clone, Copy)]
@@ -253,6 +256,7 @@ pub(crate) struct UnresolvedMapping {
 pub(crate) fn shared_failure_code(codes: impl IntoIterator<Item = ExitCode>) -> ExitCode {
     let mut codes = codes.into_iter();
     let Some(first) = codes.next() else {
+        debug_assert!(false, "shared_failure_code called with no failures");
         return ExitCode::Failure;
     };
     if matches!(first, ExitCode::AuthError | ExitCode::ConfigError) && codes.all(|c| c == first) {
@@ -340,8 +344,8 @@ impl fmt::Display for NoTagsInfo {
 #[derive(Debug, Default)]
 pub(crate) struct WatchLogState {
     warned_no_tags: HashSet<String>,
-    /// [`target_key`] for every target currently reported down.
-    dropped_targets: HashSet<String>,
+    /// Registries currently reported down, per mapping.
+    dropped_targets: HashMap<String, HashSet<String>>,
     /// Mappings currently reported as unresolvable.
     unresolved: HashSet<String>,
     last_outcomes: HashMap<String, MappingOutcome>,
@@ -373,7 +377,11 @@ impl WatchLogState {
     /// Keyed on mapping plus registry so two mappings losing the same mirror
     /// each report once, and a second mirror going down still reports.
     fn observe_dropped_target(&mut self, from: &str, registry: &str) -> bool {
-        let changed = self.dropped_targets.insert(target_key(from, registry));
+        let down = match self.dropped_targets.get_mut(from) {
+            Some(down) => down,
+            None => self.dropped_targets.entry(from.to_owned()).or_default(),
+        };
+        let changed = down.insert(registry.to_owned());
         if changed {
             self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
         }
@@ -386,14 +394,10 @@ impl WatchLogState {
     /// Reconciling rather than clearing wholesale is what makes a partial
     /// recovery work: clearing only when nothing is down leaves a recovered
     /// mirror suppressed for as long as any sibling stays down.
-    fn forget_recovered_targets(&mut self, from: &str, still_down: &HashSet<&str>) {
-        let prefix = target_key(from, "");
-        self.dropped_targets
-            .retain(|key| match key.strip_prefix(&prefix) {
-                // Another mapping's key.
-                None => true,
-                Some(registry) => still_down.contains(registry),
-            });
+    fn forget_recovered_targets(&mut self, from: &str, still_down: &[DroppedTarget]) {
+        if let Some(down) = self.dropped_targets.get_mut(from) {
+            down.retain(|registry| still_down.iter().any(|t| t.registry == *registry));
+        }
     }
 
     /// Record a mapping that could not be resolved. Returns `true` on
@@ -461,22 +465,9 @@ impl WatchLogState {
         self.last_outcomes
             .retain(|k, _| active_set.contains(k.as_str()));
         self.unresolved.retain(|k| active_set.contains(k.as_str()));
-        // Composite keys need a prefix split, which is why this cannot join
-        // the retains above. A mapping removed and later re-added would
-        // otherwise keep a stale key and never warn about its dead mirror.
-        self.dropped_targets.retain(|key| {
-            key.split_once('\u{0}')
-                .is_some_and(|(from, _)| active_set.contains(from))
-        });
+        self.dropped_targets
+            .retain(|k, _| active_set.contains(k.as_str()));
     }
-}
-
-/// Key a dropped target by mapping and registry.
-///
-/// NUL-separated because neither a repository path nor a registry alias can
-/// contain it, so the split back is unambiguous.
-fn target_key(from: &str, registry: &str) -> String {
-    format!("{from}\u{0}{registry}")
 }
 
 /// Resolve the cache directory and file path from config.
@@ -532,9 +523,10 @@ pub(crate) async fn run(
     // sequential network work with no output of their own. One ticker spans
     // the lot so the run is never silent for longer than the interval.
     let tracker = PrepareTracker::default();
-    let resolution = with_prepare_progress(&tracker, async {
-        let clients = build_clients(&config, &tracker).await;
-        let batch_checkers = build_batch_checkers(&config, &clients, &tracker).await;
+    let resolution = with_prepare_progress(&tracker, "sync", async {
+        let referenced = referenced_registries(&config);
+        let clients = build_clients(&config, &referenced, &tracker).await;
+        let batch_checkers = build_batch_checkers(&config, &clients, &referenced, &tracker).await;
         resolve_all(
             &config,
             &clients,
@@ -545,7 +537,7 @@ pub(crate) async fn run(
         )
         .await
     })
-    .await;
+    .await?;
     let Resolution {
         resolved: mappings,
         unresolved,
@@ -655,9 +647,10 @@ pub(crate) async fn run(
         })
         .collect();
 
-    // Anything dropped before the engine started is absent from the mappings
-    // it sees, and the prune cannot tell that from a deletion.
-    let complete = unresolved.is_empty() && dropped_targets.is_empty();
+    // Anything absent from the mappings the engine sees looks deleted to the
+    // prune. That includes a mapping whose tag list came back empty, which a
+    // transient short response is indistinguishable from.
+    let complete = unresolved.is_empty() && dropped_targets.is_empty() && no_match == 0;
     let engine =
         SyncEngine::new(RetryConfig::default(), max_concurrent).with_cache_pruning(complete);
     let report = engine
@@ -702,7 +695,7 @@ pub(crate) async fn run(
 
 /// Exit code for a dry run, which produces no [`SyncReport`] to fold into.
 fn dry_run_exit_code(
-    resolved: usize,
+    succeeded: usize,
     unresolved: &[UnresolvedMapping],
     dropped: &[DroppedTarget],
 ) -> ExitCode {
@@ -715,7 +708,7 @@ fn dry_run_exit_code(
             ExitCode::PartialFailure
         };
     }
-    if resolved > 0 {
+    if succeeded > 0 {
         return ExitCode::PartialFailure;
     }
     total_failure_code(unresolved)
@@ -1031,8 +1024,11 @@ fn parse_size(s: &str) -> Option<u64> {
 /// registry can fail. Record the failure against that alias instead of
 /// aborting: registries the failing one shares no mapping with still sync, and
 /// the mappings that do reference it fail with the original error text.
-pub(crate) async fn build_clients(config: &Config, tracker: &PrepareTracker) -> ClientMap {
-    let referenced = referenced_registries(config);
+pub(crate) async fn build_clients(
+    config: &Config,
+    referenced: &Referenced,
+    tracker: &PrepareTracker,
+) -> ClientMap {
     tracker.begin(PreparePhase::Registries, referenced.len());
     let mut clients = ClientMap::with_capacity(referenced.len());
     for (name, reg) in &config.registries {
@@ -1048,10 +1044,7 @@ pub(crate) async fn build_clients(config: &Config, tracker: &PrepareTracker) -> 
                     error = %err,
                     "registry client setup failed; mappings using this registry will be skipped"
                 );
-                Err(ClientInitError {
-                    auth: matches!(err.exit_code(), ExitCode::AuthError),
-                    message: err.to_string(),
-                })
+                Err(ClientInitError(err))
             }
         };
         clients.insert(name.clone(), entry);
@@ -1066,10 +1059,10 @@ pub(crate) async fn build_clients(config: &Config, tracker: &PrepareTracker) -> 
 /// mapping uses costs an auth round trip against the rate-limit budget and, on
 /// failure, logs an error nothing depends on. A target value that does not
 /// resolve is left out here; `resolve_mapping` reports it per mapping.
-fn referenced_registries(config: &Config) -> HashSet<String> {
+pub(crate) fn referenced_registries(config: &Config) -> Referenced {
     let known: HashSet<&str> = config.registries.keys().map(String::as_str).collect();
     let defaults = config.defaults.as_ref();
-    let mut used = HashSet::new();
+    let mut referenced = Referenced::default();
     for mapping in &config.mappings {
         if let Some(source) = mapping
             .source
@@ -1080,24 +1073,38 @@ fn referenced_registries(config: &Config) -> HashSet<String> {
             // total past the number of clients actually built.
             .filter(|name| known.contains(name))
         {
-            used.insert(source.to_owned());
+            referenced.sources.insert(source.to_owned());
         }
         if let Ok(names) = mapping_target_names(mapping, config, &known) {
-            used.extend(names);
+            referenced.targets.extend(names);
         }
     }
-    used
+    referenced
 }
 
-/// Registry aliases named as a target by at least one mapping.
-fn referenced_targets(config: &Config) -> HashSet<String> {
-    let known: HashSet<&str> = config.registries.keys().map(String::as_str).collect();
-    config
-        .mappings
-        .iter()
-        .filter_map(|m| mapping_target_names(m, config, &known).ok())
-        .flatten()
-        .collect()
+/// Registry aliases the config actually uses, split by role.
+///
+/// Both sets come from one walk: expanding every mapping's target groups is
+/// the most expensive part of the prepare phase, and clients and batch
+/// checkers want different halves of the same answer.
+#[derive(Debug, Default)]
+pub(crate) struct Referenced {
+    /// Aliases named as a source.
+    sources: HashSet<String>,
+    /// Aliases named as a target, with groups expanded.
+    targets: HashSet<String>,
+}
+
+impl Referenced {
+    /// Whether any mapping names this alias at all.
+    fn contains(&self, name: &str) -> bool {
+        self.sources.contains(name) || self.targets.contains(name)
+    }
+
+    /// How many distinct registries need a client.
+    fn len(&self) -> usize {
+        self.sources.union(&self.targets).count()
+    }
 }
 
 /// Target registry aliases a mapping names, with groups expanded.
@@ -1134,17 +1141,15 @@ fn client_for(
 ) -> Result<Arc<RegistryClient>, CliError> {
     match clients.get(name) {
         Some(Ok(client)) => Ok(Arc::clone(client)),
-        Some(Err(err)) => {
+        Some(Err(ClientInitError(cause))) => {
             let msg = format!(
-                "mapping '{mapping_from}': {role} registry '{name}' is unavailable: {}",
-                err.message
+                "mapping '{mapping_from}': {role} registry '{name}' is unavailable: {cause}"
             );
-            // A denied registry stays a denial here, so a run that failed only
-            // on credentials still exits with the auth code.
-            Err(if err.auth {
-                CliError::Auth(msg)
-            } else {
-                CliError::Input(msg)
+            // The cause keeps its classification, so a run that failed only on
+            // credentials still exits with the auth code.
+            Err(match cause.exit_code() {
+                ExitCode::AuthError => CliError::Auth(msg),
+                _ => CliError::Input(msg),
             })
         }
         None => Err(CliError::Input(format!(
@@ -1166,20 +1171,19 @@ fn client_for(
 async fn build_batch_checkers(
     config: &Config,
     clients: &ClientMap,
+    referenced: &Referenced,
     tracker: &PrepareTracker,
 ) -> HashMap<String, Rc<dyn BatchBlobChecker>> {
     let mut checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
-    // The client map is already the referenced set, so deriving it from there
-    // avoids re-resolving every mapping's target groups a second time. Only
-    // registries whose client actually built are worth a checker: the rest
-    // have already failed and would just repeat the round trip.
-    let targets = referenced_targets(config);
+    // Targets only, and only where the client built: the map is read by
+    // target alias, and a registry that already failed would just repeat the
+    // round trip for a checker nothing can use.
     let usable: Vec<(&String, &RegistryConfig)> = config
         .registries
         .iter()
         .filter(|(name, _)| {
-            targets.contains(name.as_str()) && matches!(clients.get(*name), Some(Ok(_)))
+            referenced.targets.contains(name.as_str()) && matches!(clients.get(*name), Some(Ok(_)))
         })
         .collect();
     tracker.begin(PreparePhase::BatchCheckers, usable.len());
@@ -1221,6 +1225,7 @@ async fn build_batch_checkers(
 }
 
 /// What resolving a whole config produced.
+#[derive(Debug)]
 pub(crate) struct Resolution {
     /// Mappings ready for the engine.
     pub resolved: Vec<ResolvedMapping>,
@@ -1248,7 +1253,7 @@ async fn resolve_all(
     with_report: bool,
     mut watch_log: Option<&mut WatchLogState>,
     tracker: &PrepareTracker,
-) -> Resolution {
+) -> Result<Resolution, CliError> {
     tracker.begin(PreparePhase::Mappings, config.mappings.len());
     let mut resolved = Vec::new();
     let mut unresolved = Vec::new();
@@ -1287,6 +1292,12 @@ async fn resolve_all(
                 // mapping with nothing to do, not a failure.
                 no_match += 1;
             }
+            // A broken config is not a transient failure to route around: a
+            // bad glob, an unparseable platform, an unknown registry alias, or
+            // a `min_tags` tripwire all mean the operator asked for something
+            // the run must not silently do less than. Isolation covers
+            // registries that are down, not configs that are wrong.
+            Err(err) if err.exit_code() == ExitCode::ConfigError => return Err(err),
             Err(err) => {
                 // Gated like every other watch surface: without it a
                 // permanently broken mapping logs an ERROR every cycle while
@@ -1309,12 +1320,12 @@ async fn resolve_all(
         tracker.advance();
     }
 
-    Resolution {
+    Ok(Resolution {
         resolved,
         unresolved,
         dropped_targets,
         no_match,
-    }
+    })
 }
 
 /// WARN once per target that goes down, not once per watch cycle.
@@ -1334,8 +1345,7 @@ fn reconcile_dropped_targets(
         }
         return;
     };
-    let now: HashSet<&str> = dropped.iter().map(|t| t.registry.as_str()).collect();
-    state.forget_recovered_targets(from, &now);
+    state.forget_recovered_targets(from, dropped);
     for target in dropped {
         if state.observe_dropped_target(from, &target.registry) {
             warn_dropped_target(target);
@@ -1383,6 +1393,7 @@ fn build_targets(
 ) -> (Vec<TargetEntry>, Option<CliError>) {
     let mut targets = Vec::with_capacity(target_names.len());
     let mut worst_err: Option<CliError> = None;
+    let mut codes = Vec::new();
     for name in target_names {
         match client_for(clients, &name, from, RegistryRole::Target) {
             Ok(client) => targets.push(TargetEntry {
@@ -1397,23 +1408,27 @@ fn build_targets(
                     registry: name,
                     error: err.to_string(),
                 });
-                // Keep a denial over anything else rather than the last one
-                // seen: target order comes straight from the config file, and
-                // the same outage should not exit 2 or 4 depending on how the
-                // list happens to be written.
-                let replace = match &worst_err {
-                    None => true,
-                    Some(existing) => {
-                        !matches!(existing.exit_code(), ExitCode::AuthError)
-                            && matches!(err.exit_code(), ExitCode::AuthError)
-                    }
-                };
-                if replace {
+                // Order-independent, and folded by the same rule the run-level
+                // code uses: target order comes straight from the config file,
+                // and mixed causes report the generic failure rather than
+                // whichever happened to be written last.
+                codes.push(err.exit_code());
+                if worst_err.is_none() {
                     worst_err = Some(err);
                 }
             }
         }
     }
+    // Re-classify with the shared rule so the error the caller surfaces
+    // carries the folded code rather than the first one seen.
+    let worst_err = worst_err.map(|err| {
+        let folded = shared_failure_code(codes);
+        if folded == err.exit_code() {
+            err
+        } else {
+            CliError::Input(err.to_string())
+        }
+    });
     (targets, worst_err)
 }
 
@@ -1778,13 +1793,13 @@ fn describe_filter(
 struct SyncOutput<'a> {
     #[serde(flatten)]
     report: &'a SyncReport,
-    /// Mappings dropped during resolution. Absent when every mapping resolved,
-    /// so the document shape is unchanged on a clean run.
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    /// Mappings dropped during resolution.
+    ///
+    /// Always present, empty on a clean run: `analyze` reports the same key
+    /// the same way, and a consumer reading both should not have to handle a
+    /// missing field on one and not the other.
     unresolved_mappings: &'a [UnresolvedMapping],
-    /// Targets a resolved mapping could not use. Absent when none were
-    /// dropped, so the document shape is unchanged on a clean run.
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    /// Targets a resolved mapping could not use.
     dropped_targets: &'a [DroppedTarget],
 }
 
@@ -2975,10 +2990,11 @@ mappings:
 
     /// A registry whose client could not be built, as `build_clients` records it.
     fn broken_client(message: &str, auth: bool) -> Result<Arc<RegistryClient>, ClientInitError> {
-        Err(ClientInitError {
-            message: message.to_string(),
-            auth,
-        })
+        Err(ClientInitError(if auth {
+            CliError::Auth(message.to_string())
+        } else {
+            CliError::Input(message.to_string())
+        }))
     }
 
     async fn resolve(config: &Config, clients: &ClientMap) -> Resolution {
@@ -2991,6 +3007,7 @@ mappings:
             &PrepareTracker::default(),
         )
         .await
+        .expect("no config-class failure in these fixtures")
     }
 
     /// A mapping that cannot be resolved must not cost the run the mappings
@@ -3279,7 +3296,12 @@ mappings:
         )
         .expect("config yaml parses");
 
-        let clients = build_clients(&config, &PrepareTracker::default()).await;
+        let clients = build_clients(
+            &config,
+            &referenced_registries(&config),
+            &PrepareTracker::default(),
+        )
+        .await;
 
         let mut names: Vec<&str> = clients.keys().map(String::as_str).collect();
         names.sort_unstable();
@@ -3314,12 +3336,16 @@ mappings:
 
         let used = referenced_registries(&config);
 
-        assert!(used.contains("src"));
-        assert!(used.contains("dst"), "target groups must be expanded");
+        assert!(used.sources.contains("src"));
+        assert!(
+            used.targets.contains("dst"),
+            "target groups must be expanded"
+        );
         assert!(
             !used.contains("unused"),
             "a registry no mapping names must not be built"
         );
+        assert_eq!(used.len(), 2);
     }
 
     /// The prepare ticker must fire on wall-clock, not on item boundaries.
@@ -3422,11 +3448,12 @@ mappings:
         .expect("config yaml parses");
 
         let tracker = PrepareTracker::default();
-        let clients = build_clients(&config, &tracker).await;
-        let checkers = build_batch_checkers(&config, &clients, &tracker).await;
+        let referenced = referenced_registries(&config);
+        let clients = build_clients(&config, &referenced, &tracker).await;
+        let checkers = build_batch_checkers(&config, &clients, &referenced, &tracker).await;
 
         assert!(checkers.is_empty(), "neither registry is ECR");
-        let p = tracker.state.get();
+        let p = tracker.snapshot();
         assert_eq!(
             p.total, 1,
             "only the target registry is a checker candidate; the map is read by target alias"
@@ -3457,7 +3484,11 @@ mappings:
         // Partial recovery: mirror-a is back, mirror-b is still down. The
         // all-or-nothing clear this replaced left mirror-a suppressed for as
         // long as any sibling stayed down.
-        let still_down: HashSet<&str> = ["mirror-b"].into_iter().collect();
+        let still_down = [DroppedTarget {
+            from: "repo/one".into(),
+            registry: "mirror-b".into(),
+            error: "still down".into(),
+        }];
         state.forget_recovered_targets("repo/one", &still_down);
         assert!(
             state.observe_dropped_target("repo/one", "mirror-a"),
@@ -3567,6 +3598,53 @@ mappings:
         assert!(
             dropped.is_empty(),
             "nothing was dropped; the config named nothing"
+        );
+    }
+
+    /// A broken config must still stop the run. Isolation exists for
+    /// registries that are down, not for configs that are wrong: a bad glob,
+    /// an unparseable platform, an unknown alias, or a `min_tags` tripwire all
+    /// mean the operator asked for something the run must not silently do
+    /// less than.
+    #[tokio::test]
+    async fn a_config_error_is_fatal_rather_than_isolated() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+registries:
+  src:
+    url: source.test
+  dst:
+    url: target.test
+defaults:
+  source: src
+  targets: [dst]
+mappings:
+  - from: repo/one
+    tags:
+      glob: ["v1"]
+  - from: repo/two
+    tags:
+      glob: ["v1"]
+      immutable_tags: "[unclosed"
+"#,
+        )
+        .expect("config yaml parses");
+
+        let err = resolve_all(
+            &config,
+            &working_clients(),
+            &HashMap::new(),
+            false,
+            None,
+            &PrepareTracker::default(),
+        )
+        .await
+        .expect_err("an invalid glob must not be isolated");
+
+        assert_eq!(
+            err.exit_code(),
+            ExitCode::ConfigError,
+            "and it keeps the config exit code"
         );
     }
 
@@ -3736,9 +3814,10 @@ mappings:
         assert!(value.get("stats").is_some(), "{value}");
     }
 
-    /// The key is absent on a clean run so the document shape is unchanged.
+    /// Both keys are always present, so one consumer can read `sync` and
+    /// `analyze` output with the same shape.
     #[test]
-    fn json_output_omits_unresolved_mappings_when_empty() {
+    fn json_output_always_carries_the_failure_keys() {
         let report = report_with(Vec::new());
         let value = serde_json::to_value(SyncOutput {
             report: &report,
@@ -3747,7 +3826,8 @@ mappings:
         })
         .expect("serializes");
 
-        assert!(value.get("unresolved_mappings").is_none(), "{value}");
+        assert_eq!(value["unresolved_mappings"], serde_json::json!([]));
+        assert_eq!(value["dropped_targets"], serde_json::json!([]));
     }
 
     /// Full wire-up: `select_filtered_tags` + `ResolvedMapping` construction +

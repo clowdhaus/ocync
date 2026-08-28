@@ -932,6 +932,10 @@ impl SyncEngine {
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.reset();
+        // The `select!` branch only fires on a poll where no work was ready,
+        // so a steady completion stream would starve it. This deadline is
+        // checked from the work arms too, which is what guarantees a cadence.
+        let mut next_heartbeat = tokio::time::Instant::now() + self.heartbeat_interval;
 
         // Seed discovery with all (mapping, tag) pairs.
         for mapping in &mappings {
@@ -1087,6 +1091,17 @@ impl SyncEngine {
                 Some(result) = execution_futures.next(), if !execution_futures.is_empty() => {
                     progress.image_completed(&result);
                     results.push(result);
+                    if tokio::time::Instant::now() >= next_heartbeat {
+                        progress.run_heartbeat(RunProgress {
+                            in_discovery: discovery_futures.len(),
+                            pending: pending.len(),
+                            in_flight: execution_futures.len(),
+                            completed: results.len(),
+                            elapsed: run_start.elapsed(),
+                        });
+                        next_heartbeat = tokio::time::Instant::now() + self.heartbeat_interval;
+                        heartbeat.reset();
+                    }
                 }
                 _ = async {
                     // Guard above ensures shutdown.is_some(); unwrap cannot panic.
@@ -1194,6 +1209,7 @@ impl SyncEngine {
                         completed: results.len(),
                         elapsed: run_start.elapsed(),
                     });
+                    next_heartbeat = tokio::time::Instant::now() + self.heartbeat_interval;
                 }
                 else => break,
             }

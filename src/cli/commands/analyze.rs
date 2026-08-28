@@ -20,8 +20,8 @@ use ocync_sync::ShutdownSignal;
 
 use crate::cli::commands::synchronize::{
     ClientMap, DroppedTarget, MappingResolution, PreparePhase, PrepareTracker, UnresolvedMapping,
-    build_clients, log_unresolved_mapping, resolve_mapping, shared_failure_code,
-    with_prepare_progress,
+    build_clients, log_unresolved_mapping, referenced_registries, resolve_mapping,
+    shared_failure_code, with_prepare_progress,
 };
 use crate::cli::config::{Config, load_config};
 use crate::cli::output::format_bytes;
@@ -91,8 +91,8 @@ pub(crate) async fn run(
     // to span the whole loop, not just the client build, or the tag-listing
     // stretch it exists for stays silent.
     let tracker = PrepareTracker::default();
-    let analysis = with_prepare_progress(&tracker, async {
-        let clients = build_clients(&config, &tracker).await;
+    let analysis = with_prepare_progress(&tracker, "analysis", async {
+        let clients = build_clients(&config, &referenced_registries(&config), &tracker).await;
         tracker.begin(PreparePhase::Mappings, config.mappings.len());
         collect_analysis(&config, &clients, &no_checkers, shutdown, &tracker).await
     })
@@ -175,7 +175,7 @@ async fn collect_analysis(
 
         for tag_pair in &resolved.tags {
             if shutdown.is_triggered() {
-                tracing::info!("shutdown signal received, stopping analysis early");
+                // The outer loop logs it; saying so once is enough.
                 analysis.interrupted = true;
                 break;
             }

@@ -15,14 +15,10 @@ pub(crate) async fn run_check(configs: &[PathBuf]) -> Result<ExitCode, CliError>
 /// [`run_check`] with the status sink injected, so a test can assert which
 /// files and registries were actually reached.
 async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<ExitCode, CliError> {
-    let mut all_ok = true;
-    // Tracked apart from `all_ok`: a broken config file is a different problem
-    // from a rejected credential, and keeps its own exit code.
-    let mut config_error = false;
     // `ping` treats 401 as reachable, so a denial almost always arrives from
-    // client construction. Keeping its classification is what lets a wholly
+    // client construction. Keeping the classification is what lets a wholly
     // denied check exit 4 instead of a generic partial failure.
-    let mut auth_error = false;
+    let mut worst = Worst::Clean;
 
     for path in configs {
         // `-c` is repeatable and the files are independent, so one unreadable
@@ -31,8 +27,7 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
             Ok(config) => config,
             Err(err) => {
                 let _ = writeln!(out, "  FAIL  {} -- {err}", path.display());
-                config_error = true;
-                all_ok = false;
+                worst = worst.max(Worst::Unreadable);
                 continue;
             }
         };
@@ -48,39 +43,57 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
                         let _ = writeln!(out, "  FAIL  {name} ({safe_url}) -- {err}");
                         // `ping` accepts 401 as reachable but returns Err on
                         // 403, which is a denial and keeps the auth code.
-                        if err.is_auth_error() {
-                            auth_error = true;
-                        }
-                        all_ok = false;
+                        worst = worst.max(if err.is_auth_error() {
+                            Worst::Denied
+                        } else {
+                            Worst::Failed
+                        });
                     }
                 },
                 Err(err) => {
                     let _ = writeln!(out, "  FAIL  {name} -- {err}");
-                    if matches!(err.exit_code(), ExitCode::AuthError) {
-                        auth_error = true;
-                    }
-                    all_ok = false;
+                    worst = worst.max(if matches!(err.exit_code(), ExitCode::AuthError) {
+                        Worst::Denied
+                    } else {
+                        Worst::Failed
+                    });
                 }
             }
         }
     }
 
-    Ok(classify(config_error, all_ok, auth_error))
+    Ok(worst.exit_code())
 }
 
 /// Pick the exit code for a completed check.
 ///
 /// Ordered by which cause the operator has to fix first: an unreadable config
 /// outranks a denial, which outranks a generic failure.
-fn classify(config_error: bool, all_ok: bool, auth_error: bool) -> ExitCode {
-    if config_error {
-        ExitCode::ConfigError
-    } else if all_ok {
-        ExitCode::Success
-    } else if auth_error {
-        ExitCode::AuthError
-    } else {
-        ExitCode::PartialFailure
+/// The worst thing a credential check ran into.
+///
+/// Ordered by which cause the operator has to fix first, so folding is
+/// `max` and the precedence lives in the type rather than an if-chain.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Worst {
+    /// Every registry answered.
+    #[default]
+    Clean,
+    /// A registry failed for a reason that is not a denial.
+    Failed,
+    /// Credentials were rejected.
+    Denied,
+    /// A config file could not be read at all.
+    Unreadable,
+}
+
+impl Worst {
+    fn exit_code(self) -> ExitCode {
+        match self {
+            Self::Clean => ExitCode::Success,
+            Self::Failed => ExitCode::PartialFailure,
+            Self::Denied => ExitCode::AuthError,
+            Self::Unreadable => ExitCode::ConfigError,
+        }
     }
 }
 
@@ -143,17 +156,15 @@ mod tests {
     /// into the generic partial failure.
     #[test]
     fn auth_failures_outrank_a_generic_partial_failure() {
-        assert_eq!(
-            classify(false, false, true),
-            ExitCode::AuthError,
-            "a denial reports as one"
-        );
-        assert_eq!(
-            classify(true, false, true),
-            ExitCode::ConfigError,
-            "a broken config is the cause to fix first"
-        );
-        assert_eq!(classify(false, false, false), ExitCode::PartialFailure);
-        assert_eq!(classify(false, true, false), ExitCode::Success);
+        assert_eq!(Worst::Denied.exit_code(), ExitCode::AuthError);
+        assert_eq!(Worst::Unreadable.exit_code(), ExitCode::ConfigError);
+        assert_eq!(Worst::Failed.exit_code(), ExitCode::PartialFailure);
+        assert_eq!(Worst::Clean.exit_code(), ExitCode::Success);
+
+        // The ordering is the precedence: a broken config is the cause to fix
+        // before a denial, and a denial before a generic failure.
+        assert!(Worst::Unreadable > Worst::Denied);
+        assert!(Worst::Denied > Worst::Failed);
+        assert!(Worst::Failed > Worst::Clean);
     }
 }
