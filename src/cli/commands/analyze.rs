@@ -18,7 +18,10 @@ use ocync_distribution::{Digest, RepositoryName};
 
 use ocync_sync::ShutdownSignal;
 
-use crate::cli::commands::synchronize::{MappingResolution, build_clients, resolve_mapping};
+use crate::cli::commands::synchronize::{
+    MappingResolution, PrepareTracker, build_clients, log_unresolved_mapping, resolve_mapping,
+    with_prepare_progress,
+};
 use crate::cli::config::load_config;
 use crate::cli::output::format_bytes;
 use crate::cli::{CliError, ExitCode};
@@ -53,12 +56,16 @@ pub(crate) async fn run(
     shutdown: &ShutdownSignal,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
-    let clients = build_clients(&config).await;
+    // Client construction mints a token per registry with nothing else in the
+    // log; the ticker keeps that window visible.
+    let tracker = PrepareTracker::default();
+    let clients = with_prepare_progress(&tracker, build_clients(&config, &tracker)).await;
     // Analyze doesn't push anything, so no batch checkers needed.
     let no_checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
     let mut blobs: HashMap<Digest, BlobAggregate> = HashMap::new();
     let mut image_count = 0usize;
+    let mut failed_images = 0usize;
 
     for mapping in &config.mappings {
         if shutdown.is_triggered() {
@@ -73,11 +80,7 @@ pub(crate) async fn run(
             Ok(MappingResolution::Resolved(r)) => r,
             Ok(MappingResolution::NoMatchingTags(_)) => continue,
             Err(err) => {
-                tracing::error!(
-                    from = %mapping.from,
-                    error = %err,
-                    "mapping could not be resolved; skipping"
-                );
+                log_unresolved_mapping(&mapping.from, &err);
                 continue;
             }
         };
@@ -91,7 +94,11 @@ pub(crate) async fn run(
             image_count += 1;
             let image_ref = format!("{}:{}", resolved.source_repo, tag_pair.source);
             tracing::info!(image = %image_ref, "analyzing");
-            collect_blobs(
+            // One unreadable image must not end the analysis: the remaining
+            // tags and mappings are independent of it. The count above already
+            // includes this image, so the totals stay honest about what was
+            // attempted.
+            if let Err(err) = collect_blobs(
                 &resolved.source_client,
                 &resolved.source_repo,
                 &tag_pair.source,
@@ -100,8 +107,19 @@ pub(crate) async fn run(
                 &resolved.target_repo,
                 &mut blobs,
             )
-            .await?;
+            .await
+            {
+                tracing::error!(image = %image_ref, error = %err, "image could not be analyzed; skipping");
+                failed_images += 1;
+            }
         }
+    }
+
+    if failed_images > 0 {
+        tracing::warn!(
+            failed_images,
+            "some images could not be analyzed; blob totals below exclude them"
+        );
     }
 
     if args.json {
@@ -144,15 +162,23 @@ async fn collect_blobs(
     // Recurse into index children to collect per-platform manifest blobs.
     if let ManifestKind::Index(index) = &pulled.manifest {
         for child in &index.manifests {
-            let child_pulled = source_client
+            // Platforms are independent: a missing arm64 manifest should not
+            // discard the amd64 blobs already recorded for this image.
+            let child_pulled = match source_client
                 .manifest_pull(source_repo, &child.digest.to_string())
                 .await
-                .map_err(|e| {
-                    CliError::Input(format!(
-                        "manifest_pull {image_ref} child {}: {e}",
-                        child.digest
-                    ))
-                })?;
+            {
+                Ok(pulled) => pulled,
+                Err(e) => {
+                    tracing::warn!(
+                        image = %image_ref,
+                        child = %child.digest,
+                        error = %e,
+                        "index child could not be pulled; skipping this platform"
+                    );
+                    continue;
+                }
+            };
             for descriptor in descriptors_of(&child_pulled.manifest) {
                 record_blob(
                     descriptor.digest,

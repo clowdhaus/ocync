@@ -1,7 +1,9 @@
 //! The `sync` subcommand - runs all mappings from config.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -40,20 +42,141 @@ const CACHE_FILE_NAME: &str = "transfer_state.bin";
 /// example data without overwhelming the log line.
 const NO_TAGS_SAMPLE_CAP: usize = 5;
 
-/// Minimum gap between progress lines while mappings are being resolved.
+/// Cadence of the progress line emitted while the run is preparing.
 ///
-/// Resolution is sequential and network-bound - one tag listing per mapping -
-/// so a large config can spend minutes here before the engine starts and the
-/// first per-image line appears. Emitting on a timer rather than per mapping
-/// keeps fast configs silent and slow ones legible.
-const RESOLVE_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+/// Everything before the engine starts is sequential and network-bound: each
+/// client build mints a token for ECR, GAR, and ACR, and each mapping lists a
+/// repository's tags. No per-image output exists yet, so without this a large
+/// config runs for minutes with nothing in the log.
+const PREPARE_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A step of the pre-engine phase.
+#[derive(Debug, Clone, Copy, Default)]
+enum PreparePhase {
+    #[default]
+    Registries,
+    BatchCheckers,
+    Mappings,
+}
+
+impl fmt::Display for PreparePhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registries => f.write_str("registries"),
+            Self::BatchCheckers => f.write_str("batch checkers"),
+            Self::Mappings => f.write_str("mappings"),
+        }
+    }
+}
+
+/// Snapshot of the pre-engine phase, read by the progress ticker.
+#[derive(Debug, Clone, Copy, Default)]
+struct PrepareProgress {
+    /// Which pre-engine step is running.
+    phase: PreparePhase,
+    /// Items finished in this step.
+    done: usize,
+    /// Items this step will process.
+    total: usize,
+}
+
+/// Counter the pre-engine steps advance and the progress ticker reads.
+///
+/// A plain [`Cell`] rather than a channel: the runtime is `current_thread`, so
+/// the ticker and the work it describes never run concurrently.
+#[derive(Debug, Default)]
+pub(crate) struct PrepareTracker {
+    state: Cell<PrepareProgress>,
+}
+
+impl PrepareTracker {
+    /// Start a new step, resetting the item counter.
+    fn begin(&self, phase: PreparePhase, total: usize) {
+        self.state.set(PrepareProgress {
+            phase,
+            done: 0,
+            total,
+        });
+    }
+
+    /// Record one item finished in the current step.
+    fn advance(&self) {
+        let mut p = self.state.get();
+        p.done += 1;
+        self.state.set(p);
+    }
+}
+
+/// Drive `work` to completion, logging its progress every
+/// [`PREPARE_PROGRESS_INTERVAL`].
+///
+/// The ticker fires on wall-clock, not on item boundaries, so a single slow
+/// mapping still reports. A boundary-driven throttle does not: measured on a
+/// three-mapping config it emitted nothing across an 8.6 second run.
+pub(crate) async fn with_prepare_progress<F: Future>(
+    tracker: &PrepareTracker,
+    work: F,
+) -> F::Output {
+    let mut work = std::pin::pin!(work);
+    let started = Instant::now();
+    let mut ticker = tokio::time::interval(PREPARE_PROGRESS_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` yields immediately; push the first tick out a full period so
+    // a fast run stays silent.
+    ticker.reset();
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut work => return out,
+            _ = ticker.tick() => {
+                let p = tracker.state.get();
+                tracing::info!(
+                    phase = %p.phase,
+                    done = p.done,
+                    total = p.total,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "preparing sync"
+                );
+            }
+        }
+    }
+}
 
 /// Registry clients keyed by config alias.
 ///
-/// A registry whose auth provider could not be built is stored as its error
-/// text rather than dropped, so the failure surfaces only on the mappings
-/// that actually reference it.
-pub(crate) type ClientMap = HashMap<String, Result<Arc<RegistryClient>, String>>;
+/// A registry whose auth provider could not be built is stored as its failure
+/// rather than dropped, so the error surfaces only on the mappings that
+/// actually reference it.
+pub(crate) type ClientMap = HashMap<String, Result<Arc<RegistryClient>, ClientInitError>>;
+
+/// Why a registry's client could not be built.
+///
+/// Carries the classification alongside the message: recovering it later from
+/// a stringified error is impossible, and losing it downgrades a wholly denied
+/// run from the auth exit code to the generic failure code.
+#[derive(Debug)]
+pub(crate) struct ClientInitError {
+    /// The original error, already formatted.
+    message: String,
+    /// Whether the cause was a credential failure.
+    auth: bool,
+}
+
+/// Which side of a mapping a registry sits on, for error messages.
+#[derive(Debug, Clone, Copy)]
+enum RegistryRole {
+    Source,
+    Target,
+}
+
+impl fmt::Display for RegistryRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source => f.write_str("source"),
+            Self::Target => f.write_str("target"),
+        }
+    }
+}
 
 /// Outcome of resolving a single mapping. Either the mapping is ready for the
 /// engine, or no source tag survived filtering and the caller decides whether
@@ -74,7 +197,7 @@ pub(crate) enum MappingResolution {
 /// Resolution failures are per-mapping: an unreachable registry or a 403 on
 /// one repository's tag listing must not stop the mappings behind it.
 #[derive(Debug, Serialize)]
-pub(crate) struct MappingFailure {
+pub(crate) struct UnresolvedMapping {
     /// Source repository path from the mapping config.
     pub from: String,
     /// Why the mapping could not be resolved.
@@ -121,8 +244,8 @@ impl NoTagsInfo {
     }
 }
 
-impl std::fmt::Display for NoTagsInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for NoTagsInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let total = self.source_total();
         let total_phrase = if self.artifact_count > 0 {
             format!(
@@ -286,16 +409,24 @@ pub(crate) async fn run(
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
 
-    let clients = build_clients(&config).await;
-    let batch_checkers = build_batch_checkers(&config).await;
-
-    let (mappings, unresolved) = resolve_all(
-        &config,
-        &clients,
-        &batch_checkers,
-        args.dry_run,
-        watch_log.as_deref_mut(),
-    )
+    // Client construction, batch-checker setup, and mapping resolution are all
+    // sequential network work with no output of their own. One ticker spans
+    // the lot so the run is never silent for longer than the interval.
+    let tracker = PrepareTracker::default();
+    let (mappings, unresolved) = with_prepare_progress(&tracker, async {
+        let clients = build_clients(&config, &tracker).await;
+        let batch_checkers = build_batch_checkers(&config, &clients, &tracker).await;
+        let (mappings, unresolved) = resolve_all(
+            &config,
+            &clients,
+            &batch_checkers,
+            args.dry_run,
+            watch_log.as_deref_mut(),
+            &tracker,
+        )
+        .await;
+        (mappings, unresolved)
+    })
     .await;
 
     if let Some(state) = watch_log.as_mut() {
@@ -416,7 +547,7 @@ pub(crate) async fn run(
 }
 
 /// Exit code for a dry run, which produces no [`SyncReport`] to fold into.
-fn dry_run_exit_code(resolved: usize, unresolved: &[MappingFailure]) -> ExitCode {
+fn dry_run_exit_code(resolved: usize, unresolved: &[UnresolvedMapping]) -> ExitCode {
     if unresolved.is_empty() {
         return ExitCode::Success;
     }
@@ -428,10 +559,10 @@ fn dry_run_exit_code(resolved: usize, unresolved: &[MappingFailure]) -> ExitCode
 
 /// Exit code for a run where nothing succeeded.
 ///
-/// Keeps the dedicated auth code when every mapping was denied. Before
-/// failures were isolated the first 403 aborted with that code, and dropping
-/// to the generic failure code would silently retire it.
-fn total_failure_code(unresolved: &[MappingFailure]) -> ExitCode {
+/// A run denied everywhere exits with the auth code rather than the generic
+/// failure code, so an operator can tell "fix the credentials" from "fix
+/// something else" without reading the log.
+fn total_failure_code(unresolved: &[UnresolvedMapping]) -> ExitCode {
     if !unresolved.is_empty() && unresolved.iter().all(|f| f.auth) {
         ExitCode::AuthError
     } else {
@@ -444,17 +575,11 @@ fn total_failure_code(unresolved: &[MappingFailure]) -> ExitCode {
 /// A mapping that never reached the engine produces no [`ocync_sync::ImageResult`],
 /// so [`SyncReport::exit_code`] cannot see it. Counting each as a failure is
 /// what keeps a run whose mappings all 403'd from exiting 0.
-fn combined_exit_code(report: &SyncReport, unresolved: &[MappingFailure]) -> ExitCode {
+fn combined_exit_code(report: &SyncReport, unresolved: &[UnresolvedMapping]) -> ExitCode {
     if unresolved.is_empty() {
         return ExitCode::from_report(report.exit_code());
     }
-    let has_success = report.images.iter().any(|i| {
-        matches!(
-            i.status,
-            ocync_sync::ImageStatus::Synced | ocync_sync::ImageStatus::Skipped { .. }
-        )
-    });
-    if has_success {
+    if report.has_success() {
         return ExitCode::PartialFailure;
     }
     // Images that ran and failed for non-auth reasons make this a generic
@@ -603,12 +728,16 @@ fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: 
 
 /// One-line cycle tail rolling up totals across all mappings. The caller
 /// is responsible for gating this in watch mode (skip on idle cycles).
-fn emit_cycle_tail(descriptors: &[MappingDescriptor], unresolved: usize, report: &SyncReport) {
-    let line = format_cycle_tail(descriptors.len(), unresolved, report);
+fn emit_cycle_tail(
+    descriptors: &[MappingDescriptor],
+    unresolved_count: usize,
+    report: &SyncReport,
+) {
+    let line = format_cycle_tail(descriptors.len(), unresolved_count, report);
     // Counts are already in the message; structured fields would be a
     // verbatim restatement in text output. JSON aggregators parse the
     // message (or use the SyncReport via `--json`).
-    if report.stats.images_failed > 0 || unresolved > 0 {
+    if report.stats.images_failed > 0 || unresolved_count > 0 {
         tracing::warn!("{line}");
     } else {
         tracing::info!("{line}");
@@ -617,12 +746,12 @@ fn emit_cycle_tail(descriptors: &[MappingDescriptor], unresolved: usize, report:
 
 /// Render the cycle tail. Split from [`emit_cycle_tail`] so the wording is
 /// testable without a tracing subscriber.
-fn format_cycle_tail(mapping_count: usize, unresolved: usize, report: &SyncReport) -> String {
+fn format_cycle_tail(mapping_count: usize, unresolved_count: usize, report: &SyncReport) -> String {
     let s = &report.stats;
     // Unresolved mappings never reached the engine, so they are absent from
     // every count above and need their own clause.
-    let unresolved_clause = if unresolved > 0 {
-        format!(" | {unresolved} unresolved")
+    let unresolved_clause = if unresolved_count > 0 {
+        format!(" | {unresolved_count} unresolved")
     } else {
         String::new()
     };
@@ -700,9 +829,14 @@ fn parse_size(s: &str) -> Option<u64> {
 /// registry can fail. Record the failure against that alias instead of
 /// aborting: registries the failing one shares no mapping with still sync, and
 /// the mappings that do reference it fail with the original error text.
-pub(crate) async fn build_clients(config: &Config) -> ClientMap {
-    let mut clients = ClientMap::with_capacity(config.registries.len());
+pub(crate) async fn build_clients(config: &Config, tracker: &PrepareTracker) -> ClientMap {
+    let referenced = referenced_registries(config);
+    tracker.begin(PreparePhase::Registries, referenced.len());
+    let mut clients = ClientMap::with_capacity(referenced.len());
     for (name, reg) in &config.registries {
+        if !referenced.contains(name) {
+            continue;
+        }
         let hostname = bare_hostname(&reg.url);
         let entry = match build_registry_client(hostname, Some(reg)).await {
             Ok(client) => Ok(Arc::new(client)),
@@ -712,12 +846,48 @@ pub(crate) async fn build_clients(config: &Config) -> ClientMap {
                     error = %err,
                     "registry client setup failed; mappings using this registry will be skipped"
                 );
-                Err(err.to_string())
+                Err(ClientInitError {
+                    auth: matches!(err.exit_code(), ExitCode::AuthError),
+                    message: err.to_string(),
+                })
             }
         };
         clients.insert(name.clone(), entry);
+        tracker.advance();
     }
     clients
+}
+
+/// Registry aliases at least one mapping actually references.
+///
+/// Building a client mints a token for ECR, GAR, and ACR, so a registry no
+/// mapping uses costs an auth round trip against the rate-limit budget and, on
+/// failure, logs an error nothing depends on. A target value that does not
+/// resolve is left out here; `resolve_mapping` reports it per mapping.
+fn referenced_registries(config: &Config) -> HashSet<String> {
+    let known: HashSet<&str> = config.registries.keys().map(String::as_str).collect();
+    let defaults = config.defaults.as_ref();
+    let mut used = HashSet::new();
+    for mapping in &config.mappings {
+        if let Some(source) = mapping
+            .source
+            .as_deref()
+            .or(defaults.and_then(|d| d.source.as_deref()))
+        {
+            used.insert(source.to_owned());
+        }
+        if let Some(targets) = mapping
+            .targets
+            .as_ref()
+            .or(defaults.and_then(|d| d.targets.as_ref()))
+        {
+            let context = format!("mapping '{}'", mapping.from);
+            if let Ok(names) = resolve_target_names(targets, config, &known, &context) {
+                used.extend(names);
+            }
+        }
+    }
+    used
 }
 
 /// Look up a usable client for `name`, turning a missing or failed registry
@@ -726,13 +896,23 @@ fn client_for(
     clients: &ClientMap,
     name: &str,
     mapping_from: &str,
-    role: &str,
+    role: RegistryRole,
 ) -> Result<Arc<RegistryClient>, CliError> {
     match clients.get(name) {
         Some(Ok(client)) => Ok(Arc::clone(client)),
-        Some(Err(err)) => Err(CliError::Input(format!(
-            "mapping '{mapping_from}': {role} registry '{name}' is unavailable: {err}"
-        ))),
+        Some(Err(err)) => {
+            let msg = format!(
+                "mapping '{mapping_from}': {role} registry '{name}' is unavailable: {}",
+                err.message
+            );
+            // A denied registry stays a denial here, so a run that failed only
+            // on credentials still exits with the auth code.
+            Err(if err.auth {
+                CliError::Auth(msg)
+            } else {
+                CliError::Input(msg)
+            })
+        }
         None => Err(CliError::Input(format!(
             "mapping '{mapping_from}': {role} registry '{name}' not found in clients"
         ))),
@@ -744,10 +924,20 @@ fn client_for(
 /// Automatically creates a [`BatchChecker`] for every registry detected
 /// as ECR (via explicit `auth_type: ecr` or hostname auto-detection). No
 /// user configuration is needed - if we know it's ECR, we use the batch API.
-async fn build_batch_checkers(config: &Config) -> HashMap<String, Rc<dyn BatchBlobChecker>> {
+async fn build_batch_checkers(
+    config: &Config,
+    clients: &ClientMap,
+    tracker: &PrepareTracker,
+) -> HashMap<String, Rc<dyn BatchBlobChecker>> {
     let mut checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
+    // The client map is already the referenced set; deriving it from there
+    // avoids re-resolving every mapping's target groups a second time.
+    tracker.begin(PreparePhase::BatchCheckers, clients.len());
     for (name, reg) in &config.registries {
+        if !clients.contains_key(name) {
+            continue;
+        }
         let hostname = bare_hostname(&reg.url);
         // Explicit non-Ecr auth_type is a hard opt-out: don't try to build an
         // AWS-SDK-backed batch checker for a registry the user has declared
@@ -777,6 +967,7 @@ async fn build_batch_checkers(config: &Config) -> HashMap<String, Rc<dyn BatchBl
                 "ECR batch checker unavailable; manifest commits fall back to retry-on-conflict"
             ),
         }
+        tracker.advance();
     }
 
     checkers
@@ -787,21 +978,20 @@ async fn build_batch_checkers(config: &Config) -> HashMap<String, Rc<dyn BatchBl
 /// One unreachable registry, one 403 on a tag listing, or one bad repository
 /// name must not cost the run every other mapping. Each failure is logged and
 /// recorded; resolution continues. Returns the mappings that are ready for the
-/// engine plus one [`MappingFailure`] per mapping that is not.
+/// engine plus one [`UnresolvedMapping`] per mapping that is not.
 async fn resolve_all(
     config: &Config,
     clients: &ClientMap,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
     with_report: bool,
     mut watch_log: Option<&mut WatchLogState>,
-) -> (Vec<ResolvedMapping>, Vec<MappingFailure>) {
-    let total = config.mappings.len();
-    let started = Instant::now();
-    let mut last_progress = started;
+    tracker: &PrepareTracker,
+) -> (Vec<ResolvedMapping>, Vec<UnresolvedMapping>) {
+    tracker.begin(PreparePhase::Mappings, config.mappings.len());
     let mut resolved = Vec::new();
-    let mut failures = Vec::new();
+    let mut unresolved = Vec::new();
 
-    for (index, mapping) in config.mappings.iter().enumerate() {
+    for mapping in &config.mappings {
         match resolve_mapping(mapping, config, clients, batch_checkers, with_report).await {
             Ok(MappingResolution::Resolved(m)) => resolved.push(m),
             Ok(MappingResolution::NoMatchingTags(info)) => {
@@ -814,33 +1004,30 @@ async fn resolve_all(
                 }
             }
             Err(err) => {
-                tracing::error!(
-                    from = %mapping.from,
-                    error = %err,
-                    "mapping could not be resolved; continuing with the remaining mappings"
-                );
-                failures.push(MappingFailure {
+                log_unresolved_mapping(&mapping.from, &err);
+                unresolved.push(UnresolvedMapping {
                     from: mapping.from.clone(),
                     auth: matches!(err.exit_code(), ExitCode::AuthError),
                     error: err.to_string(),
                 });
             }
         }
-
-        // Timer-gated so a config that resolves in a second stays silent while
-        // one that takes minutes reports where it is.
-        if index + 1 < total && last_progress.elapsed() >= RESOLVE_PROGRESS_INTERVAL {
-            tracing::info!(
-                resolved = index + 1,
-                total,
-                elapsed_secs = started.elapsed().as_secs(),
-                "resolving mappings"
-            );
-            last_progress = Instant::now();
-        }
+        tracker.advance();
     }
 
-    (resolved, failures)
+    (resolved, unresolved)
+}
+
+/// Report a mapping that could not be turned into work.
+///
+/// Shared with `analyze`, which drops the same mapping for the same reasons
+/// and should say so the same way.
+pub(crate) fn log_unresolved_mapping(from: &str, err: &CliError) {
+    tracing::error!(
+        from = %from,
+        error = %err,
+        "mapping could not be resolved; continuing with the remaining mappings"
+    );
 }
 
 /// Resolve a single mapping config into a [`MappingResolution`].
@@ -868,7 +1055,7 @@ pub(crate) async fn resolve_mapping(
             ))
         })?;
 
-    let source_client = client_for(clients, source_name, &mapping.from, "source")?;
+    let source_client = client_for(clients, source_name, &mapping.from, RegistryRole::Source)?;
 
     // --- Target registries ---
     let targets_value = mapping
@@ -887,19 +1074,41 @@ pub(crate) async fn resolve_mapping(
     let target_names =
         resolve_target_names(targets_value, config, &known, &context).map_err(CliError::Config)?;
 
-    let mut targets: Vec<TargetEntry> = target_names
-        .into_iter()
-        .map(|name| {
-            let client = client_for(clients, &name, &mapping.from, "target")?;
-            let batch_checker = batch_checkers.get(&name).cloned();
-            Ok(TargetEntry {
-                name: RegistryAlias::new(name),
-                client,
-                batch_checker,
-                existing_tags: HashSet::new(),
-            })
-        })
-        .collect::<Result<Vec<_>, CliError>>()?;
+    // One unusable target must not take its siblings with it: a mapping that
+    // fans out to three registries still syncs to the two that work. Mirrors
+    // the per-target degradation the immutable-tag listing below already does.
+    // Only when every target is gone does the mapping have nothing to do.
+    let mut targets: Vec<TargetEntry> = Vec::with_capacity(target_names.len());
+    let mut last_target_err = None;
+    for name in target_names {
+        match client_for(clients, &name, &mapping.from, RegistryRole::Target) {
+            Ok(client) => {
+                let batch_checker = batch_checkers.get(&name).cloned();
+                targets.push(TargetEntry {
+                    name: RegistryAlias::new(name),
+                    client,
+                    batch_checker,
+                    existing_tags: HashSet::new(),
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    from = %mapping.from,
+                    registry = %name,
+                    error = %err,
+                    "target registry unavailable; syncing the mapping's remaining targets"
+                );
+                last_target_err = Some(err);
+            }
+        }
+    }
+    if targets.is_empty() {
+        // Every target failed, so the mapping itself is unresolvable. Surface
+        // one of the causes rather than a generic "no targets" message.
+        return Err(last_target_err.unwrap_or_else(|| {
+            CliError::Input(format!("mapping '{}': no target registries", mapping.from))
+        }));
+    }
 
     // --- Fetch and filter tags ---
     let source_repo_path = RepositoryName::new(&mapping.from)?;
@@ -1182,19 +1391,14 @@ struct SyncOutput<'a> {
     report: &'a SyncReport,
     /// Mappings dropped during resolution. Absent when every mapping resolved,
     /// so the document shape is unchanged on a clean run.
-    #[serde(skip_serializing_if = "slice_is_empty")]
-    unresolved_mappings: &'a [MappingFailure],
-}
-
-/// Serde predicate for a borrowed slice field.
-fn slice_is_empty<T>(s: &&[T]) -> bool {
-    s.is_empty()
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    unresolved_mappings: &'a [UnresolvedMapping],
 }
 
 /// Write sync output as JSON when `--json` is passed.
 fn write_output(
     report: &SyncReport,
-    unresolved: &[MappingFailure],
+    unresolved: &[UnresolvedMapping],
     json: bool,
 ) -> Result<(), CliError> {
     if json {
@@ -2351,17 +2555,38 @@ mappings:
         ])
     }
 
+    /// A registry whose client could not be built, as `build_clients` records it.
+    fn broken_client(message: &str, auth: bool) -> Result<Arc<RegistryClient>, ClientInitError> {
+        Err(ClientInitError {
+            message: message.to_string(),
+            auth,
+        })
+    }
+
+    async fn resolve(
+        config: &Config,
+        clients: &ClientMap,
+    ) -> (Vec<ResolvedMapping>, Vec<UnresolvedMapping>) {
+        resolve_all(
+            config,
+            clients,
+            &HashMap::new(),
+            false,
+            None,
+            &PrepareTracker::default(),
+        )
+        .await
+    }
+
     /// A mapping that cannot be resolved must not cost the run the mappings
-    /// behind it. Before this, the first failure `?`-returned out of `run` and
-    /// every later mapping was silently dropped.
+    /// behind it: the mapping *after* the failure is the one that proves it.
     #[tokio::test]
     async fn resolve_all_isolates_a_failing_mapping() {
         let config = three_mapping_config();
-        let (resolved, failures) =
-            resolve_all(&config, &working_clients(), &HashMap::new(), false, None).await;
+        let (resolved, unresolved) = resolve(&config, &working_clients()).await;
 
-        assert_eq!(failures.len(), 1, "only the bad mapping should fail");
-        assert_eq!(failures[0].from, "repo/two");
+        assert_eq!(unresolved.len(), 1, "only the bad mapping should fail");
+        assert_eq!(unresolved[0].from, "repo/two");
 
         // The negative half: the mapping *after* the failure still resolved.
         let names: Vec<&str> = resolved.iter().map(|m| m.source_repo.as_str()).collect();
@@ -2400,22 +2625,27 @@ mappings:
             ("src".to_string(), Ok(test_client("https://source.test"))),
             (
                 "broken".to_string(),
-                Err("ECR auth setup for 'broken.test': 403 Forbidden".to_string()),
+                broken_client("ECR auth setup for 'broken.test': 403 Forbidden", true),
             ),
             ("dst".to_string(), Ok(test_client("https://target.test"))),
         ]);
 
-        let (resolved, failures) =
-            resolve_all(&config, &clients, &HashMap::new(), false, None).await;
+        let (resolved, unresolved) = resolve(&config, &clients).await;
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].source_repo.as_str(), "repo/one");
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].from, "repo/two");
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].from, "repo/two");
         assert!(
-            failures[0].error.contains("403 Forbidden"),
+            unresolved[0].error.contains("403 Forbidden"),
             "the setup error must survive to the mapping failure: {}",
-            failures[0].error
+            unresolved[0].error
+        );
+        // The classification has to survive too, or a wholly denied run
+        // silently drops from the auth exit code to the generic one.
+        assert!(
+            unresolved[0].auth,
+            "a denied registry must stay classified as a denial"
         );
     }
 
@@ -2441,11 +2671,134 @@ mappings:
         )
         .expect("config yaml parses");
 
-        let (resolved, failures) =
-            resolve_all(&config, &working_clients(), &HashMap::new(), false, None).await;
+        let (resolved, unresolved) = resolve(&config, &working_clients()).await;
 
         assert_eq!(resolved.len(), 1);
-        assert!(failures.is_empty());
+        assert!(unresolved.is_empty());
+    }
+
+    /// A mapping fanning out to several targets keeps the ones that work.
+    ///
+    /// This is the same principle as per-mapping isolation, one level down: a
+    /// broken mirror must not stop the other mirrors from receiving the image.
+    #[tokio::test]
+    async fn resolve_all_keeps_the_working_targets_when_one_is_unavailable() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+registries:
+  src:
+    url: source.test
+  good:
+    url: good.test
+  broken:
+    url: broken.test
+defaults:
+  source: src
+  targets: [good, broken]
+mappings:
+  - from: repo/one
+    tags:
+      glob: ["v1"]
+"#,
+        )
+        .expect("config yaml parses");
+
+        let clients = ClientMap::from([
+            ("src".to_string(), Ok(test_client("https://source.test"))),
+            ("good".to_string(), Ok(test_client("https://good.test"))),
+            (
+                "broken".to_string(),
+                broken_client("ECR auth setup for 'broken.test': 403 Forbidden", true),
+            ),
+        ]);
+
+        let (resolved, unresolved) = resolve(&config, &clients).await;
+
+        assert!(
+            unresolved.is_empty(),
+            "one dead target must not unresolve the whole mapping"
+        );
+        assert_eq!(resolved.len(), 1);
+        let targets: Vec<&str> = resolved[0].targets.iter().map(|t| &*t.name).collect();
+        assert_eq!(targets, vec!["good"], "the healthy target must survive");
+    }
+
+    /// Losing every target is different from losing one: there is nowhere left
+    /// to sync, so the mapping is unresolvable and keeps its cause.
+    #[tokio::test]
+    async fn resolve_all_fails_the_mapping_when_every_target_is_gone() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+registries:
+  src:
+    url: source.test
+  broken:
+    url: broken.test
+defaults:
+  source: src
+  targets: [broken]
+mappings:
+  - from: repo/one
+    tags:
+      glob: ["v1"]
+"#,
+        )
+        .expect("config yaml parses");
+
+        let clients = ClientMap::from([
+            ("src".to_string(), Ok(test_client("https://source.test"))),
+            (
+                "broken".to_string(),
+                broken_client("ECR auth setup for 'broken.test': 403 Forbidden", true),
+            ),
+        ]);
+
+        let (resolved, unresolved) = resolve(&config, &clients).await;
+
+        assert!(resolved.is_empty());
+        assert_eq!(unresolved.len(), 1);
+        assert!(
+            unresolved[0].error.contains("403 Forbidden"),
+            "the cause must survive, not a generic 'no targets': {}",
+            unresolved[0].error
+        );
+        assert!(unresolved[0].auth);
+    }
+
+    /// Building a client mints a token for ECR, GAR, and ACR, so a registry no
+    /// mapping references must not be contacted at all.
+    #[test]
+    fn referenced_registries_ignores_unused_entries() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+registries:
+  src:
+    url: source.test
+  dst:
+    url: target.test
+  unused:
+    url: unused.test
+target_groups:
+  mirrors: [dst]
+defaults:
+  source: src
+mappings:
+  - from: repo/one
+    targets: mirrors
+    tags:
+      glob: ["v1"]
+"#,
+        )
+        .expect("config yaml parses");
+
+        let used = referenced_registries(&config);
+
+        assert!(used.contains("src"));
+        assert!(used.contains("dst"), "target groups must be expanded");
+        assert!(
+            !used.contains("unused"),
+            "a registry no mapping names must not be built"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2461,8 +2814,8 @@ mappings:
         )
     }
 
-    fn failure(from: &str, auth: bool) -> MappingFailure {
-        MappingFailure {
+    fn unresolved_mapping(from: &str, auth: bool) -> UnresolvedMapping {
+        UnresolvedMapping {
             from: from.into(),
             error: "boom".into(),
             auth,
@@ -2476,7 +2829,7 @@ mappings:
         let report = report_from(vec![ocync_sync::ImageStatus::Synced]);
         assert_eq!(combined_exit_code(&report, &[]), ExitCode::Success);
         assert_eq!(
-            combined_exit_code(&report, &[failure("repo/two", false)]),
+            combined_exit_code(&report, &[unresolved_mapping("repo/two", false)]),
             ExitCode::PartialFailure
         );
     }
@@ -2485,7 +2838,10 @@ mappings:
     #[test]
     fn combined_exit_code_is_failure_when_nothing_succeeded() {
         let empty = report_with(Vec::new());
-        let failures = [failure("repo/one", false), failure("repo/two", true)];
+        let failures = [
+            unresolved_mapping("repo/one", false),
+            unresolved_mapping("repo/two", true),
+        ];
         assert_eq!(combined_exit_code(&empty, &failures), ExitCode::Failure);
     }
 
@@ -2497,7 +2853,7 @@ mappings:
             reason: ocync_sync::SkipReason::DigestMatch,
         }]);
         assert_eq!(
-            combined_exit_code(&report, &[failure("repo/two", false)]),
+            combined_exit_code(&report, &[unresolved_mapping("repo/two", false)]),
             ExitCode::PartialFailure
         );
     }
@@ -2507,7 +2863,10 @@ mappings:
     #[test]
     fn combined_exit_code_keeps_the_auth_code_when_every_mapping_was_denied() {
         let empty = report_with(Vec::new());
-        let denied = [failure("repo/one", true), failure("repo/two", true)];
+        let denied = [
+            unresolved_mapping("repo/one", true),
+            unresolved_mapping("repo/two", true),
+        ];
         assert_eq!(combined_exit_code(&empty, &denied), ExitCode::AuthError);
     }
 
@@ -2515,7 +2874,10 @@ mappings:
     #[test]
     fn combined_exit_code_does_not_claim_auth_for_a_mixed_failure_set() {
         let empty = report_with(Vec::new());
-        let mixed = [failure("repo/one", true), failure("repo/two", false)];
+        let mixed = [
+            unresolved_mapping("repo/one", true),
+            unresolved_mapping("repo/two", false),
+        ];
         assert_eq!(combined_exit_code(&empty, &mixed), ExitCode::Failure);
     }
 
@@ -2523,11 +2885,11 @@ mappings:
     fn dry_run_exit_code_maps_resolution_counts() {
         assert_eq!(dry_run_exit_code(3, &[]), ExitCode::Success);
         assert_eq!(
-            dry_run_exit_code(2, &[failure("repo/two", false)]),
+            dry_run_exit_code(2, &[unresolved_mapping("repo/two", false)]),
             ExitCode::PartialFailure
         );
         assert_eq!(
-            dry_run_exit_code(0, &[failure("repo/two", false)]),
+            dry_run_exit_code(0, &[unresolved_mapping("repo/two", false)]),
             ExitCode::Failure
         );
     }
@@ -2537,7 +2899,10 @@ mappings:
     /// downgraded a denied dry run from 4 to 2.
     #[test]
     fn dry_run_exit_code_keeps_the_auth_code_when_every_mapping_was_denied() {
-        let denied = [failure("repo/one", true), failure("repo/two", true)];
+        let denied = [
+            unresolved_mapping("repo/one", true),
+            unresolved_mapping("repo/two", true),
+        ];
         assert_eq!(dry_run_exit_code(0, &denied), ExitCode::AuthError);
         // Something resolved, so the run was only partly denied.
         assert_eq!(dry_run_exit_code(1, &denied), ExitCode::PartialFailure);
@@ -2566,7 +2931,7 @@ mappings:
     #[test]
     fn json_output_carries_unresolved_mappings() {
         let report = report_with(Vec::new());
-        let failures = vec![MappingFailure {
+        let failures = vec![UnresolvedMapping {
             from: "repo/two".into(),
             error: "403 Forbidden".into(),
             auth: true,

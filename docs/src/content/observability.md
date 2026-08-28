@@ -64,10 +64,10 @@ Abbreviated example:
 
 At the default verbosity, per-image lines are suppressed, so a long run would otherwise be silent from start to finish. Two periodic lines fill that gap:
 
-- `resolving mappings` during mapping resolution, once the phase has run for more than five seconds
-- `sync in progress` every 30 seconds while discovery or transfers are still in flight, carrying `discovering`, `pending`, `in_flight`, `completed`, and `elapsed_secs`
+- `preparing sync` every five seconds before the engine starts, carrying `phase` (`registries`, `batch checkers`, or `mappings`), `done`, `total`, and `elapsed_secs`. This window is sequential network work: a token mint per registry, then a tag listing per mapping.
+- `sync in progress` every 30 seconds while discovery or transfers are still in flight, carrying `in_discovery`, `pending`, `in_flight`, `completed`, and `elapsed_secs`
 
-Both are timer-gated, so a run that finishes quickly emits neither.
+Both fire on wall-clock rather than on item boundaries, so a single slow mapping still reports, and a run that finishes inside one interval emits neither.
 
 Disable all progress output with `--quiet`.
 

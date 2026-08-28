@@ -11,7 +11,16 @@ pub(crate) async fn run_check(configs: &[PathBuf]) -> Result<ExitCode, CliError>
     let mut all_ok = true;
 
     for path in configs {
-        let config = load_config(path)?;
+        // `-c` is repeatable and the files are independent, so one unreadable
+        // config must not skip the registries defined in the others.
+        let config = match load_config(path) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("  FAIL  {} -- {err}", path.display());
+                all_ok = false;
+                continue;
+            }
+        };
 
         for (name, reg) in &config.registries {
             let safe_url = redact_url(&reg.url);

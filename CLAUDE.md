@@ -33,7 +33,8 @@ ocync syncs content bit-for-bit from source to target(s). We do NOT convert, tra
 A run covers many images across many mappings. One denial, one unreachable registry, one bad repository name must never cancel the rest.
 
 - `SyncReport` is the contract: the engine never fails as a whole, and the CLI driver must not either. No `?` on a per-mapping or per-image path in `synchronize::run`, `resolve_all`, or `analyze::run`. Record the failure, log it, continue.
-- Anything constructed per-registry (clients, ECR batch checkers) fails only the mappings that reference it. Store the error against the alias instead of aborting construction.
+- Anything constructed per-registry (clients, ECR batch checkers) fails only the mappings that reference it. Store the error against the alias instead of aborting construction, and keep the classification with it: a stringified error cannot be told apart from a denial later.
+- Isolation applies at every level it can. One dead target does not cancel a mapping's other targets; one unreadable image does not cancel the rest of an analysis; one bad config file does not cancel the others.
 - Isolated failures must stay visible. Fold them into the exit code, the cycle tail, and the `--json` document, and preserve the specific exit code the abort used to produce. Silent tolerance is worse than the abort it replaces.
 - Optional optimizations (batch checkers, target tag listings for immutable skip) degrade with a WARN. Required work does not.
 

@@ -1,6 +1,7 @@
 //! Verbosity-aware progress reporters for sync output.
 //!
-//! [`TextProgress`] writes per-image status lines to stderr. There is no
+//! [`TextProgress`] writes per-image status lines to stderr, and a periodic
+//! liveness line to tracing while a run is still in flight. There is no
 //! per-cycle aggregate stdout line: the CLI driver emits a per-mapping
 //! INFO line via tracing after the engine returns, which carries the
 //! source/target context an aggregate cannot.
@@ -91,18 +92,18 @@ impl ProgressReporter for TextProgress {
         }
     }
 
-    fn run_progress(&self, p: RunProgress) {
+    fn run_heartbeat(&self, snapshot: RunProgress) {
         // Goes through tracing rather than the stderr writer above: this is a
         // periodic status line, not per-image output, so it belongs in the log
         // stream where `--log-format json` and the level filter apply. At
         // verbosity 0 the per-image lines are suppressed, which makes this the
         // only thing distinguishing a long run from a hung one.
         tracing::info!(
-            discovering = p.discovering,
-            pending = p.pending,
-            in_flight = p.in_flight,
-            completed = p.completed,
-            elapsed_secs = p.elapsed.as_secs(),
+            in_discovery = snapshot.in_discovery,
+            pending = snapshot.pending,
+            in_flight = snapshot.in_flight,
+            completed = snapshot.completed,
+            elapsed_secs = snapshot.elapsed.as_secs(),
             "sync in progress"
         );
     }

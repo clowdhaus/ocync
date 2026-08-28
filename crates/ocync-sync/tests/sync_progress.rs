@@ -8,7 +8,7 @@ use std::time::Duration;
 use ocync_sync::engine::{SyncEngine, TagPair};
 use ocync_sync::progress::{ProgressReporter, RunProgress};
 use ocync_sync::staging::BlobStage;
-use ocync_sync::{ImageResult, ImageStatus, ShutdownSignal, SyncReport};
+use ocync_sync::{ImageResult, ShutdownSignal, SyncReport};
 use wiremock::MockServer;
 
 use helpers::*;
@@ -22,8 +22,8 @@ struct RecordingProgress {
 impl ProgressReporter for RecordingProgress {
     fn image_started(&self, _source: &str, _target: &str) {}
     fn image_completed(&self, _result: &ImageResult) {}
-    fn run_progress(&self, progress: RunProgress) {
-        self.snapshots.borrow_mut().push(progress);
+    fn run_heartbeat(&self, snapshot: RunProgress) {
+        self.snapshots.borrow_mut().push(snapshot);
     }
     fn run_completed(&self, _report: &SyncReport) {}
 }
@@ -69,9 +69,13 @@ async fn run_with_heartbeat(interval: Duration) -> (SyncReport, Vec<RunProgress>
 ///
 /// Without this the engine is silent between the first image starting and the
 /// last one finishing, which is indistinguishable from a wedged run.
-#[tokio::test]
+///
+/// `start_paused` makes this deterministic rather than a race against a short
+/// wall-clock interval: registry I/O is not a timer, so tokio auto-advances to
+/// the heartbeat deadline whenever the run is blocked on the network.
+#[tokio::test(start_paused = true)]
 async fn heartbeat_fires_while_work_is_in_flight() {
-    let (report, snapshots) = run_with_heartbeat(Duration::from_millis(1)).await;
+    let (report, snapshots) = run_with_heartbeat(Duration::from_secs(1)).await;
 
     assert_eq!(report.stats.images_synced, 2);
     assert!(
@@ -84,7 +88,7 @@ async fn heartbeat_fires_while_work_is_in_flight() {
     // both at zero would mean the heartbeat outlived the work it describes.
     for s in &snapshots {
         assert!(
-            s.discovering + s.in_flight > 0,
+            s.in_discovery + s.in_flight > 0,
             "heartbeat fired with nothing in flight: {s:?}"
         );
         assert!(
@@ -96,6 +100,10 @@ async fn heartbeat_fires_while_work_is_in_flight() {
 
 /// The heartbeat is timer-gated, not emitted unconditionally: a run that
 /// finishes well inside one interval reports nothing.
+///
+/// Deliberately NOT `start_paused`: virtual time auto-advances to any pending
+/// deadline, which would fire even a ten-minute interval and make this pass
+/// for the wrong reason.
 #[tokio::test]
 async fn heartbeat_stays_silent_for_a_short_run() {
     let (report, snapshots) = run_with_heartbeat(Duration::from_secs(600)).await;
@@ -106,22 +114,6 @@ async fn heartbeat_stays_silent_for_a_short_run() {
         "short run must not emit progress, got {} snapshot(s)",
         snapshots.len()
     );
-}
-
-/// The heartbeat must not keep the engine alive past its work. A completed run
-/// returns rather than looping on the timer.
-#[tokio::test]
-async fn heartbeat_does_not_block_run_completion() {
-    let (report, _) = run_with_heartbeat(Duration::from_millis(1)).await;
-
-    assert_eq!(report.images.len(), 2);
-    for image in &report.images {
-        assert!(
-            matches!(image.status, ImageStatus::Synced),
-            "expected all images synced, got {:?}",
-            image.status
-        );
-    }
 }
 
 /// Shutdown freezes discovery, so undiscovered tags stop being work the engine

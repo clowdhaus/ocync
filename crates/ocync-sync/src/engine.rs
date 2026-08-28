@@ -746,7 +746,7 @@ const BLOB_CONCURRENCY: usize = 6;
 /// Default shutdown drain deadline in seconds.
 const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 25;
 
-/// Default cadence for [`crate::progress::ProgressReporter::run_progress`] callbacks.
+/// Default cadence for [`crate::progress::ProgressReporter::run_heartbeat`] callbacks.
 ///
 /// Discovery and execution can each run for minutes without an image reaching
 /// a terminal state. Without a periodic callback the caller has no way to tell
@@ -816,7 +816,7 @@ impl SyncEngine {
         self
     }
 
-    /// Configure how often [`crate::progress::ProgressReporter::run_progress`] fires while the
+    /// Configure how often [`crate::progress::ProgressReporter::run_heartbeat`] fires while the
     /// run still has work in flight. Default 30 seconds.
     ///
     /// # Panics
@@ -1171,8 +1171,8 @@ impl SyncEngine {
                 _ = heartbeat.tick(), if !execution_futures.is_empty()
                     || (!shutting_down && !discovery_paused && !discovery_futures.is_empty()) =>
                 {
-                    progress.run_progress(crate::progress::RunProgress {
-                        discovering: discovery_futures.len(),
+                    progress.run_heartbeat(crate::progress::RunProgress {
+                        in_discovery: discovery_futures.len(),
                         pending: pending.len(),
                         in_flight: execution_futures.len(),
                         completed: results.len(),
