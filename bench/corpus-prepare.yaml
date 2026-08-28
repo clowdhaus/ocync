@@ -1,0 +1,89 @@
+# Prepare-phase benchmark corpus.
+#
+# Measures the pre-engine phase in isolation: build a client per registry,
+# list every mapping's tags, and filter them. Nothing is transferred, so this
+# corpus is about mapping count and tag count, not layer size.
+#
+# Two properties matter and both are load-bearing:
+#
+# 1. Every tag entry is a WILDCARD. A mapping whose tags are all literal takes
+#    the exact-tag fast path in `resolve_mapping_inner` and never calls
+#    `list_tags` at all, which is why the main corpus cannot see this phase:
+#    all of its tags are literals. See `TagsConfig::exact_tags`.
+#
+# 2. Many mappings, not a few big ones. The cost being measured is one round
+#    trip per mapping, so the shape that exposes it is a wide config. The main
+#    corpus is 39 entries chosen for blob sharing, which is the wrong shape.
+#
+# Sources are anonymous public ECR mirrors: no rate-limit budget is spent on
+# Docker Hub, and no credentials beyond the ones the harness already needs for
+# the ECR target. The target is never written to, because this scenario runs
+# `--dry-run`.
+
+corpus:
+  target_registry: "${BENCH_TARGET_REGISTRY}"
+  target_prefix: "bench-prepare"
+
+images:
+  # Docker official images mirrored to public ECR. Each has a deep tag list,
+  # so the listing is a real round trip rather than a single small page.
+  - source: "public.ecr.aws/docker/library/alpine"
+    tags: ["3.*"]
+  - source: "public.ecr.aws/docker/library/busybox"
+    tags: ["1.*"]
+  - source: "public.ecr.aws/docker/library/nginx"
+    tags: ["1.*"]
+  - source: "public.ecr.aws/docker/library/redis"
+    tags: ["7.*"]
+  - source: "public.ecr.aws/docker/library/python"
+    tags: ["3.1*"]
+  - source: "public.ecr.aws/docker/library/node"
+    tags: ["2*"]
+  - source: "public.ecr.aws/docker/library/golang"
+    tags: ["1.2*"]
+  - source: "public.ecr.aws/docker/library/ubuntu"
+    tags: ["2*"]
+  - source: "public.ecr.aws/docker/library/debian"
+    tags: ["1*"]
+  - source: "public.ecr.aws/docker/library/postgres"
+    tags: ["1*"]
+  - source: "public.ecr.aws/docker/library/mysql"
+    tags: ["8.*"]
+  - source: "public.ecr.aws/docker/library/mongo"
+    tags: ["7.*"]
+  - source: "public.ecr.aws/docker/library/httpd"
+    tags: ["2.*"]
+  - source: "public.ecr.aws/docker/library/memcached"
+    tags: ["1.*"]
+  - source: "public.ecr.aws/docker/library/rabbitmq"
+    tags: ["3.*"]
+  - source: "public.ecr.aws/docker/library/traefik"
+    tags: ["v2.*"]
+  - source: "public.ecr.aws/docker/library/consul"
+    tags: ["1.*"]
+  - source: "public.ecr.aws/docker/library/influxdb"
+    tags: ["2.*"]
+  - source: "public.ecr.aws/docker/library/telegraf"
+    tags: ["1.*"]
+  - source: "public.ecr.aws/docker/library/haproxy"
+    tags: ["2.*"]
+  - source: "public.ecr.aws/docker/library/maven"
+    tags: ["3.*"]
+  - source: "public.ecr.aws/docker/library/gradle"
+    tags: ["8.*"]
+  - source: "public.ecr.aws/docker/library/tomcat"
+    tags: ["1*"]
+  - source: "public.ecr.aws/docker/library/openjdk"
+    tags: ["1*"]
+  - source: "public.ecr.aws/docker/library/ruby"
+    tags: ["3.*"]
+  - source: "public.ecr.aws/docker/library/perl"
+    tags: ["5.*"]
+  - source: "public.ecr.aws/docker/library/rust"
+    tags: ["1.*"]
+  - source: "public.ecr.aws/docker/library/erlang"
+    tags: ["2*"]
+  - source: "public.ecr.aws/docker/library/elixir"
+    tags: ["1.*"]
+  - source: "public.ecr.aws/docker/library/caddy"
+    tags: ["2.*"]

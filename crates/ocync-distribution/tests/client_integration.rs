@@ -11,7 +11,9 @@ use ocync_distribution::RepositoryName;
 use ocync_distribution::auth::{AuthProvider, Scope, Token};
 use ocync_distribution::client::RegistryClientBuilder;
 use url::Url;
-use wiremock::matchers::{header_exists, method, path, path_regex, query_param};
+use wiremock::matchers::{
+    header_exists, method, path, path_regex, query_param, query_param_is_missing,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Shared state for [`MockAuth`], allowing assertions after the auth provider
@@ -986,4 +988,39 @@ async fn manifest_pull_requests_pull_scope() {
         has_pull_only,
         "manifest_pull must request pull-only scope, got: {scopes:?}"
     );
+}
+
+/// The tag listing must not ask for a page size.
+///
+/// Sending `n` can only cost round trips. Docker Hub answers a request without
+/// it by returning every tag in one response (`library/python`, 3,911 tags, no
+/// `Link` header), and `distribution/distribution` does the same; adding
+/// `n=1000` turns that single request into four. ECR already pages at 1000
+/// unasked and rejects anything larger, so there is nothing to win there
+/// either. This is a guard, not a preference: the optimization looks obvious
+/// and is backwards.
+#[tokio::test]
+async fn list_tags_does_not_request_a_page_size() {
+    let server = MockServer::start().await;
+
+    // Any `n` at all fails the match, so the mock 404s and the assert below
+    // fires rather than silently passing on a different code path.
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/tags/list"))
+        .and(query_param_is_missing("n"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "repo",
+            "tags": ["v1"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .build()
+        .unwrap();
+
+    let repo = RepositoryName::new("repo").unwrap();
+    let tags = client.list_tags(&repo).await.unwrap();
+    assert_eq!(tags, vec!["v1"]);
 }

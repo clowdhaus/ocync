@@ -462,13 +462,25 @@ pub(crate) async fn run_tool(
     config_path: &Path,
     proxy_url: Option<&str>,
     workspace_root: &Path,
+    dry_run: bool,
 ) -> Result<RunResult, String> {
     let config_str = config_path.to_string_lossy();
-    let args: Vec<&str> = match tool {
+    let mut args: Vec<&str> = match tool {
         Tool::Ocync => vec!["sync", "--config", &config_str, "--json", "-v"],
         Tool::Dregsy => vec!["-config", &config_str],
         Tool::Regsync => vec!["once", "-c", &config_str],
     };
+    // Only ocync has a mode that resolves every mapping and then stops, which
+    // is what isolates the prepare phase. The scenario that asks for it runs
+    // ocync alone for exactly that reason.
+    if dry_run {
+        assert_eq!(
+            tool,
+            Tool::Ocync,
+            "dry-run is an ocync-only mode; no competitor has an equivalent"
+        );
+        args.push("--dry-run");
+    }
 
     let binary = tool_path(tool, workspace_root);
 

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use futures_util::StreamExt;
 use ocync_distribution::ecr::BatchBlobChecker;
 use ocync_distribution::spec::ManifestKind;
 use ocync_distribution::{Digest, RepositoryName};
@@ -77,6 +78,17 @@ struct Analysis {
     interrupted: bool,
 }
 
+/// Mappings resolved, and images pulled, at once.
+///
+/// Analysis is pure read traffic against the source registry: a tag listing
+/// per mapping and a manifest pull per image, all independent. Same value and
+/// same reasoning as `sync`'s
+/// [`PREPARE_MAPPING_CONCURRENCY`](super::synchronize::PREPARE_MAPPING_CONCURRENCY),
+/// kept separate because the two commands can be tuned apart: a ceiling on
+/// open work, not a request rate, with each client's AIMD window still
+/// governing how hard any one registry is hit.
+const ANALYZE_CONCURRENCY: usize = 16;
+
 /// Run the analyze command.
 pub(crate) async fn run(
     args: &AnalyzeArgs,
@@ -93,8 +105,15 @@ pub(crate) async fn run(
     let tracker = PrepareTracker::default();
     let analysis = with_prepare_progress(&tracker, "analysis", async {
         let clients = build_clients(&config, &referenced_registries(&config), &tracker).await;
-        tracker.begin(PreparePhase::Mappings, config.mappings.len());
-        collect_analysis(&config, &clients, &no_checkers, shutdown, &tracker).await
+        collect_analysis(
+            &config,
+            &clients,
+            &no_checkers,
+            shutdown,
+            &tracker,
+            ANALYZE_CONCURRENCY,
+        )
+        .await
     })
     .await;
 
@@ -117,34 +136,62 @@ pub(crate) async fn run(
 }
 
 /// Walk every mapping and tag, recording blobs and what could not be read.
+///
+/// Both walks overlap their network waits: mappings resolve concurrently, then
+/// every image across every mapping is pulled from one flattened list. The
+/// flattening is what makes the second walk worth anything -- a config of many
+/// mappings holding a handful of tags each would otherwise be as serial as
+/// before, because each mapping's walk is only a request or two long.
+///
+/// Aggregation stays sequential and in order. `analysis.blobs` has one owner,
+/// and the report has to read the same way whichever registry answered first.
 async fn collect_analysis(
     config: &Config,
     clients: &ClientMap,
     no_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
     shutdown: &ShutdownSignal,
     tracker: &PrepareTracker,
+    concurrency: usize,
 ) -> Analysis {
     let mut analysis = Analysis::default();
+    // Begun here rather than by the caller so this function owns both of the
+    // steps it runs, the way `sync`'s `resolve_all` does.
+    tracker.begin(PreparePhase::Mappings, config.mappings.len());
 
-    for mapping in &config.mappings {
-        if shutdown.is_triggered() {
-            tracing::info!("shutdown signal received, stopping analysis early");
+    /// One mapping's resolution, or `None` if shutdown reached it first.
+    type MappingOutcome = Option<(Result<MappingResolution, CliError>, Vec<DroppedTarget>)>;
+
+    // --- Resolve every mapping ---
+    //
+    // `None` marks a mapping shutdown reached before it started. Checked
+    // inside the task rather than once before the fan-out so a signal part way
+    // through still stops the work that has not begun, which is what the
+    // sequential loop's `break` did.
+    let outcomes: Vec<MappingOutcome> =
+        futures_util::stream::iter(config.mappings.iter().map(|mapping| async move {
+            if shutdown.is_triggered() {
+                return None;
+            }
+            // Held for the whole task so every exit still counts the mapping:
+            // one that skipped it would strand the progress line short of its
+            // total.
+            let _item = tracker.track(&mapping.from);
+            Some(resolve_mapping(mapping, config, clients, no_checkers, false).await)
+        }))
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+
+    let mut resolved_mappings = Vec::new();
+    for (mapping, outcome) in config.mappings.iter().zip(outcomes) {
+        let Some((outcome, dropped)) = outcome else {
             analysis.interrupted = true;
-            break;
-        }
+            continue;
+        };
 
-        // Advanced up front so every exit from the match below still counts
-        // the mapping: a `continue` that skips it strands the progress line
-        // short of its total.
-        tracker.advance();
-
-        // One unresolvable mapping must not cost the analysis every mapping
-        // behind it, same as `sync`.
         // Dropped targets arrive whatever the outcome: analyze reports what a
         // sync would move, so a target it cannot reach changes the answer even
         // when the mapping itself then fails.
-        let (outcome, dropped) =
-            resolve_mapping(mapping, config, clients, no_checkers, false).await;
         for target in &dropped {
             tracing::warn!(
                 from = %target.from,
@@ -155,9 +202,11 @@ async fn collect_analysis(
         }
         analysis.dropped.extend(dropped);
 
-        let resolved = match outcome {
-            Ok(MappingResolution::Resolved(r)) => r,
-            Ok(MappingResolution::NoMatchingTags(_)) => continue,
+        match outcome {
+            Ok(MappingResolution::Resolved(r)) => resolved_mappings.push(r),
+            Ok(MappingResolution::NoMatchingTags(_)) => {}
+            // One unresolvable mapping must not cost the analysis every
+            // mapping behind it, same as `sync`.
             Err(err) => {
                 log_unresolved_mapping(&mapping.from, &err);
                 // A mapping the analysis could not resolve is a hole in the
@@ -169,51 +218,85 @@ async fn collect_analysis(
                     code: err.exit_code(),
                     error: err.to_string(),
                 });
-                continue;
             }
-        };
+        }
+    }
 
-        for tag_pair in &resolved.tags {
+    // --- Walk every image, flattened across mappings ---
+    let images: Vec<(usize, String)> = resolved_mappings
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, m)| m.tags.iter().map(move |t| (idx, t.source.clone())))
+        .collect();
+
+    // Its own step, so the progress line keeps meaning something. Resolution
+    // finishes long before the walk does, and without this the ticker would
+    // report a completed mapping count for the whole of the slower half.
+    tracker.begin(PreparePhase::Images, images.len());
+
+    let mut pulls = futures_util::stream::iter(images.iter().map(|(idx, tag)| {
+        let resolved = &resolved_mappings[*idx];
+        async move {
+            let image_ref = format!("{}:{}", resolved.source_repo, tag);
             if shutdown.is_triggered() {
-                // The outer loop logs it; saying so once is enough.
-                analysis.interrupted = true;
-                break;
+                return (*idx, image_ref, None);
             }
-
-            let image_ref = format!("{}:{}", resolved.source_repo, tag_pair.source);
+            let _item = tracker.track(&image_ref);
             tracing::info!(image = %image_ref, "analyzing");
             // One unreadable image must not end the analysis: the remaining
             // tags and mappings are independent of it.
-            match collect_blobs(
+            let pulled = pull_image_descriptors(
                 &resolved.source_client,
                 &resolved.source_repo,
-                &tag_pair.source,
+                tag,
                 &image_ref,
-                &resolved.targets,
-                &resolved.target_repo,
-                &mut analysis.blobs,
             )
-            .await
-            {
-                Ok(Completeness::Full) => analysis.analyzed += 1,
+            .await;
+            (*idx, image_ref, Some(pulled))
+        }
+    }))
+    .buffered(concurrency.max(1));
+
+    while let Some((idx, image_ref, pulled)) = pulls.next().await {
+        let Some(pulled) = pulled else {
+            analysis.interrupted = true;
+            continue;
+        };
+        let resolved = &resolved_mappings[idx];
+        match pulled {
+            Ok((descriptors, completeness)) => {
+                for descriptor in descriptors {
+                    record_blob(
+                        descriptor.digest,
+                        descriptor.size,
+                        &image_ref,
+                        &resolved.targets,
+                        &resolved.target_repo,
+                        &mut analysis.blobs,
+                    );
+                }
+                analysis.analyzed += 1;
                 // A skipped index child still leaves this image's other
                 // platforms recorded, so it counts as analyzed. Conflating it
                 // with a total failure reported a mostly-complete run as zero
                 // images and exited 2.
-                Ok(Completeness::Partial) => {
-                    analysis.analyzed += 1;
+                if matches!(completeness, Completeness::Partial) {
                     analysis.partial += 1;
                 }
-                Err(err) => {
-                    tracing::error!(
-                        image = %image_ref,
-                        error = %err,
-                        "image could not be analyzed; skipping"
-                    );
-                    analysis.failed += 1;
-                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    image = %image_ref,
+                    error = %err,
+                    "image could not be analyzed; skipping"
+                );
+                analysis.failed += 1;
             }
         }
+    }
+
+    if analysis.interrupted {
+        tracing::info!("shutdown signal received, stopping analysis early");
     }
 
     analysis
@@ -261,34 +344,29 @@ enum Completeness {
     Partial,
 }
 
-/// Pull a manifest (recursively for indexes) and record every blob's
-/// descriptor against the source image reference and target set.
-async fn collect_blobs(
+/// Pull a manifest, recursing into index children, and return every blob
+/// descriptor it references.
+///
+/// Recording is the caller's job. Splitting it out is what lets images be
+/// pulled concurrently: the network half borrows nothing mutable, so the
+/// aggregate map keeps a single owner and one deterministic write order.
+///
+/// Index children stay sequential within an image. The images themselves
+/// already overlap, and the client's AIMD window saturates well below the
+/// number of images in flight, so nesting a second level of concurrency here
+/// would add no throughput.
+async fn pull_image_descriptors(
     source_client: &ocync_distribution::RegistryClient,
     source_repo: &RepositoryName,
     tag: &str,
     image_ref: &str,
-    targets: &[ocync_sync::engine::TargetEntry],
-    target_repo: &RepositoryName,
-    blobs: &mut HashMap<Digest, BlobAggregate>,
-) -> Result<Completeness, CliError> {
+) -> Result<(Vec<BlobDescriptor>, Completeness), CliError> {
     let pulled = source_client
         .manifest_pull(source_repo, tag)
         .await
         .map_err(|e| CliError::Input(format!("manifest_pull {image_ref}: {e}")))?;
 
-    let descriptors = descriptors_of(&pulled.manifest);
-    for descriptor in descriptors {
-        record_blob(
-            descriptor.digest,
-            descriptor.size,
-            image_ref,
-            targets,
-            target_repo,
-            blobs,
-        );
-    }
-
+    let mut descriptors = descriptors_of(&pulled.manifest);
     let mut completeness = Completeness::Full;
 
     // Recurse into index children to collect per-platform manifest blobs.
@@ -296,11 +374,11 @@ async fn collect_blobs(
         for child in &index.manifests {
             // Platforms are independent: a missing arm64 manifest should not
             // discard the amd64 blobs already recorded for this image.
-            let child_pulled = match source_client
+            match source_client
                 .manifest_pull(source_repo, &child.digest.to_string())
                 .await
             {
-                Ok(pulled) => pulled,
+                Ok(child_pulled) => descriptors.extend(descriptors_of(&child_pulled.manifest)),
                 Err(e) => {
                     tracing::warn!(
                         image = %image_ref,
@@ -309,23 +387,12 @@ async fn collect_blobs(
                         "index child could not be pulled; skipping this platform"
                     );
                     completeness = Completeness::Partial;
-                    continue;
                 }
-            };
-            for descriptor in descriptors_of(&child_pulled.manifest) {
-                record_blob(
-                    descriptor.digest,
-                    descriptor.size,
-                    image_ref,
-                    targets,
-                    target_repo,
-                    blobs,
-                );
             }
         }
     }
 
-    Ok(completeness)
+    Ok((descriptors, completeness))
 }
 
 /// Descriptor data extracted from a manifest.
@@ -567,6 +634,281 @@ mod tests {
         assert_eq!(
             analyze_exit_code(&analysis(3, 0, 0, 1)),
             ExitCode::PartialFailure
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Prepare-phase concurrency
+    // -----------------------------------------------------------------------
+
+    use crate::cli::commands::test_support::{
+        Arrivals, SlowRecorder, arrivals, config_yaml, max_in_flight, repo_names, test_client,
+    };
+
+    /// A registry that answers tag listings and manifest pulls after `delay`,
+    /// recording each separately.
+    async fn slow_registry(
+        repos: &[String],
+        tags: &[&str],
+        delay: std::time::Duration,
+    ) -> (wiremock::MockServer, Config, ClientMap, Arrivals, Arrivals) {
+        let server = wiremock::MockServer::start().await;
+        let tag_arrivals = arrivals();
+        let manifest_arrivals = arrivals();
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/v2/repo/img\d+/tags/list$",
+            ))
+            .respond_with(SlowRecorder::tag_list(&tag_arrivals, delay, tags))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/v2/repo/img\d+/manifests/.+$",
+            ))
+            .respond_with(SlowRecorder::image_manifest(&manifest_arrivals, delay))
+            .mount(&server)
+            .await;
+
+        let yaml = config_yaml(&server, repos, "      glob: [\"*\"]\n");
+        let config: Config = serde_yaml::from_str(&yaml).expect("generated config parses");
+        let clients = ClientMap::from([
+            ("src".to_string(), Ok(test_client(&server.uri()))),
+            ("dst".to_string(), Ok(test_client(&server.uri()))),
+        ]);
+        (server, config, clients, tag_arrivals, manifest_arrivals)
+    }
+
+    /// Analysis must resolve its mappings concurrently, like `sync` does.
+    #[tokio::test]
+    async fn collect_analysis_resolves_mappings_concurrently() {
+        let delay = std::time::Duration::from_millis(250);
+        let repos = repo_names(8);
+        let (_server, config, clients, tag_arrivals, _) =
+            slow_registry(&repos, &["v1"], delay).await;
+
+        let analysis = collect_analysis(
+            &config,
+            &clients,
+            &HashMap::new(),
+            &ShutdownSignal::new(),
+            &PrepareTracker::default(),
+            ANALYZE_CONCURRENCY,
+        )
+        .await;
+
+        assert_eq!(analysis.analyzed, 8, "every image must be analyzed");
+        let observed = max_in_flight(&tag_arrivals, delay);
+        assert!(
+            observed > 1,
+            "tag listings must overlap; saw at most {observed} in flight"
+        );
+    }
+
+    /// The image walk must overlap across mappings, not just within one.
+    ///
+    /// The shape that matters is many mappings holding few tags each: walking
+    /// one mapping's tags at a time leaves that config as slow as it ever was,
+    /// because each mapping's walk is one request long.
+    #[tokio::test]
+    async fn collect_analysis_pulls_images_concurrently_across_mappings() {
+        let delay = std::time::Duration::from_millis(250);
+        let repos = repo_names(8);
+        let (_server, config, clients, _, manifest_arrivals) =
+            slow_registry(&repos, &["v1"], delay).await;
+
+        let analysis = collect_analysis(
+            &config,
+            &clients,
+            &HashMap::new(),
+            &ShutdownSignal::new(),
+            &PrepareTracker::default(),
+            ANALYZE_CONCURRENCY,
+        )
+        .await;
+
+        assert_eq!(analysis.analyzed, 8);
+        let observed = max_in_flight(&manifest_arrivals, delay);
+        assert!(
+            observed > 1,
+            "manifest pulls must overlap across mappings; saw at most {observed} in flight"
+        );
+    }
+
+    /// Shutdown before the walk starts must stop it, not just flag it.
+    ///
+    /// The negative half is the registry: a check that ran after the fan-out
+    /// would still have listed every mapping's tags before noticing.
+    #[tokio::test]
+    async fn collect_analysis_starts_nothing_once_shutdown_is_triggered() {
+        let delay = std::time::Duration::from_millis(1);
+        let repos = repo_names(8);
+        let (_server, config, clients, tag_arrivals, manifest_arrivals) =
+            slow_registry(&repos, &["v1"], delay).await;
+
+        let shutdown = ShutdownSignal::new();
+        shutdown.trigger();
+
+        let analysis = collect_analysis(
+            &config,
+            &clients,
+            &HashMap::new(),
+            &shutdown,
+            &PrepareTracker::default(),
+            ANALYZE_CONCURRENCY,
+        )
+        .await;
+
+        assert!(analysis.interrupted, "the report must say it is truncated");
+        assert_eq!(analysis.analyzed, 0);
+        assert_eq!(
+            tag_arrivals.lock().expect("no panic in a stub").len(),
+            0,
+            "no mapping should have been resolved"
+        );
+        assert_eq!(
+            manifest_arrivals.lock().expect("no panic in a stub").len(),
+            0,
+            "and no image should have been pulled"
+        );
+    }
+
+    /// Shutdown part way through leaves a truncated report, not a clean one.
+    ///
+    /// More images than the concurrency bound, so the ones past the first
+    /// batch have not started when the signal lands and must not start.
+    #[tokio::test]
+    async fn collect_analysis_stops_pulling_images_after_shutdown() {
+        let delay = std::time::Duration::from_millis(1);
+        let images = ANALYZE_CONCURRENCY * 3;
+        let repos = repo_names(images);
+        let (_server, config, clients, _, manifest_arrivals) =
+            slow_registry(&repos, &["v1"], delay).await;
+
+        let shutdown = ShutdownSignal::new();
+        let no_checkers = HashMap::new();
+        let tracker = PrepareTracker::default();
+        let analysis = {
+            // Triggered once resolution is done and the image walk is under
+            // way, so the walk is what gets cut short.
+            let walk = collect_analysis(
+                &config,
+                &clients,
+                &no_checkers,
+                &shutdown,
+                &tracker,
+                ANALYZE_CONCURRENCY,
+            );
+            let trip = async {
+                while manifest_arrivals
+                    .lock()
+                    .expect("no panic in a stub")
+                    .is_empty()
+                {
+                    tokio::task::yield_now().await;
+                }
+                shutdown.trigger();
+            };
+            let (analysis, ()) = futures_util::future::join(walk, trip).await;
+            analysis
+        };
+
+        assert!(analysis.interrupted, "the report must say it is truncated");
+        assert!(
+            analysis.analyzed < images,
+            "the walk must stop short; analyzed {} of {images}",
+            analysis.analyzed
+        );
+    }
+
+    /// How long an analysis takes as its two walks are widened.
+    ///
+    /// The config shape is the one that exposes the flattened image walk: many
+    /// mappings holding a single tag each, so a per-mapping walk would still
+    /// be one request long and gain nothing. Concurrency 1 is the behaviour
+    /// this replaced.
+    #[tokio::test]
+    #[ignore = "wall-clock benchmark against a latency-injected mock registry"]
+    async fn analyze_benchmark_walk_concurrency() {
+        let mappings = 95;
+        let delay = std::time::Duration::from_millis(30);
+        let repos = repo_names(mappings);
+
+        println!(
+            "\n{mappings} mappings, 1 tag each, {}ms per request (1 tag list + 1 manifest each)\n",
+            delay.as_millis()
+        );
+        println!(
+            "{:>11}  {:>10}  {:>10}",
+            "concurrency", "elapsed", "speedup"
+        );
+
+        let mut baseline: Option<std::time::Duration> = None;
+        for concurrency in [1usize, 4, 8, 16, 32] {
+            // Fresh server and clients per row: AIMD widens as a registry keeps
+            // answering, so reuse would hand later rows a head start.
+            let (_server, config, clients, _, _) = slow_registry(&repos, &["v1"], delay).await;
+
+            let started = std::time::Instant::now();
+            let analysis = collect_analysis(
+                &config,
+                &clients,
+                &HashMap::new(),
+                &ShutdownSignal::new(),
+                &PrepareTracker::default(),
+                concurrency,
+            )
+            .await;
+            let elapsed = started.elapsed();
+            assert_eq!(analysis.analyzed, mappings);
+
+            let base = *baseline.get_or_insert(elapsed);
+            println!(
+                "{concurrency:>11}  {:>9.2}s  {:>9.1}x",
+                elapsed.as_secs_f64(),
+                base.as_secs_f64() / elapsed.as_secs_f64()
+            );
+        }
+        println!(
+            "\nboth walks run at most {ANALYZE_CONCURRENCY} at once; past that each \
+             registry's AIMD window is the binding constraint\n"
+        );
+    }
+
+    /// The image walk has to drive the progress line too.
+    ///
+    /// Resolution finishes long before the walk does. Left on the mapping
+    /// step, the ticker would report `done=N total=N` for the whole of the
+    /// slower half, which reads as a finished run that never ends.
+    #[tokio::test]
+    async fn collect_analysis_reports_the_image_walk_as_its_own_step() {
+        let delay = std::time::Duration::from_millis(1);
+        let repos = repo_names(3);
+        let (_server, config, clients, _, _) = slow_registry(&repos, &["v1", "v2"], delay).await;
+
+        let tracker = PrepareTracker::default();
+        let analysis = collect_analysis(
+            &config,
+            &clients,
+            &HashMap::new(),
+            &ShutdownSignal::new(),
+            &tracker,
+            ANALYZE_CONCURRENCY,
+        )
+        .await;
+
+        assert_eq!(analysis.analyzed, 6, "three mappings, two tags each");
+        let p = tracker.snapshot();
+        assert!(
+            matches!(p.phase, PreparePhase::Images),
+            "the walk must leave the tracker on the image step, got {:?}",
+            p.phase
+        );
+        assert_eq!(
+            (p.done, p.total),
+            (6, 6),
+            "and count every image, not every mapping"
         );
     }
 }

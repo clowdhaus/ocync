@@ -83,6 +83,7 @@ anstyle = { version = "1", default-features = false }
 clap = { workspace = true, features = ["color"] }
 schemars.workspace = true
 http.workspace = true
+futures-util.workspace = true
 ocync-distribution.workspace = true
 ocync-sync.workspace = true
 serde.workspace = true
@@ -100,6 +101,9 @@ tempfile.workspace = true
 # `test-util` supplies the paused clock the prepare-ticker tests drive.
 tokio = { workspace = true, features = ["test-util"] }
 uuid.workspace = true
+# Backs the prepare-phase concurrency tests and benchmark, which need a
+# registry that answers `tags/list` with a controlled delay.
+wiremock = { version = "0.6", default-features = false }
 
 [profile.release]
 strip = true

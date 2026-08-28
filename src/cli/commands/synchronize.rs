@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
 use ocync_distribution::{RegistryClient, RepositoryName};
@@ -45,11 +46,24 @@ const NO_TAGS_SAMPLE_CAP: usize = 5;
 
 /// Cadence of the progress line emitted while the run is preparing.
 ///
-/// Everything before the engine starts is sequential and network-bound: each
-/// client build mints a token for ECR, GAR, and ACR, and each mapping lists a
-/// repository's tags. No per-image output exists yet, so without this a large
-/// config runs for minutes with nothing in the log.
+/// Everything before the engine starts is network-bound: each client build
+/// mints a token for ECR, GAR, and ACR, and each mapping lists a repository's
+/// tags. Client and batch-checker construction run one registry at a time;
+/// mapping resolution overlaps up to [`PREPARE_MAPPING_CONCURRENCY`] at once.
+/// No per-image output exists yet, so without this a large config runs for
+/// minutes with nothing in the log.
 const PREPARE_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Mappings whose resolution may be in flight at once.
+///
+/// Resolution is network-bound and independent per mapping, so running one at
+/// a time makes the prepare phase cost the sum of every registry's latency
+/// rather than its maximum. This is a ceiling on how many mappings are open,
+/// not on how hard any registry is hit: every request underneath still passes
+/// that registry's AIMD window, which starts at one in flight and widens only
+/// as the registry keeps answering, so a wide config cannot turn into a burst
+/// against a single host.
+pub(crate) const PREPARE_MAPPING_CONCURRENCY: usize = 16;
 
 /// A step of the pre-engine phase.
 #[derive(Debug, Clone, Copy, Default)]
@@ -61,6 +75,8 @@ pub(crate) enum PreparePhase {
     BatchCheckers,
     /// Listing and filtering tags, one mapping at a time.
     Mappings,
+    /// Reading image manifests, one per resolved tag. `analyze` only.
+    Images,
 }
 
 impl fmt::Display for PreparePhase {
@@ -69,13 +85,14 @@ impl fmt::Display for PreparePhase {
             Self::Registries => f.write_str("registries"),
             Self::BatchCheckers => f.write_str("batch checkers"),
             Self::Mappings => f.write_str("mappings"),
+            Self::Images => f.write_str("images"),
         }
     }
 }
 
-/// Snapshot of the pre-engine phase, read by the progress ticker.
+/// Counts for the pre-engine phase, held in a [`Cell`].
 #[derive(Debug, Clone, Copy, Default)]
-struct PrepareProgress {
+struct PrepareCounts {
     /// Which pre-engine step is running.
     phase: PreparePhase,
     /// Items finished in this step.
@@ -84,35 +101,120 @@ struct PrepareProgress {
     total: usize,
 }
 
-/// Counter the pre-engine steps advance and the progress ticker reads.
+/// An item the current step has started and not yet finished.
+#[derive(Debug)]
+struct InFlightItem {
+    /// Identity used to remove the item when its guard drops.
+    id: u64,
+    /// What the item is, as the operator named it in config.
+    name: String,
+    /// `tokio`'s clock, not `std`'s, so a paused runtime still ages items.
+    started: tokio::time::Instant,
+}
+
+/// What the progress ticker reports for one tick.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PrepareProgress {
+    /// Which pre-engine step is running.
+    pub(crate) phase: PreparePhase,
+    /// Items finished in this step.
+    pub(crate) done: usize,
+    /// Items this step will process.
+    pub(crate) total: usize,
+    /// Items started and not yet finished.
+    pub(crate) in_flight: usize,
+    /// The in-flight item running longest, and for how long.
+    ///
+    /// This is the whole point of tracking names: a step that sits at the same
+    /// `done` count for minutes is otherwise unattributable, and the operator
+    /// cannot tell a huge tag listing from a wedged registry.
+    pub(crate) slowest: Option<(String, Duration)>,
+}
+
+/// Counters and in-flight set the pre-engine steps update and the progress
+/// ticker reads.
 ///
-/// A plain [`Cell`] rather than a channel: the runtime is `current_thread`, so
-/// the ticker and the work it describes never run concurrently.
+/// Plain [`Cell`] and [`RefCell`] rather than channels or locks: the runtime is
+/// `current_thread`, so the ticker and the work it describes never run
+/// concurrently, and no borrow here is held across an await.
 #[derive(Debug, Default)]
 pub(crate) struct PrepareTracker {
-    state: Cell<PrepareProgress>,
+    counts: Cell<PrepareCounts>,
+    in_flight: RefCell<Vec<InFlightItem>>,
+    next_id: Cell<u64>,
 }
 
 impl PrepareTracker {
-    /// Start a new step, resetting the item counter.
+    /// Start a new step, resetting the item counter and in-flight set.
     pub(crate) fn begin(&self, phase: PreparePhase, total: usize) {
-        self.state.set(PrepareProgress {
+        self.counts.set(PrepareCounts {
             phase,
             done: 0,
             total,
         });
+        self.in_flight.borrow_mut().clear();
     }
 
-    /// The current step and its counts.
-    fn snapshot(&self) -> PrepareProgress {
-        self.state.get()
+    /// Mark `name` in flight until the returned guard drops.
+    ///
+    /// A guard rather than paired calls: resolution has many early exits, and
+    /// every one of them must both retire the item and advance the counter or
+    /// the progress line stalls short of its total forever.
+    pub(crate) fn track(&self, name: &str) -> InFlightGuard<'_> {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        self.in_flight.borrow_mut().push(InFlightItem {
+            id,
+            name: name.to_owned(),
+            started: tokio::time::Instant::now(),
+        });
+        InFlightGuard { tracker: self, id }
     }
 
-    /// Record one item finished in the current step.
-    pub(crate) fn advance(&self) {
-        let mut p = self.state.get();
-        p.done += 1;
-        self.state.set(p);
+    /// The current step, its counts, and what is still running.
+    pub(crate) fn snapshot(&self) -> PrepareProgress {
+        let counts = self.counts.get();
+        let in_flight = self.in_flight.borrow();
+        let now = tokio::time::Instant::now();
+        let slowest = in_flight
+            .iter()
+            // Earliest start wins, so the report names the item actually
+            // holding the step up rather than whichever was added last.
+            .min_by_key(|item| item.started)
+            .map(|item| {
+                (
+                    item.name.clone(),
+                    now.saturating_duration_since(item.started),
+                )
+            });
+        PrepareProgress {
+            phase: counts.phase,
+            done: counts.done,
+            total: counts.total,
+            in_flight: in_flight.len(),
+            slowest,
+        }
+    }
+
+    /// Retire an in-flight item and count it finished.
+    fn finish(&self, id: u64) {
+        self.in_flight.borrow_mut().retain(|item| item.id != id);
+        let mut counts = self.counts.get();
+        counts.done += 1;
+        self.counts.set(counts);
+    }
+}
+
+/// Guard marking one item in flight for as long as it is held.
+#[derive(Debug)]
+pub(crate) struct InFlightGuard<'a> {
+    tracker: &'a PrepareTracker,
+    id: u64,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.finish(self.id);
     }
 }
 
@@ -128,10 +230,20 @@ pub(crate) async fn with_prepare_progress<F: Future>(
     work: F,
 ) -> F::Output {
     tick_while(tracker, PREPARE_PROGRESS_INTERVAL, work, |p, elapsed| {
+        // `slowest` is rendered even when nothing is in flight, which only
+        // happens between steps; `in_flight=0` beside it says why.
+        let (slowest, slowest_secs) = p
+            .slowest
+            .as_ref()
+            .map(|(name, age)| (name.as_str(), age.as_secs()))
+            .unwrap_or(("-", 0));
         tracing::info!(
             phase = %p.phase,
             done = p.done,
             total = p.total,
+            in_flight = p.in_flight,
+            slowest = %slowest,
+            slowest_secs = slowest_secs,
             elapsed_secs = elapsed.as_secs(),
             "preparing {what}"
         );
@@ -520,8 +632,8 @@ pub(crate) async fn run(
     let config = load_config(&args.config)?;
 
     // Client construction, batch-checker setup, and mapping resolution are all
-    // sequential network work with no output of their own. One ticker spans
-    // the lot so the run is never silent for longer than the interval.
+    // network work with no output of their own. One ticker spans the lot so
+    // the run is never silent for longer than the interval.
     let tracker = PrepareTracker::default();
     let resolution = with_prepare_progress(&tracker, "sync", async {
         let referenced = referenced_registries(&config);
@@ -534,6 +646,7 @@ pub(crate) async fn run(
             args.dry_run,
             watch_log.as_deref_mut(),
             &tracker,
+            PREPARE_MAPPING_CONCURRENCY,
         )
         .await
     })
@@ -1035,6 +1148,10 @@ pub(crate) async fn build_clients(
         if !referenced.contains(name) {
             continue;
         }
+        // Minting this registry's token is itself a round trip, so a slow or
+        // wedged provider is named in the progress line rather than showing up
+        // as a stalled count.
+        let _item = tracker.track(name);
         let hostname = bare_hostname(&reg.url);
         let entry = match build_registry_client(hostname, Some(reg)).await {
             Ok(client) => Ok(Arc::new(client)),
@@ -1048,7 +1165,6 @@ pub(crate) async fn build_clients(
             }
         };
         clients.insert(name.clone(), entry);
-        tracker.advance();
     }
     clients
 }
@@ -1188,6 +1304,8 @@ async fn build_batch_checkers(
         .collect();
     tracker.begin(PreparePhase::BatchCheckers, usable.len());
     for (name, reg) in usable {
+        // Held for the whole body so every `continue` still retires the item.
+        let _item = tracker.track(name);
         let hostname = bare_hostname(&reg.url);
         // Explicit non-Ecr auth_type is a hard opt-out: don't try to build an
         // AWS-SDK-backed batch checker for a registry the user has declared
@@ -1200,7 +1318,6 @@ async fn build_batch_checkers(
         };
 
         if !is_ecr {
-            tracker.advance();
             continue;
         }
 
@@ -1218,7 +1335,6 @@ async fn build_batch_checkers(
                 "ECR batch checker unavailable; manifest commits fall back to retry-on-conflict"
             ),
         }
-        tracker.advance();
     }
 
     checkers
@@ -1246,6 +1362,10 @@ pub(crate) struct Resolution {
 /// name must not cost the run every other mapping. Each failure is logged and
 /// recorded; resolution continues. Returns the mappings that are ready for the
 /// engine plus one [`UnresolvedMapping`] per mapping that is not.
+///
+/// Up to `concurrency` mappings resolve at once, but the result is always in
+/// config order: callers depend on that for deterministic logs, watch-mode
+/// state, and which config error stops the run.
 async fn resolve_all(
     config: &Config,
     clients: &ClientMap,
@@ -1253,6 +1373,7 @@ async fn resolve_all(
     with_report: bool,
     mut watch_log: Option<&mut WatchLogState>,
     tracker: &PrepareTracker,
+    concurrency: usize,
 ) -> Result<Resolution, CliError> {
     tracker.begin(PreparePhase::Mappings, config.mappings.len());
     let mut resolved = Vec::new();
@@ -1260,13 +1381,32 @@ async fn resolve_all(
     let mut dropped_targets = Vec::new();
     let mut no_match = 0usize;
 
-    for mapping in &config.mappings {
+    // Resolution is independent per mapping and spends nearly all of its time
+    // waiting on a registry, so the waits overlap. `buffered` yields in config
+    // order however the registries answered, which keeps the bookkeeping below
+    // deterministic: it touches `watch_log` and the run's counters, and a log
+    // whose order changed run to run would be unreadable.
+    //
+    // One consequence of overlapping: a mapping that a config error would once
+    // have pre-empted may already have run and emitted its own warnings by the
+    // time the error is reached. The run still stops at the first config error
+    // in config order, which is what the exit code and the operator depend on.
+    let outcomes: Vec<(Result<MappingResolution, CliError>, Vec<DroppedTarget>)> =
+        futures_util::stream::iter(config.mappings.iter().map(|mapping| async move {
+            // The guard both names the mapping while it runs and counts it
+            // finished when it ends, however it ends.
+            let _item = tracker.track(&mapping.from);
+            resolve_mapping(mapping, config, clients, batch_checkers, with_report).await
+        }))
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+
+    for (mapping, (outcome, dropped)) in config.mappings.iter().zip(outcomes) {
         // Dropped targets come back whatever the outcome, so a mapping that
         // loses a mirror and then fails on its tag listing still reports the
         // outage. Reconciled against the previous cycle before anything else,
         // so a mirror that recovered re-arms even if the mapping then failed.
-        let (outcome, dropped) =
-            resolve_mapping(mapping, config, clients, batch_checkers, with_report).await;
         reconcile_dropped_targets(&mapping.from, &dropped, watch_log.as_deref_mut());
         dropped_targets.extend(dropped);
 
@@ -1317,7 +1457,6 @@ async fn resolve_all(
                 });
             }
         }
-        tracker.advance();
     }
 
     Ok(Resolution {
@@ -1607,11 +1746,37 @@ async fn resolve_mapping_inner(
         let glob_set = build_glob_set(&[pattern.to_owned()])?;
 
         let target_repo_path = RepositoryName::new(&target_repo)?;
-        for entry in &mut targets {
-            match entry.client.list_tags(&target_repo_path).await {
+
+        // One read-only listing per mirror, all independent, so they overlap
+        // rather than making a mapping's prepare cost scale with its fan-out.
+        // Unbounded across the mapping's own targets on purpose: each target
+        // is a distinct registry with its own AIMD window, so widening here
+        // cannot concentrate load on any one host.
+        // Cloned out first so the listings borrow this vec rather than
+        // `targets`, which has to be mutably reborrowed to store the results.
+        let target_clients: Vec<Arc<RegistryClient>> =
+            targets.iter().map(|e| Arc::clone(&e.client)).collect();
+        let listings: Vec<Result<Vec<String>, ocync_distribution::Error>> =
+            futures_util::stream::iter(
+                target_clients
+                    .iter()
+                    .map(|client| client.list_tags(&target_repo_path)),
+            )
+            .buffered(target_clients.len().max(1))
+            .collect()
+            .await;
+
+        // Applied in target order, so a mapping's warnings read the same way
+        // whichever mirror answered first.
+        for (entry, listing) in targets.iter_mut().zip(listings) {
+            match listing {
                 Ok(tags) => entry.existing_tags = tags.into_iter().collect(),
                 Err(e) => {
                     tracing::warn!(
+                        // Without `from` this warning names a registry but not
+                        // the mapping, and mappings now resolve concurrently,
+                        // so neighbouring log lines no longer identify it.
+                        from = %mapping.from,
                         registry = %entry.name,
                         error = %e,
                         "failed to list target tags; immutable skip disabled for this target"
@@ -3005,6 +3170,7 @@ mappings:
             false,
             None,
             &PrepareTracker::default(),
+            PREPARE_MAPPING_CONCURRENCY,
         )
         .await
         .expect("no config-class failure in these fixtures")
@@ -3405,8 +3571,9 @@ mappings:
             &tracker,
             Duration::from_secs(5),
             async {
+                let item = tracker.track("registry-a");
                 tokio::time::sleep(Duration::from_secs(7)).await;
-                tracker.advance();
+                drop(item);
                 tokio::time::sleep(Duration::from_secs(7)).await;
             },
             |p, _| seen.borrow_mut().push(p.done),
@@ -3637,6 +3804,7 @@ mappings:
             false,
             None,
             &PrepareTracker::default(),
+            PREPARE_MAPPING_CONCURRENCY,
         )
         .await
         .expect_err("an invalid glob must not be isolated");
@@ -3889,5 +4057,476 @@ mappings:
         // And carries the full pipeline trace.
         assert!(out.contains("source tags: 10"), "{out}");
         assert!(out.contains("dropped (10):"), "{out}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Prepare-phase concurrency
+    // -----------------------------------------------------------------------
+
+    use crate::cli::commands::test_support::{
+        Arrivals, SlowRecorder, arrivals, config_yaml, max_in_flight, repo_names,
+    };
+
+    /// A source registry that answers every mapping's tag listing after
+    /// `delay`, plus the config and clients pointed at it.
+    async fn slow_tag_registry(
+        mappings: usize,
+        delay: Duration,
+    ) -> (wiremock::MockServer, Config, ClientMap, Arrivals) {
+        let server = wiremock::MockServer::start().await;
+        let arrivals = arrivals();
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/v2/repo/img\d+/tags/list$",
+            ))
+            .respond_with(SlowRecorder::tag_list(&arrivals, delay, &["v1"]))
+            .mount(&server)
+            .await;
+
+        let yaml = config_yaml(&server, &repo_names(mappings), "      glob: [\"*\"]\n");
+        let config: Config = serde_yaml::from_str(&yaml).expect("generated config parses");
+        let clients = ClientMap::from([
+            ("src".to_string(), Ok(test_client(&server.uri()))),
+            ("dst".to_string(), Ok(test_client(&server.uri()))),
+        ]);
+        (server, config, clients, arrivals)
+    }
+
+    /// Mapping resolution must overlap its network waits.
+    ///
+    /// Every mapping's tag listing is an independent round trip, so resolving
+    /// them one at a time makes the prepare phase cost the sum of every
+    /// registry's latency. Measured on a 95-mapping config that was 11 minutes
+    /// before the engine started.
+    #[tokio::test]
+    async fn resolve_all_resolves_mappings_concurrently() {
+        let delay = Duration::from_millis(250);
+        let (_server, config, clients, arrivals) = slow_tag_registry(8, delay).await;
+
+        let resolution = resolve_all(
+            &config,
+            &clients,
+            &HashMap::new(),
+            false,
+            None,
+            &PrepareTracker::default(),
+            PREPARE_MAPPING_CONCURRENCY,
+        )
+        .await
+        .expect("no config-class failure in this fixture");
+
+        assert_eq!(resolution.resolved.len(), 8, "every mapping must resolve");
+        let observed = max_in_flight(&arrivals, delay);
+        assert!(
+            observed > 1,
+            "tag listings must overlap; saw at most {observed} in flight"
+        );
+    }
+
+    /// Concurrency is a ceiling, not an invitation to open every mapping at
+    /// once.
+    ///
+    /// A config with hundreds of mappings pointed at one registry must not
+    /// become a burst of hundreds of simultaneous tag listings. The limit is
+    /// what stands between the two, so it is asserted exactly: reaching it
+    /// proves resolution overlaps, and never passing it proves the ceiling is
+    /// real.
+    #[tokio::test]
+    async fn resolve_all_never_exceeds_its_concurrency_limit() {
+        let delay = Duration::from_millis(250);
+        let limit = 2;
+        let (_server, config, clients, arrivals) = slow_tag_registry(8, delay).await;
+
+        resolve_all(
+            &config,
+            &clients,
+            &HashMap::new(),
+            false,
+            None,
+            &PrepareTracker::default(),
+            limit,
+        )
+        .await
+        .expect("no config-class failure in this fixture");
+
+        let observed = max_in_flight(&arrivals, delay);
+        assert_eq!(
+            observed, limit,
+            "resolution must run exactly {limit} mappings at a time"
+        );
+    }
+
+    /// A zero limit must still make progress rather than stall forever.
+    ///
+    /// `buffered(0)` yields nothing and never completes, so the floor is not
+    /// cosmetic: without it a miscomputed limit hangs the run before the
+    /// engine starts, with a progress line reporting `done=0` forever.
+    #[tokio::test]
+    async fn resolve_all_treats_a_zero_limit_as_one() {
+        let (_server, config, clients, _arrivals) =
+            slow_tag_registry(2, Duration::from_millis(1)).await;
+
+        let resolution = resolve_all(
+            &config,
+            &clients,
+            &HashMap::new(),
+            false,
+            None,
+            &PrepareTracker::default(),
+            0,
+        )
+        .await
+        .expect("no config-class failure in this fixture");
+
+        assert_eq!(resolution.resolved.len(), 2);
+    }
+
+    /// A mapping's targets must be listed concurrently.
+    ///
+    /// The immutable-tag optimization lists every target's existing tags
+    /// before the engine starts. Walking the mirrors one at a time makes a
+    /// mapping's prepare cost scale with its fan-out, which is the opposite of
+    /// what fanning out is for: the listings are independent and read-only.
+    #[tokio::test]
+    async fn resolve_mapping_lists_target_tags_concurrently() {
+        let delay = Duration::from_millis(250);
+        let server = wiremock::MockServer::start().await;
+        let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // The source listing is fast and on its own path, so only the target
+        // listings land in the recorder.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/repo/img0/tags/list"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "repo/img0", "tags": ["v1"]})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/mirror/img0/tags/list"))
+            .respond_with(SlowRecorder::tag_list(&arrivals, delay, &["v1"]))
+            .mount(&server)
+            .await;
+
+        let config: Config = serde_yaml::from_str(&format!(
+            r#"
+registries:
+  src:
+    url: {uri}
+  dst1:
+    url: {uri}
+  dst2:
+    url: {uri}
+  dst3:
+    url: {uri}
+defaults:
+  source: src
+  targets: [dst1, dst2, dst3]
+mappings:
+  - from: repo/img0
+    to: mirror/img0
+    tags:
+      glob: ["*"]
+      immutable_tags: "v*"
+"#,
+            uri = server.uri()
+        ))
+        .expect("config yaml parses");
+
+        let clients = ClientMap::from([
+            ("src".to_string(), Ok(test_client(&server.uri()))),
+            ("dst1".to_string(), Ok(test_client(&server.uri()))),
+            ("dst2".to_string(), Ok(test_client(&server.uri()))),
+            ("dst3".to_string(), Ok(test_client(&server.uri()))),
+        ]);
+
+        let (outcome, _dropped) = resolve_mapping(
+            &config.mappings[0],
+            &config,
+            &clients,
+            &HashMap::new(),
+            false,
+        )
+        .await;
+        assert!(matches!(
+            outcome.expect("the mapping resolves"),
+            MappingResolution::Resolved(_)
+        ));
+
+        let observed = max_in_flight(&arrivals, delay);
+        assert_eq!(
+            observed, 3,
+            "all three target listings must be open at once"
+        );
+    }
+
+    /// The progress line must name the item holding the step up.
+    ///
+    /// A count alone leaves a stall unattributable: a step that sits at the
+    /// same `done` for minutes could be one huge tag listing or a wedged
+    /// registry, and the operator cannot tell which without the name.
+    #[tokio::test(start_paused = true)]
+    async fn prepare_ticker_names_the_item_holding_the_step_up() {
+        let tracker = PrepareTracker::default();
+        tracker.begin(PreparePhase::Mappings, 2);
+        let seen = RefCell::new(Vec::new());
+
+        tick_while(
+            &tracker,
+            Duration::from_secs(5),
+            async {
+                let slow = tracker.track("repo/slow");
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                // Started later, so it must never be the one reported even
+                // though it is the most recent thing to begin.
+                let quick = tracker.track("repo/quick");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                drop(quick);
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                drop(slow);
+            },
+            |p, _| seen.borrow_mut().push(p.slowest.clone()),
+        )
+        .await;
+
+        let reported: Vec<(String, u64)> = seen
+            .borrow()
+            .iter()
+            .map(|s| {
+                let (name, age) = s.as_ref().expect("a mapping is in flight at every tick");
+                (name.clone(), age.as_secs())
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            vec![("repo/slow".to_string(), 5), ("repo/slow".to_string(), 10),],
+            "the oldest in-flight item must be reported, with how long it has been running"
+        );
+    }
+
+    /// Retiring an item both counts it and takes it out of the in-flight set.
+    ///
+    /// The guard is what makes that unconditional. Resolution has many early
+    /// exits, and one that forgot to count would strand the progress line
+    /// short of its total for the rest of the run.
+    #[tokio::test]
+    async fn prepare_tracker_retires_an_item_when_its_guard_drops() {
+        let tracker = PrepareTracker::default();
+        tracker.begin(PreparePhase::Mappings, 1);
+
+        let item = tracker.track("repo/one");
+        let during = tracker.snapshot();
+        assert_eq!((during.done, during.in_flight), (0, 1));
+
+        drop(item);
+        let after = tracker.snapshot();
+        assert_eq!((after.done, after.in_flight), (1, 0));
+        assert!(
+            after.slowest.is_none(),
+            "nothing is running, so nothing is reported as slow"
+        );
+    }
+
+    /// A new step starts from a clean in-flight set.
+    ///
+    /// Steps run back to back under one ticker, so a leaked item from the
+    /// previous step would be reported as the thing holding up the next one.
+    #[tokio::test]
+    async fn prepare_tracker_clears_in_flight_items_between_steps() {
+        let tracker = PrepareTracker::default();
+        tracker.begin(PreparePhase::Registries, 1);
+        let leaked = tracker.track("registry-a");
+        std::mem::forget(leaked);
+
+        tracker.begin(PreparePhase::Mappings, 1);
+
+        let p = tracker.snapshot();
+        assert_eq!(p.in_flight, 0);
+        assert!(p.slowest.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Prepare-phase benchmarks
+    //
+    // Ignored by default: they measure wall-clock against a mock registry with
+    // injected latency, which is too slow for the normal test run. Run with:
+    //
+    //   cargo test --bin ocync -- --ignored --nocapture prepare_phase
+    // -----------------------------------------------------------------------
+
+    /// Tag count the pagination benchmark serves.
+    const BENCH_REPO_TAGS: usize = 3000;
+
+    /// A `tags/list` that behaves the way the real registries do: a request
+    /// carrying no `n` gets every tag in one response with no `Link` header,
+    /// and only an explicit `n` produces pages.
+    ///
+    /// Measured against Docker Hub and matching `distribution/distribution`,
+    /// which sets its internal limit to -1 when `n` is absent.
+    struct PaginatedTagList {
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl wiremock::Respond for PaginatedTagList {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let all: Vec<String> = (0..BENCH_REPO_TAGS).map(|i| format!("tag{i:04}")).collect();
+            // No `n` means no paging at all, which is the whole point.
+            let mut page = all.len();
+            let mut last: Option<String> = None;
+            for (k, v) in req.url.query_pairs() {
+                match k.as_ref() {
+                    "n" => page = v.parse().unwrap_or(all.len()),
+                    "last" => last = Some(v.into_owned()),
+                    _ => {}
+                }
+            }
+
+            let start = match &last {
+                Some(l) => all.iter().position(|t| t == l).map_or(0, |i| i + 1),
+                None => 0,
+            };
+            let end = (start + page).min(all.len());
+            let mut resp = wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name": "repo/paged", "tags": &all[start..end]}));
+            if end < all.len() {
+                resp = resp.append_header(
+                    "link",
+                    format!(
+                        r#"</v2/repo/paged/tags/list?n={page}&last={}>; rel="next""#,
+                        all[end - 1]
+                    )
+                    .as_str(),
+                );
+            }
+            resp
+        }
+    }
+
+    /// How long the prepare phase takes as mapping resolution is widened.
+    ///
+    /// Concurrency 1 is the behaviour this replaced, so the first row is the
+    /// baseline every other row is measured against.
+    #[tokio::test]
+    #[ignore = "wall-clock benchmark against a latency-injected mock registry"]
+    async fn prepare_phase_benchmark_resolution_concurrency() {
+        let mappings = 95;
+        let delay = Duration::from_millis(60);
+
+        println!(
+            "\n{mappings} mappings, {}ms per tag listing\n",
+            delay.as_millis()
+        );
+        println!(
+            "{:>11}  {:>10}  {:>10}  {:>12}",
+            "concurrency", "elapsed", "speedup", "max in flight"
+        );
+
+        let mut baseline: Option<Duration> = None;
+        for concurrency in [1usize, 4, 8, 16, 32] {
+            // A fresh server and fresh clients per row: AIMD widens as a
+            // registry keeps answering, so reusing them would hand later rows
+            // a head start the first row never had.
+            let (_server, config, clients, arrivals) = slow_tag_registry(mappings, delay).await;
+
+            let started = std::time::Instant::now();
+            let resolution = resolve_all(
+                &config,
+                &clients,
+                &HashMap::new(),
+                false,
+                None,
+                &PrepareTracker::default(),
+                concurrency,
+            )
+            .await
+            .expect("no config-class failure in this fixture");
+            let elapsed = started.elapsed();
+            assert_eq!(resolution.resolved.len(), mappings);
+
+            let observed = max_in_flight(&arrivals, delay);
+            let base = *baseline.get_or_insert(elapsed);
+            println!(
+                "{concurrency:>11}  {:>9.2}s  {:>9.1}x  {observed:>12}",
+                elapsed.as_secs_f64(),
+                base.as_secs_f64() / elapsed.as_secs_f64()
+            );
+        }
+        println!(
+            "\nresolution runs at most {PREPARE_MAPPING_CONCURRENCY} mappings at once; \
+             past that each registry's AIMD window is the binding constraint\n"
+        );
+    }
+
+    /// How many round trips one repository's tag listing costs, with and
+    /// without asking for a page size.
+    ///
+    /// Both walks hit the same registry over the same tag set. This is the
+    /// evidence for not sending `n`: the request that asks for nothing gets
+    /// everything in one response, and the one that asks for a page size pays
+    /// per page. It reproduces what Docker Hub does with `library/python`.
+    #[tokio::test]
+    #[ignore = "benchmark: counts round trips against a paginated mock registry"]
+    async fn prepare_phase_benchmark_tag_list_pagination() {
+        let server = wiremock::MockServer::start().await;
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/repo/paged/tags/list"))
+            .respond_with(PaginatedTagList {
+                requests: Arc::clone(&requests),
+            })
+            .mount(&server)
+            .await;
+
+        // What sending an explicit page size would cost: follow the pagination
+        // it creates, one round trip per page.
+        let http = ocync_distribution::test_http_client();
+        let mut url = format!("{}/v2/repo/paged/tags/list?n=1000", server.uri());
+        let mut paged_tags = 0usize;
+        loop {
+            let resp = http.get(&url).send().await.expect("mock answers");
+            // The mock emits exactly one link-value, so the path is whatever
+            // sits between the angle brackets. The client's own parser is
+            // crate-private and stays that way: this baseline deliberately
+            // does not share code with the thing it is measuring.
+            let next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|h| {
+                    let start = h.find('<')? + 1;
+                    let end = h[start..].find('>')? + start;
+                    Some(h[start..end].to_owned())
+                });
+            let body: serde_json::Value = resp.json().await.expect("mock returns json");
+            paged_tags += body["tags"].as_array().map_or(0, |a| a.len());
+            match next {
+                Some(path) => url = format!("{}{path}", server.uri()),
+                None => break,
+            }
+        }
+        let paged_requests = requests.swap(0, std::sync::atomic::Ordering::Relaxed);
+
+        let client = test_client(&server.uri());
+        let tags = client
+            .list_tags(&RepositoryName::new("repo/paged").unwrap())
+            .await
+            .expect("the listing succeeds");
+        let ocync_requests = requests.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(tags.len(), BENCH_REPO_TAGS, "the whole listing is walked");
+        assert_eq!(paged_tags, BENCH_REPO_TAGS, "and so is the paged walk");
+
+        println!("\n{BENCH_REPO_TAGS} tags in one repository\n");
+        println!("{:>24}  {:>9}", "request", "round trips");
+        println!("{:>24}  {ocync_requests:>9}", "no n (ocync)");
+        println!("{:>24}  {paged_requests:>9}", "n=1000");
+        println!(
+            "\nasking for a page size costs {:.0}x the round trips\n",
+            paged_requests as f64 / ocync_requests as f64
+        );
     }
 }

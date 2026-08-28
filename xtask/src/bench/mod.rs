@@ -40,6 +40,14 @@ pub(crate) struct BenchArgs {
     #[arg(long, default_value = "bench/corpus-partial-overrides.yaml")]
     pub(crate) partial_overrides: String,
 
+    /// Path to the prepare-scenario corpus YAML.
+    ///
+    /// Separate from `--corpus` because the two measure opposite things: the
+    /// main corpus is a handful of entries chosen for blob sharing and pinned
+    /// to literal tags, which skips tag enumeration entirely.
+    #[arg(long, default_value = "bench/corpus-prepare.yaml")]
+    pub(crate) prepare_corpus: String,
+
     /// Use first N images only.
     #[arg(long)]
     pub(crate) limit: Option<usize>,
@@ -99,6 +107,8 @@ pub(crate) enum Scenario {
     Partial,
     /// Run at increasing corpus sizes -- measures scaling behavior (ocync only).
     Scale,
+    /// Resolve every mapping and stop -- measures the prepare phase (ocync only).
+    Prepare,
     /// Run all scenarios in sequence.
     All,
 }
@@ -256,7 +266,14 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // Guard: refuse to run if TMPDIR resolves to tmpfs. Staging writes
     // multi-GB blobs and tmpfs is RAM-backed, causing OOM/ENOSPC.
     // The bench-remote xtask sets TMPDIR=$HOME/ocync/bench/.tmp (on EBS).
-    reject_tmpfs_tmpdir()?;
+    //
+    // The prepare scenario is exempt because it stages nothing: `--dry-run`
+    // resolves mappings and stops, so there is no blob to write anywhere.
+    // Applying the guard to it would refuse the one scenario cheap enough to
+    // run on a laptop, for a disk cost it does not have.
+    if !matches!(args.scenario, Scenario::Prepare) {
+        reject_tmpfs_tmpdir()?;
+    }
 
     // 1. Parse corpus (apply skip-registries filter, then limit).
     let loaded = corpus::load(&args.corpus)?;
@@ -368,13 +385,26 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // 6. Expand All into individual scenarios, then dispatch each.
     let scenarios: Vec<Scenario> = match args.scenario {
-        Scenario::All => vec![Scenario::Sync, Scenario::Partial, Scenario::Scale],
+        Scenario::All => vec![
+            Scenario::Sync,
+            Scenario::Partial,
+            Scenario::Scale,
+            Scenario::Prepare,
+        ],
         other => vec![other],
     };
 
     // Pre-warm CDN so all tools see identically cached source manifests.
+    //
+    // The prepare scenario needs none of it. It runs one tool, pulls no blobs,
+    // and reads a different corpus than the one warmed here, so warming for it
+    // is hundreds of pointless requests against registries that rate-limit.
+    // A mixed run still warms, because the scenarios beside it do transfer.
+    let transfers = scenarios.iter().any(|s| !matches!(s, Scenario::Prepare));
     if args.skip_prewarm {
         eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
+    } else if !transfers {
+        eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
     } else {
         cdn_prewarm(&corpus).await;
     }
@@ -436,6 +466,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     eprintln!("bench: scale scenario requires ocync (skipping)");
                 }
             }
+            Scenario::Prepare => {
+                // ocync only: no competitor has a mode that resolves tags and
+                // stops, so there is nothing to compare against. Same reason
+                // the scale scenario runs alone.
+                if tools.contains(&Tool::Ocync) {
+                    let result = run_prepare(&args, &output_dir).await?;
+                    report.scenarios.push(result);
+                } else {
+                    eprintln!("bench: prepare scenario requires ocync (skipping)");
+                }
+            }
             Scenario::All => unreachable!("expanded above"),
         }
     }
@@ -492,9 +533,22 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             })
             .collect(),
     };
+    // The archive is tracked in git and read as a history of comparable runs.
+    // A run whose machine could not be identified is not comparable to one on
+    // a known instance, and the harness already says so with a WARNING per
+    // missing field. Appending it anyway puts a laptop's numbers next to the
+    // rig's under the same key, where nothing downstream can tell them apart.
+    // The summary is still written; only the shared history is protected.
     let results_dir = Path::new("bench/results");
-    report::append_record(results_dir, reg_key, record)?;
-    eprintln!("bench: run record appended to bench/results/{reg_key}.json");
+    if record.machine.instance_type == "unknown" {
+        eprintln!(
+            "bench: run record NOT appended (instance metadata unknown, so this \
+             run is not comparable to the archived ones); summary only"
+        );
+    } else {
+        report::append_record(results_dir, reg_key, record)?;
+        eprintln!("bench: run record appended to bench/results/{reg_key}.json");
+    }
 
     // 9. Handle regression mode.
     if args.regression {
@@ -562,6 +616,7 @@ async fn run_single_tool(
     config_dir: &Path,
     output_dir: &Path,
     phase: &str,
+    dry_run: bool,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
     // 1. Generate config.
     let config_content = match tool {
@@ -609,7 +664,14 @@ async fn run_single_tool(
     // update-ca-trust on AL2023) so that rustls-native-certs and OpenSSL
     // both trust the MITM'd connections. HTTPS_PROXY alone is sufficient.
     let workspace_root = Path::new(".");
-    let result = runner::run_tool(tool, &config_path, proxy_url.as_deref(), workspace_root).await?;
+    let result = runner::run_tool(
+        tool,
+        &config_path,
+        proxy_url.as_deref(),
+        workspace_root,
+        dry_run,
+    )
+    .await?;
 
     // 6. Stop proxy, parse log, aggregate metrics. Abort on source
     //    registry errors that indicate tainted benchmark data.
@@ -748,8 +810,16 @@ async fn run_sync(
         // Cold run.
         progress(&format!("  cold: {tool}"));
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
-            let cold =
-                run_single_tool(args, tool, corpus, config_dir.path(), output_dir, "cold").await?;
+            let cold = run_single_tool(
+                args,
+                tool,
+                corpus,
+                config_dir.path(),
+                output_dir,
+                "cold",
+                false,
+            )
+            .await?;
             if cold.exit_code != Some(0) {
                 return Err(format!(
                     "{tool} cold sync failed (exit {:?}); aborting -- \
@@ -770,8 +840,16 @@ async fn run_sync(
 
             // Warm run: target still populated, same config_dir.
             progress(&format!("  warm: {tool}"));
-            let warm =
-                run_single_tool(args, tool, corpus, config_dir.path(), output_dir, "warm").await?;
+            let warm = run_single_tool(
+                args,
+                tool,
+                corpus,
+                config_dir.path(),
+                output_dir,
+                "warm",
+                false,
+            )
+            .await?;
             if warm.exit_code != Some(0) {
                 return Err(format!(
                     "{tool} warm sync failed (exit {:?}); aborting -- \
@@ -848,6 +926,7 @@ async fn run_partial(
                 config_dir.path(),
                 output_dir,
                 "prime",
+                false,
             )
             .await?;
             if prime.exit_code != Some(0) {
@@ -867,6 +946,7 @@ async fn run_partial(
                 config_dir.path(),
                 output_dir,
                 "partial",
+                false,
             )
             .await?;
             if run.exit_code != Some(0) {
@@ -932,9 +1012,16 @@ async fn run_scale(
 
             let run_result: Result<(), Box<dyn std::error::Error>> = async {
                 let config_dir = tempfile::tempdir()?;
-                let run =
-                    run_single_tool(args, tool, &subset, config_dir.path(), output_dir, "scale")
-                        .await?;
+                let run = run_single_tool(
+                    args,
+                    tool,
+                    &subset,
+                    config_dir.path(),
+                    output_dir,
+                    "scale",
+                    false,
+                )
+                .await?;
                 if run.exit_code != Some(0) {
                     return Err(format!(
                         "{tool} scale sync failed at {size} images (exit {:?}); aborting",
@@ -961,6 +1048,65 @@ async fn run_scale(
     }
 
     Ok(points)
+}
+
+/// Measure the pre-engine phase on its own.
+///
+/// `--dry-run` resolves every mapping and stops, so the run is a client build
+/// per registry plus a tag listing per mapping and nothing else. That is the
+/// whole point: in a full sync this work is a rounding error beside gigabytes
+/// of blob transfer, which is why a regression here went unnoticed long enough
+/// to cost eleven minutes on a 95-mapping config.
+///
+/// None of the sync scenario's fairness machinery applies. Nothing is
+/// transferred, so there are no blobs to fall out of page cache, no ECR repos
+/// to reset, and no CDN edge to pre-warm. Skipping it is what keeps this
+/// scenario cheap enough to run often.
+async fn run_prepare(
+    args: &BenchArgs,
+    output_dir: &Path,
+) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
+    progress("bench: running prepare scenario (ocync, --dry-run)");
+
+    // Its own corpus: wildcard tags, so resolution actually enumerates. A
+    // corpus of literal tags takes the exact-tag fast path and measures
+    // nothing. See `bench/corpus-prepare.yaml`.
+    let corpus = corpus::load(&args.prepare_corpus)?;
+    let corpus = match args.limit {
+        Some(n) => corpus.limit(n),
+        None => corpus,
+    };
+    progress(&format!("  prepare: {} mappings", corpus.images.len()));
+
+    let config_dir = tempfile::tempdir()?;
+    let run = run_single_tool(
+        args,
+        Tool::Ocync,
+        &corpus,
+        config_dir.path(),
+        output_dir,
+        "prepare",
+        true,
+    )
+    .await?;
+
+    // `--dry-run` exits non-zero when a mapping could not be resolved. That is
+    // the measurement failing, not a finding: a run that skipped mappings did
+    // less work and its wall clock means nothing.
+    if run.exit_code != Some(0) {
+        return Err(format!(
+            "ocync prepare dry-run failed (exit {:?}); the timing would not be comparable",
+            run.exit_code
+        )
+        .into());
+    }
+
+    Ok(ScenarioResult {
+        scenario: "Prepare (dry-run)".to_string(),
+        runs: vec![run],
+        shuffle_seed: 0,
+        tool_order: Vec::new(),
+    })
 }
 
 /// Sleep for 30 seconds between benchmark runs to let rate limits recover.
@@ -1711,6 +1857,7 @@ impl std::fmt::Display for Scenario {
             Scenario::Sync => f.write_str("sync"),
             Scenario::Partial => f.write_str("partial"),
             Scenario::Scale => f.write_str("scale"),
+            Scenario::Prepare => f.write_str("prepare"),
             Scenario::All => f.write_str("all"),
         }
     }
