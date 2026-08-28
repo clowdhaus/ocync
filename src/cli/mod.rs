@@ -131,6 +131,14 @@ pub(crate) enum CliError {
     /// Invalid user input.
     #[error("{0}")]
     Input(String),
+
+    /// Credential resolution failed for a registry.
+    ///
+    /// Distinct from [`Self::Input`] so that a run whose only failures were
+    /// denials exits with the dedicated auth code. The provider crates return
+    /// their own error types here, so the cause arrives already formatted.
+    #[error("{0}")]
+    Auth(String),
 }
 
 impl CliError {
@@ -140,6 +148,7 @@ impl CliError {
             Self::Config(_) => ExitCode::ConfigError,
             Self::Filter(_) => ExitCode::ConfigError,
             Self::Registry(e) if e.is_auth_error() => ExitCode::AuthError,
+            Self::Auth(_) => ExitCode::AuthError,
             _ => ExitCode::Failure,
         }
     }
@@ -220,7 +229,7 @@ pub(crate) async fn build_registry_client(
             let profile = registry_config.and_then(|r| r.aws_profile.as_deref());
             let auth = EcrAuth::new(bare_host, profile)
                 .await
-                .map_err(|e| CliError::Input(format!("ECR auth setup for '{bare_host}': {e}")))?;
+                .map_err(|e| CliError::Auth(format!("ECR auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Basic) => {
@@ -249,19 +258,22 @@ pub(crate) async fn build_registry_client(
         Some(AuthType::Gar | AuthType::Gcr) => {
             let auth = GcpAuth::new(bare_host, http)
                 .await
-                .map_err(|e| CliError::Input(format!("GCP auth setup for '{bare_host}': {e}")))?;
+                .map_err(|e| CliError::Auth(format!("GCP auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Acr) => {
             let auth = AcrAuth::new(bare_host)
                 .await
-                .map_err(|e| CliError::Input(format!("ACR auth setup for '{bare_host}': {e}")))?;
+                .map_err(|e| CliError::Auth(format!("ACR auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Ghcr | AuthType::DockerConfig) => {
             if matches!(auth_type, Some(AuthType::Ghcr)) {
                 warn_ghcr_deprecation_once(bare_host);
             }
+            // A missing config file is a setup problem, not a rejected
+            // credential: `Input`, not `Auth`. The credential *exchange*
+            // below is the auth-classified step.
             let docker_config = DockerConfig::load_default().map_err(|e| {
                 CliError::Input(format!(
                     "failed to load docker config for '{bare_host}': {e}"
@@ -280,25 +292,25 @@ pub(crate) async fn build_registry_client(
             match detect_provider_kind(bare_host) {
                 Some(ProviderKind::Ecr) => {
                     let auth = EcrAuth::new(bare_host, None).await.map_err(|e| {
-                        CliError::Input(format!("ECR auth setup for '{bare_host}': {e}"))
+                        CliError::Auth(format!("ECR auth setup for '{bare_host}': {e}"))
                     })?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::EcrPublic) => {
                     let auth = EcrPublicAuth::new(http.clone())
                         .await
-                        .map_err(|e| CliError::Input(format!("ECR Public auth setup: {e}")))?;
+                        .map_err(|e| CliError::Auth(format!("ECR Public auth setup: {e}")))?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Gar | ProviderKind::Gcr) => {
                     let auth = GcpAuth::new(bare_host, http).await.map_err(|e| {
-                        CliError::Input(format!("GCP auth setup for '{bare_host}': {e}"))
+                        CliError::Auth(format!("GCP auth setup for '{bare_host}': {e}"))
                     })?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Acr) => {
                     let auth = AcrAuth::new(bare_host).await.map_err(|e| {
-                        CliError::Input(format!("ACR auth setup for '{bare_host}': {e}"))
+                        CliError::Auth(format!("ACR auth setup for '{bare_host}': {e}"))
                     })?;
                     RegistryClient::builder(url).auth(auth)
                 }
@@ -310,7 +322,7 @@ pub(crate) async fn build_registry_client(
                             let auth = DockerConfigAuth::new(endpoint, &config, http)
                                 .await
                                 .map_err(|e| {
-                                    CliError::Input(format!(
+                                    CliError::Auth(format!(
                                         "docker config credential resolution for '{bare_host}': {e}"
                                     ))
                                 })?;
@@ -365,16 +377,24 @@ pub(crate) fn setup_logging(cli: &Cli) {
         .add_directive("rustls=warn".parse().unwrap())
         .add_directive("tower=warn".parse().unwrap());
 
+    // stderr, not the default stdout: `--json` writes its document to stdout,
+    // and the periodic progress lines would otherwise be interleaved into it
+    // for the whole duration of exactly the long runs `--json` exists for.
     match format {
         LogFormat::Json => {
             fmt()
                 .json()
                 .with_env_filter(env_filter)
                 .with_target(false)
+                .with_writer(std::io::stderr)
                 .init();
         }
         LogFormat::Text => {
-            fmt().with_env_filter(env_filter).with_target(false).init();
+            fmt()
+                .with_env_filter(env_filter)
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .init();
         }
     }
 }
@@ -472,6 +492,19 @@ mod tests {
     fn cli_error_exit_code_input() {
         let err = CliError::Input("bad url".into());
         assert_eq!(err.exit_code(), ExitCode::Failure);
+    }
+
+    #[test]
+    fn cli_error_exit_code_auth() {
+        // Credential-provider setup failures carry their own exit code so a
+        // run denied everywhere is distinguishable from a generic failure.
+        let err = CliError::Auth("ECR auth setup for 'x': 403 Forbidden".into());
+        assert_eq!(err.exit_code(), ExitCode::AuthError);
+        // The negative half: a plain input error must not claim it.
+        assert_eq!(
+            CliError::Input("bad url".into()).exit_code(),
+            ExitCode::Failure
+        );
     }
 
     #[test]

@@ -50,12 +50,20 @@ pub struct SyncReport {
 }
 
 impl SyncReport {
+    /// Whether any image synced or was skipped.
+    ///
+    /// Exposed because a caller that also tracks failures the report cannot
+    /// see, such as a mapping dropped before the engine ran, has to fold them
+    /// into the exit code itself and would otherwise re-derive this predicate.
+    pub fn has_success(&self) -> bool {
+        self.images
+            .iter()
+            .any(|i| matches!(i.status, ImageStatus::Synced | ImageStatus::Skipped { .. }))
+    }
+
     /// Derive process exit code from results.
     pub fn exit_code(&self) -> i32 {
-        let has_success = self
-            .images
-            .iter()
-            .any(|i| matches!(i.status, ImageStatus::Synced | ImageStatus::Skipped { .. }));
+        let has_success = self.has_success();
         let has_failure = self
             .images
             .iter()

@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
+use crate::progress::RunProgress;
 use crate::retry::{self, RetryConfig};
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
@@ -746,6 +747,14 @@ const BLOB_CONCURRENCY: usize = 6;
 /// Default shutdown drain deadline in seconds.
 const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 25;
 
+/// Default cadence for [`crate::progress::ProgressReporter::run_heartbeat`] callbacks.
+///
+/// Discovery and execution can each run for minutes without an image reaching
+/// a terminal state. Without a periodic callback the caller has no way to tell
+/// a slow run from a wedged one. 30 seconds is short enough to notice a stall
+/// and long enough that the callback is not itself the noise.
+const DEFAULT_HEARTBEAT_SECS: u64 = 30;
+
 /// Sync engine - orchestrates concurrent image transfers across registries.
 ///
 /// Discovery futures drain first via `tokio::select!`, then leader-follower
@@ -762,6 +771,10 @@ pub struct SyncEngine {
     source_head_timeout: Duration,
     /// Deadline for the per-blob mount-source wait. Default: 60 seconds.
     mount_source_wait_deadline: Duration,
+    /// Cadence for in-flight progress callbacks. Default: 30 seconds.
+    heartbeat_interval: Duration,
+    /// Whether the end-of-run prune may treat absent entries as deleted.
+    prune_cache: bool,
 }
 
 impl SyncEngine {
@@ -776,6 +789,8 @@ impl SyncEngine {
             drain_deadline: Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
             source_head_timeout: Duration::from_secs(5),
             mount_source_wait_deadline: Duration::from_secs(60),
+            heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
+            prune_cache: true,
         }
     }
 
@@ -802,6 +817,34 @@ impl SyncEngine {
     /// falls back to push instead of hanging. Default 60 seconds.
     pub fn with_mount_source_wait_deadline(mut self, deadline: Duration) -> Self {
         self.mount_source_wait_deadline = deadline;
+        self
+    }
+
+    /// Configure how often [`crate::progress::ProgressReporter::run_heartbeat`] fires while the
+    /// run still has work in flight. Default 30 seconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics on [`Duration::ZERO`] - a zero-period interval would spin the
+    /// engine's `select!` loop.
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "heartbeat interval must be greater than zero"
+        );
+        self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Whether the end-of-run cache prune may run. Default `true`.
+    ///
+    /// The prune derives "still live" from the mappings it was handed, so it
+    /// cannot tell a mapping deleted from config from one that failed to
+    /// resolve this run. Callers that dropped work before the engine started
+    /// must pass `false`, or a single transient denial discards the cached
+    /// state for everything it could not reach and the next run re-fetches it.
+    pub fn with_cache_pruning(mut self, prune: bool) -> Self {
+        self.prune_cache = prune;
         self
     }
 
@@ -882,6 +925,17 @@ impl SyncEngine {
         };
 
         let mut immutable_tag_skips: u64 = 0;
+
+        // Liveness heartbeat. `interval` yields its first tick immediately;
+        // `reset` pushes it out a full period so the first callback lands
+        // after the run has actually been quiet for that long.
+        let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.reset();
+        // The `select!` branch only fires on a poll where no work was ready,
+        // so a steady completion stream would starve it. This deadline is
+        // checked from the work arms too, which is what guarantees a cadence.
+        let mut next_heartbeat = tokio::time::Instant::now() + self.heartbeat_interval;
 
         // Seed discovery with all (mapping, tag) pairs.
         for mapping in &mappings {
@@ -1037,6 +1091,17 @@ impl SyncEngine {
                 Some(result) = execution_futures.next(), if !execution_futures.is_empty() => {
                     progress.image_completed(&result);
                     results.push(result);
+                    if tokio::time::Instant::now() >= next_heartbeat {
+                        progress.run_heartbeat(RunProgress {
+                            in_discovery: discovery_futures.len(),
+                            pending: pending.len(),
+                            in_flight: execution_futures.len(),
+                            completed: results.len(),
+                            elapsed: run_start.elapsed(),
+                        });
+                        next_heartbeat = tokio::time::Instant::now() + self.heartbeat_interval;
+                        heartbeat.reset();
+                    }
                 }
                 _ = async {
                     // Guard above ensures shutdown.is_some(); unwrap cannot panic.
@@ -1126,6 +1191,26 @@ impl SyncEngine {
                         }
                     }
                 }
+                // Last in `biased` order: real work always pre-empts the
+                // heartbeat.
+                //
+                // The guard is the disjunction of the two work branches' own
+                // preconditions, and must stay that way. A looser guard (say,
+                // "discovery futures remain") leaves this branch enabled after
+                // shutdown has frozen discovery, which starves the `else` exit
+                // and hangs the engine for a whole interval.
+                _ = heartbeat.tick(), if !execution_futures.is_empty()
+                    || (!shutting_down && !discovery_paused && !discovery_futures.is_empty()) =>
+                {
+                    progress.run_heartbeat(RunProgress {
+                        in_discovery: discovery_futures.len(),
+                        pending: pending.len(),
+                        in_flight: execution_futures.len(),
+                        completed: results.len(),
+                        elapsed: run_start.elapsed(),
+                    });
+                    next_heartbeat = tokio::time::Instant::now() + self.heartbeat_interval;
+                }
                 else => break,
             }
         }
@@ -1134,7 +1219,11 @@ impl SyncEngine {
 
         // Prune stale cache entries for tags/targets no longer in the mapping set.
         // Prevents unbounded cache growth when source tags or targets are deleted.
-        {
+        //
+        // Skipped when the caller could not resolve everything: absence would
+        // then mean "failed this run", not "deleted from config", and pruning
+        // on it throws away cache state the next run has to re-earn.
+        if self.prune_cache {
             let live_keys: HashSet<SnapshotKey> = mappings
                 .iter()
                 .flat_map(|m| {

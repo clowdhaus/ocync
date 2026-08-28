@@ -1,6 +1,7 @@
 //! Verbosity-aware progress reporters for sync output.
 //!
-//! [`TextProgress`] writes per-image status lines to stderr. There is no
+//! [`TextProgress`] writes per-image status lines to stderr, and a periodic
+//! liveness line to tracing while a run is still in flight. There is no
 //! per-cycle aggregate stdout line: the CLI driver emits a per-mapping
 //! INFO line via tracing after the engine returns, which carries the
 //! source/target context an aggregate cannot.
@@ -8,7 +9,7 @@
 use std::cell::RefCell;
 use std::io::{self, Write};
 
-use ocync_sync::progress::ProgressReporter;
+use ocync_sync::progress::{ProgressReporter, RunProgress};
 use ocync_sync::{ImageResult, ImageStatus, SyncReport};
 
 use crate::cli::output::{format_bytes, format_duration};
@@ -89,6 +90,22 @@ impl ProgressReporter for TextProgress {
                 tracing::warn!(error = %e, "failed to write progress to stderr");
             }
         }
+    }
+
+    fn run_heartbeat(&self, snapshot: RunProgress) {
+        // Goes through tracing rather than the stderr writer above: this is a
+        // periodic status line, not per-image output, so it belongs in the log
+        // stream where `--log-format json` and the level filter apply. At
+        // verbosity 0 the per-image lines are suppressed, which makes this the
+        // only thing distinguishing a long run from a hung one.
+        tracing::info!(
+            in_discovery = snapshot.in_discovery,
+            pending = snapshot.pending,
+            in_flight = snapshot.in_flight,
+            completed = snapshot.completed,
+            elapsed_secs = snapshot.elapsed.as_secs(),
+            "sync in progress"
+        );
     }
 
     fn run_completed(&self, _report: &SyncReport) {

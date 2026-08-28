@@ -173,6 +173,16 @@ ocync auth check -c config.yaml -c config2.yaml
 | `3` | Invalid configuration |
 | `4` | Authentication or authorization failure |
 
+A mapping that fails to resolve is skipped rather than aborting the run, and counts as a failure for the exit code: `1` when other mappings still synced or skipped images, `2` when none did, and `4` when nothing ran and every mapping was denied.
+
+A mapping that resolved but could not use one of its targets also exits `1`: the images did not reach a registry the config named.
+
+`analyze` follows the same shape. It exits `1` when it read some images but not all (or could not reach a target it was asked to estimate for), and `2` when it could read none.
+
+`--dry-run` resolves mappings for real, which lists tags against the source registry unless the config names only exact tag literals. It therefore reports the same unresolved mappings, dropped targets, and exit codes as a real run: a CI stage using it as a config lint will fail on a registry outage, where previously it always exited `0`.
+
+`auth check` exits `3` when any config file could not be read, `4` when credentials were rejected, and `1` when a registry failed for another reason. Files after an unreadable one are still checked.
+
 ## Structured output
 
 Use `--json` to get machine-readable sync reports for CI/CD pipelines:

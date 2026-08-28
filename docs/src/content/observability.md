@@ -14,6 +14,10 @@ ocync sync -c config.yaml --json
 
 Reports include per-image results and aggregate statistics: blobs transferred, bytes moved, mounts performed, cache hits, and errors.
 
+A mapping that could not be resolved at all -- unreachable registry, denied tag listing, bad repository name -- never reaches the engine and so produces no per-image entry. Those mappings are listed separately under `unresolved_mappings`, which is omitted entirely when every mapping resolved. The rest of the run still proceeds; one failing mapping does not cancel the others.
+
+A mapping that resolved but lost one of several targets is not unresolved: it synced to the targets that worked. The ones it could not use appear under `dropped_targets`, also omitted when empty, and each is summarised in the cycle tail as `| N targets dropped`. A dropped target moves the exit code off success, because images did not reach a registry the config named.
+
 Abbreviated example:
 
 ```json
@@ -43,9 +47,26 @@ Abbreviated example:
     "discovery_head_failures": 0,
     "discovery_target_stale": 0
   },
-  "duration": { "secs": 4, "nanos": 210000000 }
+  "duration": { "secs": 4, "nanos": 210000000 },
+  "unresolved_mappings": [
+    {
+      "from": "cgr.dev/chainguard/private",
+      "error": "mapping 'cgr.dev/chainguard/private': registry error: 403 Forbidden"
+    }
+  ],
+  "dropped_targets": [
+    {
+      "from": "cgr.dev/chainguard/nginx",
+      "registry": "backup-ecr",
+      "error": "mapping 'cgr.dev/chainguard/nginx': target registry 'backup-ecr' is unavailable: ECR auth setup for '...': 403 Forbidden"
+    }
+  ]
 }
 ```
+
+### analyze
+
+`ocync analyze --json` reports `images_analyzed`, `images_partial` (recorded, but missing at least one platform of a multi-arch image), `images_failed` (could not be read at all), plus `unresolved_mappings` and `dropped_targets` in the same shape `sync` uses, so one consumer reads both. An analysis that could not read everything exits non-zero, because the totals are short by whatever it missed.
 
 ## Progress indicators
 
@@ -53,6 +74,13 @@ Abbreviated example:
 
 - **TTY**: real-time progress bars with per-image and aggregate stats
 - **Non-TTY / CI**: periodic heartbeat lines with summary counts
+
+At the default verbosity, per-image lines are suppressed, so a long run would otherwise be silent from start to finish. Two periodic lines fill that gap:
+
+- `preparing sync` every five seconds before the engine starts, carrying `phase` (`registries`, `batch checkers`, or `mappings`), `done`, `total`, and `elapsed_secs`. This window is sequential network work: a token mint per registry, then a tag listing per mapping.
+- `sync in progress` every 30 seconds while discovery or transfers are still in flight, carrying `in_discovery`, `pending`, `in_flight`, `completed`, and `elapsed_secs`
+
+Both fire on wall-clock rather than on item boundaries, so a single slow mapping still reports, and a run that finishes inside one interval emits neither.
 
 Disable all progress output with `--quiet`.
 
