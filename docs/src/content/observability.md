@@ -66,7 +66,7 @@ Abbreviated example:
 
 ### analyze
 
-`ocync analyze --json` reports `images_analyzed`, `images_partial` (recorded, but missing at least one platform of a multi-arch image), `images_failed` (could not be read at all), and `dropped_targets` (excluded from the mount-savings estimate). An analysis that could not read everything exits non-zero, because the totals are short by whatever it missed.
+`ocync analyze --json` reports `images_analyzed`, `images_partial` (recorded, but missing at least one platform of a multi-arch image), `images_failed` (could not be read at all), plus `unresolved_mappings` and `dropped_targets` in the same shape `sync` uses, so one consumer reads both. An analysis that could not read everything exits non-zero, because the totals are short by whatever it missed.
 
 ## Progress indicators
 

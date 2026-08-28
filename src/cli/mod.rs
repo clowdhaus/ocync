@@ -377,16 +377,24 @@ pub(crate) fn setup_logging(cli: &Cli) {
         .add_directive("rustls=warn".parse().unwrap())
         .add_directive("tower=warn".parse().unwrap());
 
+    // stderr, not the default stdout: `--json` writes its document to stdout,
+    // and the periodic progress lines would otherwise be interleaved into it
+    // for the whole duration of exactly the long runs `--json` exists for.
     match format {
         LogFormat::Json => {
             fmt()
                 .json()
                 .with_env_filter(env_filter)
                 .with_target(false)
+                .with_writer(std::io::stderr)
                 .init();
         }
         LogFormat::Text => {
-            fmt().with_env_filter(env_filter).with_target(false).init();
+            fmt()
+                .with_env_filter(env_filter)
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .init();
         }
     }
 }

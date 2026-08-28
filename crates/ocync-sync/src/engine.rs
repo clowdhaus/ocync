@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
+use crate::progress::RunProgress;
 use crate::retry::{self, RetryConfig};
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
@@ -772,6 +773,8 @@ pub struct SyncEngine {
     mount_source_wait_deadline: Duration,
     /// Cadence for in-flight progress callbacks. Default: 30 seconds.
     heartbeat_interval: Duration,
+    /// Whether the end-of-run prune may treat absent entries as deleted.
+    prune_cache: bool,
 }
 
 impl SyncEngine {
@@ -787,6 +790,7 @@ impl SyncEngine {
             source_head_timeout: Duration::from_secs(5),
             mount_source_wait_deadline: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
+            prune_cache: true,
         }
     }
 
@@ -829,6 +833,18 @@ impl SyncEngine {
             "heartbeat interval must be greater than zero"
         );
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Whether the end-of-run cache prune may run. Default `true`.
+    ///
+    /// The prune derives "still live" from the mappings it was handed, so it
+    /// cannot tell a mapping deleted from config from one that failed to
+    /// resolve this run. Callers that dropped work before the engine started
+    /// must pass `false`, or a single transient denial discards the cached
+    /// state for everything it could not reach and the next run re-fetches it.
+    pub fn with_cache_pruning(mut self, prune: bool) -> Self {
+        self.prune_cache = prune;
         self
     }
 
@@ -1171,7 +1187,7 @@ impl SyncEngine {
                 _ = heartbeat.tick(), if !execution_futures.is_empty()
                     || (!shutting_down && !discovery_paused && !discovery_futures.is_empty()) =>
                 {
-                    progress.run_heartbeat(crate::progress::RunProgress {
+                    progress.run_heartbeat(RunProgress {
                         in_discovery: discovery_futures.len(),
                         pending: pending.len(),
                         in_flight: execution_futures.len(),
@@ -1187,7 +1203,11 @@ impl SyncEngine {
 
         // Prune stale cache entries for tags/targets no longer in the mapping set.
         // Prevents unbounded cache growth when source tags or targets are deleted.
-        {
+        //
+        // Skipped when the caller could not resolve everything: absence would
+        // then mean "failed this run", not "deleted from config", and pruning
+        // on it throws away cache state the next run has to re-earn.
+        if self.prune_cache {
             let live_keys: HashSet<SnapshotKey> = mappings
                 .iter()
                 .flat_map(|m| {

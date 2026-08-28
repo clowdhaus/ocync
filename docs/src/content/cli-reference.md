@@ -179,6 +179,8 @@ A mapping that resolved but could not use one of its targets also exits `1`: the
 
 `analyze` follows the same shape. It exits `1` when it read some images but not all (or could not reach a target it was asked to estimate for), and `2` when it could read none.
 
+`--dry-run` resolves mappings for real, which lists tags against the source registry unless the config names only exact tag literals. It therefore reports the same unresolved mappings, dropped targets, and exit codes as a real run: a CI stage using it as a config lint will fail on a registry outage, where previously it always exited `0`.
+
 `auth check` exits `3` when any config file could not be read, `4` when credentials were rejected, and `1` when a registry failed for another reason. Files after an unreadable one are still checked.
 
 ## Structured output

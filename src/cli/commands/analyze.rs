@@ -19,8 +19,9 @@ use ocync_distribution::{Digest, RepositoryName};
 use ocync_sync::ShutdownSignal;
 
 use crate::cli::commands::synchronize::{
-    ClientMap, DroppedTarget, MappingResolution, PreparePhase, PrepareTracker, build_clients,
-    log_unresolved_mapping, resolve_mapping, with_prepare_progress,
+    ClientMap, DroppedTarget, MappingResolution, PreparePhase, PrepareTracker, UnresolvedMapping,
+    build_clients, log_unresolved_mapping, resolve_mapping, shared_failure_code,
+    with_prepare_progress,
 };
 use crate::cli::config::{Config, load_config};
 use crate::cli::output::format_bytes;
@@ -64,10 +65,16 @@ struct Analysis {
     partial: usize,
     /// Images that could not be read at all.
     failed: usize,
-    /// Mappings that never produced any images to read.
-    unresolved: usize,
+    /// Mappings that produced no images to read.
+    ///
+    /// The same shape `sync` reports, so one consumer can read both. Each
+    /// carries its classification, so a wholly denied analysis exits 4 the way
+    /// `sync` does rather than collapsing to the generic failure.
+    unresolved: Vec<UnresolvedMapping>,
     /// Targets excluded from the mount-savings estimate.
     dropped: Vec<DroppedTarget>,
+    /// Whether shutdown cut the walk short.
+    interrupted: bool,
 }
 
 /// Run the analyze command.
@@ -91,11 +98,11 @@ pub(crate) async fn run(
     })
     .await;
 
-    if analysis.failed > 0 || analysis.partial > 0 || analysis.unresolved > 0 {
+    if analysis.failed > 0 || analysis.partial > 0 || !analysis.unresolved.is_empty() {
         tracing::warn!(
             failed_images = analysis.failed,
             partial_images = analysis.partial,
-            unresolved_mappings = analysis.unresolved,
+            unresolved_mappings = analysis.unresolved.len(),
             "the analysis is incomplete; the reported totals are short by whatever it could not read"
         );
     }
@@ -122,6 +129,7 @@ async fn collect_analysis(
     for mapping in &config.mappings {
         if shutdown.is_triggered() {
             tracing::info!("shutdown signal received, stopping analysis early");
+            analysis.interrupted = true;
             break;
         }
 
@@ -132,31 +140,35 @@ async fn collect_analysis(
 
         // One unresolvable mapping must not cost the analysis every mapping
         // behind it, same as `sync`.
-        let resolved = match resolve_mapping(mapping, config, clients, no_checkers, false).await {
-            Ok(MappingResolution::Resolved(r, dropped)) => {
-                // Analyze reports what a sync would move, so a target it
-                // cannot reach changes the answer and has to be reported
-                // rather than quietly costed out of the estimate.
-                for target in &dropped {
-                    tracing::warn!(
-                        from = %target.from,
-                        registry = %target.registry,
-                        error = %target.error,
-                        "target registry unavailable; excluded from the mount-savings estimate"
-                    );
-                }
-                analysis.dropped.extend(dropped);
-                r
-            }
-            Ok(MappingResolution::NoMatchingTags(_, dropped)) => {
-                analysis.dropped.extend(dropped);
-                continue;
-            }
+        // Dropped targets arrive whatever the outcome: analyze reports what a
+        // sync would move, so a target it cannot reach changes the answer even
+        // when the mapping itself then fails.
+        let (outcome, dropped) =
+            resolve_mapping(mapping, config, clients, no_checkers, false).await;
+        for target in &dropped {
+            tracing::warn!(
+                from = %target.from,
+                registry = %target.registry,
+                error = %target.error,
+                "target registry unavailable; excluded from the mount-savings estimate"
+            );
+        }
+        analysis.dropped.extend(dropped);
+
+        let resolved = match outcome {
+            Ok(MappingResolution::Resolved(r)) => r,
+            Ok(MappingResolution::NoMatchingTags(_)) => continue,
             Err(err) => {
                 log_unresolved_mapping(&mapping.from, &err);
                 // A mapping the analysis could not resolve is a hole in the
-                // estimate exactly like an image it could not read.
-                analysis.unresolved += 1;
+                // estimate exactly like an image it could not read. Its
+                // classification is kept so a wholly denied analysis reports
+                // as a denial rather than a generic failure.
+                analysis.unresolved.push(UnresolvedMapping {
+                    from: mapping.from.clone(),
+                    code: err.exit_code(),
+                    error: err.to_string(),
+                });
                 continue;
             }
         };
@@ -164,6 +176,7 @@ async fn collect_analysis(
         for tag_pair in &resolved.tags {
             if shutdown.is_triggered() {
                 tracing::info!("shutdown signal received, stopping analysis early");
+                analysis.interrupted = true;
                 break;
             }
 
@@ -211,17 +224,32 @@ async fn collect_analysis(
 /// An incomplete estimate must not look like a clean one: the totals are short
 /// by whatever the unread images and unreachable targets hold.
 fn analyze_exit_code(analysis: &Analysis) -> ExitCode {
+    // An interrupted walk is a truncated report, which is the same kind of
+    // incompleteness as an unreadable image and must not read as clean.
     if analysis.failed == 0
         && analysis.partial == 0
-        && analysis.unresolved == 0
+        && analysis.unresolved.is_empty()
         && analysis.dropped.is_empty()
+        && !analysis.interrupted
     {
         return ExitCode::Success;
     }
-    if analysis.analyzed == 0 {
-        return ExitCode::Failure;
+    if analysis.interrupted && analysis.analyzed > 0 {
+        return ExitCode::PartialFailure;
     }
-    ExitCode::PartialFailure
+    // Something was read, or the only defect was an unreachable target: the
+    // report exists, it is just short. `sync` reports the same case as partial.
+    if analysis.analyzed > 0 || (analysis.failed == 0 && analysis.unresolved.is_empty()) {
+        return ExitCode::PartialFailure;
+    }
+    // Nothing readable at all. Keep the specific cause when every failure
+    // agrees on one, so a wholly denied analysis exits 4 like `sync`.
+    let codes = analysis
+        .unresolved
+        .iter()
+        .map(|u| u.code)
+        .chain((analysis.failed > 0).then_some(ExitCode::Failure));
+    shared_failure_code(codes)
 }
 
 /// Whether every blob referenced by an image was recorded.
@@ -387,6 +415,12 @@ fn print_text(analysis: &Analysis) {
     let mount_savings_by_target = compute_mount_savings(blobs);
 
     let attempted = analysis.analyzed + analysis.failed;
+    if !analysis.unresolved.is_empty() {
+        println!(
+            "  WARNING: {} mapping(s) could not be resolved; excluded entirely",
+            analysis.unresolved.len()
+        );
+    }
     if analysis.failed > 0 || analysis.partial > 0 {
         println!(
             "Analyzed {} of {attempted} image mappings ({} incomplete, {} failed)",
@@ -434,15 +468,7 @@ fn print_json(analysis: &Analysis) -> Result<(), CliError> {
         "unresolved_mappings": analysis.unresolved,
         // A target the estimate could not reach changes the answer, so it is
         // part of the document rather than a log line only.
-        "dropped_targets": analysis
-            .dropped
-            .iter()
-            .map(|d| serde_json::json!({
-                "from": d.from,
-                "registry": d.registry,
-                "error": d.error,
-            }))
-            .collect::<Vec<_>>(),
+        "dropped_targets": analysis.dropped,
         "total_blobs": blobs.len(),
         "total_bytes": blobs.values().map(|b| b.size).sum::<u64>(),
         "shared_blobs": blobs.values().filter(|b| b.images.len() > 1).count(),
@@ -471,7 +497,8 @@ mod tests {
             analyzed,
             partial,
             failed,
-            unresolved: 0,
+            unresolved: Vec::new(),
+            interrupted: false,
             dropped: (0..dropped)
                 .map(|i| DroppedTarget {
                     from: "repo/one".into(),
@@ -512,12 +539,24 @@ mod tests {
         );
     }
 
+    /// A run cut short by SIGINT is a truncated report, not a clean one.
+    #[test]
+    fn an_interrupted_analysis_is_partial() {
+        let mut a = analysis(3, 0, 0, 0);
+        a.interrupted = true;
+        assert_eq!(analyze_exit_code(&a), ExitCode::PartialFailure);
+    }
+
     /// A mapping the analysis could not resolve is as much a hole in the
     /// estimate as an image it could not read.
     #[test]
     fn an_unresolved_mapping_alone_is_partial() {
         let mut a = analysis(3, 0, 0, 0);
-        a.unresolved = 1;
+        a.unresolved = vec![UnresolvedMapping {
+            from: "repo/one".into(),
+            error: "403 Forbidden".into(),
+            code: ExitCode::AuthError,
+        }];
         assert_eq!(analyze_exit_code(&a), ExitCode::PartialFailure);
     }
 

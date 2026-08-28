@@ -54,9 +54,12 @@ const PREPARE_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 /// A step of the pre-engine phase.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) enum PreparePhase {
+    /// Building a client per referenced registry.
     #[default]
     Registries,
+    /// Building an ECR blob-visibility checker per target registry.
     BatchCheckers,
+    /// Listing and filtering tags, one mapping at a time.
     Mappings,
 }
 
@@ -205,9 +208,8 @@ impl fmt::Display for RegistryRole {
 /// the disparity instead of the allocation traffic.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum MappingResolution {
-    /// Ready for the engine, plus any target dropped along the way.
-    Resolved(ResolvedMapping, Vec<DroppedTarget>),
-    NoMatchingTags(NoTagsInfo, Vec<DroppedTarget>),
+    Resolved(ResolvedMapping),
+    NoMatchingTags(NoTagsInfo),
 }
 
 /// A target a mapping could not use.
@@ -235,13 +237,29 @@ pub(crate) struct UnresolvedMapping {
     pub from: String,
     /// Why the mapping could not be resolved.
     pub error: String,
-    /// Whether the cause was an authentication or authorization failure.
+    /// What the failure would have exited with had it aborted the run.
     ///
-    /// Kept out of the JSON document -- it exists only so a run where every
-    /// mapping was denied still exits with the dedicated auth code that a
-    /// run-wide abort used to produce.
+    /// Kept out of the JSON document. A bool would collapse every non-auth
+    /// classification into the generic failure code, retiring exit 3 and with
+    /// it the `min_tags` tripwire, whose whole job is to stop a run.
     #[serde(skip)]
-    pub auth: bool,
+    pub code: ExitCode,
+}
+
+/// Fold a run's failure classifications into one exit code.
+///
+/// A specific code survives only when every failure agrees on it: mixed causes
+/// report the generic failure, because no single one names what to fix.
+pub(crate) fn shared_failure_code(codes: impl IntoIterator<Item = ExitCode>) -> ExitCode {
+    let mut codes = codes.into_iter();
+    let Some(first) = codes.next() else {
+        return ExitCode::Failure;
+    };
+    if matches!(first, ExitCode::AuthError | ExitCode::ConfigError) && codes.all(|c| c == first) {
+        first
+    } else {
+        ExitCode::Failure
+    }
 }
 
 /// Diagnostic context for a mapping whose filter rejected every source tag.
@@ -322,8 +340,10 @@ impl fmt::Display for NoTagsInfo {
 #[derive(Debug, Default)]
 pub(crate) struct WatchLogState {
     warned_no_tags: HashSet<String>,
-    /// `"{mapping}\0{registry}"` for every target currently reported down.
+    /// [`target_key`] for every target currently reported down.
     dropped_targets: HashSet<String>,
+    /// Mappings currently reported as unresolvable.
+    unresolved: HashSet<String>,
     last_outcomes: HashMap<String, MappingOutcome>,
     cycle_emit_count: u32,
 }
@@ -353,20 +373,46 @@ impl WatchLogState {
     /// Keyed on mapping plus registry so two mappings losing the same mirror
     /// each report once, and a second mirror going down still reports.
     fn observe_dropped_target(&mut self, from: &str, registry: &str) -> bool {
-        let changed = self
-            .dropped_targets
-            .insert(format!("{from}\u{0}{registry}"));
+        let changed = self.dropped_targets.insert(target_key(from, registry));
         if changed {
             self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
         }
         changed
     }
 
-    /// Forget every dropped target for `from`, so a mirror coming back
-    /// re-arms the WARN if it goes down again.
-    fn clear_dropped_targets(&mut self, from: &str) {
-        let prefix = format!("{from}\u{0}");
-        self.dropped_targets.retain(|k| !k.starts_with(&prefix));
+    /// Forget any target of `from` absent from `still_down`, so a mirror that
+    /// recovered warns again if it fails later.
+    ///
+    /// Reconciling rather than clearing wholesale is what makes a partial
+    /// recovery work: clearing only when nothing is down leaves a recovered
+    /// mirror suppressed for as long as any sibling stays down.
+    fn forget_recovered_targets(&mut self, from: &str, still_down: &HashSet<&str>) {
+        let prefix = target_key(from, "");
+        self.dropped_targets
+            .retain(|key| match key.strip_prefix(&prefix) {
+                // Another mapping's key.
+                None => true,
+                Some(registry) => still_down.contains(registry),
+            });
+    }
+
+    /// Record a mapping that could not be resolved. Returns `true` on
+    /// transition into the failure state (caller emits the ERROR).
+    fn observe_mapping_unresolved(&mut self, from: &str) -> bool {
+        // A mapping that stops resolving reports no outcome this cycle, so a
+        // stale entry here would suppress the recovery line when it returns
+        // with identical counts.
+        self.last_outcomes.remove(from);
+        let changed = self.unresolved.insert(from.to_string());
+        if changed {
+            self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
+        }
+        changed
+    }
+
+    /// Record a mapping that resolved, re-arming its unresolved ERROR.
+    fn observe_mapping_resolved(&mut self, from: &str) {
+        self.unresolved.remove(from);
     }
 
     /// Record a successful resolution. Returns `true` when the mapping was
@@ -414,7 +460,23 @@ impl WatchLogState {
             .retain(|k| active_set.contains(k.as_str()));
         self.last_outcomes
             .retain(|k, _| active_set.contains(k.as_str()));
+        self.unresolved.retain(|k| active_set.contains(k.as_str()));
+        // Composite keys need a prefix split, which is why this cannot join
+        // the retains above. A mapping removed and later re-added would
+        // otherwise keep a stale key and never warn about its dead mirror.
+        self.dropped_targets.retain(|key| {
+            key.split_once('\u{0}')
+                .is_some_and(|(from, _)| active_set.contains(from))
+        });
     }
+}
+
+/// Key a dropped target by mapping and registry.
+///
+/// NUL-separated because neither a repository path nor a registry alias can
+/// contain it, so the split back is unambiguous.
+fn target_key(from: &str, registry: &str) -> String {
+    format!("{from}\u{0}{registry}")
 }
 
 /// Resolve the cache directory and file path from config.
@@ -470,10 +532,10 @@ pub(crate) async fn run(
     // sequential network work with no output of their own. One ticker spans
     // the lot so the run is never silent for longer than the interval.
     let tracker = PrepareTracker::default();
-    let (mappings, unresolved, dropped_targets) = with_prepare_progress(&tracker, async {
+    let resolution = with_prepare_progress(&tracker, async {
         let clients = build_clients(&config, &tracker).await;
         let batch_checkers = build_batch_checkers(&config, &clients, &tracker).await;
-        let (mappings, unresolved, dropped_targets) = resolve_all(
+        resolve_all(
             &config,
             &clients,
             &batch_checkers,
@@ -481,10 +543,15 @@ pub(crate) async fn run(
             watch_log.as_deref_mut(),
             &tracker,
         )
-        .await;
-        (mappings, unresolved, dropped_targets)
+        .await
     })
     .await;
+    let Resolution {
+        resolved: mappings,
+        unresolved,
+        dropped_targets,
+        no_match,
+    } = resolution;
 
     if let Some(state) = watch_log.as_mut() {
         for resolved in &mappings {
@@ -500,9 +567,9 @@ pub(crate) async fn run(
     }
 
     if args.dry_run {
-        crate::cli::commands::dry_run::print(&mappings, verbose);
+        crate::cli::commands::dry_run::print(&mappings, &unresolved, &dropped_targets, verbose);
         return Ok(dry_run_exit_code(
-            mappings.len(),
+            mappings.len() + no_match,
             &unresolved,
             &dropped_targets,
         ));
@@ -570,14 +637,29 @@ pub(crate) async fn run(
     // grouped from the report's per-image outcomes.
     let descriptors: Vec<MappingDescriptor> = mappings
         .iter()
-        .map(|m| MappingDescriptor {
-            from: m.source_repo.as_str().to_string(),
-            target_repo: m.target_repo.as_str().to_string(),
-            target_names: m.targets.iter().map(|t| (*t.name).to_string()).collect(),
+        .map(|m| {
+            let from = m.source_repo.as_str().to_string();
+            MappingDescriptor {
+                target_repo: m.target_repo.as_str().to_string(),
+                target_names: m.targets.iter().map(|t| (*t.name).to_string()).collect(),
+                // Taken from the dropped list rather than `m.targets`, which
+                // is already filtered: without it the bracket disappears at
+                // exactly the moment a registry is missing from it.
+                dropped_names: dropped_targets
+                    .iter()
+                    .filter(|d| d.from == from)
+                    .map(|d| d.registry.clone())
+                    .collect(),
+                from,
+            }
         })
         .collect();
 
-    let engine = SyncEngine::new(RetryConfig::default(), max_concurrent);
+    // Anything dropped before the engine started is absent from the mappings
+    // it sees, and the prune cannot tell that from a deletion.
+    let complete = unresolved.is_empty() && dropped_targets.is_empty();
+    let engine =
+        SyncEngine::new(RetryConfig::default(), max_concurrent).with_cache_pruning(complete);
     let report = engine
         .run(mappings, cache.clone(), staging, progress, shutdown)
         .await;
@@ -610,7 +692,12 @@ pub(crate) async fn run(
 
     write_output(&report, &unresolved, &dropped_targets, args.json)?;
 
-    Ok(combined_exit_code(&report, &unresolved, &dropped_targets))
+    Ok(combined_exit_code(
+        &report,
+        &unresolved,
+        &dropped_targets,
+        no_match,
+    ))
 }
 
 /// Exit code for a dry run, which produces no [`SyncReport`] to fold into.
@@ -644,11 +731,7 @@ fn dry_run_exit_code(
 /// failure code, so an operator can tell "fix the credentials" from "fix
 /// something else" without reading the log.
 fn total_failure_code(unresolved: &[UnresolvedMapping]) -> ExitCode {
-    if !unresolved.is_empty() && unresolved.iter().all(|f| f.auth) {
-        ExitCode::AuthError
-    } else {
-        ExitCode::Failure
-    }
+    shared_failure_code(unresolved.iter().map(|u| u.code))
 }
 
 /// Fold mapping-level resolution failures into the run's exit code.
@@ -660,6 +743,7 @@ fn combined_exit_code(
     report: &SyncReport,
     unresolved: &[UnresolvedMapping],
     dropped: &[DroppedTarget],
+    no_match: usize,
 ) -> ExitCode {
     if unresolved.is_empty() {
         // A dropped target means images never reached a registry the config
@@ -669,7 +753,9 @@ fn combined_exit_code(
             other => other,
         };
     }
-    if report.has_success() {
+    // A mapping whose filter matched nothing is healthy with nothing to do, so
+    // it counts as the run working, even though it contributes no image.
+    if report.has_success() || no_match > 0 {
         return ExitCode::PartialFailure;
     }
     // Images that ran and failed for non-auth reasons make this a generic
@@ -687,6 +773,8 @@ struct MappingDescriptor {
     from: String,
     target_repo: String,
     target_names: Vec<String>,
+    /// Registries the config named that this mapping could not use.
+    dropped_names: Vec<String>,
 }
 
 /// Per-mapping aggregated outcome derived from [`SyncReport.images`].
@@ -805,8 +893,15 @@ fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: 
     // Multi-target mappings need the bracket to disambiguate which targets
     // the line refers to. Single-target mappings: omit -- the destination
     // is already in the `from -> to` arrow.
-    let targets_clause = if d.target_names.len() > 1 {
-        format!(" [{}]", d.target_names.join(", "))
+    // Shown whenever more than one registry was configured, which includes the
+    // case where only one survived: that is precisely when the operator needs
+    // to see which.
+    let targets_clause = if d.target_names.len() + d.dropped_names.len() > 1 {
+        let mut names = d.target_names.join(", ");
+        if !d.dropped_names.is_empty() {
+            names.push_str(&format!(", {} unreachable", d.dropped_names.join(", ")));
+        }
+        format!(" [{names}]")
     } else {
         String::new()
     };
@@ -852,7 +947,12 @@ fn format_cycle_tail(
         String::new()
     };
     let dropped_clause = if dropped_count > 0 {
-        format!(" | {dropped_count} targets dropped")
+        let plural = if dropped_count == 1 {
+            "target"
+        } else {
+            "targets"
+        };
+        format!(" | {dropped_count} {plural} dropped")
     } else {
         String::new()
     };
@@ -975,6 +1075,10 @@ fn referenced_registries(config: &Config) -> HashSet<String> {
             .source
             .as_deref()
             .or(defaults.and_then(|d| d.source.as_deref()))
+            // Only aliases that exist: an unknown one is reported per mapping
+            // during resolution, and counting it here inflates the progress
+            // total past the number of clients actually built.
+            .filter(|name| known.contains(name))
         {
             used.insert(source.to_owned());
         }
@@ -983,6 +1087,17 @@ fn referenced_registries(config: &Config) -> HashSet<String> {
         }
     }
     used
+}
+
+/// Registry aliases named as a target by at least one mapping.
+fn referenced_targets(config: &Config) -> HashSet<String> {
+    let known: HashSet<&str> = config.registries.keys().map(String::as_str).collect();
+    config
+        .mappings
+        .iter()
+        .filter_map(|m| mapping_target_names(m, config, &known).ok())
+        .flatten()
+        .collect()
 }
 
 /// Target registry aliases a mapping names, with groups expanded.
@@ -1040,10 +1155,14 @@ fn client_for(
 
 /// Build batch blob checkers for ECR registries.
 ///
-/// Creates a [`BatchChecker`] for every registry that a mapping references,
-/// whose client built successfully, and that is detected as ECR (via explicit
-/// `auth_type: ecr` or hostname auto-detection). No user configuration is
-/// needed - if we know it's ECR, we use the batch API.
+/// Creates a [`BatchChecker`] for every registry that a mapping names as a
+/// *target*, whose client built successfully, and that is detected as ECR (via
+/// explicit `auth_type: ecr` or hostname auto-detection). No user
+/// configuration is needed - if we know it's ECR, we use the batch API.
+///
+/// Targets only: the map is read in exactly one place, keyed by target alias,
+/// so a checker for a source-only registry is an AWS round trip per cycle that
+/// nothing can consume.
 async fn build_batch_checkers(
     config: &Config,
     clients: &ClientMap,
@@ -1055,10 +1174,13 @@ async fn build_batch_checkers(
     // avoids re-resolving every mapping's target groups a second time. Only
     // registries whose client actually built are worth a checker: the rest
     // have already failed and would just repeat the round trip.
+    let targets = referenced_targets(config);
     let usable: Vec<(&String, &RegistryConfig)> = config
         .registries
         .iter()
-        .filter(|(name, _)| matches!(clients.get(*name), Some(Ok(_))))
+        .filter(|(name, _)| {
+            targets.contains(name.as_str()) && matches!(clients.get(*name), Some(Ok(_)))
+        })
         .collect();
     tracker.begin(PreparePhase::BatchCheckers, usable.len());
     for (name, reg) in usable {
@@ -1098,6 +1220,21 @@ async fn build_batch_checkers(
     checkers
 }
 
+/// What resolving a whole config produced.
+pub(crate) struct Resolution {
+    /// Mappings ready for the engine.
+    pub resolved: Vec<ResolvedMapping>,
+    /// Mappings that produced no work at all.
+    pub unresolved: Vec<UnresolvedMapping>,
+    /// Targets dropped from otherwise usable mappings.
+    pub dropped_targets: Vec<DroppedTarget>,
+    /// Mappings whose filter legitimately matched nothing.
+    ///
+    /// Healthy, but they contribute no images, so without counting them a run
+    /// that was half fine and half denied looks wholly denied.
+    pub no_match: usize,
+}
+
 /// Resolve every configured mapping, isolating per-mapping failures.
 ///
 /// One unreachable registry, one 403 on a tag listing, or one bad repository
@@ -1111,30 +1248,34 @@ async fn resolve_all(
     with_report: bool,
     mut watch_log: Option<&mut WatchLogState>,
     tracker: &PrepareTracker,
-) -> (
-    Vec<ResolvedMapping>,
-    Vec<UnresolvedMapping>,
-    Vec<DroppedTarget>,
-) {
+) -> Resolution {
     tracker.begin(PreparePhase::Mappings, config.mappings.len());
     let mut resolved = Vec::new();
     let mut unresolved = Vec::new();
     let mut dropped_targets = Vec::new();
+    let mut no_match = 0usize;
 
     for mapping in &config.mappings {
-        match resolve_mapping(mapping, config, clients, batch_checkers, with_report).await {
-            Ok(MappingResolution::Resolved(m, dropped)) => {
-                if dropped.is_empty()
-                    && let Some(state) = watch_log.as_deref_mut()
-                {
-                    // Every target back: re-arm so a future outage warns again.
-                    state.clear_dropped_targets(&mapping.from);
+        // Dropped targets come back whatever the outcome, so a mapping that
+        // loses a mirror and then fails on its tag listing still reports the
+        // outage. Reconciled against the previous cycle before anything else,
+        // so a mirror that recovered re-arms even if the mapping then failed.
+        let (outcome, dropped) =
+            resolve_mapping(mapping, config, clients, batch_checkers, with_report).await;
+        reconcile_dropped_targets(&mapping.from, &dropped, watch_log.as_deref_mut());
+        dropped_targets.extend(dropped);
+
+        match outcome {
+            Ok(MappingResolution::Resolved(m)) => {
+                if let Some(state) = watch_log.as_deref_mut() {
+                    state.observe_mapping_resolved(&mapping.from);
                 }
-                report_dropped_targets(&dropped, watch_log.as_deref_mut());
                 resolved.push(m);
-                dropped_targets.extend(dropped);
             }
-            Ok(MappingResolution::NoMatchingTags(info, dropped)) => {
+            Ok(MappingResolution::NoMatchingTags(info)) => {
+                if let Some(state) = watch_log.as_deref_mut() {
+                    state.observe_mapping_resolved(&mapping.from);
+                }
                 let should_warn = match watch_log.as_deref_mut() {
                     Some(state) => state.observe_no_match(&info.from),
                     None => true,
@@ -1142,17 +1283,25 @@ async fn resolve_all(
                 if should_warn {
                     emit_no_tags_warn(&info);
                 }
-                // A mapping whose filter matched nothing can still have lost a
-                // real target. Without this, the same outage reports
-                // differently depending on whether any tag happened to match.
-                report_dropped_targets(&dropped, watch_log.as_deref_mut());
-                dropped_targets.extend(dropped);
+                // A filter that legitimately matches nothing is a healthy
+                // mapping with nothing to do, not a failure.
+                no_match += 1;
             }
             Err(err) => {
-                log_unresolved_mapping(&mapping.from, &err);
+                // Gated like every other watch surface: without it a
+                // permanently broken mapping logs an ERROR every cycle while
+                // `cycle_emit_count` stays at zero, so watch prints "no state
+                // changes" beside the error stream it just produced.
+                let should_log = match watch_log.as_deref_mut() {
+                    Some(state) => state.observe_mapping_unresolved(&mapping.from),
+                    None => true,
+                };
+                if should_log {
+                    log_unresolved_mapping(&mapping.from, &err);
+                }
                 unresolved.push(UnresolvedMapping {
                     from: mapping.from.clone(),
-                    auth: matches!(err.exit_code(), ExitCode::AuthError),
+                    code: err.exit_code(),
                     error: err.to_string(),
                 });
             }
@@ -1160,29 +1309,47 @@ async fn resolve_all(
         tracker.advance();
     }
 
-    (resolved, unresolved, dropped_targets)
+    Resolution {
+        resolved,
+        unresolved,
+        dropped_targets,
+        no_match,
+    }
 }
 
-/// WARN once per target that went down, not once per watch cycle.
+/// WARN once per target that goes down, not once per watch cycle.
 ///
-/// Without the transition gate a permanently dead mirror warns on every cycle
-/// while `cycle_emit_count` stays at zero, so watch prints "no state changes"
-/// beside the warning it just emitted.
-fn report_dropped_targets(dropped: &[DroppedTarget], mut watch_log: Option<&mut WatchLogState>) {
+/// Reconciles rather than accumulates: a mirror that came back is forgotten
+/// even while a sibling stays down, so when it fails again it warns again.
+/// Accumulating suppressed the second outage until every target of the mapping
+/// was simultaneously healthy, which a flapping fleet may never reach.
+fn reconcile_dropped_targets(
+    from: &str,
+    dropped: &[DroppedTarget],
+    watch_log: Option<&mut WatchLogState>,
+) {
+    let Some(state) = watch_log else {
+        for target in dropped {
+            warn_dropped_target(target);
+        }
+        return;
+    };
+    let now: HashSet<&str> = dropped.iter().map(|t| t.registry.as_str()).collect();
+    state.forget_recovered_targets(from, &now);
     for target in dropped {
-        let should_warn = match watch_log.as_deref_mut() {
-            Some(state) => state.observe_dropped_target(&target.from, &target.registry),
-            None => true,
-        };
-        if should_warn {
-            tracing::warn!(
-                from = %target.from,
-                registry = %target.registry,
-                error = %target.error,
-                "target registry unavailable; syncing the mapping's remaining targets"
-            );
+        if state.observe_dropped_target(from, &target.registry) {
+            warn_dropped_target(target);
         }
     }
+}
+
+fn warn_dropped_target(target: &DroppedTarget) {
+    tracing::warn!(
+        from = %target.from,
+        registry = %target.registry,
+        error = %target.error,
+        "target registry unavailable; syncing the mapping's remaining targets"
+    );
 }
 
 /// Report a mapping that could not be turned into work.
@@ -1212,10 +1379,10 @@ fn build_targets(
     clients: &ClientMap,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
     from: &str,
-) -> (Vec<TargetEntry>, Vec<DroppedTarget>, Option<CliError>) {
+    dropped: &mut Vec<DroppedTarget>,
+) -> (Vec<TargetEntry>, Option<CliError>) {
     let mut targets = Vec::with_capacity(target_names.len());
-    let mut dropped = Vec::new();
-    let mut last_err = None;
+    let mut worst_err: Option<CliError> = None;
     for name in target_names {
         match client_for(clients, &name, from, RegistryRole::Target) {
             Ok(client) => targets.push(TargetEntry {
@@ -1230,11 +1397,24 @@ fn build_targets(
                     registry: name,
                     error: err.to_string(),
                 });
-                last_err = Some(err);
+                // Keep a denial over anything else rather than the last one
+                // seen: target order comes straight from the config file, and
+                // the same outage should not exit 2 or 4 depending on how the
+                // list happens to be written.
+                let replace = match &worst_err {
+                    None => true,
+                    Some(existing) => {
+                        !matches!(existing.exit_code(), ExitCode::AuthError)
+                            && matches!(err.exit_code(), ExitCode::AuthError)
+                    }
+                };
+                if replace {
+                    worst_err = Some(err);
+                }
             }
         }
     }
-    (targets, dropped, last_err)
+    (targets, worst_err)
 }
 
 /// Resolve a single mapping config into a [`MappingResolution`].
@@ -1249,6 +1429,31 @@ pub(crate) async fn resolve_mapping(
     clients: &ClientMap,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
     with_report: bool,
+) -> (Result<MappingResolution, CliError>, Vec<DroppedTarget>) {
+    // Targets are resolved first and returned unconditionally: every `?` in
+    // the rest of resolution would otherwise discard them, and a mapping that
+    // loses a mirror and then hits a rate limit on its tag listing would
+    // report the outage nowhere.
+    let mut dropped = Vec::new();
+    let result = resolve_mapping_inner(
+        mapping,
+        config,
+        clients,
+        batch_checkers,
+        with_report,
+        &mut dropped,
+    )
+    .await;
+    (result, dropped)
+}
+
+async fn resolve_mapping_inner(
+    mapping: &MappingConfig,
+    config: &Config,
+    clients: &ClientMap,
+    batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
+    with_report: bool,
+    dropped: &mut Vec<DroppedTarget>,
 ) -> Result<MappingResolution, CliError> {
     // --- Source registry ---
     let source_name = mapping
@@ -1268,8 +1473,13 @@ pub(crate) async fn resolve_mapping(
     let known: HashSet<&str> = config.registries.keys().map(String::as_str).collect();
     let target_names = mapping_target_names(mapping, config, &known)?;
 
-    let (mut targets, dropped, last_target_err) =
-        build_targets(target_names, clients, batch_checkers, &mapping.from);
+    let (mut targets, last_target_err) = build_targets(
+        target_names,
+        clients,
+        batch_checkers,
+        &mapping.from,
+        dropped,
+    );
     // Every named target failed, so the mapping has nowhere to sync. Surface
     // the underlying cause rather than a generic "no targets". A config that
     // names no targets at all is left alone: that produced a zero-target
@@ -1347,7 +1557,7 @@ pub(crate) async fn resolve_mapping(
             filter_desc: describe_filter(mapping_tags, defaults_tags),
             samples: Vec::new(),
         });
-        return Ok(MappingResolution::NoMatchingTags(info, dropped));
+        return Ok(MappingResolution::NoMatchingTags(info));
     }
 
     // --- Target repo ---
@@ -1414,23 +1624,20 @@ pub(crate) async fn resolve_mapping(
         None => ResolvedArtifacts::default(),
     };
 
-    Ok(MappingResolution::Resolved(
-        ResolvedMapping {
-            source_authority,
-            source_client,
-            source_repo: RepositoryName::new(mapping.from.clone())?,
-            target_repo: RepositoryName::new(target_repo)?,
-            targets,
-            tags: filtered.into_iter().map(TagPair::same).collect(),
-            platforms,
-            head_first,
-            immutable_glob,
-            artifacts_config: Rc::new(artifacts),
-            candidate_count,
-            filter_report,
-        },
-        dropped,
-    ))
+    Ok(MappingResolution::Resolved(ResolvedMapping {
+        source_authority,
+        source_client,
+        source_repo: RepositoryName::new(mapping.from.clone())?,
+        target_repo: RepositoryName::new(target_repo)?,
+        targets,
+        tags: filtered.into_iter().map(TagPair::same).collect(),
+        platforms,
+        head_first,
+        immutable_glob,
+        artifacts_config: Rc::new(artifacts),
+        candidate_count,
+        filter_report,
+    }))
 }
 
 /// Emit a tracing WARN for a [`NoTagsInfo`] with both a human-readable
@@ -2547,6 +2754,7 @@ include: ["1.25.0-rc1"]
             from: "library/alpine".into(),
             target_repo: "mirror/alpine".into(),
             target_names: vec!["ttl".into()],
+            dropped_names: Vec::new(),
         };
         let synced_only = MappingOutcome {
             synced: 3,
@@ -2582,6 +2790,27 @@ include: ["1.25.0-rc1"]
     }
 
     /// Multi-target mappings keep the `[targets]` bracket so the operator
+    /// A mapping that lost a target still names its registries: the one line
+    /// whose job is saying where the images went must not go quiet at the
+    /// moment one of them is missing.
+    #[test]
+    fn format_mapping_outcome_names_an_unreachable_target() {
+        let d = MappingDescriptor {
+            from: "library/alpine".into(),
+            target_repo: "mirror/alpine".into(),
+            target_names: vec!["good".into()],
+            dropped_names: vec!["broken".into()],
+        };
+        let outcome = MappingOutcome {
+            synced: 4,
+            ..Default::default()
+        };
+
+        let line = format_mapping_outcome(&d, &outcome, false);
+
+        assert!(line.contains("[good, broken unreachable]"), "{line}");
+    }
+
     /// can see which destinations the outcome covers.
     #[test]
     fn format_mapping_outcome_multi_target_keeps_bracket() {
@@ -2589,6 +2818,7 @@ include: ["1.25.0-rc1"]
             from: "library/alpine".into(),
             target_repo: "mirror/alpine".into(),
             target_names: vec!["ecr-prod".into(), "ghcr-mirror".into()],
+            dropped_names: Vec::new(),
         };
         let synced = MappingOutcome {
             synced: 1,
@@ -2751,12 +2981,6 @@ mappings:
         })
     }
 
-    type Resolution = (
-        Vec<ResolvedMapping>,
-        Vec<UnresolvedMapping>,
-        Vec<DroppedTarget>,
-    );
-
     async fn resolve(config: &Config, clients: &ClientMap) -> Resolution {
         resolve_all(
             config,
@@ -2774,7 +2998,11 @@ mappings:
     #[tokio::test]
     async fn resolve_all_isolates_a_failing_mapping() {
         let config = three_mapping_config();
-        let (resolved, unresolved, _dropped) = resolve(&config, &working_clients()).await;
+        let Resolution {
+            resolved,
+            unresolved,
+            ..
+        } = resolve(&config, &working_clients()).await;
 
         assert_eq!(unresolved.len(), 1, "only the bad mapping should fail");
         assert_eq!(unresolved[0].from, "repo/two");
@@ -2821,7 +3049,12 @@ mappings:
             ("dst".to_string(), Ok(test_client("https://target.test"))),
         ]);
 
-        let (resolved, unresolved, _dropped) = resolve(&config, &clients).await;
+        let Resolution {
+            resolved,
+            unresolved,
+            dropped_targets: _dropped,
+            ..
+        } = resolve(&config, &clients).await;
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].source_repo.as_str(), "repo/one");
@@ -2835,7 +3068,7 @@ mappings:
         // The classification has to survive too, or a wholly denied run
         // silently drops from the auth exit code to the generic one.
         assert!(
-            unresolved[0].auth,
+            matches!(unresolved[0].code, ExitCode::AuthError),
             "a denied registry must stay classified as a denial"
         );
     }
@@ -2862,7 +3095,11 @@ mappings:
         )
         .expect("config yaml parses");
 
-        let (resolved, unresolved, _dropped) = resolve(&config, &working_clients()).await;
+        let Resolution {
+            resolved,
+            unresolved,
+            ..
+        } = resolve(&config, &working_clients()).await;
 
         assert_eq!(resolved.len(), 1);
         assert!(unresolved.is_empty());
@@ -2903,7 +3140,12 @@ mappings:
             ),
         ]);
 
-        let (resolved, unresolved, dropped) = resolve(&config, &clients).await;
+        let Resolution {
+            resolved,
+            unresolved,
+            dropped_targets: dropped,
+            ..
+        } = resolve(&config, &clients).await;
 
         assert!(
             unresolved.is_empty(),
@@ -2933,12 +3175,12 @@ mappings:
         }];
 
         assert_eq!(
-            combined_exit_code(&report, &[], &dropped),
+            combined_exit_code(&report, &[], &dropped, 0),
             ExitCode::PartialFailure,
             "an unreached target must not report as a clean run"
         );
         assert_eq!(
-            combined_exit_code(&report, &[], &[]),
+            combined_exit_code(&report, &[], &[], 0),
             ExitCode::Success,
             "and must not fire when nothing was dropped"
         );
@@ -2948,7 +3190,7 @@ mappings:
         );
 
         let line = format_cycle_tail(1, 0, dropped.len(), &report);
-        assert!(line.contains("1 targets dropped"), "{line}");
+        assert!(line.contains("1 target dropped"), "{line}");
 
         let value = serde_json::to_value(SyncOutput {
             report: &report,
@@ -2989,7 +3231,12 @@ mappings:
             ),
         ]);
 
-        let (resolved, unresolved, _dropped) = resolve(&config, &clients).await;
+        let Resolution {
+            resolved,
+            unresolved,
+            dropped_targets: _dropped,
+            ..
+        } = resolve(&config, &clients).await;
 
         assert!(resolved.is_empty());
         assert_eq!(unresolved.len(), 1);
@@ -2998,7 +3245,7 @@ mappings:
             "the cause must survive, not a generic 'no targets': {}",
             unresolved[0].error
         );
-        assert!(unresolved[0].auth);
+        assert!(matches!(unresolved[0].code, ExitCode::AuthError));
     }
 
     /// The guard, not just the helper: `build_clients` must not construct a
@@ -3180,7 +3427,10 @@ mappings:
 
         assert!(checkers.is_empty(), "neither registry is ECR");
         let p = tracker.state.get();
-        assert_eq!(p.total, 2);
+        assert_eq!(
+            p.total, 1,
+            "only the target registry is a checker candidate; the map is read by target alias"
+        );
         assert_eq!(p.done, p.total, "every registry considered must be counted");
     }
 
@@ -3204,10 +3454,81 @@ mappings:
             "the same mirror under another mapping is its own transition"
         );
 
-        // Recovery re-arms only the mapping that recovered.
-        state.clear_dropped_targets("repo/one");
-        assert!(state.observe_dropped_target("repo/one", "mirror-a"));
-        assert!(!state.observe_dropped_target("repo/two", "mirror-a"));
+        // Partial recovery: mirror-a is back, mirror-b is still down. The
+        // all-or-nothing clear this replaced left mirror-a suppressed for as
+        // long as any sibling stayed down.
+        let still_down: HashSet<&str> = ["mirror-b"].into_iter().collect();
+        state.forget_recovered_targets("repo/one", &still_down);
+        assert!(
+            state.observe_dropped_target("repo/one", "mirror-a"),
+            "a recovered mirror must warn again when it fails again"
+        );
+        assert!(
+            !state.observe_dropped_target("repo/one", "mirror-b"),
+            "the mirror that never recovered must stay quiet"
+        );
+        assert!(
+            !state.observe_dropped_target("repo/two", "mirror-a"),
+            "another mapping's state is untouched"
+        );
+    }
+
+    /// A mapping dropped from config must not leave state behind, or
+    /// re-adding it later silently suppresses its next outage.
+    #[test]
+    fn retain_active_prunes_dropped_targets_and_unresolved() {
+        let mut state = WatchLogState::default();
+        state.observe_dropped_target("repo/gone", "mirror-a");
+        state.observe_dropped_target("repo/stays", "mirror-a");
+        state.observe_mapping_unresolved("repo/gone");
+        state.observe_mapping_unresolved("repo/stays");
+
+        state.retain_active(["repo/stays"]);
+
+        assert!(
+            state.observe_dropped_target("repo/gone", "mirror-a"),
+            "the removed mapping's target key must be gone"
+        );
+        assert!(
+            !state.observe_dropped_target("repo/stays", "mirror-a"),
+            "the surviving mapping keeps its state"
+        );
+        assert!(state.observe_mapping_unresolved("repo/gone"));
+        assert!(!state.observe_mapping_unresolved("repo/stays"));
+    }
+
+    /// A mapping that stops resolving must not keep its last outcome, or the
+    /// recovery cycle reports nothing when the counts come back identical.
+    #[test]
+    fn becoming_unresolved_clears_the_last_outcome() {
+        let mut state = WatchLogState::default();
+        let outcome = MappingOutcome {
+            synced: 0,
+            skipped: 5,
+            failed: 0,
+            bytes: 0,
+        };
+        assert!(
+            state
+                .observe_mapping_outcome("repo/one", &outcome)
+                .is_some()
+        );
+        // Same counts again: suppressed, as designed.
+        assert!(
+            state
+                .observe_mapping_outcome("repo/one", &outcome)
+                .is_none()
+        );
+
+        state.observe_mapping_unresolved("repo/one");
+        state.observe_mapping_resolved("repo/one");
+
+        assert!(
+            state
+                .observe_mapping_outcome("repo/one", &outcome)
+                .is_some(),
+            "recovery must report even when the counts are unchanged"
+        );
     }
 
     /// A mapping naming no targets at all keeps its old zero-target shape
@@ -3233,7 +3554,12 @@ mappings:
 
         let clients =
             ClientMap::from([("src".to_string(), Ok(test_client("https://source.test")))]);
-        let (resolved, unresolved, dropped) = resolve(&config, &clients).await;
+        let Resolution {
+            resolved,
+            unresolved,
+            dropped_targets: dropped,
+            ..
+        } = resolve(&config, &clients).await;
 
         assert_eq!(resolved.len(), 1, "no targets is not a resolution failure");
         assert!(resolved[0].targets.is_empty());
@@ -3261,7 +3587,11 @@ mappings:
         UnresolvedMapping {
             from: from.into(),
             error: "boom".into(),
-            auth,
+            code: if auth {
+                ExitCode::AuthError
+            } else {
+                ExitCode::Failure
+            },
         }
     }
 
@@ -3270,9 +3600,9 @@ mappings:
     #[test]
     fn combined_exit_code_downgrades_a_clean_report_with_unresolved_mappings() {
         let report = report_from(vec![ocync_sync::ImageStatus::Synced]);
-        assert_eq!(combined_exit_code(&report, &[], &[]), ExitCode::Success);
+        assert_eq!(combined_exit_code(&report, &[], &[], 0), ExitCode::Success);
         assert_eq!(
-            combined_exit_code(&report, &[unresolved_mapping("repo/two", false)], &[]),
+            combined_exit_code(&report, &[unresolved_mapping("repo/two", false)], &[], 0),
             ExitCode::PartialFailure
         );
     }
@@ -3286,7 +3616,7 @@ mappings:
             unresolved_mapping("repo/two", true),
         ];
         assert_eq!(
-            combined_exit_code(&empty, &failures, &[]),
+            combined_exit_code(&empty, &failures, &[], 0),
             ExitCode::Failure
         );
     }
@@ -3299,7 +3629,7 @@ mappings:
             reason: ocync_sync::SkipReason::DigestMatch,
         }]);
         assert_eq!(
-            combined_exit_code(&report, &[unresolved_mapping("repo/two", false)], &[]),
+            combined_exit_code(&report, &[unresolved_mapping("repo/two", false)], &[], 0),
             ExitCode::PartialFailure
         );
     }
@@ -3314,7 +3644,7 @@ mappings:
             unresolved_mapping("repo/two", true),
         ];
         assert_eq!(
-            combined_exit_code(&empty, &denied, &[]),
+            combined_exit_code(&empty, &denied, &[], 0),
             ExitCode::AuthError
         );
     }
@@ -3327,7 +3657,10 @@ mappings:
             unresolved_mapping("repo/one", true),
             unresolved_mapping("repo/two", false),
         ];
-        assert_eq!(combined_exit_code(&empty, &mixed, &[]), ExitCode::Failure);
+        assert_eq!(
+            combined_exit_code(&empty, &mixed, &[], 0),
+            ExitCode::Failure
+        );
     }
 
     #[test]
@@ -3383,7 +3716,7 @@ mappings:
         let failures = vec![UnresolvedMapping {
             from: "repo/two".into(),
             error: "403 Forbidden".into(),
-            auth: true,
+            code: ExitCode::AuthError,
         }];
         let value = serde_json::to_value(SyncOutput {
             report: &report,
@@ -3394,7 +3727,7 @@ mappings:
 
         assert_eq!(value["unresolved_mappings"][0]["from"], "repo/two");
         assert_eq!(value["unresolved_mappings"][0]["error"], "403 Forbidden");
-        // The auth flag drives the exit code only; it is not part of the document.
+        // The classification drives the exit code only; not part of the document.
         assert!(
             value["unresolved_mappings"][0].get("auth").is_none(),
             "{value}"
@@ -3466,7 +3799,7 @@ mappings:
         };
 
         let mut buf: Vec<u8> = Vec::new();
-        crate::cli::commands::dry_run::write_to(&mut buf, &[mapping], false).unwrap();
+        crate::cli::commands::dry_run::write_to(&mut buf, &[mapping], &[], &[], false).unwrap();
         let out = String::from_utf8(buf).unwrap();
 
         // The end-to-end output surfaces the BelowMinTags warning.

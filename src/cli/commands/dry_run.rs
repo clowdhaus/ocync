@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 
 use ocync_sync::engine::{ResolvedMapping, TagPair};
+
+use crate::cli::commands::synchronize::{DroppedTarget, UnresolvedMapping};
 use ocync_sync::filter::{DropKind, FilterReport};
 
 /// Default sample cap per drop reason and per include-rescue list. Removed
@@ -17,20 +19,45 @@ const SAMPLE_CAP: usize = 5;
 ///
 /// `verbose` is the global `cli.verbose >= 1` toggle; when true, all
 /// rejected tags per drop reason are printed (no sample cap).
-pub(crate) fn print(mappings: &[ResolvedMapping], verbose: bool) {
+pub(crate) fn print(
+    mappings: &[ResolvedMapping],
+    unresolved: &[UnresolvedMapping],
+    dropped: &[DroppedTarget],
+    verbose: bool,
+) {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     // Stdout write errors during dry-run are almost always SIGPIPE (e.g.
     // `ocync sync --dry-run | head`). Swallow them: the user explicitly
     // asked us to stop writing.
-    let _ = write_to(&mut handle, mappings, verbose);
+    let _ = write_to(&mut handle, mappings, unresolved, dropped, verbose);
 }
 
 pub(crate) fn write_to<W: Write>(
     w: &mut W,
     mappings: &[ResolvedMapping],
+    unresolved: &[UnresolvedMapping],
+    dropped: &[DroppedTarget],
     verbose: bool,
 ) -> io::Result<()> {
+    // Written before the plan: the plan describes what a sync would do, and
+    // these are the parts of the config it could not describe at all. Without
+    // them a wholly denied dry run prints "no mappings to sync", which reads
+    // as a filter problem while the exit code reports a credential failure.
+    for u in unresolved {
+        writeln!(w, "dry-run: {} -- UNRESOLVED: {}", u.from, u.error)?;
+    }
+    for d in dropped {
+        writeln!(
+            w,
+            "dry-run: {} -- target {} unreachable: {}",
+            d.from, d.registry, d.error
+        )?;
+    }
+    if !unresolved.is_empty() || !dropped.is_empty() {
+        writeln!(w)?;
+    }
+
     if mappings.is_empty() {
         writeln!(w, "dry-run: no mappings to sync")?;
         return Ok(());
@@ -311,8 +338,31 @@ mod tests {
 
     #[test]
     fn empty_mappings_emits_no_mappings_message() {
-        let out = capture(|w| write_to(w, &[], false));
+        let out = capture(|w| write_to(w, &[], &[], &[], false));
         assert_eq!(out, "dry-run: no mappings to sync\n");
+    }
+
+    /// A wholly denied dry run must say so. Printing only "no mappings to
+    /// sync" reads as a filter problem while the exit code reports a
+    /// credential failure.
+    #[test]
+    fn unresolved_mappings_are_named_before_the_plan() {
+        let unresolved = [UnresolvedMapping {
+            from: "library/nginx".into(),
+            error: "registry error: 403 Forbidden".into(),
+            code: crate::cli::ExitCode::AuthError,
+        }];
+        let dropped = [DroppedTarget {
+            from: "library/alpine".into(),
+            registry: "backup".into(),
+            error: "unavailable".into(),
+        }];
+
+        let out = capture(|w| write_to(w, &[], &unresolved, &dropped, false));
+
+        assert!(out.contains("library/nginx"), "{out}");
+        assert!(out.contains("403 Forbidden"), "{out}");
+        assert!(out.contains("target backup unreachable"), "{out}");
     }
 
     #[test]

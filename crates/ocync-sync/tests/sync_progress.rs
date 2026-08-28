@@ -5,11 +5,13 @@ mod helpers;
 use std::cell::RefCell;
 use std::time::Duration;
 
+use ocync_distribution::spec::MediaType;
 use ocync_sync::engine::{SyncEngine, TagPair};
 use ocync_sync::progress::{ProgressReporter, RunProgress};
 use ocync_sync::staging::BlobStage;
 use ocync_sync::{ImageResult, ShutdownSignal, SyncReport};
-use wiremock::MockServer;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use helpers::*;
 
@@ -29,7 +31,14 @@ impl ProgressReporter for RecordingProgress {
 }
 
 /// Run a two-image sync with the given heartbeat cadence.
-async fn run_with_heartbeat(interval: Duration) -> (SyncReport, Vec<RunProgress>) {
+///
+/// `source_delay` is applied to the source manifest GET. Under `start_paused`
+/// wiremock's delay is a `tokio::time::sleep`, so it advances with virtual
+/// time and gives the run a known duration to measure the cadence against.
+async fn run_with_heartbeat(
+    interval: Duration,
+    source_delay: Duration,
+) -> (SyncReport, Vec<RunProgress>) {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
@@ -37,6 +46,18 @@ async fn run_with_heartbeat(interval: Duration) -> (SyncReport, Vec<RunProgress>
         let parts = ManifestBuilder::new(format!("config-{tag}").as_bytes())
             .layer(format!("layer-{tag}").as_bytes())
             .build();
+        // Registered before `mount_source` so this delayed responder is the
+        // one that answers the manifest GET.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/library/app/manifests/{tag}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(parts.bytes.clone())
+                    .insert_header("content-type", MediaType::OciManifest.as_str())
+                    .set_delay(source_delay),
+            )
+            .mount(&source_server)
+            .await;
         parts.mount_source(&source_server, "library/app", tag).await;
         parts.mount_target(&target_server, "mirror/app", tag).await;
     }
@@ -70,17 +91,20 @@ async fn run_with_heartbeat(interval: Duration) -> (SyncReport, Vec<RunProgress>
 /// Without this the engine is silent between the first image starting and the
 /// last one finishing, which is indistinguishable from a wedged run.
 ///
-/// `start_paused` makes this deterministic rather than a race against a short
-/// wall-clock interval: registry I/O is not a timer, so tokio auto-advances to
-/// the heartbeat deadline whenever the run is blocked on the network.
-#[tokio::test(start_paused = true)]
+/// The source responds after a known delay, so the cadence is measurable
+/// rather than assumed. Asserting only "at least one" would pass for any
+/// interval at all; the lower bound below is what ties the count to the
+/// period, and it fails if the interval is widened past the delay.
+#[tokio::test]
 async fn heartbeat_fires_while_work_is_in_flight() {
-    let (report, snapshots) = run_with_heartbeat(Duration::from_secs(1)).await;
+    let (report, snapshots) =
+        run_with_heartbeat(Duration::from_millis(100), Duration::from_millis(800)).await;
 
     assert_eq!(report.stats.images_synced, 2);
     assert!(
-        !snapshots.is_empty(),
-        "a run longer than the heartbeat interval must report progress"
+        snapshots.len() >= 4,
+        "800ms of blocked discovery at a 100ms cadence must report repeatedly, got {}",
+        snapshots.len()
     );
 
     // The branch is guarded on work remaining, so every snapshot must show at
@@ -106,7 +130,7 @@ async fn heartbeat_fires_while_work_is_in_flight() {
 /// for the wrong reason.
 #[tokio::test]
 async fn heartbeat_stays_silent_for_a_short_run() {
-    let (report, snapshots) = run_with_heartbeat(Duration::from_secs(600)).await;
+    let (report, snapshots) = run_with_heartbeat(Duration::from_secs(600), Duration::ZERO).await;
 
     assert_eq!(report.stats.images_synced, 2);
     assert!(

@@ -46,6 +46,11 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
                     }
                     Err(err) => {
                         let _ = writeln!(out, "  FAIL  {name} ({safe_url}) -- {err}");
+                        // `ping` accepts 401 as reachable but returns Err on
+                        // 403, which is a denial and keeps the auth code.
+                        if err.is_auth_error() {
+                            auth_error = true;
+                        }
                         all_ok = false;
                     }
                 },
@@ -103,7 +108,10 @@ mod tests {
         std::fs::File::create(&good)
             .and_then(|mut f| {
                 f.write_all(
-                    b"registries:\n  r:\n    url: unreachable.invalid\n    auth_type: static_token\n    token: t\nmappings: []\n",
+                    // A URL that fails to parse, so the check reports the
+                    // registry without issuing a request: the test must not
+                    // depend on name resolution or a network timeout.
+                    b"registries:\n  r:\n    url: \"exa mple\"\n    auth_type: static_token\n    token: t\nmappings: []\n",
                 )
             })
             .expect("write good config");
