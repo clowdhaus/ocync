@@ -493,4 +493,42 @@ images:
         assert_eq!(partial.images[1].tags, vec!["latest", "3.12"]);
         assert_eq!(partial.images[2].tags, vec!["2023", "2"]);
     }
+
+    /// The prepare corpus is only worth running if it defeats the exact-tag
+    /// fast path.
+    ///
+    /// `TagsConfig::exact_tags` returns the tags verbatim when every pattern
+    /// is a literal, and `resolve_mapping_inner` then skips `list_tags`
+    /// entirely. A prepare corpus pinned to literal tags would run clean, take
+    /// a plausible-looking time, and measure none of the phase it is named
+    /// for. The main corpus is exactly that shape, which is why this one
+    /// exists.
+    #[test]
+    fn prepare_corpus_tags_are_all_wildcards() {
+        // Env var only has to expand; the prepare scenario never writes here.
+        unsafe { std::env::set_var("BENCH_TARGET_REGISTRY", "example.invalid") };
+        let corpus = load("../bench/corpus-prepare.yaml")
+            .or_else(|_| load("bench/corpus-prepare.yaml"))
+            .expect("the prepare corpus parses");
+
+        assert!(
+            corpus.images.len() >= 20,
+            "the phase costs one round trip per mapping, so a narrow corpus \
+             cannot show it; got {} mappings",
+            corpus.images.len()
+        );
+
+        let literal: Vec<&str> = corpus
+            .images
+            .iter()
+            .flat_map(|img| img.tags.iter())
+            .filter(|tag| !tag.contains(['*', '?', '[']))
+            .map(String::as_str)
+            .collect();
+        assert!(
+            literal.is_empty(),
+            "every prepare-corpus tag must be a wildcard or the tag listing is \
+             never issued; these are literals: {literal:?}"
+        );
+    }
 }

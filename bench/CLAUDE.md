@@ -54,6 +54,18 @@ cargo xtask bench-remote --provider aws --fetch
 - `bench/results/<timestamp>/summary.md` - human-readable comparison table with winners bolded
 - `bench/results/{registry}.json` - compact per-registry run record archive (tracked in git)
 
+## The prepare scenario
+
+`cargo xtask bench prepare` (or `bench-remote --scenario prepare`) measures the pre-engine phase on its own: build a client per registry, list every mapping's tags, filter them, and stop. It runs `ocync sync --dry-run`, so nothing is transferred.
+
+It is ocync-only, for the same reason the scale scenario is: no competitor has a mode that resolves tags and then stops, so there is nothing to compare against.
+
+**It uses its own corpus, `bench/corpus-prepare.yaml`, and that is load-bearing.** Every tag in the main corpus is a literal, so `TagsConfig::exact_tags` returns them verbatim and `resolve_mapping_inner` skips `list_tags` entirely. A prepare run against the main corpus would exit clean, report a plausible time, and measure none of the phase it is named for. The prepare corpus uses wildcard tags to force enumeration, and `prepare_corpus_tags_are_all_wildcards` fails if anyone pins them back to literals.
+
+The main corpus is 39 entries chosen for blob sharing. The prepare phase costs one round trip per mapping, so the shape that exposes it is many mappings, not a few large ones. That is the second reason for a separate file.
+
+None of the sync scenario's fairness machinery applies here. Nothing is transferred, so there are no blobs to fall out of page cache, no ECR repos to reset, and no CDN edge to pre-warm. Skipping all of it is what keeps this scenario cheap enough to run often.
+
 ## Metrics captured per tool per scenario
 
 | Metric | Source | Winner = |
