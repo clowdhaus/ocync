@@ -19,8 +19,8 @@ use ocync_distribution::{Digest, RepositoryName};
 use ocync_sync::ShutdownSignal;
 
 use crate::cli::commands::synchronize::{
-    MappingResolution, PrepareTracker, build_clients, log_unresolved_mapping, resolve_mapping,
-    with_prepare_progress,
+    MappingResolution, PreparePhase, PrepareTracker, build_clients, log_unresolved_mapping,
+    resolve_mapping, with_prepare_progress,
 };
 use crate::cli::config::load_config;
 use crate::cli::output::format_bytes;
@@ -56,16 +56,23 @@ pub(crate) async fn run(
     shutdown: &ShutdownSignal,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
-    // Client construction mints a token per registry with nothing else in the
-    // log; the ticker keeps that window visible.
-    let tracker = PrepareTracker::default();
-    let clients = with_prepare_progress(&tracker, build_clients(&config, &tracker)).await;
     // Analyze doesn't push anything, so no batch checkers needed.
     let no_checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
     let mut blobs: HashMap<Digest, BlobAggregate> = HashMap::new();
     let mut image_count = 0usize;
     let mut failed_images = 0usize;
+
+    // Client construction mints a token per registry and each mapping lists a
+    // repository's tags, all before the first `analyzing` line. The ticker
+    // spans both, as it does in `sync`.
+    let tracker = PrepareTracker::default();
+    let clients = with_prepare_progress(&tracker, async {
+        let clients = build_clients(&config, &tracker).await;
+        tracker.begin(PreparePhase::Mappings, config.mappings.len());
+        clients
+    })
+    .await;
 
     for mapping in &config.mappings {
         if shutdown.is_triggered() {
@@ -77,7 +84,20 @@ pub(crate) async fn run(
         // behind it, same as `sync`.
         let resolved = match resolve_mapping(mapping, &config, &clients, &no_checkers, false).await
         {
-            Ok(MappingResolution::Resolved(r)) => r,
+            Ok(MappingResolution::Resolved(r, dropped)) => {
+                // Analyze reports what a sync would move; a target it cannot
+                // reach changes that answer, so say so rather than quietly
+                // costing it out of the totals.
+                for target in &dropped {
+                    tracing::warn!(
+                        from = %target.from,
+                        registry = %target.registry,
+                        error = %target.error,
+                        "target registry unavailable; excluded from the mount-savings estimate"
+                    );
+                }
+                r
+            }
             Ok(MappingResolution::NoMatchingTags(_)) => continue,
             Err(err) => {
                 log_unresolved_mapping(&mapping.from, &err);
@@ -98,7 +118,7 @@ pub(crate) async fn run(
             // tags and mappings are independent of it. The count above already
             // includes this image, so the totals stay honest about what was
             // attempted.
-            if let Err(err) = collect_blobs(
+            match collect_blobs(
                 &resolved.source_client,
                 &resolved.source_repo,
                 &tag_pair.source,
@@ -109,26 +129,59 @@ pub(crate) async fn run(
             )
             .await
             {
-                tracing::error!(image = %image_ref, error = %err, "image could not be analyzed; skipping");
-                failed_images += 1;
+                Ok(Completeness::Full) => {}
+                // A skipped index child leaves this image's blob set short,
+                // which is the same kind of hole as a skipped image and has
+                // to reach the same counter, exit code, and report.
+                Ok(Completeness::Partial) => failed_images += 1,
+                Err(err) => {
+                    tracing::error!(
+                        image = %image_ref,
+                        error = %err,
+                        "image could not be analyzed; skipping"
+                    );
+                    failed_images += 1;
+                }
             }
         }
+        tracker.advance();
     }
 
     if failed_images > 0 {
         tracing::warn!(
             failed_images,
-            "some images could not be analyzed; blob totals below exclude them"
+            "some images could not be analyzed; they are excluded from the reported blob totals"
         );
     }
 
     if args.json {
-        print_json(&blobs, image_count)?;
+        print_json(&blobs, image_count, failed_images)?;
     } else {
-        print_text(&blobs, image_count);
+        print_text(&blobs, image_count, failed_images);
     }
 
-    Ok(ExitCode::Success)
+    Ok(analyze_exit_code(image_count, failed_images))
+}
+
+/// Exit code for an analysis that could not read every image.
+///
+/// An incomplete report must not look like a clean one: the totals are
+/// missing whatever those images contributed.
+fn analyze_exit_code(image_count: usize, failed_images: usize) -> ExitCode {
+    match (image_count.saturating_sub(failed_images), failed_images) {
+        (_, 0) => ExitCode::Success,
+        (0, _) => ExitCode::Failure,
+        _ => ExitCode::PartialFailure,
+    }
+}
+
+/// Whether every blob referenced by an image was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Completeness {
+    /// Every referenced manifest was pulled.
+    Full,
+    /// At least one index child could not be pulled, so blobs are missing.
+    Partial,
 }
 
 /// Pull a manifest (recursively for indexes) and record every blob's
@@ -141,7 +194,7 @@ async fn collect_blobs(
     targets: &[ocync_sync::engine::TargetEntry],
     target_repo: &RepositoryName,
     blobs: &mut HashMap<Digest, BlobAggregate>,
-) -> Result<(), CliError> {
+) -> Result<Completeness, CliError> {
     let pulled = source_client
         .manifest_pull(source_repo, tag)
         .await
@@ -158,6 +211,8 @@ async fn collect_blobs(
             blobs,
         );
     }
+
+    let mut completeness = Completeness::Full;
 
     // Recurse into index children to collect per-platform manifest blobs.
     if let ManifestKind::Index(index) = &pulled.manifest {
@@ -176,6 +231,7 @@ async fn collect_blobs(
                         error = %e,
                         "index child could not be pulled; skipping this platform"
                     );
+                    completeness = Completeness::Partial;
                     continue;
                 }
             };
@@ -192,7 +248,7 @@ async fn collect_blobs(
         }
     }
 
-    Ok(())
+    Ok(completeness)
 }
 
 /// Descriptor data extracted from a manifest.
@@ -271,7 +327,7 @@ fn compute_mount_savings(blobs: &HashMap<Digest, BlobAggregate>) -> BTreeMap<Str
     savings
 }
 
-fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) {
+fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize, failed_images: usize) {
     let total_blobs = blobs.len();
     let total_bytes: u64 = blobs.values().map(|b| b.size).sum();
 
@@ -280,7 +336,12 @@ fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) {
 
     let mount_savings_by_target = compute_mount_savings(blobs);
 
-    println!("Analyzed {image_count} image mappings");
+    let analyzed = image_count.saturating_sub(failed_images);
+    if failed_images > 0 {
+        println!("Analyzed {analyzed} of {image_count} image mappings ({failed_images} failed)");
+    } else {
+        println!("Analyzed {analyzed} image mappings");
+    }
     println!();
     println!(
         "Unique blobs: {total_blobs} ({})",
@@ -303,11 +364,16 @@ fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) {
     }
 }
 
-fn print_json(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize) -> Result<(), CliError> {
+fn print_json(
+    blobs: &HashMap<Digest, BlobAggregate>,
+    image_count: usize,
+    failed_images: usize,
+) -> Result<(), CliError> {
     let mount_savings_by_target = compute_mount_savings(blobs);
 
     let report = serde_json::json!({
-        "images_analyzed": image_count,
+        "images_analyzed": image_count.saturating_sub(failed_images),
+        "images_failed": failed_images,
         "total_blobs": blobs.len(),
         "total_bytes": blobs.values().map(|b| b.size).sum::<u64>(),
         "shared_blobs": blobs.values().filter(|b| b.images.len() > 1).count(),

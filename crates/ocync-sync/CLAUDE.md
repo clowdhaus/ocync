@@ -18,7 +18,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 - `select!` uses `biased;` (prefer execution completions to free permits).
 - Emptiness guards (`if !pool.is_empty()`) on every branch prevent busy-looping.
 - Shutdown branch must check work-remaining or it blocks the else exit.
-- Same rule for the `run_progress` heartbeat branch: its guard is the disjunction of the execution and discovery branches' own preconditions (`!execution_futures.is_empty() || (!shutting_down && !discovery_paused && !discovery_futures.is_empty())`). Guarding it on "futures remain" alone leaves it armed after shutdown freezes discovery, starving `else => break` and hanging the engine for a full interval. `sync_progress.rs` pins this.
+- Same rule for the `run_heartbeat` branch: its guard is the disjunction of the execution and discovery branches' own preconditions (`!execution_futures.is_empty() || (!shutting_down && !discovery_paused && !discovery_futures.is_empty())`). Guarding it on "futures remain" alone leaves it armed after shutdown freezes discovery, starving `else => break` and hanging the engine for a full interval. `sync_progress.rs` pins this.
 
 ## Leader-follower blob mounting
 

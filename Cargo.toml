@@ -97,6 +97,8 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `test-util` supplies the paused clock the prepare-ticker tests drive.
+tokio = { workspace = true, features = ["test-util"] }
 uuid.workspace = true
 
 [profile.release]

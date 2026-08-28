@@ -487,6 +487,19 @@ mod tests {
     }
 
     #[test]
+    fn cli_error_exit_code_auth() {
+        // Credential-provider setup failures carry their own exit code so a
+        // run denied everywhere is distinguishable from a generic failure.
+        let err = CliError::Auth("ECR auth setup for 'x': 403 Forbidden".into());
+        assert_eq!(err.exit_code(), ExitCode::AuthError);
+        // The negative half: a plain input error must not claim it.
+        assert_eq!(
+            CliError::Input("bad url".into()).exit_code(),
+            ExitCode::Failure
+        );
+    }
+
+    #[test]
     fn cli_error_exit_code_filter() {
         let err = CliError::Filter(ocync_sync::Error::LatestWithoutSort);
         assert_eq!(err.exit_code(), ExitCode::ConfigError);
