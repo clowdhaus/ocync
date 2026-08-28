@@ -207,7 +207,7 @@ impl fmt::Display for RegistryRole {
 pub(crate) enum MappingResolution {
     /// Ready for the engine, plus any target dropped along the way.
     Resolved(ResolvedMapping, Vec<DroppedTarget>),
-    NoMatchingTags(NoTagsInfo),
+    NoMatchingTags(NoTagsInfo, Vec<DroppedTarget>),
 }
 
 /// A target a mapping could not use.
@@ -322,6 +322,8 @@ impl fmt::Display for NoTagsInfo {
 #[derive(Debug, Default)]
 pub(crate) struct WatchLogState {
     warned_no_tags: HashSet<String>,
+    /// `"{mapping}\0{registry}"` for every target currently reported down.
+    dropped_targets: HashSet<String>,
     last_outcomes: HashMap<String, MappingOutcome>,
     cycle_emit_count: u32,
 }
@@ -343,6 +345,28 @@ impl WatchLogState {
             self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
         }
         changed
+    }
+
+    /// Record a dropped target. Returns `true` on transition into the dropped
+    /// state (caller emits a WARN); `false` while the same target stays down.
+    ///
+    /// Keyed on mapping plus registry so two mappings losing the same mirror
+    /// each report once, and a second mirror going down still reports.
+    fn observe_dropped_target(&mut self, from: &str, registry: &str) -> bool {
+        let changed = self
+            .dropped_targets
+            .insert(format!("{from}\u{0}{registry}"));
+        if changed {
+            self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
+        }
+        changed
+    }
+
+    /// Forget every dropped target for `from`, so a mirror coming back
+    /// re-arms the WARN if it goes down again.
+    fn clear_dropped_targets(&mut self, from: &str) {
+        let prefix = format!("{from}\u{0}");
+        self.dropped_targets.retain(|k| !k.starts_with(&prefix));
     }
 
     /// Record a successful resolution. Returns `true` when the mapping was
@@ -611,6 +635,10 @@ fn dry_run_exit_code(
 }
 
 /// Exit code for a run where nothing succeeded.
+///
+/// Only unresolved mappings are consulted. A dropped target never reaches here
+/// (the caller returns `PartialFailure` first, since something did resolve),
+/// so it cannot make an all-denied run report as anything else.
 ///
 /// A run denied everywhere exits with the auth code rather than the generic
 /// failure code, so an operator can tell "fix the credentials" from "fix
@@ -1096,10 +1124,17 @@ async fn resolve_all(
     for mapping in &config.mappings {
         match resolve_mapping(mapping, config, clients, batch_checkers, with_report).await {
             Ok(MappingResolution::Resolved(m, dropped)) => {
+                if dropped.is_empty()
+                    && let Some(state) = watch_log.as_deref_mut()
+                {
+                    // Every target back: re-arm so a future outage warns again.
+                    state.clear_dropped_targets(&mapping.from);
+                }
+                report_dropped_targets(&dropped, watch_log.as_deref_mut());
                 resolved.push(m);
                 dropped_targets.extend(dropped);
             }
-            Ok(MappingResolution::NoMatchingTags(info)) => {
+            Ok(MappingResolution::NoMatchingTags(info, dropped)) => {
                 let should_warn = match watch_log.as_deref_mut() {
                     Some(state) => state.observe_no_match(&info.from),
                     None => true,
@@ -1107,6 +1142,11 @@ async fn resolve_all(
                 if should_warn {
                     emit_no_tags_warn(&info);
                 }
+                // A mapping whose filter matched nothing can still have lost a
+                // real target. Without this, the same outage reports
+                // differently depending on whether any tag happened to match.
+                report_dropped_targets(&dropped, watch_log.as_deref_mut());
+                dropped_targets.extend(dropped);
             }
             Err(err) => {
                 log_unresolved_mapping(&mapping.from, &err);
@@ -1123,6 +1163,28 @@ async fn resolve_all(
     (resolved, unresolved, dropped_targets)
 }
 
+/// WARN once per target that went down, not once per watch cycle.
+///
+/// Without the transition gate a permanently dead mirror warns on every cycle
+/// while `cycle_emit_count` stays at zero, so watch prints "no state changes"
+/// beside the warning it just emitted.
+fn report_dropped_targets(dropped: &[DroppedTarget], mut watch_log: Option<&mut WatchLogState>) {
+    for target in dropped {
+        let should_warn = match watch_log.as_deref_mut() {
+            Some(state) => state.observe_dropped_target(&target.from, &target.registry),
+            None => true,
+        };
+        if should_warn {
+            tracing::warn!(
+                from = %target.from,
+                registry = %target.registry,
+                error = %target.error,
+                "target registry unavailable; syncing the mapping's remaining targets"
+            );
+        }
+    }
+}
+
 /// Report a mapping that could not be turned into work.
 ///
 /// Shared with `analyze`, which drops the same mapping for the same reasons
@@ -1133,6 +1195,46 @@ pub(crate) fn log_unresolved_mapping(from: &str, err: &CliError) {
         error = %err,
         "mapping could not be resolved; continuing with the remaining mappings"
     );
+}
+
+/// Build a mapping's target entries, keeping the ones whose registry works.
+///
+/// One unusable target must not take its siblings with it: a mapping that fans
+/// out to three registries still syncs to the two that work. Mirrors the
+/// per-target degradation the immutable-tag listing already does.
+///
+/// Returns the usable entries, the dropped ones, and the last error, which the
+/// caller needs when nothing is left. Reporting is the caller's job: only it
+/// knows whether any target survived, and `sync` and `analyze` word it
+/// differently.
+fn build_targets(
+    target_names: Vec<String>,
+    clients: &ClientMap,
+    batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
+    from: &str,
+) -> (Vec<TargetEntry>, Vec<DroppedTarget>, Option<CliError>) {
+    let mut targets = Vec::with_capacity(target_names.len());
+    let mut dropped = Vec::new();
+    let mut last_err = None;
+    for name in target_names {
+        match client_for(clients, &name, from, RegistryRole::Target) {
+            Ok(client) => targets.push(TargetEntry {
+                batch_checker: batch_checkers.get(&name).cloned(),
+                name: RegistryAlias::new(name),
+                client,
+                existing_tags: HashSet::new(),
+            }),
+            Err(err) => {
+                dropped.push(DroppedTarget {
+                    from: from.to_owned(),
+                    registry: name,
+                    error: err.to_string(),
+                });
+                last_err = Some(err);
+            }
+        }
+    }
+    (targets, dropped, last_err)
 }
 
 /// Resolve a single mapping config into a [`MappingResolution`].
@@ -1166,40 +1268,8 @@ pub(crate) async fn resolve_mapping(
     let known: HashSet<&str> = config.registries.keys().map(String::as_str).collect();
     let target_names = mapping_target_names(mapping, config, &known)?;
 
-    // One unusable target must not take its siblings with it: a mapping that
-    // fans out to three registries still syncs to the two that work. Mirrors
-    // the per-target degradation the immutable-tag listing below already does.
-    // Only when every target is gone does the mapping have nothing to do.
-    let mut targets: Vec<TargetEntry> = Vec::with_capacity(target_names.len());
-    let mut last_target_err = None;
-    let mut dropped = Vec::new();
-    for name in target_names {
-        match client_for(clients, &name, &mapping.from, RegistryRole::Target) {
-            Ok(client) => {
-                let batch_checker = batch_checkers.get(&name).cloned();
-                targets.push(TargetEntry {
-                    name: RegistryAlias::new(name),
-                    client,
-                    batch_checker,
-                    existing_tags: HashSet::new(),
-                });
-            }
-            Err(err) => {
-                tracing::warn!(
-                    from = %mapping.from,
-                    registry = %name,
-                    error = %err,
-                    "target registry unavailable; syncing the mapping's remaining targets"
-                );
-                dropped.push(DroppedTarget {
-                    from: mapping.from.clone(),
-                    registry: name,
-                    error: err.to_string(),
-                });
-                last_target_err = Some(err);
-            }
-        }
-    }
+    let (mut targets, dropped, last_target_err) =
+        build_targets(target_names, clients, batch_checkers, &mapping.from);
     // Every named target failed, so the mapping has nowhere to sync. Surface
     // the underlying cause rather than a generic "no targets". A config that
     // names no targets at all is left alone: that produced a zero-target
@@ -1208,6 +1278,15 @@ pub(crate) async fn resolve_mapping(
         && let Some(err) = last_target_err
     {
         return Err(err);
+    }
+    if targets.is_empty() {
+        // Reachable via `targets: []`. The engine treats it as a degenerate
+        // mapping, but it still costs a source manifest pull per tag, so say
+        // so rather than letting it look like work.
+        tracing::warn!(
+            from = %mapping.from,
+            "mapping names no target registries; nothing will be pushed"
+        );
     }
 
     // --- Fetch and filter tags ---
@@ -1268,7 +1347,7 @@ pub(crate) async fn resolve_mapping(
             filter_desc: describe_filter(mapping_tags, defaults_tags),
             samples: Vec::new(),
         });
-        return Ok(MappingResolution::NoMatchingTags(info));
+        return Ok(MappingResolution::NoMatchingTags(info, dropped));
     }
 
     // --- Target repo ---
@@ -3065,6 +3144,103 @@ mappings:
             *seen.borrow(),
             vec![0, 1],
             "the second line must show the item finished in between"
+        );
+    }
+
+    /// The progress line has to reach its total. The counter previously
+    /// advanced only for ECR registries, so any config without one reported
+    /// `done=0 total=N` forever.
+    #[tokio::test]
+    async fn batch_checker_progress_reaches_its_total_without_ecr() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+registries:
+  src:
+    url: source.test
+    auth_type: static_token
+    token: t
+  dst:
+    url: target.test
+    auth_type: static_token
+    token: t
+defaults:
+  source: src
+  targets: [dst]
+mappings:
+  - from: repo/one
+    tags:
+      glob: ["v1"]
+"#,
+        )
+        .expect("config yaml parses");
+
+        let tracker = PrepareTracker::default();
+        let clients = build_clients(&config, &tracker).await;
+        let checkers = build_batch_checkers(&config, &clients, &tracker).await;
+
+        assert!(checkers.is_empty(), "neither registry is ECR");
+        let p = tracker.state.get();
+        assert_eq!(p.total, 2);
+        assert_eq!(p.done, p.total, "every registry considered must be counted");
+    }
+
+    /// A watch cycle re-reporting the same dead mirror is noise; a different
+    /// mirror going down is not.
+    #[test]
+    fn dropped_target_warnings_fire_once_per_transition() {
+        let mut state = WatchLogState::default();
+
+        assert!(state.observe_dropped_target("repo/one", "mirror-a"));
+        assert!(
+            !state.observe_dropped_target("repo/one", "mirror-a"),
+            "the same target must not warn twice"
+        );
+        assert!(
+            state.observe_dropped_target("repo/one", "mirror-b"),
+            "a second mirror going down is a new transition"
+        );
+        assert!(
+            state.observe_dropped_target("repo/two", "mirror-a"),
+            "the same mirror under another mapping is its own transition"
+        );
+
+        // Recovery re-arms only the mapping that recovered.
+        state.clear_dropped_targets("repo/one");
+        assert!(state.observe_dropped_target("repo/one", "mirror-a"));
+        assert!(!state.observe_dropped_target("repo/two", "mirror-a"));
+    }
+
+    /// A mapping naming no targets at all keeps its old zero-target shape
+    /// rather than becoming an error, which is the case the engine documents
+    /// as degenerate but handles.
+    #[tokio::test]
+    async fn a_mapping_with_no_named_targets_still_resolves() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+registries:
+  src:
+    url: source.test
+defaults:
+  source: src
+  targets: []
+mappings:
+  - from: repo/one
+    tags:
+      glob: ["v1"]
+"#,
+        )
+        .expect("config yaml parses");
+
+        let clients =
+            ClientMap::from([("src".to_string(), Ok(test_client("https://source.test")))]);
+        let (resolved, unresolved, dropped) = resolve(&config, &clients).await;
+
+        assert_eq!(resolved.len(), 1, "no targets is not a resolution failure");
+        assert!(resolved[0].targets.is_empty());
+        assert!(unresolved.is_empty());
+        assert!(
+            dropped.is_empty(),
+            "nothing was dropped; the config named nothing"
         );
     }
 

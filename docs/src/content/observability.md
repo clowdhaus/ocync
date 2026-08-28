@@ -16,6 +16,8 @@ Reports include per-image results and aggregate statistics: blobs transferred, b
 
 A mapping that could not be resolved at all -- unreachable registry, denied tag listing, bad repository name -- never reaches the engine and so produces no per-image entry. Those mappings are listed separately under `unresolved_mappings`, which is omitted entirely when every mapping resolved. The rest of the run still proceeds; one failing mapping does not cancel the others.
 
+A mapping that resolved but lost one of several targets is not unresolved: it synced to the targets that worked. The ones it could not use appear under `dropped_targets`, also omitted when empty, and each is summarised in the cycle tail as `| N targets dropped`. A dropped target moves the exit code off success, because images did not reach a registry the config named.
+
 Abbreviated example:
 
 ```json
@@ -51,9 +53,20 @@ Abbreviated example:
       "from": "cgr.dev/chainguard/private",
       "error": "mapping 'cgr.dev/chainguard/private': registry error: 403 Forbidden"
     }
+  ],
+  "dropped_targets": [
+    {
+      "from": "cgr.dev/chainguard/nginx",
+      "registry": "backup-ecr",
+      "error": "mapping 'cgr.dev/chainguard/nginx': target registry 'backup-ecr' is unavailable: ECR auth setup for '...': 403 Forbidden"
+    }
   ]
 }
 ```
+
+### analyze
+
+`ocync analyze --json` reports `images_analyzed`, `images_partial` (recorded, but missing at least one platform of a multi-arch image), `images_failed` (could not be read at all), and `dropped_targets` (excluded from the mount-savings estimate). An analysis that could not read everything exits non-zero, because the totals are short by whatever it missed.
 
 ## Progress indicators
 

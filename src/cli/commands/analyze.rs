@@ -19,10 +19,10 @@ use ocync_distribution::{Digest, RepositoryName};
 use ocync_sync::ShutdownSignal;
 
 use crate::cli::commands::synchronize::{
-    MappingResolution, PreparePhase, PrepareTracker, build_clients, log_unresolved_mapping,
-    resolve_mapping, with_prepare_progress,
+    ClientMap, DroppedTarget, MappingResolution, PreparePhase, PrepareTracker, build_clients,
+    log_unresolved_mapping, resolve_mapping, with_prepare_progress,
 };
-use crate::cli::config::load_config;
+use crate::cli::config::{Config, load_config};
 use crate::cli::output::format_bytes;
 use crate::cli::{CliError, ExitCode};
 
@@ -50,6 +50,26 @@ struct BlobAggregate {
     target_repos: BTreeMap<String, BTreeSet<RepositoryName>>,
 }
 
+/// What an analysis produced, including what it could not read.
+///
+/// The three image counts are disjoint views of the same attempts: `analyzed`
+/// is every image that contributed blobs, `partial` is the subset of those
+/// missing at least one platform, and `failed` contributed nothing at all.
+#[derive(Debug, Default)]
+struct Analysis {
+    blobs: HashMap<Digest, BlobAggregate>,
+    /// Images that contributed blobs, complete or not.
+    analyzed: usize,
+    /// Images recorded with at least one platform missing.
+    partial: usize,
+    /// Images that could not be read at all.
+    failed: usize,
+    /// Mappings that never produced any images to read.
+    unresolved: usize,
+    /// Targets excluded from the mount-savings estimate.
+    dropped: Vec<DroppedTarget>,
+}
+
 /// Run the analyze command.
 pub(crate) async fn run(
     args: &AnalyzeArgs,
@@ -59,20 +79,45 @@ pub(crate) async fn run(
     // Analyze doesn't push anything, so no batch checkers needed.
     let no_checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
-    let mut blobs: HashMap<Digest, BlobAggregate> = HashMap::new();
-    let mut image_count = 0usize;
-    let mut failed_images = 0usize;
-
-    // Client construction mints a token per registry and each mapping lists a
-    // repository's tags, all before the first `analyzing` line. The ticker
-    // spans both, as it does in `sync`.
+    // Client construction mints a token per registry and every mapping lists a
+    // repository's tags, all before the first `analyzing` line. The ticker has
+    // to span the whole loop, not just the client build, or the tag-listing
+    // stretch it exists for stays silent.
     let tracker = PrepareTracker::default();
-    let clients = with_prepare_progress(&tracker, async {
+    let analysis = with_prepare_progress(&tracker, async {
         let clients = build_clients(&config, &tracker).await;
         tracker.begin(PreparePhase::Mappings, config.mappings.len());
-        clients
+        collect_analysis(&config, &clients, &no_checkers, shutdown, &tracker).await
     })
     .await;
+
+    if analysis.failed > 0 || analysis.partial > 0 || analysis.unresolved > 0 {
+        tracing::warn!(
+            failed_images = analysis.failed,
+            partial_images = analysis.partial,
+            unresolved_mappings = analysis.unresolved,
+            "the analysis is incomplete; the reported totals are short by whatever it could not read"
+        );
+    }
+
+    if args.json {
+        print_json(&analysis)?;
+    } else {
+        print_text(&analysis);
+    }
+
+    Ok(analyze_exit_code(&analysis))
+}
+
+/// Walk every mapping and tag, recording blobs and what could not be read.
+async fn collect_analysis(
+    config: &Config,
+    clients: &ClientMap,
+    no_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
+    shutdown: &ShutdownSignal,
+    tracker: &PrepareTracker,
+) -> Analysis {
+    let mut analysis = Analysis::default();
 
     for mapping in &config.mappings {
         if shutdown.is_triggered() {
@@ -80,14 +125,18 @@ pub(crate) async fn run(
             break;
         }
 
+        // Advanced up front so every exit from the match below still counts
+        // the mapping: a `continue` that skips it strands the progress line
+        // short of its total.
+        tracker.advance();
+
         // One unresolvable mapping must not cost the analysis every mapping
         // behind it, same as `sync`.
-        let resolved = match resolve_mapping(mapping, &config, &clients, &no_checkers, false).await
-        {
+        let resolved = match resolve_mapping(mapping, config, clients, no_checkers, false).await {
             Ok(MappingResolution::Resolved(r, dropped)) => {
-                // Analyze reports what a sync would move; a target it cannot
-                // reach changes that answer, so say so rather than quietly
-                // costing it out of the totals.
+                // Analyze reports what a sync would move, so a target it
+                // cannot reach changes the answer and has to be reported
+                // rather than quietly costed out of the estimate.
                 for target in &dropped {
                     tracing::warn!(
                         from = %target.from,
@@ -96,11 +145,18 @@ pub(crate) async fn run(
                         "target registry unavailable; excluded from the mount-savings estimate"
                     );
                 }
+                analysis.dropped.extend(dropped);
                 r
             }
-            Ok(MappingResolution::NoMatchingTags(_)) => continue,
+            Ok(MappingResolution::NoMatchingTags(_, dropped)) => {
+                analysis.dropped.extend(dropped);
+                continue;
+            }
             Err(err) => {
                 log_unresolved_mapping(&mapping.from, &err);
+                // A mapping the analysis could not resolve is a hole in the
+                // estimate exactly like an image it could not read.
+                analysis.unresolved += 1;
                 continue;
             }
         };
@@ -111,13 +167,10 @@ pub(crate) async fn run(
                 break;
             }
 
-            image_count += 1;
             let image_ref = format!("{}:{}", resolved.source_repo, tag_pair.source);
             tracing::info!(image = %image_ref, "analyzing");
             // One unreadable image must not end the analysis: the remaining
-            // tags and mappings are independent of it. The count above already
-            // includes this image, so the totals stay honest about what was
-            // attempted.
+            // tags and mappings are independent of it.
             match collect_blobs(
                 &resolved.source_client,
                 &resolved.source_repo,
@@ -125,58 +178,54 @@ pub(crate) async fn run(
                 &image_ref,
                 &resolved.targets,
                 &resolved.target_repo,
-                &mut blobs,
+                &mut analysis.blobs,
             )
             .await
             {
-                Ok(Completeness::Full) => {}
-                // A skipped index child leaves this image's blob set short,
-                // which is the same kind of hole as a skipped image and has
-                // to reach the same counter, exit code, and report.
-                Ok(Completeness::Partial) => failed_images += 1,
+                Ok(Completeness::Full) => analysis.analyzed += 1,
+                // A skipped index child still leaves this image's other
+                // platforms recorded, so it counts as analyzed. Conflating it
+                // with a total failure reported a mostly-complete run as zero
+                // images and exited 2.
+                Ok(Completeness::Partial) => {
+                    analysis.analyzed += 1;
+                    analysis.partial += 1;
+                }
                 Err(err) => {
                     tracing::error!(
                         image = %image_ref,
                         error = %err,
                         "image could not be analyzed; skipping"
                     );
-                    failed_images += 1;
+                    analysis.failed += 1;
                 }
             }
         }
-        tracker.advance();
     }
 
-    if failed_images > 0 {
-        tracing::warn!(
-            failed_images,
-            "some images could not be analyzed; they are excluded from the reported blob totals"
-        );
-    }
-
-    if args.json {
-        print_json(&blobs, image_count, failed_images)?;
-    } else {
-        print_text(&blobs, image_count, failed_images);
-    }
-
-    Ok(analyze_exit_code(image_count, failed_images))
+    analysis
 }
 
-/// Exit code for an analysis that could not read every image.
+/// Exit code for an analysis that could not read everything it was asked to.
 ///
-/// An incomplete report must not look like a clean one: the totals are
-/// missing whatever those images contributed.
-fn analyze_exit_code(image_count: usize, failed_images: usize) -> ExitCode {
-    match (image_count.saturating_sub(failed_images), failed_images) {
-        (_, 0) => ExitCode::Success,
-        (0, _) => ExitCode::Failure,
-        _ => ExitCode::PartialFailure,
+/// An incomplete estimate must not look like a clean one: the totals are short
+/// by whatever the unread images and unreachable targets hold.
+fn analyze_exit_code(analysis: &Analysis) -> ExitCode {
+    if analysis.failed == 0
+        && analysis.partial == 0
+        && analysis.unresolved == 0
+        && analysis.dropped.is_empty()
+    {
+        return ExitCode::Success;
     }
+    if analysis.analyzed == 0 {
+        return ExitCode::Failure;
+    }
+    ExitCode::PartialFailure
 }
 
 /// Whether every blob referenced by an image was recorded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum Completeness {
     /// Every referenced manifest was pulled.
     Full,
@@ -327,7 +376,8 @@ fn compute_mount_savings(blobs: &HashMap<Digest, BlobAggregate>) -> BTreeMap<Str
     savings
 }
 
-fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize, failed_images: usize) {
+fn print_text(analysis: &Analysis) {
+    let blobs = &analysis.blobs;
     let total_blobs = blobs.len();
     let total_bytes: u64 = blobs.values().map(|b| b.size).sum();
 
@@ -336,11 +386,20 @@ fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize, failed
 
     let mount_savings_by_target = compute_mount_savings(blobs);
 
-    let analyzed = image_count.saturating_sub(failed_images);
-    if failed_images > 0 {
-        println!("Analyzed {analyzed} of {image_count} image mappings ({failed_images} failed)");
+    let attempted = analysis.analyzed + analysis.failed;
+    if analysis.failed > 0 || analysis.partial > 0 {
+        println!(
+            "Analyzed {} of {attempted} image mappings ({} incomplete, {} failed)",
+            analysis.analyzed, analysis.partial, analysis.failed,
+        );
     } else {
-        println!("Analyzed {analyzed} image mappings");
+        println!("Analyzed {} image mappings", analysis.analyzed);
+    }
+    for target in &analysis.dropped {
+        println!(
+            "  WARNING: target {} unreachable; excluded from the estimate",
+            target.registry
+        );
     }
     println!();
     println!(
@@ -364,16 +423,26 @@ fn print_text(blobs: &HashMap<Digest, BlobAggregate>, image_count: usize, failed
     }
 }
 
-fn print_json(
-    blobs: &HashMap<Digest, BlobAggregate>,
-    image_count: usize,
-    failed_images: usize,
-) -> Result<(), CliError> {
+fn print_json(analysis: &Analysis) -> Result<(), CliError> {
+    let blobs = &analysis.blobs;
     let mount_savings_by_target = compute_mount_savings(blobs);
 
     let report = serde_json::json!({
-        "images_analyzed": image_count.saturating_sub(failed_images),
-        "images_failed": failed_images,
+        "images_analyzed": analysis.analyzed,
+        "images_partial": analysis.partial,
+        "images_failed": analysis.failed,
+        "unresolved_mappings": analysis.unresolved,
+        // A target the estimate could not reach changes the answer, so it is
+        // part of the document rather than a log line only.
+        "dropped_targets": analysis
+            .dropped
+            .iter()
+            .map(|d| serde_json::json!({
+                "from": d.from,
+                "registry": d.registry,
+                "error": d.error,
+            }))
+            .collect::<Vec<_>>(),
         "total_blobs": blobs.len(),
         "total_bytes": blobs.values().map(|b| b.size).sum::<u64>(),
         "shared_blobs": blobs.values().filter(|b| b.images.len() > 1).count(),
@@ -390,4 +459,75 @@ fn print_json(
             .map_err(|e| CliError::Input(format!("serialize report: {e}")))?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analysis(analyzed: usize, partial: usize, failed: usize, dropped: usize) -> Analysis {
+        Analysis {
+            blobs: HashMap::new(),
+            analyzed,
+            partial,
+            failed,
+            unresolved: 0,
+            dropped: (0..dropped)
+                .map(|i| DroppedTarget {
+                    from: "repo/one".into(),
+                    registry: format!("mirror-{i}"),
+                    error: "403 Forbidden".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_complete_analysis_is_a_clean_exit() {
+        assert_eq!(analyze_exit_code(&analysis(3, 0, 0, 0)), ExitCode::Success);
+        assert_eq!(analyze_exit_code(&analysis(0, 0, 0, 0)), ExitCode::Success);
+    }
+
+    /// An image missing one platform still contributed the others, so the
+    /// report is partial, not empty. Counting it as a total failure reported a
+    /// mostly-complete run as zero images analyzed and exited 2.
+    #[test]
+    fn a_partial_image_is_partial_not_failed() {
+        assert_eq!(
+            analyze_exit_code(&analysis(1, 1, 0, 0)),
+            ExitCode::PartialFailure
+        );
+    }
+
+    #[test]
+    fn nothing_readable_is_a_failure() {
+        assert_eq!(analyze_exit_code(&analysis(0, 0, 3, 0)), ExitCode::Failure);
+    }
+
+    #[test]
+    fn some_readable_is_partial() {
+        assert_eq!(
+            analyze_exit_code(&analysis(2, 0, 1, 0)),
+            ExitCode::PartialFailure
+        );
+    }
+
+    /// A mapping the analysis could not resolve is as much a hole in the
+    /// estimate as an image it could not read.
+    #[test]
+    fn an_unresolved_mapping_alone_is_partial() {
+        let mut a = analysis(3, 0, 0, 0);
+        a.unresolved = 1;
+        assert_eq!(analyze_exit_code(&a), ExitCode::PartialFailure);
+    }
+
+    /// An unreachable target changes the mount-savings answer even when every
+    /// image read cleanly, so it cannot report as a clean run.
+    #[test]
+    fn an_unreachable_target_alone_is_partial() {
+        assert_eq!(
+            analyze_exit_code(&analysis(3, 0, 0, 1)),
+            ExitCode::PartialFailure
+        );
+    }
 }
