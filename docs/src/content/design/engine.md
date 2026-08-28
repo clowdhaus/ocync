@@ -22,6 +22,8 @@ Measured on 95 mappings against a single source at 60 ms per tag listing:
 
 The last two rows are identical because a single registry's AIMD window tops out near 13 over 95 requests. That is where the bound of 16 comes from: high enough that AIMD is the constraint for a single-source config, low enough that a wide multi-registry config cannot open an unbounded number of connections at once.
 
+The 60 ms is a synthetic latency chosen to keep the benchmark short. It measures how the speedup scales and where AIMD becomes the ceiling, not any particular config's absolute time. A real config's floor is its single slowest mapping, because overlapping removes the queueing behind that mapping but not its own duration: a run of 675 seconds of serial work holding one 160-second mapping lands near 160 to 200 seconds, not 675 divided by the speedup above. The `slowest` field in the progress line exists to name that mapping.
+
 Results are collected in config order regardless of which registry answered first, so per-mapping warnings, the watch-mode state, and the run's counters stay deterministic. A config error still stops the run at the first offending mapping in config order, though mappings behind it may already have run and logged.
 
 Tag listings deliberately send no `n`. Asking for a page size looks like an optimization and is the opposite of one: a request without `n` is answered at least as generously as one with it, so `n` can only add round trips.
