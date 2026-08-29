@@ -181,15 +181,26 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
     form: &[(&str, &str)],
 ) -> Result<T, Error> {
     let url = format!("{base_url}{endpoint}");
-    let response = http
-        .post(&url)
-        .form(form)
-        .send()
-        .await
-        .map_err(|e| Error::AuthFailed {
-            registry: service.to_owned(),
-            reason: format!("ACR {endpoint} request failed: {e}"),
-        })?;
+
+    // Retried like the other prepare-phase auth paths. A dropped connection
+    // or a throttle here fails every mapping on this registry, not one, and
+    // nothing above the prepare phase would re-send it.
+    //
+    // The throttled response is returned rather than raised, so the non-success
+    // branch below still reads the body: ACR names the exhausted quota there.
+    let response =
+        crate::retry::send_retrying(http.post(&url).form(form), &format!("ACR {endpoint}"))
+            .await
+            .map_err(|e| Error::AuthFailed {
+                registry: service.to_owned(),
+                // Unwrapped so the reason reads as it always has: `Error::Http`
+                // Displays as "HTTP request failed: ..." and would double the
+                // prefix this line already writes.
+                reason: match &e {
+                    Error::Http(inner) => format!("ACR {endpoint} request failed: {inner}"),
+                    other => format!("ACR {endpoint} request failed: {other}"),
+                },
+            })?;
 
     let status = response.status();
     if !status.is_success() {

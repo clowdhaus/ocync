@@ -50,10 +50,21 @@ When `auth_type` IS set in config, it overrides detection. Valid values: `ecr`, 
 - GHCR: 1 window. GitHub enforces a single 2000 RPM aggregate cap per authenticated principal across reads and writes; separate read/write windows would silently exceed the cap.
 - ACR: 2 windows (separate ReadOps and WriteOps quotas).
 - Unknown (Chainguard, Quay, generic): 5-window coarse grouping (heads, reads, uploads, manifest-write, tag-list).
-- AIMD congestion epochs: 100ms epoch prevents cascade collapse from burst 429s.
+- AIMD congestion epochs: 100ms epoch prevents cascade collapse from burst 429s. Halving is only half the 429 response; see "Retry" below for the other half.
+- ECR Public's shared read window includes `TagList`, and its bucket value (8 TPS) is derived from AWS's 10 TPS authenticated *pull* quota. AWS publishes no TPS quota for tag listing, and a 2026-08-28 probe drew repeated 429s on `TagList` at that pacing with credentials loaded. Treat that value as measured-and-insufficient, not documented. See `docs/src/content/registries/ecr-public.md`.
 - Token-bucket layer (`TokenBucket` in `aimd.rs`) sits in front of the AIMD windows for registries with documented per-account TPS caps. Configured per `WindowKey` via `bucket_config_for_window()` returning a `BucketConfig { rate_per_sec, burst }`; ECR / ECR Public / GHCR / GAR / ACR get buckets, others fall back to AIMD-only. Bucket pacing happens BEFORE concurrency permits so a paced action does not occupy a slot another window could service.
 - AIMD halving rebuilds the per-action semaphore but preserves the bucket: rate-cap state is independent of concurrency state. Restoring burst tokens during throttle would defeat the purpose.
 - Cap values were verified against AWS service quotas, Google Artifact Registry quotas, and Microsoft historical SKU defaults on 2026-04-26. GHCR's value is community-measured against the visible 2000 RPM enforcement.
+
+## Retry
+
+`src/retry.rs` owns the transient-failure contract for this crate, and `retrying()` is the one shape every caller uses.
+
+- The client surfaces failures to its caller; `ocync-sync`'s engine retries the ones it drives via `with_retry`. The **prepare phase runs before the engine exists**, so anything reachable from it has to retry itself or a single throttle fails a whole mapping.
+- Retrying in the prepare phase: `list_tags` (body read included, so a mid-page reset is re-sent), `token_exchange::exchange` (both the `/v2/` ping and the realm token request), and `acr::exchange_post`. `analyze`'s manifest walk retries at its call site in `src/cli/commands/analyze.rs` using `ocync_sync::retry::with_retry`, because `manifest_pull` is shared with the engine and must not double-retry.
+- `is_transient_transport` is `pub` and is the **single** definition of the transient-transport predicate for the workspace. `ocync_sync::retry::should_retry_transport` delegates to it. Do not add a second copy: `is_request()` already covers connect failures and timeouts on the async hyper path, which is easy to get wrong from first principles.
+- Backoff is jittered. Up to 16 mappings hit one registry concurrently, so an unjittered schedule sends every throttled retry back in lockstep.
+- Do NOT add retry inside `send_with_aimd` or `manifest_pull`. Those are on the engine's path, which already retries; `tests/client_integration.rs::get_429_retries_and_succeeds` pins that layering.
 
 ## Upload protocol quirks
 

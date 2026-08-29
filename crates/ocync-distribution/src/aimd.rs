@@ -231,7 +231,11 @@ pub enum WindowKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(missing_docs)] // Variants are self-describing.
 pub enum EcrPublicGroup {
-    /// Manifest reads/heads, blob reads/heads, and tag list (10 TPS).
+    /// Manifest reads/heads, blob reads/heads, and tag list.
+    ///
+    /// Paced from the 10 TPS authenticated pull quota. AWS publishes no TPS
+    /// quota for tag listing, and tag listing has been measured throttling
+    /// below this pacing; see `bucket_config_for_window`.
     Read,
     ManifestWrite,
     BlobUploadInit,
@@ -356,7 +360,17 @@ fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
         WindowKey::Ecr(BlobUploadChunk) => cfg(400.0, 50.0),
         // ECR Public (per-account, per-region; AWS docs).
         // PutImage / InitiateLayerUpload / CompleteLayerUpload / authenticated
-        // pulls 10 TPS each, UploadLayerPart 260 TPS.
+        // pulls 10 TPS each, UploadLayerPart 260 TPS. Unauthenticated pulls
+        // are 1 TPS and not adjustable, which this table does not model
+        // because the window key is derived from host and action only.
+        //
+        // The read value is measured-insufficient, not documented: a
+        // 95-mapping run on 2026-08-28 with credentials loaded drew repeated
+        // 429s on TagList at this pacing, halving the window 11 -> 6 -> 3.
+        // AWS documents no TPS quota for tag listing at all, so grouping it
+        // with pulls is an assumption. `list_tags` retries the 429 rather
+        // than failing the mapping; lowering this value is the other half and
+        // wants its own measurement rather than a guess.
         WindowKey::EcrPublic(EcrPublicGroup::BlobUploadChunk) => cfg(200.0, 30.0),
         WindowKey::EcrPublic(_) => cfg(8.0, 10.0),
         // GHCR: single 2000 RPM (~33 RPS) aggregate cap per authenticated

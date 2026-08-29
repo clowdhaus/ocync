@@ -1,10 +1,13 @@
 //! Tag listing with pagination for OCI repositories.
 
+use std::cell::Cell;
+
 use serde::Deserialize;
 
 use crate::aimd::RegistryAction;
 use crate::client::RegistryClient;
 use crate::error::Error;
+use crate::retry::{MAX_LISTING_RETRIES, retrying};
 use crate::spec::RepositoryName;
 
 /// Maximum number of tag list pages to follow before treating the pagination
@@ -92,6 +95,11 @@ impl RegistryClient {
         let mut all_tags = Vec::new();
         let mut path = "tags/list".to_owned();
         let mut page_count: usize = 0;
+        // One budget for the whole walk. Per-page retries would bound the
+        // worst case only nominally: a listing may run to MAX_TAG_PAGES, and
+        // four retries on each of those is hours of backing off at a registry
+        // that has stopped serving the listing.
+        let retry_budget = Cell::new(MAX_LISTING_RETRIES);
 
         loop {
             page_count += 1;
@@ -102,18 +110,27 @@ impl RegistryClient {
                     ),
                 });
             }
-            let resp = self
-                .get(repository, &path, None, RegistryAction::TagList)
-                .await?;
+            // Retried as one unit, body included. A throttle or a dropped
+            // connection here is transient, and nothing above the prepare
+            // phase would re-send it: the mapping would just fail. Reading
+            // the body inside the retry matters because a connection reset
+            // part way through a page is exactly the failure a re-send fixes.
+            let (next_url, tag_list) = retrying("tag listing", &retry_budget, || async {
+                let resp = self
+                    .get(repository, &path, None, RegistryAction::TagList)
+                    .await?;
 
-            // Check for Link header before consuming the body.
-            let next_url = resp
-                .headers()
-                .get("link")
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_next_link);
+                // Check for the Link header before consuming the body.
+                let next_url = resp
+                    .headers()
+                    .get("link")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_next_link);
 
-            let tag_list: TagListResponse = resp.json().await?;
+                let tag_list: TagListResponse = resp.json().await?;
+                Ok((next_url, tag_list))
+            })
+            .await?;
             all_tags.extend(tag_list.tags);
 
             match next_url {

@@ -19,6 +19,7 @@ use url::Host;
 
 use super::{Credentials, Scope, Token};
 use crate::error::Error;
+use crate::retry::send_retrying;
 
 /// Cached `WWW-Authenticate` challenge for a registry.
 ///
@@ -403,7 +404,7 @@ pub(crate) async fn exchange(
         cached.clone()
     } else {
         let v2_url = format!("{base_url}/v2/");
-        let resp = http.get(&v2_url).send().await?;
+        let resp = send_retrying(http.get(&v2_url), "registry ping").await?;
 
         if resp.status().is_success() {
             tracing::debug!(base_url, "registry requires no auth, returning empty token");
@@ -460,7 +461,7 @@ pub(crate) async fn exchange(
         request = request.header("Authorization", basic_header_value(creds));
     }
 
-    let resp = request.send().await?;
+    let resp = send_retrying(request, "token endpoint").await?;
 
     if resp.status().is_redirection() {
         let status = resp.status();
@@ -838,6 +839,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("WWW-Authenticate"));
+    }
+
+    /// A throttled token endpoint must be re-sent, not fail the mapping.
+    ///
+    /// 95 mappings against one registry need 95 scoped tokens, so this
+    /// endpoint is high-volume exactly when a run is widest. Surfacing its
+    /// 429 loses a mapping the registry never refused.
+    #[tokio::test]
+    async fn exchange_retries_a_throttled_token_endpoint() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .mount(&mock)
+            .await;
+
+        // Throttled once, then answered.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(wiremock::ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "issued"})),
+            )
+            .mount(&mock)
+            .await;
+
+        let http = crate::test_http_client();
+        let (token, _) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
+            .await
+            .expect("a throttled token endpoint must be retried, not surfaced");
+        assert_eq!(token.value(), "issued");
+    }
+
+    /// Retries are bounded: an endpoint that only throttles still returns.
+    #[tokio::test]
+    async fn exchange_gives_up_on_a_persistently_throttled_endpoint() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, mock.uri()),
+            ))
+            .mount(&mock)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(wiremock::ResponseTemplate::new(429))
+            .expect(u64::from(crate::retry::MAX_TRANSIENT_RETRIES) + 1)
+            .mount(&mock)
+            .await;
+
+        let http = crate::test_http_client();
+        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("429"),
+            "the surfaced error must still say it was throttled: {err}"
+        );
     }
 
     #[tokio::test]

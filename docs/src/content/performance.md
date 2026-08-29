@@ -44,7 +44,7 @@ Measured 2026-04-26 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit)
 
 | Tool | Default concurrency | Adaptive backoff | Rate limit strategy |
 |------|:---:|:---:|-----|
-| `ocync` | 5 initial, 50 cap ([AIMD](/design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](/design/overview#adaptive-concurrency-aimd) congestion control on 429 |
+| `ocync` | 1 initial, 50 cap ([AIMD](/design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](/design/overview#adaptive-concurrency-aimd) congestion control on 429, plus bounded jittered retry (4 attempts) of throttled prepare-phase reads |
 | containerd | 3 layers | No | Lock-based dedup, retries on 429 (no backoff) |
 | regsync | 3 per registry | No | Reads `RateLimit-Remaining` header, pauses proactively |
 | crane | 4 jobs | Retry with backoff (0.1s-0.9s transport, 1s-9s operation) | Retry on 408/5xx, 3 attempts |

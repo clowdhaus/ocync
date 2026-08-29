@@ -1382,25 +1382,49 @@ async fn resolve_all(
     let mut no_match = 0usize;
 
     // Resolution is independent per mapping and spends nearly all of its time
-    // waiting on a registry, so the waits overlap. `buffered` yields in config
-    // order however the registries answered, which keeps the bookkeeping below
-    // deterministic: it touches `watch_log` and the run's counters, and a log
-    // whose order changed run to run would be unreadable.
+    // waiting on a registry, so the waits overlap.
+    //
+    // `buffer_unordered` rather than `buffered`, and the difference is the
+    // whole point of the concurrency. An ordered queue frees a slot only when
+    // the head yields, so one mapping listing a repository with tens of
+    // thousands of tags pins its slot and every mapping that finished behind
+    // it keeps its own, leaving the window slack while the rest of the config
+    // waits. On a 95-mapping run that held the window at 2 or 3 of 16 for
+    // minutes at a time and gave back almost all of the speedup.
+    //
+    // Config order is still what the bookkeeping below needs, so each outcome
+    // carries its index and the results are put back in order once they are
+    // all in. That keeps `watch_log`, the run's counters, and the warning
+    // stream identical run to run however the registries answered.
     //
     // One consequence of overlapping: a mapping that a config error would once
     // have pre-empted may already have run and emitted its own warnings by the
     // time the error is reached. The run still stops at the first config error
     // in config order, which is what the exit code and the operator depend on.
-    let outcomes: Vec<(Result<MappingResolution, CliError>, Vec<DroppedTarget>)> =
-        futures_util::stream::iter(config.mappings.iter().map(|mapping| async move {
-            // The guard both names the mapping while it runs and counts it
-            // finished when it ends, however it ends.
-            let _item = tracker.track(&mapping.from);
-            resolve_mapping(mapping, config, clients, batch_checkers, with_report).await
+    /// One mapping's resolution alongside the targets it lost on the way.
+    ///
+    /// Named for what it holds rather than `MappingOutcome`, which is already
+    /// a `pub(crate)` struct in this file with an unrelated shape.
+    type ResolutionAndDropped = (Result<MappingResolution, CliError>, Vec<DroppedTarget>);
+
+    let mut indexed: Vec<(usize, ResolutionAndDropped)> =
+        futures_util::stream::iter(config.mappings.iter().enumerate().map(|(idx, mapping)| {
+            async move {
+                // The guard both names the mapping while it runs and counts it
+                // finished when it ends, however it ends.
+                let _item = tracker.track(&mapping.from);
+                (
+                    idx,
+                    resolve_mapping(mapping, config, clients, batch_checkers, with_report).await,
+                )
+            }
         }))
-        .buffered(concurrency.max(1))
+        .buffer_unordered(concurrency.max(1))
         .collect()
         .await;
+    indexed.sort_by_key(|(idx, _)| *idx);
+    let outcomes: Vec<ResolutionAndDropped> =
+        indexed.into_iter().map(|(_, outcome)| outcome).collect();
 
     for (mapping, (outcome, dropped)) in config.mappings.iter().zip(outcomes) {
         // Dropped targets come back whatever the outcome, so a mapping that
@@ -4182,6 +4206,134 @@ mappings:
         assert_eq!(resolution.resolved.len(), 2);
     }
 
+    /// A registry whose repositories do not all answer at the same speed.
+    ///
+    /// `slow` repositories answer after `slow_delay`, the rest after
+    /// `fast_delay`, and the slow ones come first in config order.
+    ///
+    /// The uniform fixture above cannot expose an ordered queue. When every
+    /// mapping takes the same time the head is never the straggler, so a
+    /// combinator that frees its slot only at the head behaves exactly like
+    /// one that frees each slot as it finishes. Real configs are the opposite
+    /// of uniform: a repository with tens of thousands of tags sits beside one
+    /// with three.
+    async fn skewed_tag_registry(
+        total: usize,
+        slow: &[usize],
+        slow_delay: Duration,
+        fast_delay: Duration,
+    ) -> (wiremock::MockServer, Config, ClientMap) {
+        let server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/v2/repo/slow\d+/tags/list$",
+            ))
+            .respond_with(SlowRecorder::tag_list(&arrivals(), slow_delay, &["v1"]))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/v2/repo/img[\w-]+/tags/list$",
+            ))
+            .respond_with(SlowRecorder::tag_list(&arrivals(), fast_delay, &["v1"]))
+            .mount(&server)
+            .await;
+
+        // Position matters: the queue is built in config order, so where the
+        // slow mappings sit is the whole variable.
+        let repos: Vec<String> = (0..total)
+            .map(|i| {
+                if slow.contains(&i) {
+                    format!("repo/slow{i}")
+                } else {
+                    format!("repo/img{i}")
+                }
+            })
+            .collect();
+
+        let yaml = config_yaml(&server, &repos, "      glob: [\"*\"]\n");
+        let config: Config = serde_yaml::from_str(&yaml).expect("generated config parses");
+        let src = test_client(&server.uri());
+
+        // Warm the registry's AIMD window before the measured run.
+        //
+        // The window opens at 1 and widens by `1/w` per success, so a cold
+        // client hands the first mapping the only permit and every other
+        // mapping waits on it regardless of how the queue above is built.
+        // That hides the queue's own behaviour behind the ramp. A real run
+        // reaches this phase against a registry that has been answering for
+        // minutes, so a warm window is the honest starting state.
+        // The window opens at 1 and grows by `1/w` per success, so it reaches
+        // `sqrt(1 + 2n)` after n of them: 8 successes give ~4.3, which only
+        // just clears a limit of 4. 16 give ~5.7, so AIMD is comfortably not
+        // the binding constraint and a slack window can only mean the queue.
+        let warmup = RepositoryName::new("repo/img-warmup").expect("fixture repo name is valid");
+        for _ in 0..16 {
+            src.list_tags(&warmup)
+                .await
+                .expect("warmup listing succeeds");
+        }
+
+        let clients = ClientMap::from([
+            ("src".to_string(), Ok(src)),
+            ("dst".to_string(), Ok(test_client(&server.uri()))),
+        ]);
+        (server, config, clients)
+    }
+
+    /// A slow mapping must not hold the window closed behind it.
+    ///
+    /// The concurrency limit is a ceiling on open mappings, but it is also a
+    /// floor: while any mapping has not started, the window has to be full,
+    /// or the run pays for slots it is not using. This is the half that
+    /// `resolve_all_never_exceeds_its_concurrency_limit` cannot see, because
+    /// a maximum is reached in the first instant and never contradicted after.
+    #[tokio::test]
+    async fn resolve_all_keeps_its_window_full_while_mappings_wait() {
+        let limit = 4;
+        let (_server, config, clients) = skewed_tag_registry(
+            12,
+            &[0],
+            Duration::from_millis(600),
+            Duration::from_millis(20),
+        )
+        .await;
+
+        let tracker = PrepareTracker::default();
+        let starved: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
+        let checkers = HashMap::new();
+
+        let work = resolve_all(&config, &clients, &checkers, false, None, &tracker, limit);
+
+        let observer = {
+            let starved = Rc::clone(&starved);
+            let tracker = &tracker;
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let p = tracker.snapshot();
+                    let unstarted = p.total.saturating_sub(p.done + p.in_flight);
+                    if unstarted > 0 && p.in_flight < limit {
+                        starved.set(Some((p.in_flight, unstarted)));
+                    }
+                }
+            }
+        };
+
+        let resolution = tokio::select! {
+            r = work => r.expect("no config-class failure in this fixture"),
+            _ = observer => unreachable!("the observer loops until resolution finishes"),
+        };
+
+        assert_eq!(resolution.resolved.len(), 12, "every mapping must resolve");
+        assert_eq!(
+            starved.get(),
+            None,
+            "the window went slack while mappings waited: (in_flight, unstarted)"
+        );
+    }
+
     /// A mapping's targets must be listed concurrently.
     ///
     /// The immutable-tag optimization lists every target's existing tags
@@ -4459,6 +4611,77 @@ mappings:
             "\nresolution runs at most {PREPARE_MAPPING_CONCURRENCY} mappings at once; \
              past that each registry's AIMD window is the binding constraint\n"
         );
+    }
+
+    /// What the prepare phase costs when the mappings are not all the same
+    /// size, which is the only shape that tells an ordered queue apart from a
+    /// window that refills as work finishes.
+    ///
+    /// `prepare_phase_benchmark_resolution_concurrency` gives every mapping
+    /// the same latency. Under uniform latency the head of a queue is never
+    /// the straggler, so both behave identically and the benchmark reports the
+    /// same speedup either way. Real configs are the opposite: a repository
+    /// with tens of thousands of tags sits beside one with three, and the slow
+    /// ones are scattered rather than bunched at the front.
+    ///
+    /// The floor is the slowest single mapping, since concurrency removes the
+    /// queueing behind it but not its own duration. A run landing at a
+    /// multiple of the floor is paying for slots it is not using.
+    #[tokio::test]
+    #[ignore = "wall-clock benchmark against a latency-injected mock registry"]
+    async fn prepare_phase_benchmark_skewed_resolution() {
+        let mappings = 95;
+        let slow_delay = Duration::from_millis(800);
+        let fast_delay = Duration::from_millis(20);
+        // One slow mapping per window: the shape a run actually hits, and the
+        // one an ordered queue handles worst, because each slow mapping pins
+        // its own window instead of sharing one with the others.
+        let slow: Vec<usize> = (0..mappings).step_by(PREPARE_MAPPING_CONCURRENCY).collect();
+
+        println!(
+            "\n{mappings} mappings, {} slow at {}ms, rest at {}ms, one slow per window\n",
+            slow.len(),
+            slow_delay.as_millis(),
+            fast_delay.as_millis()
+        );
+        println!(
+            "{:>11}  {:>10}  {:>10}  {:>14}",
+            "concurrency", "elapsed", "floor", "over floor"
+        );
+
+        for concurrency in [1usize, 8, 16, 32] {
+            let (_server, config, clients) =
+                skewed_tag_registry(mappings, &slow, slow_delay, fast_delay).await;
+
+            let started = std::time::Instant::now();
+            let resolution = resolve_all(
+                &config,
+                &clients,
+                &HashMap::new(),
+                false,
+                None,
+                &PrepareTracker::default(),
+                concurrency,
+            )
+            .await
+            .expect("no config-class failure in this fixture");
+            let elapsed = started.elapsed();
+            assert_eq!(resolution.resolved.len(), mappings);
+
+            // Every mapping still has to run, so the floor is whichever is
+            // larger: the slowest single mapping, or the total work spread
+            // evenly across the window.
+            let total_work = slow_delay.mul_f64(slow.len() as f64)
+                + fast_delay.mul_f64((mappings - slow.len()) as f64);
+            let floor = slow_delay.max(total_work.div_f64(concurrency as f64));
+            println!(
+                "{concurrency:>11}  {:>9.2}s  {:>9.2}s  {:>13.1}x",
+                elapsed.as_secs_f64(),
+                floor.as_secs_f64(),
+                elapsed.as_secs_f64() / floor.as_secs_f64()
+            );
+        }
+        println!();
     }
 
     /// How many round trips one repository's tag listing costs, with and

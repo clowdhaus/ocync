@@ -137,3 +137,11 @@ cargo test --package ocync-sync
 # Run a single test file (fast iteration during development)
 cargo test --package ocync-sync --test sync_artifacts
 ```
+
+## Retry
+
+`with_retry` lives in `src/retry.rs` (moved there from `engine.rs` so it sits with `RetryConfig` and the `should_retry*` predicates) and is `pub`, because the CLI's `analyze` walk needs it too.
+
+It is not the only retry layer any more. The prepare phase runs before the engine exists, so tag listing, token exchange, and ACR's OAuth exchanges retry themselves inside `ocync-distribution` (see that crate's CLAUDE.md). A 429 during tag listing therefore no longer surfaces as an unresolved mapping and never reaches `with_retry`.
+
+`should_retry_transport` delegates to `ocync_distribution::retry::is_transient_transport` rather than repeating the predicate. Keep it that way; two copies drift.

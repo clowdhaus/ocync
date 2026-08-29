@@ -18,6 +18,8 @@ pub mod error;
 pub mod manifest;
 /// OCI image reference parser.
 pub mod reference;
+/// Bounded retry for transient failures in the prepare phase.
+pub mod retry;
 /// SHA-256 wrapper backed by aws-lc-rs.
 pub mod sha256;
 /// OCI image spec types - manifests, descriptors, and platforms.
