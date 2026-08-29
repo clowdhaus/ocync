@@ -10,6 +10,8 @@ Everything before the engine starts is preparation: build one client per referen
 
 This work is network-bound and independent per mapping, so it runs concurrently, bounded at 16 mappings in flight. The bound is a ceiling on open mappings, not on how hard any registry is hit: every request underneath still passes that registry's AIMD window, which starts at one in flight and widens only as the registry keeps answering. A config whose mappings all share one source therefore self-limits at whatever AIMD has earned, and a config spread across registries goes wider.
 
+The bound is also a floor, and that half is load-bearing. A slot frees when its own mapping finishes, not when the oldest one does. An ordered queue gives back almost all of the benefit on a real config: one mapping listing a repository with tens of thousands of tags pins its slot, every mapping that finished behind it keeps its own, and the window sits at 2 or 3 of 16 while the rest of the config waits. Measured on a 95-mapping run, that shape spent 625 seconds to do 442 seconds of work. Config order is restored after collection instead, by carrying each outcome's index and sorting once every result is in.
+
 Measured on 95 mappings against a single source at 60 ms per tag listing:
 
 | Mappings in flight | Elapsed | Speedup | Peak requests in flight |
@@ -20,11 +22,13 @@ Measured on 95 mappings against a single source at 60 ms per tag listing:
 | 16                 | 0.89s   | 6.8x    | 13                      |
 | 32                 | 0.89s   | 6.7x    | 13                      |
 
+Every mapping in that benchmark has the same latency, which is the one shape that cannot tell an ordered queue apart from a window that refills as work finishes: when nothing is slower than anything else, the head is never the straggler. `prepare_phase_benchmark_skewed_resolution` covers the shape that can, one deep repository per window among shallow ones, where the same run costs 4.84s ordered against 1.09s unordered.
+
 The last two rows are identical because a single registry's AIMD window tops out near 13 over 95 requests. That is where the bound of 16 comes from: high enough that AIMD is the constraint for a single-source config, low enough that a wide multi-registry config cannot open an unbounded number of connections at once.
 
 The 60 ms is a synthetic latency chosen to keep the benchmark short. It measures how the speedup scales and where AIMD becomes the ceiling, not any particular config's absolute time. A real config's floor is its single slowest mapping, because overlapping removes the queueing behind that mapping but not its own duration: a run of 675 seconds of serial work holding one 160-second mapping lands near 160 to 200 seconds, not 675 divided by the speedup above. The `slowest` field in the progress line exists to name that mapping.
 
-Results are collected in config order regardless of which registry answered first, so per-mapping warnings, the watch-mode state, and the run's counters stay deterministic. A config error still stops the run at the first offending mapping in config order, though mappings behind it may already have run and logged.
+Results are put back in config order after collection, so the watch-mode state and the run's counters stay deterministic. Warnings emitted inside a mapping's own resolution interleave in completion order; it is the bookkeeping after collection that is ordered. A config error still stops the run at the first offending mapping in config order, though mappings behind it may already have run and logged.
 
 Tag listings deliberately send no `n`. Asking for a page size looks like an optimization and is the opposite of one: a request without `n` is answered at least as generously as one with it, so `n` can only add round trips.
 
@@ -33,6 +37,14 @@ Tag listings deliberately send no `n`. Asking for a page size looks like an opti
 - ECR Public already pages at 1000 without being asked, and ECR rejects an `n` above 1000, so the largest value it would accept changes nothing.
 
 The `Link` loop still follows pagination for registries that impose it unasked. Measured 2026-08-28.
+
+### Retry in the prepare phase
+
+The engine retries the work it drives, through `with_retry`. The prepare phase runs before the engine exists, so nothing above it would re-send anything: a single throttle or dropped connection there fails a whole mapping or image. Tag listing, token exchange, ACR's OAuth exchanges, and `analyze`'s manifest walk therefore retry themselves.
+
+A 429 is backpressure, not a refusal. AIMD has already halved the window by the time one surfaces, so a retry is paced by the throttle that caused it. The schedule is bounded at 4 attempts and jittered: up to 16 mappings hit one registry at once, so an unjittered schedule would send every throttled retry back in lockstep and produce the next burst.
+
+`ocync_distribution::retry` owns the transient predicate for the whole workspace, and `ocync_sync::retry::should_retry_transport` delegates to it, because two copies of that predicate drift.
 
 While preparation runs, a progress line is emitted every 5 seconds naming the longest-running item:
 
@@ -46,7 +58,7 @@ Without `slowest`, a step that sits at the same `done` count for minutes is unat
 
 `analyze` has the same shape and the same bound. It resolves mappings concurrently, then pulls image manifests from a single list flattened across every mapping. The flattening is what makes the second walk worth anything: a config of many mappings holding a handful of tags each would otherwise stay serial, because each mapping's walk is only a request or two long. Index children stay sequential within an image, since the images already overlap and AIMD saturates well below the number in flight.
 
-Aggregation stays sequential and in config order. `analysis.blobs` has one owner, and the report must read the same way whichever registry answered first. Shutdown is checked inside each task rather than once before the fan-out, so a signal part way through stops work that has not started while in-flight work finishes.
+Aggregation stays sequential: `analysis.blobs` has one owner and one consumer loop. It no longer runs in config order, which the report does not need, because every figure it prints is a count, a sum, or a sorted container. Mapping-level outcomes are re-sorted because the bookkeeping does need config order. Shutdown is checked inside each task rather than once before the fan-out, so a signal part way through stops work that has not started while in-flight work finishes.
 
 Measured on 95 mappings holding one tag each, 30 ms per request:
 

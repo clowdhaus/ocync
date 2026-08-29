@@ -636,6 +636,79 @@ async fn list_tags_returns_all_tags() {
     assert_eq!(tags, vec!["v1", "v2", "latest"]);
 }
 
+/// A 429 is backpressure, not a verdict on the request.
+///
+/// AIMD halves the window when a registry throttles, which paces everything
+/// that comes after. The request that absorbed the 429 still has to be sent
+/// again: dropping it turns a rate limit into a failed mapping, and a wide
+/// config against a rate-limited registry then reports failures for work the
+/// registry never refused, only deferred.
+#[tokio::test]
+async fn list_tags_retries_after_a_429() {
+    let server = MockServer::start().await;
+
+    // Throttled once, then answered. Mounted first so it takes priority
+    // until its single use is spent.
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/tags/list"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "errors": [{"code": "TOOMANYREQUESTS", "message": "Rate exceeded"}]
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/tags/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "repo",
+            "tags": ["v1", "v2"]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .build()
+        .unwrap();
+
+    let repo = RepositoryName::new("repo").unwrap();
+    let tags = client
+        .list_tags(&repo)
+        .await
+        .expect("a throttled listing must be retried, not surfaced as a failure");
+    assert_eq!(tags, vec!["v1", "v2"]);
+}
+
+/// Retries are bounded: a registry that only ever throttles must still return.
+#[tokio::test]
+async fn list_tags_gives_up_after_persistent_429s() {
+    let server = MockServer::start().await;
+
+    // The exact count is the bound. Without it this test passes just as well
+    // against an unbounded retry, which is the thing it exists to prevent.
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/tags/list"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "errors": [{"code": "TOOMANYREQUESTS", "message": "Rate exceeded"}]
+        })))
+        .expect(u64::from(ocync_distribution::retry::MAX_TRANSIENT_RETRIES) + 1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClientBuilder::new(mock_base_url(&server))
+        .build()
+        .unwrap();
+
+    let repo = RepositoryName::new("repo").unwrap();
+    let err = client
+        .list_tags(&repo)
+        .await
+        .expect_err("a registry that never stops throttling must surface the failure");
+    assert!(
+        format!("{err}").contains("429"),
+        "the surfaced error must still say it was throttled: {err}"
+    );
+}
+
 #[tokio::test]
 async fn list_tags_follows_pagination() {
     let server = MockServer::start().await;

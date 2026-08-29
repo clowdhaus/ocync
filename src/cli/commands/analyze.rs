@@ -18,6 +18,7 @@ use ocync_distribution::spec::ManifestKind;
 use ocync_distribution::{Digest, RepositoryName};
 
 use ocync_sync::ShutdownSignal;
+use ocync_sync::retry::{RetryConfig, with_retry};
 
 use crate::cli::commands::synchronize::{
     ClientMap, DroppedTarget, MappingResolution, PreparePhase, PrepareTracker, UnresolvedMapping,
@@ -143,8 +144,18 @@ pub(crate) async fn run(
 /// mappings holding a handful of tags each would otherwise be as serial as
 /// before, because each mapping's walk is only a request or two long.
 ///
-/// Aggregation stays sequential and in order. `analysis.blobs` has one owner,
-/// and the report has to read the same way whichever registry answered first.
+/// Both walks free each slot as its own work finishes rather than when the
+/// oldest one does. An ordered queue would let a single mapping listing a
+/// repository with tens of thousands of tags hold its slot while everything
+/// that finished behind it holds theirs, which leaves the window slack and
+/// gives back most of the overlap.
+///
+/// Aggregation stays sequential: `analysis.blobs` has one owner and one
+/// consumer loop. It no longer runs in config order, which the report does not
+/// need -- every figure it prints is a count, a sum, or a sorted container, so
+/// it reads the same whichever registry answered first. Mapping bookkeeping
+/// does need config order, so those outcomes are put back in order once they
+/// are all in.
 async fn collect_analysis(
     config: &Config,
     clients: &ClientMap,
@@ -167,20 +178,27 @@ async fn collect_analysis(
     // inside the task rather than once before the fan-out so a signal part way
     // through still stops the work that has not begun, which is what the
     // sequential loop's `break` did.
-    let outcomes: Vec<MappingOutcome> =
-        futures_util::stream::iter(config.mappings.iter().map(|mapping| async move {
-            if shutdown.is_triggered() {
-                return None;
+    let mut indexed: Vec<(usize, MappingOutcome)> =
+        futures_util::stream::iter(config.mappings.iter().enumerate().map(|(idx, mapping)| {
+            async move {
+                if shutdown.is_triggered() {
+                    return (idx, None);
+                }
+                // Held for the whole task so every exit still counts the mapping:
+                // one that skipped it would strand the progress line short of its
+                // total.
+                let _item = tracker.track(&mapping.from);
+                (
+                    idx,
+                    Some(resolve_mapping(mapping, config, clients, no_checkers, false).await),
+                )
             }
-            // Held for the whole task so every exit still counts the mapping:
-            // one that skipped it would strand the progress line short of its
-            // total.
-            let _item = tracker.track(&mapping.from);
-            Some(resolve_mapping(mapping, config, clients, no_checkers, false).await)
         }))
-        .buffered(concurrency.max(1))
+        .buffer_unordered(concurrency.max(1))
         .collect()
         .await;
+    indexed.sort_by_key(|(idx, _)| *idx);
+    let outcomes: Vec<MappingOutcome> = indexed.into_iter().map(|(_, o)| o).collect();
 
     let mut resolved_mappings = Vec::new();
     for (mapping, outcome) in config.mappings.iter().zip(outcomes) {
@@ -234,6 +252,11 @@ async fn collect_analysis(
     // report a completed mapping count for the whole of the slower half.
     tracker.begin(PreparePhase::Images, images.len());
 
+    // The engine owns the retry policy for the transfer phase; this walk runs
+    // before the engine exists, so it carries the same defaults itself.
+    let retry = RetryConfig::default();
+    let retry = &retry;
+
     let mut pulls = futures_util::stream::iter(images.iter().map(|(idx, tag)| {
         let resolved = &resolved_mappings[*idx];
         async move {
@@ -250,12 +273,13 @@ async fn collect_analysis(
                 &resolved.source_repo,
                 tag,
                 &image_ref,
+                retry,
             )
             .await;
             (*idx, image_ref, Some(pulled))
         }
     }))
-    .buffered(concurrency.max(1));
+    .buffer_unordered(concurrency.max(1));
 
     while let Some((idx, image_ref, pulled)) = pulls.next().await {
         let Some(pulled) = pulled else {
@@ -355,16 +379,27 @@ enum Completeness {
 /// already overlap, and the client's AIMD window saturates well below the
 /// number of images in flight, so nesting a second level of concurrency here
 /// would add no throughput.
+///
+/// Every pull is retried here. This walk is the highest-volume request path in
+/// the prepare phase, one manifest read per tag plus one per platform, all
+/// against the same source registry at `ANALYZE_CONCURRENCY`, so it is exactly
+/// the shape that provokes a throttle. The retry lives at this call site
+/// rather than inside `manifest_pull` because the engine wraps its own
+/// `manifest_pull` calls in `with_retry`; putting one further down would
+/// multiply the two. `analyze` runs before the engine exists, so it brings its
+/// own.
 async fn pull_image_descriptors(
     source_client: &ocync_distribution::RegistryClient,
     source_repo: &RepositoryName,
     tag: &str,
     image_ref: &str,
+    retry: &RetryConfig,
 ) -> Result<(Vec<BlobDescriptor>, Completeness), CliError> {
-    let pulled = source_client
-        .manifest_pull(source_repo, tag)
-        .await
-        .map_err(|e| CliError::Input(format!("manifest_pull {image_ref}: {e}")))?;
+    let pulled = with_retry(retry, "analyze manifest pull", || {
+        source_client.manifest_pull(source_repo, tag)
+    })
+    .await
+    .map_err(|e| CliError::Input(format!("manifest_pull {image_ref}: {e}")))?;
 
     let mut descriptors = descriptors_of(&pulled.manifest);
     let mut completeness = Completeness::Full;
@@ -374,9 +409,11 @@ async fn pull_image_descriptors(
         for child in &index.manifests {
             // Platforms are independent: a missing arm64 manifest should not
             // discard the amd64 blobs already recorded for this image.
-            match source_client
-                .manifest_pull(source_repo, &child.digest.to_string())
-                .await
+            let child_ref = child.digest.to_string();
+            match with_retry(retry, "analyze child manifest pull", || {
+                source_client.manifest_pull(source_repo, &child_ref)
+            })
+            .await
             {
                 Ok(child_pulled) => descriptors.extend(descriptors_of(&child_pulled.manifest)),
                 Err(e) => {

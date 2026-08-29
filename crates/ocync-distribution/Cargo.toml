@@ -26,6 +26,7 @@ aws-sdk-ecr = { workspace = true }
 aws-sdk-ecrpublic = { workspace = true }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 bytes.workspace = true
+fastrand.workspace = true
 futures-util = { version = "0.3", default-features = false }
 google-cloud-auth.workspace = true
 http.workspace = true

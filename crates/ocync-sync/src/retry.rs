@@ -1,5 +1,6 @@
 //! Retry configuration and backoff logic for transient failures.
 
+use std::future::Future;
 use std::time::Duration;
 
 use http::StatusCode;
@@ -152,7 +153,10 @@ struct OciError {
 /// show which variant was encountered so the match can be extended.
 pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
     if let ocync_distribution::Error::Http(reqwest_err) = error {
-        reqwest_err.is_request() || reqwest_err.is_body() || reqwest_err.is_decode()
+        // One definition, in the crate that owns the reqwest surface. Two
+        // copies of this predicate drift; the prepare-phase retry in
+        // `ocync_distribution::retry` needs the same answer this does.
+        ocync_distribution::retry::is_transient_transport(reqwest_err)
     } else {
         tracing::debug!(
             error = %error,
@@ -171,6 +175,57 @@ pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
 fn jitter(base: Duration) -> Duration {
     let factor = 0.75 + fastrand::f64() * 0.5;
     base.mul_f64(factor)
+}
+
+/// Retry an async operation with exponential backoff on transient errors.
+///
+/// Calls `f()` in a loop. Retries on HTTP 408/429/5xx, transport-level
+/// errors (connection refused, DNS failure, request timeout), and the
+/// ECR-specific 404 `BLOB_UPLOAD_UNKNOWN` body marker via
+/// [`is_blob_upload_unknown`] (ECR returns this code on manifest
+/// push when blob upload PUT-201s haven't fully propagated).
+/// Waits with jittered exponential backoff up to `config.max_retries` times.
+/// Returns the first `Ok` or the final `Err`.
+pub async fn with_retry<T, F, Fut>(
+    config: &RetryConfig,
+    operation: &str,
+    f: F,
+) -> Result<T, ocync_distribution::Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, ocync_distribution::Error>>,
+{
+    let mut attempt = 0;
+    loop {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                let retryable = if let Some(status) = e.status_code() {
+                    should_retry(status, attempt, config.max_retries)
+                        || (attempt < config.max_retries && is_blob_upload_unknown(&e))
+                } else {
+                    // Transport-level errors (connection refused, DNS failure,
+                    // request timeout) are retryable when attempts remain.
+                    attempt < config.max_retries && should_retry_transport(&e)
+                };
+
+                if retryable {
+                    let backoff = config.backoff_for(attempt);
+                    tracing::warn!(
+                        operation,
+                        attempt,
+                        error = %e,
+                        backoff_ms = backoff.as_millis(),
+                        "retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

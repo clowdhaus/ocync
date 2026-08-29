@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
 use crate::progress::RunProgress;
-use crate::retry::{self, RetryConfig};
+use crate::retry::{RetryConfig, with_retry};
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
 use crate::{
@@ -3206,57 +3206,6 @@ fn file_read_stream(
             Err(e) => Some((Err(e), (file, buf))),
         }
     })
-}
-
-/// Retry an async operation with exponential backoff on transient errors.
-///
-/// Calls `f()` in a loop. Retries on HTTP 408/429/5xx, transport-level
-/// errors (connection refused, DNS failure, request timeout), and the
-/// ECR-specific 404 `BLOB_UPLOAD_UNKNOWN` body marker via
-/// [`retry::is_blob_upload_unknown`] (ECR returns this code on manifest
-/// push when blob upload PUT-201s haven't fully propagated).
-/// Waits with jittered exponential backoff up to `config.max_retries` times.
-/// Returns the first `Ok` or the final `Err`.
-async fn with_retry<T, F, Fut>(
-    config: &RetryConfig,
-    operation: &str,
-    f: F,
-) -> Result<T, ocync_distribution::Error>
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = Result<T, ocync_distribution::Error>>,
-{
-    let mut attempt = 0;
-    loop {
-        match f().await {
-            Ok(val) => return Ok(val),
-            Err(e) => {
-                let retryable = if let Some(status) = e.status_code() {
-                    retry::should_retry(status, attempt, config.max_retries)
-                        || (attempt < config.max_retries && retry::is_blob_upload_unknown(&e))
-                } else {
-                    // Transport-level errors (connection refused, DNS failure,
-                    // request timeout) are retryable when attempts remain.
-                    attempt < config.max_retries && retry::should_retry_transport(&e)
-                };
-
-                if retryable {
-                    let backoff = config.backoff_for(attempt);
-                    warn!(
-                        operation,
-                        attempt,
-                        error = %e,
-                        backoff_ms = backoff.as_millis(),
-                        "retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    attempt += 1;
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-    }
 }
 
 /// Compute aggregate statistics from a list of image results.
