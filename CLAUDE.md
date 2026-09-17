@@ -1,100 +1,39 @@
 # ocync
 
-OCI registry sync tool. Rust workspace with 3 core crates: `ocync` (CLI binary), `ocync-distribution` (OCI registry client), `ocync-sync` (sync engine). The workspace also includes `bench/proxy` (benchmark MITM proxy) and `xtask` (build/bench automation).
+OCI registry sync tool. Crates: `ocync` (CLI), `ocync-distribution` (registry client), `ocync-sync` (sync engine), plus `bench/proxy` and `xtask`.
 
-## Crate-specific guidance
+Read the nested file for the area you touch:
 
-Each crate has its own CLAUDE.md with targeted context:
+- `crates/ocync-distribution/CLAUDE.md`: auth, AIMD, registry detection, upload quirks, testing
+- `crates/ocync-sync/CLAUDE.md`: concurrency and `RefCell` rules, notify contracts, leader-follower, engine
+- `bench/CLAUDE.md`: benchmark infrastructure, bench-proxy, competitor config, instance ops
+- `docs/CLAUDE.md`: link convention, link plugin, GitHub Pages trailing-slash bugs
 
-- `crates/ocync-distribution/CLAUDE.md` - auth protocols, AIMD, registry detection, upload quirks, testing (wiremock/testcontainers)
-- `crates/ocync-sync/CLAUDE.md` - concurrency model, RefCell rules, notify contracts, leader-follower, engine architecture, testing
-- `bench/CLAUDE.md` - benchmark infrastructure, bench-proxy, competitor config gotchas, instance ops
-- `docs/CLAUDE.md` - cross-page link convention, build-time link plugin, GH Pages trailing-slash bug class, link-verification approach
+## Priorities, in order
 
-## Design priorities
+1. Bytes transferred and rate-limit friendliness. Wall-clock follows from this.
+2. Correctness. An optimization must degrade safely and visibly.
+3. Wall-clock. Never report it without byte and request counts.
+4. UX, at zero cost when disabled.
 
-Ranked by weight. These override local optimization instincts when they conflict.
+## Invariants
 
-1. **Efficiency - bytes transferred and rate-limit friendliness.** Every blob we avoid transferring, every API call we avoid issuing, is the real win. Wall-clock is downstream.
-2. **Correctness** - staleness handling, auth invalidation, protocol conformance. Efficiency optimizations must degrade safely, not silently.
-3. **Wall-clock speed** - a consequence of (1), not a goal separate from it. Reports that prioritize wall-clock without byte/request counts are misleading.
-4. **UX** - clear errors, structured output, sensible defaults. Must be zero-cost when disabled so it never drags on (1).
+- **Content is synced bit-for-bit.** Never convert, transform or rewrite manifest or blob bytes, including Docker v2 to OCI. Digests are identity, and every skip optimization depends on them.
+- **One failure never cancels the run.** `SyncReport` is the contract. No `?` on a per-mapping or per-image path in `synchronize::run`, `resolve_all` or `analyze::run`. A per-registry client or batch checker that fails to construct fails only the mappings using it, storing the classified error against the alias. Isolated failures still reach the exit code, the cycle tail and the `--json` document. Optional optimizations degrade with a WARN, required work does not.
+- **Single-threaded tokio** (`current_thread`): shared state is `Rc<RefCell<>>`, never `Arc<Mutex<>>`.
+- **Crypto**: `aws-lc-rs` is the only TLS provider. `ring` and `native-tls` are banned in `deny.toml`, and `ocync_distribution::install_crypto_provider()` installs the provider at startup.
+- The only Cargo features are `fips` and `non-fips`. Dependencies use `default-features = false`.
+- Return `ExitCode` via `Termination`, never `process::exit()`.
+- Every `.rs` file has `//!` and every `pub` item has `///`. Types do not stutter (`Error`, not `DistributionError`).
 
-## Content integrity
+## Tests
 
-ocync syncs content bit-for-bit from source to target(s). We do NOT convert, transform, or rewrite manifest or blob content. Digests are identity -- changing bytes changes the digest, breaks signatures, pin-by-digest workflows, and the OCI content-addressable model.
+Every change carries a negative assertion: a test that fails if the intended path is NOT taken. Unit-test leaves and integration-test the bridges (client to engine, HTTP to AIMD, cache to target HEAD).
 
-- Manifest bytes are transferred verbatim. No format conversion (Docker v2 to OCI or vice versa).
-- Blob bytes are streamed directly from source to target without modification.
-- All registries in production accept both Docker v2 and OCI manifests. There is no real-world use case for format conversion, and it would break every digest-based optimization (skip detection, transfer state cache, immutable tag handling, head-first).
+## Workflow
 
-## Failure isolation
-
-A run covers many images across many mappings. One denial, one unreachable registry, one bad repository name must never cancel the rest.
-
-- `SyncReport` is the contract: the engine never fails as a whole, and the CLI driver must not either. No `?` on a per-mapping or per-image path in `synchronize::run`, `resolve_all`, or `analyze::run`. Record the failure, log it, continue.
-- Anything constructed per-registry (clients, ECR batch checkers) fails only the mappings that reference it. Store the error against the alias instead of aborting construction, and keep the classification with it: a stringified error cannot be told apart from a denial later.
-- Isolation applies at every level it can. One dead target does not cancel a mapping's other targets; one unreadable image does not cancel the rest of an analysis; one bad config file does not cancel the others.
-- Isolated failures must stay visible. Fold them into the exit code, the cycle tail, and the `--json` document, and preserve the specific exit code the abort used to produce. Silent tolerance is worse than the abort it replaces.
-- Optional optimizations (batch checkers, target tag listings for immutable skip) degrade with a WARN. Required work does not.
-
-## Scope discipline
-
-Every PR ships the smallest correct change + one test that catches regression. Defer scaffolding to a follow-up PR justified by a second observation.
-
-- No forward declarations, stub implementations, or placeholder types
-- No `pub` items without a caller in the diff
-- No struct fields or enum variants without a reader
-- No Cargo feature flags except crypto backend (`fips` vs `non-fips`) - unavoidable platform linking
-- Test what can break: at least one test that would fail if the intended path is NOT taken (negative assertion)
-- If the change is ~10 LOC of real intent, aim for ~100 LOC total diff. 10x is a smell worth justifying.
-- Challenge the use case before building. If a feature breaks existing optimizations (skip detection, caching, digest comparison), the cost likely exceeds the benefit.
-
-## Code standards
-
-- **Naming**: stutter-free types (`Error` not `DistributionError`); OCI spec terminology verbatim for on-wire types
-- **Imports**: `use` statements; group std > external > crate; no inline paths
-- **Docs**: every `.rs` file gets `//!`; all `pub` items get `///`
-- **Errors**: invalid user config returns `Result`, never silently degrades
-- **Dependencies**: `default-features = false` everywhere; justify every new dep; prefer hand-written under ~100 lines over a crate
-- **Crypto**: `aws-lc-rs` is the sole TLS crypto provider (FIPS and non-FIPS). `ring` and `native-tls` are banned in `deny.toml`. `reqwest` uses `rustls-no-provider`; the provider is installed via `ocync_distribution::install_crypto_provider()` at process startup.
-- **Process control**: return `ExitCode` via `Termination`; never `process::exit()`
-- **Concurrency model**: single-threaded tokio (`current_thread`). All shared state uses `Rc<RefCell<>>`, never `Arc<Mutex<>>`. See `crates/ocync-sync/CLAUDE.md` for full rules.
-
-## Testing
-
-- Unit-test leaves, integration-test bridges (client -> engine, HTTP -> AIMD, cache -> target HEAD). A bug between layers is the most common bug.
-- See crate CLAUDE.md files for crate-specific testing guidance.
-
-## Git workflow
-
-- One PR at a time, merge to main, then next. No stacked PRs ever.
-- When dispatching parallel worktree agents, each MUST create its own branch from `main` (`git checkout -b feat/xxx main`). Never push to an existing branch from a worktree agent.
-- Never include `Co-Authored-By: Claude` or Anthropic attribution
-- Run the CI gate locally before push: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked && cargo deny check`
-- During rebase conflicts on `Cargo.lock`, regenerate with `git checkout --theirs Cargo.lock && cargo generate-lockfile`
-- Never squash commits with `git reset --soft` when intermediate commits touch the same files -- content from middle commits is silently dropped. Use `git rebase -i` with fixup/squash instead.
-
-## Plans and specs
-
-- `docs/src/content/design/overview.md` - full design document (engine architecture, concurrency, cache)
-- `docs/src/content/design/engine.md` - pipeline, transfer state cache, AIMD, multi-target reuse
-- `docs/src/content/design/benchmark.md` - layered benchmark plan (protocol / throughput / cross-tool)
-- `docs/src/content/design/watch-mode.md` - watch mode, discovery optimization, platform filtering
-- `docs/superpowers/plans/` (gitignored) - in-flight implementation plans
-- `docs/superpowers/specs/` (gitignored) - design specs; delete once fully implemented
-- Unimplemented features are marked with `> **Status: Planned.**` in design docs. Remove the marker when implementing -- implemented features are self-evident from code.
-
-When a benchmark or probe run changes our understanding of a registry's behavior, update the relevant per-registry doc in `docs/src/content/registries/` in the same PR as the behavior change.
-
-## Commands
-
-```bash
-# CI gate (run before every push)
-cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test && cargo deny check
-
-# Run all tests
-cargo test
-```
-
-See crate CLAUDE.md files for crate-specific test commands. See `bench/CLAUDE.md` for benchmark infrastructure.
+- Gate before push: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked && cargo deny check`.
+- One pull request at a time, merged before the next. Never stack.
+- On a `Cargo.lock` rebase conflict: `git checkout --theirs Cargo.lock && cargo generate-lockfile`.
+- Design lives in `docs/src/content/design/`. Unbuilt features carry `> **Status: Planned.**`, removed when implemented.
+- A run that changes what we know about a registry updates its page in `docs/src/content/registries/` in the same pull request.
