@@ -43,7 +43,9 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
+use crate::cache::{
+    ManifestClaim, PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache,
+};
 use crate::progress::RunProgress;
 use crate::retry::{RetryConfig, with_retry};
 use crate::shutdown::ShutdownSignal;
@@ -871,6 +873,7 @@ impl SyncEngine {
     ) -> SyncReport {
         let run_start = Instant::now();
         let run_id = Uuid::now_v7();
+        cache.borrow_mut().clear_manifest_pushes();
 
         // Synchronous writes are fine: current_thread runtime, file is tiny.
         let mut timing_file = std::env::var("OCYNC_TIMING_FILE")
@@ -1782,16 +1785,7 @@ async fn execute_item(
     }
 
     // Push manifests (children first, then top-level by tag).
-    match push_manifests(
-        retry,
-        &item.target_client,
-        &item.target.repo,
-        &item.target.tag,
-        &item.source_data,
-        item.batch_checker.as_deref(),
-    )
-    .await
-    {
+    match push_manifests(retry, &item, cache).await {
         Ok(()) => {
             // Mark this repo as having a committed manifest so it becomes
             // a valid cross-repo mount source. ECR requires a committed
@@ -2703,6 +2697,10 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
 
 /// Push all manifests (children for indexes, then top-level) to one target.
 ///
+/// A child already pushed to this repo in this run is skipped, and one
+/// another task is pushing is awaited, so tags sharing an index push its
+/// children once. The top-level manifest is always pushed, by tag.
+///
 /// When `batch_checker` is `Some` AND `retry.manifest_commit_wait` is
 /// non-zero, calls
 /// [`BatchBlobChecker::wait_for_blobs_available`] on every blob the
@@ -2715,13 +2713,14 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
 /// `Duration::ZERO` also skips the wait.
 async fn push_manifests(
     retry: &RetryConfig,
-    target_client: &RegistryClient,
-    target_repo: &RepositoryName,
-    target_tag: &str,
-    source_data: &PulledManifest,
-    batch_checker: Option<&dyn BatchBlobChecker>,
+    item: &TransferTask,
+    cache: &Rc<RefCell<TransferStateCache>>,
 ) -> Result<(), crate::Error> {
-    if let Some(checker) = batch_checker
+    let target_client = &item.target_client;
+    let target_repo = &item.target.repo;
+    let source_data = &item.source_data;
+    let target_name = &item.target_name;
+    if let Some(checker) = item.batch_checker.as_deref()
         && !retry.manifest_commit_wait.is_zero()
     {
         // Extract every leaf-blob digest the manifest references
@@ -2775,7 +2774,19 @@ async fn push_manifests(
         .map(|child| {
             let child_digest_str = child.digest.to_string();
             async move {
-                with_retry(retry, "manifest push", || {
+                loop {
+                    let claim = cache.borrow_mut().claim_manifest_push(
+                        target_name,
+                        target_repo,
+                        &child.digest,
+                    );
+                    match claim {
+                        ManifestClaim::Pushed => return Ok(()),
+                        ManifestClaim::Wait(notify) => notify.notified().await,
+                        ManifestClaim::Claimed => break,
+                    }
+                }
+                let result = with_retry(retry, "manifest push", || {
                     target_client.manifest_push(
                         target_repo,
                         &child_digest_str,
@@ -2783,11 +2794,21 @@ async fn push_manifests(
                         &child.raw_bytes,
                     )
                 })
-                .await
-                .map_err(|e| crate::Error::Manifest {
-                    reference: child_digest_str.clone(),
-                    source: e,
-                })
+                .await;
+                let mut c = cache.borrow_mut();
+                match result {
+                    Ok(_) => {
+                        c.mark_manifest_pushed(target_name, target_repo, &child.digest);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        c.release_manifest_claim(target_name, target_repo, &child.digest);
+                        Err(crate::Error::Manifest {
+                            reference: child_digest_str.clone(),
+                            source: e,
+                        })
+                    }
+                }
             }
         })
         .collect();
@@ -2801,14 +2822,14 @@ async fn push_manifests(
     with_retry(retry, "manifest push", || {
         target_client.manifest_push(
             target_repo,
-            target_tag,
+            &item.target.tag,
             &source_data.pull.media_type,
             &source_data.pull.raw_bytes,
         )
     })
     .await
     .map_err(|e| crate::Error::Manifest {
-        reference: target_tag.to_owned(),
+        reference: item.target.tag.clone(),
         source: e,
     })?;
 

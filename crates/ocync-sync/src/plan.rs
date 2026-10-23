@@ -56,7 +56,8 @@ pub enum ClaimAction {
     /// Caller now holds the upload claim. Proceed with mount/HEAD/push;
     /// call `release_blob_claim` when done.
     Claimed,
-    /// Another repo holds the claim; await `notify` and retry.
+    /// Another task holds the claim, for this repo or another; await
+    /// `notify` and retry.
     /// `holder` is included for diagnostic logging.
     Wait {
         /// The repo currently holding the upload claim (for diagnostic logging).
@@ -69,14 +70,15 @@ pub enum ClaimAction {
 /// Metadata for a tracked blob at a single target.
 ///
 /// Per-(repo) state lives in `repos`; each repo's lifecycle is independent.
-/// The `claim` slot serializes uploads of this digest across repos at the
-/// target side: at most one repo holds the claim at a time, and other
-/// repos calling `claim_blob_upload` see this as `Some` and wait.
+/// The `claim` slot serializes uploads of this digest at the target side:
+/// at most one task holds the claim at a time, and every other task calling
+/// `claim_blob_upload` sees it as `Some` and waits, including a task for the
+/// holder's own repo.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct BlobInfo {
     /// Per-(repo) state. `BTreeMap` for deterministic iteration.
     pub(crate) repos: BTreeMap<RepositoryName, RepoBlobState>,
-    /// Cross-repo upload-claim holder. `Some(R)` means R is currently
+    /// Upload-claim holder. `Some(R)` means R is currently
     /// uploading (or in mount/HEAD/push for) this digest at the target.
     /// Stripped before persistence.
     #[serde(skip)]
@@ -180,11 +182,12 @@ impl BlobDedupMap {
         );
     }
 
-    /// Atomic check-and-claim on the cross-repo upload coordination slot.
+    /// Atomic check-and-claim on the upload coordination slot.
     ///
     /// Returns `ClaimAction::Claimed` if `current_repo` now holds the claim
     /// (state for `current_repo` is set to `Uploading`), or `ClaimAction::Wait`
-    /// with the existing holder's notify handle.
+    /// with the existing holder's notify handle. A holder in `current_repo`
+    /// also means wait: two images syncing into one repo share the upload.
     pub(crate) fn claim_blob_upload(
         &mut self,
         target: &str,
@@ -193,7 +196,7 @@ impl BlobDedupMap {
     ) -> ClaimAction {
         let entry = self.entry_mut(target, digest);
         match &entry.claim {
-            Some(holder) if holder != current_repo => {
+            Some(holder) => {
                 let notify = entry
                     .claim_notify
                     .get_or_insert_with(|| Rc::new(Notify::new()))
@@ -203,7 +206,7 @@ impl BlobDedupMap {
                     notify,
                 }
             }
-            _ => {
+            None => {
                 entry.claim = Some(current_repo.clone());
                 entry
                     .repos
@@ -540,6 +543,29 @@ mod tests {
         assert!(persisted.repo_state("reg.io", &d, &repo("e")).is_none());
         // d2 has no persistable entries -- the entry should be gone entirely.
         assert!(persisted.repos_iter("reg.io", &d2).next().is_none());
+    }
+
+    /// A second image syncing into the holder's own repo waits for the
+    /// holder instead of uploading the same blob alongside it.
+    #[test]
+    fn claim_held_by_same_repo_returns_wait() {
+        let mut map = BlobDedupMap::default();
+        let d = test_digest();
+
+        match map.claim_blob_upload("reg.io", &d, &repo("x")) {
+            ClaimAction::Claimed => {}
+            _ => panic!(),
+        }
+        match map.claim_blob_upload("reg.io", &d, &repo("x")) {
+            ClaimAction::Wait { holder, notify: _ } => assert_eq!(holder, repo("x")),
+            ClaimAction::Claimed => panic!("a second claim in the same repo must wait"),
+        }
+
+        map.release_blob_claim("reg.io", &d);
+        match map.claim_blob_upload("reg.io", &d, &repo("x")) {
+            ClaimAction::Claimed => {}
+            _ => panic!("a released claim is free again"),
+        }
     }
 
     /// Persistence strips the claim slot. Round-trip via postcard.

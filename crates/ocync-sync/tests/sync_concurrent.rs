@@ -169,7 +169,8 @@ async fn sync_partial_blob_failure_stops_remaining() {
 }
 
 /// Two tags (v1, v2) with identical blob digests, run at `max_concurrent = 50`.
-/// Dedup must work under real concurrency.
+/// Dedup must work under real concurrency: both tags sync into one repo, so
+/// the second waits on the first's upload claim instead of uploading too.
 #[tokio::test]
 async fn sync_concurrent_dedup_at_real_concurrency() {
     let source_server = MockServer::start().await;
@@ -244,26 +245,80 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
         .all(|r| matches!(r.status, ImageStatus::Synced));
     assert!(all_synced, "both images should sync successfully");
 
-    // Under real concurrency, both tags may race past the cache and both
-    // transfer the shared blobs. The key invariant: total blob operations
-    // equals 4 (each image has 2 blobs), both images succeed, and each
-    // source manifest is pulled exactly once (verified by wiremock expect(1)).
-    let total_transferred: u64 = report.images.iter().map(|r| r.blob_stats.transferred).sum();
+    // Each shared blob is uploaded once and skipped once.
     let total_skipped: u64 = report.images.iter().map(|r| r.blob_stats.skipped).sum();
-    assert_eq!(
-        total_transferred + total_skipped,
-        4,
-        "total blob operations should be 4 (config x2 + layer x2)"
-    );
-    // Dedup may or may not fire under concurrency (race-dependent), so
-    // assert bounds: transferred is 2..=4, skipped is 0..=2.
-    assert!(
-        (2..=4).contains(&report.stats.blobs_transferred),
-        "blobs transferred should be 2-4 under concurrent execution, got {}",
-        report.stats.blobs_transferred,
-    );
+    assert_eq!(report.stats.blobs_transferred, 2, "no blob uploaded twice");
+    assert_eq!(total_skipped, 2);
+    let received = target_server.received_requests().await.unwrap();
+    let upload_starts = received
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/v2/repo/blobs/uploads/")
+        .count();
+    assert_eq!(upload_starts, 2, "one upload session per distinct blob");
     assert_eq!(report.stats.images_synced, 2);
     // wiremock expect(1) assertions verify each source manifest was pulled exactly once.
+}
+
+/// Four tags resolving to one two-child index, synced concurrently into one
+/// repo. Each child manifest is PUT once by digest; each tag's index is PUT.
+#[tokio::test]
+async fn sync_tags_sharing_an_index_push_each_child_once() {
+    use ocync_distribution::spec::Platform;
+
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let linux = |arch: &str| Platform {
+        architecture: arch.to_string(),
+        os: "linux".to_string(),
+        variant: None,
+        os_version: None,
+        os_features: None,
+    };
+    let amd64 = ManifestBuilder::new(b"cfg-amd64")
+        .layer(b"layer-amd64")
+        .build();
+    let arm64 = ManifestBuilder::new(b"cfg-arm64")
+        .layer(b"layer-arm64")
+        .build();
+    let index = IndexBuilder::new()
+        .manifest(&amd64, Some(linux("amd64")))
+        .manifest(&arm64, Some(linux("arm64")))
+        .build();
+    let tags = ["latest", "3", "3.24", "3.24.3"];
+    for tag in tags {
+        index.mount_source(&source_server, "repo", tag).await;
+        index.mount_target(&target_server, "repo", tag).await;
+    }
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        tags.iter().map(|t| TagPair::same(*t)).collect(),
+    );
+    let report = run_sync(vec![mapping]).await;
+
+    assert_eq!(report.stats.images_synced, 4);
+    let received = target_server.received_requests().await.unwrap();
+    let puts_to = |reference: &str| {
+        let manifest_path = format!("/v2/repo/manifests/{reference}");
+        received
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path() == manifest_path)
+            .count()
+    };
+    for child in [&amd64, &arm64] {
+        assert_eq!(
+            puts_to(&child.digest.to_string()),
+            1,
+            "child {} must not be PUT once per tag",
+            child.digest
+        );
+    }
+    for tag in tags {
+        assert_eq!(puts_to(tag), 1, "tag {tag} must still get its index PUT");
+    }
 }
 
 // ---------------------------------------------------------------------------

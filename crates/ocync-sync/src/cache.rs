@@ -20,12 +20,13 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ocync_distribution::Digest;
 use ocync_distribution::spec::{PlatformFilter, RegistryAuthority, RepositoryName};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
 use crate::plan::{BlobDedupMap, ClaimAction};
@@ -113,6 +114,30 @@ pub struct SourceSnapshot {
 /// Map of [`SnapshotKey`] to [`SourceSnapshot`].
 type SourceSnapshotMap = HashMap<SnapshotKey, SourceSnapshot>;
 
+/// A child manifest pushed by digest to one (target, repo) in this run.
+type ManifestPushKey = (String, RepositoryName, Digest);
+
+/// State of a child manifest push recorded for this run.
+#[derive(Debug)]
+enum ManifestPush {
+    /// A task is pushing it; `Notify` fires when that push resolves.
+    InFlight(Rc<Notify>),
+    /// The target accepted it.
+    Pushed,
+}
+
+/// Outcome of [`TransferStateCache::claim_manifest_push`].
+#[derive(Debug)]
+pub(crate) enum ManifestClaim {
+    /// Caller now holds the push. Call `mark_manifest_pushed` on success or
+    /// `release_manifest_claim` on failure.
+    Claimed,
+    /// Another task is pushing it; await `notify` and claim again.
+    Wait(Rc<Notify>),
+    /// Already pushed to this (target, repo) in this run; skip the PUT.
+    Pushed,
+}
+
 /// Persistent transfer state cache.
 ///
 /// Wraps [`BlobDedupMap`] and adds load/persist operations so that stable blob
@@ -133,6 +158,10 @@ pub struct TransferStateCache {
     /// subscribe via `repo_committed_watch` and call `wait_for(|&v| v).await`.
     /// Fresh each run.
     repo_committed_watches: HashMap<String, HashMap<RepositoryName, watch::Sender<bool>>>,
+    /// Runtime-only: child manifests pushed by digest, so tags sharing one
+    /// index push its children once. Cleared at the start of every run, so a
+    /// manifest deleted at the target between runs is pushed again.
+    manifest_pushes: HashMap<ManifestPushKey, ManifestPush>,
 }
 
 impl TransferStateCache {
@@ -316,6 +345,58 @@ impl TransferStateCache {
         }
     }
 
+    /// Atomic check-and-claim on pushing a child manifest by digest.
+    pub(crate) fn claim_manifest_push(
+        &mut self,
+        target: &str,
+        repo: &RepositoryName,
+        digest: &Digest,
+    ) -> ManifestClaim {
+        let key = (target.to_owned(), repo.clone(), digest.clone());
+        match self.manifest_pushes.get(&key) {
+            Some(ManifestPush::Pushed) => ManifestClaim::Pushed,
+            Some(ManifestPush::InFlight(notify)) => ManifestClaim::Wait(Rc::clone(notify)),
+            None => {
+                self.manifest_pushes
+                    .insert(key, ManifestPush::InFlight(Rc::new(Notify::new())));
+                ManifestClaim::Claimed
+            }
+        }
+    }
+
+    /// Record a claimed child manifest as accepted, waking any waiters.
+    pub(crate) fn mark_manifest_pushed(
+        &mut self,
+        target: &str,
+        repo: &RepositoryName,
+        digest: &Digest,
+    ) {
+        let key = (target.to_owned(), repo.clone(), digest.clone());
+        if let Some(ManifestPush::InFlight(notify)) =
+            self.manifest_pushes.insert(key, ManifestPush::Pushed)
+        {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Drop a failed claim so a waiter claims and pushes it itself.
+    pub(crate) fn release_manifest_claim(
+        &mut self,
+        target: &str,
+        repo: &RepositoryName,
+        digest: &Digest,
+    ) {
+        let key = (target.to_owned(), repo.clone(), digest.clone());
+        if let Some(ManifestPush::InFlight(notify)) = self.manifest_pushes.remove(&key) {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Forget every child manifest push. Called at the start of each run.
+    pub(crate) fn clear_manifest_pushes(&mut self) {
+        self.manifest_pushes.clear();
+    }
+
     /// Lazy invalidation: drop the entire entry for the blob.
     pub fn invalidate_blob(&mut self, target: &str, digest: &Digest) {
         self.dedup.invalidate(target, digest);
@@ -484,6 +565,7 @@ impl TransferStateCache {
             snapshots,
             committed_repos: HashMap::new(),
             repo_committed_watches: HashMap::new(),
+            manifest_pushes: HashMap::new(),
         })
     }
 }
@@ -661,6 +743,52 @@ mod tests {
             }
             _ => panic!("y should be told to wait"),
         }
+    }
+
+    #[test]
+    fn claim_manifest_push_waits_then_skips_once_pushed() {
+        let mut cache = TransferStateCache::new();
+        let (t, r, d) = ("reg.io", repo("x"), digest());
+        assert!(matches!(
+            cache.claim_manifest_push(t, &r, &d),
+            ManifestClaim::Claimed
+        ));
+        assert!(matches!(
+            cache.claim_manifest_push(t, &r, &d),
+            ManifestClaim::Wait(_)
+        ));
+        // Another repo at the same target pushes its own copy.
+        assert!(matches!(
+            cache.claim_manifest_push(t, &repo("y"), &d),
+            ManifestClaim::Claimed
+        ));
+
+        cache.mark_manifest_pushed(t, &r, &d);
+        assert!(matches!(
+            cache.claim_manifest_push(t, &r, &d),
+            ManifestClaim::Pushed
+        ));
+
+        cache.clear_manifest_pushes();
+        assert!(matches!(
+            cache.claim_manifest_push(t, &r, &d),
+            ManifestClaim::Claimed
+        ));
+    }
+
+    #[test]
+    fn released_manifest_claim_is_free_again() {
+        let mut cache = TransferStateCache::new();
+        let (t, r, d) = ("reg.io", repo("x"), digest());
+        assert!(matches!(
+            cache.claim_manifest_push(t, &r, &d),
+            ManifestClaim::Claimed
+        ));
+        cache.release_manifest_claim(t, &r, &d);
+        assert!(matches!(
+            cache.claim_manifest_push(t, &r, &d),
+            ManifestClaim::Claimed
+        ));
     }
 
     #[test]

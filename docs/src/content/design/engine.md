@@ -214,7 +214,7 @@ The greedy set-cover provably covers every shared blob. No "uncovered follower" 
 
 ### Progressive promotion
 
-All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Cross-repo upload coordination is per-(target, digest): the first repo to arrive holds an explicit `claim` slot in `BlobInfo`; other repos wait on its `claim_notify` and re-check after release.
+All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Upload coordination is per-(target, digest): the first task to arrive holds an explicit `claim` slot in `BlobInfo`, and every other task waits on its `claim_notify` and re-checks after release. That includes a task for the holder's own repo, such as a second tag of the same image, which then finds the blob present and skips it.
 
 ### Bounded-deadline mount-source resolution
 
@@ -330,7 +330,7 @@ The ordering ensures that the Alpine base layer (referenced by 80 images) is pus
 
 On crash or interruption, the most-shared blobs have been pushed first, providing maximum mount opportunities for the next run. A crash at 50% completion with frequency ordering leaves a much more useful cache state than a crash at 50% with arbitrary ordering because the shared base layers that benefit the most images are already present at the target.
 
-Index (multi-arch) manifests have a dependency structure: child manifests must be pushed before the index. Discovery resolves the full index tree (pulling the index manifest AND all child manifests) before sending the item to execution. Execution pushes children first (each child's blobs, then child manifest), then the top-level index manifest by tag. This matches OCI spec dependency ordering.
+Index (multi-arch) manifests have a dependency structure: child manifests must be pushed before the index. Discovery resolves the full index tree (pulling the index manifest AND all child manifests) before sending the item to execution. Execution pushes children first (each child's blobs, then child manifest), then the top-level index manifest by tag. This matches OCI spec dependency ordering. Tags that share an index share its children: a child already pushed to the same target repo in this run is skipped, one still in flight is awaited, and only the index is pushed per tag.
 
 Semver ordering within each mapping means the first images to reach execution are related (`nginx:1.24`, `nginx:1.25`, `nginx:1.26`) and share ~95% of layers. The dedup map converges fast because ordering naturally front-loads shared content. Image-level ordering ("process nginx:1.26 before myapp:latest because nginx shares more layers") is correct but coarse. Blob-level ordering is finer-grained and globally optimal.
 
