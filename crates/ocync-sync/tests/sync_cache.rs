@@ -2026,3 +2026,34 @@ async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
         "the second index must not wait on blobs it can never use"
     );
 }
+
+/// A repo-failed watch is cleared at the end of a run even when cache
+/// pruning is off, so the next run in the same process does not see a stale
+/// fired watch and wait on, or mount from, a repo that never committed.
+#[tokio::test]
+async fn run_clears_repo_watches_without_cache_pruning() {
+    use ocync_sync::engine::SyncEngine;
+    use ocync_sync::progress::NullProgress;
+    use ocync_sync::staging::BlobStage;
+
+    let cache = empty_cache();
+    let repo = RepositoryName::new("repo").unwrap();
+    cache.borrow_mut().notify_repo_failed("target", &repo);
+
+    SyncEngine::new(fast_retry(), 50)
+        .with_cache_pruning(false)
+        .run(
+            Vec::new(),
+            Rc::clone(&cache),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    let watch = cache.borrow_mut().repo_committed_watch("target", &repo);
+    assert!(
+        !*watch.borrow(),
+        "the previous run's fired watch carried into the next run"
+    );
+}

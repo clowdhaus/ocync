@@ -2067,7 +2067,9 @@ fn blobs_from_manifest(source_data: &PulledManifest) -> Vec<&Descriptor> {
     }
 }
 
-/// Blobs an index child references. Nested indexes are rejected at discovery.
+/// Blobs an image manifest references. An index has none of its own:
+/// discovery rejects nested index children, and an index artifact is pushed
+/// as a manifest only.
 fn child_blobs(child: &ManifestPull) -> Vec<&Descriptor> {
     match &child.manifest {
         ManifestKind::Image(m) => collect_image_blobs(m),
