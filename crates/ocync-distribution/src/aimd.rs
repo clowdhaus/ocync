@@ -391,11 +391,22 @@ fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
     })
 }
 
+/// How a request admitted by an [`AimdPermit`] ended.
+#[derive(Debug, Clone, Copy)]
+enum Outcome {
+    Success,
+    Throttled,
+}
+
 /// State stored per AIMD window inside [`AimdController`].
 struct WindowState {
     window: AimdWindow,
-    /// Semaphore enforcing the current window limit.
+    /// Semaphore enforcing the current window limit. Never replaced: a
+    /// request queued on it must stay reachable by every later release.
     semaphore: Arc<Semaphore>,
+    /// Permits still to retire after a shrink, taken as their holders
+    /// release them. Total permits minus `owed` equals the window limit.
+    owed: usize,
     /// Optional token bucket for hard TPS ceilings (None = AIMD only).
     bucket: Option<Arc<TokenBucket>>,
 }
@@ -411,8 +422,36 @@ impl WindowState {
         Self {
             window,
             semaphore: Arc::new(Semaphore::new(limit)),
+            owed: 0,
             bucket,
         }
+    }
+
+    /// Apply `outcome` to the window, then resize the semaphore to the new
+    /// limit and return or retire `permit`. A shrink retires idle permits at
+    /// once and the rest as they are released, so requests in flight above
+    /// the new limit are not joined by new ones. Returns the old and new
+    /// limits.
+    fn settle(&mut self, outcome: Outcome, permit: OwnedSemaphorePermit) -> (usize, usize) {
+        let old_limit = self.window.limit();
+        match outcome {
+            Outcome::Success => self.window.on_success(),
+            Outcome::Throttled => self.window.on_throttle(),
+        }
+        let new_limit = self.window.limit();
+        if new_limit > old_limit {
+            let repaid = self.owed.min(new_limit - old_limit);
+            self.owed -= repaid;
+            self.semaphore.add_permits(new_limit - old_limit - repaid);
+        } else {
+            self.owed += old_limit - new_limit;
+        }
+        if self.owed > 0 {
+            permit.forget();
+            self.owed -= 1;
+        }
+        self.owed -= self.semaphore.forget_permits(self.owed);
+        (old_limit, new_limit)
     }
 }
 
@@ -502,7 +541,7 @@ impl AimdController {
             windows: &self.windows,
             aggregate_permit,
             action_permit: Some(action_permit),
-            reported: false,
+            outcome: Outcome::Success,
             host: self.host.clone(),
             action: op,
         }
@@ -524,22 +563,23 @@ impl AimdController {
 
 /// RAII permit returned by [`AimdController::acquire`].
 ///
-/// Must be resolved by calling [`success`](AimdPermit::success) or
-/// [`throttled`](AimdPermit::throttled) before the permit is dropped. If
-/// dropped without a report, the outcome is treated as a success - non-rate-limit
-/// errors (network timeouts, auth failures) should not penalise the window.
+/// Resolved by [`success`](AimdPermit::success) or
+/// [`throttled`](AimdPermit::throttled); the window is updated when the
+/// permit drops. Dropped unresolved, the outcome is a success:
+/// non-rate-limit errors (network timeouts, auth failures) must not penalise
+/// the window.
 pub struct AimdPermit<'a> {
     key: WindowKey,
     windows: &'a Mutex<HashMap<WindowKey, WindowState>>,
     /// Held for RAII: returned to the aggregate semaphore on drop.
     #[allow(dead_code)]
     aggregate_permit: OwnedSemaphorePermit,
-    /// `Option` so `throttled()` can forget the permit to shrink the semaphore.
+    /// `Option` so `drop` can hand the permit to [`WindowState::settle`].
     action_permit: Option<OwnedSemaphorePermit>,
-    reported: bool,
-    /// Registry hostname for diagnostic logging in [`throttled`](Self::throttled).
+    outcome: Outcome,
+    /// Registry hostname for diagnostic logging on a halving.
     host: String,
-    /// The operation type for diagnostic logging in [`throttled`](Self::throttled).
+    /// The operation type for diagnostic logging on a halving.
     action: RegistryAction,
 }
 
@@ -547,93 +587,43 @@ impl std::fmt::Debug for AimdPermit<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AimdPermit")
             .field("key", &self.key)
-            .field("reported", &self.reported)
+            .field("outcome", &self.outcome)
             .finish_non_exhaustive()
     }
 }
 
-impl<'a> AimdPermit<'a> {
+impl AimdPermit<'_> {
     /// Report a successful response and release both permits.
-    pub fn success(mut self) {
-        self.reported = true;
-        if let Some(state) = self
-            .windows
-            .lock()
-            .expect("aimd lock poisoned")
-            .get_mut(&self.key)
-        {
-            let old_limit = state.window.limit();
-            state.window.on_success();
-            let new_limit = state.window.limit();
-            // Grow the semaphore if the window expanded.
-            if new_limit > old_limit {
-                state.semaphore.add_permits(new_limit - old_limit);
-            }
-        }
-    }
+    pub fn success(self) {}
 
     /// Report a 429 throttle response and release both permits.
     ///
     /// Triggers a multiplicative decrease in the per-action window (subject to
-    /// the congestion epoch). When the window shrinks, the per-action semaphore
-    /// is replaced with a new one sized to the new limit. Outstanding permits
-    /// from the old semaphore complete naturally - they hold their own `Arc`
-    /// reference and won't interfere with the new semaphore. This mirrors TCP
-    /// congestion control: the window shrinks immediately but packets already
-    /// in flight are not recalled.
+    /// the congestion epoch).
     pub fn throttled(mut self) {
-        self.reported = true;
-        if let Some(state) = self
-            .windows
-            .lock()
-            .expect("aimd lock poisoned")
-            .get_mut(&self.key)
-        {
-            let old_limit = state.window.limit();
-            state.window.on_throttle();
-            let new_limit = state.window.limit();
-            if new_limit < old_limit {
-                tracing::warn!(
-                    registry = %self.host,
-                    action = ?self.action,
-                    old_window = old_limit,
-                    new_window = new_limit,
-                    "AIMD halved on 429"
-                );
-                // Replace the semaphore so new acquires are bounded by the
-                // reduced limit. Forget our permit so it doesn't return to
-                // the old (now-orphaned) semaphore.
-                state.semaphore = Arc::new(Semaphore::new(new_limit));
-                if let Some(permit) = self.action_permit.take() {
-                    permit.forget();
-                }
-            }
-        }
+        self.outcome = Outcome::Throttled;
     }
 }
 
 impl Drop for AimdPermit<'_> {
     fn drop(&mut self) {
-        // Treat unreported drops as success - errors unrelated to rate limits
-        // (timeouts, auth failures, etc.) should not shrink the window.
-        if !self.reported {
-            if let Some(state) = self
-                .windows
-                .lock()
-                .expect("aimd lock poisoned")
-                .get_mut(&self.key)
-            {
-                let old_limit = state.window.limit();
-                state.window.on_success();
-                let new_limit = state.window.limit();
-                // Grow the semaphore if the window expanded.
-                if new_limit > old_limit {
-                    state.semaphore.add_permits(new_limit - old_limit);
-                }
-            }
+        let Some(permit) = self.action_permit.take() else {
+            return;
+        };
+        let mut windows = self.windows.lock().expect("aimd lock poisoned");
+        let Some(state) = windows.get_mut(&self.key) else {
+            return;
+        };
+        let (old_window, new_window) = state.settle(self.outcome, permit);
+        if new_window < old_window {
+            tracing::warn!(
+                registry = %self.host,
+                action = ?self.action,
+                old_window,
+                new_window,
+                "AIMD halved on 429"
+            );
         }
-        // aggregate_permit and action_permit are dropped automatically
-        // (Rust drops fields in declaration order).
     }
 }
 
@@ -1074,9 +1064,9 @@ mod tests {
 
     #[tokio::test(start_paused = true, flavor = "current_thread")]
     async fn aimd_halving_preserves_bucket_state() {
-        // AIMD halving rebuilds the per-action Semaphore (the action_permit is
-        // forgotten). The bucket must NOT be rebuilt -- it represents an
-        // independent rate-cap concern that survives concurrency adjustment.
+        // AIMD halving shrinks the per-action Semaphore. The bucket must NOT
+        // be rebuilt -- it represents an independent rate-cap concern that
+        // survives concurrency adjustment.
         // Regression: a future refactor that rebuilds bucket on halving would
         // restore burst tokens and re-enable over-cap traffic exactly when the
         // registry has signalled it cannot handle current load.
@@ -1101,5 +1091,85 @@ mod tests {
             waited >= std::time::Duration::from_secs_f64(1.0 / 80.0),
             "bucket pacing must survive AIMD halving, got {waited:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiters_queued_before_a_halving_are_still_admitted() {
+        // ECR manifest HEADs have no token bucket, so only the window gates.
+        let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 100);
+        let op = RegistryAction::ManifestHead;
+        let past_epoch = DEFAULT_EPOCH + Duration::from_millis(5);
+        let admitted = Duration::from_secs(1);
+
+        ctrl.acquire(op).await.success();
+        assert_eq!(ctrl.window_limit(op), 2);
+        let first = ctrl.acquire(op).await;
+        let second = ctrl.acquire(op).await;
+        let mut third = Box::pin(ctrl.acquire(op));
+        let mut fourth = Box::pin(ctrl.acquire(op));
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut third)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut fourth)
+                .await
+                .is_err()
+        );
+
+        // Halve, grow back, halve again: each halving is reported by a
+        // request admitted before it, while `fourth` is still queued.
+        tokio::time::sleep(past_epoch).await;
+        first.throttled();
+        second.success();
+        let third = tokio::time::timeout(admitted, third)
+            .await
+            .expect("third admitted after second released");
+        tokio::time::sleep(past_epoch).await;
+        third.throttled();
+        assert_eq!(ctrl.window_limit(op), 1);
+
+        tokio::time::timeout(admitted, fourth)
+            .await
+            .expect("a waiter queued before the halvings must not be stranded")
+            .success();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn halving_holds_new_requests_until_in_flight_drops_below_limit() {
+        let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 100);
+        let op = RegistryAction::ManifestHead;
+        for _ in 0..4 {
+            ctrl.acquire(op).await.success();
+        }
+        assert_eq!(ctrl.window_limit(op), 4);
+        let in_flight = [
+            ctrl.acquire(op).await,
+            ctrl.acquire(op).await,
+            ctrl.acquire(op).await,
+            ctrl.acquire(op).await,
+        ];
+
+        tokio::time::sleep(DEFAULT_EPOCH + Duration::from_millis(5)).await;
+        let [first, second, _third, _fourth] = in_flight;
+        first.throttled();
+        assert_eq!(ctrl.window_limit(op), 2);
+        let mut next = Box::pin(ctrl.acquire(op));
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut next)
+                .await
+                .is_err(),
+            "three in flight against a limit of two must not admit a fourth"
+        );
+
+        // The success grows the window to 3 and releases its permit, leaving
+        // two in flight.
+        second.success();
+        assert_eq!(ctrl.window_limit(op), 3);
+        tokio::time::timeout(Duration::ZERO, next)
+            .await
+            .expect("admitted once in flight drops below the limit")
+            .success();
     }
 }
