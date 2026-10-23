@@ -39,16 +39,6 @@ pub(crate) fn registry_origin(registry: &url::Url) -> String {
     registry.origin().ascii_serialization()
 }
 
-/// Host of a registry's base URL, with its port when one is given: the name
-/// credentials and token services know the registry by.
-pub(crate) fn registry_host(registry: &url::Url) -> String {
-    let host = registry.host_str().unwrap_or_default();
-    match registry.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_owned(),
-    }
-}
-
 /// Tokens are proactively refreshed when their remaining lifetime drops
 /// below this window. Must be shorter than the shortest token TTL we
 /// encounter (Docker Hub returns 300s). The prior value of 15 minutes
@@ -284,17 +274,6 @@ mod tests {
 
     /// Credentials and token services know a registry by its host, with the
     /// port only when one is written.
-    #[test]
-    fn registry_host_keeps_only_an_explicit_port() {
-        for (url, host) in [
-            ("http://localhost:5000", "localhost:5000"),
-            ("https://ghcr.io", "ghcr.io"),
-            ("https://registry.example.com/", "registry.example.com"),
-        ] {
-            assert_eq!(registry_host(&url.parse().unwrap()), host, "{url}");
-        }
-    }
-
     #[test]
     fn scope_display_single_action() {
         let scope = Scope::pull("library/nginx");

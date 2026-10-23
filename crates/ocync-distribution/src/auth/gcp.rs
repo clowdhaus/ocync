@@ -22,9 +22,7 @@ use std::time::Duration;
 use super::ecr::SdkCredentialCache;
 use super::token_cache::TokenCache;
 use super::token_exchange;
-use super::{
-    AuthProvider, Credentials, Scope, Token, registry_host, registry_origin, scopes_cache_key,
-};
+use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 
 /// Username for GCP `OAuth2` token exchange.
@@ -127,7 +125,7 @@ impl GcpAuth {
     /// refreshed automatically when approaching expiry.
     /// `registry` is the base URL the registry's client uses.
     pub async fn new(registry: &url::Url, http: reqwest::Client) -> Result<Self, Error> {
-        let hostname = registry_host(registry);
+        let hostname = registry.host_str().unwrap_or_default().to_owned();
         let credentials = google_cloud_auth::credentials::Builder::default()
             .with_scopes(["https://www.googleapis.com/auth/devstorage.read_write"])
             .build_access_token_credentials()

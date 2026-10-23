@@ -536,3 +536,24 @@ async fn configured_http_registry_is_reached_over_http() {
         assert_eq!(tags, ["v1"]);
     }
 }
+
+#[test]
+fn reference_host_resolves_to_its_config_entry() {
+    let registries = [
+        config("http://localhost:5000", None),
+        config("registry-1.docker.io", None),
+    ];
+    for (host, url) in [
+        ("localhost:5000", "http://localhost:5000"),
+        ("docker.io", "registry-1.docker.io"),
+    ] {
+        let Registry::Configured(found) = Registry::resolve(&registries, host) else {
+            panic!("{host} should match its config entry");
+        };
+        assert_eq!(found.url, url, "{host}");
+    }
+    assert!(matches!(
+        Registry::resolve(&registries, "https://ghcr.io/"),
+        Registry::Host("ghcr.io")
+    ));
+}

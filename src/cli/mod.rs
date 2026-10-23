@@ -187,6 +187,7 @@ pub(crate) fn endpoint_host(hostname: &str) -> &str {
 }
 
 /// The registry a client is built for.
+#[derive(Clone, Copy)]
 pub(crate) enum Registry<'a> {
     /// A registry entry from the config file: its `url`, scheme included,
     /// and its auth settings.
@@ -194,6 +195,27 @@ pub(crate) enum Registry<'a> {
     /// A bare host from an image reference that no config entry matches.
     /// Reached over HTTPS with auth auto-detected from the host.
     Host(&'a str),
+}
+
+impl<'a> Registry<'a> {
+    /// The entry in `registries` for an image reference's registry `host`,
+    /// matched after the Docker Hub endpoint rewrite, else the bare host.
+    pub(crate) fn resolve(registries: &'a [RegistryConfig], host: &'a str) -> Self {
+        let host = bare_hostname(host);
+        let endpoint = endpoint_host(host);
+        registries
+            .iter()
+            .find(|r| endpoint_host(bare_hostname(&r.url)) == endpoint)
+            .map_or(Self::Host(host), Self::Configured)
+    }
+
+    /// The config entry, when the registry has one.
+    pub(crate) fn config(self) -> Option<&'a RegistryConfig> {
+        match self {
+            Self::Configured(config) => Some(config),
+            Self::Host(_) => None,
+        }
+    }
 }
 
 /// Build a [`RegistryClient`] for `registry`, using the appropriate auth
@@ -206,17 +228,19 @@ pub(crate) async fn build_registry_client(
     // entry point installs this at `main` startup; this call covers
     // test entry points and any future caller that bypasses main.
     ocync_distribution::install_crypto_provider();
-    let (address, registry_config) = match registry {
-        Registry::Configured(config) => (config.url.as_str(), Some(config)),
-        Registry::Host(host) => (host, None),
+    let registry_config = registry.config();
+    let (bare_host, address) = match registry {
+        Registry::Configured(config)
+            if config.url.starts_with("http://") || config.url.starts_with("https://") =>
+        {
+            (bare_hostname(&config.url), config.url.clone())
+        }
+        Registry::Configured(RegistryConfig { url: host, .. }) => {
+            (host.as_str(), format!("https://{host}"))
+        }
+        Registry::Host(host) => (host, format!("https://{host}")),
     };
-    let bare_host = bare_hostname(address);
-    let with_scheme = if address.starts_with("http://") || address.starts_with("https://") {
-        address.to_owned()
-    } else {
-        format!("https://{address}")
-    };
-    let mut url = Url::parse(&with_scheme)
+    let mut url = Url::parse(&address)
         .map_err(|e| CliError::Input(format!("invalid registry URL '{address}': {e}")))?;
     // Requests go to the endpoint host while `bare_host` stays the auth scope
     // and service. Docker Hub requires this split: requests go to
@@ -286,7 +310,7 @@ pub(crate) async fn build_registry_client(
                     "failed to load docker config for '{bare_host}': {e}"
                 ))
             })?;
-            let auth = DockerConfigAuth::new(&url, &docker_config, http).await?;
+            let auth = DockerConfigAuth::new(&url, endpoint, &docker_config, http).await?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Anonymous) => {
@@ -326,13 +350,13 @@ pub(crate) async fn build_registry_client(
                     // Try docker config - falls back to anonymous exchange if no creds found.
                     match DockerConfig::load_default() {
                         Ok(config) => {
-                            let auth = DockerConfigAuth::new(&url, &config, http).await.map_err(
-                                |e| {
-                                    CliError::Auth(format!(
-                                        "docker config credential resolution for '{bare_host}': {e}"
-                                    ))
-                                },
-                            )?;
+                            let auth = DockerConfigAuth::new(&url, endpoint, &config, http)
+                                .await
+                                .map_err(|e| {
+                                CliError::Auth(format!(
+                                    "docker config credential resolution for '{bare_host}': {e}"
+                                ))
+                            })?;
                             RegistryClient::builder(url).auth(auth)
                         }
                         Err(_) => {
