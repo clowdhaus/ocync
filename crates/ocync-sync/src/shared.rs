@@ -230,8 +230,6 @@ pub(crate) struct PerRun {
     pub(crate) referrers: RefCell<Work<SourceManifestKey, Referrers>>,
     /// Artifacts (manifest and blobs) copied by digest to a target repo.
     pub(crate) artifact_pushes: RefCell<Work<CopyKey, ()>>,
-    /// Artifact blobs copied by digest to a target repo.
-    pub(crate) artifact_blobs: RefCell<Work<CopyKey, ()>>,
     /// Blob copies that failed after their retries. A task copying the same
     /// blob between the same repos reports this error instead of repeating
     /// the copy.

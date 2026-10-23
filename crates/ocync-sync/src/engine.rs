@@ -1760,7 +1760,8 @@ async fn execute_item(
         batch_checker: item.batch_checker.as_ref(),
         mount_source_wait_deadline,
     };
-    let outcome = transfer_image_blobs(&ctx, &item.source_data, freq_counts).await;
+    let outcome =
+        transfer_image_blobs(&ctx, blobs_from_manifest(&item.source_data), freq_counts).await;
 
     if let Some(err) = outcome.error {
         warn!(target_name = %item.target_name, error = %err, "blob transfer failed");
@@ -1797,7 +1798,7 @@ async fn execute_item(
                 .mark_repo_committed(&item.target_name, &item.target.repo);
 
             // Discover and sync artifacts (signatures, SBOMs, attestations).
-            let artifacts_skipped = match discover_and_sync_artifacts(&item, retry, shared).await {
+            let artifacts_skipped = match discover_and_sync_artifacts(&ctx, &item).await {
                 Ok(skipped) => skipped,
                 Err(err) => {
                     let (kind, retries) = if err.is_required_artifacts_missing() {
@@ -2250,11 +2251,9 @@ struct TransferContext<'a> {
 /// the cache first.
 async fn transfer_image_blobs(
     ctx: &TransferContext<'_>,
-    source_data: &PulledManifest,
+    mut blobs: Vec<&Descriptor>,
     freq_counts: &HashMap<Digest, usize>,
 ) -> TargetBlobOutcome {
-    let mut blobs: Vec<&Descriptor> = blobs_from_manifest(source_data);
-
     // Sort by descending frequency (most-shared first for maximum cache benefit).
     // Rust's sort_by is stable, so blobs with equal frequency preserve their
     // original manifest order (config first, then layers).
@@ -2943,10 +2942,10 @@ async fn push_manifest(
 /// Returns `Ok(true)` when artifact discovery was skipped due to a transient
 /// error (the image synced but artifacts may be missing at the target).
 async fn discover_and_sync_artifacts(
+    ctx: &TransferContext<'_>,
     item: &TransferTask,
-    retry: &RetryConfig,
-    shared: &PerRun,
 ) -> Result<bool, crate::Error> {
+    let shared = ctx.shared;
     let artifacts_config = &item.artifacts_config;
     let source_client = &item.source_client;
     let source_repo = &item.source.repo;
@@ -3016,7 +3015,7 @@ async fn discover_and_sync_artifacts(
             &desc.digest,
         );
         run_once(&shared.artifact_pushes, push_key, || {
-            sync_artifact(item, retry, shared, desc)
+            sync_artifact(ctx, item, desc)
         })
         .await?;
     }
@@ -3027,15 +3026,13 @@ async fn discover_and_sync_artifacts(
 /// Copy one artifact from the source to the target repo: pull manifest,
 /// push blobs, push manifest.
 async fn sync_artifact(
+    ctx: &TransferContext<'_>,
     item: &TransferTask,
-    retry: &RetryConfig,
-    shared: &PerRun,
     desc: &Descriptor,
 ) -> Result<(), crate::Error> {
+    let (retry, shared) = (ctx.retry, ctx.shared);
     let source_client = &item.source_client;
-    let target_client = &item.target_client;
     let source_repo = &item.source.repo;
-    let target_repo = &item.target.repo;
     let artifact_digest_str = desc.digest.to_string();
 
     // Pull the artifact manifest from source, once per run across targets.
@@ -3053,117 +3050,30 @@ async fn sync_artifact(
     })
     .await?;
 
-    // Push artifact blobs.
-    let mut blob_digests: Vec<Digest> = Vec::new();
-    if let ManifestKind::Image(ref manifest) = artifact_pull.manifest {
-        let blobs: Vec<&Descriptor> = collect_image_blobs(manifest);
-        blob_digests = blobs.iter().map(|b| b.digest.clone()).collect();
-
-        // Batch-check pre-population (mirrors `transfer_image_blobs`).
-        // When a batch checker is configured (production: ECR),
-        // skip per-blob HEAD calls for blobs the batch API already
-        // reports present at the target.
-        let already_present: HashSet<Digest> = match item.batch_checker.as_deref() {
-            Some(checker) => match checker
-                .check_blob_existence(target_repo, &blob_digests)
-                .await
-            {
-                Ok(existing) => existing,
-                Err(e) => {
-                    warn!(
-                        target_repo = %target_repo,
-                        artifact_digest = %artifact_digest_str,
-                        error = %e,
-                        "artifact batch check failed, falling back to per-blob HEAD"
-                    );
-                    HashSet::new()
-                }
-            },
-            None => HashSet::new(),
-        };
-
-        // Pull+push missing blobs concurrently, capped by BLOB_CONCURRENCY.
-        let blob_sem = Semaphore::new(BLOB_CONCURRENCY);
-        let mut blob_futures = FuturesUnordered::new();
-        for blob in blobs {
-            let blob_digest = blob.digest.clone();
-            let blob_size = blob.size;
-            let blob_already_present = already_present.contains(&blob.digest);
-            let sem = &blob_sem;
-            let artifact_digest_str = artifact_digest_str.clone();
-            let key = copy_key(
-                source_client,
-                source_repo,
-                &item.target_name,
-                target_repo,
-                &blob.digest,
-            );
-            // Once per (source repo, target repo) per run: artifacts often
-            // share a blob, such as the empty config.
-            blob_futures.push(run_once(&shared.artifact_blobs, key, move || async move {
-                // For batch-already-present blobs, skip the HEAD and
-                // any pull/push: the batch API already confirmed
-                // visibility. Otherwise do a HEAD check (covers
-                // non-batch-checker targets) and only pull+push on
-                // 404.
-                if !blob_already_present {
-                    let exists = target_client
-                        .blob_exists(target_repo, &blob_digest)
-                        .await
-                        .unwrap_or(None);
-                    if exists.is_none() {
-                        let _permit = sem.acquire().await.expect("sem closed");
-                        let stream = with_retry(retry, "artifact blob pull", || {
-                            source_client.blob_pull(source_repo, &blob_digest)
-                        })
-                        .await
-                        .map_err(|e| crate::Error::ArtifactSync {
-                            reference: artifact_digest_str.clone(),
-                            reason: format!("blob pull failed for {blob_digest}: {e}"),
-                        })?;
-                        target_client
-                            .blob_push_stream(target_repo, &blob_digest, Some(blob_size), stream)
-                            .await
-                            .map_err(|e| crate::Error::ArtifactSync {
-                                reference: artifact_digest_str.clone(),
-                                reason: format!("blob push failed for {blob_digest}: {e}"),
-                            })?;
-                    }
-                }
-                Ok::<(), crate::Error>(())
-            }));
-        }
-        // Fail-fast on first error: dropping `blob_futures` cancels
-        // in-flight blob HTTP. This is deliberately asymmetric with
-        // `transfer_image_blobs` (which uses a `cancel: Cell<bool>`
-        // flag so all blobs finish for stats / notify-failed
-        // bookkeeping). Artifacts have no per-blob stats, a dropped
-        // shared copy frees its claim for the next task, and the caller at
-        // `process_one_target` already treats artifact-sync errors
-        // as a non-fatal warning -- so cancelling the rest is
-        // cheaper than draining them after we've already decided
-        // to fail the artifact.
-        while let Some(result) = blob_futures.next().await {
-            result?;
-        }
+    // Artifact blobs take the image blob path: claimed, mounted, staged
+    // and recorded like any other blob copy. Byte and blob counts stay out
+    // of the image's report, as an artifact can be shared by many images.
+    let blobs = child_blobs(&artifact_pull);
+    let blob_digests: Vec<Digest> = blobs.iter().map(|b| b.digest.clone()).collect();
+    if let Some(err) = transfer_image_blobs(ctx, blobs, &HashMap::new())
+        .await
+        .error
+    {
+        return Err(crate::Error::ArtifactSync {
+            reference: artifact_digest_str.clone(),
+            reason: format!("blob copy failed: {err}"),
+        });
     }
 
     wait_for_commit(item, retry, &blob_digests).await;
 
     // Push artifact manifest by digest (not by tag).
-    with_retry(retry, "artifact manifest push", || {
-        target_client.manifest_push(
-            target_repo,
-            &artifact_digest_str,
-            &artifact_pull.media_type,
-            &artifact_pull.raw_bytes,
-        )
-    })
-    .await
-    .map_err(|e| crate::Error::ArtifactSync {
-        reference: artifact_digest_str.clone(),
-        reason: format!("manifest push failed: {e}"),
-    })?;
+    push_manifest(retry, item, &artifact_digest_str, &artifact_pull)
+        .await
+        .map_err(|e| crate::Error::ArtifactSync {
+            reference: artifact_digest_str.clone(),
+            reason: format!("manifest push failed: {e}"),
+        })?;
 
     debug!(
         repo = %source_repo,

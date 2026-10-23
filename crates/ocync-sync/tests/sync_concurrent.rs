@@ -116,15 +116,15 @@ async fn sync_partial_blob_failure_stops_remaining() {
     mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
     mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
 
-    // Config blob push succeeds (POST/PUT monolithic for small blobs).
-    // Use query_param to match the config blob's finalization PUT.
+    // Both uploads start; the config's finalization PUT succeeds and the
+    // layer's returns 403 (non-retryable). Matched by digest, so the order
+    // the two blobs upload in does not matter.
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
         .respond_with(
             ResponseTemplate::new(202)
                 .insert_header("location", "/v2/repo/blobs/uploads/partial-id"),
         )
-        .up_to_n_times(1)
         .mount(&target_server)
         .await;
     Mock::given(method("PUT"))
@@ -133,10 +133,12 @@ async fn sync_partial_blob_failure_stops_remaining() {
         .respond_with(ResponseTemplate::new(201))
         .mount(&target_server)
         .await;
-
-    // Layer blob push POST returns 403 (non-retryable).
-    Mock::given(method("POST"))
-        .and(path("/v2/repo/blobs/uploads/"))
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/blobs/uploads/partial-id"))
+        .and(query_param(
+            "digest",
+            parts.layer_descs[0].digest.to_string(),
+        ))
         .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
         .mount(&target_server)
         .await;
