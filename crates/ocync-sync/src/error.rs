@@ -1,5 +1,7 @@
 //! Error types for sync operations.
 
+use std::sync::Arc;
+
 use ocync_distribution::Digest;
 use thiserror::Error;
 
@@ -83,6 +85,11 @@ pub enum Error {
         /// Why the artifact sync failed.
         reason: String,
     },
+
+    /// A failure recorded once and reported by every image that needed the
+    /// same work, such as tags sharing one child manifest push.
+    #[error(transparent)]
+    Shared(Arc<Error>),
 }
 
 impl Error {
@@ -92,6 +99,7 @@ impl Error {
             Self::Manifest { source, .. } | Self::BlobTransfer { source, .. } => {
                 source.status_code()
             }
+            Self::Shared(err) => err.status_code(),
             _ => None,
         }
     }
@@ -231,6 +239,22 @@ mod tests {
             },
         };
         assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[test]
+    fn shared_error_keeps_message_and_status_code() {
+        let err = Error::Shared(Arc::new(Error::Manifest {
+            reference: "sha256:abc".into(),
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::BAD_REQUEST,
+                message: "denied".into(),
+            },
+        }));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(
+            err.to_string(),
+            "manifest operation failed for sha256:abc: registry returned 400 Bad Request: denied"
+        );
     }
 
     #[test]

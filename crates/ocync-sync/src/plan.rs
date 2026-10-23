@@ -1,4 +1,4 @@
-//! Per-(repo) blob state and cross-repo upload-claim coordination for mount support.
+//! Per-(repo) blob state and upload-claim coordination for mount support.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -216,8 +216,8 @@ impl BlobDedupMap {
         }
     }
 
-    /// Release the cross-repo upload claim, firing `claim_notify` to wake
-    /// any waiting repos. Called by the holder on terminal outcome.
+    /// Release the upload claim, firing `claim_notify` to wake any waiting
+    /// tasks. Called by the holder on terminal outcome.
     pub(crate) fn release_blob_claim(&mut self, target: &str, digest: &Digest) {
         if let Some(index) = self.inner.get_mut(target) {
             if let Some(info) = index.get_mut(digest) {
@@ -227,17 +227,6 @@ impl BlobDedupMap {
                 }
             }
         }
-    }
-
-    /// Return the current claim holder, if any, excluding `current_repo`.
-    pub(crate) fn claim_holder<'a>(
-        &'a self,
-        target: &str,
-        digest: &Digest,
-        current_repo: &RepositoryName,
-    ) -> Option<&'a RepositoryName> {
-        let info = self.inner.get(target)?.get(digest)?;
-        info.claim.as_ref().filter(|h| *h != current_repo)
     }
 
     /// Iterate `(repo, state)` pairs for a blob at a target.
@@ -376,7 +365,10 @@ mod tests {
             Some(&RepoBlobState::Verified),
         );
         // Claim is still X.
-        assert_eq!(map.claim_holder("reg.io", &d, &repo("z")), Some(&repo("x")),);
+        match map.claim_blob_upload("reg.io", &d, &repo("z")) {
+            ClaimAction::Wait { holder, notify: _ } => assert_eq!(holder, repo("x")),
+            ClaimAction::Claimed => panic!("X's claim must still be held"),
+        }
     }
 
     /// `set_blob_failed` at one repo must not release another repo's claim.
@@ -394,7 +386,10 @@ mod tests {
         map.set_blob_failed("reg.io", &d, &repo("y"), "io error".into());
 
         // Claim is still X.
-        assert_eq!(map.claim_holder("reg.io", &d, &repo("z")), Some(&repo("x")),);
+        match map.claim_blob_upload("reg.io", &d, &repo("z")) {
+            ClaimAction::Wait { holder, notify: _ } => assert_eq!(holder, repo("x")),
+            ClaimAction::Claimed => panic!("X's claim must still be held"),
+        }
         // X's state is unchanged.
         assert_eq!(
             map.repo_state("reg.io", &d, &repo("x")),
@@ -464,7 +459,10 @@ mod tests {
             map.repo_state("reg.io", &d, &repo("y")),
             Some(&RepoBlobState::Completed),
         );
-        assert!(map.claim_holder("reg.io", &d, &repo("z")).is_none());
+        match map.claim_blob_upload("reg.io", &d, &repo("z")) {
+            ClaimAction::Claimed => {}
+            ClaimAction::Wait { .. } => panic!("a released claim is free again"),
+        }
     }
 
     /// `mark_blob_repo_stale` transitions Completed to Failed; subsequent

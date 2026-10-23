@@ -223,3 +223,7 @@ aws_secret_access_key = ...
 The AWS SDK reads the file from `~/.aws/credentials` by default, or from the path in `AWS_SHARED_CREDENTIALS_FILE`. The file does not need a `[default]` section — the ambient chain skips the file entirely when no profile is named, so Pod Identity / IRSA still serves `my-source`.
 
 For Kubernetes deployments, see the AWS shared-config files section of [Kubernetes secrets](/registries/secrets) for two production-grade injection patterns (External Secrets Operator and CSI Secrets Store).
+
+## CloudTrail errors on repeated pushes
+
+ECR answers a manifest PUT or blob upload for content the repository already holds with `201 Created`, but CloudTrail records the call as `ImageAlreadyExistsException` or `LayerAlreadyExistsException`. The sync succeeds and ocync reports no failure. ocync pushes each blob and child manifest once per repository per run, so tags sharing one index do not cause these entries. They still appear when a new index is pushed whose child manifests the repository already holds from an earlier run.

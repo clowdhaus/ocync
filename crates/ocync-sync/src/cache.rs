@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ocync_distribution::Digest;
@@ -124,18 +125,23 @@ enum ManifestPush {
     InFlight(Rc<Notify>),
     /// The target accepted it.
     Pushed,
+    /// The push failed after its retries. Every later claim reports this
+    /// error rather than pushing the same bytes against the same failure.
+    Failed(Arc<crate::Error>),
 }
 
 /// Outcome of [`TransferStateCache::claim_manifest_push`].
 #[derive(Debug)]
 pub(crate) enum ManifestClaim {
     /// Caller now holds the push. Call `mark_manifest_pushed` on success or
-    /// `release_manifest_claim` on failure.
+    /// `mark_manifest_failed` on failure.
     Claimed,
     /// Another task is pushing it; await `notify` and claim again.
     Wait(Rc<Notify>),
     /// Already pushed to this (target, repo) in this run; skip the PUT.
     Pushed,
+    /// Already failed for this (target, repo) in this run; report this error.
+    Failed(Arc<crate::Error>),
 }
 
 /// Persistent transfer state cache.
@@ -178,17 +184,6 @@ impl TransferStateCache {
     /// Whether the blob is present (Verified or Completed) at the given (target, repo).
     pub fn blob_present_at(&self, target: &str, digest: &Digest, repo: &RepositoryName) -> bool {
         self.dedup.blob_present_at(target, digest, repo)
-    }
-
-    /// The current cross-repo upload-claim holder for this digest, excluding
-    /// `current_repo`. Replaces `blob_in_progress_uploader`.
-    pub fn blob_claim_for<'a>(
-        &'a self,
-        target: &str,
-        digest: &Digest,
-        current_repo: &RepositoryName,
-    ) -> Option<&'a RepositoryName> {
-        self.dedup.claim_holder(target, digest, current_repo)
     }
 
     /// Atomic check-and-claim on the upload-coordination slot.
@@ -356,6 +351,7 @@ impl TransferStateCache {
         match self.manifest_pushes.get(&key) {
             Some(ManifestPush::Pushed) => ManifestClaim::Pushed,
             Some(ManifestPush::InFlight(notify)) => ManifestClaim::Wait(Rc::clone(notify)),
+            Some(ManifestPush::Failed(err)) => ManifestClaim::Failed(Arc::clone(err)),
             None => {
                 self.manifest_pushes
                     .insert(key, ManifestPush::InFlight(Rc::new(Notify::new())));
@@ -379,15 +375,19 @@ impl TransferStateCache {
         }
     }
 
-    /// Drop a failed claim so a waiter claims and pushes it itself.
-    pub(crate) fn release_manifest_claim(
+    /// Record a claimed child manifest as failed for the rest of the run,
+    /// waking any waiters to report `err`.
+    pub(crate) fn mark_manifest_failed(
         &mut self,
         target: &str,
         repo: &RepositoryName,
         digest: &Digest,
+        err: Arc<crate::Error>,
     ) {
         let key = (target.to_owned(), repo.clone(), digest.clone());
-        if let Some(ManifestPush::InFlight(notify)) = self.manifest_pushes.remove(&key) {
+        if let Some(ManifestPush::InFlight(notify)) =
+            self.manifest_pushes.insert(key, ManifestPush::Failed(err))
+        {
             notify.notify_waiters();
         }
     }
@@ -777,14 +777,21 @@ mod tests {
     }
 
     #[test]
-    fn released_manifest_claim_is_free_again() {
+    fn failed_manifest_push_fails_later_claims_until_cleared() {
         let mut cache = TransferStateCache::new();
         let (t, r, d) = ("reg.io", repo("x"), digest());
         assert!(matches!(
             cache.claim_manifest_push(t, &r, &d),
             ManifestClaim::Claimed
         ));
-        cache.release_manifest_claim(t, &r, &d);
+        cache.mark_manifest_failed(t, &r, &d, Arc::new(crate::Error::LatestWithoutSort));
+        assert!(matches!(
+            cache.claim_manifest_push(t, &r, &d),
+            ManifestClaim::Failed(_)
+        ));
+
+        // A failure never carries into the next run.
+        cache.clear_manifest_pushes();
         assert!(matches!(
             cache.claim_manifest_push(t, &r, &d),
             ManifestClaim::Claimed

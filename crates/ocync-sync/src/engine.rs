@@ -2380,7 +2380,7 @@ async fn wait_for_blob_claim(
                     %digest,
                     holder = %holder,
                     target = %ctx.target_name,
-                    "waiting for in-flight upload to complete before mounting",
+                    "waiting for in-flight upload of this blob to finish",
                 );
                 notify.notified().await;
                 // Re-check skip on wake -- a batch_check could have populated
@@ -2699,7 +2699,9 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
 ///
 /// A child already pushed to this repo in this run is skipped, and one
 /// another task is pushing is awaited, so tags sharing an index push its
-/// children once. The top-level manifest is always pushed, by tag.
+/// children once. A child whose push already failed in this run fails with
+/// the same error and is not pushed again: the retry budget is spent once.
+/// The top-level manifest is always pushed, by tag.
 ///
 /// When `batch_checker` is `Some` AND `retry.manifest_commit_wait` is
 /// non-zero, calls
@@ -2782,6 +2784,7 @@ async fn push_manifests(
                     );
                     match claim {
                         ManifestClaim::Pushed => return Ok(()),
+                        ManifestClaim::Failed(err) => return Err(crate::Error::Shared(err)),
                         ManifestClaim::Wait(notify) => notify.notified().await,
                         ManifestClaim::Claimed => break,
                     }
@@ -2802,11 +2805,17 @@ async fn push_manifests(
                         Ok(())
                     }
                     Err(e) => {
-                        c.release_manifest_claim(target_name, target_repo, &child.digest);
-                        Err(crate::Error::Manifest {
+                        let err = Arc::new(crate::Error::Manifest {
                             reference: child_digest_str.clone(),
                             source: e,
-                        })
+                        });
+                        c.mark_manifest_failed(
+                            target_name,
+                            target_repo,
+                            &child.digest,
+                            Arc::clone(&err),
+                        );
+                        Err(crate::Error::Shared(err))
                     }
                 }
             }
