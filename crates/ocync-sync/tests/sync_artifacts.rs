@@ -823,3 +823,62 @@ async fn artifact_shared_by_tags_syncs_once() {
         "signature pushed per tag"
     );
 }
+
+/// Two signatures of one image share their config blob. The blob is
+/// uploaded to the target repo once, not once per artifact.
+#[tokio::test]
+async fn artifacts_sharing_a_blob_upload_it_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parent = ManifestBuilder::new(b"parent-config")
+        .layer(b"parent-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1").await;
+    parent.mount_target(&target_server, "repo", "v1").await;
+    let first = ArtifactBuilder::new(b"shared-config", b"payload-one").build();
+    let second = ArtifactBuilder::new(b"shared-config", b"payload-two").build();
+    assert_eq!(first.config_desc.digest, second.config_desc.digest);
+    let referrers = ReferrersIndexBuilder::new()
+        .artifact(&first)
+        .artifact(&second)
+        .build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
+    for artifact in [&first, &second] {
+        artifact.mount_source(&source_server, "repo").await;
+        artifact.mount_target(&target_server, "repo").await;
+    }
+
+    let mapping = ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts {
+            enabled: true,
+            ..ResolvedArtifacts::default()
+        }),
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
+            "repo",
+            vec![TagPair::same("v1")],
+        )
+    };
+    let report = run_sync(vec![mapping]).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    // The query string carries the digest URL-encoded; match on its hex.
+    let config = first.config_desc.digest.hex().to_owned();
+    let uploads = target_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.method.as_str() == "PUT"
+                && r.url.path().contains("/blobs/uploads/")
+                && r.url.query().is_some_and(|q| q.contains(&config))
+        })
+        .count();
+    assert_eq!(
+        uploads, 1,
+        "a blob shared by two artifacts is uploaded per artifact"
+    );
+}

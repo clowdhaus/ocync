@@ -81,7 +81,7 @@ impl<K: Eq + Hash, V> ClaimGuard<'_, K, V> {
 impl<K: Eq + Hash, V> Drop for ClaimGuard<'_, K, V> {
     fn drop(&mut self) {
         // No borrow is live when a future is dropped on this single-threaded
-        // runtime; if one were, the slot would stay claimed, as before guards.
+        // runtime. If one were, the slot would stay claimed.
         if let Some(key) = self.key.take()
             && let Ok(mut work) = self.shared.try_borrow_mut()
             && let Some(Slot::InFlight(notify)) = work.slots.remove(&key)
@@ -163,14 +163,19 @@ pub(crate) enum Referrers {
 /// All work shared between tasks in one run. Created fresh by every run.
 #[derive(Debug, Default)]
 pub(crate) struct RunShared {
-    /// Source manifests pulled by digest: index children and artifacts.
-    pub(crate) manifest_pulls: RefCell<SharedWork<SourceManifestKey, Rc<ManifestPull>>>,
+    /// Index children pulled by digest during discovery.
+    pub(crate) child_pulls: RefCell<SharedWork<SourceManifestKey, Rc<ManifestPull>>>,
+    /// Artifact manifests pulled by digest during execution. Kept apart from
+    /// `child_pulls` so an execution task never waits on discovery.
+    pub(crate) artifact_pulls: RefCell<SharedWork<SourceManifestKey, Rc<ManifestPull>>>,
     /// Child manifests pushed by digest to a target repo.
     pub(crate) child_pushes: RefCell<SharedWork<TargetDigestKey, ()>>,
     /// Referrer discovery per source manifest.
     pub(crate) referrers: RefCell<SharedWork<SourceManifestKey, Referrers>>,
     /// Artifacts (manifest and blobs) copied by digest to a target repo.
     pub(crate) artifact_pushes: RefCell<SharedWork<TargetDigestKey, ()>>,
+    /// Artifact blobs copied by digest to a target repo.
+    pub(crate) artifact_blobs: RefCell<SharedWork<TargetDigestKey, ()>>,
     /// Blob copies that failed after their retries. A task copying the same
     /// blob between the same repos reports this error instead of repeating
     /// the copy.

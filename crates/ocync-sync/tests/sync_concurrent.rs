@@ -495,6 +495,67 @@ async fn sync_dropped_shared_child_pull_is_redone_by_the_waiter() {
     );
 }
 
+/// Layer `d` cannot be pulled from repo `r`'s source, but repo `q` holds it
+/// committed at the target, so a later task in `r` claims it to mount from
+/// `q`. When that mount is not fulfilled, the task reports the recorded
+/// failure instead of pulling `d` from the failing source again.
+#[tokio::test]
+async fn sync_unfulfilled_mount_does_not_repeat_a_failed_copy() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let in_r = ManifestBuilder::new(b"cfg-r").layer(b"layer-d").build();
+    let in_q = ManifestBuilder::new(b"cfg-q").layer(b"layer-d").build();
+    let d = in_r.layer_descs[0].digest.clone();
+    for tag in ["t1", "t2"] {
+        in_r.mount_source(&source_server, "r", tag).await;
+        in_r.mount_target(&target_server, "r", tag).await;
+    }
+    in_q.mount_source(&source_server, "q", "u").await;
+    in_q.mount_target(&target_server, "q", "u").await;
+    let d_path = format!("/v2/r/blobs/{d}");
+    Mock::given(method("GET"))
+        .and(path(d_path.clone()))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+
+    // One at a time. `t1` leads (it shares the most blobs), so it runs
+    // first and records the failed copy; `u` then commits `d` in `q`, and
+    // `t2` finds `q` as a mount source.
+    let report = run_sync_sequential(vec![
+        mapping_from_servers(
+            &source_server,
+            &target_server,
+            "q",
+            vec![TagPair::same("u")],
+        ),
+        mapping_from_servers(
+            &source_server,
+            &target_server,
+            "r",
+            vec![TagPair::same("t1"), TagPair::same("t2")],
+        ),
+    ])
+    .await;
+    assert_eq!(
+        report.stats.images_synced, 1,
+        "`u` syncs from its own source"
+    );
+    assert_eq!(report.stats.images_failed, 2);
+    let d_gets = source_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == d_path)
+        .count();
+    assert_eq!(
+        d_gets, 1,
+        "the failed copy of `d` into `r` must not be repeated"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test: concurrent transfers wait on in-progress uploads to enable cross-repo mount
 // ---------------------------------------------------------------------------

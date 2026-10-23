@@ -1994,7 +1994,7 @@ async fn pull_source_manifest(
                     let child_digest_str = child_desc.digest.to_string();
                     let key = (authority.clone(), repo.clone(), child_desc.digest.clone());
                     async move {
-                        let child_pull = run_once(&shared.manifest_pulls, key, || async {
+                        let child_pull = run_once(&shared.child_pulls, key, || async {
                             with_retry(retry, "manifest pull", || {
                                 client.manifest_pull(repo, &child_digest_str)
                             })
@@ -2063,11 +2063,16 @@ fn blobs_from_manifest(source_data: &PulledManifest) -> Vec<&Descriptor> {
         ManifestKind::Index(_) => source_data
             .children
             .iter()
-            .flat_map(|c| match &c.manifest {
-                ManifestKind::Image(m) => collect_image_blobs(m),
-                ManifestKind::Index(_) => Vec::new(),
-            })
+            .flat_map(|c| child_blobs(c))
             .collect(),
+    }
+}
+
+/// Blobs an index child references. Nested indexes are rejected at discovery.
+fn child_blobs(child: &ManifestPull) -> Vec<&Descriptor> {
+    match &child.manifest {
+        ManifestKind::Image(m) => collect_image_blobs(m),
+        ManifestKind::Index(_) => Vec::new(),
     }
 }
 
@@ -2151,6 +2156,23 @@ impl<'a> BlobIoContext<'a> {
             retry: ctx.retry,
             staging: ctx.staging,
         }
+    }
+
+    /// The failure recorded in this run for this task's copy of `digest`.
+    fn recorded_failure(&self, digest: &Digest) -> Option<Arc<crate::Error>> {
+        let failures = self.blob_failures.borrow();
+        if failures.is_empty() {
+            return None;
+        }
+        failures
+            .get(&blob_copy_key(
+                self.source_authority,
+                self.source_repo,
+                self.sink.target_name,
+                self.target_repo,
+                digest,
+            ))
+            .cloned()
     }
 
     /// Record a failed copy of `digest` for the rest of the run, release the
@@ -2434,23 +2456,7 @@ async fn wait_for_blob_claim(
         if cancel.get() {
             return BlobClaim::Cancelled;
         }
-        let failure = {
-            let failures = ctx.shared.blob_failures.borrow();
-            if failures.is_empty() {
-                None
-            } else {
-                failures
-                    .get(&blob_copy_key(
-                        ctx.source_authority,
-                        ctx.source_repo,
-                        ctx.target_name,
-                        ctx.target_repo,
-                        digest,
-                    ))
-                    .cloned()
-            }
-        };
-        if let Some(err) = failure {
+        if let Some(err) = BlobIoContext::from_ctx(ctx).recorded_failure(digest) {
             let mountable = ctx
                 .cache
                 .borrow()
@@ -2649,6 +2655,17 @@ async fn transfer_claimed_blob(
                 // claim prevents concurrent waiters from re-claiming and
                 // starting duplicate pushes.
                 io.sink.mark_repo_stale(digest, &from_repo);
+                // A mount source let this task past a recorded copy failure;
+                // without the mount, the copy would repeat that failure.
+                if let Some(err) = io.recorded_failure(digest) {
+                    if matches!(staging, StagingClaim::Pull) {
+                        io.staging.notify_failed(digest);
+                    }
+                    io.sink
+                        .fail(digest.clone(), io.target_repo.to_owned(), err.to_string());
+                    io.sink.release_claim(digest);
+                    return BlobResult::Failed(crate::Error::Shared(err));
+                }
                 mount_attempted = true;
             }
         }
@@ -2823,19 +2840,15 @@ async fn push_manifests(
             Claim::Claimed(guard) => claimed.push((child, guard)),
             Claim::Wait(_) => held_elsewhere.push(child),
             Claim::Done(Ok(())) => {}
-            Claim::Done(Err(err)) => failed = Some(crate::Error::Shared(err)),
+            // The index cannot be pushed without this child. Returning drops
+            // this task's claims, so tasks needing those children do them.
+            Claim::Done(Err(err)) => return Err(crate::Error::Shared(err)),
         }
     }
 
     let wait_for: Vec<&Descriptor> = match &source_data.pull.manifest {
         ManifestKind::Image(m) => collect_image_blobs(m),
-        ManifestKind::Index(_) => claimed
-            .iter()
-            .flat_map(|(c, _)| match &c.manifest {
-                ManifestKind::Image(m) => collect_image_blobs(m),
-                ManifestKind::Index(_) => Vec::new(),
-            })
-            .collect(),
+        ManifestKind::Index(_) => claimed.iter().flat_map(|(c, _)| child_blobs(c)).collect(),
     };
     if let Some(checker) = item.batch_checker.as_deref()
         && !retry.manifest_commit_wait.is_zero()
@@ -3089,7 +3102,7 @@ async fn sync_artifact(
         source_repo.clone(),
         desc.digest.clone(),
     );
-    let artifact_pull = run_once(&shared.manifest_pulls, pull_key, || async {
+    let artifact_pull = run_once(&shared.artifact_pulls, pull_key, || async {
         with_retry(retry, "artifact manifest pull", || {
             source_client.manifest_pull(source_repo, &artifact_digest_str)
         })
@@ -3140,7 +3153,14 @@ async fn sync_artifact(
             let blob_already_present = already_present.contains(&blob.digest);
             let sem = &blob_sem;
             let artifact_digest_str = artifact_digest_str.clone();
-            blob_futures.push(async move {
+            let key = (
+                item.target_name.to_string(),
+                target_repo.clone(),
+                blob.digest.clone(),
+            );
+            // Once per target repo per run: artifacts often share a blob,
+            // such as the empty config.
+            blob_futures.push(run_once(&shared.artifact_blobs, key, move || async move {
                 // For batch-already-present blobs, skip the HEAD and
                 // any pull/push: the batch API already confirmed
                 // visibility. Otherwise do a HEAD check (covers
@@ -3171,14 +3191,14 @@ async fn sync_artifact(
                     }
                 }
                 Ok::<(), crate::Error>(())
-            });
+            }));
         }
         // Fail-fast on first error: dropping `blob_futures` cancels
         // in-flight blob HTTP. This is deliberately asymmetric with
         // `transfer_image_blobs` (which uses a `cancel: Cell<bool>`
         // flag so all blobs finish for stats / notify-failed
-        // bookkeeping). Artifacts have no per-blob stats or
-        // cross-image dedup to maintain, and the caller at
+        // bookkeeping). Artifacts have no per-blob stats, a dropped
+        // shared copy frees its claim for the next task, and the caller at
         // `process_one_target` already treats artifact-sync errors
         // as a non-fatal warning -- so cancelling the rest is
         // cheaper than draining them after we've already decided
