@@ -302,7 +302,7 @@ When a mapping has multiple targets (e.g., us-ecr + eu-ecr + ap-ecr), the source
 
 The write path uses an atomic protocol: `{digest}.tmp.{random}` -> `fsync` -> `rename` to `{digest}` -> `fsync` parent directory. Incomplete writes are never visible as cache entries. After rename, target readers get page-cached reads at memory speed (4+ GB/s) because the data stays in page cache when reads happen milliseconds after writes.
 
-Source-pull dedup via `BlobStage::claim_or_check` eliminates redundant source GETs. When multiple images share a blob, the first to claim it pulls from source. Subsequent claimers wait for the pull to complete, then read from disk. `tokio::sync::Notify::notify_waiters()` does NOT store permits, so every code path that transitions a blob out of `InProgress` MUST call `notify_staged` or `notify_failed`. Missing notify causes deadlock for concurrent waiters.
+Source-pull dedup via `BlobStage::claim_or_check` eliminates redundant source GETs. When multiple images share a blob, the first to claim it pulls from source. Subsequent claimers wait for the pull to complete, then read from disk. The claim is a guard from the shared per-run claim type: dropping it on any path (staged, failed, or resolved by mount or HEAD) wakes the waiters, so no path can leave them waiting. No outcome is recorded; the staged file is the record, and a failed pull is retried by a waiter, whose source may differ.
 
 Crash recovery: on startup, delete all `.tmp.*` files in the cache directory. Named by digest, so orphaned files are identifiable. Eviction runs between sync cycles when cache size exceeds `staging_size_limit` (default 2GB), evicting blobs referenced by fewer discovered manifests first. In-flight transfers are never interrupted by eviction.
 

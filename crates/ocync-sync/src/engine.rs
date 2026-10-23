@@ -47,7 +47,8 @@ use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferState
 use crate::progress::RunProgress;
 use crate::retry::{RetryConfig, count_retries, retries_made, with_retry};
 use crate::shared::{
-    Claim, CopyKey, PerRun, Referrers, claim, copy_key, run_once, source_key, target_key,
+    Claim, ClaimGuard, CopyKey, PerRun, Referrers, claim, copy_key, run_once, source_key,
+    target_key,
 };
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
@@ -2204,17 +2205,14 @@ impl<'a> BlobIoContext<'a> {
 /// Pre-semaphore staging resolution. The staging dedup wait
 /// (`Notify::notified()`) runs outside the semaphore via
 /// [`resolve_staging`], preventing permit exhaustion.
-#[derive(Clone, Copy)]
-enum StagingClaim {
+enum StagingClaim<'a> {
     /// Staging disabled -- use direct source-pull + target-push.
     Disabled,
     /// Blob already staged by another task -- read from disk.
     Staged,
     /// This task claimed the source pull -- pull and stage, then push.
-    /// If the blob is resolved via mount or HEAD before the pull happens,
-    /// the caller MUST call `staging.notify_failed(digest)` to unblock
-    /// other tasks waiting on this digest's staging notification.
-    Pull,
+    /// Dropping the claim on any path wakes tasks waiting on this digest.
+    Pull(ClaimGuard<'a, Digest, ()>),
 }
 
 /// Context for transferring blobs from source to a single target.
@@ -2493,14 +2491,14 @@ async fn wait_for_blob_claim(
 /// would consume a permit for the entire duration of another task's
 /// source pull, contributing to the same semaphore-exhaustion deadlock
 /// class as blob claim waits and repo-committed waits.
-async fn resolve_staging(staging: &Rc<BlobStage>, digest: &Digest) -> StagingClaim {
+async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> StagingClaim<'a> {
     if !staging.is_enabled() {
         return StagingClaim::Disabled;
     }
     loop {
         match staging.claim_or_check(digest) {
             crate::staging::StagePullAction::Exists => return StagingClaim::Staged,
-            crate::staging::StagePullAction::Pull => return StagingClaim::Pull,
+            crate::staging::StagePullAction::Pull(guard) => return StagingClaim::Pull(guard),
             crate::staging::StagePullAction::Wait(notify) => {
                 notify.notified().await;
                 continue;
@@ -2586,12 +2584,9 @@ async fn run_under_semaphore(
     batch_checked: &HashSet<Digest>,
     cancel: &Cell<bool>,
     mount_source: Option<RepositoryName>,
-    staging: StagingClaim,
+    staging: StagingClaim<'_>,
 ) -> BlobResult {
     if cancel.get() {
-        if matches!(staging, StagingClaim::Pull) {
-            io.staging.notify_failed(digest);
-        }
         io.sink.fail(
             digest.clone(),
             io.target_repo.to_owned(),
@@ -2617,7 +2612,7 @@ async fn transfer_claimed_blob(
     size: u64,
     batch_checked: &HashSet<Digest>,
     mount_source: Option<RepositoryName>,
-    staging: StagingClaim,
+    staging: StagingClaim<'_>,
 ) -> BlobResult {
     let mut mount_attempted = false;
 
@@ -2629,9 +2624,6 @@ async fn transfer_claimed_blob(
             .await
         {
             Ok(MountResult::Mounted) => {
-                if matches!(staging, StagingClaim::Pull) {
-                    io.staging.notify_failed(digest);
-                }
                 io.sink.complete(digest.clone(), io.target_repo.to_owned());
                 io.sink.release_claim(digest);
                 return BlobResult::Mounted;
@@ -2654,9 +2646,6 @@ async fn transfer_claimed_blob(
         let head_result = io.target_client.blob_exists(io.target_repo, digest).await;
         match head_result {
             Ok(Some(_)) => {
-                if matches!(staging, StagingClaim::Pull) {
-                    io.staging.notify_failed(digest);
-                }
                 io.sink.exists(digest.clone(), io.target_repo.to_owned());
                 io.sink.release_claim(digest);
                 return BlobResult::Skipped;
@@ -2676,14 +2665,11 @@ async fn transfer_claimed_blob(
     // A mount source let this task past a recorded copy failure, and the
     // mount did not avoid the copy: copying would repeat that failure.
     if let Some(err) = io.recorded_failure(digest) {
-        if matches!(staging, StagingClaim::Pull) {
-            io.staging.notify_failed(digest);
-        }
         return BlobResult::Failed(io.release_failed(digest, err));
     }
 
     let transfer_result: Result<(), crate::Error> = match staging {
-        StagingClaim::Pull => {
+        StagingClaim::Pull(guard) => {
             // This task claimed the source pull. Pull to disk, then push.
             if let Err(e) = with_retry(io.retry, "blob pull (to stage)", || async {
                 let mut writer =
@@ -2712,14 +2698,14 @@ async fn transfer_claimed_blob(
             })
             .await
             {
-                io.staging.notify_failed(digest);
                 let err = crate::Error::BlobTransfer {
                     digest: digest.clone(),
                     source: e,
                 };
                 return BlobResult::Failed(io.fail_copy(digest, err));
             }
-            io.staging.notify_staged(digest);
+            // Staged: waiters read it from disk while this task pushes.
+            drop(guard);
 
             push_staged_blob(io, digest).await
         }
