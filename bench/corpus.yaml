@@ -115,9 +115,9 @@ images:
   - source: "public.ecr.aws/docker/library/nginx"
     tags: ["1.27", "1.26"]
   # These four tags must resolve to one multi-arch index, so the run measures
-  # each child manifest being pushed once rather than once per tag. When
-  # alpine releases past 3.24.3 they diverge: update 3.24.3 to the patch that
-  # `latest` points at.
+  # each child manifest being pulled and pushed once rather than once per tag.
+  # Any alpine release splits them: re-point `3.24` and `3.24.3` to the minor
+  # and patch that `latest` resolves to.
   - source: "public.ecr.aws/docker/library/alpine"
     tags: ["latest", "3", "3.24", "3.24.3"]
   - source: "public.ecr.aws/docker/library/golang"

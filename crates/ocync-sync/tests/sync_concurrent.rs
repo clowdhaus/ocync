@@ -259,42 +259,7 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
     // wiremock expect(1) assertions verify each source manifest was pulled exactly once.
 }
 
-/// Tags that all resolve to one index, as alpine's floating tags do.
-const SHARED_INDEX_TAGS: [&str; 4] = ["latest", "3", "3.24", "3.24.3"];
-
-/// Mount a two-child (amd64, arm64) index under every tag in
-/// [`SHARED_INDEX_TAGS`] at both servers, returning the two children.
-async fn mount_shared_index(
-    source: &MockServer,
-    target: &MockServer,
-) -> (ManifestParts, ManifestParts) {
-    use ocync_distribution::spec::Platform;
-
-    let linux = |arch: &str| Platform {
-        architecture: arch.to_string(),
-        os: "linux".to_string(),
-        variant: None,
-        os_version: None,
-        os_features: None,
-    };
-    let amd64 = ManifestBuilder::new(b"cfg-amd64")
-        .layer(b"layer-amd64")
-        .build();
-    let arm64 = ManifestBuilder::new(b"cfg-arm64")
-        .layer(b"layer-arm64")
-        .build();
-    let index = IndexBuilder::new()
-        .manifest(&amd64, Some(linux("amd64")))
-        .manifest(&arm64, Some(linux("arm64")))
-        .build();
-    for tag in SHARED_INDEX_TAGS {
-        index.mount_source(source, "repo", tag).await;
-        index.mount_target(target, "repo", tag).await;
-    }
-    (amd64, arm64)
-}
-
-/// Run [`SHARED_INDEX_TAGS`] concurrently from `source` into `target`.
+/// Run [`SHARED_TAGS`] concurrently from `source` into `target`.
 async fn sync_shared_index_tags(
     source: &MockServer,
     target: &MockServer,
@@ -303,10 +268,7 @@ async fn sync_shared_index_tags(
         source,
         target,
         "repo",
-        SHARED_INDEX_TAGS
-            .iter()
-            .map(|t| TagPair::same(*t))
-            .collect(),
+        SHARED_TAGS.iter().map(|t| TagPair::same(*t)).collect(),
     );
     run_sync(vec![mapping]).await
 }
@@ -342,11 +304,37 @@ async fn sync_tags_sharing_an_index_push_each_child_once() {
             child.digest
         );
     }
-    for tag in SHARED_INDEX_TAGS {
+    for tag in SHARED_TAGS {
         assert_eq!(
             manifest_puts(&target_server, tag).await,
             1,
             "tag {tag} must still get its index PUT"
+        );
+    }
+}
+
+/// Four tags resolving to one index pull each child manifest from the source
+/// once, not once per tag.
+#[tokio::test]
+async fn sync_tags_sharing_an_index_pull_each_child_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (amd64, arm64) = mount_shared_index(&source_server, &target_server).await;
+
+    let report = sync_shared_index_tags(&source_server, &target_server).await;
+
+    assert_eq!(report.stats.images_synced, 4);
+    let received = source_server.received_requests().await.unwrap();
+    for child in [&amd64, &arm64] {
+        let child_path = format!("/v2/repo/manifests/{}", child.digest);
+        let gets = received
+            .iter()
+            .filter(|r| r.method.as_str() == "GET" && r.url.path() == child_path)
+            .count();
+        assert_eq!(
+            gets, 1,
+            "child {} must not be pulled once per tag",
+            child.digest
         );
     }
 }
@@ -377,10 +365,14 @@ async fn sync_tags_sharing_an_index_push_a_failing_child_once() {
     for image in &report.images {
         match &image.status {
             ImageStatus::Failed {
-                status_code, error, ..
+                status_code,
+                error,
+                retries,
+                ..
             } => {
                 assert_eq!(*status_code, Some(400), "{}", image.target);
                 assert!(error.contains(&failing), "{}: {error}", image.target);
+                assert_eq!(*retries, 0, "{}: a 400 is never retried", image.target);
             }
             other => panic!("{}: expected Failed, got {other:?}", image.target),
         }
@@ -390,13 +382,50 @@ async fn sync_tags_sharing_an_index_push_a_failing_child_once() {
         1,
         "a failed child must not be pushed again by each waiting tag"
     );
-    for tag in SHARED_INDEX_TAGS {
+    for tag in SHARED_TAGS {
         assert_eq!(
             manifest_puts(&target_server, tag).await,
             0,
             "tag {tag} must not PUT an index whose child failed"
         );
     }
+}
+
+/// A blob copy that fails is attempted once, not once per tag sharing it:
+/// tags waiting on the failed copy fail with its error instead of repeating
+/// it one after another.
+#[tokio::test]
+async fn sync_tags_sharing_a_blob_attempt_a_failing_copy_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (amd64, _arm64) = mount_shared_index(&source_server, &target_server).await;
+    let layer_path = format!("/v2/repo/blobs/{}", amd64.layer_descs[0].digest);
+    Mock::given(method("GET"))
+        .and(path(layer_path.clone()))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        sync_shared_index_tags(&source_server, &target_server),
+    )
+    .await
+    .expect("tags waiting on a failed blob copy must not hang");
+
+    assert_eq!(report.stats.images_failed, 4);
+    let layer_gets = source_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == layer_path)
+        .count();
+    assert_eq!(
+        layer_gets, 1,
+        "a failed blob copy must not be repeated per tag"
+    );
 }
 
 // ---------------------------------------------------------------------------

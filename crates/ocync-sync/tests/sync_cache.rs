@@ -1894,3 +1894,64 @@ async fn manifest_commit_wait_fires_only_when_enabled() {
         "with manifest_commit_wait>0 the commit-gate wait must fire once per manifest"
     );
 }
+
+/// Four tags sharing one index wait on blob visibility once: the first task
+/// claims every child and waits on their blobs, and the others, finding the
+/// children claimed, push only their index and skip the wait.
+#[tokio::test]
+async fn manifest_commit_wait_runs_once_for_tags_sharing_an_index() {
+    use ocync_sync::engine::SyncEngine;
+    use ocync_sync::progress::NullProgress;
+    use ocync_sync::retry::RetryConfig;
+    use ocync_sync::staging::BlobStage;
+
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (amd64, arm64) = mount_shared_index(&source_server, &target_server).await;
+    let existing: HashSet<Digest> = [&amd64, &arm64]
+        .iter()
+        .flat_map(|m| {
+            [
+                m.config_desc.digest.clone(),
+                m.layer_descs[0].digest.clone(),
+            ]
+        })
+        .collect();
+    let (checker, _checks, waits) = WaitTrackingChecker::new("repo", existing);
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![TargetEntry {
+            name: RegistryAlias::new("target"),
+            client: mock_client(&target_server),
+            batch_checker: Some(Rc::new(checker)),
+            existing_tags: HashSet::new(),
+        }],
+        SHARED_TAGS.iter().map(|t| TagPair::same(*t)).collect(),
+    );
+    let retry = RetryConfig {
+        max_retries: 2,
+        initial_backoff: std::time::Duration::from_millis(1),
+        max_backoff: std::time::Duration::from_millis(10),
+        backoff_multiplier: 2,
+        manifest_commit_wait: std::time::Duration::from_millis(200),
+    };
+    let report = SyncEngine::new(retry, 4)
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_synced, 4);
+    assert_eq!(
+        waits.load(Ordering::Relaxed),
+        1,
+        "the blob-visibility wait must not run once per tag"
+    );
+}

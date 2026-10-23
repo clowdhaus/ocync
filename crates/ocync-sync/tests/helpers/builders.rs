@@ -379,3 +379,36 @@ impl ReferrersIndexBuilder {
         serde_json::to_vec(&index).unwrap()
     }
 }
+
+/// Tags that all point at one manifest, as alpine's floating tags do.
+pub const SHARED_TAGS: [&str; 4] = ["latest", "3", "3.24", "3.24.3"];
+
+/// Mount a two-child (amd64, arm64) index under every tag in
+/// [`SHARED_TAGS`] at both servers, returning the two children.
+pub async fn mount_shared_index(
+    source: &wiremock::MockServer,
+    target: &wiremock::MockServer,
+) -> (ManifestParts, ManifestParts) {
+    let linux = |arch: &str| Platform {
+        architecture: arch.to_string(),
+        os: "linux".to_string(),
+        variant: None,
+        os_version: None,
+        os_features: None,
+    };
+    let amd64 = ManifestBuilder::new(b"cfg-amd64")
+        .layer(b"layer-amd64")
+        .build();
+    let arm64 = ManifestBuilder::new(b"cfg-arm64")
+        .layer(b"layer-arm64")
+        .build();
+    let index = IndexBuilder::new()
+        .manifest(&amd64, Some(linux("amd64")))
+        .manifest(&arm64, Some(linux("arm64")))
+        .build();
+    for tag in SHARED_TAGS {
+        index.mount_source(source, "repo", tag).await;
+        index.mount_target(target, "repo", tag).await;
+    }
+    (amd64, arm64)
+}

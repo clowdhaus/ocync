@@ -13,6 +13,8 @@ pub mod plan;
 pub mod progress;
 /// Retry configuration and backoff logic.
 pub mod retry;
+/// Per-run work shared between tasks that need the same content.
+pub(crate) mod shared;
 /// Tag-version parser, comparator, and range matcher.
 pub(crate) mod version;
 

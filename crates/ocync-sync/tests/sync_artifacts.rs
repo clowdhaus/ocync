@@ -766,3 +766,60 @@ async fn artifact_transient_error_propagates_to_all_targets() {
         "aggregate count must reflect both targets"
     );
 }
+
+/// Four tags of one signed image, synced concurrently into one repo. The
+/// signature is pulled from the source and PUT to the target once, not once
+/// per tag.
+#[tokio::test]
+async fn artifact_shared_by_tags_syncs_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parent = ManifestBuilder::new(b"parent-config")
+        .layer(b"parent-layer")
+        .build();
+    let sig = ArtifactBuilder::new(b"sig-config", b"sig-payload").build();
+    let referrers = ReferrersIndexBuilder::new().artifact(&sig).build();
+    for tag in SHARED_TAGS {
+        parent.mount_source(&source_server, "repo", tag).await;
+        parent.mount_target(&target_server, "repo", tag).await;
+    }
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
+    sig.mount_source(&source_server, "repo").await;
+    sig.mount_target(&target_server, "repo").await;
+
+    let mapping = ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts {
+            enabled: true,
+            ..ResolvedArtifacts::default()
+        }),
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
+            "repo",
+            SHARED_TAGS.iter().map(|t| TagPair::same(*t)).collect(),
+        )
+    };
+    let report = run_sync(vec![mapping]).await;
+
+    assert_eq!(report.stats.images_synced, 4);
+    let sig_path = format!("/v2/repo/manifests/{}", sig.digest);
+    let count = |requests: &[wiremock::Request], verb: &str| {
+        requests
+            .iter()
+            .filter(|r| r.method.as_str() == verb && r.url.path() == sig_path)
+            .count()
+    };
+    let source_requests = source_server.received_requests().await.unwrap();
+    let target_requests = target_server.received_requests().await.unwrap();
+    assert_eq!(
+        count(&source_requests, "GET"),
+        1,
+        "signature pulled per tag"
+    );
+    assert_eq!(
+        count(&target_requests, "PUT"),
+        1,
+        "signature pushed per tag"
+    );
+}

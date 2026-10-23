@@ -226,4 +226,4 @@ For Kubernetes deployments, see the AWS shared-config files section of [Kubernet
 
 ## CloudTrail errors on repeated pushes
 
-ECR answers a manifest PUT or blob upload for content the repository already holds with `201 Created`, but CloudTrail records the call as `ImageAlreadyExistsException` or `LayerAlreadyExistsException`. The sync succeeds and ocync reports no failure. ocync pushes each blob and child manifest once per repository per run, so tags sharing one index do not cause these entries. They still appear when a new index is pushed whose child manifests the repository already holds from an earlier run.
+ECR answers a manifest PUT or blob upload for content the repository already holds with `201 Created`, but CloudTrail records the call as `ImageAlreadyExistsException` or `LayerAlreadyExistsException`. The sync succeeds and ocync reports no failure. ocync pushes each blob, child manifest and artifact once per repository per run, so tags sharing one index or one signature do not cause these entries. They still appear when a new index is pushed whose child manifests the repository already holds from an earlier run.

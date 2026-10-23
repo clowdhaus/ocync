@@ -1,5 +1,6 @@
 //! Retry configuration and backoff logic for transient failures.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::time::Duration;
 
@@ -177,6 +178,23 @@ fn jitter(base: Duration) -> Duration {
     base.mul_f64(factor)
 }
 
+tokio::task_local! {
+    /// Retries `with_retry` has made inside the enclosing [`count_retries`].
+    static RETRIES: Cell<u32>;
+}
+
+/// Run `fut`, counting the retries [`with_retry`] makes inside it. The engine
+/// wraps each image's discovery and execution, so a failed image reports the
+/// retries it made rather than the configured budget.
+pub(crate) async fn count_retries<F: Future>(fut: F) -> F::Output {
+    RETRIES.scope(Cell::new(0), fut).await
+}
+
+/// Retries made so far inside the enclosing [`count_retries`], or 0 outside one.
+pub(crate) fn retries_made() -> u32 {
+    RETRIES.try_with(Cell::get).unwrap_or(0)
+}
+
 /// Retry an async operation with exponential backoff on transient errors.
 ///
 /// Calls `f()` in a loop. Retries on HTTP 408/429/5xx, transport-level
@@ -220,6 +238,9 @@ where
                     );
                     tokio::time::sleep(backoff).await;
                     attempt += 1;
+                    // Outside `count_retries` (the CLI's own walks) there is
+                    // no image to attribute the retry to.
+                    let _ = RETRIES.try_with(|n| n.set(n.get() + 1));
                     continue;
                 }
                 return Err(e);
@@ -527,5 +548,36 @@ mod tests {
             should_retry_transport(&err),
             "request timeout should be retryable"
         );
+    }
+
+    /// A failed image reports the retries it made, not the configured budget.
+    #[tokio::test(flavor = "current_thread")]
+    async fn count_retries_counts_only_retries_made_inside_it() {
+        let cfg = RetryConfig {
+            max_retries: 5,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+            ..RetryConfig::default()
+        };
+        let calls = Cell::new(0);
+        let made = count_retries(async {
+            let result = with_retry(&cfg, "test", || async {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err(ocync_distribution::Error::RegistryError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: "busy".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+            assert!(result.is_ok());
+            retries_made()
+        })
+        .await;
+        assert_eq!(made, 2);
+        assert_eq!(retries_made(), 0, "no count outside count_retries");
     }
 }
