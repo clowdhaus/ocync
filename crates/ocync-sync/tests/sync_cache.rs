@@ -1961,7 +1961,6 @@ async fn manifest_commit_wait_runs_once_for_tags_sharing_an_index() {
 /// waiting on blob visibility for its own child `c3`.
 #[tokio::test]
 async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
-    use ocync_distribution::spec::Platform;
     use ocync_sync::engine::SyncEngine;
     use ocync_sync::progress::NullProgress;
     use ocync_sync::retry::RetryConfig;
@@ -1969,13 +1968,6 @@ async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
 
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
-    let linux = |arch: &str| Platform {
-        architecture: arch.to_string(),
-        os: "linux".to_string(),
-        variant: None,
-        os_version: None,
-        os_features: None,
-    };
     let c1 = ManifestBuilder::new(b"cfg-c1").layer(b"layer-c1").build();
     let c2 = ManifestBuilder::new(b"cfg-c2").layer(b"layer-c2").build();
     let c3 = ManifestBuilder::new(b"cfg-c3").layer(b"layer-c3").build();

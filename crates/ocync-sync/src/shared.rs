@@ -46,11 +46,11 @@ pub(crate) enum Claim<'a, K: Eq + Hash, V> {
 
 /// Per-run record of work done once per key.
 #[derive(Debug)]
-pub(crate) struct SharedWork<K, V> {
+pub(crate) struct Work<K, V> {
     slots: HashMap<K, Slot<V>>,
 }
 
-impl<K, V> Default for SharedWork<K, V> {
+impl<K, V> Default for Work<K, V> {
     fn default() -> Self {
         Self {
             slots: HashMap::new(),
@@ -62,7 +62,7 @@ impl<K, V> Default for SharedWork<K, V> {
 /// the guard unfinished (its task cancelled, or a sibling's error dropping
 /// it) frees the key and wakes the waiters, so one of them does the work.
 pub(crate) struct ClaimGuard<'a, K: Eq + Hash, V> {
-    shared: &'a RefCell<SharedWork<K, V>>,
+    shared: &'a RefCell<Work<K, V>>,
     key: Option<K>,
 }
 
@@ -96,7 +96,7 @@ impl<K: Eq + Hash, V> Drop for ClaimGuard<'_, K, V> {
 
 /// Atomic check-and-claim on `key`.
 pub(crate) fn claim<K: Eq + Hash + Clone, V: Clone>(
-    shared: &RefCell<SharedWork<K, V>>,
+    shared: &RefCell<Work<K, V>>,
     key: K,
 ) -> Claim<'_, K, V> {
     let mut work = shared.borrow_mut();
@@ -119,7 +119,7 @@ pub(crate) fn claim<K: Eq + Hash + Clone, V: Clone>(
 /// case wait for and return its outcome. A failure comes back as
 /// [`crate::Error::Shared`] to every task that needed the work.
 pub(crate) async fn run_once<K, V, F, Fut>(
-    shared: &RefCell<SharedWork<K, V>>,
+    shared: &RefCell<Work<K, V>>,
     key: K,
     work: F,
 ) -> Result<V, crate::Error>
@@ -134,7 +134,11 @@ where
             Claim::Done(outcome) => return outcome.map_err(crate::Error::Shared),
             Claim::Wait(notify) => notify.notified().await,
             Claim::Claimed(guard) => {
-                let outcome = work().await.map_err(Arc::new);
+                // A failure of nested shared work is already shared.
+                let outcome = work().await.map_err(|err| match err {
+                    crate::Error::Shared(err) => err,
+                    err => Arc::new(err),
+                });
                 guard.finish(outcome.clone());
                 return outcome.map_err(crate::Error::Shared);
             }
@@ -214,20 +218,20 @@ pub(crate) enum Referrers {
 
 /// All work shared between tasks in one run. Created fresh by every run.
 #[derive(Debug, Default)]
-pub(crate) struct RunShared {
+pub(crate) struct PerRun {
     /// Index children pulled by digest during discovery.
-    pub(crate) child_pulls: RefCell<SharedWork<SourceManifestKey, Rc<ManifestPull>>>,
+    pub(crate) child_pulls: RefCell<Work<SourceManifestKey, Rc<ManifestPull>>>,
     /// Artifact manifests pulled by digest during execution. Kept apart from
     /// `child_pulls` so an execution task never waits on discovery.
-    pub(crate) artifact_pulls: RefCell<SharedWork<SourceManifestKey, Rc<ManifestPull>>>,
+    pub(crate) artifact_pulls: RefCell<Work<SourceManifestKey, Rc<ManifestPull>>>,
     /// Child manifests pushed by digest to a target repo.
-    pub(crate) child_pushes: RefCell<SharedWork<TargetDigestKey, ()>>,
+    pub(crate) child_pushes: RefCell<Work<TargetDigestKey, ()>>,
     /// Referrer discovery per source manifest.
-    pub(crate) referrers: RefCell<SharedWork<SourceManifestKey, Referrers>>,
+    pub(crate) referrers: RefCell<Work<SourceManifestKey, Referrers>>,
     /// Artifacts (manifest and blobs) copied by digest to a target repo.
-    pub(crate) artifact_pushes: RefCell<SharedWork<CopyKey, ()>>,
+    pub(crate) artifact_pushes: RefCell<Work<CopyKey, ()>>,
     /// Artifact blobs copied by digest to a target repo.
-    pub(crate) artifact_blobs: RefCell<SharedWork<CopyKey, ()>>,
+    pub(crate) artifact_blobs: RefCell<Work<CopyKey, ()>>,
     /// Blob copies that failed after their retries. A task copying the same
     /// blob between the same repos reports this error instead of repeating
     /// the copy.
@@ -258,7 +262,7 @@ mod tests {
 
     #[test]
     fn claim_waits_while_in_flight_then_returns_the_outcome() {
-        let work = RefCell::new(SharedWork::<&str, u32>::default());
+        let work = RefCell::new(Work::<&str, u32>::default());
         let Claim::Claimed(guard) = claim(&work, "k") else {
             panic!("first claim must claim")
         };
@@ -271,7 +275,7 @@ mod tests {
 
     #[test]
     fn a_failure_is_returned_to_later_claims_not_retried() {
-        let work = RefCell::new(SharedWork::<&str, ()>::default());
+        let work = RefCell::new(Work::<&str, ()>::default());
         let Claim::Claimed(guard) = claim(&work, "k") else {
             panic!("first claim must claim")
         };
@@ -283,7 +287,7 @@ mod tests {
     /// it and does the work instead of waiting forever.
     #[tokio::test(flavor = "current_thread")]
     async fn a_dropped_claim_wakes_waiters_to_claim_it() {
-        let work = RefCell::new(SharedWork::<&str, u32>::default());
+        let work = RefCell::new(Work::<&str, u32>::default());
         let Claim::Claimed(guard) = claim(&work, "k") else {
             panic!("first claim must claim")
         };
@@ -302,7 +306,7 @@ mod tests {
     /// value without running its own work.
     #[tokio::test(flavor = "current_thread")]
     async fn run_once_runs_work_once_for_concurrent_callers() {
-        let shared = RefCell::new(SharedWork::<&str, u32>::default());
+        let shared = RefCell::new(Work::<&str, u32>::default());
         let runs = std::cell::Cell::new(0);
         let work = || async {
             runs.set(runs.get() + 1);
@@ -314,9 +318,25 @@ mod tests {
         assert_eq!(runs.get(), 1, "the waiter must not run the work again");
     }
 
+    /// Work that fails with another record's shared failure reports that
+    /// failure, not a second wrapping of it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_once_keeps_a_nested_shared_failure_as_is() {
+        let inner = Arc::new(failure());
+        let shared = RefCell::new(Work::<&str, u32>::default());
+        let result = run_once(&shared, "k", || async {
+            Err(crate::Error::Shared(Arc::clone(&inner)))
+        })
+        .await;
+        let Err(crate::Error::Shared(err)) = result else {
+            panic!("expected a shared failure, got {result:?}")
+        };
+        assert!(Arc::ptr_eq(&err, &inner), "wrapped again: {err:?}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn run_once_shares_a_failure_with_every_caller() {
-        let shared = RefCell::new(SharedWork::<&str, u32>::default());
+        let shared = RefCell::new(Work::<&str, u32>::default());
         let first = run_once(&shared, "k", || async { Err(failure()) }).await;
         let second = run_once(&shared, "k", || async { Ok(1) }).await;
         assert!(matches!(first, Err(crate::Error::Shared(_))));

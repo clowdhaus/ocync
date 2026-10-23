@@ -47,7 +47,7 @@ use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferState
 use crate::progress::RunProgress;
 use crate::retry::{RetryConfig, count_retries, retries_made, with_retry};
 use crate::shared::{
-    Claim, CopyKey, Referrers, RunShared, claim, copy_key, run_once, source_key, target_key,
+    Claim, CopyKey, PerRun, Referrers, claim, copy_key, run_once, source_key, target_key,
 };
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
@@ -702,7 +702,7 @@ struct PromoteContext<'a> {
     staging: &'a Rc<BlobStage>,
     freq_map: &'a BlobFrequencyMap,
     retry: &'a RetryConfig,
-    shared: &'a Rc<RunShared>,
+    shared: &'a Rc<PerRun>,
 }
 
 /// Default cap for concurrent image transfers (Level 1: global image semaphore).
@@ -874,7 +874,7 @@ impl SyncEngine {
         let mut freq_map = BlobFrequencyMap::new();
         let global_sem = Rc::new(Semaphore::new(self.max_concurrent));
         let staging = Rc::new(staging);
-        let shared = Rc::new(RunShared::default());
+        let shared = Rc::new(PerRun::default());
         let mut results: Vec<ImageResult> = Vec::new();
         let mut shutting_down = false;
         let mut drain_deadline: Option<tokio::time::Instant> = None;
@@ -1277,7 +1277,7 @@ struct DiscoveryParams {
     /// Artifact sync configuration (Rc-shared with mapping).
     artifacts_config: Rc<ResolvedArtifacts>,
     /// Work shared between tasks in this run.
-    shared: Rc<RunShared>,
+    shared: Rc<PerRun>,
 }
 
 /// Discover a single (mapping, tag) pair: HEAD source, check cache, pull if needed.
@@ -1580,7 +1580,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
 
 struct FullPullParams<'a> {
     source_client: &'a Arc<RegistryClient>,
-    shared: &'a RunShared,
+    shared: &'a PerRun,
     source: &'a ImageRef,
     target: &'a ImageRef,
     targets: &'a [TargetEntry],
@@ -1742,7 +1742,7 @@ async fn execute_item(
     freq_counts: &HashMap<Digest, usize>,
     retry: &RetryConfig,
     mount_source_wait_deadline: Duration,
-    shared: &RunShared,
+    shared: &PerRun,
 ) -> ImageResult {
     let start = Instant::now();
 
@@ -1918,7 +1918,7 @@ async fn pull_source_manifest(
     tag: &str,
     retry: &RetryConfig,
     platforms: Option<&[PlatformFilter]>,
-    shared: &RunShared,
+    shared: &PerRun,
 ) -> Result<PulledManifest, crate::Error> {
     let pull = with_retry(retry, "manifest pull", || client.manifest_pull(repo, tag))
         .await
@@ -2229,7 +2229,7 @@ enum StagingClaim {
 struct TransferContext<'a> {
     cache: &'a Rc<RefCell<TransferStateCache>>,
     /// Work shared between tasks in this run.
-    shared: &'a RunShared,
+    shared: &'a PerRun,
     /// Shared staging area for pull-once, fan-out multi-target transfers.
     staging: &'a Rc<BlobStage>,
     retry: &'a RetryConfig,
@@ -2805,9 +2805,8 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
 async fn push_manifests(
     retry: &RetryConfig,
     item: &TransferTask,
-    shared: &RunShared,
+    shared: &PerRun,
 ) -> Result<(), crate::Error> {
-    let target_client = &item.target_client;
     let target_repo = &item.target.repo;
     let source_data = &item.source_data;
     let child_key =
@@ -2878,7 +2877,7 @@ async fn push_manifests(
     // Push claimed children concurrently. join_all, not try_join_all: a
     // transient failure on one child must not cancel the others.
     let pushes = claimed.into_iter().map(|(child, guard)| async move {
-        let outcome = push_child_manifest(retry, item, child)
+        let outcome = push_manifest(retry, item, &child.digest.to_string(), child)
             .await
             .map_err(Arc::new);
         guard.finish(outcome.clone());
@@ -2896,8 +2895,9 @@ async fn push_manifests(
     // Then the children other tasks are pushing. Should one of them have
     // been dropped before finishing, this task pushes the child itself.
     let awaited = held_elsewhere.iter().map(|child| {
-        run_once(&shared.child_pushes, child_key(child), || {
-            push_child_manifest(retry, item, child)
+        run_once(&shared.child_pushes, child_key(child), move || {
+            let reference = child.digest.to_string();
+            async move { push_manifest(retry, item, &reference, child).await }
         })
     });
     for result in futures_util::future::join_all(awaited).await {
@@ -2905,42 +2905,29 @@ async fn push_manifests(
     }
 
     // Push top-level manifest by tag.
-    with_retry(retry, "manifest push", || {
-        target_client.manifest_push(
-            target_repo,
-            &item.target.tag,
-            &source_data.pull.media_type,
-            &source_data.pull.raw_bytes,
-        )
-    })
-    .await
-    .map_err(|e| crate::Error::Manifest {
-        reference: item.target.tag.clone(),
-        source: e,
-    })?;
-
-    Ok(())
+    push_manifest(retry, item, &item.target.tag, &source_data.pull).await
 }
 
-/// Push one child manifest to the task's target repo by digest.
-async fn push_child_manifest(
+/// Push `manifest` to the task's target repo as `reference` (a tag, or a
+/// child's digest).
+async fn push_manifest(
     retry: &RetryConfig,
     item: &TransferTask,
-    child: &ManifestPull,
+    reference: &str,
+    manifest: &ManifestPull,
 ) -> Result<(), crate::Error> {
-    let child_digest_str = child.digest.to_string();
     with_retry(retry, "manifest push", || {
         item.target_client.manifest_push(
             &item.target.repo,
-            &child_digest_str,
-            &child.media_type,
-            &child.raw_bytes,
+            reference,
+            &manifest.media_type,
+            &manifest.raw_bytes,
         )
     })
     .await
     .map(|_| ())
     .map_err(|e| crate::Error::Manifest {
-        reference: child_digest_str.clone(),
+        reference: reference.to_owned(),
         source: e,
     })
 }
@@ -2973,7 +2960,7 @@ async fn push_child_manifest(
 async fn discover_and_sync_artifacts(
     item: &TransferTask,
     retry: &RetryConfig,
-    shared: &RunShared,
+    shared: &PerRun,
 ) -> Result<bool, crate::Error> {
     let artifacts_config = &item.artifacts_config;
     let source_client = &item.source_client;
@@ -3061,7 +3048,7 @@ async fn discover_and_sync_artifacts(
 async fn sync_artifact(
     item: &TransferTask,
     retry: &RetryConfig,
-    shared: &RunShared,
+    shared: &PerRun,
     desc: &Descriptor,
 ) -> Result<(), crate::Error> {
     let source_client = &item.source_client;

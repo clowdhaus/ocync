@@ -43,7 +43,7 @@ pub mod mocks;
 // Re-export commonly used items for ergonomic `use helpers::*` imports.
 pub use builders::{
     ArtifactBuilder, ArtifactParts, IndexBuilder, IndexParts, ManifestBuilder, ManifestParts,
-    ReferrersIndexBuilder, SHARED_TAGS, mount_shared_index,
+    ReferrersIndexBuilder, SHARED_TAGS, linux, mount_shared_index,
 };
 pub use fixtures::*;
 pub use mocks::*;

@@ -380,6 +380,17 @@ impl ReferrersIndexBuilder {
     }
 }
 
+/// A `linux/<arch>` platform.
+pub fn linux(arch: &str) -> Platform {
+    Platform {
+        architecture: arch.to_string(),
+        os: "linux".to_string(),
+        variant: None,
+        os_version: None,
+        os_features: None,
+    }
+}
+
 /// Tags that all point at one manifest, as alpine's floating tags do.
 pub const SHARED_TAGS: [&str; 4] = ["latest", "3", "3.24", "3.24.3"];
 
@@ -389,13 +400,6 @@ pub async fn mount_shared_index(
     source: &wiremock::MockServer,
     target: &wiremock::MockServer,
 ) -> (ManifestParts, ManifestParts) {
-    let linux = |arch: &str| Platform {
-        architecture: arch.to_string(),
-        os: "linux".to_string(),
-        variant: None,
-        os_version: None,
-        os_features: None,
-    };
     let amd64 = ManifestBuilder::new(b"cfg-amd64")
         .layer(b"layer-amd64")
         .build();

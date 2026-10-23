@@ -434,17 +434,8 @@ async fn sync_tags_sharing_a_blob_attempt_a_failing_copy_once() {
 /// rather than wait on a pull that will never finish.
 #[tokio::test]
 async fn sync_dropped_shared_child_pull_is_redone_by_the_waiter() {
-    use ocync_distribution::spec::Platform;
-
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
-    let linux = |arch: &str| Platform {
-        architecture: arch.to_string(),
-        os: "linux".to_string(),
-        variant: None,
-        os_version: None,
-        os_features: None,
-    };
     let a = ManifestBuilder::new(b"cfg-a").layer(b"layer-a").build();
     let b = ManifestBuilder::new(b"cfg-b").layer(b"layer-b").build();
     let c = ManifestBuilder::new(b"cfg-c").layer(b"layer-c").build();
@@ -561,17 +552,8 @@ async fn sync_unfulfilled_mount_does_not_repeat_a_failed_copy() {
 /// at once instead of waiting on `c2`, which its index can no longer use.
 #[tokio::test]
 async fn sync_failed_own_child_does_not_wait_on_shared_children() {
-    use ocync_distribution::spec::Platform;
-
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
-    let linux = |arch: &str| Platform {
-        architecture: arch.to_string(),
-        os: "linux".to_string(),
-        variant: None,
-        os_version: None,
-        os_features: None,
-    };
     let c1 = ManifestBuilder::new(b"cfg-c1").layer(b"layer-c1").build();
     let c2 = ManifestBuilder::new(b"cfg-c2").layer(b"layer-c2").build();
     let c3 = ManifestBuilder::new(b"cfg-c3").layer(b"layer-c3").build();
