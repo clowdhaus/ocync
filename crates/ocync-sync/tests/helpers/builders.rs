@@ -83,6 +83,12 @@ pub struct ManifestParts {
 }
 
 impl ManifestParts {
+    /// Digests of the config and every layer.
+    pub fn blob_digests(&self) -> impl Iterator<Item = Digest> + '_ {
+        std::iter::once(self.config_desc.digest.clone())
+            .chain(self.layer_descs.iter().map(|d| d.digest.clone()))
+    }
+
     /// Mount all source mocks (manifest GET + blob GETs) for this image.
     pub async fn mount_source(&self, server: &wiremock::MockServer, repo: &str, tag: &str) {
         super::mocks::mount_source_manifest(server, repo, tag, &self.bytes).await;

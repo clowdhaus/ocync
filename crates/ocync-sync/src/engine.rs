@@ -2832,47 +2832,14 @@ async fn push_manifests(
         ManifestKind::Image(m) => collect_image_blobs(m),
         ManifestKind::Index(_) => claimed.iter().flat_map(|(c, _)| child_blobs(c)).collect(),
     };
-    if let Some(checker) = item.batch_checker.as_deref()
-        && !retry.manifest_commit_wait.is_zero()
-    {
-        // Collect through a HashSet to deduplicate (one clone per digest);
-        // BatchCheckLayerAvailability does not care about order.
-        let digests: Vec<Digest> = wait_for
-            .iter()
-            .map(|d| d.digest.clone())
-            .collect::<HashSet<Digest>>()
-            .into_iter()
-            .collect();
-
-        if !digests.is_empty() {
-            match checker
-                .wait_for_blobs_available(target_repo, &digests, retry.manifest_commit_wait)
-                .await
-            {
-                Ok(()) => {
-                    debug!(
-                        target_repo = %target_repo,
-                        blob_count = digests.len(),
-                        "BatchCheckLayerAvailability confirms all blobs visible; proceeding with manifest push"
-                    );
-                }
-                Err(e) => {
-                    // Falling through to the retry path is the design
-                    // choice: a stuck consistency view is a real
-                    // condition we want surfaced via the same retry
-                    // accounting as any other transient failure, not a
-                    // hard error here. with_retry will catch any
-                    // residual BLOB_UPLOAD_UNKNOWN below.
-                    warn!(
-                        target_repo = %target_repo,
-                        blob_count = digests.len(),
-                        error = %e,
-                        "BatchCheckLayerAvailability wait did not converge before deadline; proceeding (retry path will catch any BLOB_UPLOAD_UNKNOWN)"
-                    );
-                }
-            }
-        }
-    }
+    // Deduplicated: children of one index often share a config blob.
+    let digests: Vec<Digest> = wait_for
+        .iter()
+        .map(|d| d.digest.clone())
+        .collect::<HashSet<Digest>>()
+        .into_iter()
+        .collect();
+    wait_for_commit(item, retry, &digests).await;
 
     // Push claimed children concurrently. join_all, not try_join_all: a
     // transient failure on one child must not cancel the others.
@@ -2906,6 +2873,38 @@ async fn push_manifests(
 
     // Push top-level manifest by tag.
     push_manifest(retry, item, &item.target.tag, &source_data.pull).await
+}
+
+/// Wait until the target reports every blob in `digests` visible, when it
+/// has a batch checker (production: ECR) and `manifest_commit_wait` is
+/// non-zero. ECR's manifest validator can lag blob PUT-201s; on timeout the
+/// push goes ahead and `with_retry` catches any residual
+/// `BLOB_UPLOAD_UNKNOWN`, so a stuck consistency view is surfaced through
+/// the same retry accounting as any other transient failure.
+async fn wait_for_commit(item: &TransferTask, retry: &RetryConfig, digests: &[Digest]) {
+    let Some(checker) = item.batch_checker.as_deref() else {
+        return;
+    };
+    if retry.manifest_commit_wait.is_zero() || digests.is_empty() {
+        return;
+    }
+    let target_repo = &item.target.repo;
+    match checker
+        .wait_for_blobs_available(target_repo, digests, retry.manifest_commit_wait)
+        .await
+    {
+        Ok(()) => debug!(
+            target_repo = %target_repo,
+            blob_count = digests.len(),
+            "BatchCheckLayerAvailability confirms all blobs visible; proceeding with manifest push"
+        ),
+        Err(e) => warn!(
+            target_repo = %target_repo,
+            blob_count = digests.len(),
+            error = %e,
+            "BatchCheckLayerAvailability wait did not converge before deadline; proceeding (retry path will catch any BLOB_UPLOAD_UNKNOWN)"
+        ),
+    }
 }
 
 /// Push `manifest` to the task's target repo as `reference` (a tag, or a
@@ -2977,17 +2976,13 @@ async fn discover_and_sync_artifacts(
         Ok(discover_referrers(source_client, source_repo, parent_digest).await)
     })
     .await?;
-    let (referrers_index, discovery_succeeded) = match referrers {
-        Referrers::Found(index) => (Some(index), true),
-        Referrers::NotFound => (None, true),
-        Referrers::Failed => (None, false),
-    };
+    let discovery_succeeded = !matches!(referrers, Referrers::Failed);
 
     // Filter matching descriptors. When `artifact_type` is None (e.g. for
     // tag-fallback single-manifest referrers), falls back to media_type per
     // OCI 1.1 artifact guidance.
-    let matching: Vec<&Descriptor> = match referrers_index {
-        Some(ref index) => index
+    let matching: Vec<&Descriptor> = match referrers {
+        Referrers::Found(ref index) => index
             .manifests
             .iter()
             .filter(|desc| {
@@ -2998,7 +2993,7 @@ async fn discover_and_sync_artifacts(
                 artifacts_config.type_matches(artifact_type)
             })
             .collect(),
-        None => Vec::new(),
+        Referrers::NotFound | Referrers::Failed => Vec::new(),
     };
 
     // require_artifacts enforcement: only fire when we successfully confirmed
@@ -3055,7 +3050,6 @@ async fn sync_artifact(
     let target_client = &item.target_client;
     let source_repo = &item.source.repo;
     let target_repo = &item.target.repo;
-    let batch_checker = item.batch_checker.as_deref();
     let artifact_digest_str = desc.digest.to_string();
 
     // Pull the artifact manifest from source, once per run across targets.
@@ -3083,7 +3077,7 @@ async fn sync_artifact(
         // When a batch checker is configured (production: ECR),
         // skip per-blob HEAD calls for blobs the batch API already
         // reports present at the target.
-        let already_present: HashSet<Digest> = match batch_checker {
+        let already_present: HashSet<Digest> = match item.batch_checker.as_deref() {
             Some(checker) => match checker
                 .check_blob_existence(target_repo, &blob_digests)
                 .await
@@ -3168,36 +3162,7 @@ async fn sync_artifact(
         }
     }
 
-    // Gate the artifact manifest PUT on the target's blob-visibility
-    // view, mirroring `push_manifests`. Same rationale: ECR's
-    // manifest validator can lag blob PUT-201s by hundreds of ms.
-    if let Some(checker) = batch_checker
-        && !retry.manifest_commit_wait.is_zero()
-        && !blob_digests.is_empty()
-    {
-        match checker
-            .wait_for_blobs_available(target_repo, &blob_digests, retry.manifest_commit_wait)
-            .await
-        {
-            Ok(()) => {
-                debug!(
-                    target_repo = %target_repo,
-                    artifact_digest = %artifact_digest_str,
-                    blob_count = blob_digests.len(),
-                    "BatchCheckLayerAvailability confirms artifact blobs visible; proceeding with manifest push"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    target_repo = %target_repo,
-                    artifact_digest = %artifact_digest_str,
-                    blob_count = blob_digests.len(),
-                    error = %e,
-                    "BatchCheckLayerAvailability wait did not converge before deadline; proceeding (retry path will catch any BLOB_UPLOAD_UNKNOWN)"
-                );
-            }
-        }
-    }
+    wait_for_commit(item, retry, &blob_digests).await;
 
     // Push artifact manifest by digest (not by tag).
     with_retry(retry, "artifact manifest push", || {

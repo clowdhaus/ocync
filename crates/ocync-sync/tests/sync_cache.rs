@@ -1910,12 +1910,7 @@ async fn manifest_commit_wait_runs_once_for_tags_sharing_an_index() {
     let (amd64, arm64) = mount_shared_index(&source_server, &target_server).await;
     let existing: HashSet<Digest> = [&amd64, &arm64]
         .iter()
-        .flat_map(|m| {
-            [
-                m.config_desc.digest.clone(),
-                m.layer_descs[0].digest.clone(),
-            ]
-        })
+        .flat_map(|m| m.blob_digests())
         .collect();
     let (checker, _checks, waits) = WaitTrackingChecker::new("repo", existing);
 
@@ -1991,12 +1986,7 @@ async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
         .await;
     let existing: HashSet<Digest> = [&c1, &c2, &c3]
         .iter()
-        .flat_map(|m| {
-            [
-                m.config_desc.digest.clone(),
-                m.layer_descs[0].digest.clone(),
-            ]
-        })
+        .flat_map(|m| m.blob_digests())
         .collect();
     let (checker, _checks, waits) = WaitTrackingChecker::new("repo", existing);
 

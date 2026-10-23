@@ -286,9 +286,10 @@ async fn manifest_puts(target: &MockServer, reference: &str) -> usize {
 }
 
 /// Four tags resolving to one two-child index, synced concurrently into one
-/// repo. Each child manifest is PUT once by digest; each tag's index is PUT.
+/// repo. Each child manifest is pulled from the source and PUT to the target
+/// once; each tag's index is still PUT.
 #[tokio::test]
-async fn sync_tags_sharing_an_index_push_each_child_once() {
+async fn sync_tags_sharing_an_index_copy_each_child_once() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
     let (amd64, arm64) = mount_shared_index(&source_server, &target_server).await;
@@ -296,11 +297,18 @@ async fn sync_tags_sharing_an_index_push_each_child_once() {
     let report = sync_shared_index_tags(&source_server, &target_server).await;
 
     assert_eq!(report.stats.images_synced, 4);
+    let pulled = source_server.received_requests().await.unwrap();
     for child in [&amd64, &arm64] {
+        let child_path = format!("/v2/repo/manifests/{}", child.digest);
+        let gets = pulled
+            .iter()
+            .filter(|r| r.method.as_str() == "GET" && r.url.path() == child_path)
+            .count();
+        assert_eq!(gets, 1, "child {} pulled once per tag", child.digest);
         assert_eq!(
             manifest_puts(&target_server, &child.digest.to_string()).await,
             1,
-            "child {} must not be PUT once per tag",
+            "child {} PUT once per tag",
             child.digest
         );
     }
@@ -309,32 +317,6 @@ async fn sync_tags_sharing_an_index_push_each_child_once() {
             manifest_puts(&target_server, tag).await,
             1,
             "tag {tag} must still get its index PUT"
-        );
-    }
-}
-
-/// Four tags resolving to one index pull each child manifest from the source
-/// once, not once per tag.
-#[tokio::test]
-async fn sync_tags_sharing_an_index_pull_each_child_once() {
-    let source_server = MockServer::start().await;
-    let target_server = MockServer::start().await;
-    let (amd64, arm64) = mount_shared_index(&source_server, &target_server).await;
-
-    let report = sync_shared_index_tags(&source_server, &target_server).await;
-
-    assert_eq!(report.stats.images_synced, 4);
-    let received = source_server.received_requests().await.unwrap();
-    for child in [&amd64, &arm64] {
-        let child_path = format!("/v2/repo/manifests/{}", child.digest);
-        let gets = received
-            .iter()
-            .filter(|r| r.method.as_str() == "GET" && r.url.path() == child_path)
-            .count();
-        assert_eq!(
-            gets, 1,
-            "child {} must not be pulled once per tag",
-            child.digest
         );
     }
 }
