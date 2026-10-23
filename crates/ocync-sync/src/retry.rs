@@ -183,11 +183,12 @@ tokio::task_local! {
     static RETRIES: Cell<u32>;
 }
 
-/// Run `fut`, counting the retries [`with_retry`] makes inside it. The engine
-/// wraps each image's discovery and execution, so a failed image reports the
-/// retries it made rather than the configured budget.
-pub(crate) async fn count_retries<F: Future>(fut: F) -> F::Output {
-    RETRIES.scope(Cell::new(0), fut).await
+/// Run `fut`, counting the retries [`with_retry`] makes inside it, starting
+/// from `already`. The engine wraps each image's discovery, then its
+/// execution starting from the discovery count, so a failed image reports
+/// the retries it made rather than the configured budget.
+pub(crate) async fn count_retries<F: Future>(already: u32, fut: F) -> F::Output {
+    RETRIES.scope(Cell::new(already), fut).await
 }
 
 /// Retries made so far inside the enclosing [`count_retries`], or 0 outside one.
@@ -560,7 +561,7 @@ mod tests {
             ..RetryConfig::default()
         };
         let calls = Cell::new(0);
-        let made = count_retries(async {
+        let made = count_retries(1, async {
             let result = with_retry(&cfg, "test", || async {
                 calls.set(calls.get() + 1);
                 if calls.get() < 3 {
@@ -577,7 +578,7 @@ mod tests {
             retries_made()
         })
         .await;
-        assert_eq!(made, 2);
+        assert_eq!(made, 3, "two retries on top of the one already counted");
         assert_eq!(retries_made(), 0, "no count outside count_retries");
     }
 }

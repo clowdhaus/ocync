@@ -556,6 +556,77 @@ async fn sync_unfulfilled_mount_does_not_repeat_a_failed_copy() {
     );
 }
 
+/// Tag `x` lists children `c1` and `c2`; tag `y` lists `c2` and `c3`. `x`
+/// holds `c2`, whose push is slow. `y`'s own child `c3` fails, so `y` fails
+/// at once instead of waiting on `c2`, which its index can no longer use.
+#[tokio::test]
+async fn sync_failed_own_child_does_not_wait_on_shared_children() {
+    use ocync_distribution::spec::Platform;
+
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let linux = |arch: &str| Platform {
+        architecture: arch.to_string(),
+        os: "linux".to_string(),
+        variant: None,
+        os_version: None,
+        os_features: None,
+    };
+    let c1 = ManifestBuilder::new(b"cfg-c1").layer(b"layer-c1").build();
+    let c2 = ManifestBuilder::new(b"cfg-c2").layer(b"layer-c2").build();
+    let c3 = ManifestBuilder::new(b"cfg-c3").layer(b"layer-c3").build();
+    let x = IndexBuilder::new()
+        .manifest(&c1, Some(linux("amd64")))
+        .manifest(&c2, Some(linux("arm64")))
+        .build();
+    let y = IndexBuilder::new()
+        .manifest(&c2, Some(linux("arm64")))
+        .manifest(&c3, Some(linux("s390x")))
+        .build();
+    x.mount_source(&source_server, "repo", "x").await;
+    x.mount_target(&target_server, "repo", "x").await;
+    y.mount_source(&source_server, "repo", "y").await;
+    y.mount_target(&target_server, "repo", "y").await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/repo/manifests/{}", c2.digest)))
+        .respond_with(ResponseTemplate::new(201).set_delay(std::time::Duration::from_secs(2)))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/repo/manifests/{}", c3.digest)))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        // In this order `x` claims `c2` first. Reversed, `y` claims `c2`
+        // and waits on its own slow push, which is intended.
+        vec![TagPair::same("y"), TagPair::same("x")],
+    );
+    let report = run_sync(vec![mapping]).await;
+
+    let y_result = report
+        .images
+        .iter()
+        .find(|i| i.target.ends_with(":y"))
+        .expect("y is reported");
+    assert!(
+        matches!(y_result.status, ImageStatus::Failed { .. }),
+        "{:?}",
+        y_result.status
+    );
+    assert!(
+        y_result.duration < std::time::Duration::from_secs(1),
+        "y waited {:?} on a child its index can no longer use",
+        y_result.duration
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test: concurrent transfers wait on in-progress uploads to enable cross-repo mount
 // ---------------------------------------------------------------------------

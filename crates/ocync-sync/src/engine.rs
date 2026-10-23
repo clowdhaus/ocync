@@ -46,7 +46,9 @@ use uuid::Uuid;
 use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
 use crate::progress::RunProgress;
 use crate::retry::{RetryConfig, count_retries, retries_made, with_retry};
-use crate::shared::{BlobCopyKey, Claim, Referrers, RunShared, claim, run_once};
+use crate::shared::{
+    BlobCopyKey, Claim, ClientId, Referrers, RunShared, claim, run_once, source_key, target_key,
+};
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
 use crate::{
@@ -105,7 +107,7 @@ impl fmt::Display for ImageRef {
 /// Wraps the config-defined name (e.g. `us-ecr`) or bare hostname for
 /// ad-hoc commands. Must be unique per mapping - it is used as the outer
 /// key in the blob dedup map.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RegistryAlias(String);
 
 impl RegistryAlias {
@@ -402,9 +404,6 @@ struct TransferTask {
     source_data: Rc<PulledManifest>,
     /// Source client for pulling blobs.
     source_client: Arc<RegistryClient>,
-    /// Source registry, so work shared between tasks is only shared when
-    /// it reads from the same source.
-    source_authority: RegistryAuthority,
     /// Target registry name (dedup key).
     target_name: RegistryAlias,
     /// Target client for pushing.
@@ -417,6 +416,8 @@ struct TransferTask {
     batch_checker: Option<Rc<dyn BatchBlobChecker>>,
     /// Artifact sync configuration (Rc-shared with mapping).
     artifacts_config: Rc<ResolvedArtifacts>,
+    /// Retries made discovering this image, counted into its total.
+    discovery_retries: u32,
 }
 
 /// Discovery outcome for one (mapping, tag) pair.
@@ -973,7 +974,7 @@ impl SyncEngine {
                     shared: Rc::clone(&shared),
                 };
 
-                discovery_futures.push(async move { count_retries(discover_tag(params)).await });
+                discovery_futures.push(async move { count_retries(0, discover_tag(params)).await });
             }
         }
 
@@ -985,6 +986,7 @@ impl SyncEngine {
             let sem = Rc::clone(ctx.sem);
             let cache_ref = Rc::clone(ctx.cache);
             let retry = ctx.retry.clone();
+            let discovery_retries = item.discovery_retries;
             let freq_counts: HashMap<Digest, usize> = {
                 let blobs = blobs_from_manifest(&item.source_data);
                 blobs
@@ -999,15 +1001,18 @@ impl SyncEngine {
             Box::pin(async move {
                 let _permit = sem.acquire().await.unwrap();
                 progress.image_started(&source_str, &target_str);
-                count_retries(execute_item(
-                    item,
-                    &cache_ref,
-                    &staging_ref,
-                    &freq_counts,
-                    &retry,
-                    mount_source_wait_deadline,
-                    &shared_ref,
-                ))
+                count_retries(
+                    discovery_retries,
+                    execute_item(
+                        item,
+                        &cache_ref,
+                        &staging_ref,
+                        &freq_counts,
+                        &retry,
+                        mount_source_wait_deadline,
+                        &shared_ref,
+                    ),
+                )
                 .await
             })
         };
@@ -1376,7 +1381,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                 // Some targets stale - need full pull for those targets.
                 let outcome = full_pull_and_build_tasks(FullPullParams {
                     source_client: &source_client,
-                    source_authority: &source_authority,
                     shared: &shared,
                     source: &source,
                     target: &target,
@@ -1441,7 +1445,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
             // Some targets stale - fall through to full pull for those targets.
             let outcome = full_pull_and_build_tasks(FullPullParams {
                 source_client: &source_client,
-                source_authority: &source_authority,
                 shared: &shared,
                 source: &source,
                 target: &target,
@@ -1470,7 +1473,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
 
     let outcome = full_pull_and_build_tasks(FullPullParams {
         source_client: &source_client,
-        source_authority: &source_authority,
         shared: &shared,
         source: &source,
         target: &target,
@@ -1578,7 +1580,6 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
 
 struct FullPullParams<'a> {
     source_client: &'a Arc<RegistryClient>,
-    source_authority: &'a RegistryAuthority,
     shared: &'a RunShared,
     source: &'a ImageRef,
     target: &'a ImageRef,
@@ -1600,7 +1601,6 @@ struct FullPullParams<'a> {
 async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutcome {
     let FullPullParams {
         source_client,
-        source_authority,
         shared,
         source,
         target,
@@ -1617,7 +1617,6 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
     // Pull source manifest (shared across all targets for this tag).
     let source_data = match pull_source_manifest(
         source_client,
-        source_authority,
         &source.repo,
         &source.tag,
         retry,
@@ -1713,13 +1712,13 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                 active_items.push(TransferTask {
                     source_data: Rc::clone(&source_data),
                     source_client: Arc::clone(source_client),
-                    source_authority: source_authority.clone(),
                     target_name,
                     target_client,
                     source: source.clone(),
                     target: target.clone(),
                     batch_checker,
                     artifacts_config: Rc::clone(artifacts_config),
+                    discovery_retries: retries_made(),
                 });
             }
         }
@@ -1752,7 +1751,6 @@ async fn execute_item(
         staging,
         retry,
         shared,
-        source_authority: &item.source_authority,
         source_client: &item.source_client,
         source_repo: &item.source.repo,
         target_client: &item.target_client,
@@ -1916,7 +1914,6 @@ async fn execute_item(
 /// re-serialized to reflect only the kept descriptors.
 async fn pull_source_manifest(
     client: &RegistryClient,
-    authority: &RegistryAuthority,
     repo: &RepositoryName,
     tag: &str,
     retry: &RetryConfig,
@@ -1992,7 +1989,7 @@ async fn pull_source_manifest(
                 .iter()
                 .map(|child_desc| {
                     let child_digest_str = child_desc.digest.to_string();
-                    let key = (authority.clone(), repo.clone(), child_desc.digest.clone());
+                    let key = source_key(client, repo, &child_desc.digest);
                     async move {
                         let child_pull = run_once(&shared.child_pulls, key, || async {
                             with_retry(retry, "manifest pull", || {
@@ -2131,7 +2128,6 @@ struct BlobIoContext<'a> {
     sink: BlobSink<'a>,
     /// Failed copies in this run, written when this task's copy fails.
     blob_failures: &'a RefCell<HashMap<BlobCopyKey, Arc<crate::Error>>>,
-    source_authority: &'a RegistryAuthority,
     source_client: &'a RegistryClient,
     source_repo: &'a RepositoryName,
     target_client: &'a RegistryClient,
@@ -2148,7 +2144,6 @@ impl<'a> BlobIoContext<'a> {
                 target_name: ctx.target_name,
             },
             blob_failures: &ctx.shared.blob_failures,
-            source_authority: ctx.source_authority,
             source_client: ctx.source_client,
             source_repo: ctx.source_repo,
             target_client: ctx.target_client,
@@ -2166,7 +2161,7 @@ impl<'a> BlobIoContext<'a> {
         }
         failures
             .get(&blob_copy_key(
-                self.source_authority,
+                self.source_client,
                 self.source_repo,
                 self.sink.target_name,
                 self.target_repo,
@@ -2185,7 +2180,7 @@ impl<'a> BlobIoContext<'a> {
             .fail(digest.clone(), self.target_repo.to_owned(), err.to_string());
         if !is_local_io(&err) {
             let key = blob_copy_key(
-                self.source_authority,
+                self.source_client,
                 self.source_repo,
                 self.sink.target_name,
                 self.target_repo,
@@ -2229,8 +2224,6 @@ struct TransferContext<'a> {
     cache: &'a Rc<RefCell<TransferStateCache>>,
     /// Work shared between tasks in this run.
     shared: &'a RunShared,
-    /// Source registry, part of the key for a recorded blob copy failure.
-    source_authority: &'a RegistryAuthority,
     /// Shared staging area for pull-once, fan-out multi-target transfers.
     staging: &'a Rc<BlobStage>,
     retry: &'a RetryConfig,
@@ -2405,29 +2398,35 @@ enum BlobClaim {
 }
 
 /// Whether a blob copy failed on local staging I/O (disk full, a missing
-/// staged file) rather than on either registry.
+/// staged file) rather than on either registry. A read error while
+/// streaming a staged file reaches us wrapped in the HTTP client's error,
+/// so the whole source chain is searched.
 fn is_local_io(err: &crate::Error) -> bool {
-    matches!(
-        err,
-        crate::Error::BlobTransfer {
-            source: ocync_distribution::Error::Io { .. },
-            ..
+    let crate::Error::BlobTransfer { source, .. } = err else {
+        return false;
+    };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(source);
+    while let Some(e) = cause {
+        if let Some(ocync_distribution::Error::Io { .. }) = e.downcast_ref() {
+            return true;
         }
-    )
+        cause = e.source();
+    }
+    false
 }
 
 /// Key of one blob copy between a source repo and a target repo.
 fn blob_copy_key(
-    source_authority: &RegistryAuthority,
+    source_client: &RegistryClient,
     source_repo: &RepositoryName,
-    target_name: &str,
+    target_name: &RegistryAlias,
     target_repo: &RepositoryName,
     digest: &Digest,
 ) -> BlobCopyKey {
     (
-        source_authority.clone(),
+        ClientId::of(source_client),
         source_repo.clone(),
-        (target_name.to_owned(), target_repo.clone(), digest.clone()),
+        target_key(target_name, target_repo, digest),
     )
 }
 
@@ -2822,13 +2821,8 @@ async fn push_manifests(
     let target_client = &item.target_client;
     let target_repo = &item.target.repo;
     let source_data = &item.source_data;
-    let child_key = |child: &ManifestPull| {
-        (
-            item.target_name.to_string(),
-            target_repo.clone(),
-            child.digest.clone(),
-        )
-    };
+    let child_key =
+        |child: &ManifestPull| target_key(&item.target_name, target_repo, &child.digest);
 
     // Claim before waiting on blob availability, so tasks sharing an index
     // split its children instead of each waiting on all of them.
@@ -2906,6 +2900,10 @@ async fn push_manifests(
             failed.get_or_insert(err);
         }
     }
+    // The index cannot be pushed now; the other children are not needed.
+    if let Some(err) = failed {
+        return Err(err);
+    }
     // Then the children other tasks are pushing. Should one of them have
     // been dropped before finishing, this task pushes the child itself.
     let awaited = held_elsewhere.iter().map(|child| {
@@ -2914,12 +2912,7 @@ async fn push_manifests(
         })
     });
     for result in futures_util::future::join_all(awaited).await {
-        if let Err(err) = result {
-            failed.get_or_insert(err);
-        }
-    }
-    if let Some(err) = failed {
-        return Err(err);
+        result?;
     }
 
     // Push top-level manifest by tag.
@@ -3003,11 +2996,7 @@ async fn discover_and_sync_artifacts(
 
     // Discover once per source manifest per run, however many tags and
     // targets sync it.
-    let referrers_key = (
-        item.source_authority.clone(),
-        source_repo.clone(),
-        parent_digest.clone(),
-    );
+    let referrers_key = source_key(source_client, source_repo, parent_digest);
     let referrers = run_once(&shared.referrers, referrers_key, || async {
         Ok(
             match discover_referrers(source_client, source_repo, parent_digest).await {
@@ -3067,11 +3056,7 @@ async fn discover_and_sync_artifacts(
     // by artifact rather than parent, so two mappings into one repo with
     // different artifact filters each get the artifacts they select.
     for desc in &matching {
-        let push_key = (
-            item.target_name.to_string(),
-            item.target.repo.clone(),
-            desc.digest.clone(),
-        );
+        let push_key = target_key(&item.target_name, &item.target.repo, &desc.digest);
         run_once(&shared.artifact_pushes, push_key, || {
             sync_artifact(item, retry, shared, desc)
         })
@@ -3097,11 +3082,7 @@ async fn sync_artifact(
     let artifact_digest_str = desc.digest.to_string();
 
     // Pull the artifact manifest from source, once per run across targets.
-    let pull_key = (
-        item.source_authority.clone(),
-        source_repo.clone(),
-        desc.digest.clone(),
-    );
+    let pull_key = source_key(source_client, source_repo, &desc.digest);
     let artifact_pull = run_once(&shared.artifact_pulls, pull_key, || async {
         with_retry(retry, "artifact manifest pull", || {
             source_client.manifest_pull(source_repo, &artifact_digest_str)
@@ -3153,11 +3134,7 @@ async fn sync_artifact(
             let blob_already_present = already_present.contains(&blob.digest);
             let sem = &blob_sem;
             let artifact_digest_str = artifact_digest_str.clone();
-            let key = (
-                item.target_name.to_string(),
-                target_repo.clone(),
-                blob.digest.clone(),
-            );
+            let key = target_key(&item.target_name, target_repo, &blob.digest);
             // Once per target repo per run: artifacts often share a blob,
             // such as the empty config.
             blob_futures.push(run_once(&shared.artifact_blobs, key, move || async move {
@@ -3580,6 +3557,48 @@ mod tests {
         assert_eq!(freq.count(&d2), 1);
     }
 
+    /// A staged file that fails to read mid-upload surfaces wrapped in the
+    /// HTTP client's error on the streaming path; it is still local I/O.
+    #[tokio::test]
+    async fn staging_read_error_during_streaming_push_is_local_io() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(202).insert_header("location", "/v2/repo/blobs/uploads/id"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let client = RegistryClient::builder(server.uri().parse().unwrap())
+            .build()
+            .unwrap();
+        let digest = Digest::from_sha256(Sha256::digest(b"blob"));
+        let unreadable = futures_util::stream::iter([Err(ocync_distribution::Error::Io {
+            context: "staging read",
+            source: std::io::Error::other("disk read failed"),
+        })]);
+
+        let source = client
+            .blob_push_stream(
+                &RepositoryName::new("repo").unwrap(),
+                &digest,
+                Some(4),
+                unreadable,
+            )
+            .await
+            .expect_err("an unreadable body cannot upload");
+        assert!(
+            is_local_io(&crate::Error::BlobTransfer { digest, source }),
+            "a wrapped staging read error must not be recorded as a registry failure"
+        );
+    }
+
     #[test]
     fn only_registry_failures_are_recorded_as_copy_failures() {
         let digest = Digest::from_sha256(Sha256::digest(b"blob"));
@@ -3707,7 +3726,6 @@ mod tests {
         TransferTask {
             source_data,
             source_client: Arc::clone(&client),
-            source_authority: RegistryAuthority::new("source.test:443"),
             target_name: RegistryAlias::new("test-target"),
             target_client: client,
             source: ImageRef {
@@ -3720,6 +3738,7 @@ mod tests {
             },
             batch_checker: None,
             artifacts_config: Rc::new(ResolvedArtifacts::default()),
+            discovery_retries: 0,
         }
     }
 
@@ -3827,7 +3846,6 @@ mod tests {
         pending.push_back(TransferTask {
             source_data: Rc::clone(&base),
             source_client: Arc::clone(&client_a),
-            source_authority: RegistryAuthority::new("source.test:443"),
             target_name: RegistryAlias::new("target-1"),
             target_client: Arc::clone(&client_a),
             source: ImageRef {
@@ -3840,11 +3858,11 @@ mod tests {
             },
             batch_checker: None,
             artifacts_config: Rc::new(ResolvedArtifacts::default()),
+            discovery_retries: 0,
         });
         pending.push_back(TransferTask {
             source_data: Rc::clone(&base),
             source_client: Arc::clone(&client_b),
-            source_authority: RegistryAuthority::new("source.test:443"),
             target_name: RegistryAlias::new("target-2"),
             target_client: Arc::clone(&client_b),
             source: ImageRef {
@@ -3857,6 +3875,7 @@ mod tests {
             },
             batch_checker: None,
             artifacts_config: Rc::new(ResolvedArtifacts::default()),
+            discovery_retries: 0,
         });
         pending.push_back(test_task(child_a, "child_a"));
         pending.push_back(test_task(child_b, "child_b"));

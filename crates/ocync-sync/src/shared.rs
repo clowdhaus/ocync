@@ -14,9 +14,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ocync_distribution::Digest;
+use ocync_distribution::RegistryClient;
 use ocync_distribution::manifest::ManifestPull;
-use ocync_distribution::spec::{ImageIndex, RegistryAuthority, RepositoryName};
+use ocync_distribution::spec::{ImageIndex, RepositoryName};
 use tokio::sync::Notify;
+
+use crate::engine::RegistryAlias;
 
 /// Outcome of a piece of shared work. The error is shared so every task that
 /// needed the work reports the same failure.
@@ -139,14 +142,46 @@ where
     }
 }
 
-/// A source manifest by digest: (source registry, source repo, digest).
-pub(crate) type SourceManifestKey = (RegistryAuthority, RepositoryName, Digest);
+/// Identity of one configured source registry. Each registry entry in the
+/// config gets its own client, so two entries for one host (anonymous and
+/// logged in, say) are different sources and never share an outcome. The
+/// address is stable for the run: every mapping holds its client throughout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ClientId(usize);
+
+impl ClientId {
+    /// The identity of `client`.
+    pub(crate) fn of(client: &RegistryClient) -> Self {
+        Self(std::ptr::from_ref(client) as usize)
+    }
+}
+
+/// A source manifest by digest: (source client, source repo, digest).
+pub(crate) type SourceManifestKey = (ClientId, RepositoryName, Digest);
 
 /// A manifest or blob by digest at one target repo: (target, repo, digest).
-pub(crate) type TargetDigestKey = (String, RepositoryName, Digest);
+pub(crate) type TargetDigestKey = (RegistryAlias, RepositoryName, Digest);
 
 /// A blob copied from one source repo to one target repo.
-pub(crate) type BlobCopyKey = (RegistryAuthority, RepositoryName, TargetDigestKey);
+pub(crate) type BlobCopyKey = (ClientId, RepositoryName, TargetDigestKey);
+
+/// Key of a source manifest pulled by digest.
+pub(crate) fn source_key(
+    client: &RegistryClient,
+    repo: &RepositoryName,
+    digest: &Digest,
+) -> SourceManifestKey {
+    (ClientId::of(client), repo.clone(), digest.clone())
+}
+
+/// Key of a manifest or blob by digest at one target repo.
+pub(crate) fn target_key(
+    target: &RegistryAlias,
+    repo: &RepositoryName,
+    digest: &Digest,
+) -> TargetDigestKey {
+    (target.clone(), repo.clone(), digest.clone())
+}
 
 /// Referrer discovery result for one source manifest.
 #[derive(Debug, Clone)]
@@ -188,6 +223,20 @@ mod tests {
 
     fn failure() -> crate::Error {
         crate::Error::LatestWithoutSort
+    }
+
+    /// Two config entries for one host (anonymous and logged in, say) are
+    /// different sources: one's failure must never reach the other.
+    #[test]
+    fn clients_for_one_host_are_different_sources() {
+        let client = || {
+            RegistryClient::builder("https://registry.example.com".parse().unwrap())
+                .build()
+                .unwrap()
+        };
+        let (anonymous, logged_in) = (client(), client());
+        assert_ne!(ClientId::of(&anonymous), ClientId::of(&logged_in));
+        assert_eq!(ClientId::of(&anonymous), ClientId::of(&anonymous));
     }
 
     #[test]
