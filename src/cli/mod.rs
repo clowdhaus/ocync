@@ -186,39 +186,46 @@ pub(crate) fn endpoint_host(hostname: &str) -> &str {
     }
 }
 
-/// Build a [`RegistryClient`] for the given hostname, using the appropriate
-/// auth provider based on explicit `auth_type` or hostname auto-detection.
-///
-/// Pass `None` for config when calling from commands that don't use config
-/// files (e.g. `copy`, which takes image references directly).
+/// The registry a client is built for.
+pub(crate) enum Registry<'a> {
+    /// A registry entry from the config file: its `url`, scheme included,
+    /// and its auth settings.
+    Configured(&'a RegistryConfig),
+    /// A bare host from an image reference that no config entry matches.
+    /// Reached over HTTPS with auth auto-detected from the host.
+    Host(&'a str),
+}
+
+/// Build a [`RegistryClient`] for `registry`, using the appropriate auth
+/// provider based on explicit `auth_type` or hostname auto-detection.
 pub(crate) async fn build_registry_client(
-    hostname: &str,
-    registry_config: Option<&RegistryConfig>,
+    registry: Registry<'_>,
 ) -> Result<RegistryClient, CliError> {
     // Idempotent: required before any reqwest::Client::new() call below
     // because reqwest is built with rustls-no-provider. The production
     // entry point installs this at `main` startup; this call covers
     // test entry points and any future caller that bypasses main.
     ocync_distribution::install_crypto_provider();
-    let bare_host = bare_hostname(hostname);
-    // Rewrite the HTTP endpoint host while keeping `bare_host` as-is for auth
-    // scope. Docker Hub requires this split: requests go to registry-1.docker.io,
-    // but the token scope/service stays docker.io.
-    let endpoint = endpoint_host(bare_host);
-    let base_url = if hostname.starts_with("http://") || hostname.starts_with("https://") {
-        // Preserve scheme; rewrite only the host substring (noop unless
-        // bare_host was exactly `docker.io`).
-        if endpoint == bare_host {
-            hostname.to_string()
-        } else {
-            hostname.replace(bare_host, endpoint)
-        }
-    } else {
-        format!("https://{endpoint}")
+    let (address, registry_config) = match registry {
+        Registry::Configured(config) => (config.url.as_str(), Some(config)),
+        Registry::Host(host) => (host, None),
     };
-
-    let url = Url::parse(&base_url)
-        .map_err(|e| CliError::Input(format!("invalid registry URL '{base_url}': {e}")))?;
+    let bare_host = bare_hostname(address);
+    let with_scheme = if address.starts_with("http://") || address.starts_with("https://") {
+        address.to_owned()
+    } else {
+        format!("https://{address}")
+    };
+    let mut url = Url::parse(&with_scheme)
+        .map_err(|e| CliError::Input(format!("invalid registry URL '{address}': {e}")))?;
+    // Requests go to the endpoint host while `bare_host` stays the auth scope
+    // and service. Docker Hub requires this split: requests go to
+    // registry-1.docker.io, but the token scope/service stays docker.io.
+    let endpoint = endpoint_host(bare_host);
+    if endpoint != bare_host {
+        url.set_host(Some(endpoint))
+            .map_err(|e| CliError::Input(format!("invalid registry host '{endpoint}': {e}")))?;
+    }
 
     let http = reqwest::Client::new();
 
@@ -238,7 +245,7 @@ pub(crate) async fn build_registry_client(
                 .and_then(|r| r.credentials.as_ref())
                 .expect("basic auth requires credentials (validated)");
             let auth = BasicAuth::new(
-                endpoint,
+                &url,
                 http,
                 Credentials::Basic {
                     username: creds.username.clone(),
@@ -256,13 +263,13 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Gar | AuthType::Gcr) => {
-            let auth = GcpAuth::new(bare_host, http)
+            let auth = GcpAuth::new(&url, http)
                 .await
                 .map_err(|e| CliError::Auth(format!("GCP auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Acr) => {
-            let auth = AcrAuth::new(bare_host)
+            let auth = AcrAuth::new(&url)
                 .await
                 .map_err(|e| CliError::Auth(format!("ACR auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
@@ -279,11 +286,11 @@ pub(crate) async fn build_registry_client(
                     "failed to load docker config for '{bare_host}': {e}"
                 ))
             })?;
-            let auth = DockerConfigAuth::new(endpoint, &docker_config, http).await?;
+            let auth = DockerConfigAuth::new(&url, &docker_config, http).await?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Anonymous) => {
-            let auth = AnonymousAuth::new(endpoint, http);
+            let auth = AnonymousAuth::new(&url, http);
             RegistryClient::builder(url).auth(auth)
         }
         None => {
@@ -303,13 +310,13 @@ pub(crate) async fn build_registry_client(
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Gar | ProviderKind::Gcr) => {
-                    let auth = GcpAuth::new(bare_host, http).await.map_err(|e| {
+                    let auth = GcpAuth::new(&url, http).await.map_err(|e| {
                         CliError::Auth(format!("GCP auth setup for '{bare_host}': {e}"))
                     })?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Acr) => {
-                    let auth = AcrAuth::new(bare_host).await.map_err(|e| {
+                    let auth = AcrAuth::new(&url).await.map_err(|e| {
                         CliError::Auth(format!("ACR auth setup for '{bare_host}': {e}"))
                     })?;
                     RegistryClient::builder(url).auth(auth)
@@ -319,13 +326,13 @@ pub(crate) async fn build_registry_client(
                     // Try docker config - falls back to anonymous exchange if no creds found.
                     match DockerConfig::load_default() {
                         Ok(config) => {
-                            let auth = DockerConfigAuth::new(endpoint, &config, http)
-                                .await
-                                .map_err(|e| {
+                            let auth = DockerConfigAuth::new(&url, &config, http).await.map_err(
+                                |e| {
                                     CliError::Auth(format!(
                                         "docker config credential resolution for '{bare_host}': {e}"
                                     ))
-                                })?;
+                                },
+                            )?;
                             RegistryClient::builder(url).auth(auth)
                         }
                         Err(_) => {
@@ -334,7 +341,7 @@ pub(crate) async fn build_registry_client(
                                 registry = bare_host,
                                 "no docker config found, using anonymous auth"
                             );
-                            let auth = AnonymousAuth::new(endpoint, http);
+                            let auth = AnonymousAuth::new(&url, http);
                             RegistryClient::builder(url).auth(auth)
                         }
                     }

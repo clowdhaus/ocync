@@ -5,7 +5,9 @@ use ocync_sync::filter::FilterConfig;
 
 use crate::TagsArgs;
 use crate::cli::config::load_config;
-use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client, endpoint_host};
+use crate::cli::{
+    CliError, ExitCode, Registry, bare_hostname, build_registry_client, endpoint_host,
+};
 
 pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     let registry = args.repository.registry();
@@ -26,7 +28,12 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
         None
     };
 
-    let client = build_registry_client(registry, reg_config.as_ref()).await?;
+    let client = build_registry_client(
+        reg_config
+            .as_ref()
+            .map_or(Registry::Host(registry), Registry::Configured),
+    )
+    .await?;
 
     let repo_path = RepositoryName::new(repository)?;
     let all_tags = client.list_tags(&repo_path).await?;

@@ -405,7 +405,7 @@
           "default": null
         },
         "url": {
-          "description": "Registry base URL (e.g. `registry-1.docker.io`, `123456789012.dkr.ecr.us-east-1.amazonaws.com`).",
+          "description": "Registry base URL (e.g. `registry-1.docker.io`, `123456789012.dkr.ecr.us-east-1.amazonaws.com`).\nHTTPS unless written with `http://`, which uses plain HTTP (local registries only).",
           "type": "string"
         }
       },

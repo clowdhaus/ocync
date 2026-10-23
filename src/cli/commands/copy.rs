@@ -19,7 +19,9 @@ use ocync_sync::staging::BlobStage;
 
 use crate::CopyArgs;
 use crate::cli::config::{AuthType, load_config};
-use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client, endpoint_host};
+use crate::cli::{
+    CliError, ExitCode, Registry, bare_hostname, build_registry_client, endpoint_host,
+};
 
 /// Run the copy command: transfer a single image from source to destination.
 ///
@@ -55,10 +57,18 @@ pub(crate) async fn run(
         .find(|r| endpoint_host(bare_hostname(&r.url)) == normalized_dst);
 
     let source_client = Arc::new(
-        build_registry_client(bare_hostname(args.source.registry()), src_reg_config).await?,
+        build_registry_client(src_reg_config.map_or(
+            Registry::Host(bare_hostname(args.source.registry())),
+            Registry::Configured,
+        ))
+        .await?,
     );
     let target_client = Arc::new(
-        build_registry_client(bare_hostname(args.destination.registry()), dst_reg_config).await?,
+        build_registry_client(dst_reg_config.map_or(
+            Registry::Host(bare_hostname(args.destination.registry())),
+            Registry::Configured,
+        ))
+        .await?,
     );
 
     let source_authority = source_client

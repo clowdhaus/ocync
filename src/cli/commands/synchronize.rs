@@ -31,7 +31,7 @@ use crate::cli::config::{
     resolve_target_names,
 };
 use crate::cli::output::{format_bytes, format_duration};
-use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client};
+use crate::cli::{CliError, ExitCode, Registry, bare_hostname, build_registry_client};
 
 /// Default cache TTL: 12 hours.
 pub(crate) const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
@@ -1152,8 +1152,7 @@ pub(crate) async fn build_clients(
         // wedged provider is named in the progress line rather than showing up
         // as a stalled count.
         let _item = tracker.track(name);
-        let hostname = bare_hostname(&reg.url);
-        let entry = match build_registry_client(hostname, Some(reg)).await {
+        let entry = match build_registry_client(Registry::Configured(reg)).await {
             Ok(client) => Ok(Arc::new(client)),
             Err(err) => {
                 tracing::error!(

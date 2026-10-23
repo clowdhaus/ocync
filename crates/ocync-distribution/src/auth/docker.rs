@@ -12,7 +12,9 @@ use serde::Deserialize;
 
 use super::token_cache::TokenCache;
 use super::token_exchange;
-use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
+use super::{
+    AuthProvider, Credentials, Scope, Token, registry_host, registry_origin, scopes_cache_key,
+};
 use crate::error::Error;
 
 /// Docker Hub hostnames that all resolve to the same credential entry.
@@ -338,15 +340,16 @@ impl fmt::Debug for DockerConfigAuth {
 }
 
 impl DockerConfigAuth {
-    /// Create a new Docker config auth provider for the given hostname.
-    ///
-    /// Resolves credentials from `config`. Uses HTTPS by default.
+    /// Create a Docker config auth provider for the registry at `registry`,
+    /// the base URL its client uses. Credentials are looked up in `config`
+    /// under the registry's host (with its port, when one is given).
     pub async fn new(
-        registry: impl Into<String>,
+        registry: &url::Url,
         config: &DockerConfig,
         http: reqwest::Client,
     ) -> Result<Self, Error> {
-        let registry = registry.into();
+        let base_url = registry_origin(registry);
+        let registry = registry_host(registry);
         let credentials = resolve_from_docker_config(config, &registry).await?;
         if credentials.is_some() {
             tracing::debug!(registry = %registry, "docker config: resolved credentials");
@@ -354,7 +357,7 @@ impl DockerConfigAuth {
             tracing::debug!(registry = %registry, "docker config: no credentials, using anonymous");
         }
         Ok(Self {
-            base_url: format!("https://{registry}"),
+            base_url,
             http,
             credentials,
             tokens: TokenCache::new(),
@@ -867,7 +870,7 @@ mod tests {
     #[tokio::test]
     async fn docker_config_auth_name() {
         let auth = DockerConfigAuth::new(
-            "example.com",
+            &"https://example.com".parse().unwrap(),
             &DockerConfig::default(),
             crate::test_http_client(),
         )
@@ -894,9 +897,13 @@ mod tests {
             cred_helpers: HashMap::new(),
             creds_store: None,
         };
-        let auth = DockerConfigAuth::new("ghcr.io", &config, crate::test_http_client())
-            .await
-            .unwrap();
+        let auth = DockerConfigAuth::new(
+            &"https://ghcr.io".parse().unwrap(),
+            &config,
+            crate::test_http_client(),
+        )
+        .await
+        .unwrap();
         // Verify credentials were resolved (has_credentials in Debug output).
         let debug = format!("{auth:?}");
         assert!(debug.contains("has_credentials: true"));
@@ -993,9 +1000,13 @@ mod tests {
             creds_store: None,
         };
         // quay.io not in config -- should resolve as anonymous.
-        let auth = DockerConfigAuth::new("quay.io", &config, crate::test_http_client())
-            .await
-            .unwrap();
+        let auth = DockerConfigAuth::new(
+            &"https://quay.io".parse().unwrap(),
+            &config,
+            crate::test_http_client(),
+        )
+        .await
+        .unwrap();
         let debug = format!("{auth:?}");
         assert!(debug.contains("has_credentials: false"));
     }

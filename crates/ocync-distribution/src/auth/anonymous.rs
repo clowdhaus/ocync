@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 use super::token_cache::TokenCache;
 use super::token_exchange;
-use super::{AuthProvider, Scope, Token, scopes_cache_key};
+use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 
 /// Anonymous auth provider that performs the Docker token-exchange flow.
@@ -35,26 +35,11 @@ impl fmt::Debug for AnonymousAuth {
 }
 
 impl AnonymousAuth {
-    /// Create a new anonymous auth provider for the given registry hostname.
-    ///
-    /// Uses HTTPS by default. For non-HTTPS registries (e.g. local development),
-    /// use [`AnonymousAuth::with_base_url`].
-    pub fn new(registry: impl Into<String>, http: reqwest::Client) -> Self {
-        let registry = registry.into();
+    /// Create an anonymous auth provider for the registry at `registry`, the
+    /// base URL its client uses.
+    pub fn new(registry: &url::Url, http: reqwest::Client) -> Self {
         Self {
-            base_url: format!("https://{registry}"),
-            http,
-            tokens: TokenCache::new(),
-            challenge_cache: token_exchange::ChallengeCache::new(),
-        }
-    }
-
-    /// Create a new anonymous auth provider with an explicit base URL.
-    ///
-    /// Use this for registries that don't use HTTPS (e.g. `http://localhost:5000`).
-    pub fn with_base_url(base_url: impl Into<String>, http: reqwest::Client) -> Self {
-        Self {
-            base_url: base_url.into(),
+            base_url: registry_origin(registry),
             http,
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
@@ -140,7 +125,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = AnonymousAuth::with_base_url(server.uri(), crate::test_http_client());
+        let auth = AnonymousAuth::new(&server.uri().parse().unwrap(), crate::test_http_client());
         let token = auth
             .get_token(&[Scope::pull("library/nginx")])
             .await
@@ -172,7 +157,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = AnonymousAuth::with_base_url(server.uri(), crate::test_http_client());
+        let auth = AnonymousAuth::new(&server.uri().parse().unwrap(), crate::test_http_client());
         let t1 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         let t2 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         assert_eq!(t1.value(), "cached");
@@ -203,7 +188,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = AnonymousAuth::with_base_url(server.uri(), crate::test_http_client());
+        let auth = AnonymousAuth::new(&server.uri().parse().unwrap(), crate::test_http_client());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.invalidate().await;
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
@@ -235,7 +220,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = AnonymousAuth::with_base_url(server.uri(), crate::test_http_client());
+        let auth = AnonymousAuth::new(&server.uri().parse().unwrap(), crate::test_http_client());
         let t1 = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
         let t2 = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
         assert_eq!(t1.value(), "reused");
@@ -286,8 +271,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = Arc::new(AnonymousAuth::with_base_url(
-            server.uri(),
+        let auth = Arc::new(AnonymousAuth::new(
+            &server.uri().parse().unwrap(),
             crate::test_http_client(),
         ));
         let auth_a = Arc::clone(&auth);
@@ -322,7 +307,10 @@ mod tests {
 
     #[test]
     fn anonymous_auth_name() {
-        let auth = AnonymousAuth::new("example.com", crate::test_http_client());
+        let auth = AnonymousAuth::new(
+            &"https://example.com".parse().unwrap(),
+            crate::test_http_client(),
+        );
         assert_eq!(auth.name(), "anonymous");
     }
 }

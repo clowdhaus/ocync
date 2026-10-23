@@ -212,6 +212,7 @@ pub(crate) enum AuthType {
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub(crate) struct RegistryConfig {
     /// Registry base URL (e.g. `registry-1.docker.io`, `123456789012.dkr.ecr.us-east-1.amazonaws.com`).
+    /// HTTPS unless written with `http://`, which uses plain HTTP (local registries only).
     pub url: String,
 
     /// Authentication method to use for this registry.

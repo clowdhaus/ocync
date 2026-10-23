@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 use super::ecr::SdkCredentialCache;
 use super::token_cache::TokenCache;
 use super::token_exchange::no_redirect_http_client;
-use super::{AuthProvider, Scope, Token, scopes_cache_key};
+use super::{AuthProvider, Scope, Token, registry_host, registry_origin, scopes_cache_key};
 use crate::error::Error;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -584,13 +584,15 @@ impl fmt::Debug for AcrAuth {
 }
 
 impl AcrAuth {
-    /// Construct a new `AcrAuth` for the given ACR hostname.
-    pub async fn new(hostname: &str) -> Result<Self, Error> {
-        let (authority, resource) = azure_endpoints(hostname);
+    /// Construct an `AcrAuth` for the registry at `registry`, the base URL
+    /// its client uses.
+    pub async fn new(registry: &url::Url) -> Result<Self, Error> {
+        let hostname = registry_host(registry);
+        let (authority, resource) = azure_endpoints(&hostname);
         let api = Box::new(AzureCredentialChain::new(authority, resource));
         Ok(Self {
-            base_url: format!("https://{hostname}"),
-            service: hostname.to_owned(),
+            base_url: registry_origin(registry),
+            service: hostname,
             exchange_http: no_redirect_http_client(),
             api,
             refresh_cache: SdkCredentialCache::new(),
