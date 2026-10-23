@@ -376,7 +376,7 @@ The existing `ShutdownSignal` infrastructure in `crates/ocync-sync/src/shutdown.
 
 8. **Index manifests are fully resolved before execution.** Discovery pulls the full index tree (index + all children) before sending to the pending queue. Execution pushes children first, then the index, matching OCI spec dependency ordering.
 
-9. **Error escalation is per-image, not per-target or per-tag.** A blob failure stops that (tag, target) pair, preventing manifest push and recording the image as failed in the sync report. Other targets for the same tag are independent and continue. Other tags are independent and continue. A 429 on one AIMD window does not affect other windows or other registries. The engine always completes the full sync run and reports all failures, never aborts early on a single image failure.
+9. **Error escalation is per-image, not per-target or per-tag.** A blob failure stops that (tag, target) pair, preventing manifest push and recording the image as failed in the sync report. Other targets for the same tag are independent and continue. Other tags are independent and continue, except that tags pushing the same child manifest to the same repo share its outcome: a child whose push failed after its retries fails each of them with that error, and each still reports its own failure. A 429 on one AIMD window does not affect other windows or other registries. The engine always completes the full sync run and reports all failures, never aborts early on a single image failure.
 
 ## Failure interaction matrix
 
@@ -390,6 +390,7 @@ Optimizations can amplify each other's failure modes. This matrix captures non-o
 | Disk full during staging | Partial temp file, subsequent reads corrupt | Atomic rename pattern (`.tmp.{random}` -> `{digest}`). On ENOSPC: disable disk staging for remainder of run (circuit breaker), continue with fresh source pulls per target |
 | HEAD/GET digest mismatch (Docker Hub) | Discovery HEAD: graceful degradation to always-pull (extra HEAD per cycle, no correctness bug). `head_first`: false skip means target has stale content | Discovery HEAD: unconditional with fallback, no operator action needed. `head_first`: opt-in only, observable via `discovery_head_first_skips` in `SyncStats` |
 | GAR shared quota + high pipeline concurrency | Increased request rate exhausts shared quota faster than sequential processing | Detect GAR targets (`*-docker.pkg.dev`), cap concurrency at 5 for all operation types via single shared AIMD window |
+| Child manifest push fails, shared by N tags | One exhausted retry budget fails all N tags in the repo, including tags of different indexes that share the child | Intended: the same bytes to the same repo get the same answer, so retrying per tag would only add requests against the failing endpoint. Each tag reports the failure. The record is per run, so the next run retries |
 
 ## Alternatives considered
 
