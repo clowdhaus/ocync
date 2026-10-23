@@ -824,6 +824,62 @@ async fn artifact_shared_by_tags_syncs_once() {
     );
 }
 
+/// Two mappings from different sources sync one signed image into one
+/// target repo. The signature cannot be pulled from one source; the other
+/// source's mapping still syncs it, and the broken source's mapping fails.
+#[tokio::test]
+async fn artifact_failure_from_one_source_does_not_fail_another() {
+    let good_source = MockServer::start().await;
+    let broken_source = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parent = ManifestBuilder::new(b"parent-config")
+        .layer(b"parent-layer")
+        .build();
+    let sig = ArtifactBuilder::new(b"sig-config", b"sig-payload").build();
+    let referrers = ReferrersIndexBuilder::new().artifact(&sig).build();
+    for (source, tag) in [(&good_source, "good"), (&broken_source, "broken")] {
+        parent.mount_source(source, "repo", tag).await;
+        parent.mount_target(&target_server, "repo", tag).await;
+        mount_referrers(source, "repo", &parent.digest, &referrers).await;
+    }
+    // Only the good source serves the signature itself.
+    sig.mount_source(&good_source, "repo").await;
+    sig.mount_target(&target_server, "repo").await;
+
+    let with_artifacts = |source: &MockServer, tag: &str| ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts {
+            enabled: true,
+            ..ResolvedArtifacts::default()
+        }),
+        ..mapping_from_servers(source, &target_server, "repo", vec![TagPair::same(tag)])
+    };
+    let report = run_sync(vec![
+        with_artifacts(&broken_source, "broken"),
+        with_artifacts(&good_source, "good"),
+    ])
+    .await;
+
+    let status = |tag: &str| {
+        &report
+            .images
+            .iter()
+            .find(|i| i.target.ends_with(&format!(":{tag}")))
+            .expect("every tag is reported")
+            .status
+    };
+    assert!(
+        matches!(status("good"), ImageStatus::Synced),
+        "the good source's mapping got the broken source's failure: {:?}",
+        status("good")
+    );
+    assert!(
+        matches!(status("broken"), ImageStatus::Failed { .. }),
+        "the broken source's mapping reused the good source's copy: {:?}",
+        status("broken")
+    );
+}
+
 /// Two signatures of one image share their config blob. The blob is
 /// uploaded to the target repo once, not once per artifact.
 #[tokio::test]

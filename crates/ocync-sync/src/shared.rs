@@ -162,8 +162,9 @@ pub(crate) type SourceManifestKey = (ClientId, RepositoryName, Digest);
 /// A manifest or blob by digest at one target repo: (target, repo, digest).
 pub(crate) type TargetDigestKey = (RegistryAlias, RepositoryName, Digest);
 
-/// A blob copied from one source repo to one target repo.
-pub(crate) type BlobCopyKey = (ClientId, RepositoryName, TargetDigestKey);
+/// A blob or artifact copied by digest from one source repo to one target
+/// repo. The copy pulls from the source, so its outcome is the source's too.
+pub(crate) type CopyKey = (ClientId, RepositoryName, TargetDigestKey);
 
 /// Key of a source manifest pulled by digest.
 pub(crate) fn source_key(
@@ -181,6 +182,22 @@ pub(crate) fn target_key(
     digest: &Digest,
 ) -> TargetDigestKey {
     (target.clone(), repo.clone(), digest.clone())
+}
+
+/// Key of a blob or artifact copied by digest from one source repo to one
+/// target repo.
+pub(crate) fn copy_key(
+    source_client: &RegistryClient,
+    source_repo: &RepositoryName,
+    target: &RegistryAlias,
+    target_repo: &RepositoryName,
+    digest: &Digest,
+) -> CopyKey {
+    (
+        ClientId::of(source_client),
+        source_repo.clone(),
+        target_key(target, target_repo, digest),
+    )
 }
 
 /// Referrer discovery result for one source manifest.
@@ -208,13 +225,13 @@ pub(crate) struct RunShared {
     /// Referrer discovery per source manifest.
     pub(crate) referrers: RefCell<SharedWork<SourceManifestKey, Referrers>>,
     /// Artifacts (manifest and blobs) copied by digest to a target repo.
-    pub(crate) artifact_pushes: RefCell<SharedWork<TargetDigestKey, ()>>,
+    pub(crate) artifact_pushes: RefCell<SharedWork<CopyKey, ()>>,
     /// Artifact blobs copied by digest to a target repo.
-    pub(crate) artifact_blobs: RefCell<SharedWork<TargetDigestKey, ()>>,
+    pub(crate) artifact_blobs: RefCell<SharedWork<CopyKey, ()>>,
     /// Blob copies that failed after their retries. A task copying the same
     /// blob between the same repos reports this error instead of repeating
     /// the copy.
-    pub(crate) blob_failures: RefCell<HashMap<BlobCopyKey, Arc<crate::Error>>>,
+    pub(crate) blob_failures: RefCell<HashMap<CopyKey, Arc<crate::Error>>>,
 }
 
 #[cfg(test)]

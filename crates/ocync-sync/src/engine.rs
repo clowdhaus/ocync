@@ -47,7 +47,7 @@ use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferState
 use crate::progress::RunProgress;
 use crate::retry::{RetryConfig, count_retries, retries_made, with_retry};
 use crate::shared::{
-    BlobCopyKey, Claim, ClientId, Referrers, RunShared, claim, run_once, source_key, target_key,
+    Claim, CopyKey, Referrers, RunShared, claim, copy_key, run_once, source_key, target_key,
 };
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
@@ -2127,7 +2127,7 @@ impl<'a> BlobSink<'a> {
 struct BlobIoContext<'a> {
     sink: BlobSink<'a>,
     /// Failed copies in this run, written when this task's copy fails.
-    blob_failures: &'a RefCell<HashMap<BlobCopyKey, Arc<crate::Error>>>,
+    blob_failures: &'a RefCell<HashMap<CopyKey, Arc<crate::Error>>>,
     source_client: &'a RegistryClient,
     source_repo: &'a RepositoryName,
     target_client: &'a RegistryClient,
@@ -2160,7 +2160,7 @@ impl<'a> BlobIoContext<'a> {
             return None;
         }
         failures
-            .get(&blob_copy_key(
+            .get(&copy_key(
                 self.source_client,
                 self.source_repo,
                 self.sink.target_name,
@@ -2176,10 +2176,8 @@ impl<'a> BlobIoContext<'a> {
     /// registries, so the next task copying the blob tries again.
     fn fail_copy(&self, digest: &Digest, err: crate::Error) -> crate::Error {
         let err = Arc::new(err);
-        self.sink
-            .fail(digest.clone(), self.target_repo.to_owned(), err.to_string());
         if !is_local_io(&err) {
-            let key = blob_copy_key(
+            let key = copy_key(
                 self.source_client,
                 self.source_repo,
                 self.sink.target_name,
@@ -2190,6 +2188,14 @@ impl<'a> BlobIoContext<'a> {
                 .borrow_mut()
                 .insert(key, Arc::clone(&err));
         }
+        self.release_failed(digest, err)
+    }
+
+    /// Mark this task's copy of `digest` failed with `err` and release the
+    /// claim, waking its waiters.
+    fn release_failed(&self, digest: &Digest, err: Arc<crate::Error>) -> crate::Error {
+        self.sink
+            .fail(digest.clone(), self.target_repo.to_owned(), err.to_string());
         self.sink.release_claim(digest);
         crate::Error::Shared(err)
     }
@@ -2413,21 +2419,6 @@ fn is_local_io(err: &crate::Error) -> bool {
         cause = e.source();
     }
     false
-}
-
-/// Key of one blob copy between a source repo and a target repo.
-fn blob_copy_key(
-    source_client: &RegistryClient,
-    source_repo: &RepositoryName,
-    target_name: &RegistryAlias,
-    target_repo: &RepositoryName,
-    digest: &Digest,
-) -> BlobCopyKey {
-    (
-        ClientId::of(source_client),
-        source_repo.clone(),
-        target_key(target_name, target_repo, digest),
-    )
 }
 
 /// Cache check + atomic claim, run OUTSIDE the per-image blob semaphore.
@@ -2654,17 +2645,6 @@ async fn transfer_claimed_blob(
                 // claim prevents concurrent waiters from re-claiming and
                 // starting duplicate pushes.
                 io.sink.mark_repo_stale(digest, &from_repo);
-                // A mount source let this task past a recorded copy failure;
-                // without the mount, the copy would repeat that failure.
-                if let Some(err) = io.recorded_failure(digest) {
-                    if matches!(staging, StagingClaim::Pull) {
-                        io.staging.notify_failed(digest);
-                    }
-                    io.sink
-                        .fail(digest.clone(), io.target_repo.to_owned(), err.to_string());
-                    io.sink.release_claim(digest);
-                    return BlobResult::Failed(crate::Error::Shared(err));
-                }
                 mount_attempted = true;
             }
         }
@@ -2691,6 +2671,15 @@ async fn transfer_claimed_blob(
                 );
             }
         }
+    }
+
+    // A mount source let this task past a recorded copy failure, and the
+    // mount did not avoid the copy: copying would repeat that failure.
+    if let Some(err) = io.recorded_failure(digest) {
+        if matches!(staging, StagingClaim::Pull) {
+            io.staging.notify_failed(digest);
+        }
+        return BlobResult::Failed(io.release_failed(digest, err));
     }
 
     let transfer_result: Result<(), crate::Error> = match staging {
@@ -2998,13 +2987,7 @@ async fn discover_and_sync_artifacts(
     // targets sync it.
     let referrers_key = source_key(source_client, source_repo, parent_digest);
     let referrers = run_once(&shared.referrers, referrers_key, || async {
-        Ok(
-            match discover_referrers(source_client, source_repo, parent_digest).await {
-                (Some(index), _) => Referrers::Found(index),
-                (None, true) => Referrers::NotFound,
-                (None, false) => Referrers::Failed,
-            },
-        )
+        Ok(discover_referrers(source_client, source_repo, parent_digest).await)
     })
     .await?;
     let (referrers_index, discovery_succeeded) = match referrers {
@@ -3052,11 +3035,18 @@ async fn discover_and_sync_artifacts(
         "syncing artifacts"
     );
 
-    // Transfer each matching artifact once per target repo per run. Keyed
-    // by artifact rather than parent, so two mappings into one repo with
-    // different artifact filters each get the artifacts they select.
+    // Copy each matching artifact once per (source repo, target repo) per
+    // run. Keyed by artifact rather than parent, so two mappings into one
+    // repo with different artifact filters each get the artifacts they
+    // select, and by source, so one source's failure never fails another.
     for desc in &matching {
-        let push_key = target_key(&item.target_name, &item.target.repo, &desc.digest);
+        let push_key = copy_key(
+            &item.source_client,
+            &item.source.repo,
+            &item.target_name,
+            &item.target.repo,
+            &desc.digest,
+        );
         run_once(&shared.artifact_pushes, push_key, || {
             sync_artifact(item, retry, shared, desc)
         })
@@ -3134,9 +3124,15 @@ async fn sync_artifact(
             let blob_already_present = already_present.contains(&blob.digest);
             let sem = &blob_sem;
             let artifact_digest_str = artifact_digest_str.clone();
-            let key = target_key(&item.target_name, target_repo, &blob.digest);
-            // Once per target repo per run: artifacts often share a blob,
-            // such as the empty config.
+            let key = copy_key(
+                source_client,
+                source_repo,
+                &item.target_name,
+                target_repo,
+                &blob.digest,
+            );
+            // Once per (source repo, target repo) per run: artifacts often
+            // share a blob, such as the empty config.
             blob_futures.push(run_once(&shared.artifact_blobs, key, move || async move {
                 // For batch-already-present blobs, skip the HEAD and
                 // any pull/push: the batch API already confirmed
@@ -3243,20 +3239,17 @@ async fn sync_artifact(
 /// Discover referrers for a manifest from the source registry.
 ///
 /// Tries the referrers API first, falls back to the tag-based lookup.
-/// Returns `(Option<ImageIndex>, discovery_succeeded)`.
 async fn discover_referrers(
     source_client: &RegistryClient,
     source_repo: &RepositoryName,
     parent_digest: &Digest,
-) -> (Option<ImageIndex>, bool) {
-    let mut discovery_succeeded = true;
-
+) -> Referrers {
     // Step 1: Try referrers API.
-    let index = match source_client
+    match source_client
         .referrers(source_repo, parent_digest, None)
         .await
     {
-        Ok(Some(index)) => Some(index),
+        Ok(Some(index)) => Referrers::Found(index),
         Ok(None) => {
             // 404 - try tag fallback (step 2).
             let fallback_tag = parent_digest.tag_fallback();
@@ -3271,7 +3264,7 @@ async fn discover_referrers(
                 .await
             {
                 Ok(pull) => match pull.manifest {
-                    ManifestKind::Index(index) => Some(*index),
+                    ManifestKind::Index(index) => Referrers::Found(*index),
                     ManifestKind::Image(_) => {
                         // A single image manifest at the fallback tag is
                         // itself an artifact referrer. Wrap in a synthetic
@@ -3285,7 +3278,7 @@ async fn discover_referrers(
                             artifact_type: None,
                             annotations: None,
                         };
-                        Some(ImageIndex {
+                        Referrers::Found(ImageIndex {
                             schema_version: 2,
                             media_type: Some(MediaType::OciIndex),
                             manifests: vec![desc],
@@ -3301,7 +3294,7 @@ async fn discover_referrers(
                         digest = %parent_digest,
                         "no referrers found (API 404, tag fallback 404)"
                     );
-                    None
+                    Referrers::NotFound
                 }
                 Err(e) => {
                     // Non-404 error on fallback is not fatal; log and continue.
@@ -3311,8 +3304,7 @@ async fn discover_referrers(
                         error = %e,
                         "tag fallback failed, skipping artifact sync"
                     );
-                    discovery_succeeded = false;
-                    None
+                    Referrers::Failed
                 }
             }
         }
@@ -3325,12 +3317,9 @@ async fn discover_referrers(
                 error = %e,
                 "referrers API failed, skipping artifact sync"
             );
-            discovery_succeeded = false;
-            None
+            Referrers::Failed
         }
-    };
-
-    (index, discovery_succeeded)
+    }
 }
 
 /// Read a file in 256 KB chunks, yielding a stream of `Bytes`.

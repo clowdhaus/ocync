@@ -587,6 +587,18 @@ async fn sync_failed_own_child_does_not_wait_on_shared_children() {
     x.mount_target(&target_server, "repo", "x").await;
     y.mount_source(&source_server, "repo", "y").await;
     y.mount_target(&target_server, "repo", "y").await;
+    // `y`'s own layer arrives late, so `x` has always claimed `c2` by the
+    // time `y` pushes its children.
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", c3.layer_descs[0].digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(c3.layers_data[0].clone())
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
     Mock::given(method("PUT"))
         .and(path(format!("/v2/repo/manifests/{}", c2.digest)))
         .respond_with(ResponseTemplate::new(201).set_delay(std::time::Duration::from_secs(2)))
@@ -604,8 +616,6 @@ async fn sync_failed_own_child_does_not_wait_on_shared_children() {
         &source_server,
         &target_server,
         "repo",
-        // In this order `x` claims `c2` first. Reversed, `y` claims `c2`
-        // and waits on its own slow push, which is intended.
         vec![TagPair::same("y"), TagPair::same("x")],
     );
     let report = run_sync(vec![mapping]).await;
