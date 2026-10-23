@@ -25,7 +25,6 @@
 //! by [`BlobStage::cleanup_tmp_files`].
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -33,6 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ocync_distribution::Digest;
 use tokio::sync::Notify;
+
+use crate::shared::{Claim, ClaimGuard, Work, claim};
 
 /// Shared sequence counter for generating unique temporary file names across
 /// both [`BlobStage::write`] and [`BlobStage::begin_write`]. A single counter
@@ -64,14 +65,13 @@ pub(crate) fn best_effort_dir_fsync(path: &std::path::Path) {
 /// Prevents concurrent image tasks from pulling the same blob from source
 /// when staging is enabled. The first task claims the pull; concurrent tasks
 /// wait for the file to appear on disk.
-#[derive(Debug)]
-pub enum StagePullAction {
+pub(crate) enum StagePullAction<'a> {
     /// Blob already staged on disk. Skip source pull, read from staging.
     Exists,
-    /// Claimed: this task should pull from source and stage the blob.
-    /// Call [`BlobStage::notify_staged`] after writing, or
-    /// [`BlobStage::notify_failed`] on failure.
-    Pull,
+    /// Claimed: this task should pull from source and stage the blob. Drop
+    /// the guard once the blob is staged or the pull is abandoned; that
+    /// wakes the waiters.
+    Pull(ClaimGuard<'a, Digest, ()>),
     /// Another task is currently pulling this blob. Await the [`Notify`],
     /// then call `claim_or_check` again (the pull may have failed).
     Wait(Rc<Notify>),
@@ -97,10 +97,10 @@ pub enum StagePullAction {
 #[derive(Debug)]
 pub struct BlobStage {
     base_dir: Option<PathBuf>,
-    /// In-progress source pulls keyed by digest. When a task claims a pull,
-    /// it inserts a `Notify`; waiters clone and `.notified().await` on it.
-    /// Removed on completion ([`notify_staged`]) or failure ([`notify_failed`]).
-    pulls: RefCell<HashMap<Digest, Rc<Notify>>>,
+    /// In-progress source pulls keyed by digest. No outcome is recorded:
+    /// the staged file is the record, and a failed pull is retried by a
+    /// waiter, whose source may differ.
+    pulls: RefCell<Work<Digest, ()>>,
 }
 
 impl BlobStage {
@@ -110,7 +110,7 @@ impl BlobStage {
     pub fn new(base_dir: PathBuf) -> Self {
         Self {
             base_dir: Some(base_dir),
-            pulls: RefCell::new(HashMap::new()),
+            pulls: RefCell::new(Work::default()),
         }
     }
 
@@ -120,7 +120,7 @@ impl BlobStage {
     pub fn disabled() -> Self {
         Self {
             base_dir: None,
-            pulls: RefCell::new(HashMap::new()),
+            pulls: RefCell::new(Work::default()),
         }
     }
 
@@ -136,50 +136,17 @@ impl BlobStage {
         self.blob_path(digest).is_some_and(|p| p.exists())
     }
 
-    /// Check-and-claim for source-pull dedup.
-    ///
-    /// Returns [`StagePullAction::Exists`] if the blob is already on disk,
-    /// [`StagePullAction::Pull`] if this task should pull it (claiming the
-    /// digest), or [`StagePullAction::Wait`] if another task is pulling it.
-    ///
-    /// When staging is disabled, always returns `Pull` (no dedup possible).
-    ///
-    /// Callers must call [`notify_staged`] after a successful pull or
-    /// [`notify_failed`] on failure. Failing to do so will deadlock waiters.
-    pub fn claim_or_check(&self, digest: &Digest) -> StagePullAction {
-        if !self.is_enabled() {
-            return StagePullAction::Pull;
-        }
+    /// Check-and-claim for source-pull dedup. Only called with staging
+    /// enabled.
+    pub(crate) fn claim_or_check(&self, digest: &Digest) -> StagePullAction<'_> {
         if self.exists(digest) {
             return StagePullAction::Exists;
         }
-        let mut pulls = self.pulls.borrow_mut();
-        if let Some(notify) = pulls.get(digest) {
-            StagePullAction::Wait(Rc::clone(notify))
-        } else {
-            pulls.insert(digest.clone(), Rc::new(Notify::new()));
-            StagePullAction::Pull
-        }
-    }
-
-    /// Signal that a staged pull completed successfully.
-    ///
-    /// Removes the in-progress entry and wakes any waiting tasks. Waiters
-    /// will re-enter [`claim_or_check`] and find the blob on disk via
-    /// [`exists`].
-    pub fn notify_staged(&self, digest: &Digest) {
-        if let Some(notify) = self.pulls.borrow_mut().remove(digest) {
-            notify.notify_waiters();
-        }
-    }
-
-    /// Signal that a staged pull failed.
-    ///
-    /// Removes the in-progress entry and wakes waiters so one of them can
-    /// retry the pull from its own source.
-    pub fn notify_failed(&self, digest: &Digest) {
-        if let Some(notify) = self.pulls.borrow_mut().remove(digest) {
-            notify.notify_waiters();
+        match claim(&self.pulls, digest.clone()) {
+            Claim::Claimed(guard) => StagePullAction::Pull(guard),
+            Claim::Wait(notify) => StagePullAction::Wait(notify),
+            // No outcome is ever recorded; the disk check above decides.
+            Claim::Done(_) => StagePullAction::Exists,
         }
     }
 
@@ -448,4 +415,44 @@ fn read_dir_entries(dir: &std::path::Path) -> Result<Vec<PathBuf>, io::Error> {
         entries.push(entry?.path());
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest() -> Digest {
+        Digest::from_sha256(ocync_distribution::sha256::Sha256::digest(b"blob"))
+    }
+
+    #[test]
+    fn a_staged_blob_is_read_from_disk_not_pulled() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = BlobStage::new(dir.path().to_path_buf());
+        stage.write(&digest(), b"blob").unwrap();
+        assert!(matches!(
+            stage.claim_or_check(&digest()),
+            StagePullAction::Exists
+        ));
+    }
+
+    /// A pull abandoned before staging (failed, or resolved by mount or
+    /// HEAD) lets a waiter pull from its own source.
+    #[test]
+    fn a_dropped_pull_claim_lets_the_next_caller_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = BlobStage::new(dir.path().to_path_buf());
+        let StagePullAction::Pull(guard) = stage.claim_or_check(&digest()) else {
+            panic!("first caller must pull")
+        };
+        assert!(matches!(
+            stage.claim_or_check(&digest()),
+            StagePullAction::Wait(_)
+        ));
+        drop(guard);
+        assert!(matches!(
+            stage.claim_or_check(&digest()),
+            StagePullAction::Pull(_)
+        ));
+    }
 }

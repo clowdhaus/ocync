@@ -1894,3 +1894,166 @@ async fn manifest_commit_wait_fires_only_when_enabled() {
         "with manifest_commit_wait>0 the commit-gate wait must fire once per manifest"
     );
 }
+
+/// Four tags sharing one index wait on blob visibility once: the first task
+/// claims every child and waits on their blobs, and the others, finding the
+/// children claimed, push only their index and skip the wait.
+#[tokio::test]
+async fn manifest_commit_wait_runs_once_for_tags_sharing_an_index() {
+    use ocync_sync::engine::SyncEngine;
+    use ocync_sync::progress::NullProgress;
+    use ocync_sync::retry::RetryConfig;
+    use ocync_sync::staging::BlobStage;
+
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (amd64, arm64) = mount_shared_index(&source_server, &target_server).await;
+    let existing: HashSet<Digest> = [&amd64, &arm64]
+        .iter()
+        .flat_map(|m| m.blob_digests())
+        .collect();
+    let (checker, _checks, waits) = WaitTrackingChecker::new("repo", existing);
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![TargetEntry {
+            name: RegistryAlias::new("target"),
+            client: mock_client(&target_server),
+            batch_checker: Some(Rc::new(checker)),
+            existing_tags: HashSet::new(),
+        }],
+        SHARED_TAGS.iter().map(|t| TagPair::same(*t)).collect(),
+    );
+    let retry = RetryConfig {
+        max_retries: 2,
+        initial_backoff: std::time::Duration::from_millis(1),
+        max_backoff: std::time::Duration::from_millis(10),
+        backoff_multiplier: 2,
+        manifest_commit_wait: std::time::Duration::from_millis(200),
+    };
+    let report = SyncEngine::new(retry, 4)
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_synced, 4);
+    assert_eq!(
+        waits.load(Ordering::Relaxed),
+        1,
+        "the blob-visibility wait must not run once per tag"
+    );
+}
+
+/// Two indexes in one repo share child `c1`, whose push fails. Run one at a
+/// time, the second finds `c1` already failed and fails at once, without
+/// waiting on blob visibility for its own child `c3`.
+#[tokio::test]
+async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
+    use ocync_sync::engine::SyncEngine;
+    use ocync_sync::progress::NullProgress;
+    use ocync_sync::retry::RetryConfig;
+    use ocync_sync::staging::BlobStage;
+
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let c1 = ManifestBuilder::new(b"cfg-c1").layer(b"layer-c1").build();
+    let c2 = ManifestBuilder::new(b"cfg-c2").layer(b"layer-c2").build();
+    let c3 = ManifestBuilder::new(b"cfg-c3").layer(b"layer-c3").build();
+    let x = IndexBuilder::new()
+        .manifest(&c1, Some(linux("amd64")))
+        .manifest(&c2, Some(linux("arm64")))
+        .build();
+    let y = IndexBuilder::new()
+        .manifest(&c1, Some(linux("amd64")))
+        .manifest(&c3, Some(linux("s390x")))
+        .build();
+    x.mount_source(&source_server, "repo", "x").await;
+    x.mount_target(&target_server, "repo", "x").await;
+    y.mount_source(&source_server, "repo", "y").await;
+    y.mount_target(&target_server, "repo", "y").await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/repo/manifests/{}", c1.digest)))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+    let existing: HashSet<Digest> = [&c1, &c2, &c3]
+        .iter()
+        .flat_map(|m| m.blob_digests())
+        .collect();
+    let (checker, _checks, waits) = WaitTrackingChecker::new("repo", existing);
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![TargetEntry {
+            name: RegistryAlias::new("target"),
+            client: mock_client(&target_server),
+            batch_checker: Some(Rc::new(checker)),
+            existing_tags: HashSet::new(),
+        }],
+        vec![TagPair::same("x"), TagPair::same("y")],
+    );
+    let retry = RetryConfig {
+        max_retries: 2,
+        initial_backoff: std::time::Duration::from_millis(1),
+        max_backoff: std::time::Duration::from_millis(10),
+        backoff_multiplier: 2,
+        manifest_commit_wait: std::time::Duration::from_millis(200),
+    };
+    let report = SyncEngine::new(retry, 1)
+        .run(
+            vec![mapping],
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_failed, 2);
+    assert_eq!(
+        waits.load(Ordering::Relaxed),
+        1,
+        "the second index must not wait on blobs it can never use"
+    );
+}
+
+/// A repo-failed watch is cleared at the end of a run even when cache
+/// pruning is off, so the next run in the same process does not see a stale
+/// fired watch and wait on, or mount from, a repo that never committed.
+#[tokio::test]
+async fn run_clears_repo_watches_without_cache_pruning() {
+    use ocync_sync::engine::SyncEngine;
+    use ocync_sync::progress::NullProgress;
+    use ocync_sync::staging::BlobStage;
+
+    let cache = empty_cache();
+    let repo = RepositoryName::new("repo").unwrap();
+    cache.borrow_mut().notify_repo_failed("target", &repo);
+
+    SyncEngine::new(fast_retry(), 50)
+        .with_cache_pruning(false)
+        .run(
+            Vec::new(),
+            Rc::clone(&cache),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    let watch = cache.borrow_mut().repo_committed_watch("target", &repo);
+    assert!(
+        !*watch.borrow(),
+        "the previous run's fired watch carried into the next run"
+    );
+}

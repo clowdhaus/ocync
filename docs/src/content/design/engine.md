@@ -214,7 +214,7 @@ The greedy set-cover provably covers every shared blob. No "uncovered follower" 
 
 ### Progressive promotion
 
-All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Cross-repo upload coordination is per-(target, digest): the first repo to arrive holds an explicit `claim` slot in `BlobInfo`; other repos wait on its `claim_notify` and re-check after release.
+All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Upload coordination is per-(target, digest): the first task to arrive holds an explicit `claim` slot in `BlobInfo`, and every other task waits on its `claim_notify` and re-checks after release. That includes a task for the holder's own repo, such as a second tag of the same image, which then finds the blob present and skips it.
 
 ### Bounded-deadline mount-source resolution
 
@@ -302,7 +302,7 @@ When a mapping has multiple targets (e.g., us-ecr + eu-ecr + ap-ecr), the source
 
 The write path uses an atomic protocol: `{digest}.tmp.{random}` -> `fsync` -> `rename` to `{digest}` -> `fsync` parent directory. Incomplete writes are never visible as cache entries. After rename, target readers get page-cached reads at memory speed (4+ GB/s) because the data stays in page cache when reads happen milliseconds after writes.
 
-Source-pull dedup via `BlobStage::claim_or_check` eliminates redundant source GETs. When multiple images share a blob, the first to claim it pulls from source. Subsequent claimers wait for the pull to complete, then read from disk. `tokio::sync::Notify::notify_waiters()` does NOT store permits, so every code path that transitions a blob out of `InProgress` MUST call `notify_staged` or `notify_failed`. Missing notify causes deadlock for concurrent waiters.
+Source-pull dedup via `BlobStage::claim_or_check` eliminates redundant source GETs. When multiple images share a blob, the first to claim it pulls from source. Subsequent claimers wait for the pull to complete, then read from disk. The claim is a guard from the shared per-run claim type: dropping it on any path (staged, failed, or resolved by mount or HEAD) wakes the waiters, so no path can leave them waiting. No outcome is recorded; the staged file is the record, and a failed pull is retried by a waiter, whose source may differ.
 
 Crash recovery: on startup, delete all `.tmp.*` files in the cache directory. Named by digest, so orphaned files are identifiable. Eviction runs between sync cycles when cache size exceeds `staging_size_limit` (default 2GB), evicting blobs referenced by fewer discovered manifests first. In-flight transfers are never interrupted by eviction.
 
@@ -330,7 +330,15 @@ The ordering ensures that the Alpine base layer (referenced by 80 images) is pus
 
 On crash or interruption, the most-shared blobs have been pushed first, providing maximum mount opportunities for the next run. A crash at 50% completion with frequency ordering leaves a much more useful cache state than a crash at 50% with arbitrary ordering because the shared base layers that benefit the most images are already present at the target.
 
-Index (multi-arch) manifests have a dependency structure: child manifests must be pushed before the index. Discovery resolves the full index tree (pulling the index manifest AND all child manifests) before sending the item to execution. Execution pushes children first (each child's blobs, then child manifest), then the top-level index manifest by tag. This matches OCI spec dependency ordering.
+Index (multi-arch) manifests have a dependency structure: child manifests must be pushed before the index. Discovery resolves the full index tree (pulling the index manifest AND all child manifests) before sending the item to execution. Execution pushes children first (each child's blobs, then child manifest), then the top-level index manifest by tag. This matches OCI spec dependency ordering. Tags that share an index share its children. Work that several tasks need is done once per run by whichever task claims it first; the others wait for its outcome (`PerRun` in `shared.rs`, created fresh by every run):
+
+- Child manifests are pulled from the source once per (source client, repo, digest), and pushed once per (target, repo, digest). Only the index is pushed per tag. Source work is keyed by client, not host, because each configured registry entry has its own client: two entries for one host with different credentials never share an outcome.
+- Before waiting on blob visibility, a task claims every child it can. It waits only on the blobs of the children it claimed, so tags sharing an index do not each wait on all of them. A task that finds one of its children already failed, or whose own child push fails, returns at once rather than waiting on children other tasks hold.
+- Referrers are discovered once per source manifest, and each artifact is copied once per (source client, source repo, target, target repo, digest). Artifact blobs take the image blob path, so they are claimed, mounted, staged and recorded like any other blob; their bytes are not counted in the image's report, as one artifact can serve many images. Keying by artifact rather than parent lets two mappings into one repo with different artifact filters each get what they select. A copy pulls from its source, so two sources syncing one artifact into one repo each copy it: one source's failure never fails the other.
+- A shared piece of work that fails after its retries fails every task that needed it with the same error, without another request, so a failing endpoint is retried once per run rather than once per tag. A blob copy that fails is recorded per (source client, source repo, target, target repo, digest), and a task needing the same copy fails with that error unless a committed mount source can supply the blob. If that mount is not fulfilled, the task fails with the recorded error rather than repeating the copy. A copy abandoned because another blob of its image failed, or one that failed on local staging I/O (found anywhere in the error's source chain, since the HTTP client wraps a read error from a streamed body), is not recorded, so a waiter copies it itself.
+- A claimant dropped before it finishes (a sibling's error cancelling its future) frees the key and wakes its waiters, and one of them does the work.
+
+Nothing here outlives the run, so the next run tries again.
 
 Semver ordering within each mapping means the first images to reach execution are related (`nginx:1.24`, `nginx:1.25`, `nginx:1.26`) and share ~95% of layers. The dedup map converges fast because ordering naturally front-loads shared content. Image-level ordering ("process nginx:1.26 before myapp:latest because nginx shares more layers") is correct but coarse. Blob-level ordering is finer-grained and globally optimal.
 
@@ -376,7 +384,7 @@ The existing `ShutdownSignal` infrastructure in `crates/ocync-sync/src/shutdown.
 
 8. **Index manifests are fully resolved before execution.** Discovery pulls the full index tree (index + all children) before sending to the pending queue. Execution pushes children first, then the index, matching OCI spec dependency ordering.
 
-9. **Error escalation is per-image, not per-target or per-tag.** A blob failure stops that (tag, target) pair, preventing manifest push and recording the image as failed in the sync report. Other targets for the same tag are independent and continue. Other tags are independent and continue. A 429 on one AIMD window does not affect other windows or other registries. The engine always completes the full sync run and reports all failures, never aborts early on a single image failure.
+9. **Error escalation is per-image, not per-target or per-tag.** A blob failure stops that (tag, target) pair, preventing manifest push and recording the image as failed in the sync report. Other targets for the same tag are independent and continue. Other tags are independent and continue, except that tasks needing the same shared work (a child manifest, a blob copy between the same repos, an artifact) share its outcome: work that failed after its retries fails each of them with that error, and each still reports its own failure. A 429 on one AIMD window does not affect other windows or other registries. The engine always completes the full sync run and reports all failures, never aborts early on a single image failure.
 
 ## Failure interaction matrix
 
@@ -390,6 +398,7 @@ Optimizations can amplify each other's failure modes. This matrix captures non-o
 | Disk full during staging | Partial temp file, subsequent reads corrupt | Atomic rename pattern (`.tmp.{random}` -> `{digest}`). On ENOSPC: disable disk staging for remainder of run (circuit breaker), continue with fresh source pulls per target |
 | HEAD/GET digest mismatch (Docker Hub) | Discovery HEAD: graceful degradation to always-pull (extra HEAD per cycle, no correctness bug). `head_first`: false skip means target has stale content | Discovery HEAD: unconditional with fallback, no operator action needed. `head_first`: opt-in only, observable via `discovery_head_first_skips` in `SyncStats` |
 | GAR shared quota + high pipeline concurrency | Increased request rate exhausts shared quota faster than sequential processing | Detect GAR targets (`*-docker.pkg.dev`), cap concurrency at 5 for all operation types via single shared AIMD window |
+| Shared work fails (child manifest, blob copy, artifact), needed by N tags | One exhausted retry budget fails all N tags, including tags of different indexes that share a child | Intended: the same request between the same repos gets the same answer, so retrying per tag would only add requests against the failing endpoint. Each tag reports the failure and the retries it made itself. A blob with a committed mount source is mounted instead. The record is per run, so the next run retries |
 
 ## Alternatives considered
 

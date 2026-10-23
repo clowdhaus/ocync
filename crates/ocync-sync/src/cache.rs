@@ -126,7 +126,10 @@ pub struct TransferStateCache {
     dedup: BlobDedupMap,
     snapshots: SourceSnapshotMap,
     /// Runtime-only: tracks which (target, repo) pairs have had their manifests
-    /// committed. Only repos here are eligible mount sources. Fresh each run.
+    /// committed. Only repos here are eligible mount sources. Kept across runs
+    /// in one process: a repo committed in an earlier run still holds its
+    /// manifest at the target, and a stale entry self-heals through
+    /// `mark_blob_repo_stale` when a mount from it fails.
     committed_repos: HashMap<String, HashSet<RepositoryName>>,
     /// Runtime-only: per-(target, repo) `watch` channel that transitions from
     /// `false` to `true` when the repo's manifest commits or fails. Followers
@@ -149,17 +152,6 @@ impl TransferStateCache {
     /// Whether the blob is present (Verified or Completed) at the given (target, repo).
     pub fn blob_present_at(&self, target: &str, digest: &Digest, repo: &RepositoryName) -> bool {
         self.dedup.blob_present_at(target, digest, repo)
-    }
-
-    /// The current cross-repo upload-claim holder for this digest, excluding
-    /// `current_repo`. Replaces `blob_in_progress_uploader`.
-    pub fn blob_claim_for<'a>(
-        &'a self,
-        target: &str,
-        digest: &Digest,
-        current_repo: &RepositoryName,
-    ) -> Option<&'a RepositoryName> {
-        self.dedup.claim_holder(target, digest, current_repo)
     }
 
     /// Atomic check-and-claim on the upload-coordination slot.

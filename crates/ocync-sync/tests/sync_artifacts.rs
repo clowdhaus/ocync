@@ -766,3 +766,175 @@ async fn artifact_transient_error_propagates_to_all_targets() {
         "aggregate count must reflect both targets"
     );
 }
+
+/// Four tags of one signed image, synced concurrently into one repo. The
+/// signature is pulled from the source and PUT to the target once, not once
+/// per tag.
+#[tokio::test]
+async fn artifact_shared_by_tags_syncs_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parent = ManifestBuilder::new(b"parent-config")
+        .layer(b"parent-layer")
+        .build();
+    let sig = ArtifactBuilder::new(b"sig-config", b"sig-payload").build();
+    let referrers = ReferrersIndexBuilder::new().artifact(&sig).build();
+    for tag in SHARED_TAGS {
+        parent.mount_source(&source_server, "repo", tag).await;
+        parent.mount_target(&target_server, "repo", tag).await;
+    }
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
+    sig.mount_source(&source_server, "repo").await;
+    sig.mount_target(&target_server, "repo").await;
+
+    let mapping = ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts {
+            enabled: true,
+            ..ResolvedArtifacts::default()
+        }),
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
+            "repo",
+            SHARED_TAGS.iter().map(|t| TagPair::same(*t)).collect(),
+        )
+    };
+    let report = run_sync(vec![mapping]).await;
+
+    assert_eq!(report.stats.images_synced, 4);
+    let sig_path = format!("/v2/repo/manifests/{}", sig.digest);
+    let count = |requests: &[wiremock::Request], verb: &str| {
+        requests
+            .iter()
+            .filter(|r| r.method.as_str() == verb && r.url.path() == sig_path)
+            .count()
+    };
+    let source_requests = source_server.received_requests().await.unwrap();
+    let target_requests = target_server.received_requests().await.unwrap();
+    assert_eq!(
+        count(&source_requests, "GET"),
+        1,
+        "signature pulled per tag"
+    );
+    assert_eq!(
+        count(&target_requests, "PUT"),
+        1,
+        "signature pushed per tag"
+    );
+}
+
+/// Two mappings from different sources sync one signed image into one
+/// target repo. The signature cannot be pulled from one source; the other
+/// source's mapping still syncs it, and the broken source's mapping fails.
+#[tokio::test]
+async fn artifact_failure_from_one_source_does_not_fail_another() {
+    let good_source = MockServer::start().await;
+    let broken_source = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parent = ManifestBuilder::new(b"parent-config")
+        .layer(b"parent-layer")
+        .build();
+    let sig = ArtifactBuilder::new(b"sig-config", b"sig-payload").build();
+    let referrers = ReferrersIndexBuilder::new().artifact(&sig).build();
+    for (source, tag) in [(&good_source, "good"), (&broken_source, "broken")] {
+        parent.mount_source(source, "repo", tag).await;
+        parent.mount_target(&target_server, "repo", tag).await;
+        mount_referrers(source, "repo", &parent.digest, &referrers).await;
+    }
+    // Only the good source serves the signature itself.
+    sig.mount_source(&good_source, "repo").await;
+    sig.mount_target(&target_server, "repo").await;
+
+    let with_artifacts = |source: &MockServer, tag: &str| ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts {
+            enabled: true,
+            ..ResolvedArtifacts::default()
+        }),
+        ..mapping_from_servers(source, &target_server, "repo", vec![TagPair::same(tag)])
+    };
+    let report = run_sync(vec![
+        with_artifacts(&broken_source, "broken"),
+        with_artifacts(&good_source, "good"),
+    ])
+    .await;
+
+    let status = |tag: &str| {
+        &report
+            .images
+            .iter()
+            .find(|i| i.target.ends_with(&format!(":{tag}")))
+            .expect("every tag is reported")
+            .status
+    };
+    assert!(
+        matches!(status("good"), ImageStatus::Synced),
+        "the good source's mapping got the broken source's failure: {:?}",
+        status("good")
+    );
+    assert!(
+        matches!(status("broken"), ImageStatus::Failed { .. }),
+        "the broken source's mapping reused the good source's copy: {:?}",
+        status("broken")
+    );
+}
+
+/// Two signatures of one image share their config blob. The blob is
+/// uploaded to the target repo once, not once per artifact.
+#[tokio::test]
+async fn artifacts_sharing_a_blob_upload_it_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parent = ManifestBuilder::new(b"parent-config")
+        .layer(b"parent-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1").await;
+    parent.mount_target(&target_server, "repo", "v1").await;
+    let first = ArtifactBuilder::new(b"shared-config", b"payload-one").build();
+    let second = ArtifactBuilder::new(b"shared-config", b"payload-two").build();
+    assert_eq!(first.config_desc.digest, second.config_desc.digest);
+    let referrers = ReferrersIndexBuilder::new()
+        .artifact(&first)
+        .artifact(&second)
+        .build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
+    for artifact in [&first, &second] {
+        artifact.mount_source(&source_server, "repo").await;
+        artifact.mount_target(&target_server, "repo").await;
+    }
+
+    let mapping = ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts {
+            enabled: true,
+            ..ResolvedArtifacts::default()
+        }),
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
+            "repo",
+            vec![TagPair::same("v1")],
+        )
+    };
+    let report = run_sync(vec![mapping]).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    // The query string carries the digest URL-encoded; match on its hex.
+    let config = first.config_desc.digest.hex().to_owned();
+    let uploads = target_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.method.as_str() == "PUT"
+                && r.url.path().contains("/blobs/uploads/")
+                && r.url.query().is_some_and(|q| q.contains(&config))
+        })
+        .count();
+    assert_eq!(
+        uploads, 1,
+        "a blob shared by two artifacts is uploaded per artifact"
+    );
+}

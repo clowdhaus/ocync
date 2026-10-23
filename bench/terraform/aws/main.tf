@@ -103,7 +103,7 @@ module "key_pair" {
 
 resource "local_sensitive_file" "ssh_key" {
   filename        = "${path.module}/.ssh-key"
-  content         = module.key_pair.private_key_openssh
+  content         = "${chomp(module.key_pair.private_key_openssh)}\n"
   file_permission = "0600"
 }
 

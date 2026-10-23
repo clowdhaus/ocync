@@ -116,15 +116,15 @@ async fn sync_partial_blob_failure_stops_remaining() {
     mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
     mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
 
-    // Config blob push succeeds (POST/PUT monolithic for small blobs).
-    // Use query_param to match the config blob's finalization PUT.
+    // Both uploads start; the config's finalization PUT succeeds and the
+    // layer's returns 403 (non-retryable). Matched by digest, so the order
+    // the two blobs upload in does not matter.
     Mock::given(method("POST"))
         .and(path("/v2/repo/blobs/uploads/"))
         .respond_with(
             ResponseTemplate::new(202)
                 .insert_header("location", "/v2/repo/blobs/uploads/partial-id"),
         )
-        .up_to_n_times(1)
         .mount(&target_server)
         .await;
     Mock::given(method("PUT"))
@@ -133,10 +133,12 @@ async fn sync_partial_blob_failure_stops_remaining() {
         .respond_with(ResponseTemplate::new(201))
         .mount(&target_server)
         .await;
-
-    // Layer blob push POST returns 403 (non-retryable).
-    Mock::given(method("POST"))
-        .and(path("/v2/repo/blobs/uploads/"))
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/blobs/uploads/partial-id"))
+        .and(query_param(
+            "digest",
+            parts.layer_descs[0].digest.to_string(),
+        ))
         .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
         .mount(&target_server)
         .await;
@@ -169,7 +171,8 @@ async fn sync_partial_blob_failure_stops_remaining() {
 }
 
 /// Two tags (v1, v2) with identical blob digests, run at `max_concurrent = 50`.
-/// Dedup must work under real concurrency.
+/// Dedup must work under real concurrency: both tags sync into one repo, so
+/// the second waits on the first's upload claim instead of uploading too.
 #[tokio::test]
 async fn sync_concurrent_dedup_at_real_concurrency() {
     let source_server = MockServer::start().await;
@@ -244,26 +247,360 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
         .all(|r| matches!(r.status, ImageStatus::Synced));
     assert!(all_synced, "both images should sync successfully");
 
-    // Under real concurrency, both tags may race past the cache and both
-    // transfer the shared blobs. The key invariant: total blob operations
-    // equals 4 (each image has 2 blobs), both images succeed, and each
-    // source manifest is pulled exactly once (verified by wiremock expect(1)).
-    let total_transferred: u64 = report.images.iter().map(|r| r.blob_stats.transferred).sum();
+    // Each shared blob is uploaded once and skipped once.
     let total_skipped: u64 = report.images.iter().map(|r| r.blob_stats.skipped).sum();
-    assert_eq!(
-        total_transferred + total_skipped,
-        4,
-        "total blob operations should be 4 (config x2 + layer x2)"
-    );
-    // Dedup may or may not fire under concurrency (race-dependent), so
-    // assert bounds: transferred is 2..=4, skipped is 0..=2.
-    assert!(
-        (2..=4).contains(&report.stats.blobs_transferred),
-        "blobs transferred should be 2-4 under concurrent execution, got {}",
-        report.stats.blobs_transferred,
-    );
+    assert_eq!(report.stats.blobs_transferred, 2, "no blob uploaded twice");
+    assert_eq!(total_skipped, 2);
+    let received = target_server.received_requests().await.unwrap();
+    let upload_starts = received
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/v2/repo/blobs/uploads/")
+        .count();
+    assert_eq!(upload_starts, 2, "one upload session per distinct blob");
     assert_eq!(report.stats.images_synced, 2);
     // wiremock expect(1) assertions verify each source manifest was pulled exactly once.
+}
+
+/// Run [`SHARED_TAGS`] concurrently from `source` into `target`.
+async fn sync_shared_index_tags(
+    source: &MockServer,
+    target: &MockServer,
+) -> ocync_sync::SyncReport {
+    let mapping = mapping_from_servers(
+        source,
+        target,
+        "repo",
+        SHARED_TAGS.iter().map(|t| TagPair::same(*t)).collect(),
+    );
+    run_sync(vec![mapping]).await
+}
+
+/// Count the manifest PUTs `target` received for `reference` in `repo`.
+async fn manifest_puts(target: &MockServer, reference: &str) -> usize {
+    let manifest_path = format!("/v2/repo/manifests/{reference}");
+    target
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "PUT" && r.url.path() == manifest_path)
+        .count()
+}
+
+/// Four tags resolving to one two-child index, synced concurrently into one
+/// repo. Each child manifest is pulled from the source and PUT to the target
+/// once; each tag's index is still PUT.
+#[tokio::test]
+async fn sync_tags_sharing_an_index_copy_each_child_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (amd64, arm64) = mount_shared_index(&source_server, &target_server).await;
+
+    let report = sync_shared_index_tags(&source_server, &target_server).await;
+
+    assert_eq!(report.stats.images_synced, 4);
+    let pulled = source_server.received_requests().await.unwrap();
+    for child in [&amd64, &arm64] {
+        let child_path = format!("/v2/repo/manifests/{}", child.digest);
+        let gets = pulled
+            .iter()
+            .filter(|r| r.method.as_str() == "GET" && r.url.path() == child_path)
+            .count();
+        assert_eq!(gets, 1, "child {} pulled once per tag", child.digest);
+        assert_eq!(
+            manifest_puts(&target_server, &child.digest.to_string()).await,
+            1,
+            "child {} PUT once per tag",
+            child.digest
+        );
+    }
+    for tag in SHARED_TAGS {
+        assert_eq!(
+            manifest_puts(&target_server, tag).await,
+            1,
+            "tag {tag} must still get its index PUT"
+        );
+    }
+}
+
+/// A child manifest PUT that fails is sent once, not once per tag sharing
+/// the index: every tag fails with that error and no tag pushes its index.
+#[tokio::test]
+async fn sync_tags_sharing_an_index_push_a_failing_child_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (amd64, _arm64) = mount_shared_index(&source_server, &target_server).await;
+    let failing = amd64.digest.to_string();
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/repo/manifests/{failing}")))
+        .respond_with(ResponseTemplate::new(400).set_body_string("manifest invalid"))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        sync_shared_index_tags(&source_server, &target_server),
+    )
+    .await
+    .expect("tags waiting on a failed child must not hang");
+
+    assert_eq!(report.stats.images_failed, 4);
+    for image in &report.images {
+        match &image.status {
+            ImageStatus::Failed {
+                status_code,
+                error,
+                retries,
+                ..
+            } => {
+                assert_eq!(*status_code, Some(400), "{}", image.target);
+                assert!(error.contains(&failing), "{}: {error}", image.target);
+                assert_eq!(*retries, 0, "{}: a 400 is never retried", image.target);
+            }
+            other => panic!("{}: expected Failed, got {other:?}", image.target),
+        }
+    }
+    assert_eq!(
+        manifest_puts(&target_server, &failing).await,
+        1,
+        "a failed child must not be pushed again by each waiting tag"
+    );
+    for tag in SHARED_TAGS {
+        assert_eq!(
+            manifest_puts(&target_server, tag).await,
+            0,
+            "tag {tag} must not PUT an index whose child failed"
+        );
+    }
+}
+
+/// A blob copy that fails is attempted once, not once per tag sharing it:
+/// tags waiting on the failed copy fail with its error instead of repeating
+/// it one after another.
+#[tokio::test]
+async fn sync_tags_sharing_a_blob_attempt_a_failing_copy_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (amd64, _arm64) = mount_shared_index(&source_server, &target_server).await;
+    let layer_path = format!("/v2/repo/blobs/{}", amd64.layer_descs[0].digest);
+    Mock::given(method("GET"))
+        .and(path(layer_path.clone()))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        sync_shared_index_tags(&source_server, &target_server),
+    )
+    .await
+    .expect("tags waiting on a failed blob copy must not hang");
+
+    assert_eq!(report.stats.images_failed, 4);
+    let layer_gets = source_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == layer_path)
+        .count();
+    assert_eq!(
+        layer_gets, 1,
+        "a failed blob copy must not be repeated per tag"
+    );
+}
+
+/// Tag `one`'s index lists children `a` and `b`; tag `two`'s lists `b` and
+/// `c`. `a` fails while `one` is still pulling `b`, which drops that pull.
+/// `two`, waiting on `one`'s pull of `b`, must pull `b` itself and sync
+/// rather than wait on a pull that will never finish.
+#[tokio::test]
+async fn sync_dropped_shared_child_pull_is_redone_by_the_waiter() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let a = ManifestBuilder::new(b"cfg-a").layer(b"layer-a").build();
+    let b = ManifestBuilder::new(b"cfg-b").layer(b"layer-b").build();
+    let c = ManifestBuilder::new(b"cfg-c").layer(b"layer-c").build();
+    let one = IndexBuilder::new()
+        .manifest(&a, Some(linux("amd64")))
+        .manifest(&b, Some(linux("arm64")))
+        .build();
+    let two = IndexBuilder::new()
+        .manifest(&b, Some(linux("arm64")))
+        .manifest(&c, Some(linux("s390x")))
+        .build();
+    one.mount_source(&source_server, "repo", "one").await;
+    one.mount_target(&target_server, "repo", "one").await;
+    two.mount_source(&source_server, "repo", "two").await;
+    two.mount_target(&target_server, "repo", "two").await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{}", a.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{}", b.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b.bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::same("one"), TagPair::same("two")],
+    );
+    let report = tokio::time::timeout(std::time::Duration::from_secs(10), run_sync(vec![mapping]))
+        .await
+        .expect("a waiter on a dropped pull must not hang");
+
+    assert_eq!(report.stats.images_failed, 1, "only `one` fails, on `a`");
+    assert_eq!(
+        report.stats.images_synced, 1,
+        "`two` syncs, pulling `b` itself"
+    );
+}
+
+/// Layer `d` cannot be pulled from repo `r`'s source, but repo `q` holds it
+/// committed at the target, so a later task in `r` claims it to mount from
+/// `q`. When that mount is not fulfilled, the task reports the recorded
+/// failure instead of pulling `d` from the failing source again.
+#[tokio::test]
+async fn sync_unfulfilled_mount_does_not_repeat_a_failed_copy() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let in_r = ManifestBuilder::new(b"cfg-r").layer(b"layer-d").build();
+    let in_q = ManifestBuilder::new(b"cfg-q").layer(b"layer-d").build();
+    let d = in_r.layer_descs[0].digest.clone();
+    for tag in ["t1", "t2"] {
+        in_r.mount_source(&source_server, "r", tag).await;
+        in_r.mount_target(&target_server, "r", tag).await;
+    }
+    in_q.mount_source(&source_server, "q", "u").await;
+    in_q.mount_target(&target_server, "q", "u").await;
+    let d_path = format!("/v2/r/blobs/{d}");
+    Mock::given(method("GET"))
+        .and(path(d_path.clone()))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+
+    // One at a time. `t1` leads (it shares the most blobs), so it runs
+    // first and records the failed copy; `u` then commits `d` in `q`, and
+    // `t2` finds `q` as a mount source.
+    let report = run_sync_sequential(vec![
+        mapping_from_servers(
+            &source_server,
+            &target_server,
+            "q",
+            vec![TagPair::same("u")],
+        ),
+        mapping_from_servers(
+            &source_server,
+            &target_server,
+            "r",
+            vec![TagPair::same("t1"), TagPair::same("t2")],
+        ),
+    ])
+    .await;
+    assert_eq!(
+        report.stats.images_synced, 1,
+        "`u` syncs from its own source"
+    );
+    assert_eq!(report.stats.images_failed, 2);
+    let d_gets = source_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == d_path)
+        .count();
+    assert_eq!(
+        d_gets, 1,
+        "the failed copy of `d` into `r` must not be repeated"
+    );
+}
+
+/// Tag `x` lists children `c1` and `c2`; tag `y` lists `c2` and `c3`. `x`
+/// holds `c2`, whose push is slow. `y`'s own child `c3` fails, so `y` fails
+/// at once instead of waiting on `c2`, which its index can no longer use.
+#[tokio::test]
+async fn sync_failed_own_child_does_not_wait_on_shared_children() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let c1 = ManifestBuilder::new(b"cfg-c1").layer(b"layer-c1").build();
+    let c2 = ManifestBuilder::new(b"cfg-c2").layer(b"layer-c2").build();
+    let c3 = ManifestBuilder::new(b"cfg-c3").layer(b"layer-c3").build();
+    let x = IndexBuilder::new()
+        .manifest(&c1, Some(linux("amd64")))
+        .manifest(&c2, Some(linux("arm64")))
+        .build();
+    let y = IndexBuilder::new()
+        .manifest(&c2, Some(linux("arm64")))
+        .manifest(&c3, Some(linux("s390x")))
+        .build();
+    x.mount_source(&source_server, "repo", "x").await;
+    x.mount_target(&target_server, "repo", "x").await;
+    y.mount_source(&source_server, "repo", "y").await;
+    y.mount_target(&target_server, "repo", "y").await;
+    // `y`'s own layer arrives late, so `x` has always claimed `c2` by the
+    // time `y` pushes its children.
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{}", c3.layer_descs[0].digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(c3.layers_data[0].clone())
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/repo/manifests/{}", c2.digest)))
+        .respond_with(ResponseTemplate::new(201).set_delay(std::time::Duration::from_secs(2)))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/repo/manifests/{}", c3.digest)))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::same("y"), TagPair::same("x")],
+    );
+    let report = run_sync(vec![mapping]).await;
+
+    let y_result = report
+        .images
+        .iter()
+        .find(|i| i.target.ends_with(":y"))
+        .expect("y is reported");
+    assert!(
+        matches!(y_result.status, ImageStatus::Failed { .. }),
+        "{:?}",
+        y_result.status
+    );
+    assert!(
+        y_result.duration < std::time::Duration::from_secs(1),
+        "y waited {:?} on a child its index can no longer use",
+        y_result.duration
+    );
 }
 
 // ---------------------------------------------------------------------------
