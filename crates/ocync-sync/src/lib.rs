@@ -133,7 +133,9 @@ pub enum ImageStatus {
         kind: ErrorKind,
         /// Error message describing the failure.
         error: String,
-        /// Number of retry attempts made.
+        /// Number of retry attempts this image made. An image failing on work
+        /// another image did for both (a shared child manifest, blob copy or
+        /// artifact) reports 0 here; that image reports the retries.
         retries: u32,
         /// HTTP status code from the failing request, if available.
         #[serde(skip_serializing_if = "Option::is_none")]

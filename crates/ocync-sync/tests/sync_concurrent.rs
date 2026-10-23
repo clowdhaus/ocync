@@ -428,6 +428,73 @@ async fn sync_tags_sharing_a_blob_attempt_a_failing_copy_once() {
     );
 }
 
+/// Tag `one`'s index lists children `a` and `b`; tag `two`'s lists `b` and
+/// `c`. `a` fails while `one` is still pulling `b`, which drops that pull.
+/// `two`, waiting on `one`'s pull of `b`, must pull `b` itself and sync
+/// rather than wait on a pull that will never finish.
+#[tokio::test]
+async fn sync_dropped_shared_child_pull_is_redone_by_the_waiter() {
+    use ocync_distribution::spec::Platform;
+
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let linux = |arch: &str| Platform {
+        architecture: arch.to_string(),
+        os: "linux".to_string(),
+        variant: None,
+        os_version: None,
+        os_features: None,
+    };
+    let a = ManifestBuilder::new(b"cfg-a").layer(b"layer-a").build();
+    let b = ManifestBuilder::new(b"cfg-b").layer(b"layer-b").build();
+    let c = ManifestBuilder::new(b"cfg-c").layer(b"layer-c").build();
+    let one = IndexBuilder::new()
+        .manifest(&a, Some(linux("amd64")))
+        .manifest(&b, Some(linux("arm64")))
+        .build();
+    let two = IndexBuilder::new()
+        .manifest(&b, Some(linux("arm64")))
+        .manifest(&c, Some(linux("s390x")))
+        .build();
+    one.mount_source(&source_server, "repo", "one").await;
+    one.mount_target(&target_server, "repo", "one").await;
+    two.mount_source(&source_server, "repo", "two").await;
+    two.mount_target(&target_server, "repo", "two").await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{}", a.digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/manifests/{}", b.digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b.bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::same("one"), TagPair::same("two")],
+    );
+    let report = tokio::time::timeout(std::time::Duration::from_secs(10), run_sync(vec![mapping]))
+        .await
+        .expect("a waiter on a dropped pull must not hang");
+
+    assert_eq!(report.stats.images_failed, 1, "only `one` fails, on `a`");
+    assert_eq!(
+        report.stats.images_synced, 1,
+        "`two` syncs, pulling `b` itself"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test: concurrent transfers wait on in-progress uploads to enable cross-repo mount
 // ---------------------------------------------------------------------------

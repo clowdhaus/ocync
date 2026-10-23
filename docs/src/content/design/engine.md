@@ -335,7 +335,8 @@ Index (multi-arch) manifests have a dependency structure: child manifests must b
 - Child manifests are pulled from the source once per (source registry, repo, digest), and pushed once per (target, repo, digest). Only the index is pushed per tag.
 - Before waiting on blob visibility, a task claims every child it can. It waits only on the blobs of the children it claimed, so tags sharing an index do not each wait on all of them.
 - Referrers are discovered once per source manifest, and each artifact is copied once per (target, repo, artifact digest). Keying by artifact rather than parent lets two mappings into one repo with different artifact filters each get what they select.
-- A shared piece of work that fails after its retries fails every task that needed it with the same error, without another request, so a failing endpoint is retried once per run rather than once per tag. A blob copy that fails is recorded per (source registry, source repo, target, target repo, digest), and a task needing the same copy fails with that error unless a committed mount source can supply the blob. A copy abandoned because another blob of its image failed is not recorded, so a waiter copies it itself.
+- A shared piece of work that fails after its retries fails every task that needed it with the same error, without another request, so a failing endpoint is retried once per run rather than once per tag. A blob copy that fails is recorded per (source registry, source repo, target, target repo, digest), and a task needing the same copy fails with that error unless a committed mount source can supply the blob. A copy abandoned because another blob of its image failed, or one that failed on local staging I/O, is not recorded, so a waiter copies it itself.
+- A claimant dropped before it finishes (a sibling's error cancelling its future) frees the key and wakes its waiters, and one of them does the work.
 
 Nothing here outlives the run, so the next run tries again.
 

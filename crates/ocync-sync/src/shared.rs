@@ -31,12 +31,10 @@ enum Slot<V> {
     Done(Outcome<V>),
 }
 
-/// Result of [`SharedWork::claim`].
-#[derive(Debug)]
-pub(crate) enum Claim<V> {
-    /// Caller does the work and must call [`SharedWork::finish`], even on
-    /// failure: waiters are only woken by `finish`.
-    Claimed,
+/// Result of [`claim`].
+pub(crate) enum Claim<'a, K: Eq + Hash, V> {
+    /// Caller does the work and reports it through the guard.
+    Claimed(ClaimGuard<'a, K, V>),
     /// Another task is doing it; await `notify`, then claim again.
     Wait(Rc<Notify>),
     /// Already done in this run.
@@ -57,25 +55,59 @@ impl<K, V> Default for SharedWork<K, V> {
     }
 }
 
-impl<K: Eq + Hash, V: Clone> SharedWork<K, V> {
-    /// Atomic check-and-claim on `key`.
-    pub(crate) fn claim(&mut self, key: K) -> Claim<V> {
-        match self.slots.entry(key) {
-            Entry::Occupied(slot) => match slot.get() {
-                Slot::InFlight(notify) => Claim::Wait(Rc::clone(notify)),
-                Slot::Done(outcome) => Claim::Done(outcome.clone()),
-            },
-            Entry::Vacant(slot) => {
-                slot.insert(Slot::InFlight(Rc::new(Notify::new())));
-                Claim::Claimed
-            }
+/// A claim on one key. [`ClaimGuard::finish`] records the outcome; dropping
+/// the guard unfinished (its task cancelled, or a sibling's error dropping
+/// it) frees the key and wakes the waiters, so one of them does the work.
+pub(crate) struct ClaimGuard<'a, K: Eq + Hash, V> {
+    shared: &'a RefCell<SharedWork<K, V>>,
+    key: Option<K>,
+}
+
+impl<K: Eq + Hash, V> ClaimGuard<'_, K, V> {
+    /// Record the outcome of the claimed work and wake its waiters.
+    pub(crate) fn finish(mut self, outcome: Outcome<V>) {
+        if let Some(key) = self.key.take()
+            && let Some(Slot::InFlight(notify)) = self
+                .shared
+                .borrow_mut()
+                .slots
+                .insert(key, Slot::Done(outcome))
+        {
+            notify.notify_waiters();
         }
     }
+}
 
-    /// Record the outcome of claimed work and wake its waiters.
-    pub(crate) fn finish(&mut self, key: K, outcome: Outcome<V>) {
-        if let Some(Slot::InFlight(notify)) = self.slots.insert(key, Slot::Done(outcome)) {
+impl<K: Eq + Hash, V> Drop for ClaimGuard<'_, K, V> {
+    fn drop(&mut self) {
+        // No borrow is live when a future is dropped on this single-threaded
+        // runtime; if one were, the slot would stay claimed, as before guards.
+        if let Some(key) = self.key.take()
+            && let Ok(mut work) = self.shared.try_borrow_mut()
+            && let Some(Slot::InFlight(notify)) = work.slots.remove(&key)
+        {
             notify.notify_waiters();
+        }
+    }
+}
+
+/// Atomic check-and-claim on `key`.
+pub(crate) fn claim<K: Eq + Hash + Clone, V: Clone>(
+    shared: &RefCell<SharedWork<K, V>>,
+    key: K,
+) -> Claim<'_, K, V> {
+    let mut work = shared.borrow_mut();
+    match work.slots.entry(key.clone()) {
+        Entry::Occupied(slot) => match slot.get() {
+            Slot::InFlight(notify) => Claim::Wait(Rc::clone(notify)),
+            Slot::Done(outcome) => Claim::Done(outcome.clone()),
+        },
+        Entry::Vacant(slot) => {
+            slot.insert(Slot::InFlight(Rc::new(Notify::new())));
+            Claim::Claimed(ClaimGuard {
+                shared,
+                key: Some(key),
+            })
         }
     }
 }
@@ -95,16 +127,16 @@ where
     Fut: Future<Output = Result<V, crate::Error>>,
 {
     loop {
-        let claim = shared.borrow_mut().claim(key.clone());
-        match claim {
+        match claim(shared, key.clone()) {
             Claim::Done(outcome) => return outcome.map_err(crate::Error::Shared),
             Claim::Wait(notify) => notify.notified().await,
-            Claim::Claimed => break,
+            Claim::Claimed(guard) => {
+                let outcome = work().await.map_err(Arc::new);
+                guard.finish(outcome.clone());
+                return outcome.map_err(crate::Error::Shared);
+            }
         }
     }
-    let outcome = work().await.map_err(Arc::new);
-    shared.borrow_mut().finish(key, outcome.clone());
-    outcome.map_err(crate::Error::Shared)
 }
 
 /// A source manifest by digest: (source registry, source repo, digest).
@@ -132,7 +164,7 @@ pub(crate) enum Referrers {
 #[derive(Debug, Default)]
 pub(crate) struct RunShared {
     /// Source manifests pulled by digest: index children and artifacts.
-    pub(crate) manifest_pulls: RefCell<SharedWork<SourceManifestKey, ManifestPull>>,
+    pub(crate) manifest_pulls: RefCell<SharedWork<SourceManifestKey, Rc<ManifestPull>>>,
     /// Child manifests pushed by digest to a target repo.
     pub(crate) child_pushes: RefCell<SharedWork<TargetDigestKey, ()>>,
     /// Referrer discovery per source manifest.
@@ -155,21 +187,44 @@ mod tests {
 
     #[test]
     fn claim_waits_while_in_flight_then_returns_the_outcome() {
-        let mut work = SharedWork::<&str, u32>::default();
-        assert!(matches!(work.claim("k"), Claim::Claimed));
-        assert!(matches!(work.claim("k"), Claim::Wait(_)));
-        assert!(matches!(work.claim("other"), Claim::Claimed));
+        let work = RefCell::new(SharedWork::<&str, u32>::default());
+        let Claim::Claimed(guard) = claim(&work, "k") else {
+            panic!("first claim must claim")
+        };
+        assert!(matches!(claim(&work, "k"), Claim::Wait(_)));
+        assert!(matches!(claim(&work, "other"), Claim::Claimed(_)));
 
-        work.finish("k", Ok(7));
-        assert!(matches!(work.claim("k"), Claim::Done(Ok(7))));
+        guard.finish(Ok(7));
+        assert!(matches!(claim(&work, "k"), Claim::Done(Ok(7))));
     }
 
     #[test]
     fn a_failure_is_returned_to_later_claims_not_retried() {
-        let mut work = SharedWork::<&str, ()>::default();
-        assert!(matches!(work.claim("k"), Claim::Claimed));
-        work.finish("k", Err(Arc::new(failure())));
-        assert!(matches!(work.claim("k"), Claim::Done(Err(_))));
+        let work = RefCell::new(SharedWork::<&str, ()>::default());
+        let Claim::Claimed(guard) = claim(&work, "k") else {
+            panic!("first claim must claim")
+        };
+        guard.finish(Err(Arc::new(failure())));
+        assert!(matches!(claim(&work, "k"), Claim::Done(Err(_))));
+    }
+
+    /// A claimant dropped before finishing frees the key, so a waiter claims
+    /// it and does the work instead of waiting forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_claim_wakes_waiters_to_claim_it() {
+        let work = RefCell::new(SharedWork::<&str, u32>::default());
+        let Claim::Claimed(guard) = claim(&work, "k") else {
+            panic!("first claim must claim")
+        };
+        let Claim::Wait(notify) = claim(&work, "k") else {
+            panic!("second claim must wait")
+        };
+        let woken = notify.notified();
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), woken)
+            .await
+            .expect("dropping the claim must wake its waiters");
+        assert!(matches!(claim(&work, "k"), Claim::Claimed(_)));
     }
 
     /// Two concurrent callers: the second waits on the first and gets its

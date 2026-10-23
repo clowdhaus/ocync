@@ -46,7 +46,7 @@ use uuid::Uuid;
 use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
 use crate::progress::RunProgress;
 use crate::retry::{RetryConfig, count_retries, retries_made, with_retry};
-use crate::shared::{BlobCopyKey, Claim, Referrers, RunShared, run_once};
+use crate::shared::{BlobCopyKey, Claim, Referrers, RunShared, claim, run_once};
 use crate::shutdown::ShutdownSignal;
 use crate::staging::BlobStage;
 use crate::{
@@ -367,9 +367,10 @@ fn skip_image_result(source: &ImageRef, target: &ImageRef, reason: SkipReason) -
 struct PulledManifest {
     /// The top-level manifest (image or index).
     pull: ManifestPull,
-    /// For index manifests: pre-pulled child manifests.
+    /// For index manifests: pre-pulled child manifests, shared with every
+    /// other tag whose index lists the same child.
     /// Empty for single-image manifests (blobs are derived from `pull.manifest`).
-    children: Vec<ManifestPull>,
+    children: Vec<Rc<ManifestPull>>,
 }
 
 /// Per-target outcome of the blob transfer phase.
@@ -1998,6 +1999,7 @@ async fn pull_source_manifest(
                                 client.manifest_pull(repo, &child_digest_str)
                             })
                             .await
+                            .map(Rc::new)
                             .map_err(|e| crate::Error::Manifest {
                                 reference: child_digest_str.clone(),
                                 source: e,
@@ -2014,12 +2016,7 @@ async fn pull_source_manifest(
                     }
                 })
                 .collect();
-            // join_all, not try_join_all: dropping a sibling mid-pull would
-            // leave its shared claim in flight and hang every task waiting on it.
-            let children = futures_util::future::join_all(child_futures)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?;
+            let children = futures_util::future::try_join_all(child_futures).await?;
 
             // When platform filtering is active, rebuild the index manifest with
             // only the matching descriptors. The raw_bytes and digest must be
@@ -2157,21 +2154,25 @@ impl<'a> BlobIoContext<'a> {
     }
 
     /// Record a failed copy of `digest` for the rest of the run, release the
-    /// claim, and return the error every task copying it reports.
+    /// claim, and return the error every task copying it reports. A local
+    /// staging I/O error is not recorded: it says nothing about the
+    /// registries, so the next task copying the blob tries again.
     fn fail_copy(&self, digest: &Digest, err: crate::Error) -> crate::Error {
         let err = Arc::new(err);
         self.sink
             .fail(digest.clone(), self.target_repo.to_owned(), err.to_string());
-        let key = blob_copy_key(
-            self.source_authority,
-            self.source_repo,
-            self.sink.target_name,
-            self.target_repo,
-            digest,
-        );
-        self.blob_failures
-            .borrow_mut()
-            .insert(key, Arc::clone(&err));
+        if !is_local_io(&err) {
+            let key = blob_copy_key(
+                self.source_authority,
+                self.source_repo,
+                self.sink.target_name,
+                self.target_repo,
+                digest,
+            );
+            self.blob_failures
+                .borrow_mut()
+                .insert(key, Arc::clone(&err));
+        }
         self.sink.release_claim(digest);
         crate::Error::Shared(err)
     }
@@ -2381,6 +2382,18 @@ enum BlobClaim {
     Failed(Arc<crate::Error>),
 }
 
+/// Whether a blob copy failed on local staging I/O (disk full, a missing
+/// staged file) rather than on either registry.
+fn is_local_io(err: &crate::Error) -> bool {
+    matches!(
+        err,
+        crate::Error::BlobTransfer {
+            source: ocync_distribution::Error::Io { .. },
+            ..
+        }
+    )
+}
+
 /// Key of one blob copy between a source repo and a target repo.
 fn blob_copy_key(
     source_authority: &RegistryAuthority,
@@ -2417,18 +2430,26 @@ async fn wait_for_blob_claim(
 
     // Step 2: atomic check-and-claim. A copy that already failed between the
     // same repos fails this one too, unless a mount can avoid the copy.
-    let copy_key = blob_copy_key(
-        ctx.source_authority,
-        ctx.source_repo,
-        ctx.target_name,
-        ctx.target_repo,
-        digest,
-    );
     loop {
         if cancel.get() {
             return BlobClaim::Cancelled;
         }
-        let failure = ctx.shared.blob_failures.borrow().get(&copy_key).cloned();
+        let failure = {
+            let failures = ctx.shared.blob_failures.borrow();
+            if failures.is_empty() {
+                None
+            } else {
+                failures
+                    .get(&blob_copy_key(
+                        ctx.source_authority,
+                        ctx.source_repo,
+                        ctx.target_name,
+                        ctx.target_repo,
+                        digest,
+                    ))
+                    .cloned()
+            }
+        };
         if let Some(err) = failure {
             let mountable = ctx
                 .cache
@@ -2794,13 +2815,12 @@ async fn push_manifests(
 
     // Claim before waiting on blob availability, so tasks sharing an index
     // split its children instead of each waiting on all of them.
-    let mut claimed: Vec<&ManifestPull> = Vec::new();
+    let mut claimed = Vec::new();
     let mut held_elsewhere: Vec<&ManifestPull> = Vec::new();
     let mut failed: Option<crate::Error> = None;
     for child in &source_data.children {
-        let claim = shared.child_pushes.borrow_mut().claim(child_key(child));
-        match claim {
-            Claim::Claimed => claimed.push(child),
+        match claim(&shared.child_pushes, child_key(child)) {
+            Claim::Claimed(guard) => claimed.push((child, guard)),
             Claim::Wait(_) => held_elsewhere.push(child),
             Claim::Done(Ok(())) => {}
             Claim::Done(Err(err)) => failed = Some(crate::Error::Shared(err)),
@@ -2811,7 +2831,7 @@ async fn push_manifests(
         ManifestKind::Image(m) => collect_image_blobs(m),
         ManifestKind::Index(_) => claimed
             .iter()
-            .flat_map(|c| match &c.manifest {
+            .flat_map(|(c, _)| match &c.manifest {
                 ManifestKind::Image(m) => collect_image_blobs(m),
                 ManifestKind::Index(_) => Vec::new(),
             })
@@ -2859,17 +2879,13 @@ async fn push_manifests(
         }
     }
 
-    // Push claimed children concurrently. join_all, not try_join_all: every
-    // claim must be finished or its waiters hang, and a transient failure on
-    // one child must not cancel the others.
-    let pushes = claimed.iter().map(|child| async move {
+    // Push claimed children concurrently. join_all, not try_join_all: a
+    // transient failure on one child must not cancel the others.
+    let pushes = claimed.into_iter().map(|(child, guard)| async move {
         let outcome = push_child_manifest(retry, item, child)
             .await
             .map_err(Arc::new);
-        shared
-            .child_pushes
-            .borrow_mut()
-            .finish(child_key(child), outcome.clone());
+        guard.finish(outcome.clone());
         outcome.map_err(crate::Error::Shared)
     });
     for outcome in futures_util::future::join_all(pushes).await {
@@ -3078,16 +3094,13 @@ async fn sync_artifact(
             source_client.manifest_pull(source_repo, &artifact_digest_str)
         })
         .await
-        .map_err(|e| crate::Error::Manifest {
+        .map(Rc::new)
+        .map_err(|e| crate::Error::ArtifactSync {
             reference: artifact_digest_str.clone(),
-            source: e,
+            reason: format!("manifest pull failed: {e}"),
         })
     })
-    .await
-    .map_err(|e| crate::Error::ArtifactSync {
-        reference: artifact_digest_str.clone(),
-        reason: format!("manifest pull failed: {e}"),
-    })?;
+    .await?;
 
     // Push artifact blobs.
     let mut blob_digests: Vec<Digest> = Vec::new();
@@ -3545,6 +3558,30 @@ mod tests {
 
         assert_eq!(freq.count(&d1), 2);
         assert_eq!(freq.count(&d2), 1);
+    }
+
+    #[test]
+    fn only_registry_failures_are_recorded_as_copy_failures() {
+        let digest = Digest::from_sha256(Sha256::digest(b"blob"));
+        let local = crate::Error::BlobTransfer {
+            digest: digest.clone(),
+            source: ocync_distribution::Error::Io {
+                context: "staging write",
+                source: std::io::Error::other("disk full"),
+            },
+        };
+        let registry = crate::Error::BlobTransfer {
+            digest,
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::NOT_FOUND,
+                message: "blob unknown".into(),
+            },
+        };
+        assert!(
+            is_local_io(&local),
+            "a disk error must not fail other tasks"
+        );
+        assert!(!is_local_io(&registry));
     }
 
     #[test]
