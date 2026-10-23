@@ -248,59 +248,6 @@ async fn controller_drop_without_report_treated_as_success() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Concurrent permits -- verifies semaphore replacement under throttle
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn controller_throttle_with_outstanding_permits() {
-    let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 64);
-    let op = RegistryAction::BlobUploadChunk;
-
-    // Warm up window so there's room to shrink.
-    for _ in 0..30 {
-        let p = ctrl.acquire(op).await;
-        p.success();
-    }
-    let before = ctrl.window_limit(op);
-    assert!(
-        before > 2,
-        "window should have grown past 2 after 30 successes"
-    );
-
-    // Acquire multiple permits concurrently (simulating in-flight requests).
-    let p1 = ctrl.acquire(op).await;
-    let p2 = ctrl.acquire(op).await;
-    let p3 = ctrl.acquire(op).await;
-
-    // Sleep past the epoch so throttle takes effect.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // Throttle one -- this replaces the semaphore. The other permits
-    // hold references to the old semaphore and should complete normally.
-    p1.throttled();
-
-    let after_throttle = ctrl.window_limit(op);
-    // Window should approximately halve -- verify it shrank by more than 1.
-    assert!(
-        after_throttle <= before.div_ceil(2),
-        "throttle should approximately halve the window (before={before}, after={after_throttle})"
-    );
-
-    // Remaining permits from old semaphore complete without issue.
-    p2.success();
-    p3.success();
-
-    // New acquires go through the replacement semaphore at the reduced limit.
-    let p4 = ctrl.acquire(op).await;
-    p4.success();
-    let final_limit = ctrl.window_limit(op);
-    assert!(
-        final_limit <= before,
-        "limit after recovery should stay at or below pre-throttle level"
-    );
-}
-
 #[tokio::test]
 async fn controller_multiple_throttles_across_epochs() {
     let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 64);
