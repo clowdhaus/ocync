@@ -526,15 +526,16 @@ impl AimdController {
             b.acquire().await;
         }
 
-        // Acquire aggregate permit first, then per-action.
-        let aggregate_permit = Arc::clone(&self.aggregate)
-            .acquire_owned()
-            .await
-            .expect("aggregate semaphore closed");
+        // Per-action first, then aggregate: a request queued on a throttled
+        // window must not hold aggregate capacity other windows need.
         let action_permit = action_semaphore
             .acquire_owned()
             .await
             .expect("action semaphore closed");
+        let aggregate_permit = Arc::clone(&self.aggregate)
+            .acquire_owned()
+            .await
+            .expect("aggregate semaphore closed");
 
         AimdPermit {
             key,
@@ -610,7 +611,12 @@ impl Drop for AimdPermit<'_> {
         let Some(permit) = self.action_permit.take() else {
             return;
         };
-        let mut windows = self.windows.lock().expect("aimd lock poisoned");
+        // A poisoned lock must not panic here: a permit can drop while a
+        // panic unwinds, and a second panic aborts the process.
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = windows.get_mut(&self.key) else {
             return;
         };
@@ -1098,42 +1104,66 @@ mod tests {
         // ECR manifest HEADs have no token bucket, so only the window gates.
         let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 100);
         let op = RegistryAction::ManifestHead;
-        let past_epoch = DEFAULT_EPOCH + Duration::from_millis(5);
         let admitted = Duration::from_secs(1);
 
         ctrl.acquire(op).await.success();
         assert_eq!(ctrl.window_limit(op), 2);
         let first = ctrl.acquire(op).await;
         let second = ctrl.acquire(op).await;
-        let mut third = Box::pin(ctrl.acquire(op));
-        let mut fourth = Box::pin(ctrl.acquire(op));
-        assert!(
-            tokio::time::timeout(Duration::ZERO, &mut third)
-                .await
-                .is_err()
-        );
-        assert!(
-            tokio::time::timeout(Duration::ZERO, &mut fourth)
-                .await
-                .is_err()
-        );
+        let mut queued = [
+            Box::pin(ctrl.acquire(op)),
+            Box::pin(ctrl.acquire(op)),
+            Box::pin(ctrl.acquire(op)),
+        ];
+        for waiter in &mut queued {
+            assert!(tokio::time::timeout(Duration::ZERO, waiter).await.is_err());
+        }
+        let [third, fourth, mut fifth] = queued;
 
-        // Halve, grow back, halve again: each halving is reported by a
-        // request admitted before it, while `fourth` is still queued.
-        tokio::time::sleep(past_epoch).await;
+        // Halve, grow back, halve again. Each halving is reported by a request
+        // admitted before it, and `fifth` stays queued across both.
         first.throttled();
         second.success();
         let third = tokio::time::timeout(admitted, third)
             .await
-            .expect("third admitted after second released");
-        tokio::time::sleep(past_epoch).await;
+            .expect("third admitted after the window grew back");
+        let fourth = tokio::time::timeout(admitted, fourth)
+            .await
+            .expect("fourth admitted by the permit second released");
+        tokio::time::sleep(DEFAULT_EPOCH + Duration::from_millis(5)).await;
         third.throttled();
         assert_eq!(ctrl.window_limit(op), 1);
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut fifth)
+                .await
+                .is_err(),
+            "fourth still fills a window of one"
+        );
 
-        tokio::time::timeout(admitted, fourth)
+        fourth.success();
+        tokio::time::timeout(admitted, fifth)
             .await
             .expect("a waiter queued before the halvings must not be stranded")
             .success();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_on_a_full_window_holds_no_aggregate_permit() {
+        // Aggregate cap of 2; manifest and blob HEADs are separate ECR windows.
+        let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 2);
+        let holder = ctrl.acquire(RegistryAction::ManifestHead).await;
+        let mut waiter = Box::pin(ctrl.acquire(RegistryAction::ManifestHead));
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut waiter)
+                .await
+                .is_err()
+        );
+
+        tokio::time::timeout(Duration::ZERO, ctrl.acquire(RegistryAction::BlobHead))
+            .await
+            .expect("another window must still get the second aggregate permit")
+            .success();
+        holder.success();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1151,7 +1181,6 @@ mod tests {
             ctrl.acquire(op).await,
         ];
 
-        tokio::time::sleep(DEFAULT_EPOCH + Duration::from_millis(5)).await;
         let [first, second, _third, _fourth] = in_flight;
         first.throttled();
         assert_eq!(ctrl.window_limit(op), 2);
