@@ -114,6 +114,10 @@ images:
     tags: ["7", "6"]
   - source: "public.ecr.aws/docker/library/nginx"
     tags: ["1.27", "1.26"]
+  # Floating tags that move together onto one multi-arch index: each child
+  # manifest must be pushed once, not once per tag.
+  - source: "public.ecr.aws/docker/library/alpine"
+    tags: ["latest", "3", "3.24", "3.24.3"]
   - source: "public.ecr.aws/docker/library/golang"
     tags: ["1.22", "1.21"]
 
