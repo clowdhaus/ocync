@@ -9,7 +9,7 @@ use std::pin::Pin;
 
 use super::token_cache::TokenCache;
 use super::token_exchange;
-use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
+use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 
 /// Auth provider that performs the Docker token-exchange flow with HTTP Basic credentials.
@@ -41,35 +41,11 @@ impl fmt::Debug for BasicAuth {
 }
 
 impl BasicAuth {
-    /// Create a new Basic auth provider for the given registry hostname.
-    ///
-    /// Uses HTTPS by default. For non-HTTPS registries (e.g. local development),
-    /// use [`BasicAuth::with_base_url`].
-    pub fn new(
-        registry: impl Into<String>,
-        http: reqwest::Client,
-        credentials: Credentials,
-    ) -> Self {
-        let registry = registry.into();
+    /// Create a Basic auth provider for the registry at `registry`, the base
+    /// URL its client uses.
+    pub fn new(registry: &url::Url, http: reqwest::Client, credentials: Credentials) -> Self {
         Self {
-            base_url: format!("https://{registry}"),
-            http,
-            credentials,
-            tokens: TokenCache::new(),
-            challenge_cache: token_exchange::ChallengeCache::new(),
-        }
-    }
-
-    /// Create a new Basic auth provider with an explicit base URL.
-    ///
-    /// Use this for registries that don't use HTTPS (e.g. `http://localhost:5000`).
-    pub fn with_base_url(
-        base_url: impl Into<String>,
-        http: reqwest::Client,
-        credentials: Credentials,
-    ) -> Self {
-        Self {
-            base_url: base_url.into(),
+            base_url: registry_origin(registry),
             http,
             credentials,
             tokens: TokenCache::new(),
@@ -200,8 +176,11 @@ mod tests {
         mount_v2_challenge(&server, 1).await;
         mount_token_endpoint(&server, "tok123", 1).await;
 
-        let auth =
-            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &server.uri().parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let token = auth
             .get_token(&[Scope::pull("library/nginx")])
             .await
@@ -235,8 +214,11 @@ mod tests {
         mount_v2_challenge(&server, 1).await;
         mount_token_endpoint(&server, "cached-tok", 1).await;
 
-        let auth =
-            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &server.uri().parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let scopes = [Scope::pull("library/nginx")];
         let t1 = auth.get_token(&scopes).await.unwrap();
         let t2 = auth.get_token(&scopes).await.unwrap();
@@ -250,8 +232,11 @@ mod tests {
         mount_v2_challenge(&server, 2).await;
         mount_token_endpoint(&server, "fresh-tok", 2).await;
 
-        let auth =
-            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &server.uri().parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let scopes = [Scope::pull("library/nginx")];
         auth.get_token(&scopes).await.unwrap();
         auth.invalidate().await;
@@ -268,8 +253,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth =
-            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &server.uri().parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let token = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         assert_eq!(token.value(), "");
     }
@@ -285,8 +273,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth =
-            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &server.uri().parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
         assert!(matches!(err, Error::AuthFailed { .. }));
     }
@@ -301,8 +292,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth =
-            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &server.uri().parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
         assert!(err.to_string().contains("WWW-Authenticate"));
     }
@@ -317,8 +311,11 @@ mod tests {
         // Token endpoint is called twice (different scopes).
         mount_token_endpoint(&server, "reused", 2).await;
 
-        let auth =
-            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &server.uri().parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let t1 = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
         let t2 = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
         assert_eq!(t1.value(), "reused");
@@ -338,8 +335,11 @@ mod tests {
         mount_token_endpoint_for_scope(&server, "repository:repo-a:pull", "tok-a", 1).await;
         mount_token_endpoint_for_scope(&server, "repository:repo-b:pull", "tok-b", 1).await;
 
-        let auth =
-            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &server.uri().parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let t_a = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
         let t_b = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
         assert_eq!(t_a.value(), "tok-a");
@@ -357,8 +357,11 @@ mod tests {
         mount_token_endpoint_for_scope(&server, "repository:repo:pull", "pull-tok", 1).await;
         mount_token_endpoint_for_scope(&server, "repository:repo:pull,push", "push-tok", 1).await;
 
-        let auth =
-            BasicAuth::with_base_url(server.uri(), crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &server.uri().parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let t_pull1 = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         assert_eq!(t_pull1.value(), "pull-tok");
         // Second pull -> cache hit; the expect(1) on the pull mock above
@@ -385,8 +388,8 @@ mod tests {
         mount_v2_challenge(&server, 1).await;
         mount_token_endpoint(&server, "single-tok", 1).await;
 
-        let auth = Arc::new(BasicAuth::with_base_url(
-            server.uri(),
+        let auth = Arc::new(BasicAuth::new(
+            &server.uri().parse().unwrap(),
             crate::test_http_client(),
             test_credentials(),
         ));
@@ -455,8 +458,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = Arc::new(BasicAuth::with_base_url(
-            server.uri(),
+        let auth = Arc::new(BasicAuth::new(
+            &server.uri().parse().unwrap(),
             crate::test_http_client(),
             test_credentials(),
         ));
@@ -518,8 +521,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = Arc::new(BasicAuth::with_base_url(
-            server.uri(),
+        let auth = Arc::new(BasicAuth::new(
+            &server.uri().parse().unwrap(),
             crate::test_http_client(),
             test_credentials(),
         ));
@@ -542,13 +545,21 @@ mod tests {
 
     #[test]
     fn basic_auth_name() {
-        let auth = BasicAuth::new("example.com", crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &"https://example.com".parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         assert_eq!(auth.name(), "basic");
     }
 
     #[test]
     fn basic_auth_debug_redacts_credentials() {
-        let auth = BasicAuth::new("example.com", crate::test_http_client(), test_credentials());
+        let auth = BasicAuth::new(
+            &"https://example.com".parse().unwrap(),
+            crate::test_http_client(),
+            test_credentials(),
+        );
         let debug = format!("{auth:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("testuser"));

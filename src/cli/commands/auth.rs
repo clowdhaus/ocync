@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crate::cli::config::load_config;
 use crate::cli::output::redact_url;
-use crate::cli::{CliError, ExitCode, build_registry_client};
+use crate::cli::{CliError, ExitCode, Registry, build_registry_client};
 
 /// Run credential checks against all registries in config files.
 pub(crate) async fn run_check(configs: &[PathBuf]) -> Result<ExitCode, CliError> {
@@ -34,7 +34,7 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
 
         for (name, reg) in &config.registries {
             let safe_url = redact_url(&reg.url);
-            match build_registry_client(&reg.url, Some(reg)).await {
+            match build_registry_client(Registry::Configured(reg)).await {
                 Ok(client) => match client.ping().await {
                     Ok(()) => {
                         let _ = writeln!(out, "  OK    {name} ({safe_url})");

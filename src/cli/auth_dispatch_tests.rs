@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::cli::config::{AuthType, BasicCredentials, RegistryConfig};
-use crate::cli::{CliError, build_registry_client};
+use crate::cli::{CliError, Registry, build_registry_client};
 
 /// Process-wide guard for tests that mutate `DOCKER_CONFIG`. Held for the
 /// duration of a single test; dropped automatically.
@@ -125,7 +125,7 @@ async fn explicit_ecr_dispatches_to_ecr() {
         "123456789012.dkr.ecr.us-east-1.amazonaws.com",
         Some(AuthType::Ecr),
     );
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("ecr"));
@@ -134,7 +134,7 @@ async fn explicit_ecr_dispatches_to_ecr() {
 #[tokio::test]
 async fn explicit_basic_with_credentials_dispatches_to_basic() {
     let cfg = config_with_basic("registry.example.com");
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("basic"));
@@ -143,7 +143,7 @@ async fn explicit_basic_with_credentials_dispatches_to_basic() {
 #[tokio::test]
 async fn explicit_static_token_dispatches_to_static_token() {
     let cfg = config_with_token("registry.example.com");
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("static-token"));
@@ -167,7 +167,7 @@ async fn auth_type_token_alias_dispatches_to_static_token() {
         head_first: false,
         aws_profile: None,
     };
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("static-token"));
@@ -176,7 +176,7 @@ async fn auth_type_token_alias_dispatches_to_static_token() {
 #[tokio::test]
 async fn explicit_gar_dispatches_to_gcp() {
     let cfg = config("us-docker.pkg.dev", Some(AuthType::Gar));
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("gcp"));
@@ -185,7 +185,7 @@ async fn explicit_gar_dispatches_to_gcp() {
 #[tokio::test]
 async fn explicit_gcr_dispatches_to_gcp() {
     let cfg = config("gcr.io", Some(AuthType::Gcr));
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("gcp"));
@@ -194,7 +194,7 @@ async fn explicit_gcr_dispatches_to_gcp() {
 #[tokio::test]
 async fn explicit_acr_dispatches_to_acr() {
     let cfg = config("example.azurecr.io", Some(AuthType::Acr));
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("acr"));
@@ -205,7 +205,7 @@ async fn explicit_ghcr_alias_dispatches_to_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("ghcr.io", Some(AuthType::Ghcr));
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     // The Ghcr branch routes to DockerConfigAuth and emits a warn-level
@@ -228,7 +228,7 @@ async fn ghcr_deprecation_fires_at_most_once() {
         let dir = tempdir_with_config();
         let _g = EnvGuard::set_docker_config(dir.path());
         let cfg = config("ghcr.io", Some(AuthType::Ghcr));
-        let _ = build_registry_client(&cfg.url, Some(&cfg))
+        let _ = build_registry_client(Registry::Configured(&cfg))
             .await
             .expect("build client");
     }
@@ -247,7 +247,7 @@ async fn explicit_docker_config_dispatches_to_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("registry.example.com", Some(AuthType::DockerConfig));
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("docker-config"));
@@ -256,7 +256,7 @@ async fn explicit_docker_config_dispatches_to_docker_config() {
 #[tokio::test]
 async fn explicit_anonymous_dispatches_to_anonymous() {
     let cfg = config("registry.example.com", Some(AuthType::Anonymous));
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
@@ -269,7 +269,7 @@ async fn explicit_anonymous_dispatches_to_anonymous() {
 #[tokio::test]
 async fn autodetect_ecr_hostname_dispatches_to_ecr() {
     let cfg = config("123456789012.dkr.ecr.us-east-1.amazonaws.com", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("ecr"));
@@ -278,7 +278,7 @@ async fn autodetect_ecr_hostname_dispatches_to_ecr() {
 #[tokio::test]
 async fn autodetect_ecr_public_dispatches_to_ecr_public() {
     let cfg = config("public.ecr.aws", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("ecr-public"));
@@ -287,7 +287,7 @@ async fn autodetect_ecr_public_dispatches_to_ecr_public() {
 #[tokio::test]
 async fn autodetect_gar_dispatches_to_gcp() {
     let cfg = config("us-docker.pkg.dev", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("gcp"));
@@ -296,7 +296,7 @@ async fn autodetect_gar_dispatches_to_gcp() {
 #[tokio::test]
 async fn autodetect_gcr_dispatches_to_gcp() {
     let cfg = config("gcr.io", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("gcp"));
@@ -305,7 +305,7 @@ async fn autodetect_gcr_dispatches_to_gcp() {
 #[tokio::test]
 async fn autodetect_acr_dispatches_to_acr() {
     let cfg = config("example.azurecr.io", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("acr"));
@@ -316,7 +316,7 @@ async fn autodetect_cgr_dev_with_no_docker_config_falls_back_to_anonymous() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("cgr.dev", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
@@ -327,7 +327,7 @@ async fn autodetect_cgr_dev_with_docker_config_uses_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("cgr.dev", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     // Provider name is "docker-config" regardless of whether the config
@@ -341,7 +341,7 @@ async fn autodetect_ghcr_io_with_docker_config_uses_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("ghcr.io", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("docker-config"));
@@ -352,7 +352,7 @@ async fn autodetect_unknown_hostname_with_no_docker_config_falls_back_to_anonymo
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("registry.unknown.example", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
@@ -367,7 +367,7 @@ async fn autodetect_docker_io_with_docker_config_uses_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("docker.io", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("docker-config"));
@@ -378,7 +378,7 @@ async fn autodetect_docker_io_with_no_docker_config_falls_back_to_anonymous() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("docker.io", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
@@ -396,7 +396,7 @@ async fn docker_io_is_rewritten_to_registry_1_for_endpoint() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("docker.io", None);
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     let authority = client
@@ -421,7 +421,7 @@ async fn explicit_anonymous_overrides_autodetect_for_cgr_dev() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("cgr.dev", Some(AuthType::Anonymous));
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
@@ -436,7 +436,7 @@ async fn explicit_static_token_overrides_autodetect_for_ghcr_io() {
     // Uses static_token instead of ecr (which would attempt real AWS SDK
     // setup on a non-ECR hostname) to keep the test offline.
     let cfg = config_with_token("ghcr.io");
-    let client = build_registry_client(&cfg.url, Some(&cfg))
+    let client = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect("build client");
     assert_eq!(client.auth_name(), Some("static-token"));
@@ -451,7 +451,7 @@ async fn explicit_ghcr_with_no_docker_config_errors() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("ghcr.io", Some(AuthType::Ghcr));
-    let err = build_registry_client(&cfg.url, Some(&cfg))
+    let err = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect_err("expected error");
     assert!(
@@ -465,7 +465,7 @@ async fn explicit_docker_config_with_no_docker_config_errors() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("registry.example.com", Some(AuthType::DockerConfig));
-    let err = build_registry_client(&cfg.url, Some(&cfg))
+    let err = build_registry_client(Registry::Configured(&cfg))
         .await
         .expect_err("expected error");
     assert!(
@@ -487,4 +487,73 @@ fn auth_type_ecr_public_is_a_parse_error() {
         parsed.is_err(),
         "auth_type 'ecr_public' must be rejected at parse time (no AuthType::EcrPublic variant)"
     );
+}
+
+/// A registry configured as `http://` is reached over plain HTTP, for both
+/// its requests and the token exchange. Covers every auth type whose
+/// provider exchanges tokens with the registry itself.
+#[tokio::test]
+async fn configured_http_registry_is_reached_over_http() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/"))
+        .respond_with(ResponseTemplate::new(401).insert_header(
+            "www-authenticate",
+            format!("Bearer realm=\"{}/token\",service=\"test\"", server.uri()),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"token":"t"}"#))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/repo/tags/list"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"name":"repo","tags":["v1"]}"#),
+        )
+        .mount(&server)
+        .await;
+    let docker_dir = tempdir_with_config();
+    let _env = EnvGuard::set_docker_config(docker_dir.path());
+
+    for cfg in [
+        config(&server.uri(), Some(AuthType::Anonymous)),
+        config_with_basic(&server.uri()),
+        config(&server.uri(), Some(AuthType::DockerConfig)),
+    ] {
+        let client = build_registry_client(Registry::Configured(&cfg))
+            .await
+            .expect("build client");
+        let tags = client
+            .list_tags(&"repo".parse().unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("{:?} over http: {e}", cfg.auth_type));
+        assert_eq!(tags, ["v1"]);
+    }
+}
+
+#[test]
+fn reference_host_resolves_to_its_config_entry() {
+    let registries = [
+        config("http://localhost:5000", None),
+        config("registry-1.docker.io", None),
+    ];
+    for (host, url) in [
+        ("localhost:5000", "http://localhost:5000"),
+        ("docker.io", "registry-1.docker.io"),
+    ] {
+        let Registry::Configured(found) = Registry::resolve(&registries, host) else {
+            panic!("{host} should match its config entry");
+        };
+        assert_eq!(found.url, url, "{host}");
+    }
+    assert!(matches!(
+        Registry::resolve(&registries, "https://ghcr.io/"),
+        Registry::Host("ghcr.io")
+    ));
 }

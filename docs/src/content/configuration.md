@@ -93,7 +93,7 @@ Named registry definitions. Auth type is auto-detected from the hostname.
 ```yaml
 registries:
   my-registry:
-    url: registry.example.com         # Required
+    url: registry.example.com         # Required. HTTPS unless written as http:// (plain HTTP, local registries only)
     auth_type: ecr                    # Optional (see below)
     max_concurrent: 50                # Optional per-registry concurrency cap (>= 1)
     head_first: true                  # Optional: HEAD-check targets before source GET

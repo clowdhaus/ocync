@@ -19,7 +19,7 @@ use ocync_sync::staging::BlobStage;
 
 use crate::CopyArgs;
 use crate::cli::config::{AuthType, load_config};
-use crate::cli::{CliError, ExitCode, bare_hostname, build_registry_client, endpoint_host};
+use crate::cli::{CliError, ExitCode, Registry, bare_hostname, build_registry_client};
 
 /// Run the copy command: transfer a single image from source to destination.
 ///
@@ -44,22 +44,11 @@ pub(crate) async fn run(
         Vec::new()
     };
 
-    let normalized_src = endpoint_host(bare_hostname(args.source.registry()));
-    let src_reg_config = registries
-        .iter()
-        .find(|r| endpoint_host(bare_hostname(&r.url)) == normalized_src);
-
-    let normalized_dst = endpoint_host(bare_hostname(args.destination.registry()));
-    let dst_reg_config = registries
-        .iter()
-        .find(|r| endpoint_host(bare_hostname(&r.url)) == normalized_dst);
-
-    let source_client = Arc::new(
-        build_registry_client(bare_hostname(args.source.registry()), src_reg_config).await?,
-    );
-    let target_client = Arc::new(
-        build_registry_client(bare_hostname(args.destination.registry()), dst_reg_config).await?,
-    );
+    let destination = Registry::resolve(&registries, args.destination.registry());
+    let dst_reg_config = destination.config();
+    let source = Registry::resolve(&registries, args.source.registry());
+    let source_client = Arc::new(build_registry_client(source).await?);
+    let target_client = Arc::new(build_registry_client(destination).await?);
 
     let source_authority = source_client
         .registry_authority()
@@ -100,7 +89,7 @@ pub(crate) async fn run(
     // When `--config` is not supplied (one-shot copy by image ref) the
     // default is false -- no per-invocation override flag yet; see
     // RegistryConfig::head_first for the field doc.
-    let head_first = src_reg_config.map(|r| r.head_first).unwrap_or(false);
+    let head_first = source.config().map(|r| r.head_first).unwrap_or(false);
 
     let mapping = ResolvedMapping {
         source_authority,

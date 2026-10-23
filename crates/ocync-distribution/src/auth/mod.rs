@@ -32,6 +32,13 @@ use std::time::{Duration, Instant};
 
 use crate::error::Error;
 
+/// Origin (scheme, host and port) of a registry's base URL, where a
+/// token-exchange provider pings `/v2/` for its challenge. Taken from the
+/// same URL the client uses, so both speak one scheme.
+pub(crate) fn registry_origin(registry: &url::Url) -> String {
+    registry.origin().ascii_serialization()
+}
+
 /// Tokens are proactively refreshed when their remaining lifetime drops
 /// below this window. Must be shorter than the shortest token TTL we
 /// encounter (Docker Hub returns 300s). The prior value of 15 minutes
@@ -265,6 +272,8 @@ pub trait AuthProvider: Send + Sync {
 mod tests {
     use super::*;
 
+    /// Credentials and token services know a registry by its host, with the
+    /// port only when one is written.
     #[test]
     fn scope_display_single_action() {
         let scope = Scope::pull("library/nginx");

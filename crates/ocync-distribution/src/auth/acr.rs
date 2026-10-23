@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 use super::ecr::SdkCredentialCache;
 use super::token_cache::TokenCache;
 use super::token_exchange::no_redirect_http_client;
-use super::{AuthProvider, Scope, Token, scopes_cache_key};
+use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -76,13 +76,7 @@ fn ttl_from_unix_exp(exp: i64) -> Duration {
 /// Sovereign clouds use different AAD login endpoints and resource URIs.
 /// Expects a DNS hostname (not an IP address) -- enforced by the ACR
 /// regex in `detect_provider_kind()`.
-fn azure_endpoints(registry_host: &str) -> (&'static str, &'static str) {
-    // Strip port if present -- bare_hostname() preserves ports
-    // (e.g. "myregistry.azurecr.cn:443") which would break the
-    // suffix match for sovereign clouds.
-    let host = registry_host
-        .rsplit_once(':')
-        .map_or(registry_host, |(h, _)| h);
+fn azure_endpoints(host: &str) -> (&'static str, &'static str) {
     if host.ends_with(".azurecr.cn") {
         (
             "login.chinacloudapi.cn",
@@ -584,13 +578,15 @@ impl fmt::Debug for AcrAuth {
 }
 
 impl AcrAuth {
-    /// Construct a new `AcrAuth` for the given ACR hostname.
-    pub async fn new(hostname: &str) -> Result<Self, Error> {
-        let (authority, resource) = azure_endpoints(hostname);
+    /// Construct an `AcrAuth` for the registry at `registry`, the base URL
+    /// its client uses.
+    pub async fn new(registry: &url::Url) -> Result<Self, Error> {
+        let hostname = registry.host_str().unwrap_or_default().to_owned();
+        let (authority, resource) = azure_endpoints(&hostname);
         let api = Box::new(AzureCredentialChain::new(authority, resource));
         Ok(Self {
-            base_url: format!("https://{hostname}"),
-            service: hostname.to_owned(),
+            base_url: registry_origin(registry),
+            service: hostname,
             exchange_http: no_redirect_http_client(),
             api,
             refresh_cache: SdkCredentialCache::new(),
@@ -762,14 +758,6 @@ mod tests {
         let (authority, resource) = azure_endpoints("myregistry.azurecr.us");
         assert_eq!(authority, "login.microsoftonline.us");
         assert_eq!(resource, "https://containerregistry.azure.us");
-    }
-
-    #[test]
-    fn azure_endpoints_strips_port_for_sovereign_match() {
-        let (authority, _) = azure_endpoints("myregistry.azurecr.cn:443");
-        assert_eq!(authority, "login.chinacloudapi.cn");
-        let (authority, _) = azure_endpoints("myregistry.azurecr.us:443");
-        assert_eq!(authority, "login.microsoftonline.us");
     }
 
     #[test]
