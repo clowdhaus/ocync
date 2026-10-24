@@ -2383,6 +2383,7 @@ dependencies = [
  "hex",
  "http",
  "pin-project-lite",
+ "rcgen",
  "regex-lite",
  "reqwest",
  "rustls",

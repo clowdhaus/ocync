@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anstyle::{Ansi256Color, Color, Style};
 use clap::builder::Styles;
 use clap::{Parser, Subcommand, ValueEnum};
-use ocync_distribution::Reference;
+use ocync_distribution::{Reference, TlsFips};
 use ocync_sync::progress::NullProgress;
 
 const PINK: Option<Color> = Some(Color::Ansi256(Ansi256Color(213)));
@@ -305,6 +305,10 @@ pub(crate) struct WatchArgs {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     ocync_distribution::install_crypto_provider();
+    if cfg!(feature = "fips") && ocync_distribution::tls_fips() != TlsFips::Approved {
+        eprintln!("error: FIPS build, but TLS is not restricted to FIPS-approved algorithms");
+        return cli::ExitCode::Failure.into();
+    }
 
     let cli = Cli::parse();
     cli::setup_logging(&cli);

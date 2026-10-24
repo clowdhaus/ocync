@@ -34,24 +34,17 @@ The duplicated hash crate versions (`digest`, `block-buffer`, `crypto-common`, `
 
 ## TLS uses only FIPS-approved algorithms
 
-> **Status: Planned.**
+The `fips` feature enables `rustls/fips`. That feature applies to every `rustls` user in the build, so `aws_lc_rs::default_provider()` drops ChaCha20-Poly1305 and every key exchange group the module does not approve, for `reqwest` and for the TLS clients the AWS SDK and `google-cloud-auth` build themselves. TLS 1.2 also requires extended master secret.
 
-`install_crypto_provider()` installs `rustls::crypto::aws_lc_rs::default_provider()`, and the `rustls` `fips` feature is not enabled. Without that feature, `rustls` keeps ChaCha20-Poly1305 and X25519 in its default cipher suites and key exchange groups, so a FIPS build can negotiate an algorithm the module does not approve.
+At startup a FIPS build checks `tls_fips()`, which builds a client configuration from the installed provider and asks `rustls` whether it is FIPS-approved, including whether the module is in approved mode. The build refuses to start if it is not. `ocync version` prints the result as `tls=approved` or `tls=not-approved`.
 
-The fix:
-
-- Enable `rustls/fips` in the `fips` feature and install `rustls::crypto::default_fips_provider()`.
-- Refuse to start a FIPS build unless the TLS configuration reports `fips() == true`.
-- `ocync version` reports the runtime FIPS state alongside the compile-time one.
-- Negative test: a handshake against a server that offers only ChaCha20-Poly1305 fails in a FIPS build.
+`tests/fips_tls.rs` in `ocync-distribution` pins the behavior: a registry client fails the handshake against a server offering only ChaCha20-Poly1305 and succeeds against one offering AES-128-GCM.
 
 ## The shipped module matches a validated certificate
 
 > **Status: Planned.**
 
 The v0.8.2 release binary `ocync-fips-linux-amd64` embeds `AWS-LC FIPS 4.2.0`. [FIPS 140-3](/fips) cites NIST Certificate #4816, which covers an earlier AWS-LC module. Confirm which certificate covers the shipped version. If none does, pin `aws-lc-fips-sys` to a validated line. Either way, the FIPS page names the certificate that matches the shipped module, and a check in the release workflow fails when the embedded version drifts from it.
-
-The FIPS page also claims the "entire TLS chain" is FIPS-compliant. That claim is corrected together with the TLS fix above.
 
 ## Releases carry a bill of materials
 

@@ -19,6 +19,8 @@ order: 7
 
 FIPS mode is a compile-time decision. The `fips` feature flag links against the FIPS-validated aws-lc module. The `non-fips` feature flag uses aws-lc-rs without FIPS validation.
 
+A FIPS build restricts TLS to FIPS-approved algorithms: AES-GCM cipher suites, key exchange over P-256, P-384 or the X25519MLKEM768 post-quantum hybrid (approved through its ML-KEM part), and extended master secret for TLS 1.2. ChaCha20-Poly1305 and plain X25519 are never offered. The restriction covers every TLS client in the binary, including the ones the AWS and Google SDKs build. A FIPS build checks this at startup and refuses to run if TLS is not FIPS-approved.
+
 ## FIPS endpoints for ECR
 
 When `AWS_USE_FIPS_ENDPOINT=true`, `ocync` rewrites ECR hostnames to use FIPS endpoints:
@@ -52,15 +54,15 @@ docker pull public.ecr.aws/clowdhaus/ocync:latest-fips
 
 ## Verifying FIPS status
 
-The `ocync version` command reports whether the binary was compiled with FIPS:
+The `ocync version` command reports whether the binary was compiled with FIPS and whether TLS is restricted to FIPS-approved algorithms at runtime:
 
 ```
 $ ocync version
 ocync 0.8.2
-FIPS 140-3: compiled=yes
+FIPS 140-3: compiled=yes tls=approved
 ```
 
-Non-FIPS builds show `compiled=no`. FIPS is a compile-time selection; there is no runtime toggle.
+Non-FIPS builds show `compiled=no tls=not-approved`. FIPS is a compile-time selection; there is no runtime toggle.
 
 ## Banned dependencies
 
