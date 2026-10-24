@@ -2051,9 +2051,15 @@ async fn run_clears_repo_watches_without_cache_pruning() {
         )
         .await;
 
-    let watch = cache.borrow_mut().repo_committed_watch("target", &repo);
-    assert!(
-        !*watch.borrow(),
+    let digest: Digest = format!("sha256:{}", "a".repeat(64)).parse().unwrap();
+    let mut cache = cache.borrow_mut();
+    cache.set_blob_verified("target", digest.clone(), repo.clone());
+    let other = RepositoryName::new("other").unwrap();
+    assert_eq!(
+        cache
+            .unresolved_watches_for("target", &digest, &other)
+            .len(),
+        1,
         "the previous run's fired watch carried into the next run"
     );
 }

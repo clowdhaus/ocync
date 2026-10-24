@@ -1329,7 +1329,7 @@ async fn sync_image_with_more_layers_than_blob_concurrency_limit() {
 /// The leader's manifest push succeeds instantly (no delay), while the
 /// follower's blob HEAD checks are delayed. This forces the "fire-before-
 /// subscribe" path in the watch channel: the leader calls
-/// `mark_repo_committed` before the follower ever calls `repo_committed_watch`.
+/// `mark_repo_committed` before the follower ever calls `unresolved_watches_for`.
 ///
 /// Without `send_replace` (using plain `send`), the leader's signal would be
 /// lost and the follower would deadlock waiting for a commit that already
@@ -1565,7 +1565,7 @@ async fn sync_leader_manifest_push_fails_follower_falls_through() {
 }
 
 /// Multiple leaders sharing blobs complete without deadlock. Validates that
-/// leader images do not deadlock waiting on each other's `repo_committed_watch`.
+/// leader images do not deadlock waiting on each other's manifest commit.
 /// With the bounded-deadline resolver, whichever leader commits first becomes
 /// a mount source for the other; if neither commits in time, the deadline trips
 /// and both fall through to push. No `is_leader` skip needed.
@@ -1694,7 +1694,7 @@ async fn sync_multi_leader_shared_blobs_no_deadlock() {
     )
     .await;
 
-    let report = result.expect("engine deadlocked: multi-leader repo_committed_watch cycle");
+    let report = result.expect("engine deadlocked: multi-leader commit-wait cycle");
     assert_eq!(report.images.len(), 3);
     assert!(
         report
@@ -2108,7 +2108,7 @@ async fn sync_follower_mount_wait_no_deadlock() {
 
     // Warm cache: the 7 "old" blobs are already at tgt-a (the leader's repo)
     // with status Completed. This makes the follower's mount-source lookup
-    // return tgt-a for each of them, triggering the repo_committed_watch wait.
+    // return tgt-a for each of them, triggering the commit wait.
     let target_name = "target";
     let cache = empty_cache();
     {
@@ -2154,12 +2154,11 @@ async fn sync_follower_mount_wait_no_deadlock() {
     // bounded-deadline guarantees correctness (both sync), not mount rate.
 }
 
-/// Two images share a blob and run concurrently, and the blob already
-/// exists at one of their target repos. Both complete, proving that a task
-/// finding the blob present (`set_blob_verified`) never leaves a waiter on
-/// the shared blob's upload claim blocked.
+/// Two images share a blob and run concurrently; the blob already exists at
+/// one of their target repos. Both sync without deadlocking on the shared
+/// blob's upload claim, and the repo that has the blob never has it pushed.
 #[tokio::test(flavor = "current_thread")]
-async fn sync_batch_check_notifies_in_progress_waiters() {
+async fn sync_shared_blob_present_at_one_repo_is_never_pushed_there() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
@@ -2183,8 +2182,7 @@ async fn sync_batch_check_notifies_in_progress_waiters() {
     mount_manifest_push(&target_server, "tgt-a", "v1").await;
 
     // Target tgt-b: shared blob HEAD returns 200 (already exists).
-    // This forces the per-blob HEAD check (or batch check) to find the
-    // blob and call set_blob_verified on the target repo.
+    // The per-blob HEAD finds the blob and marks it verified there.
     mount_manifest_head_not_found(&target_server, "tgt-b", "v1").await;
     mount_blob_not_found(&target_server, "tgt-b", &parts_b.config_desc.digest).await;
     Mock::given(method("HEAD"))
@@ -2246,7 +2244,7 @@ async fn sync_batch_check_notifies_in_progress_waiters() {
     )
     .await;
 
-    let report = result.expect("engine should not deadlock with batch-check notify");
+    let report = result.expect("engine should not deadlock on the shared blob's claim");
     assert_eq!(report.images.len(), 2);
     assert!(
         report
@@ -2257,6 +2255,19 @@ async fn sync_batch_check_notifies_in_progress_waiters() {
         report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
     );
     assert_eq!(report.stats.images_synced, 2);
+    let shared_digest = parts_b.layer_descs[0].digest.to_string();
+    let pushed_to_b = target_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.method.as_str() == "PUT"
+                && r.url.path().starts_with("/v2/tgt-b/blobs/uploads/")
+                && r.url.query().is_some_and(|q| q.contains(&shared_digest))
+        })
+        .count();
+    assert_eq!(pushed_to_b, 0, "tgt-b already has the shared blob");
 }
 
 // ---------------------------------------------------------------------------
