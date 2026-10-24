@@ -36,7 +36,7 @@ const stats = [
 ];
 
 const securityPills = [
-  "FIPS 140-3 (NIST #4816)",
+  "FIPS 140-3 module and FIPS-only TLS",
   "Hardened container images",
   "No elevated privileges",
   "Native registry auth",
@@ -107,7 +107,7 @@ const registries = [
         <p class="feature-label">02 / Security</p>
         <h2 id="security-heading">Secure by default.<br>Not by configuration.</h2>
         <p class="feature-copy">
-          FIPS 140-3 validated cryptography ships in every Linux build. Minimal,
+          Every Linux build links the AWS-LC FIPS module and speaks only FIPS-approved TLS. Minimal,
           hardened deployment artifacts. No elevated privileges required, ever.
         </p>
         <div class="pill-row" role="list" aria-label="Security features">

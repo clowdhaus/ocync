@@ -39,9 +39,9 @@ pub fn install_crypto_provider() {
 /// Which AWS-LC module this build links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoBuild {
-    /// The FIPS 140-3 validated AWS-LC-FIPS module.
+    /// The AWS-LC FIPS module. [`certification()`] gives its NIST status.
     Fips,
-    /// AWS-LC without FIPS validation.
+    /// AWS-LC without the FIPS module.
     NonFips,
 }
 
@@ -71,11 +71,19 @@ pub enum Certification {
 /// NIST's list of modules submitted for validation and not yet certified.
 pub const MODULES_IN_PROCESS_URL: &str = "https://csrc.nist.gov/Projects/Cryptographic-Module-Validation-Program/Modules-In-Process/Modules-In-Process-List";
 
-/// Certification status of the linked AWS-LC-FIPS module, from the
-/// validations AWS-LC lists in `crypto/fipsmodule/FIPS.md` for the static
-/// library, or `None` for a module this build has no record of.
+/// Certification status of the linked AWS-LC-FIPS module, or `None` for a
+/// module this build has no record of.
 pub fn certification() -> Option<Certification> {
-    match fips_module()? {
+    fips_module().and_then(certification_of)
+}
+
+/// Certification status of an AWS-LC-FIPS module number, from the
+/// validations AWS-LC lists in `crypto/fipsmodule/FIPS.md` for the static
+/// library. AWS-LC submits each FIPS branch as one module and ships that
+/// branch's patch releases as its update stream, so the record is per
+/// module number.
+fn certification_of(module: u32) -> Option<Certification> {
+    match module {
         4 => Some(Certification::InProcess),
         _ => None,
     }
@@ -139,6 +147,17 @@ pub use spec::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_4_is_in_process() {
+        assert_eq!(certification_of(4), Some(Certification::InProcess));
+    }
+
+    #[test]
+    fn modules_without_a_record_have_no_status() {
+        assert_eq!(certification_of(3), None);
+        assert_eq!(certification_of(5), None);
+    }
 
     /// Fails when aws-lc-rs moves to a module this crate has no
     /// certification record for, so the change cannot ship unrecorded.

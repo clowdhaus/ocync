@@ -28,14 +28,14 @@ A FIPS build restricts TLS to FIPS-approved algorithms: AES-GCM cipher suites, k
 | AWS-LC FIPS module (static library) | NIST status | Used by ocync |
 |---|---|---|
 | module 4 | [Modules in Process](https://csrc.nist.gov/Projects/Cryptographic-Module-Validation-Program/Modules-In-Process/Modules-In-Process-List): tested by an accredited lab and submitted to NIST, not yet certified | yes |
-| module 3.1 | Certificate [#5314](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/5314) | no |
+| module 3 | Certificate [#5314](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/5314) | no |
 | module 2.0 | Certificate [#4816](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/4816) | no |
 
-Statuses follow AWS-LC's [FIPS.md](https://github.com/aws/aws-lc/blob/main/crypto/fipsmodule/FIPS.md).
+Statuses follow AWS-LC's [FIPS.md](https://github.com/aws/aws-lc/blob/main/crypto/fipsmodule/FIPS.md). AWS-LC lists certificate #5314 as "AWS-LC-FIPS v3.1", and aws-lc-rs before 1.18 links the module 3 branch it calls 3.0.x. Check the certificate's security policy for the exact module versions it covers.
 
-`ocync` links module 4 because no other module is safe to ship with. aws-lc-rs 1.18 is the first release on module 4, and every `rustls` and `rustls-webpki` release that still works with module 3.1 is affected by published TLS advisories (RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0348, RUSTSEC-2026-0349, RUSTSEC-2026-0382). The fixes require aws-lc-rs 1.18.
+`ocync` links module 4 because no other module is safe to ship with. aws-lc-rs 1.18 is the first release on module 4, and every `rustls` and `rustls-webpki` release that still works with module 3 is affected by published TLS advisories (RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0348, RUSTSEC-2026-0349, RUSTSEC-2026-0382). The fixes require aws-lc-rs 1.18.
 
-For FedRAMP, the Rev5 cryptographic module rules expect modules with an active validation or update streams of them (CMU-CSO-UVM), and require documenting each module and whether it is validated (CMU-CSO-CMD). Until NIST certifies module 4, record `ocync` as using AWS-LC FIPS module 4, submitted and not yet certified. `ocync version` prints the status of the module a binary links, and a test fails the build if aws-lc-rs moves to a module `ocync` has no record of.
+For FedRAMP, the Rev5 cryptographic module rules expect modules with an active validation or update streams of them (CMU-CSO-UVM), and require documenting each module and whether it is validated (CMU-CSO-CMD). Until NIST certifies module 4, record `ocync` as using AWS-LC FIPS module 4, submitted and not yet certified. `ocync version` prints the status of the module a binary links, and a test fails the build if aws-lc-rs moves to a FIPS module number `ocync` has no record of. Patch releases within module 4 are its update stream and keep the same record.
 
 ## FIPS endpoints for ECR
 

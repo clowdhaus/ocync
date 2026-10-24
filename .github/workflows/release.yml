@@ -310,7 +310,7 @@ jobs:
 
             def caveats
               <<~CAVEATS
-                Linux builds use FIPS-validated AWS-LC.
+                Linux builds use the AWS-LC FIPS module. Run `ocync version` for its NIST status.
               CAVEATS
             end
           end

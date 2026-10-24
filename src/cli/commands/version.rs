@@ -66,8 +66,10 @@ mod tests {
         );
         assert!(!lines[2].ends_with("unknown"), "{report}");
         assert!(lines[3].starts_with("  release: AWS-LC "), "{report}");
-        assert!(lines[4].starts_with("  certificate: "), "{report}");
-        assert!(!lines[4].ends_with("no record for this module"), "{report}");
+        assert_eq!(
+            lines[4],
+            format!("  certificate: none yet, module in process ({MODULES_IN_PROCESS_URL})")
+        );
         assert_eq!(lines[5], "  tls: approved");
     }
 
