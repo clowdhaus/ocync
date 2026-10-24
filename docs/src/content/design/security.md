@@ -49,9 +49,9 @@ At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the ins
 Release binaries and the image's binary are built with `cargo auditable`, which embeds the dependency list in the binary, so scanners such as grype and trivy read it from the shipped artifact. `syft` turns it into CycloneDX:
 
 - Each binary ships with `<binary>.cdx.json`, attested on GitHub next to its build provenance.
-- Each platform image carries a cosign attestation of its bill of materials, which also lists the base image's packages.
+- Each platform image carries a cosign attestation of its bill of materials, which also lists the base image's packages. The multi-arch index carries both platforms' attestations.
 
-The list comes from cargo's dependency graph, so it can name crates that are not linked: `ring`, which a weak feature in `rustls-webpki` mentions, and `aws-lc-sys`, which `rustls` resolves in a FIPS build. `cargo deny` is the ban check. `cargo xtask sbom-check` fails CI and the release when a bill of materials lacks `ocync`, `aws-lc-rs` or the build's AWS-LC module crate, which catches a binary built without its dependency list or a FIPS binary built without the FIPS module.
+The list comes from cargo's dependency graph, so it can name crates that are not linked: `ring`, which a weak feature in `rustls-webpki` mentions, and `aws-lc-sys`, which `rustls` resolves in a FIPS build. `cargo deny` is the ban check. `cargo xtask sbom-check` fails CI and the release, before anything is attested, when a binary's or image's bill of materials lacks `ocync`, `aws-lc-rs` or the build's AWS-LC module crate, which catches a binary built without its dependency list or a FIPS binary built without the FIPS module.
 
 ## Owned Google authentication
 

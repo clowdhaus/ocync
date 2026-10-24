@@ -41,7 +41,6 @@ jobs:
               - 'deny.toml'
               - '.github/workflows/ci.yml'
               - '.github/actions/setup-rust/**'
-              - '.github/actions/sbom/**'
 
   format:
     name: Format
@@ -95,15 +94,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
+            tools: cargo-auditable,syft
+            sbom: check
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            tools: cargo-auditable
+            sbom: skip
     steps:
       - if: needs.changes.outputs.rust == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: needs.changes.outputs.rust == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          tools: cargo-auditable,syft
+          tools: ${{ matrix.tools }}
       - name: Build release binary
         if: needs.changes.outputs.rust == 'true'
         run: cargo auditable build --release --locked
@@ -116,11 +119,12 @@ jobs:
       # One arch proves the recipe; the check compiles xtask, so the other
       # arch skips it.
       - name: Check bill of materials
-        if: needs.changes.outputs.rust == 'true' && matrix.runner == 'ubuntu-24.04'
-        uses: ./.github/actions/sbom
-        with:
-          binary: target/${{ matrix.target }}/release/ocync
-          crypto: fips
+        if: needs.changes.outputs.rust == 'true' && matrix.sbom == 'check'
+        env:
+          BINARY: target/${{ matrix.target }}/release/ocync
+        run: |
+          syft scan "file:$BINARY" --output "cyclonedx-json=$BINARY.cdx.json"
+          cargo run --locked -p xtask -- sbom-check --crypto fips "$BINARY.cdx.json"
 
   check-non-fips:
     name: Check (non-fips)

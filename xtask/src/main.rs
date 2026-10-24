@@ -15,8 +15,8 @@ enum Cli {
     Bench(bench::BenchArgs),
     /// Run benchmarks on a remote bench instance via SSH.
     BenchRemote(bench::remote::BenchRemoteArgs),
-    /// Check a release bill of materials against the crates the binary must
-    /// and must not contain.
+    /// Check that release bills of materials list `ocync` and the AWS-LC
+    /// module the build links.
     SbomCheck(sbom::SbomCheckArgs),
 }
 

@@ -36,11 +36,12 @@ impl Crypto {
 /// Arguments for `sbom-check`.
 #[derive(clap::Args)]
 pub(crate) struct SbomCheckArgs {
-    /// CycloneDX JSON document to check.
-    path: PathBuf,
-    /// The AWS-LC build the binary must link.
+    /// The AWS-LC build every binary must link.
     #[arg(long, value_enum)]
     crypto: Crypto,
+    /// CycloneDX JSON documents to check.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -52,14 +53,27 @@ struct Document {
 #[derive(Deserialize)]
 struct Component {
     name: String,
-    #[serde(default)]
     purl: Option<String>,
 }
 
+/// Check every document, reporting each one that fails.
 pub(crate) fn run(args: &SbomCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let text =
-        std::fs::read_to_string(&args.path).map_err(|e| format!("{}: {e}", args.path.display()))?;
-    Ok(check(&text, args.crypto)?)
+    let failures: Vec<String> = args
+        .paths
+        .iter()
+        .filter_map(|path| {
+            std::fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|text| check(&text, args.crypto))
+                .err()
+                .map(|e| format!("{}: {e}", path.display()))
+        })
+        .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n").into())
+    }
 }
 
 fn check(text: &str, crypto: Crypto) -> Result<(), String> {
