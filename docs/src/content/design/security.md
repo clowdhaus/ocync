@@ -48,7 +48,7 @@ At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the ins
 
 Release binaries and the image's binary are built with `cargo auditable`, which embeds the dependency list in the binary, so scanners such as grype and trivy read it from the shipped artifact.
 
-That embedded list comes from `cargo metadata`, which resolves features across the whole workspace ([rust-lang/cargo#7754](https://github.com/rust-lang/cargo/issues/7754)). It names crates that other workspace members enable but `ocync` never compiles: 24 in the 0.8.2 FIPS build, including `quinn`, `chrono` and `ring`. None of them leaves a source path in the binary, while compiled crates such as `rustls` and `tokio` do. A FIPS build also lists `aws-lc-sys`, which `rustls` resolves but the binary does not link: its only AWS-LC release string is the FIPS one.
+That embedded list comes from `cargo metadata`, which lists an optional dependency whenever a weak feature (`dep?/feature`, such as `quinn?/rustls-aws-lc-rs` in `reqwest`) names it, even when nothing enables it. It names 24 crates in the 0.8.2 FIPS build that no workspace member compiles, including `quinn`, `chrono` and `ring`. None of them leaves a source path in the binary, while compiled crates such as `rustls` and `tokio` do. A FIPS build also lists `aws-lc-sys`, which `rustls` resolves but the binary does not link: its only AWS-LC release string is the FIPS one.
 
 `tools/sbom` turns syft's CycloneDX output into the release bill of materials:
 

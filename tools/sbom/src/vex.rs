@@ -27,8 +27,8 @@ pub(crate) struct Absent {
 /// Why a listed crate is not in the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Reason {
-    /// Workspace-wide feature resolution listed it; cargo does not compile it
-    /// into `ocync`.
+    /// `cargo metadata` listed it through a weak feature; cargo does not
+    /// compile it into `ocync`.
     NotCompiled,
     /// Cargo compiles it, but the binary links only the AWS-LC FIPS module.
     NotLinked,
@@ -39,8 +39,9 @@ impl Reason {
         match self {
             Self::NotCompiled => {
                 "The dependency list embedded by cargo auditable comes from cargo metadata, which \
-                 resolves features across the whole workspace. Cargo's resolver does not compile \
-                 this crate into ocync, so the binary contains none of its code."
+                 lists an optional dependency whenever a weak feature names it, even when nothing \
+                 enables it. Cargo's resolver does not compile this crate into ocync, so the \
+                 binary contains none of its code."
             }
             Self::NotLinked => {
                 "rustls resolves aws-lc-sys in a FIPS build, but the binary links only the AWS-LC \
