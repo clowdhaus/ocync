@@ -21,14 +21,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-
 use serde::Deserialize;
 
 use super::detect::ECR_PUBLIC_HOST;
 use super::ecr::{
-    AuthorizationData, CredentialCache, EcrApi, EcrTokenResponse, remaining, validate_ecr_token,
+    AuthorizationData, CredentialCache, EcrApi, EcrToken, EcrTokenResponse, remaining,
 };
 use super::token_cache::TokenCache;
 use super::token_exchange;
@@ -98,30 +95,10 @@ impl EcrApi for AwsEcrPublicApi {
 /// password and returns `Credentials::Basic` for use in OCI Bearer
 /// token exchange, along with the token's TTL.
 fn decode_ecr_credentials(
-    encoded_token: &str,
+    encoded_token: String,
     ttl: Option<Duration>,
 ) -> Result<(Credentials, Duration), Error> {
-    validate_ecr_token(encoded_token, ECR_PUBLIC_HOST)?;
-
-    let decoded = BASE64.decode(encoded_token).map_err(|e| {
-        Error::auth_failed(
-            ECR_PUBLIC_HOST,
-            format!("invalid base64 in ECR Public token: {e}"),
-        )
-    })?;
-    let text = String::from_utf8(decoded).map_err(|e| {
-        Error::auth_failed(
-            ECR_PUBLIC_HOST,
-            format!("ECR Public token is not valid UTF-8: {e}"),
-        )
-    })?;
-
-    let password = text
-        .strip_prefix("AWS:")
-        .ok_or_else(|| {
-            Error::auth_failed(ECR_PUBLIC_HOST, "ECR Public token missing 'AWS:' prefix")
-        })?
-        .to_owned();
+    let password = EcrToken::parse(encoded_token, ECR_PUBLIC_HOST)?.into_password();
 
     Ok((
         Credentials::Basic {
@@ -220,7 +197,7 @@ impl EcrPublicAuth {
                     e
                 })?;
                 let (credentials, ttl) =
-                    decode_ecr_credentials(&response.encoded_token, response.expires_in)?;
+                    decode_ecr_credentials(response.encoded_token, response.expires_in)?;
                 tracing::debug!(
                     ttl_secs = ttl.as_secs(),
                     "ECR Public registry credentials refreshed"
@@ -379,7 +356,7 @@ mod tests {
     #[test]
     fn decode_ecr_credentials_valid() {
         let encoded = BASE64.encode("AWS:my-secret-password");
-        let (creds, _ttl) = decode_ecr_credentials(&encoded, None).unwrap();
+        let (creds, _ttl) = decode_ecr_credentials(encoded, None).unwrap();
         match creds {
             Credentials::Basic { username, password } => {
                 assert_eq!(username, "AWS");
@@ -391,7 +368,7 @@ mod tests {
     #[test]
     fn decode_ecr_credentials_invalid_prefix() {
         let encoded = BASE64.encode("NOTAWS:password");
-        assert!(decode_ecr_credentials(&encoded, None).is_err());
+        assert!(decode_ecr_credentials(encoded, None).is_err());
     }
 
     #[tokio::test]

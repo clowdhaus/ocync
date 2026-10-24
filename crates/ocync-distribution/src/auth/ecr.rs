@@ -213,27 +213,41 @@ impl<T: Clone + Send + Sync> CredentialCache<T> {
     }
 }
 
-/// Validate an ECR authorization token.
-///
-/// ECR tokens are base64-encoded strings in the format `AWS:<token>`.
-/// Validates the format and returns the original encoded string unchanged --
-/// ECR expects it sent as `Authorization: Basic <encoded>`.
-pub(super) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Error> {
-    let decoded = BASE64
-        .decode(encoded)
-        .map_err(|e| Error::auth_failed(registry, format!("invalid base64 in ECR token: {e}")))?;
+/// An ECR authorization token: base64 of `AWS:<password>`.
+pub(super) struct EcrToken {
+    /// The token as ECR sent it, which ECR takes back as
+    /// `Authorization: Basic <encoded>`.
+    encoded: String,
+    /// The password the token carries, which ECR Public's token exchange
+    /// takes.
+    password: String,
+}
 
-    let text = String::from_utf8(decoded)
-        .map_err(|e| Error::auth_failed(registry, format!("ECR token is not valid UTF-8: {e}")))?;
-
-    if !text.starts_with("AWS:") {
-        return Err(Error::auth_failed(
-            registry,
-            "ECR token does not start with 'AWS:'",
-        ));
+impl EcrToken {
+    /// Read `encoded`, naming `registry` in any error.
+    pub(super) fn parse(encoded: String, registry: &str) -> Result<Self, Error> {
+        let decoded = BASE64.decode(&encoded).map_err(|e| {
+            Error::auth_failed(registry, format!("invalid base64 in ECR token: {e}"))
+        })?;
+        let text = String::from_utf8(decoded).map_err(|e| {
+            Error::auth_failed(registry, format!("ECR token is not valid UTF-8: {e}"))
+        })?;
+        let password = text
+            .strip_prefix("AWS:")
+            .ok_or_else(|| Error::auth_failed(registry, "ECR token does not start with 'AWS:'"))?
+            .to_owned();
+        Ok(Self { encoded, password })
     }
 
-    Ok(())
+    /// The token as ECR sent it.
+    pub(super) fn into_encoded(self) -> String {
+        self.encoded
+    }
+
+    /// The password the token carries.
+    pub(super) fn into_password(self) -> String {
+        self.password
+    }
 }
 
 /// AWS ECR authentication provider.
@@ -323,13 +337,12 @@ impl EcrAuth {
                     tracing::warn!(registry = %self.hostname, error = %e, "ECR GetAuthorizationToken failed");
                     e
                 })?;
-                validate_ecr_token(&response.encoded_token, &self.hostname)?;
+                let token = EcrToken::parse(response.encoded_token, &self.hostname)?;
                 let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
                 tracing::debug!(registry = %self.hostname, ttl_secs = ttl.as_secs(), "ECR token refreshed");
                 // ECR expects `Authorization: Basic <base64(AWS:password)>`. The encoded
                 // token from GetAuthorizationToken is already in the right format.
-                let token =
-                    Token::with_ttl(response.encoded_token, ttl).with_scheme(AuthScheme::Basic);
+                let token = Token::with_ttl(token.into_encoded(), ttl).with_scheme(AuthScheme::Basic);
                 Ok((token, ttl))
             })
             .await
@@ -432,7 +445,7 @@ mod tests {
         }
     }
 
-    // --- validate_ecr_token tests ---
+    // --- EcrToken tests ---
 
     /// ECR answers with a list of authorization data. The expiry is read
     /// as epoch seconds. A negative one has passed, and one too large to
@@ -468,33 +481,35 @@ mod tests {
         assert_eq!(remaining(SystemTime::UNIX_EPOCH), Duration::ZERO);
     }
 
+    /// A token keeps its encoded form for ECR and yields its password for
+    /// ECR Public.
     #[test]
-    fn validate_valid_token() {
+    fn parses_a_token() {
         let encoded = BASE64.encode("AWS:my-secret-token");
-        validate_ecr_token(&encoded, "test-registry").unwrap();
+        let parse = || EcrToken::parse(encoded.clone(), "test-registry").unwrap();
+        assert_eq!(parse().into_encoded(), encoded);
+        assert_eq!(parse().into_password(), "my-secret-token");
     }
 
     #[test]
-    fn validate_token_invalid_prefix() {
+    fn parse_token_invalid_prefix() {
         let encoded = BASE64.encode("NOTAWS:token");
-        let result = validate_ecr_token(&encoded, "test-registry");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = EcrToken::parse(encoded, "test-registry")
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("AWS:"));
         assert!(err.contains("test-registry"));
     }
 
     #[test]
-    fn validate_token_invalid_base64() {
-        let result = validate_ecr_token("not-valid-base64!!!", "test-registry");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("test-registry"));
-    }
-
-    #[test]
-    fn validate_token_includes_registry_in_error() {
+    fn parse_token_invalid_base64() {
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let err = validate_ecr_token("!!!", host).unwrap_err().to_string();
+        let err = EcrToken::parse("not-valid-base64!!!".into(), host)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("invalid base64"));
         assert!(err.contains(host));
     }
 
