@@ -13,7 +13,7 @@ release = false
 
 [features]
 default = ["fips"]
-fips = ["aws-lc-rs/fips"]
+fips = ["aws-lc-rs/fips", "rustls/fips"]
 non-fips = ["aws-lc-rs/aws-lc-sys"]
 
 [lints]
@@ -43,6 +43,7 @@ tracing.workspace = true
 url = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true, features = ["aws_lc_rs"] }
 testcontainers = { version = "0.28", default-features = false }
 tokio = { workspace = true, features = ["sync", "time", "test-util", "macros", "rt-multi-thread"] }
 wiremock = { version = "0.6", default-features = false }

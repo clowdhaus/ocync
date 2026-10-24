@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anstyle::{Ansi256Color, Color, Style};
 use clap::builder::Styles;
 use clap::{Parser, Subcommand, ValueEnum};
-use ocync_distribution::Reference;
+use ocync_distribution::{CRYPTO_BUILD, CryptoBuild, Reference, TlsFips};
 use ocync_sync::progress::NullProgress;
 
 const PINK: Option<Color> = Some(Color::Ansi256(Ansi256Color(213)));
@@ -307,6 +307,13 @@ async fn main() -> std::process::ExitCode {
     ocync_distribution::install_crypto_provider();
 
     let cli = Cli::parse();
+    if refuses_to_start(&cli.command, ocync_distribution::tls_fips) {
+        eprintln!(
+            "error: FIPS build, but TLS is not restricted to FIPS-approved algorithms; \
+             run `ocync version` for details"
+        );
+        return cli::ExitCode::Failure.into();
+    }
     cli::setup_logging(&cli);
 
     // Install signal handlers for graceful shutdown.
@@ -357,10 +364,44 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// A FIPS build runs only when TLS is restricted to FIPS-approved
+/// algorithms. `version` always runs, so it can report a failing state.
+/// `tls` is queried only in a FIPS build, so a non-FIPS build pays nothing.
+fn refuses_to_start(command: &Commands, tls: impl FnOnce() -> TlsFips) -> bool {
+    CRYPTO_BUILD == CryptoBuild::Fips
+        && !matches!(command, Commands::Version)
+        && tls() != TlsFips::Approved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    fn command(args: &[&str]) -> Commands {
+        Cli::parse_from(args).command
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_build_refuses_to_start_without_approved_tls() {
+        let sync = command(&["ocync", "sync", "--config", "c.yaml"]);
+        assert!(refuses_to_start(&sync, || TlsFips::NotApproved));
+        assert!(!refuses_to_start(&sync, || TlsFips::Approved));
+    }
+
+    #[test]
+    fn version_runs_without_querying_tls() {
+        let version = command(&["ocync", "version"]);
+        assert!(!refuses_to_start(&version, || panic!("TLS state queried")));
+    }
+
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn non_fips_build_starts_without_querying_tls() {
+        let sync = command(&["ocync", "sync", "--config", "c.yaml"]);
+        assert!(!refuses_to_start(&sync, || panic!("TLS state queried")));
+    }
 
     #[test]
     fn verify_cli() {

@@ -34,16 +34,11 @@ The duplicated hash crate versions (`digest`, `block-buffer`, `crypto-common`, `
 
 ## TLS uses only FIPS-approved algorithms
 
-> **Status: Planned.**
+The `fips` feature enables `rustls/fips`. That feature applies to every `rustls` user in the build, so `aws_lc_rs::default_provider()` drops ChaCha20-Poly1305 and every key exchange group the module does not approve, for `reqwest`, which `google-cloud-auth` also uses, and for the TLS client the AWS SDK builds itself. TLS 1.2 also requires extended master secret.
 
-`install_crypto_provider()` installs `rustls::crypto::aws_lc_rs::default_provider()`, and the `rustls` `fips` feature is not enabled. Without that feature, `rustls` keeps ChaCha20-Poly1305 and X25519 in its default cipher suites and key exchange groups, so a FIPS build can negotiate an algorithm the module does not approve.
+At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the installed provider is FIPS-approved, including whether the module is in approved mode. Every command except `version` refuses to start if it is not, so `version` can still report the failing state. `ocync version` prints the AWS-LC-FIPS module number a certificate names (`module: AWS-LC-FIPS 4`), the AWS-LC release (`release: AWS-LC 4.2.0`) and the result (`tls: approved`), in the shape `openssl list -providers` uses. A FIPS build decides all of this from one constant, `CRYPTO_BUILD` in `ocync-distribution`, so the CLI cannot disagree with the linked module.
 
-The fix:
-
-- Enable `rustls/fips` in the `fips` feature and install `rustls::crypto::default_fips_provider()`.
-- Refuse to start a FIPS build unless the TLS configuration reports `fips() == true`.
-- `ocync version` reports the runtime FIPS state alongside the compile-time one.
-- Negative test: a handshake against a server that offers only ChaCha20-Poly1305 fails in a FIPS build.
+`tests/fips_tls.rs` in `ocync-distribution` pins the behavior: the registry client fails the handshake against servers offering only TLS 1.3 ChaCha20-Poly1305, only TLS 1.2 ChaCha20-Poly1305, or only X25519, and succeeds against one offering AES-128-GCM.
 
 ## The shipped module matches a validated certificate
 
@@ -51,7 +46,7 @@ The fix:
 
 The v0.8.2 release binary `ocync-fips-linux-amd64` embeds `AWS-LC FIPS 4.2.0`. [FIPS 140-3](/fips) cites NIST Certificate #4816, which covers an earlier AWS-LC module. Confirm which certificate covers the shipped version. If none does, pin `aws-lc-fips-sys` to a validated line. Either way, the FIPS page names the certificate that matches the shipped module, and a check in the release workflow fails when the embedded version drifts from it.
 
-The FIPS page also claims the "entire TLS chain" is FIPS-compliant. That claim is corrected together with the TLS fix above.
+Two claims on the FIPS page depend on this: that the module is FIPS 140-3 validated, and the X25519MLKEM768 key exchange group, which `rustls` treats as approved because ML-KEM in the AWS-LC FIPS module is FIPS-pending. Both are settled against the certificate that covers the shipped module.
 
 ## Releases carry a bill of materials
 
