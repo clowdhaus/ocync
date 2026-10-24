@@ -21,15 +21,18 @@ pub(crate) struct Compiled {
     pub(crate) ocync: String,
 }
 
-/// Ask cargo which crates it compiles into `ocync` for `crypto` on the
-/// host target.
+/// Ask cargo which crates it compiles into `ocync` for `crypto`, for the
+/// target the build used: `CARGO_BUILD_TARGET` when set, else the host.
 pub(crate) fn compiled(crypto: Crypto) -> Result<Compiled, String> {
-    let host = host()?;
+    let target = match std::env::var("CARGO_BUILD_TARGET") {
+        Ok(target) if !target.is_empty() => target,
+        _ => host()?,
+    };
     let output = Command::new("cargo")
         .args([
             "tree", "--locked", "-p", "ocync", "-e", "normal", "--target",
         ])
-        .arg(&host)
+        .arg(&target)
         .args(["--prefix", "none", "--format", "{p}"])
         .args(crypto.cargo_features())
         .output()
@@ -48,6 +51,12 @@ fn host() -> Result<String, String> {
         .arg("-vV")
         .output()
         .map_err(|e| format!("rustc -vV: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rustc -vV: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|line| line.strip_prefix("host: "))

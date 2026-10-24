@@ -75,24 +75,35 @@ pub(crate) fn finish(
         .map(str::to_string);
     components.push(aws_lc_component(aws_lc));
 
-    if let Some(dependencies) = doc.get_mut("dependencies").and_then(Value::as_array_mut) {
-        dependencies.retain(|d| !d["ref"].as_str().is_some_and(|r| removed.contains(r)));
-        for dependency in dependencies.iter_mut() {
-            if let Some(depends_on) = dependency
+    let dependencies = doc
+        .as_object_mut()
+        .ok_or("the document is not an object")?
+        .entry("dependencies")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or("`dependencies` is not an array")?;
+    dependencies.retain(|d| !d["ref"].as_str().is_some_and(|r| removed.contains(r)));
+    for dependency in dependencies.iter_mut() {
+        if let Some(depends_on) = dependency
+            .get_mut("dependsOn")
+            .and_then(Value::as_array_mut)
+        {
+            depends_on.retain(|r| !r.as_str().is_some_and(|r| removed.contains(r)));
+        }
+    }
+    if let Some(sys_ref) = sys_ref {
+        match dependencies
+            .iter_mut()
+            .find(|d| d["ref"].as_str() == Some(sys_ref.as_str()))
+        {
+            Some(dependency) => match dependency
                 .get_mut("dependsOn")
                 .and_then(Value::as_array_mut)
             {
-                depends_on.retain(|r| !r.as_str().is_some_and(|r| removed.contains(r)));
-            }
-            if sys_ref.is_some() && dependency["ref"].as_str() == sys_ref.as_deref() {
-                match dependency
-                    .get_mut("dependsOn")
-                    .and_then(Value::as_array_mut)
-                {
-                    Some(depends_on) => depends_on.push(json!(AWS_LC_REF)),
-                    None => dependency["dependsOn"] = json!([AWS_LC_REF]),
-                }
-            }
+                Some(depends_on) => depends_on.push(json!(AWS_LC_REF)),
+                None => dependency["dependsOn"] = json!([AWS_LC_REF]),
+            },
+            None => dependencies.push(json!({ "ref": sys_ref, "dependsOn": [AWS_LC_REF] })),
         }
     }
 
@@ -230,6 +241,19 @@ mod tests {
             .find(|d| d["ref"] == "pkg:cargo/aws-lc-fips-sys@0.14.3?id")
             .unwrap();
         assert_eq!(sys["dependsOn"], json!([AWS_LC_REF]));
+    }
+
+    #[test]
+    fn links_the_aws_lc_component_when_syft_wrote_no_edges() {
+        let raw = raw(FIPS_BUILD);
+        let start = raw.find(r#","dependencies""#).unwrap();
+        let raw = format!("{}}}", &raw[..start]);
+        let out = finish(&raw, &compiled(FIPS_BUILD), &fips(), Crypto::Fips).unwrap();
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            doc["dependencies"],
+            json!([{ "ref": "pkg:cargo/aws-lc-fips-sys@0.14.3?id", "dependsOn": [AWS_LC_REF] }])
+        );
     }
 
     #[test]

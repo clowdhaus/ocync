@@ -3,7 +3,8 @@
 //!
 //! syft reads the dependency list `cargo auditable` embeds, which comes from
 //! `cargo metadata`. That lists an optional dependency whenever a weak
-//! feature (`dep?/feature`) names it, even when nothing enables it, so it
+//! feature (`dep?/feature`) names it, even when nothing enables it, and
+//! resolves features across the whole workspace (rust-lang/cargo#7754), so it
 //! names crates `ocync` never compiles. `finish` keeps only the crates cargo's resolver
 //! compiles for `ocync`, drops `aws-lc-sys` from a FIPS build once the binary
 //! shows it carries no non-FIPS AWS-LC, names the linked AWS-LC library, and

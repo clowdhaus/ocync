@@ -48,7 +48,7 @@ At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the ins
 
 Release binaries and the image's binary are built with `cargo auditable`, which embeds the dependency list in the binary, so scanners such as grype and trivy read it from the shipped artifact.
 
-That embedded list comes from `cargo metadata`, which lists an optional dependency whenever a weak feature (`dep?/feature`, such as `quinn?/rustls-aws-lc-rs` in `reqwest`) names it, even when nothing enables it. It names 24 crates in the 0.8.2 FIPS build that no workspace member compiles, including `quinn`, `chrono` and `ring`. None of them leaves a source path in the binary, while compiled crates such as `rustls` and `tokio` do. A FIPS build also lists `aws-lc-sys`, which `rustls` resolves but the binary does not link: its only AWS-LC release string is the FIPS one.
+That embedded list comes from `cargo metadata`, which over-reports in two ways. It lists an optional dependency whenever a weak feature (`dep?/feature`, such as `quinn?/rustls-aws-lc-rs` in `reqwest`) names it, even when nothing enables it, and it resolves features across the whole workspace ([rust-lang/cargo#7754](https://github.com/rust-lang/cargo/issues/7754)), so it lists crates only other members compile. In the 0.8.2 FIPS build that adds 24 crates `ocync` does not compile: 22 that nothing in the workspace compiles, including `quinn`, `chrono` and `ring`, and 2 that `bench-proxy` and `xtask` bring in, `untrusted` 0.7 and `httpdate`. None of them leaves a source path in the binary, while compiled crates such as `rustls` and `tokio` do. A FIPS build also lists `aws-lc-sys`, which `rustls` resolves but the binary does not link: its only AWS-LC release string is the FIPS one.
 
 `tools/sbom` turns syft's CycloneDX output into the release bill of materials:
 
@@ -63,7 +63,7 @@ What ships:
 - Build provenance covers each platform image and the index, stored on GitHub and keyed by digest.
 - Nothing is pushed to the registry until every binary and image passes its check.
 
-Scanners that read the embedded list directly still see the dropped crates until cargo-auditable#210 ships, at which point the pinned cargo-auditable version is bumped. If a scanner flags a dropped crate before then, the fix is an OpenVEX file in this repository's `.vex/` directory, which trivy reads through VEX Hub.
+Scanners that read the embedded list directly still see the dropped crates until cargo-auditable#210 ships, at which point the pinned cargo-auditable version is bumped.
 
 ## Owned Google authentication
 
