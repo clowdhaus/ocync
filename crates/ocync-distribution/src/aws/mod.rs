@@ -4,10 +4,10 @@
 //! parsing are owned here. Credentials and the FIPS, dual-stack, endpoint URL
 //! and attempt settings still come from `aws-config`'s `SdkConfig`.
 
+mod calendar;
 mod endpoint;
 mod retry;
 mod sigv4;
-mod time;
 
 use std::fmt;
 use std::sync::Arc;
@@ -25,8 +25,8 @@ use http::{HeaderMap, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use self::calendar::parse_imf_fixdate;
 use self::endpoint::{DualStack, Endpoint, Fips};
-use self::time::parse_imf_fixdate;
 use crate::auth::ecr::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
 
@@ -364,7 +364,8 @@ enum Failure {
     /// No credentials could be loaded.
     #[error("failed to load AWS credentials: {0}")]
     Credentials(#[source] CredentialsError),
-    /// The request did not complete.
+    /// The request did not complete. Built only through `From`, which drops
+    /// the URL.
     #[error("request failed: {0}")]
     Transport(#[source] reqwest::Error),
     /// The service answered with an error.
@@ -382,6 +383,13 @@ enum Failure {
     /// The service's answer could not be read.
     #[error("unreadable response: {0}")]
     Decode(#[source] serde_json::Error),
+}
+
+/// The endpoint URL may carry a key, so a transport error drops it.
+impl From<reqwest::Error> for Failure {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(error.without_url())
+    }
 }
 
 impl Failure {
@@ -592,11 +600,7 @@ impl Client {
         for (name, value) in signed {
             request = request.header(name, value);
         }
-        // The endpoint URL may carry a key, so a transport error drops it.
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Failure::Transport(e.without_url()))?;
+        let response = request.send().await?;
         let measured = ClockSkew::measure(response.headers(), sent, SystemTime::now());
         if let Some(skew) = measured {
             self.skew.store(skew.0, Ordering::Relaxed);
@@ -612,10 +616,7 @@ impl Client {
             .get(X_AMZ_RETRY_AFTER)
             .and_then(|v| v.to_str().ok()?.parse().ok())
             .map(Duration::from_millis);
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Failure::Transport(e.without_url()))?;
+        let bytes = response.bytes().await?;
         if status.is_success() {
             return serde_json::from_slice(&bytes).map_err(Failure::Decode);
         }

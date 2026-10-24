@@ -214,7 +214,7 @@ impl<T: Clone + Send + Sync> CredentialCache<T> {
 }
 
 /// An ECR authorization token: base64 of `AWS:<password>`.
-pub(super) struct EcrToken {
+pub(super) struct AuthorizationToken {
     /// The token as ECR sent it, which ECR takes back as
     /// `Authorization: Basic <encoded>`.
     encoded: String,
@@ -223,7 +223,7 @@ pub(super) struct EcrToken {
     password: String,
 }
 
-impl EcrToken {
+impl AuthorizationToken {
     /// Read `encoded`, naming `registry` in any error.
     pub(super) fn parse(encoded: String, registry: &str) -> Result<Self, Error> {
         let decoded = BASE64.decode(&encoded).map_err(|e| {
@@ -337,7 +337,7 @@ impl EcrAuth {
                     tracing::warn!(registry = %self.hostname, error = %e, "ECR GetAuthorizationToken failed");
                     e
                 })?;
-                let token = EcrToken::parse(response.encoded_token, &self.hostname)?;
+                let token = AuthorizationToken::parse(response.encoded_token, &self.hostname)?;
                 let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
                 tracing::debug!(registry = %self.hostname, ttl_secs = ttl.as_secs(), "ECR token refreshed");
                 // ECR expects `Authorization: Basic <base64(AWS:password)>`. The encoded
@@ -445,7 +445,7 @@ mod tests {
         }
     }
 
-    // --- EcrToken tests ---
+    // --- AuthorizationToken tests ---
 
     /// ECR answers with a list of authorization data. The expiry is read
     /// as epoch seconds. A negative one has passed, and one too large to
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn parses_a_token() {
         let encoded = BASE64.encode("AWS:my-secret-token");
-        let parse = || EcrToken::parse(encoded.clone(), "test-registry").unwrap();
+        let parse = || AuthorizationToken::parse(encoded.clone(), "test-registry").unwrap();
         assert_eq!(parse().into_encoded(), encoded);
         assert_eq!(parse().into_password(), "my-secret-token");
     }
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn parse_token_invalid_prefix() {
         let encoded = BASE64.encode("NOTAWS:token");
-        let err = EcrToken::parse(encoded, "test-registry")
+        let err = AuthorizationToken::parse(encoded, "test-registry")
             .err()
             .unwrap()
             .to_string();
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn parse_token_invalid_base64() {
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let err = EcrToken::parse("not-valid-base64!!!".into(), host)
+        let err = AuthorizationToken::parse("not-valid-base64!!!".into(), host)
             .err()
             .unwrap()
             .to_string();

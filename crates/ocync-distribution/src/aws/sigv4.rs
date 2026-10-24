@@ -7,11 +7,11 @@
 //! call it.
 
 use std::fmt::{self, Write as _};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use aws_lc_rs::{digest, hmac};
 
-use super::time::CivilDate;
+use super::calendar::amz_date;
 
 /// The signing algorithm named in the string to sign and the header.
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -67,18 +67,7 @@ struct AmzDate(String);
 
 impl AmzDate {
     fn new(time: SystemTime) -> Self {
-        let secs = time
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
-        let (days, rem) = (secs / 86_400, secs % 86_400);
-        let CivilDate { year, month, day } = CivilDate::from_days(days);
-        Self(format!(
-            "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
-            rem / 3600,
-            rem % 3600 / 60,
-            rem % 60
-        ))
+        Self(amz_date(time))
     }
 
     /// The `YYYYMMDD` date the credential scope names.
@@ -240,7 +229,7 @@ fn encode_path(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
 

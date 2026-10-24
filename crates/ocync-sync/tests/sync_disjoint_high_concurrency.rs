@@ -343,7 +343,7 @@ impl BatchBlobChecker for EmptyExistingChecker {
         );
         Box::pin(async {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(BlobExistence::new(digests, []))
+            Ok(BlobExistence::new(digests, &HashSet::new()))
         })
     }
 }

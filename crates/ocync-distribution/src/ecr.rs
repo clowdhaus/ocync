@@ -104,14 +104,13 @@ impl BlobExistence {
     /// Each checked digest is available when found and missing otherwise. A
     /// found digest that was not checked is dropped, so a stray answer cannot
     /// skip a transfer.
-    pub fn new(checked: &[Digest], found: impl IntoIterator<Item = Digest>) -> Self {
-        let found: HashSet<Digest> = found.into_iter().collect();
+    pub fn new(checked: &[Digest], found: &HashSet<Digest>) -> Self {
         let (available, missing) = checked.iter().cloned().partition(|d| found.contains(d));
         Self { available, missing }
     }
 
     /// Whether the check found `digest` available.
-    pub fn is_available(&self, digest: &Digest) -> bool {
+    pub(crate) fn is_available(&self, digest: &Digest) -> bool {
         self.available.contains(digest)
     }
 
@@ -283,11 +282,12 @@ trait EcrBatchApi {
 struct BatchCheckResponse {
     /// Layers the repository holds.
     available: Vec<Digest>,
-    /// Layers that were not checked. They are transferred.
-    failures: Vec<LayerIssue>,
+    /// Layers with no usable answer. They are recorded missing and
+    /// transferred.
+    issues: Vec<LayerIssue>,
 }
 
-/// Why a layer in a batch answer was not checked.
+/// Why a layer in a batch answer has no usable answer.
 #[derive(Debug, PartialEq, Eq)]
 enum LayerIssue {
     /// ECR reported a failure for the digest, as it named it.
@@ -359,10 +359,10 @@ struct LayerFailure {
 }
 
 impl From<BatchCheckOutput> for BatchCheckResponse {
-    /// An available digest ocync cannot parse joins the failures, so it is
+    /// An available digest ocync cannot parse joins the issues, so it is
     /// logged and transferred.
     fn from(output: BatchCheckOutput) -> Self {
-        let mut failures: Vec<LayerIssue> = output
+        let mut issues: Vec<LayerIssue> = output
             .failures
             .into_iter()
             .filter_map(|f| f.layer_digest.map(LayerIssue::Failed))
@@ -377,13 +377,10 @@ impl From<BatchCheckOutput> for BatchCheckResponse {
             };
             match text.parse() {
                 Ok(digest) => available.push(digest),
-                Err(_) => failures.push(LayerIssue::Unparsed(text)),
+                Err(_) => issues.push(LayerIssue::Unparsed(text)),
             }
         }
-        Self {
-            available,
-            failures,
-        }
+        Self { available, issues }
     }
 }
 
@@ -464,7 +461,7 @@ impl BatchChecker {
         repo: &RepositoryName,
         digests: &[Digest],
     ) -> Result<BlobExistence, Error> {
-        let mut found = Vec::with_capacity(digests.len());
+        let mut found = HashSet::with_capacity(digests.len());
         let mut checked = 0;
 
         for chunk in digests.chunks(MAX_DIGESTS_PER_BATCH) {
@@ -494,7 +491,7 @@ impl BatchChecker {
                 }
             };
 
-            for issue in &response.failures {
+            for issue in &response.issues {
                 match issue {
                     LayerIssue::Failed(digest) => warn!(
                         repo = %repo,
@@ -515,7 +512,7 @@ impl BatchChecker {
             found.extend(response.available);
         }
 
-        Ok(BlobExistence::new(&digests[..checked], found))
+        Ok(BlobExistence::new(&digests[..checked], &found))
     }
 }
 
@@ -667,7 +664,7 @@ mod tests {
             BatchCheckResponse::from(output),
             BatchCheckResponse {
                 available: vec![a],
-                failures: vec![
+                issues: vec![
                     LayerIssue::Failed("sha256:bad".to_owned()),
                     LayerIssue::Unparsed("md5:nope".to_owned()),
                 ],
@@ -685,7 +682,7 @@ mod tests {
             BatchCheckResponse::from(output),
             BatchCheckResponse {
                 available: vec![],
-                failures: vec![],
+                issues: vec![],
             }
         );
     }
@@ -795,7 +792,7 @@ mod tests {
 
         let response = BatchCheckResponse {
             available: vec![d1.clone(), d2.clone()],
-            failures: vec![],
+            issues: vec![],
         };
 
         let log = CallLog::default();
@@ -824,7 +821,7 @@ mod tests {
             MockEcrBatchApi::new("my-repo", CallLog::default()).with_check_responses(vec![Ok(
                 BatchCheckResponse {
                     available: vec![stray.clone()],
-                    failures: vec![],
+                    issues: vec![],
                 },
             )]);
         let result = BatchChecker::with_api(mock)
@@ -842,7 +839,7 @@ mod tests {
 
         let response = BatchCheckResponse {
             available: vec![d1.clone()],
-            failures: vec![LayerIssue::Failed(d3.to_string())],
+            issues: vec![LayerIssue::Failed(d3.to_string())],
         };
 
         let log = CallLog::default();
@@ -880,7 +877,7 @@ mod tests {
             .map(|chunk| {
                 Ok(BatchCheckResponse {
                     available: chunk.to_vec(),
-                    failures: vec![],
+                    issues: vec![],
                 })
             })
             .collect();
@@ -942,7 +939,7 @@ mod tests {
         // API responds with entries but none are available.
         let response = BatchCheckResponse {
             available: vec![],
-            failures: vec![],
+            issues: vec![],
         };
 
         let log = CallLog::default();
@@ -968,7 +965,7 @@ mod tests {
         // Response only mentions d1, d2 is absent entirely.
         let response = BatchCheckResponse {
             available: vec![d1.clone()],
-            failures: vec![],
+            issues: vec![],
         };
 
         let log = CallLog::default();
@@ -1001,7 +998,7 @@ mod tests {
 
         let batch1_response = BatchCheckResponse {
             available: digests[..100].to_vec(),
-            failures: vec![],
+            issues: vec![],
         };
 
         let log = CallLog::default();
@@ -1051,7 +1048,7 @@ mod tests {
         let mock = MockEcrBatchApi::new("my-repo", CallLog::default()).with_check_responses(vec![
             Ok(BatchCheckResponse {
                 available: vec![],
-                failures: vec![],
+                issues: vec![],
             }),
             throttled(),
         ]);
@@ -1114,7 +1111,7 @@ mod tests {
         let mock = MockEcrBatchApi::new("repo", log.clone()).with_check_responses(vec![Ok(
             BatchCheckResponse {
                 available: vec![d1.clone(), d2.clone()],
-                failures: vec![],
+                issues: vec![],
             },
         )]);
         let checker = BatchChecker::with_api(mock);
@@ -1143,12 +1140,12 @@ mod tests {
             // Poll 1: only d1 is available.
             Ok(BatchCheckResponse {
                 available: vec![d1.clone()],
-                failures: vec![],
+                issues: vec![],
             }),
             // Poll 2: d2 now available.
             Ok(BatchCheckResponse {
                 available: vec![d2.clone()],
-                failures: vec![],
+                issues: vec![],
             }),
         ]);
         let checker = BatchChecker::with_api(mock);
@@ -1176,7 +1173,7 @@ mod tests {
             .map(|_| {
                 Ok(BatchCheckResponse {
                     available: vec![],
-                    failures: vec![],
+                    issues: vec![],
                 })
             })
             .collect();
@@ -1215,7 +1212,7 @@ mod tests {
             // Second poll succeeds with blob now available.
             Ok(BatchCheckResponse {
                 available: vec![d1.clone()],
-                failures: vec![],
+                issues: vec![],
             }),
         ]);
         let checker = BatchChecker::with_api(mock);

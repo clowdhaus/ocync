@@ -25,7 +25,7 @@ use serde::Deserialize;
 
 use super::detect::ECR_PUBLIC_HOST;
 use super::ecr::{
-    AuthorizationData, CredentialCache, EcrApi, EcrToken, EcrTokenResponse, remaining,
+    AuthorizationData, AuthorizationToken, CredentialCache, EcrApi, EcrTokenResponse, remaining,
 };
 use super::token_cache::TokenCache;
 use super::token_exchange;
@@ -98,7 +98,7 @@ fn decode_ecr_credentials(
     encoded_token: String,
     ttl: Option<Duration>,
 ) -> Result<(Credentials, Duration), Error> {
-    let password = EcrToken::parse(encoded_token, ECR_PUBLIC_HOST)?.into_password();
+    let password = AuthorizationToken::parse(encoded_token, ECR_PUBLIC_HOST)?.into_password();
 
     Ok((
         Credentials::Basic {

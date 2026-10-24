@@ -2,18 +2,21 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Seconds in a day: UNIX time has no leap seconds.
+const SECONDS_PER_DAY: u64 = 86_400;
+
 /// A proleptic Gregorian date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct CivilDate {
-    pub(super) year: u64,
-    pub(super) month: u64,
-    pub(super) day: u64,
+struct CivilDate {
+    year: u64,
+    month: u64,
+    day: u64,
 }
 
 impl CivilDate {
     /// The date `days` after 1970-01-01, from Howard Hinnant's
     /// `civil_from_days`.
-    pub(super) fn from_days(days: u64) -> Self {
+    fn from_days(days: u64) -> Self {
         let z = days + 719_468;
         let era = z / 146_097;
         let doe = z % 146_097;
@@ -36,6 +39,22 @@ impl CivilDate {
         let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
         (era * 146_097 + doe).checked_sub(719_468)
     }
+}
+
+/// `time` in UTC in the `YYYYMMDDTHHMMSSZ` form AWS signs.
+pub(super) fn amz_date(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs();
+    let (days, rem) = (secs / SECONDS_PER_DAY, secs % SECONDS_PER_DAY);
+    let CivilDate { year, month, day } = CivilDate::from_days(days);
+    format!(
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 /// Month names as an IMF-fixdate spells them.
@@ -81,7 +100,7 @@ pub(super) fn parse_imf_fixdate(text: &str) -> Option<SystemTime> {
         return None;
     }
     let days = CivilDate { year, month, day }.to_days()?;
-    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second;
+    let seconds = days * SECONDS_PER_DAY + hour * 3600 + minute * 60 + second;
     UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
 }
 

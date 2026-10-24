@@ -37,7 +37,7 @@ struct MockBatchChecker {
     /// Set of digests that the mock reports as existing at the target.
     existing: HashSet<Digest>,
     /// Set of digests that the mock reports a failed batch left unknown.
-    unchecked: HashSet<Digest>,
+    unknown: HashSet<Digest>,
     /// Tracks how many times `check_blob_existence` was called.
     call_count: Arc<AtomicUsize>,
 }
@@ -49,7 +49,7 @@ impl MockBatchChecker {
             Self {
                 expected_repo: expected_repo.to_owned(),
                 existing,
-                unchecked: HashSet::new(),
+                unknown: HashSet::new(),
                 call_count: Arc::clone(&count),
             },
             count,
@@ -72,10 +72,10 @@ impl BatchBlobChecker for MockBatchChecker {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let checked: Vec<Digest> = digests
                 .iter()
-                .filter(|d| !self.unchecked.contains(d))
+                .filter(|d| !self.unknown.contains(d))
                 .cloned()
                 .collect();
-            Ok(BlobExistence::new(&checked, self.existing.iter().cloned()))
+            Ok(BlobExistence::new(&checked, &self.existing))
         })
     }
 }
@@ -165,7 +165,7 @@ impl BatchBlobChecker for WaitTrackingChecker {
         assert_eq!(repo.as_str(), self.expected_repo);
         Box::pin(async move {
             self.check_count.fetch_add(1, Ordering::Relaxed);
-            Ok(BlobExistence::new(digests, self.existing.iter().cloned()))
+            Ok(BlobExistence::new(digests, &self.existing))
         })
     }
 
@@ -979,7 +979,7 @@ async fn sync_batch_checker_heads_unchecked_digests() {
     let (checker, _) =
         MockBatchChecker::new("repo", HashSet::from([parts.config_desc.digest.clone()]));
     let checker = MockBatchChecker {
-        unchecked: HashSet::from([layer2.clone()]),
+        unknown: HashSet::from([layer2.clone()]),
         ..checker
     };
 

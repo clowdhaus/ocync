@@ -85,6 +85,15 @@ enum Mode {
     Adaptive,
 }
 
+/// How an adaptive client paces its retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPacing {
+    /// Before retry behavior 2.1: the limiter's wait is the backoff.
+    Backoff,
+    /// Under 2.1: each retry takes a send token after its backoff.
+    SendToken,
+}
+
 /// The retry settings of one client.
 #[derive(Debug, Clone)]
 pub(super) struct Settings {
@@ -117,6 +126,15 @@ impl Settings {
                 RetryMode::Adaptive => Mode::Adaptive,
                 _ => Mode::Standard,
             },
+        }
+    }
+
+    /// How retries are paced, or `None` for a standard client.
+    fn retry_pacing(&self) -> Option<RetryPacing> {
+        match (self.mode, self.version) {
+            (Mode::Standard, _) => None,
+            (Mode::Adaptive, Version::V2_0) => Some(RetryPacing::Backoff),
+            (Mode::Adaptive, Version::V2_1) => Some(RetryPacing::SendToken),
         }
     }
 }
@@ -193,14 +211,17 @@ impl Partition {
     /// bucket never goes negative. Before retry behavior 2.1 a retry is paced
     /// through its backoff instead.
     pub(super) async fn send_token(&self, settings: &Settings, attempt: u32) {
-        let paced =
-            settings.mode == Mode::Adaptive && (attempt == 0 || settings.version == Version::V2_1);
+        let paced = match settings.retry_pacing() {
+            None => false,
+            Some(RetryPacing::SendToken) => true,
+            Some(RetryPacing::Backoff) => attempt == 0,
+        };
         if !paced {
             return;
         }
         loop {
             let now = now();
-            match self.with_limiter(now, |l| l.acquire(now, Paced::First)) {
+            match self.with_limiter(now, |l| l.acquire(now, Paced::Send)) {
                 Ok(()) => return,
                 Err(delay) => tokio::time::sleep(delay).await,
             }
@@ -249,7 +270,7 @@ impl<'a> CallPolicy<'a> {
     /// as the SDK computes it.
     fn backoff(&self, retry: u32, kind: Kind, retry_after: Option<Duration>) -> Duration {
         let s = self.settings;
-        if s.mode == Mode::Adaptive && s.version == Version::V2_0 {
+        if s.retry_pacing() == Some(RetryPacing::Backoff) {
             // The SDK charges a throttled retry at its timeout cost.
             let paced = match kind {
                 Kind::Throttling => Paced::ThrottledRetry,
@@ -314,15 +335,19 @@ fn exponential_backoff(jitter: f64, initial: Duration, doublings: u32, max: Dura
 /// A send the adaptive limiter paces, by what it costs.
 #[derive(Debug, Clone, Copy)]
 enum Paced {
-    First,
+    /// A send token: the first attempt, or under retry behavior 2.1 any
+    /// attempt.
+    Send,
+    /// A retry before 2.1, paced through its backoff.
     Retry,
+    /// A throttled retry before 2.1, paced through its backoff.
     ThrottledRetry,
 }
 
 impl Paced {
     fn cost(self) -> f64 {
         match self {
-            Self::First => 1.0,
+            Self::Send => 1.0,
             Self::Retry => 5.0,
             Self::ThrottledRetry => 10.0,
         }
@@ -804,11 +829,34 @@ mod tests {
         }
     }
 
+    /// Before retry behavior 2.1 an empty limiter's wait is the backoff;
+    /// under 2.1 the backoff is the computed one, and the limiter is left to
+    /// the send token.
+    #[test]
+    fn only_a_pre_2_1_backoff_waits_on_the_limiter() {
+        let adaptive = Settings::new(&RetryConfig::adaptive());
+        let adaptive_2_1 =
+            Settings::new(&RetryConfig::adaptive().with_retry_spec(RetrySpec::v2_1()));
+        for (settings, waits) in [(&adaptive, true), (&adaptive_2_1, false)] {
+            let partition = limited(0.0, 1.0);
+            let backoff = policy(settings, &partition).backoff(1, Kind::Throttling, None);
+            let expected = if waits {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(1)
+            };
+            assert!(
+                backoff.abs_diff(expected) < Duration::from_millis(50),
+                "{backoff:?}"
+            );
+        }
+    }
+
     /// A send that had to wait takes its token after the wait, rather than
     /// sending on the strength of the wait alone.
     #[tokio::test]
     async fn takes_the_token_after_waiting_for_it() {
-        let partition = limited(0.0, 100.0);
+        let partition = limited(0.0, 10.0);
         partition
             .send_token(&Settings::new(&RetryConfig::adaptive()), 0)
             .await;
@@ -887,7 +935,7 @@ mod tests {
     fn a_short_send_waits_without_going_negative() {
         let mut limiter = Limiter::idle();
         limiter.update(0.0, Answer::Throttle);
-        let wait = limiter.acquire(0.1, Paced::First).unwrap_err();
+        let wait = limiter.acquire(0.1, Paced::Send).unwrap_err();
         assert!((limiter.current_capacity - 0.05).abs() < 0.01);
         assert!((wait.as_secs_f64() - 1.9).abs() < 0.01);
     }
