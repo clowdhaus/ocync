@@ -17,7 +17,7 @@ order: 5
 - `aws-lc-rs` is the only TLS provider. `ring`, `openssl` and `native-tls` are banned in `deny.toml`.
 - Linux release binaries are built with the `fips` feature, statically linked against glibc. See [FIPS 140-3](/fips).
 - Content digests use `aws-lc-rs` (`crates/ocync-distribution/src/sha256.rs`).
-- Release binaries carry build provenance and a bill of materials attestation. Release images are signed with cosign and carry a bill of materials attestation. GitHub Actions are pinned to commit SHAs.
+- Release binaries and images carry build provenance, a bill of materials and, when a statement applies, an OpenVEX attestation. Images are also signed with cosign. GitHub Actions are pinned to commit SHAs.
 - The Docker base images (`cgr.dev/chainguard/rust:latest-dev`, `cgr.dev/chainguard/static:latest`) float by design so every build picks up Chainguard's patches. They are not pinned by digest.
 
 ## Dependency weight
@@ -44,14 +44,27 @@ At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the ins
 
 `ocync` links AWS-LC FIPS module 4, which AWS has submitted to NIST and which awaits certification. The docs name module 4 and its status, not a certificate it does not hold yet.
 
-## Releases carry a bill of materials
+## Releases carry a bill of materials, provenance and VEX
 
-Release binaries and the image's binary are built with `cargo auditable`, which embeds the dependency list in the binary, so scanners such as grype and trivy read it from the shipped artifact. `syft` turns it into CycloneDX:
+Release binaries and the image's binary are built with `cargo auditable`, which embeds the dependency list in the binary, so scanners such as grype and trivy read it from the shipped artifact.
 
-- Each binary ships with `<binary>.cdx.json`, attested on GitHub by the job that built it. The release's `sha256sums.txt` and build provenance cover the binaries and their bills of materials.
-- Each platform image carries a cosign attestation of its bill of materials, which also lists the base image's packages. The multi-arch index carries none, since one document cannot describe two platforms.
+That embedded list comes from `cargo metadata`, which resolves features across the whole workspace ([rust-lang/cargo#7754](https://github.com/rust-lang/cargo/issues/7754)). It names crates that other workspace members enable but `ocync` never compiles: 24 in the 0.8.2 FIPS build, including `quinn`, `chrono` and `ring`. None of them leaves a source path in the binary, while compiled crates such as `rustls` and `tokio` do. A FIPS build also lists `aws-lc-sys`, which `rustls` resolves but the binary does not link: its only AWS-LC release string is the FIPS one.
 
-The list comes from cargo's dependency graph, so it can name crates that are not linked: `ring`, which a weak feature in `rustls-webpki` mentions, and `aws-lc-sys`, which `rustls` resolves in a FIPS build. `cargo deny` is the ban check. `tools/sbom-check` fails CI, and fails the release before any image is pushed or release created, when a binary's or image's bill of materials lacks `ocync`, `aws-lc-rs` or the build's AWS-LC module crate, which catches a binary built without its dependency list or a FIPS binary built without the FIPS module.
+`tools/sbom` turns syft's CycloneDX output into the release bill of materials:
+
+- It keeps only the crates `cargo tree` compiles into `ocync` for that build, the same cross-check [cargo-auditable#210](https://github.com/rust-secure-code/cargo-auditable/pull/210) proposes upstream, and drops `aws-lc-sys` from a FIPS build.
+- It names the linked C library, read from the binary: `AWS-LC FIPS 4.2.0`, marked as FIPS 140-3 module 4, or `AWS-LC 5.11.0` (`pkg:github/aws/aws-lc@v5.11.0`).
+- It fails CI and the release when the binary links the wrong AWS-LC build, or when the bill of materials lacks `ocync` at the source tree's version, `aws-lc-rs` or the build's AWS-LC crate. That catches a binary built without its dependency list, a stale binary, and a FIPS binary built without the FIPS module.
+- For scanners that read the embedded list, it writes an OpenVEX document with a `not_affected` / `component_not_present` statement for every vulnerability grype matches on a dropped crate, aliases included. Each statement names the crate's versioned package URL, the form trivy and grype both honor. A release with no such match ships no VEX.
+
+What ships:
+
+- Each binary has `<binary>.cdx.json`, and `<binary>.vex.json` when a statement applies, both attested on GitHub by the job that built it. `sha256sums.txt` and the build provenance cover the binaries and these documents.
+- Each platform image carries cosign attestations of its bill of materials, which also lists the base image's packages, and of its VEX. trivy finds the VEX with `--vex oci`. The multi-arch index carries neither, since one document cannot describe two platforms.
+- Build provenance covers each platform image and the index, stored on GitHub and keyed by digest.
+- Nothing is pushed to the registry until every binary and image passes its check.
+
+The VEX covers advisories known when the release is built. A later advisory against a dropped crate needs a new release, or a scheduled rescan that re-attests the VEX.
 
 ## Owned Google authentication
 

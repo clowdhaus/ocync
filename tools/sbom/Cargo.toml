@@ -1,5 +1,5 @@
 [package]
-name = "sbom-check"
+name = "sbom"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

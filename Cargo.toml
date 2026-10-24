@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bench/proxy", "crates/*", "tools/sbom-check", "xtask"]
+members = ["bench/proxy", "crates/*", "tools/sbom", "xtask"]
 
 [workspace.package]
 version = "0.8.2"

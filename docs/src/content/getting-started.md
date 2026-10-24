@@ -19,12 +19,13 @@ Download from [GitHub Releases](https://github.com/clowdhaus/ocync/releases):
 
 Linux binaries statically link the AWS-LC FIPS module (see [FIPS 140-3](/fips)). macOS and Windows use aws-lc-rs without FIPS mode.
 
-Each binary ships with a CycloneDX bill of materials (`<binary>.cdx.json`), and GitHub holds a build provenance and a bill of materials attestation for it:
+Each binary ships with a CycloneDX bill of materials (`<binary>.cdx.json`) and, when a statement applies, an OpenVEX document (`<binary>.vex.json`) for crates the embedded dependency list names but the binary does not contain. GitHub holds build provenance and bill of materials attestations for each binary:
 
 ```bash
 gh attestation verify ocync-fips-linux-amd64 --repo clowdhaus/ocync
 gh attestation verify ocync-fips-linux-amd64 --repo clowdhaus/ocync \
     --predicate-type https://cyclonedx.org/bom
+grype ocync-fips-linux-amd64 --vex ocync-fips-linux-amd64.vex.json
 ```
 
 ### Homebrew
@@ -43,13 +44,15 @@ docker pull public.ecr.aws/clowdhaus/ocync:latest-fips
 
 Multi-arch image (`linux/amd64`, `linux/arm64`) based on `chainguard/static` with zero CVEs, no shell, and no package manager.
 
-The image is signed with cosign. Each platform image carries its own CycloneDX bill of materials attestation, so verify the platform tag rather than the multi-arch one:
+The image is signed with cosign and carries build provenance. Each platform image also carries its own CycloneDX bill of materials and, when a statement applies, OpenVEX attestations, so verify those against a platform tag such as `<version>-fips-amd64`:
 
 ```bash
+gh attestation verify oci://public.ecr.aws/clowdhaus/ocync:latest-fips --repo clowdhaus/ocync
 cosign verify-attestation --type cyclonedx \
     --certificate-identity-regexp '^https://github.com/clowdhaus/ocync/' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    public.ecr.aws/clowdhaus/ocync:0.8.2-fips-amd64
+    public.ecr.aws/clowdhaus/ocync:<version>-fips-amd64
+trivy image --vex oci public.ecr.aws/clowdhaus/ocync:<version>-fips-amd64
 ```
 
 ### Helm

@@ -2981,7 +2981,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sbom-check"
+name = "sbom"
 version = "0.8.2"
 dependencies = [
  "clap",

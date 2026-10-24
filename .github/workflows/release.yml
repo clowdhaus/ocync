@@ -82,12 +82,14 @@ jobs:
           kind: binary
           crypto: fips
           attest: attest
+          vex: write
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: |
             ${{ matrix.artifact }}
             ${{ matrix.artifact }}.cdx.json
+            ${{ matrix.artifact }}.vex.json
 
   build-macos:
     name: Build macOS (arm64)
@@ -108,12 +110,14 @@ jobs:
           kind: binary
           crypto: non-fips
           attest: attest
+          vex: write
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ocync-macos-arm64
           path: |
             ocync-macos-arm64
             ocync-macos-arm64.cdx.json
+            ocync-macos-arm64.vex.json
 
   build-windows:
     name: Build Windows (amd64)
@@ -135,12 +139,14 @@ jobs:
           kind: binary
           crypto: non-fips
           attest: attest
+          vex: write
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ocync-windows-amd64
           path: |
             ocync-windows-amd64.exe
             ocync-windows-amd64.exe.cdx.json
+            ocync-windows-amd64.exe.vex.json
 
   docker:
     name: Docker (${{ matrix.suffix }})
@@ -161,19 +167,26 @@ jobs:
         env:
           SUFFIX: ${{ matrix.suffix }}
         run: echo "TAG=$ECR_REGISTRY/$IMAGE_NAME:${GITHUB_REF_NAME#v}-fips-$SUFFIX" >> "$GITHUB_ENV"
+      # Single-platform manifests, which `docker manifest create` needs.
       - name: Build
-        run: docker build --tag "$TAG" .
-      - uses: ./.github/actions/sbom
+        run: docker build --provenance=false --sbom=false --tag "$TAG" .
+      - id: sbom
+        uses: ./.github/actions/sbom
         with:
           subject: ${{ env.TAG }}
           kind: image
           crypto: fips
+          vex: write
       - name: Save image
+        env:
+          SBOM: ${{ steps.sbom.outputs.path }}
+          VEX: ${{ steps.sbom.outputs.vex }}
+          SUFFIX: ${{ matrix.suffix }}
         run: |
           mkdir image
-          docker save --output "image/ocync-${{ matrix.suffix }}.tar" "$TAG"
-          mv image.cdx.json "image/ocync-${{ matrix.suffix }}.cdx.json"
-          echo "$TAG" > "image/ocync-${{ matrix.suffix }}.tag"
+          docker save --output "image/$SUFFIX.tar" "$TAG"
+          mv "$SBOM" "image/$SUFFIX.cdx.json"
+          if [ -n "$VEX" ]; then mv "$VEX" "image/$SUFFIX.vex.json"; fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.suffix }}
@@ -206,12 +219,18 @@ jobs:
       - name: Push and attest bills of materials
         run: |
           set -euo pipefail
-          for arch in amd64 arm64; do
-            docker load --input "image/ocync-$arch.tar"
-            tag="$(cat "image/ocync-$arch.tag")"
+          for tar in image/*.tar; do
+            suffix="$(basename "$tar" .tar)"
+            tag="$ECR_REGISTRY/$IMAGE_NAME:${GITHUB_REF_NAME#v}-fips-$suffix"
+            docker load --input "$tar"
             docker push "$tag"
-            cosign attest --yes --type cyclonedx --predicate "image/ocync-$arch.cdx.json" \
-              "$(docker inspect --format '{{index .RepoDigests 0}}' "$tag")"
+            digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$tag")"
+            cosign attest --yes --type cyclonedx --predicate "image/$suffix.cdx.json" \
+              "$ECR_REGISTRY/$IMAGE_NAME@$digest"
+            if [ -f "image/$suffix.vex.json" ]; then
+              cosign attest --yes --type openvex --predicate "image/$suffix.vex.json" \
+                "$ECR_REGISTRY/$IMAGE_NAME@$digest"
+            fi
           done
 
   docker-manifest:
@@ -257,6 +276,23 @@ jobs:
         run: |
           cosign sign --yes "$REGISTRY:$VERSION-fips"
           cosign sign --yes "$REGISTRY:latest-fips"
+      # Provenance for each platform image and the index, stored on GitHub
+      # and keyed by digest, so `gh attestation verify oci://...` finds it
+      # for any of the tags.
+      - name: List image digests
+        env:
+          REGISTRY: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          for tag in "$VERSION-fips" "$VERSION-fips-amd64" "$VERSION-fips-arm64"; do
+            digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$REGISTRY:$tag")"
+            echo "${digest#sha256:}  $REGISTRY" >> image-digests.txt
+          done
+      - name: Attest image build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: image-digests.txt
 
   helm:
     name: Helm
@@ -294,6 +330,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
+          pattern: ocync-*
           merge-multiple: true
       - name: Generate checksums
         run: |
