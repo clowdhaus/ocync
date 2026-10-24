@@ -1,6 +1,6 @@
 //! Tag listing with pagination for OCI repositories.
 
-use std::sync::atomic::AtomicU32;
+use std::cell::Cell;
 
 use serde::Deserialize;
 
@@ -99,7 +99,7 @@ impl RegistryClient {
         // worst case only nominally: a listing may run to MAX_TAG_PAGES, and
         // four retries on each of those is hours of backing off at a registry
         // that has stopped serving the listing.
-        let retry_budget = AtomicU32::new(MAX_LISTING_RETRIES);
+        let retry_budget = Cell::new(MAX_LISTING_RETRIES);
 
         loop {
             page_count += 1;
@@ -115,10 +115,8 @@ impl RegistryClient {
             // phase would re-send it: the mapping would just fail. Reading
             // the body inside the retry matters because a connection reset
             // part way through a page is exactly the failure a re-send fixes.
-            let (next_url, tag_list) = retrying::<_, Error, _, _, _>(
-                "tag listing",
-                &mut Budgeted(&retry_budget),
-                || async {
+            let (next_url, tag_list) =
+                retrying("tag listing", &mut Budgeted(&retry_budget), || async {
                     let resp = self
                         .get(repository, &path, None, RegistryAction::TagList)
                         .await?;
@@ -132,9 +130,8 @@ impl RegistryClient {
 
                     let tag_list: TagListResponse = resp.json().await?;
                     Ok((next_url, tag_list))
-                },
-            )
-            .await?;
+                })
+                .await?;
             all_tags.extend(tag_list.tags);
 
             match next_url {

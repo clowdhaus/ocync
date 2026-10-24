@@ -40,6 +40,24 @@ pub(super) enum Kind {
     Server,
 }
 
+/// What an answer tells the adaptive limiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// A throttle: the rate drops.
+    Throttle,
+    /// A success or any other failure: the rate grows back.
+    Other,
+}
+
+impl Answer {
+    fn of(kind: Option<Kind>) -> Self {
+        match kind {
+            Some(Kind::Throttling) => Self::Throttle,
+            Some(Kind::Transient | Kind::Server) | None => Self::Other,
+        }
+    }
+}
+
 /// The SDK's retry behavior version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Version {
@@ -123,7 +141,10 @@ impl Default for Partition {
 /// Partitions by service and region.
 type Partitions = HashMap<(Service, String), Arc<Partition>>;
 
-/// Every partition in the process.
+/// Every partition in the process. Synchronized, not `Rc<RefCell<_>>`,
+/// because the AWS client is a `Send + Sync` leaf like `RegistryClient`:
+/// the ECR auth provider holding it must be. No lock is held across an
+/// `.await`.
 static PARTITIONS: LazyLock<Mutex<Partitions>> = LazyLock::new(Mutex::default);
 
 /// The partition of `service` in `region`, shared by every client for it.
@@ -175,10 +196,10 @@ impl Partition {
     }
 
     /// Record an attempt's outcome with an adaptive client's limiter.
-    fn observe(&self, settings: &Settings, throttled: bool) {
+    fn observe(&self, settings: &Settings, answer: Answer) {
         if settings.mode == Mode::Adaptive {
             let now = now();
-            self.with_limiter(now, |l| l.update(now, throttled));
+            self.with_limiter(now, |l| l.update(now, answer));
         }
     }
 }
@@ -245,8 +266,7 @@ impl<'a> CallPolicy<'a> {
 impl Policy<Failure> for CallPolicy<'_> {
     fn retry(&mut self, attempt: u32, error: &Failure) -> Option<Duration> {
         let kind = error.retry_kind();
-        self.partition
-            .observe(self.settings, kind == Some(Kind::Throttling));
+        self.partition.observe(self.settings, Answer::of(kind));
         let kind = kind?;
         let attempts = attempt + 1;
         if attempts >= self.settings.max_attempts {
@@ -262,8 +282,8 @@ impl Policy<Failure> for CallPolicy<'_> {
         Some(backoff)
     }
 
-    fn succeeded(&mut self, _attempt: u32) {
-        self.partition.observe(self.settings, false);
+    fn succeeded(&mut self) {
+        self.partition.observe(self.settings, Answer::Other);
         self.partition
             .refund(self.held.take().unwrap_or(FIRST_TRY_REWARD));
     }
@@ -372,10 +392,10 @@ impl Limiter {
         }
     }
 
-    /// Adjust the fill rate after an answer, `throttled` or not.
-    fn update(&mut self, now: f64, throttled: bool) {
+    /// Adjust the fill rate after an answer.
+    fn update(&mut self, now: f64, answer: Answer) {
         self.measure_tx_rate(now);
-        let rate = if throttled {
+        let rate = if answer == Answer::Throttle {
             let rate_to_use = if self.enabled {
                 self.measured_tx_rate.min(self.fill_rate)
             } else {
@@ -553,7 +573,7 @@ mod tests {
                 (failure(Kind::Transient, secs(1)), secs(1), 80),
             ],
         );
-        call.succeeded(2);
+        call.succeeded();
         assert_eq!(left(&partition), 90);
     }
 
@@ -572,7 +592,7 @@ mod tests {
             ],
         );
         for _ in 0..21 {
-            policy(&settings, &partition).succeeded(0);
+            policy(&settings, &partition).succeeded();
         }
         assert_eq!(left(&partition), 20);
     }
@@ -592,7 +612,7 @@ mod tests {
                 (failure(Kind::Server, None), millis(100), 472),
             ],
         );
-        call.succeeded(2);
+        call.succeeded();
         assert_eq!(left(&partition), 486);
 
         let partition = Partition::default();
@@ -631,7 +651,7 @@ mod tests {
             &partition,
             &[(failure(Kind::Throttling, None), secs(1), 495)],
         );
-        call.succeeded(1);
+        call.succeeded();
         assert_eq!(left(&partition), 500);
 
         let partition = Partition::with_capacity(20);
@@ -732,7 +752,7 @@ mod tests {
         let partition = Partition::default();
         let adaptive = Settings::new(&RetryConfig::adaptive());
         assert_eq!(partition.first_send_delay(&adaptive), None);
-        partition.observe(&adaptive, true);
+        partition.observe(&adaptive, Answer::Throttle);
         partition.with_limiter(now(), |l| l.current_capacity = 0.0);
         assert!(partition.first_send_delay(&adaptive).is_some());
         assert_eq!(
@@ -763,28 +783,29 @@ mod tests {
     /// and the fill rate over sends every 200 ms with two throttles.
     #[test]
     fn follows_the_sdk_send_rate_vectors() {
+        use Answer::{Other as O, Throttle as T};
         let mut limiter = Limiter::idle();
         let vectors = [
-            (false, 0.2, 0.0, 0.5),
-            (false, 0.4, 0.0, 0.5),
-            (false, 0.6, 4.800000000000001, 0.5),
-            (false, 0.8, 4.800000000000001, 0.5),
-            (false, 1.0, 4.16, 0.5),
-            (false, 1.2, 4.16, 0.6912),
-            (false, 1.4, 4.16, 1.0975999999999997),
-            (false, 1.6, 5.632000000000001, 1.6384000000000005),
-            (false, 1.8, 5.632000000000001, 2.3328),
-            (true, 2.0, 4.3264, 3.0284799999999996),
-            (false, 2.2, 4.3264, 3.48663917347026),
-            (false, 2.4, 4.3264, 3.821874416040255),
-            (false, 2.6, 5.66528, 4.053385727709987),
-            (false, 2.8, 5.66528, 4.200373108479454),
-            (false, 3.0, 4.333056, 4.282036558348658),
-            (true, 3.2, 4.333056, 2.99742559084406),
-            (false, 3.4, 4.333056, 3.4522263943863463),
+            (O, 0.2, 0.0, 0.5),
+            (O, 0.4, 0.0, 0.5),
+            (O, 0.6, 4.800000000000001, 0.5),
+            (O, 0.8, 4.800000000000001, 0.5),
+            (O, 1.0, 4.16, 0.5),
+            (O, 1.2, 4.16, 0.6912),
+            (O, 1.4, 4.16, 1.0975999999999997),
+            (O, 1.6, 5.632000000000001, 1.6384000000000005),
+            (O, 1.8, 5.632000000000001, 2.3328),
+            (T, 2.0, 4.3264, 3.0284799999999996),
+            (O, 2.2, 4.3264, 3.48663917347026),
+            (O, 2.4, 4.3264, 3.821874416040255),
+            (O, 2.6, 5.66528, 4.053385727709987),
+            (O, 2.8, 5.66528, 4.200373108479454),
+            (O, 3.0, 4.333056, 4.282036558348658),
+            (T, 3.2, 4.333056, 2.99742559084406),
+            (O, 3.4, 4.333056, 3.4522263943863463),
         ];
-        for (throttled, now, tx_rate, fill_rate) in vectors {
-            limiter.update(now, throttled);
+        for (answer, now, tx_rate, fill_rate) in vectors {
+            limiter.update(now, answer);
             assert_close(limiter.measured_tx_rate, tx_rate);
             assert_close(limiter.fill_rate, fill_rate);
         }
@@ -799,7 +820,7 @@ mod tests {
             last_max_rate: 10.0,
             ..Limiter::idle()
         };
-        limiter.update(100.0, false);
+        limiter.update(100.0, Answer::Other);
         assert_close(limiter.measured_tx_rate, 0.208);
         assert_close(limiter.fill_rate, MIN_FILL_RATE);
         assert_close(limiter.max_capacity, MIN_CAPACITY);
@@ -810,7 +831,7 @@ mod tests {
     #[test]
     fn a_short_send_waits_without_going_negative() {
         let mut limiter = Limiter::idle();
-        limiter.update(0.0, true);
+        limiter.update(0.0, Answer::Throttle);
         let wait = limiter.acquire(0.1, Paced::First).unwrap_err();
         assert!((limiter.current_capacity - 0.05).abs() < 0.01);
         assert!((wait.as_secs_f64() - 1.9).abs() < 0.01);

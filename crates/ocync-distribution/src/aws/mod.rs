@@ -486,7 +486,7 @@ impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("service", &self.service)
-            .field("endpoint", &self.endpoint.url().as_str())
+            .field("endpoint", &self.endpoint)
             .finish_non_exhaustive()
     }
 }
@@ -596,7 +596,7 @@ impl Client {
         let headers = [("content-type", AWS_JSON_1_1), (X_AMZ_TARGET, target)];
         let signed_headers = [headers[0], headers[1], ("host", self.endpoint.host())];
         let sent = SystemTime::now();
-        let skew = ClockSkew(self.skew.load(Ordering::Relaxed));
+        let applied = ClockSkew(self.skew.load(Ordering::Relaxed));
         let signed = sigv4::sign(
             &sigv4::Request {
                 method: &http::Method::POST,
@@ -613,7 +613,7 @@ impl Client {
                 region: &self.region,
                 service: self.service.signing_name(),
             },
-            skew.apply(sent),
+            applied.apply(sent),
         );
         let mut request = self.http.post(self.endpoint.url().clone()).body(body);
         for (name, value) in headers {
@@ -650,8 +650,14 @@ impl Client {
             .code
             .as_ref()
             .is_some_and(|c| c.kind == CodeKind::ClockSkew);
+        // The SDK compares the whole skew. Once a signature is already on
+        // AWS's clock, a rejection is real (a denied role or a bad key), so
+        // only the skew this signature left uncorrected counts.
         Err(match measured {
-            Some(skew) if signature_rejected && skew.magnitude() > SKEW_THRESHOLD => {
+            Some(skew)
+                if signature_rejected
+                    && ClockSkew(skew.0 - applied.0).magnitude() > SKEW_THRESHOLD =>
+            {
                 Failure::ClockSkewed { error, skew }
             }
             _ => Failure::Service(error),
@@ -971,7 +977,8 @@ mod tests {
     /// the skew from the answer's `Date` and signs the retry on AWS's clock;
     /// without that, every call fails until the clock is fixed. A skew under
     /// the threshold, or a `Date` from a cache, is a real signature error
-    /// and is not re-sent.
+    /// and is not re-sent, nor is a rejection of a signature already made on
+    /// AWS's clock.
     #[tokio::test]
     async fn signs_on_the_aws_clock_after_a_skewed_signature() {
         let rejected = |ahead: Duration, cached: bool| {
@@ -985,6 +992,16 @@ mod tests {
                 response
             }
         };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(rejected(Duration::from_secs(600), false))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let corrected = client(&server, DEFAULT_MAX_ATTEMPTS);
+        corrected.skew.store(600_000, Ordering::Relaxed);
+        corrected.call(&Probe {}).await.unwrap_err();
+
         for (ahead, cached, sent) in [
             (Duration::from_secs(600), false, 2),
             (Duration::from_secs(120), false, 1),

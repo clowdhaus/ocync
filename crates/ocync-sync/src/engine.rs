@@ -2280,11 +2280,11 @@ async fn transfer_image_blobs(
             .check_blob_existence(ctx.target_repo, &all_digests)
             .await
         {
-            Ok(existing) => {
-                let existing_count = existing.len();
+            Ok(existence) => {
+                let existing_count = existence.available.len();
                 {
                     let mut c = ctx.cache.borrow_mut();
-                    for digest in &existing {
+                    for digest in &existence.available {
                         c.set_blob_verified(
                             ctx.target_name,
                             digest.clone(),
@@ -2292,14 +2292,19 @@ async fn transfer_image_blobs(
                         );
                     }
                 }
-                // Record all checked digests so the per-blob loop can skip
-                // HEAD for absent blobs too (batch already confirmed absent).
-                let checked: HashSet<Digest> = all_digests.into_iter().collect();
+                // Record the checked digests so the per-blob loop skips HEAD
+                // for absent blobs too. A digest a failed batch left
+                // unchecked still gets its HEAD.
+                let checked: HashSet<Digest> = all_digests
+                    .into_iter()
+                    .filter(|d| !existence.unchecked.contains(d))
+                    .collect();
                 debug!(
                     target_name = %ctx.target_name,
                     repo = %ctx.target_repo,
                     total = checked.len(),
                     existing = existing_count,
+                    unchecked = existence.unchecked.len(),
                     "batch check pre-populated cache"
                 );
                 checked

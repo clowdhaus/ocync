@@ -98,11 +98,18 @@ fn partition(region: &str) -> &'static Partition {
 }
 
 /// An HTTP or HTTPS endpoint, with the `host` header a signature names.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct Endpoint {
     url: Url,
     /// The host, and the port when it is not the scheme's default.
     host: String,
+}
+
+/// Only the host: a configured endpoint's path may carry a key.
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Endpoint").field(&self.host).finish()
+    }
 }
 
 impl Endpoint {
@@ -593,6 +600,8 @@ mod tests {
         let endpoint = Endpoint::parse("http://user:secret@127.0.0.1:8080/base?x=1").unwrap();
         assert_eq!(endpoint.host(), "127.0.0.1:8080");
         assert_eq!(endpoint.url().as_str(), "http://127.0.0.1:8080/base/");
+        let keyed = Endpoint::parse("https://gw.example/secret-key/ecr").unwrap();
+        assert_eq!(format!("{keyed:?}"), r#"Endpoint("gw.example")"#);
         assert_eq!(
             Endpoint::parse("https://example.com:443").unwrap().host(),
             "example.com"

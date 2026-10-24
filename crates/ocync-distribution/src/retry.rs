@@ -8,8 +8,8 @@
 //! cannot drift apart. The AWS API calls run the same loop under the AWS
 //! SDK's retry policy instead (see `crate::aws`).
 
+use std::cell::Cell;
 use std::future::Future;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::error::Error;
@@ -44,7 +44,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// as `Kind::Request`. `is_body()` and `is_decode()` cover the response-body
 /// and decoder phases, which are not classified as `Kind::Request`. A status
 /// error means the registry answered, so whether to re-send it is the status
-/// arm of the [`Transient`] impl for [`Error`] rather than this.
+/// arm of [`is_transient`] rather than this.
 ///
 /// This is the single definition of the transient-transport surface for the
 /// workspace. `ocync_sync::retry::should_retry_transport` delegates here
@@ -53,23 +53,15 @@ pub fn is_transient_transport(error: &reqwest::Error) -> bool {
     error.is_request() || error.is_body() || error.is_decode()
 }
 
-/// A failure that says whether the request behind it is worth re-sending.
-pub(crate) trait Transient {
-    /// Whether re-sending the request could succeed.
-    fn is_transient(&self) -> bool;
-}
-
-/// A throttle, or a transport failure.
+/// Whether an error is worth re-sending: a throttle, or a transport failure.
 ///
 /// A 429 is backpressure rather than a refusal. AIMD has already halved the
 /// window by the time one surfaces, so the retry is paced by the throttle it
 /// caused.
-impl Transient for Error {
-    fn is_transient(&self) -> bool {
-        match self {
-            Self::Http(e) => is_transient_transport(e),
-            other => other.status_code() == Some(http::StatusCode::TOO_MANY_REQUESTS),
-        }
+pub(crate) fn is_transient(error: &Error) -> bool {
+    match error {
+        Error::Http(e) => is_transient_transport(e),
+        other => other.status_code() == Some(http::StatusCode::TOO_MANY_REQUESTS),
     }
 }
 
@@ -93,11 +85,11 @@ pub(crate) trait Policy<E> {
     /// (0-indexed), or `None` to surface `error`.
     fn retry(&mut self, attempt: u32, error: &E) -> Option<Duration>;
 
-    /// The call succeeded on attempt `attempt` (0-indexed).
-    fn succeeded(&mut self, _attempt: u32) {}
+    /// The call succeeded.
+    fn succeeded(&mut self) {}
 }
 
-/// The crate's policy: a [`Transient`] failure is sent again on the jittered
+/// The crate's policy: an [`is_transient`] failure is sent again on the jittered
 /// schedule, at most [`MAX_TRANSIENT_RETRIES`] times per call, and each retry
 /// is drawn from the budget.
 ///
@@ -106,17 +98,15 @@ pub(crate) trait Policy<E> {
 /// pages, and four retries on each of them is a bound only on paper: it
 /// permits hours of backing off against a registry that is plainly refusing to
 /// serve the listing.
-pub(crate) struct Budgeted<'a>(pub(crate) &'a AtomicU32);
+pub(crate) struct Budgeted<'a>(pub(crate) &'a Cell<u32>);
 
-impl<E: Transient> Policy<E> for Budgeted<'_> {
-    fn retry(&mut self, attempt: u32, error: &E) -> Option<Duration> {
-        (error.is_transient()
-            && attempt < MAX_TRANSIENT_RETRIES
-            && self
-                .0
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
-                .is_ok())
-        .then(|| backoff(attempt))
+impl Policy<Error> for Budgeted<'_> {
+    fn retry(&mut self, attempt: u32, error: &Error) -> Option<Duration> {
+        if !is_transient(error) || attempt >= MAX_TRANSIENT_RETRIES || self.0.get() == 0 {
+            return None;
+        }
+        self.0.set(self.0.get() - 1);
+        Some(backoff(attempt))
     }
 }
 
@@ -135,7 +125,7 @@ where
     loop {
         match op().await {
             Ok(value) => {
-                policy.succeeded(attempt);
+                policy.succeeded();
                 return Ok(value);
             }
             Err(e) => {
@@ -259,7 +249,7 @@ mod tests {
             "a refused connection must be retryable: {err:?}"
         );
         assert!(
-            Error::Http(err).is_transient(),
+            is_transient(&Error::Http(err)),
             "and must stay retryable once wrapped"
         );
     }
@@ -293,7 +283,7 @@ mod tests {
             status: http::StatusCode::TOO_MANY_REQUESTS,
             message: "Rate exceeded".into(),
         };
-        assert!(throttled.is_transient());
+        assert!(is_transient(&throttled));
 
         for status in [
             http::StatusCode::NOT_FOUND,
@@ -304,16 +294,16 @@ mod tests {
                 status,
                 message: "no".into(),
             };
-            assert!(!err.is_transient(), "{status} must not be re-sent");
+            assert!(!is_transient(&err), "{status} must not be re-sent");
         }
     }
 
     #[tokio::test]
     async fn retrying_gives_up_and_surfaces_the_last_error() {
         let calls = Cell::new(0u32);
-        let err = retrying::<(), Error, _, _, _>(
+        let result: Result<(), Error> = retrying(
             "always throttled",
-            &mut Budgeted(&AtomicU32::new(MAX_TRANSIENT_RETRIES)),
+            &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
             || {
                 calls.set(calls.get() + 1);
                 async {
@@ -324,8 +314,8 @@ mod tests {
                 }
             },
         )
-        .await
-        .expect_err("a permanently throttled op must surface");
+        .await;
+        let err = result.expect_err("a permanently throttled op must surface");
         assert_eq!(
             calls.get(),
             MAX_TRANSIENT_RETRIES + 1,
@@ -337,9 +327,9 @@ mod tests {
     #[tokio::test]
     async fn retrying_does_not_re_run_a_permanent_failure() {
         let calls = Cell::new(0u32);
-        let _ = retrying::<(), Error, _, _, _>(
+        let _: Result<(), Error> = retrying(
             "not found",
-            &mut Budgeted(&AtomicU32::new(MAX_TRANSIENT_RETRIES)),
+            &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
             || {
                 calls.set(calls.get() + 1);
                 async {
