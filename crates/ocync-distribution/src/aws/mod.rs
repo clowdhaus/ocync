@@ -12,14 +12,15 @@ use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use aws_config::SdkConfig;
+use aws_config::retry::RetryMode;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_types::service_config::ServiceConfigKey;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use self::endpoint::{DualStack, Endpoint, Fips};
 use crate::auth::ecr::{CredentialCache, remaining};
@@ -159,6 +160,17 @@ pub(crate) trait Operation: Serialize {
     type Output: DeserializeOwned;
 }
 
+/// Read a JSON `null` as the type's default, as the SDK reads a field that
+/// is null or absent. Use with `#[serde(default)]` so an absent field reads
+/// the same.
+pub(crate) fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(<Option<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Why a [`Client`] could not be built from the AWS configuration.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConfigError {
@@ -174,19 +186,14 @@ pub(crate) enum ConfigError {
     /// An endpoint URL is configured together with dual-stack endpoints.
     #[error("Invalid Configuration: Dualstack and custom endpoint are not supported")]
     DualStackWithEndpointUrl,
-    /// The endpoint is not a URL.
-    #[error("invalid AWS endpoint '{url}': {source}")]
-    InvalidEndpoint {
-        /// The text that failed to parse.
-        url: String,
-        /// Why it is not a URL.
-        source: url::ParseError,
-    },
+    /// The endpoint is not a URL. The text is left out: it may carry a key.
+    #[error("invalid AWS endpoint URL: {0}")]
+    InvalidEndpoint(#[source] url::ParseError),
     /// The endpoint is a URL with no host to send to, such as `unix:`.
-    #[error("AWS endpoint '{url}' is not an http or https URL")]
+    #[error("AWS endpoint URL scheme '{scheme}' is not http or https")]
     EndpointNotHttp {
-        /// The configured text.
-        url: String,
+        /// The configured scheme.
+        scheme: String,
     },
     /// The HTTP client could not be built.
     #[error("failed to build the AWS HTTP client: {0}")]
@@ -497,11 +504,20 @@ impl Client {
         if max_attempts > MAX_TRANSIENT_RETRIES + 1 {
             WARNED.call_once(|| {
                 tracing::warn!(
-                %service,
-                configured = max_attempts,
-                used = MAX_TRANSIENT_RETRIES + 1,
+                    %service,
+                    configured = max_attempts,
+                    used = MAX_TRANSIENT_RETRIES + 1,
                     "AWS max attempts is above what ocync makes; using the lower count"
                 );
+            });
+        }
+        static WARNED_MODE: std::sync::Once = std::sync::Once::new();
+        if config
+            .retry_config()
+            .is_some_and(|r| r.mode() == RetryMode::Adaptive)
+        {
+            WARNED_MODE.call_once(|| {
+                tracing::warn!("AWS adaptive retry mode is not supported; using standard retries");
             });
         }
         Self::with_endpoint(
@@ -572,7 +588,6 @@ impl Client {
             &sigv4::Request {
                 method: &http::Method::POST,
                 path: self.endpoint.url().path(),
-                query: self.endpoint.url().query(),
                 headers: &signed_headers,
                 body: &body,
             },

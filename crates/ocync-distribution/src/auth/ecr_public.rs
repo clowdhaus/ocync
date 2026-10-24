@@ -71,19 +71,15 @@ impl EcrApi for AwsEcrPublicApi {
                 .await
                 .map_err(|e| Error::auth_failed(REGISTRY, e))?;
 
-            let auth_data = output.authorization_data.ok_or_else(|| Error::AuthFailed {
-                registry: REGISTRY.to_owned(),
-                reason: "ECR Public returned no authorization data".into(),
+            let auth_data = output.authorization_data.ok_or_else(|| {
+                Error::auth_failed(REGISTRY, "ECR Public returned no authorization data")
             })?;
 
-            let encoded_token = auth_data
-                .authorization_token
-                .ok_or_else(|| Error::AuthFailed {
-                    registry: REGISTRY.to_owned(),
-                    reason: "ECR Public authorization data missing token".into(),
-                })?;
+            let encoded_token = auth_data.authorization_token.ok_or_else(|| {
+                Error::auth_failed(REGISTRY, "ECR Public authorization data missing token")
+            })?;
 
-            let expires_in = auth_data.expires_at.map(|e| remaining(e.0));
+            let expires_in = auth_data.expires_at.map(remaining);
 
             Ok(EcrTokenResponse {
                 encoded_token,
@@ -104,23 +100,19 @@ fn decode_ecr_credentials(
 ) -> Result<(Credentials, Duration), Error> {
     validate_ecr_token(encoded_token, REGISTRY)?;
 
-    let decoded = BASE64
-        .decode(encoded_token)
-        .map_err(|e| Error::AuthFailed {
-            registry: REGISTRY.to_owned(),
-            reason: format!("invalid base64 in ECR Public token: {e}"),
-        })?;
-    let text = String::from_utf8(decoded).map_err(|e| Error::AuthFailed {
-        registry: REGISTRY.to_owned(),
-        reason: format!("ECR Public token is not valid UTF-8: {e}"),
+    let decoded = BASE64.decode(encoded_token).map_err(|e| {
+        Error::auth_failed(REGISTRY, format!("invalid base64 in ECR Public token: {e}"))
+    })?;
+    let text = String::from_utf8(decoded).map_err(|e| {
+        Error::auth_failed(
+            REGISTRY,
+            format!("ECR Public token is not valid UTF-8: {e}"),
+        )
     })?;
 
     let password = text
         .strip_prefix("AWS:")
-        .ok_or_else(|| Error::AuthFailed {
-            registry: REGISTRY.to_owned(),
-            reason: "ECR Public token missing 'AWS:' prefix".into(),
-        })?
+        .ok_or_else(|| Error::auth_failed(REGISTRY, "ECR Public token missing 'AWS:' prefix"))?
         .to_owned();
 
     Ok((
@@ -342,10 +334,7 @@ mod tests {
                     .lock()
                     .await
                     .pop_front()
-                    .ok_or_else(|| Error::AuthFailed {
-                        registry: "public.ecr.aws".into(),
-                        reason: "mock: no more responses".into(),
-                    })
+                    .ok_or_else(|| Error::auth_failed("public.ecr.aws", "mock: no more responses"))
             })
         }
     }

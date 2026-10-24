@@ -275,9 +275,9 @@ impl crate::aws::Operation for BatchCheckLayerAvailability<'_> {
 /// The `BatchCheckLayerAvailability` output fields ocync reads.
 #[derive(Debug, Deserialize)]
 struct BatchCheckOutput {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::aws::null_as_default")]
     layers: Vec<Layer>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::aws::null_as_default")]
     failures: Vec<LayerFailure>,
 }
 
@@ -287,7 +287,7 @@ struct Layer {
     /// Kept as text so one digest ocync cannot parse costs only that layer
     /// its skip, not the whole batch.
     layer_digest: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::aws::null_as_default")]
     layer_availability: LayerAvailability,
 }
 
@@ -486,7 +486,6 @@ impl BatchBlobChecker for BatchChecker {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::sync::Mutex;
 
@@ -595,15 +594,16 @@ mod tests {
     }
 
     /// Only `AVAILABLE` skips a transfer. A value ECR adds later, a missing
-    /// availability or a digest ocync cannot parse must count as missing,
-    /// not fail the whole batch.
+    /// or null availability or a digest ocync cannot parse must count as
+    /// missing, not fail the whole batch.
     #[test]
     fn reads_layer_availability() {
-        let (a, b, c, d) = (
+        let (a, b, c, d, e) = (
             test_digest(1),
             test_digest(2),
             test_digest(3),
             test_digest(4),
+            test_digest(5),
         );
         let body = format!(
             r#"{{"layers":[
@@ -611,6 +611,7 @@ mod tests {
                 {{"layerDigest":"{b}","layerAvailability":"UNAVAILABLE"}},
                 {{"layerDigest":"{c}","layerAvailability":"ARCHIVED"}},
                 {{"layerDigest":"{d}"}},
+                {{"layerDigest":"{e}","layerAvailability":null}},
                 {{"layerDigest":"md5:nope","layerAvailability":"AVAILABLE"}}
             ],"failures":[{{"layerDigest":"sha256:bad","failureCode":"InvalidLayerDigest"}}]}}"#
         );
@@ -620,6 +621,21 @@ mod tests {
             BatchCheckResponse {
                 available: vec![a],
                 failures: vec!["sha256:bad".to_owned(), "md5:nope".to_owned()],
+            }
+        );
+    }
+
+    /// A null list reads as empty, as the SDK reads it, so the batch is not
+    /// lost to a decode failure.
+    #[test]
+    fn reads_null_lists_as_empty() {
+        let output: BatchCheckOutput =
+            serde_json::from_str(r#"{"layers":null,"failures":null}"#).unwrap();
+        assert_eq!(
+            BatchCheckResponse::from(output),
+            BatchCheckResponse {
+                available: vec![],
+                failures: vec![],
             }
         );
     }
@@ -659,13 +675,20 @@ mod tests {
     /// Shared counters for verifying API call counts in tests.
     #[derive(Clone, Default)]
     struct CallCounts {
-        check: Arc<AtomicUsize>,
+        /// The digests each call asked about, in call order.
+        asked: Arc<std::sync::Mutex<Vec<Vec<Digest>>>>,
+    }
+
+    impl CallCounts {
+        fn calls(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
     }
 
     /// Mock ECR API that returns pre-configured responses in order.
     ///
-    /// Verifies that the caller passes the expected repository name and that
-    /// digest strings match the expected set (per mock contract fidelity).
+    /// Verifies that the caller passes the expected repository name, and
+    /// records the digests each call asks about for the test to check.
     struct MockEcrBatchApi {
         /// Expected repository name - panics if caller passes a different repo.
         expected_repo: String,
@@ -695,14 +718,14 @@ mod tests {
         fn batch_check_layer_availability<'a>(
             &'a self,
             repo: &'a str,
-            _digests: &'a [Digest],
+            digests: &'a [Digest],
         ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + 'a>> {
             assert_eq!(
                 repo, self.expected_repo,
                 "mock: caller passed wrong repo to batch API"
             );
+            self.counts.asked.lock().unwrap().push(digests.to_vec());
             Box::pin(async move {
-                self.counts.check.fetch_add(1, Ordering::Relaxed);
                 let mut responses = self.check_responses.lock().await;
                 responses.pop_front().unwrap_or_else(|| {
                     Err(Error::EcrApi {
@@ -741,7 +764,7 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains(&d1));
         assert!(result.contains(&d2));
-        assert_eq!(counts.check.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.calls(), 1);
     }
 
     /// A digest in the answer that the request did not ask about is not
@@ -832,7 +855,7 @@ mod tests {
 
         // Verify exactly 3 API calls were made.
         assert_eq!(
-            counts.check.load(Ordering::Relaxed),
+            counts.calls(),
             3,
             "expected 3 batch API calls for 250 digests"
         );
@@ -850,7 +873,7 @@ mod tests {
             .unwrap();
 
         assert!(result.is_empty());
-        assert_eq!(counts.check.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.calls(), 0);
     }
 
     #[tokio::test]
@@ -969,7 +992,7 @@ mod tests {
             );
         }
         // 2 API calls were made (first succeeded, second failed).
-        assert_eq!(counts.check.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.calls(), 2);
     }
 
     // --- Trait object compatibility ---
@@ -997,7 +1020,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(
-            counts.check.load(Ordering::Relaxed),
+            counts.calls(),
             0,
             "empty input must NOT trigger an ECR API call"
         );
@@ -1025,7 +1048,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(
-            counts.check.load(Ordering::Relaxed),
+            counts.calls(),
             1,
             "all-available on first poll must NOT loop"
         );
@@ -1048,9 +1071,6 @@ mod tests {
                 failures: vec![],
             }),
             // Poll 2: d2 now available.
-            // The trimming optimisation means we expect only d2 to be
-            // requested; if d1 were re-requested, the mock would still
-            // accept it but the count test below pins the intent.
             Ok(BatchCheckResponse {
                 available: vec![d2.clone()],
                 failures: vec![],
@@ -1065,7 +1085,11 @@ mod tests {
             )
             .await;
         assert!(result.is_ok(), "{:?}", result.err());
-        assert_eq!(counts.check.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.calls(), 2);
+        assert_eq!(
+            *counts.asked.lock().unwrap(),
+            [vec![d1, d2.clone()], vec![d2]]
+        );
     }
 
     /// Polls keep reporting blob missing until deadline expires.
@@ -1135,7 +1159,7 @@ mod tests {
             "transient errors must not abort the wait: {:?}",
             result.err()
         );
-        assert_eq!(counts.check.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.calls(), 2);
     }
 
     #[tokio::test]

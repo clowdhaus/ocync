@@ -109,23 +109,29 @@ impl Endpoint {
     /// Parse an endpoint URL from configuration or from the rules below.
     ///
     /// Requests go to the endpoint's path joined with the operation path
-    /// `/`, so `https://gw.example/ecr` is called at `/ecr/`. A query is
-    /// dropped with a warning. Both are what the SDK does.
+    /// `/`, so `https://gw.example/ecr` is called at `/ecr/`. A query and a
+    /// user and password are dropped with a warning, as the SDK sends
+    /// neither. The URL may carry a key, so it never appears in a log or
+    /// error.
     pub(super) fn parse(text: &str) -> Result<Self, ConfigError> {
-        let mut url = Url::parse(text).map_err(|source| ConfigError::InvalidEndpoint {
-            url: text.to_owned(),
-            source,
-        })?;
+        let mut url = Url::parse(text).map_err(ConfigError::InvalidEndpoint)?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(ConfigError::EndpointNotHttp {
-                url: text.to_owned(),
+                scheme: url.scheme().to_owned(),
             });
         }
-        // The query may carry a key, so only its presence is logged.
-        if url.query().is_some() {
-            tracing::warn!("the query in the configured AWS endpoint URL is ignored");
+        if url.query().is_some() || !url.username().is_empty() || url.password().is_some() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "the query and user info in the configured AWS endpoint URL are ignored"
+                );
+            });
         }
         url.set_query(None);
+        // Neither fails on an http or https URL, which has a host.
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
         let path = format!("{}/", url.path().trim_end_matches('/'));
         url.set_path(&path);
         let host = url
@@ -561,23 +567,30 @@ mod tests {
     }
 
     /// A configured endpoint that is not an HTTP URL fails when the client
-    /// is built, naming the text. A `mailto:` or `unix:` URL parses but has
-    /// no host to sign.
+    /// is built, without echoing the text, which may carry a key. A `mailto:`
+    /// or `unix:` URL parses but has no host to sign.
     #[test]
     fn rejects_an_endpoint_that_is_not_an_http_url() {
         for (text, error) in [
             (
-                "not a url",
-                "invalid AWS endpoint 'not a url': relative URL without a base",
+                "gw/ecr?key=secret",
+                "invalid AWS endpoint URL: relative URL without a base",
             ),
             (
-                "unix:/run/ecr.sock",
-                "AWS endpoint 'unix:/run/ecr.sock' is not an http or https URL",
+                "unix:/run/ecr.sock?key=secret",
+                "AWS endpoint URL scheme 'unix' is not http or https",
             ),
         ] {
             assert_eq!(Endpoint::parse(text).unwrap_err().to_string(), error);
         }
-        let endpoint = Endpoint::parse("http://127.0.0.1:8080/base?x=1").unwrap();
+    }
+
+    /// A query and a user and password are dropped, so neither a key nor a
+    /// second `Authorization` header (reqwest sends URL user info as Basic
+    /// auth) goes out with a signed request.
+    #[test]
+    fn drops_the_query_and_user_info() {
+        let endpoint = Endpoint::parse("http://user:secret@127.0.0.1:8080/base?x=1").unwrap();
         assert_eq!(endpoint.host(), "127.0.0.1:8080");
         assert_eq!(endpoint.url().as_str(), "http://127.0.0.1:8080/base/");
         assert_eq!(

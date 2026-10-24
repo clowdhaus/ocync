@@ -1,8 +1,8 @@
 //! AWS Signature Version 4 request signing, hashed and keyed with `aws-lc-rs`.
 //!
 //! Signs in the `Authorization` header, with the session token signed as
-//! `x-amz-security-token`, URI path normalization on, and the path encoded
-//! twice. That is the form every service ocync calls expects; S3 alone
+//! `x-amz-security-token`, URI path normalization on, the path encoded
+//! twice, and no query: the endpoint never carries one. That is the form every service ocync calls expects; S3 alone
 //! differs, and ocync does not call it.
 
 use std::fmt::{self, Write as _};
@@ -44,8 +44,6 @@ pub(super) struct Request<'a> {
     pub(super) method: &'a http::Method,
     /// The path as sent, already percent-encoded once.
     pub(super) path: &'a str,
-    /// The query string as sent, without the `?`.
-    pub(super) query: Option<&'a str>,
     /// The headers to sign, including `host`. The signer adds
     /// [`X_AMZ_DATE`], [`X_AMZ_SECURITY_TOKEN`] and `authorization` itself.
     pub(super) headers: &'a [(&'a str, &'a str)],
@@ -148,11 +146,11 @@ fn canonical_request(
     }
     let signed_headers = names.join(";");
 
+    // The empty line is the canonical query.
     let canonical = format!(
-        "{}\n{}\n{}\n{canonical_headers}\n{signed_headers}\n{}",
+        "{}\n{}\n\n{canonical_headers}\n{signed_headers}\n{}",
         request.method,
-        encode(&normalize_path(request.path), Encode::Path),
-        canonical_query(request.query.unwrap_or_default()),
+        encode_path(&normalize_path(request.path)),
         hex::encode(digest::digest(&digest::SHA256, request.body)),
     );
     (canonical, signed_headers)
@@ -223,36 +221,12 @@ fn normalize_path(path: &str) -> String {
     normalized
 }
 
-/// Query parameters decoded, encoded again, and sorted by name then value.
-fn canonical_query(query: &str) -> String {
-    let mut params: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
-        .map(|(k, v)| (encode(&k, Encode::Component), encode(&v, Encode::Component)))
-        .collect();
-    params.sort();
-    params
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-/// Which bytes [`encode`] leaves as they are besides the unreserved set.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Encode {
-    /// A path keeps its `/` separators.
-    Path,
-    /// A query name or value keeps nothing else.
-    Component,
-}
-
-/// Percent-encode every byte outside the RFC 3986 unreserved set.
-fn encode(value: &str, mode: Encode) -> String {
+/// Percent-encode every byte outside the RFC 3986 unreserved set but the
+/// `/` separators.
+fn encode_path(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~')
-            || (mode == Encode::Path && byte == b'/')
-        {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
             out.push(char::from(byte));
         } else {
             write!(out, "%{byte:02X}").expect("writing to a String cannot fail");
@@ -301,8 +275,9 @@ mod tests {
     /// 1.6.3, in `sigv4-test-suite/`, that apply to header signing with
     /// normalized, double-encoded paths. Left out: the unnormalized cases
     /// (S3 only), `sign_body` and `omit_session_token` cases (options ocync
-    /// never sets), and `get-space-normalized` and `get-utf8`, which expect
-    /// a single-encoded path and which `aws-sigv4` also skips.
+    /// never sets), the query cases (an endpoint never carries one), and
+    /// `get-space-normalized` and `get-utf8`, which expect a single-encoded
+    /// path and which `aws-sigv4` also skips.
     const VECTORS: &[&str] = &[
         "get-header-key-duplicate",
         "get-header-value-multiline",
@@ -316,20 +291,12 @@ mod tests {
         "get-slashes-normalized",
         "get-unreserved",
         "get-vanilla",
-        "get-vanilla-empty-query-key",
-        "get-vanilla-query",
-        "get-vanilla-query-order-encoded",
-        "get-vanilla-query-order-key-case",
-        "get-vanilla-query-unreserved",
-        "get-vanilla-utf8-query",
         "get-vanilla-with-session-token",
         "post-header-key-case",
         "post-header-key-sort",
         "post-header-value-case",
         "post-sts-header-before",
         "post-vanilla",
-        "post-vanilla-empty-query-value",
-        "post-vanilla-query",
     ];
 
     fn read(test: &str, file: &str) -> String {
@@ -346,7 +313,6 @@ mod tests {
     struct Raw {
         method: http::Method,
         path: String,
-        query: Option<String>,
         headers: Vec<(String, String)>,
         body: String,
     }
@@ -367,10 +333,7 @@ mod tests {
                 }
             })
             .collect();
-        let (path, query) = match target.split_once('?') {
-            Some((p, q)) => (p.to_string(), Some(q.to_string())),
-            None => (target, None),
-        };
+        assert!(!target.contains('?'), "{target}: the signer signs no query");
         let mut headers: Vec<(String, String)> = Vec::new();
         for line in lines {
             if line.starts_with(char::is_whitespace) {
@@ -387,8 +350,7 @@ mod tests {
         }
         Raw {
             method: method.parse().unwrap(),
-            path,
-            query,
+            path: target,
             headers,
             body: body.to_string(),
         }
@@ -418,7 +380,6 @@ mod tests {
         let request = Request {
             method: &raw.method,
             path: &raw.path,
-            query: raw.query.as_deref(),
             headers: &headers,
             body: raw.body.as_bytes(),
         };
@@ -492,7 +453,6 @@ mod tests {
         let request = Request {
             method: &http::Method::GET,
             path: "/",
-            query: None,
             headers: &[("Host", "example.amazonaws.com")],
             body: b"",
         };

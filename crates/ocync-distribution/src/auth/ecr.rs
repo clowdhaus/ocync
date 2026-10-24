@@ -47,29 +47,29 @@ pub(super) struct AuthorizationData {
     /// The base64 `AWS:<password>` token.
     pub(super) authorization_token: Option<String>,
     /// When the token expires.
-    pub(super) expires_at: Option<Expiry>,
+    #[serde(default, deserialize_with = "epoch_seconds")]
+    pub(super) expires_at: Option<SystemTime>,
 }
 
-/// A token expiry, sent as seconds since the UNIX epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Expiry(pub(super) SystemTime);
+/// Read an expiry sent as seconds since the UNIX epoch. One before the
+/// epoch has passed; one too far ahead to represent reads as no expiry, so
+/// the default lifetime applies rather than the token failing.
+fn epoch_seconds<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SystemTime>, D::Error> {
+    let Some(secs) = Option::<f64>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(Duration::try_from_secs_f64(secs.max(0.0))
+        .ok()
+        .and_then(|since_epoch| SystemTime::UNIX_EPOCH.checked_add(since_epoch)))
+}
 
 /// Time until `until`, or zero once it has passed.
 pub(crate) fn remaining(until: SystemTime) -> Duration {
     until
         .duration_since(SystemTime::now())
         .unwrap_or(Duration::ZERO)
-}
-
-impl<'de> Deserialize<'de> for Expiry {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let secs = f64::deserialize(deserializer)?;
-        Duration::try_from_secs_f64(secs)
-            .ok()
-            .and_then(|since_epoch| SystemTime::UNIX_EPOCH.checked_add(since_epoch))
-            .map(Self)
-            .ok_or_else(|| serde::de::Error::custom(format!("expiry {secs} is not a time")))
-    }
 }
 
 /// ECR's `GetAuthorizationToken`, which takes no input.
@@ -80,7 +80,7 @@ struct GetAuthorizationToken {}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetAuthorizationTokenOutput {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::aws::null_as_default")]
     authorization_data: Vec<AuthorizationData>,
 }
 
@@ -111,20 +111,16 @@ impl EcrApi for AwsEcrApi {
                 .authorization_data
                 .into_iter()
                 .next()
-                .ok_or_else(|| Error::AuthFailed {
-                    registry: self.registry.clone(),
-                    reason: "ECR returned empty authorization data".into(),
+                .ok_or_else(|| {
+                    Error::auth_failed(&self.registry, "ECR returned empty authorization data")
                 })?;
 
-            let encoded_token = auth_data
-                .authorization_token
-                .ok_or_else(|| Error::AuthFailed {
-                    registry: self.registry.clone(),
-                    reason: "ECR authorization data missing token".into(),
-                })?;
+            let encoded_token = auth_data.authorization_token.ok_or_else(|| {
+                Error::auth_failed(&self.registry, "ECR authorization data missing token")
+            })?;
 
             // Prefer the API-provided expiry over the hardcoded default.
-            let expires_in = auth_data.expires_at.map(|e| remaining(e.0));
+            let expires_in = auth_data.expires_at.map(remaining);
 
             Ok(EcrTokenResponse {
                 encoded_token,
@@ -223,21 +219,18 @@ impl<T: Clone + Send + Sync> CredentialCache<T> {
 /// Validates the format and returns the original encoded string unchanged --
 /// ECR expects it sent as `Authorization: Basic <encoded>`.
 pub(super) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Error> {
-    let decoded = BASE64.decode(encoded).map_err(|e| Error::AuthFailed {
-        registry: registry.to_owned(),
-        reason: format!("invalid base64 in ECR token: {e}"),
-    })?;
+    let decoded = BASE64
+        .decode(encoded)
+        .map_err(|e| Error::auth_failed(registry, format!("invalid base64 in ECR token: {e}")))?;
 
-    let text = String::from_utf8(decoded).map_err(|e| Error::AuthFailed {
-        registry: registry.to_owned(),
-        reason: format!("ECR token is not valid UTF-8: {e}"),
-    })?;
+    let text = String::from_utf8(decoded)
+        .map_err(|e| Error::auth_failed(registry, format!("ECR token is not valid UTF-8: {e}")))?;
 
     if !text.starts_with("AWS:") {
-        return Err(Error::AuthFailed {
-            registry: registry.to_owned(),
-            reason: "ECR token does not start with 'AWS:'".into(),
-        });
+        return Err(Error::auth_failed(
+            registry,
+            "ECR token does not start with 'AWS:'",
+        ));
     }
 
     Ok(())
@@ -289,9 +282,8 @@ impl EcrAuth {
         let hostname = hostname.into();
         let config = crate::ecr::load_sdk_config(&hostname, profile)
             .await
-            .map_err(|e| Error::AuthFailed {
-                registry: hostname.clone(),
-                reason: format!("failed to load AWS config: {e}"),
+            .map_err(|e| {
+                Error::auth_failed(&hostname, format!("failed to load AWS config: {e}"))
             })?;
 
         let client = crate::aws::Client::new(&config, crate::aws::Service::Ecr)
@@ -434,10 +426,7 @@ mod tests {
                 let mut responses = self.responses.lock().await;
                 match responses.pop_front() {
                     Some(Some(response)) => Ok(response),
-                    _ => Err(Error::AuthFailed {
-                        registry: "mock".into(),
-                        reason: "mock: no token available".into(),
-                    }),
+                    _ => Err(Error::auth_failed("mock", "mock: no token available")),
                 }
             })
         }
@@ -446,8 +435,8 @@ mod tests {
     // --- validate_ecr_token tests ---
 
     /// ECR answers with a list of authorization data. The expiry is read
-    /// as epoch seconds; one that is not a time fails the parse rather than
-    /// caching the token as already expired.
+    /// as epoch seconds. A negative one has passed, and one too large to
+    /// represent or null is no expiry; none of them fails the token.
     #[test]
     fn reads_the_get_authorization_token_output() {
         let output: GetAuthorizationTokenOutput = serde_json::from_str(
@@ -458,15 +447,20 @@ mod tests {
         assert_eq!(data.authorization_token.as_deref(), Some("QVdTOnB3"));
         assert_eq!(
             data.expires_at,
-            Some(Expiry(
-                SystemTime::UNIX_EPOCH + Duration::from_millis(4_102_444_800_500)
-            ))
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(4_102_444_800_500))
         );
-        for bad in ["-1", "1e300"] {
-            let body = format!(r#"{{"authorizationData":[{{"expiresAt":{bad}}}]}}"#);
-            let err = serde_json::from_str::<GetAuthorizationTokenOutput>(&body).unwrap_err();
-            assert!(err.to_string().contains("is not a time"), "{bad}: {err}");
+        for (sent, expected) in [
+            ("-1", Some(SystemTime::UNIX_EPOCH)),
+            ("1e300", None),
+            ("null", None),
+        ] {
+            let body = format!(r#"{{"authorizationData":[{{"expiresAt":{sent}}}]}}"#);
+            let output: GetAuthorizationTokenOutput = serde_json::from_str(&body).unwrap();
+            assert_eq!(output.authorization_data[0].expires_at, expected, "{sent}");
         }
+        let output: GetAuthorizationTokenOutput =
+            serde_json::from_str(r#"{"authorizationData":null}"#).unwrap();
+        assert!(output.authorization_data.is_empty());
     }
 
     #[test]
