@@ -5,7 +5,8 @@
 //! it runs before the engine exists, so a transient failure there fails a
 //! whole mapping or image. The operations that run there retry themselves,
 //! through [`retrying`], and share one schedule and one predicate so they
-//! cannot drift apart.
+//! cannot drift apart. The AWS API calls run the same loop under the AWS
+//! SDK's retry policy instead (see `crate::aws`).
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -86,34 +87,61 @@ fn backoff(attempt: u32) -> Duration {
     base.mul_f64(0.75 + fastrand::f64() * 0.5)
 }
 
-/// Run `op`, re-running it while it fails transiently.
+/// Decides, after each attempt of a call, whether and when to send it again.
+pub(crate) trait Policy<E> {
+    /// The wait before sending again after `error` ended attempt `attempt`
+    /// (0-indexed), or `None` to surface `error`.
+    fn retry(&mut self, attempt: u32, error: &E) -> Option<Duration>;
+
+    /// The call succeeded on attempt `attempt` (0-indexed).
+    fn succeeded(&mut self, _attempt: u32) {}
+}
+
+/// The crate's policy: a [`Transient`] failure is sent again on the jittered
+/// schedule, at most [`MAX_TRANSIENT_RETRIES`] times per call, and each retry
+/// is drawn from the budget.
+///
+/// The budget may be shared across calls, which is the bound that matters for
+/// an operation made of many of them. A tag listing may walk thousands of
+/// pages, and four retries on each of them is a bound only on paper: it
+/// permits hours of backing off against a registry that is plainly refusing to
+/// serve the listing.
+pub(crate) struct Budgeted<'a>(pub(crate) &'a AtomicU32);
+
+impl<E: Transient> Policy<E> for Budgeted<'_> {
+    fn retry(&mut self, attempt: u32, error: &E) -> Option<Duration> {
+        (error.is_transient()
+            && attempt < MAX_TRANSIENT_RETRIES
+            && self
+                .0
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
+                .is_ok())
+        .then(|| backoff(attempt))
+    }
+}
+
+/// Run `op`, re-running it while `policy` says to.
 ///
 /// `what` names the operation in the retry log. `op` must be idempotent: the
 /// callers are reads and token exchanges, which are.
-///
-/// `budget` is drawn down by every retry and may be shared across calls, which
-/// is the bound that matters for an operation made of many of them. A tag
-/// listing may walk thousands of pages, and four retries on each of them is a
-/// bound only on paper: it permits hours of backing off against a registry that
-/// is plainly refusing to serve the listing.
-pub(crate) async fn retrying<T, E, F, Fut>(what: &str, budget: &AtomicU32, op: F) -> Result<T, E>
+pub(crate) async fn retrying<T, E, P, F, Fut>(what: &str, policy: &mut P, op: F) -> Result<T, E>
 where
-    E: Transient + std::fmt::Display,
+    E: std::fmt::Display,
+    P: Policy<E>,
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
     let mut attempt: u32 = 0;
     loop {
         match op().await {
-            Ok(value) => return Ok(value),
-            Err(e)
-                if e.is_transient()
-                    && attempt < MAX_TRANSIENT_RETRIES
-                    && budget
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
-                        .is_ok() =>
-            {
-                let delay = backoff(attempt);
+            Ok(value) => {
+                policy.succeeded(attempt);
+                return Ok(value);
+            }
+            Err(e) => {
+                let Some(delay) = policy.retry(attempt, &e) else {
+                    return Err(e);
+                };
                 tracing::debug!(
                     what,
                     attempt,
@@ -124,7 +152,6 @@ where
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -284,9 +311,9 @@ mod tests {
     #[tokio::test]
     async fn retrying_gives_up_and_surfaces_the_last_error() {
         let calls = Cell::new(0u32);
-        let err = retrying::<(), Error, _, _>(
+        let err = retrying::<(), Error, _, _, _>(
             "always throttled",
-            &AtomicU32::new(MAX_TRANSIENT_RETRIES),
+            &mut Budgeted(&AtomicU32::new(MAX_TRANSIENT_RETRIES)),
             || {
                 calls.set(calls.get() + 1);
                 async {
@@ -310,9 +337,9 @@ mod tests {
     #[tokio::test]
     async fn retrying_does_not_re_run_a_permanent_failure() {
         let calls = Cell::new(0u32);
-        let _ = retrying::<(), Error, _, _>(
+        let _ = retrying::<(), Error, _, _, _>(
             "not found",
-            &AtomicU32::new(MAX_TRANSIENT_RETRIES),
+            &mut Budgeted(&AtomicU32::new(MAX_TRANSIENT_RETRIES)),
             || {
                 calls.set(calls.get() + 1);
                 async {

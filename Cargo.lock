@@ -2351,6 +2351,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-lc-rs",
+ "aws-smithy-types",
  "aws-types",
  "base64 0.23.1",
  "bytes",

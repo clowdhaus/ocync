@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::aimd::RegistryAction;
 use crate::client::RegistryClient;
 use crate::error::Error;
-use crate::retry::{MAX_LISTING_RETRIES, retrying};
+use crate::retry::{Budgeted, MAX_LISTING_RETRIES, retrying};
 use crate::spec::RepositoryName;
 
 /// Maximum number of tag list pages to follow before treating the pagination
@@ -115,8 +115,10 @@ impl RegistryClient {
             // phase would re-send it: the mapping would just fail. Reading
             // the body inside the retry matters because a connection reset
             // part way through a page is exactly the failure a re-send fixes.
-            let (next_url, tag_list) =
-                retrying::<_, Error, _, _>("tag listing", &retry_budget, || async {
+            let (next_url, tag_list) = retrying::<_, Error, _, _, _>(
+                "tag listing",
+                &mut Budgeted(&retry_budget),
+                || async {
                     let resp = self
                         .get(repository, &path, None, RegistryAction::TagList)
                         .await?;
@@ -130,8 +132,9 @@ impl RegistryClient {
 
                     let tag_list: TagListResponse = resp.json().await?;
                     Ok((next_url, tag_list))
-                })
-                .await?;
+                },
+            )
+            .await?;
             all_tags.extend(tag_list.tags);
 
             match next_url {

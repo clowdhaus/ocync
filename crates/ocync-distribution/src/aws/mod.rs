@@ -5,14 +5,16 @@
 //! and attempt settings still come from `aws-config`'s `SdkConfig`.
 
 mod endpoint;
+mod retry;
 mod sigv4;
 
 use std::fmt;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use aws_config::SdkConfig;
-use aws_config::retry::RetryMode;
+use aws_config::retry::RetryConfig;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
@@ -24,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use self::endpoint::{DualStack, Endpoint, Fips};
 use crate::auth::ecr::{CredentialCache, remaining};
-use crate::retry::{MAX_TRANSIENT_RETRIES, Transient, is_transient_transport, retrying};
+use crate::retry::{is_transient_transport, retrying};
 
 /// The content type of the AWS JSON 1.1 protocol both APIs speak.
 const AWS_JSON_1_1: &str = "application/x-amz-json-1.1";
@@ -67,17 +69,16 @@ const SKEW_THRESHOLD: Duration = Duration::from_secs(4 * 60);
 /// A round trip longer than this says nothing about the clocks.
 const MAX_MEASURED_ROUND_TRIP: Duration = Duration::from_secs(15 * 60);
 
-/// Statuses the SDK re-sends whatever the error code.
+/// Statuses the SDK re-sends as transient whatever the error code.
 const TRANSIENT_STATUSES: &[StatusCode] = &[
-    StatusCode::TOO_MANY_REQUESTS,
     StatusCode::INTERNAL_SERVER_ERROR,
     StatusCode::BAD_GATEWAY,
     StatusCode::SERVICE_UNAVAILABLE,
     StatusCode::GATEWAY_TIMEOUT,
 ];
 
-/// Error codes the SDK re-sends: throttles and transient service faults.
-const TRANSIENT_CODES: &[&str] = &[
+/// Error codes the SDK re-sends as throttles.
+const THROTTLING_CODES: &[&str] = &[
     "Throttling",
     "ThrottlingException",
     "ThrottledException",
@@ -92,9 +93,14 @@ const TRANSIENT_CODES: &[&str] = &[
     "SlowDown",
     "PriorRequestNotComplete",
     "EC2ThrottledException",
-    "RequestTimeout",
-    "RequestTimeoutException",
 ];
+
+/// Error codes the SDK re-sends as transient faults.
+const TRANSIENT_CODES: &[&str] = &["RequestTimeout", "RequestTimeoutException"];
+
+/// The header a service names its preferred wait before a retry in, in
+/// milliseconds.
+const X_AMZ_RETRY_AFTER: &str = "x-amz-retry-after";
 
 /// Error codes a request signed at the wrong time draws, which the SDK
 /// re-sends once the clocks are measured apart by more than
@@ -108,7 +114,7 @@ const CLOCK_SKEW_CODES: &[&str] = &[
 ];
 
 /// The AWS APIs ocync calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Service {
     /// Amazon ECR, for registry tokens and layer checks.
     Ecr,
@@ -203,7 +209,9 @@ pub(crate) enum ConfigError {
 /// What an AWS error code means for the request that drew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeKind {
-    /// A throttle or transient fault: re-send.
+    /// A throttle: re-send.
+    Throttling,
+    /// A transient fault: re-send.
     Transient,
     /// A signature the service rejects, perhaps for the local clock.
     ClockSkew,
@@ -229,7 +237,9 @@ impl ErrorCode {
         if code.is_empty() {
             return None;
         }
-        let kind = if TRANSIENT_CODES.contains(&code) {
+        let kind = if THROTTLING_CODES.contains(&code) {
+            CodeKind::Throttling
+        } else if TRANSIENT_CODES.contains(&code) {
             CodeKind::Transient
         } else if CLOCK_SKEW_CODES.contains(&code) {
             CodeKind::ClockSkew
@@ -249,6 +259,8 @@ struct ServiceError {
     status: StatusCode,
     code: Option<ErrorCode>,
     message: Option<String>,
+    /// The wait the service asked for before a retry.
+    retry_after: Option<Duration>,
 }
 
 impl ServiceError {
@@ -272,6 +284,7 @@ impl ServiceError {
             status,
             code,
             message,
+            retry_after: None,
         }
     }
 }
@@ -413,19 +426,32 @@ enum Failure {
     Decode(#[source] serde_json::Error),
 }
 
-impl Transient for Failure {
-    /// What the SDK re-sends.
-    fn is_transient(&self) -> bool {
+impl Failure {
+    /// How the SDK retries this failure, or `None` when it does not. A throttle
+    /// code wins over the status it came with, as in the SDK.
+    fn retry_kind(&self) -> Option<retry::Kind> {
         match self {
-            Self::Transport(e) => is_transient_transport(e),
-            Self::Service(e) => {
-                TRANSIENT_STATUSES.contains(&e.status)
-                    || e.code
-                        .as_ref()
-                        .is_some_and(|c| c.kind == CodeKind::Transient)
-            }
-            Self::ClockSkewed { .. } => true,
-            Self::Credentials(_) | Self::Decode(_) => false,
+            Self::Transport(e) => is_transient_transport(e).then_some(retry::Kind::Transient),
+            Self::Service(e) => match e.code.as_ref().map(|c| c.kind) {
+                Some(CodeKind::Throttling) => Some(retry::Kind::Throttling),
+                Some(CodeKind::Transient) => Some(retry::Kind::Transient),
+                _ if TRANSIENT_STATUSES.contains(&e.status) => Some(retry::Kind::Transient),
+                // The SDK leaves a bare 429 alone. It is retried here as the
+                // throttle it is: a proxy on `HTTPS_PROXY` answers with one, and
+                // a batch check given up on transfers every blob it covered.
+                _ if e.status == StatusCode::TOO_MANY_REQUESTS => Some(retry::Kind::Throttling),
+                _ => None,
+            },
+            Self::ClockSkewed { .. } => Some(retry::Kind::Server),
+            Self::Credentials(_) | Self::Decode(_) => None,
+        }
+    }
+
+    /// The wait the service asked for before a retry.
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Service(error) | Self::ClockSkewed { error, .. } => error.retry_after,
+            Self::Credentials(_) | Self::Transport(_) | Self::Decode(_) => None,
         }
     }
 }
@@ -447,7 +473,10 @@ pub(crate) struct Client {
     credentials: CredentialCache<Credentials>,
     /// The last [`ClockSkew`] measured, which every signature corrects for.
     skew: AtomicI64,
-    max_attempts: u32,
+    retry: retry::Settings,
+    /// The retry quota and rate limiter shared with every client for the
+    /// same service and region.
+    partition: Arc<retry::Partition>,
     service: Service,
     region: String,
     endpoint: Endpoint,
@@ -497,35 +526,18 @@ impl Client {
             _ => DualStack::Off,
         };
         let endpoint = endpoint::resolve(service, &region, fips, dual_stack, endpoint_url)?;
-        let max_attempts = config
-            .retry_config()
-            .map_or(DEFAULT_MAX_ATTEMPTS, |r| r.max_attempts());
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        if max_attempts > MAX_TRANSIENT_RETRIES + 1 {
-            WARNED.call_once(|| {
-                tracing::warn!(
-                    %service,
-                    configured = max_attempts,
-                    used = MAX_TRANSIENT_RETRIES + 1,
-                    "AWS max attempts is above what ocync makes; using the lower count"
-                );
-            });
-        }
-        static WARNED_MODE: std::sync::Once = std::sync::Once::new();
-        if config
-            .retry_config()
-            .is_some_and(|r| r.mode() == RetryMode::Adaptive)
-        {
-            WARNED_MODE.call_once(|| {
-                tracing::warn!("AWS adaptive retry mode is not supported; using standard retries");
-            });
-        }
+        let retry = config.retry_config().map_or_else(
+            || retry::Settings::new(&RetryConfig::standard()),
+            retry::Settings::new,
+        );
+        let partition = retry::partition(service, &region);
         Self::with_endpoint(
             provider,
             service,
             region,
             endpoint,
-            max_attempts,
+            retry,
+            partition,
             STALL_TIMEOUT,
         )
     }
@@ -535,7 +547,8 @@ impl Client {
         service: Service,
         region: String,
         endpoint: Endpoint,
-        max_attempts: u32,
+        retry: retry::Settings,
+        partition: Arc<retry::Partition>,
         stall_timeout: Duration,
     ) -> Result<Self, ConfigError> {
         crate::install_crypto_provider();
@@ -551,7 +564,8 @@ impl Client {
             provider,
             credentials: CredentialCache::new(),
             skew: AtomicI64::new(0),
-            max_attempts,
+            retry,
+            partition,
             service,
             region,
             endpoint,
@@ -559,17 +573,16 @@ impl Client {
     }
 
     /// Call `O` with `input`, re-sending throttles, transient faults and
-    /// clock-skewed signatures up to the configured attempt count, and
-    /// decode its output.
-    ///
-    /// The schedule between attempts is the crate's (see
-    /// [`crate::retry`]), so at most `MAX_TRANSIENT_RETRIES + 1` attempts are
-    /// made whatever the configuration asks for.
+    /// clock-skewed signatures as the SDK's retry policy allows (see
+    /// [`retry`]), and decode its output.
     pub(crate) async fn call<O: Operation>(&self, input: &O) -> Result<O::Output, CallError> {
         let body = Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize"));
         let target = format!("{}.{}", self.service.target_prefix(), O::NAME);
-        let budget = AtomicU32::new(self.max_attempts.saturating_sub(1));
-        retrying(O::NAME, &budget, || self.send(&target, body.clone()))
+        if let Some(delay) = self.partition.first_send_delay(&self.retry) {
+            tokio::time::sleep(delay).await;
+        }
+        let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
+        retrying(O::NAME, &mut policy, || self.send(&target, body.clone()))
             .await
             .map_err(|source| CallError {
                 service: self.service,
@@ -620,11 +633,19 @@ impl Client {
             .get("x-amzn-errortype")
             .and_then(|v| v.to_str().ok())
             .and_then(ErrorCode::parse);
+        let retry_after = response
+            .headers()
+            .get(X_AMZ_RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()?.parse().ok())
+            .map(Duration::from_millis);
         let bytes = response.bytes().await.map_err(Failure::Transport)?;
         if status.is_success() {
             return serde_json::from_slice(&bytes).map_err(Failure::Decode);
         }
-        let error = ServiceError::parse(status, header_code, &bytes);
+        let error = ServiceError {
+            retry_after,
+            ..ServiceError::parse(status, header_code, &bytes)
+        };
         let signature_rejected = error
             .code
             .as_ref()
@@ -690,13 +711,24 @@ mod tests {
         ))
     }
 
+    /// The SDK's settings with `max_attempts` and a 1 ms first backoff, so a
+    /// test's retries take milliseconds.
+    fn settings(max_attempts: u32) -> retry::Settings {
+        retry::Settings::new(
+            &RetryConfig::standard()
+                .with_max_attempts(max_attempts)
+                .with_initial_backoff(Duration::from_millis(1)),
+        )
+    }
+
     fn client(server: &MockServer, max_attempts: u32) -> Client {
         Client::with_endpoint(
             static_credentials(None),
             Service::Ecr,
             "us-east-1".into(),
             Endpoint::parse(&server.uri()).unwrap(),
-            max_attempts,
+            settings(max_attempts),
+            Arc::default(),
             STALL_TIMEOUT,
         )
         .unwrap()
@@ -738,7 +770,8 @@ mod tests {
             Service::Ecr,
             "us-east-1".into(),
             Endpoint::parse(&server.uri()).unwrap(),
-            DEFAULT_MAX_ATTEMPTS,
+            settings(DEFAULT_MAX_ATTEMPTS),
+            Arc::default(),
             STALL_TIMEOUT,
         )
         .unwrap();
@@ -763,8 +796,7 @@ mod tests {
     /// no further: one attempt means no retry at all.
     #[tokio::test]
     async fn retries_a_throttle_up_to_the_configured_attempts() {
-        let cap = MAX_TRANSIENT_RETRIES as u64 + 1;
-        for (max_attempts, sent) in [(3, 3), (1, 1), (10, cap)] {
+        for (max_attempts, sent) in [(3, 3), (1, 1), (10, 10)] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(throttle())
@@ -818,7 +850,8 @@ mod tests {
             Service::Ecr,
             "us-east-1".into(),
             Endpoint::parse(&format!("http://{address}")).unwrap(),
-            1,
+            settings(1),
+            Arc::default(),
             Duration::from_millis(200),
         )
         .unwrap();
@@ -860,6 +893,78 @@ mod tests {
             err.to_string(),
             "ECR GetAuthorizationToken failed: AccessDeniedException (HTTP 400 Bad Request): not authorized"
         );
+    }
+
+    /// A throttle code wins over the status it came with, a timeout code or
+    /// a 500, 502, 503 or 504 is transient, a bare 429 is a throttle, and
+    /// anything else, or an answer that does not parse, is not retried.
+    #[test]
+    fn classifies_answers_as_the_sdk_does() {
+        let kind = |status: u16, code: Option<&str>| {
+            Failure::Service(ServiceError::parse(
+                StatusCode::from_u16(status).unwrap(),
+                code.and_then(ErrorCode::parse),
+                b"",
+            ))
+            .retry_kind()
+        };
+        assert_eq!(
+            kind(503, Some("ThrottlingException")),
+            Some(retry::Kind::Throttling)
+        );
+        assert_eq!(kind(429, None), Some(retry::Kind::Throttling));
+        assert_eq!(
+            kind(400, Some("RequestTimeoutException")),
+            Some(retry::Kind::Transient)
+        );
+        for status in [500, 502, 503, 504] {
+            assert_eq!(kind(status, None), Some(retry::Kind::Transient), "{status}");
+        }
+        assert_eq!(kind(501, None), None);
+        assert_eq!(kind(400, Some("InvalidParameterException")), None);
+        let undecodable = serde_json::from_slice::<ProbeOutput>(b"{").unwrap_err();
+        assert_eq!(Failure::Decode(undecodable).retry_kind(), None);
+    }
+
+    /// A retry waits as long as `x-amz-retry-after` asks, and spends from
+    /// the quota the client shares: with too little left, the call stops
+    /// retrying whatever attempts remain.
+    #[tokio::test]
+    async fn waits_as_asked_and_spends_the_shared_quota() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(throttle().insert_header(X_AMZ_RETRY_AFTER, "300"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ok())
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        client(&server, DEFAULT_MAX_ATTEMPTS)
+            .call(&Probe {})
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(throttle())
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = Client::with_endpoint(
+            static_credentials(None),
+            Service::Ecr,
+            "us-east-1".into(),
+            Endpoint::parse(&server.uri()).unwrap(),
+            settings(10),
+            Arc::new(retry::Partition::with_capacity(5)),
+            STALL_TIMEOUT,
+        )
+        .unwrap();
+        client.call(&Probe {}).await.unwrap_err();
     }
 
     /// A host clock 10 minutes off draws a signature error. The SDK measures
@@ -1022,7 +1127,7 @@ mod tests {
                     "aws.protocoltests.restjson#ThrottlingException:http://internal.amazon.com/coral/",
                 ),
                 r#"{"__type":"Other"}"#,
-                code("ThrottlingException", CodeKind::Transient),
+                code("ThrottlingException", CodeKind::Throttling),
                 None,
             ),
             // An empty header names no code, so the body's is used.
@@ -1077,7 +1182,8 @@ mod tests {
                 Service::Ecr,
                 "us-east-1".into(),
                 Endpoint::parse("https://example.com").unwrap(),
-                DEFAULT_MAX_ATTEMPTS,
+                settings(DEFAULT_MAX_ATTEMPTS),
+                Arc::default(),
                 STALL_TIMEOUT,
             )
             .unwrap();
@@ -1111,7 +1217,8 @@ mod tests {
             Service::Ecr,
             "us-east-1".into(),
             Endpoint::parse("https://example.com").unwrap(),
-            DEFAULT_MAX_ATTEMPTS,
+            settings(DEFAULT_MAX_ATTEMPTS),
+            Arc::default(),
             STALL_TIMEOUT,
         )
         .unwrap();
