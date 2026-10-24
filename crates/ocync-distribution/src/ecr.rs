@@ -417,6 +417,7 @@ impl BatchChecker {
         digests: &[Digest],
     ) -> Result<HashSet<Digest>, Error> {
         let mut existing = HashSet::with_capacity(digests.len());
+        let mut checked = 0;
 
         for chunk in digests.chunks(MAX_DIGESTS_PER_BATCH) {
             let response = match self
@@ -428,8 +429,9 @@ impl BatchChecker {
                 Err(e) => {
                     warn!(
                         repo = %repo,
-                        completed = existing.len(),
-                        remaining = digests.len() - existing.len(),
+                        checked,
+                        available = existing.len(),
+                        unchecked = digests.len() - checked,
                         error = %e,
                         "batch check failed mid-batch, returning partial results"
                     );
@@ -456,6 +458,7 @@ impl BatchChecker {
             // Only available blobs this batch asked about enter the set, so a
             // stray digest in the answer cannot skip a transfer. Absent,
             // unavailable and failed digests are all treated as missing.
+            checked += chunk.len();
             let asked: HashSet<&Digest> = chunk.iter().collect();
             existing.extend(
                 response

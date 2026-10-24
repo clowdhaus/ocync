@@ -35,19 +35,25 @@ const X_AMZ_TARGET: &str = "x-amz-target";
 /// surfaces in seconds. It is the SDK's value.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
 
-/// A response that sends nothing for this long fails, so a stalled proxy
-/// or server cannot hold a call forever. It is the SDK's stalled-stream
-/// grace period.
+/// A call that receives nothing for this long after it is sent, or between
+/// reads, fails, so a stalled proxy or server cannot hold it forever. It is
+/// the SDK's stalled-stream grace period.
 const STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Attempts per call when the configuration sets none, as in the SDK.
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
+/// The SDK's first backoff, which doubles for each later retry.
+const SDK_INITIAL_BACKOFF_MS: u64 = 1_000;
+
 /// A credential load that takes longer fails. This is the SDK's bound for
-/// its default retry and connect settings: backoffs of 1 and 2 seconds plus
-/// three attempts of twice [`CONNECT_TIMEOUT`].
-const CREDENTIALS_LOAD_TIMEOUT: Duration =
-    Duration::from_millis(1_000 + 2_000 + 3 * 2 * CONNECT_TIMEOUT.as_millis() as u64);
+/// its default retry and connect settings: every backoff between
+/// [`DEFAULT_MAX_ATTEMPTS`] attempts, plus each attempt at twice
+/// [`CONNECT_TIMEOUT`].
+const CREDENTIALS_LOAD_TIMEOUT: Duration = Duration::from_millis(
+    SDK_INITIAL_BACKOFF_MS * ((1 << (DEFAULT_MAX_ATTEMPTS - 1)) - 1)
+        + DEFAULT_MAX_ATTEMPTS as u64 * 2 * CONNECT_TIMEOUT.as_millis() as u64,
+);
 
 /// How long a credential without an expiry is reused, as the SDK's identity
 /// cache does.
@@ -293,12 +299,11 @@ impl ClockSkew {
         if round_trip > MAX_MEASURED_ROUND_TRIP {
             return None;
         }
-        let millis = |d: Duration| {
-            i64::try_from(d.as_millis()).expect("a skew within year 9999 fits i64 milliseconds")
-        };
+        // A skew too large for i64 milliseconds measures nothing.
+        let millis = |d: Duration| i64::try_from(d.as_millis()).ok();
         Some(match server.duration_since(sent + round_trip / 2) {
-            Ok(ahead) => Self(millis(ahead)),
-            Err(behind) => Self(-millis(behind.duration())),
+            Ok(ahead) => Self(millis(ahead)?),
+            Err(behind) => Self(-millis(behind.duration())?),
         })
     }
 
@@ -488,13 +493,16 @@ impl Client {
         let max_attempts = config
             .retry_config()
             .map_or(DEFAULT_MAX_ATTEMPTS, |r| r.max_attempts());
+        static WARNED: std::sync::Once = std::sync::Once::new();
         if max_attempts > MAX_TRANSIENT_RETRIES + 1 {
-            tracing::warn!(
+            WARNED.call_once(|| {
+                tracing::warn!(
                 %service,
                 configured = max_attempts,
                 used = MAX_TRANSIENT_RETRIES + 1,
-                "AWS max attempts is above what ocync makes; using the lower count"
-            );
+                    "AWS max attempts is above what ocync makes; using the lower count"
+                );
+            });
         }
         Self::with_endpoint(
             provider,
@@ -740,7 +748,8 @@ mod tests {
     /// no further: one attempt means no retry at all.
     #[tokio::test]
     async fn retries_a_throttle_up_to_the_configured_attempts() {
-        for (max_attempts, sent) in [(3, 3), (1, 1)] {
+        let cap = MAX_TRANSIENT_RETRIES as u64 + 1;
+        for (max_attempts, sent) in [(3, 3), (1, 1), (10, cap)] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(throttle())

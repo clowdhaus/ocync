@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 use super::detect::ECR_PUBLIC_HOST as REGISTRY;
 use super::ecr::{
-    AuthorizationData, CredentialCache, EcrApi, EcrTokenResponse, Expiry, validate_ecr_token,
+    AuthorizationData, CredentialCache, EcrApi, EcrTokenResponse, remaining, validate_ecr_token,
 };
 use super::token_cache::TokenCache;
 use super::token_exchange;
@@ -83,7 +83,7 @@ impl EcrApi for AwsEcrPublicApi {
                     reason: "ECR Public authorization data missing token".into(),
                 })?;
 
-            let expires_in = auth_data.expires_at.map(Expiry::remaining);
+            let expires_in = auth_data.expires_at.map(|e| remaining(e.0));
 
             Ok(EcrTokenResponse {
                 encoded_token,

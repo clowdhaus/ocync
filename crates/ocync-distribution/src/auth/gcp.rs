@@ -103,7 +103,7 @@ pub struct GcpAuth {
     /// GCP token source for credential refresh.
     api: Box<dyn GcpTokenSource>,
     /// Cached SDK credentials (username/password) with TTL-based refresh.
-    sdk_credential_cache: CredentialCache<Credentials>,
+    credential_cache: CredentialCache<Credentials>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
@@ -141,7 +141,7 @@ impl GcpAuth {
                 credentials,
                 hostname,
             }),
-            sdk_credential_cache: CredentialCache::new(),
+            credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         })
@@ -158,7 +158,7 @@ impl GcpAuth {
             base_url: base_url.into(),
             http,
             api: Box::new(api),
-            sdk_credential_cache: CredentialCache::new(),
+            credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
@@ -166,7 +166,7 @@ impl GcpAuth {
 
     /// Get or refresh GCP `OAuth2` credentials.
     async fn ensure_credentials(&self) -> Result<Credentials, Error> {
-        self.sdk_credential_cache
+        self.credential_cache
             .get_or_refresh("gcp-oauth2-credential", async {
                 tracing::debug!("GCP OAuth2 credentials expired or missing, refreshing");
                 let access_token = self.api.access_token().await.map_err(|e| {
@@ -231,7 +231,7 @@ impl AuthProvider for GcpAuth {
             self.tokens.clear().await;
             self.challenge_cache.clear().await;
             // Also clear SDK credentials so they are re-fetched on next use.
-            self.sdk_credential_cache.clear().await;
+            self.credential_cache.clear().await;
         })
     }
 }
@@ -421,7 +421,7 @@ mod tests {
             username: GCP_USERNAME.to_owned(),
             password: "ya29.first".to_owned(),
         };
-        auth.sdk_credential_cache
+        auth.credential_cache
             .set(stale, Duration::from_secs(10))
             .await;
 

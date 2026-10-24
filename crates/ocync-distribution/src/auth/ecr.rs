@@ -52,14 +52,7 @@ pub(super) struct AuthorizationData {
 
 /// A token expiry, sent as seconds since the UNIX epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Expiry(SystemTime);
-
-impl Expiry {
-    /// Time until the expiry, or zero once it has passed.
-    pub(super) fn remaining(self) -> Duration {
-        remaining(self.0)
-    }
-}
+pub(super) struct Expiry(pub(super) SystemTime);
 
 /// Time until `until`, or zero once it has passed.
 pub(crate) fn remaining(until: SystemTime) -> Duration {
@@ -131,7 +124,7 @@ impl EcrApi for AwsEcrApi {
                 })?;
 
             // Prefer the API-provided expiry over the hardcoded default.
-            let expires_in = auth_data.expires_at.map(Expiry::remaining);
+            let expires_in = auth_data.expires_at.map(|e| remaining(e.0));
 
             Ok(EcrTokenResponse {
                 encoded_token,
@@ -478,7 +471,7 @@ mod tests {
 
     #[test]
     fn an_expiry_in_the_past_leaves_no_time() {
-        assert_eq!(Expiry(SystemTime::UNIX_EPOCH).remaining(), Duration::ZERO);
+        assert_eq!(remaining(SystemTime::UNIX_EPOCH), Duration::ZERO);
     }
 
     #[test]

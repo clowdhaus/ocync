@@ -121,8 +121,9 @@ impl Endpoint {
                 url: text.to_owned(),
             });
         }
-        if let Some(query) = url.query() {
-            tracing::warn!(query, "a query in an AWS endpoint URL is ignored");
+        // The query may carry a key, so only its presence is logged.
+        if url.query().is_some() {
+            tracing::warn!("the query in the configured AWS endpoint URL is ignored");
         }
         url.set_query(None);
         let path = format!("{}/", url.path().trim_end_matches('/'));
