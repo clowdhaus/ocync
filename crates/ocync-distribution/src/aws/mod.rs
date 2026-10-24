@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use self::calendar::parse_imf_fixdate;
 use self::endpoint::{DualStack, Endpoint, Fips};
-use crate::auth::ecr::{CredentialCache, remaining};
+use crate::credential_cache::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
 
 /// The content type of the AWS JSON 1.1 protocol both APIs speak.

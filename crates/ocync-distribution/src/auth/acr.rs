@@ -18,10 +18,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use super::ecr::CredentialCache;
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
+use crate::credential_cache::CredentialCache;
 use crate::error::Error;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

@@ -24,12 +24,11 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::detect::ECR_PUBLIC_HOST;
-use super::ecr::{
-    AuthorizationData, AuthorizationToken, CredentialCache, EcrApi, EcrTokenResponse, remaining,
-};
+use super::ecr::{AuthorizationData, AuthorizationToken, EcrApi, EcrTokenResponse};
 use super::token_cache::TokenCache;
 use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
+use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::Error;
 
 /// Default ECR Public token lifetime (12 hours).

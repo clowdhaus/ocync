@@ -19,10 +19,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use super::ecr::CredentialCache;
 use super::token_cache::TokenCache;
 use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
+use crate::credential_cache::CredentialCache;
 use crate::error::Error;
 
 /// Username for GCP `OAuth2` token exchange.

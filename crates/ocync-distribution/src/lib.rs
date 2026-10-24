@@ -10,6 +10,8 @@ mod aws;
 pub mod blob;
 /// OCI registry HTTP client.
 pub mod client;
+/// A credential cached until it nears expiry.
+mod credential_cache;
 /// OCI content-addressable digest type.
 pub mod digest;
 /// AWS ECR batch operations - bulk blob existence checks.
