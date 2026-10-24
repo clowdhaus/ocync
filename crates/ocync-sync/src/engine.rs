@@ -2081,7 +2081,7 @@ fn child_blobs(child: &ManifestPull) -> Vec<&Descriptor> {
 /// per-image blob semaphore.
 ///
 /// Exposes completion/failure signals and repo management but NOT wait
-/// primitives (`repo_committed_watch`, `claim_blob_upload`). This boundary
+/// primitives (`unresolved_watches_for`, `claim_blob_upload`). This boundary
 /// is the structural guarantee against semaphore-exhaustion deadlocks:
 /// code holding a permit literally cannot block on external signals because
 /// the type does not expose the methods needed to do so.
@@ -2350,7 +2350,7 @@ async fn transfer_image_blobs(
             //
             // `run_under_semaphore` takes `BlobIoContext` (not
             // `TransferContext`), so `ctx` is unreachable inside the
-            // permit scope. `BlobSink` has no repo_committed_watch,
+            // permit scope. `BlobSink` has no unresolved_watches_for,
             // no claim_blob_upload -- adding an external wait inside the
             // semaphore is a compile error.
             let _permit = sem.acquire().await.unwrap();
@@ -2575,7 +2575,7 @@ async fn wait_any_fired(receivers: Vec<tokio::sync::watch::Receiver<bool>>) {
 /// Entry point for the semaphore-bounded phase of blob transfer.
 ///
 /// Takes [`BlobIoContext`] (not [`TransferContext`]), making it impossible
-/// to call cache wait methods (`repo_committed_watch`, `claim_blob_upload`)
+/// to call cache wait methods (`unresolved_watches_for`, `claim_blob_upload`)
 /// inside the semaphore scope. This is the compile-time enforcement boundary
 /// against semaphore-exhaustion deadlocks.
 async fn run_under_semaphore(

@@ -26,8 +26,8 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 - No "uncovered follower" path exists - all followers' shared blobs are in the leader union.
 - Do NOT add wave partitioning among followers (dead code).
 - All tasks promoted simultaneously after discovery (leaders ordered first by `elect_leaders`). Two-level synchronization:
-  1. Per-blob `Notify` via `ClaimAction::Wait`: followers wait for leader's blob upload.
-  2. Per-repo `watch<bool>` via `repo_committed_watch`: followers wait for leader's manifest commit before mounting. ECR requires a committed manifest in the source repo for mount to succeed (201); without this wait, mounts hit Tier 3 and get 202 (Not Fulfilled). Uses `watch` (not `Notify`) because committed status is boolean state, not an event -- `watch` retains the last value so late subscribers always see it.
+  1. Per-(target, digest) upload claim via `ClaimAction::Wait`: whichever task claims a blob first uploads it, and every other task for that digest at that target, leader or follower, waits on `claim_notify` and re-checks.
+  2. Per-repo `watch<bool>` subscribed through `unresolved_watches_for`: a task waits for a candidate source repo's manifest commit before mounting from it. ECR requires a committed manifest in the source repo for mount to succeed (201), and returns 202 (Not Fulfilled) otherwise, so `committed_mount_sources` offers only repos whose manifest is committed. Uses `watch` (not `Notify`) because committed status is boolean state, not an event -- `watch` retains the last value so late subscribers always see it.
 
 ## Manifest commit gating (ECR consistency window)
 
@@ -43,16 +43,16 @@ Production default: 30s. Tests default to `Duration::ZERO` via `fast_retry()` so
 
 ## Synchronization contracts (critical)
 
-- Per-blob `Notify::notify_waiters()` does NOT store permits. Every code path that transitions a blob out of `InProgress` MUST call `notify_blob`. Same applies to `BlobStage::notify_staged` / `notify_failed` for source-pull dedup. Missing notify = deadlock for concurrent waiters.
-- Per-repo `watch::Sender::send(true)` is called by `mark_repo_committed` (success) and `notify_repo_failed` (failure). Unlike Notify, watch retains state -- late subscribers see the value immediately. No lost-signal risk.
-- Leaders MUST NOT wait on `repo_committed_watch` for other leaders. Multiple images can be elected as leaders when they share distinct blob subsets with different followers. If leader A waits for leader B's manifest commit while B waits for A's, the circular dependency deadlocks the engine. Leaders detect themselves via `preferred_mount_sources.contains(target_repo)` and skip the wait in `resolve_mount_source`, falling through to a direct mount attempt (202 on ECR triggers HEAD+push fallback).
+- Per-blob `Notify::notify_waiters()` does NOT store permits. Every path that ends an upload claim MUST call `release_blob_claim`, which notifies `claim_notify`. Source-pull dedup in staging holds a `ClaimGuard` from `shared.rs`, whose drop wakes waiters; drop it once the blob is staged or the pull fails. Missing notify = deadlock for concurrent waiters.
+- Per-repo `watch::Sender::send_replace(true)` is called by `mark_repo_committed` (success) and `notify_repo_failed` (failure). Use `send_replace`, not `send`: `send` drops the value when no receiver exists yet, so a follower subscribing later would miss it. Stored that way, late subscribers see the value immediately.
+- No wait on another image's manifest commit may be unbounded. Multiple images can be elected as leaders when they share distinct blob subsets with different followers, so commit waits can form a cycle (A waits for B while B waits for A). `resolve_mount_source` waits at most `mount_source_wait_deadline` (default 60s) per blob, then falls back to push. Do not add a commit wait outside it.
 - **Semaphore safety boundary (enforced via function signature).** External waits (`Notify::notified()`, `watch::wait_for()`) MUST NOT hold the per-image blob semaphore. If all `BLOB_CONCURRENCY` permits are consumed by external waits, no other blob can make progress, creating a deadlock. After the semaphore is acquired, `run_under_semaphore` takes `BlobIoContext` (not `TransferContext`), so `TransferContext` (and its cache read/wait methods) is unreachable. `BlobSink` only exposes write/signal methods. All external waits happen in the pre-semaphore phase: `wait_for_blob_claim` (blob claim), `resolve_mount_source` (repo-committed watch), `resolve_staging` (staging dedup).
 
 ## Transfer state cache
 
 - Two-tier: hot (in-memory) + warm (persistent disk, binary postcard + CRC32).
-- Only `ExistsAtTarget` and `Completed` persisted; transient states stripped.
-- Progressive population: HEAD checks inline during execution, not upfront batch.
+- Only `Verified` and `Completed` persisted; `Uploading` and `Failed` are stripped.
+- Progressive population: existence checks run during execution, per image. A target with a batch checker (ECR) checks all of an image's blobs in one call before the per-blob loop; otherwise each blob gets a HEAD inline.
 - Lazy invalidation: stale entries self-heal on mount/push failure.
 
 ## Blob staging

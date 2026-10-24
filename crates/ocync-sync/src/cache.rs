@@ -133,7 +133,7 @@ pub struct TransferStateCache {
     committed_repos: HashMap<String, HashSet<RepositoryName>>,
     /// Runtime-only: per-(target, repo) `watch` channel that transitions from
     /// `false` to `true` when the repo's manifest commits or fails. Followers
-    /// subscribe via `repo_committed_watch` and call `wait_for(|&v| v).await`.
+    /// subscribe via `unresolved_watches_for` and call `wait_for(|&v| v).await`.
     /// Fresh each run.
     repo_committed_watches: HashMap<String, HashMap<RepositoryName, watch::Sender<bool>>>,
 }
@@ -218,7 +218,7 @@ impl TransferStateCache {
 
     /// `Watch::Receivers` for repos that:
     ///   1. Have the blob with state in {Verified, Completed, Uploading} (NOT Failed)
-    ///   2. Have not yet had their `repo_committed_watch` fire
+    ///   2. Have not yet had their manifest-commit watch fire
     ///
     /// Used by the resolver to subscribe only to repos still able to become a
     /// committed mount source.
@@ -275,20 +275,6 @@ impl TransferStateCache {
             .entry(repo.clone())
             .or_insert_with(|| watch::channel(false).0);
         tx.send_replace(true);
-    }
-
-    /// Subscribe to a repo's manifest-commit watch.
-    pub fn repo_committed_watch(
-        &mut self,
-        target: &str,
-        repo: &RepositoryName,
-    ) -> watch::Receiver<bool> {
-        self.repo_committed_watches
-            .entry(target.to_owned())
-            .or_default()
-            .entry(repo.clone())
-            .or_insert_with(|| watch::channel(false).0)
-            .subscribe()
     }
 
     /// Whether a repo is committed at the target.
@@ -682,33 +668,31 @@ mod tests {
         assert!(!cache.is_repo_committed("reg.io", &repo("repo/b")));
     }
 
-    #[test]
-    fn repo_committed_watch_late_subscriber_sees_true() {
-        let mut cache = TransferStateCache::new();
-        cache.mark_repo_committed("reg.io", &repo("repo/a"));
-        let rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-        assert!(*rx.borrow());
-    }
-
     #[tokio::test(flavor = "current_thread")]
-    async fn repo_committed_wait_for_returns_on_late_subscribe() {
-        let mut cache = TransferStateCache::new();
-        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+    async fn commit_or_failure_resolves_a_repo_watch() {
+        type Signal = fn(&mut TransferStateCache, &str, &RepositoryName);
+        let signals: [(&str, Signal); 2] = [
+            ("committed", TransferStateCache::mark_repo_committed),
+            ("failed", TransferStateCache::notify_repo_failed),
+        ];
+        for (name, signal) in signals {
+            let mut cache = TransferStateCache::new();
+            cache.set_blob_verified("reg.io", digest(), repo("repo/a"));
+            let mut waiting = cache.unresolved_watches_for("reg.io", &digest(), &repo("repo/b"));
+            assert_eq!(waiting.len(), 1, "{name}: repo/a is unresolved");
 
-        let mut rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-        let result = rx.wait_for(|&v| v).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn repo_failed_wait_for_returns_on_late_subscribe() {
-        let mut cache = TransferStateCache::new();
-        cache.notify_repo_failed("reg.io", &repo("repo/a"));
-
-        let mut rx = cache.repo_committed_watch("reg.io", &repo("repo/a"));
-        let result = rx.wait_for(|&v| v).await;
-        assert!(result.is_ok());
-        assert!(!cache.is_repo_committed("reg.io", &repo("repo/a")));
+            signal(&mut cache, "reg.io", &repo("repo/a"));
+            assert!(
+                waiting.pop().unwrap().wait_for(|&v| v).await.is_ok(),
+                "{name}: a subscriber from before the signal is woken"
+            );
+            assert!(
+                cache
+                    .unresolved_watches_for("reg.io", &digest(), &repo("repo/b"))
+                    .is_empty(),
+                "{name}: a subscriber after the signal finds nothing to wait on"
+            );
+        }
     }
 
     #[test]
