@@ -1,0 +1,67 @@
+name: Bill of materials
+description: >-
+  Write the CycloneDX bill of materials for an ocync binary or image with syft
+  and tools/sbom and, for a binary, attest it. Needs rustup on PATH.
+
+inputs:
+  subject:
+    description: Binary path, or a local image reference for an image
+    required: true
+  kind:
+    description: binary or image
+    required: true
+  crypto:
+    description: AWS-LC build the binary must link (fips or non-fips)
+    required: true
+  attest:
+    description: attest or skip; attesting a binary needs id-token and attestations write
+    required: false
+    default: skip
+
+outputs:
+  path:
+    description: Path to the finished CycloneDX JSON document
+    value: ${{ steps.finish.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      with:
+        tool: syft@1.55.0
+
+    - id: finish
+      shell: bash
+      env:
+        SUBJECT: ${{ inputs.subject }}
+        KIND: ${{ inputs.kind }}
+        CRYPTO: ${{ inputs.crypto }}
+      run: |
+        set -euo pipefail
+        case "$KIND" in
+          binary)
+            source="file:$SUBJECT"
+            binary="$SUBJECT"
+            path="$SUBJECT.cdx.json"
+            ;;
+          image)
+            source="docker:$SUBJECT"
+            binary="$RUNNER_TEMP/ocync-from-image"
+            container="$(docker create "$SUBJECT")"
+            docker cp "$container:/usr/local/bin/ocync" "$binary"
+            docker rm "$container" > /dev/null
+            path="image-$(docker image inspect --format '{{.Architecture}}' "$SUBJECT").cdx.json"
+            ;;
+          *) echo "::error::kind must be binary or image, got $KIND"; exit 1 ;;
+        esac
+        raw="$RUNNER_TEMP/$(basename "$path").raw"
+        syft scan "$source" --output "cyclonedx-json=$raw"
+        cargo run --locked --quiet -p sbom -- \
+          --crypto "$CRYPTO" --binary "$binary" --raw "$raw" --out "$path"
+        echo "path=$path" >> "$GITHUB_OUTPUT"
+
+    - if: inputs.kind == 'binary' && inputs.attest == 'attest'
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      with:
+        subject-path: ${{ inputs.subject }}
+        sbom-path: ${{ steps.finish.outputs.path }}

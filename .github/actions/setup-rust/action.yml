@@ -6,6 +6,10 @@ inputs:
     description: Additional components to install
     required: false
     default: ""
+  cargo-auditable:
+    description: install or skip cargo-auditable, which embeds the dependency list in release binaries
+    required: false
+    default: skip
 
 runs:
   using: composite
@@ -26,6 +30,12 @@ runs:
       with:
         toolchain: "1.95"
         components: ${{ inputs.components }}
+
+    # Keep in step with the version the Dockerfile installs.
+    - if: inputs.cargo-auditable == 'install'
+      uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      with:
+        tool: cargo-auditable@0.7.7
 
     - name: Cache cargo registry
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

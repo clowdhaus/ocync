@@ -34,6 +34,7 @@ jobs:
               - '**/Cargo.toml'
               - '**/Cargo.lock'
               - '.github/workflows/docker.yml'
+              - '.github/actions/sbom/**'
 
   build:
     name: Build
@@ -43,4 +44,10 @@ jobs:
       - if: needs.changes.outputs.docker == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: needs.changes.outputs.docker == 'true'
-        run: docker build .
+        run: docker build --tag ocync:check .
+      - if: needs.changes.outputs.docker == 'true'
+        uses: ./.github/actions/sbom
+        with:
+          subject: ocync:check
+          kind: image
+          crypto: fips

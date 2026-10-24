@@ -65,19 +65,29 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust
+        with:
+          cargo-auditable: install
       - name: Build
         env:
           CARGO_BUILD_RUSTFLAGS: "-C target-feature=+crt-static"
           CARGO_BUILD_TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked
+        run: cargo auditable build --release --locked
       - name: Verify static binary
         run: "! readelf -d target/${{ matrix.target }}/release/ocync | grep -q NEEDED"
       - name: Rename binary
         run: mv target/${{ matrix.target }}/release/ocync ${{ matrix.artifact }}
+      - uses: ./.github/actions/sbom
+        with:
+          subject: ${{ matrix.artifact }}
+          kind: binary
+          crypto: fips
+          attest: attest
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.cdx.json
 
   build-macos:
     name: Build macOS (arm64)
@@ -86,14 +96,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust
+        with:
+          cargo-auditable: install
       - name: Build
-        run: cargo build --release --locked --no-default-features --features non-fips
+        run: cargo auditable build --release --locked --no-default-features --features non-fips
       - name: Rename binary
         run: mv target/release/ocync ocync-macos-arm64
+      - uses: ./.github/actions/sbom
+        with:
+          subject: ocync-macos-arm64
+          kind: binary
+          crypto: non-fips
+          attest: attest
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ocync-macos-arm64
-          path: ocync-macos-arm64
+          path: |
+            ocync-macos-arm64
+            ocync-macos-arm64.cdx.json
 
   build-windows:
     name: Build Windows (amd64)
@@ -102,15 +122,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust
+        with:
+          cargo-auditable: install
       - name: Build
-        run: cargo build --release --locked --no-default-features --features non-fips
+        run: cargo auditable build --release --locked --no-default-features --features non-fips
       - name: Rename binary
         shell: bash
         run: mv target/release/ocync.exe ocync-windows-amd64.exe
+      - uses: ./.github/actions/sbom
+        with:
+          subject: ocync-windows-amd64.exe
+          kind: binary
+          crypto: non-fips
+          attest: attest
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ocync-windows-amd64
-          path: ocync-windows-amd64.exe
+          path: |
+            ocync-windows-amd64.exe
+            ocync-windows-amd64.exe.cdx.json
 
   docker:
     name: Docker (${{ matrix.suffix }})
@@ -127,6 +157,49 @@ jobs:
             suffix: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Image tag
+        env:
+          SUFFIX: ${{ matrix.suffix }}
+        run: echo "TAG=$ECR_REGISTRY/$IMAGE_NAME:${GITHUB_REF_NAME#v}-fips-$SUFFIX" >> "$GITHUB_ENV"
+      # Single-platform manifests, which `docker manifest create` needs.
+      - name: Build
+        run: docker build --provenance=false --sbom=false --tag "$TAG" .
+      - id: sbom
+        uses: ./.github/actions/sbom
+        with:
+          subject: ${{ env.TAG }}
+          kind: image
+          crypto: fips
+      - name: Save image
+        env:
+          SBOM: ${{ steps.sbom.outputs.path }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          mkdir image
+          docker save --output "image/$SUFFIX.tar" "$TAG"
+          mv "$SBOM" "image/$SUFFIX.cdx.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.suffix }}
+          path: image/
+
+  # Pushes only once every binary and image passed its bill of materials
+  # check, so a failed check leaves nothing in the registry.
+  docker-push:
+    name: Docker push
+    runs-on: ubuntu-24.04
+    needs:
+      - build-linux
+      - build-macos
+      - build-windows
+      - docker
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: image
+          pattern: image-*
+          merge-multiple: true
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -134,20 +207,23 @@ jobs:
           aws-region: us-east-1
       - name: Login to ECR Public
         run: aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
-      - name: Extract version
-        id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - name: Build and push
-        env:
-          TAG: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-fips-${{ matrix.suffix }}
+      - name: Push and attest bills of materials
         run: |
-          docker build --tag "$TAG" .
-          docker push "$TAG"
+          set -euo pipefail
+          for tar in image/*.tar; do
+            suffix="$(basename "$tar" .tar)"
+            tag="$ECR_REGISTRY/$IMAGE_NAME:${GITHUB_REF_NAME#v}-fips-$suffix"
+            docker load --input "$tar"
+            docker push "$tag"
+            digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$tag")"
+            cosign attest --yes --type cyclonedx --predicate "image/$suffix.cdx.json" \
+              "$ECR_REGISTRY/$IMAGE_NAME@$digest"
+          done
 
   docker-manifest:
     name: Docker manifest
     runs-on: ubuntu-24.04
-    needs: docker
+    needs: docker-push
     steps:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Configure AWS credentials
@@ -187,6 +263,23 @@ jobs:
         run: |
           cosign sign --yes "$REGISTRY:$VERSION-fips"
           cosign sign --yes "$REGISTRY:latest-fips"
+      # Provenance for each platform image and the index, stored on GitHub
+      # and keyed by digest, so `gh attestation verify oci://...` finds it
+      # for any of the tags.
+      - name: List image digests
+        env:
+          REGISTRY: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          for tag in "$VERSION-fips" "$VERSION-fips-amd64" "$VERSION-fips-arm64"; do
+            digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$REGISTRY:$tag")"
+            echo "${digest#sha256:}  $REGISTRY" >> image-digests.txt
+          done
+      - name: Attest image build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: image-digests.txt
 
   helm:
     name: Helm
@@ -224,6 +317,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
+          pattern: ocync-*
           merge-multiple: true
       - name: Generate checksums
         run: |
@@ -310,7 +404,7 @@ jobs:
 
             def caveats
               <<~CAVEATS
-                Linux builds use the AWS-LC FIPS module. Run `ocync version` for its NIST status.
+                Linux builds use the AWS-LC FIPS module. Run \`ocync version\` for its NIST status.
               CAVEATS
             end
           end

@@ -17,7 +17,7 @@ order: 5
 - `aws-lc-rs` is the only TLS provider. `ring`, `openssl` and `native-tls` are banned in `deny.toml`.
 - Linux release binaries are built with the `fips` feature, statically linked against glibc. See [FIPS 140-3](/fips).
 - Content digests use `aws-lc-rs` (`crates/ocync-distribution/src/sha256.rs`).
-- Release images are signed with cosign and carry a build provenance attestation. GitHub Actions are pinned to commit SHAs.
+- Release binaries and images carry build provenance and a bill of materials attestation. Images are also signed with cosign. GitHub Actions are pinned to commit SHAs.
 - The Docker base images (`cgr.dev/chainguard/rust:latest-dev`, `cgr.dev/chainguard/static:latest`) float by design so every build picks up Chainguard's patches. They are not pinned by digest.
 
 ## Dependency weight
@@ -44,11 +44,26 @@ At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the ins
 
 `ocync` links AWS-LC FIPS module 4, which AWS has submitted to NIST and which awaits certification. The docs name module 4 and its status, not a certificate it does not hold yet.
 
-## Releases carry a bill of materials
+## Releases carry a bill of materials and provenance
 
-> **Status: Planned.**
+Release binaries and the image's binary are built with `cargo auditable`, which embeds the dependency list in the binary, so scanners such as grype and trivy read it from the shipped artifact.
 
-Each release publishes a CycloneDX software bill of materials for the binaries and the image, signed and attested alongside the existing cosign signature and provenance.
+That embedded list comes from `cargo metadata`, which over-reports in two ways. It lists an optional dependency whenever a weak feature (`dep?/feature`, such as `quinn?/rustls-aws-lc-rs` in `reqwest`) names it, even when nothing enables it, and it resolves features across the whole workspace ([rust-lang/cargo#7754](https://github.com/rust-lang/cargo/issues/7754)), so it lists crates only other members compile. In the 0.8.2 FIPS build that adds 24 crates `ocync` does not compile: 22 that nothing in the workspace compiles, including `quinn`, `chrono` and `ring`, and 2 that `bench-proxy` and `xtask` bring in, `untrusted` 0.7 and `httpdate`. None of them leaves a source path in the binary, while compiled crates such as `rustls` and `tokio` do. A FIPS build also lists `aws-lc-sys`, which `rustls` resolves but the binary does not link: its only AWS-LC release string is the FIPS one.
+
+`tools/sbom` turns syft's CycloneDX output into the release bill of materials:
+
+- It keeps only the crates `cargo tree` compiles into `ocync` for that build, the same cross-check [cargo-auditable#210](https://github.com/rust-secure-code/cargo-auditable/pull/210) proposes upstream, and drops `aws-lc-sys` from a FIPS build.
+- It names the linked C library, read from the binary: `AWS-LC FIPS 4.2.0`, marked as FIPS 140-3 module 4, or `AWS-LC 5.11.0` (`pkg:github/aws/aws-lc@v5.11.0`).
+- It fails CI and the release when the binary links the wrong AWS-LC build, or when the bill of materials lacks `ocync` at the source tree's version, `aws-lc-rs` or the build's AWS-LC crate. That catches a binary built without its dependency list, a stale binary, and a FIPS binary built without the FIPS module.
+
+What ships:
+
+- Each binary has `<binary>.cdx.json`, attested on GitHub by the job that built it. `sha256sums.txt` and the build provenance cover the binaries and these documents.
+- Each platform image carries a cosign attestation of its bill of materials, which also lists the base image's packages. The multi-arch index carries none, since one document cannot describe two platforms.
+- Build provenance covers each platform image and the index, stored on GitHub and keyed by digest.
+- Nothing is pushed to the registry until every binary and image passes its check.
+
+Scanners that read the embedded list directly still see the dropped crates until cargo-auditable#210 ships, at which point the pinned cargo-auditable version is bumped.
 
 ## Owned Google authentication
 
