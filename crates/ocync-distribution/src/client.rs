@@ -14,8 +14,27 @@ use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
-/// The `user-agent` every ocync HTTP client sends.
-pub(crate) const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
+
+/// Build a no-redirect HTTP client for token-bearing requests.
+///
+/// Uses `redirect::Policy::none()` to prevent open-redirect SSRF: a
+/// 307 redirect from a malicious endpoint would forward credentials
+/// (realm auth headers, ACR exchange form bodies) to the redirect
+/// target. Also used by the ACR provider for exchange POSTs.
+pub(crate) fn no_redirect_http_client() -> reqwest::Client {
+    no_redirect_builder()
+        .build()
+        .expect("no-redirect HTTP client builder should not fail")
+}
+
+/// The builder behind [`no_redirect_http_client`], for a client that also
+/// sets its own timeouts, such as the AWS API client.
+pub(crate) fn no_redirect_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT_VALUE)
+        .redirect(reqwest::redirect::Policy::none())
+}
 
 /// Default cap on concurrent long-lived blob streams per registry.
 ///

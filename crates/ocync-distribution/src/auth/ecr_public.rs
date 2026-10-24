@@ -12,7 +12,7 @@
 //! ECR Public is a global service; the API endpoint is always in
 //! `us-east-1` regardless of where the caller runs.
 //!
-//! SDK credentials are cached with TTL and refreshed automatically
+//! Registry credentials are cached with TTL and refreshed automatically
 //! when they approach expiry, matching [`super::ecr::EcrAuth`]'s
 //! behavior for long-running processes (watch mode).
 
@@ -26,8 +26,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::Deserialize;
 
+use super::detect::ECR_PUBLIC_HOST as REGISTRY;
 use super::ecr::{
-    AuthorizationData, EcrApi, EcrTokenResponse, Expiry, SdkCredentialCache, validate_ecr_token,
+    AuthorizationData, CredentialCache, EcrApi, EcrTokenResponse, Expiry, validate_ecr_token,
 };
 use super::token_cache::TokenCache;
 use super::token_exchange;
@@ -36,9 +37,6 @@ use crate::error::Error;
 
 /// Default ECR Public token lifetime (12 hours).
 const ECR_PUBLIC_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
-
-/// The ECR Public registry hostname.
-const REGISTRY: &str = "public.ecr.aws";
 
 /// Default [`EcrApi`], calling ECR Public through [`crate::aws::Client`].
 #[derive(Debug)]
@@ -71,7 +69,7 @@ impl EcrApi for AwsEcrPublicApi {
                 .client
                 .call(&GetAuthorizationToken {})
                 .await
-                .map_err(|e| e.into_auth_failed(REGISTRY))?;
+                .map_err(|e| Error::auth_failed(REGISTRY, e))?;
 
             let auth_data = output.authorization_data.ok_or_else(|| Error::AuthFailed {
                 registry: REGISTRY.to_owned(),
@@ -140,7 +138,7 @@ fn decode_ecr_credentials(
 /// targeting `us-east-1`), then uses them as HTTP Basic credentials in
 /// the standard OCI Bearer token exchange flow.
 ///
-/// SDK credentials are cached via [`SdkCredentialCache`] with the same
+/// Registry credentials are cached via [`CredentialCache`] with the same
 /// read-lock fast path / write-lock refresh pattern as
 /// [`super::ecr::EcrAuth`], supporting long-running processes (watch mode).
 ///
@@ -152,10 +150,10 @@ pub struct EcrPublicAuth {
     base_url: String,
     /// HTTP client for OCI token exchange.
     http: reqwest::Client,
-    /// ECR Public SDK API for credential refresh.
+    /// ECR Public API for credential refresh.
     api: Box<dyn EcrApi>,
-    /// Cached SDK credentials (username/password) with TTL-based refresh.
-    sdk_credential_cache: SdkCredentialCache<Credentials>,
+    /// Cached registry credentials (username/password) with TTL-based refresh.
+    credential_cache: CredentialCache<Credentials>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
@@ -183,13 +181,13 @@ impl EcrPublicAuth {
             .await;
 
         let client = crate::aws::Client::new(&config, crate::aws::Service::EcrPublic)
-            .map_err(|e| e.into_auth_failed(REGISTRY))?;
+            .map_err(|e| Error::auth_failed(REGISTRY, e))?;
 
         Ok(Self {
             base_url: format!("https://{REGISTRY}"),
             http,
             api: Box::new(AwsEcrPublicApi { client }),
-            sdk_credential_cache: SdkCredentialCache::new(),
+            credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         })
@@ -206,17 +204,17 @@ impl EcrPublicAuth {
             base_url: base_url.into(),
             http,
             api: Box::new(api),
-            sdk_credential_cache: SdkCredentialCache::new(),
+            credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 
-    /// Get or refresh SDK credentials from `GetAuthorizationToken`.
+    /// Get or refresh registry credentials from `GetAuthorizationToken`.
     async fn ensure_credentials(&self) -> Result<Credentials, Error> {
-        self.sdk_credential_cache
-            .get_or_refresh("ecr-public-sdk-credential", async {
-                tracing::debug!("ECR Public SDK credentials expired or missing, refreshing");
+        self.credential_cache
+            .get_or_refresh("ecr-public-credential", async {
+                tracing::debug!("ECR Public registry credentials expired or missing, refreshing");
                 let response = self.api.get_authorization_token().await.map_err(|e| {
                     tracing::warn!(error = %e, "ECR Public GetAuthorizationToken failed");
                     e
@@ -225,7 +223,7 @@ impl EcrPublicAuth {
                     decode_ecr_credentials(&response.encoded_token, response.expires_in)?;
                 tracing::debug!(
                     ttl_secs = ttl.as_secs(),
-                    "ECR Public SDK credentials refreshed"
+                    "ECR Public registry credentials refreshed"
                 );
                 Ok((credentials, ttl))
             })
@@ -247,7 +245,7 @@ impl AuthProvider for EcrPublicAuth {
             let key = scopes_cache_key(&scopes);
             self.tokens
                 .get_or_fetch(key.clone(), || async {
-                    // Ensure SDK credentials are fresh before token exchange.
+                    // Ensure registry credentials are fresh before token exchange.
                     let credentials = self.ensure_credentials().await?;
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
                     let cached_challenge = self.challenge_cache.get().await;
@@ -276,8 +274,8 @@ impl AuthProvider for EcrPublicAuth {
             tracing::debug!(base_url = %self.base_url, entries, "invalidating ECR Public token cache");
             self.tokens.clear().await;
             self.challenge_cache.clear().await;
-            // Also clear SDK credentials so they are re-fetched on next use.
-            self.sdk_credential_cache.clear().await;
+            // Also clear registry credentials so they are re-fetched on next use.
+            self.credential_cache.clear().await;
         })
     }
 }
@@ -423,8 +421,8 @@ mod tests {
             mock.mount(&server).await;
         }
 
-        // Only one SDK response available. If the second get_token call
-        // re-fetches SDK credentials it will fail, proving they were cached.
+        // Only one API response available. If the second get_token call
+        // re-fetches registry credentials it will fail, proving they were cached.
         let encoded = BASE64.encode("AWS:once");
         let auth = EcrPublicAuth::with_api(
             server.uri(),
@@ -465,16 +463,16 @@ mod tests {
             ]),
         );
 
-        // First call fetches SDK credentials (TTL=1s).
+        // First call fetches registry credentials (TTL=1s).
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
 
-        // Wait for SDK credentials to expire.
+        // Wait for registry credentials to expire.
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Clear Bearer token cache so the next call re-checks SDK credentials.
+        // Clear Bearer token cache so the next call re-checks registry credentials.
         auth.invalidate().await;
 
-        // Second call should refresh SDK credentials from the mock queue.
+        // Second call should refresh registry credentials from the mock queue.
         // If it doesn't, the expired credentials will still work for token
         // exchange (the mock server doesn't validate credentials), but the
         // ensure_credentials path will have been exercised.
@@ -516,7 +514,7 @@ mod tests {
         );
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.invalidate().await;
-        // After invalidation: SDK creds re-fetched, challenge cache cleared,
+        // After invalidation: registry creds re-fetched, challenge cache cleared,
         // Bearer cache cleared. /v2/ is pinged again.
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }

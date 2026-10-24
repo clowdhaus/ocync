@@ -107,8 +107,12 @@ pub(super) struct Endpoint {
 
 impl Endpoint {
     /// Parse an endpoint URL from configuration or from the rules below.
+    ///
+    /// Requests go to the endpoint's path joined with the operation path
+    /// `/`, so `https://gw.example/ecr` is called at `/ecr/`. A query is
+    /// dropped with a warning. Both are what the SDK does.
     pub(super) fn parse(text: &str) -> Result<Self, ConfigError> {
-        let url = Url::parse(text).map_err(|source| ConfigError::InvalidEndpoint {
+        let mut url = Url::parse(text).map_err(|source| ConfigError::InvalidEndpoint {
             url: text.to_owned(),
             source,
         })?;
@@ -117,6 +121,12 @@ impl Endpoint {
                 url: text.to_owned(),
             });
         }
+        if let Some(query) = url.query() {
+            tracing::warn!(query, "a query in an AWS endpoint URL is ignored");
+        }
+        url.set_query(None);
+        let path = format!("{}/", url.path().trim_end_matches('/'));
+        url.set_path(&path);
         let host = url
             .host_str()
             .expect("an http or https URL has a host")
@@ -141,7 +151,7 @@ impl Endpoint {
 
 /// Whether to use a FIPS 140 endpoint (`AWS_USE_FIPS_ENDPOINT`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FipsEndpoint {
+pub(super) enum Fips {
     /// Use the FIPS endpoint.
     On,
     /// Use the standard endpoint.
@@ -150,7 +160,7 @@ pub(super) enum FipsEndpoint {
 
 /// Whether to use an IPv4 and IPv6 endpoint (`AWS_USE_DUALSTACK_ENDPOINT`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DualStackEndpoint {
+pub(super) enum DualStack {
     /// Use the dual-stack endpoint.
     On,
     /// Use the IPv4 endpoint.
@@ -162,47 +172,45 @@ pub(super) enum DualStackEndpoint {
 pub(super) fn resolve(
     service: Service,
     region: &str,
-    fips: FipsEndpoint,
-    dual_stack: DualStackEndpoint,
+    fips: Fips,
+    dual_stack: DualStack,
     endpoint_url: Option<Endpoint>,
 ) -> Result<Endpoint, ConfigError> {
     if let Some(url) = endpoint_url {
         return match (fips, dual_stack) {
-            (FipsEndpoint::On, _) => Err(ConfigError::FipsWithEndpointUrl),
-            (_, DualStackEndpoint::On) => Err(ConfigError::DualStackWithEndpointUrl),
-            (FipsEndpoint::Off, DualStackEndpoint::Off) => Ok(url),
+            (Fips::On, _) => Err(ConfigError::FipsWithEndpointUrl),
+            (_, DualStack::On) => Err(ConfigError::DualStackWithEndpointUrl),
+            (Fips::Off, DualStack::Off) => Ok(url),
         };
     }
     let p = partition(region);
     let (dns, dual) = (p.dns_suffix, p.dual_stack_dns_suffix);
     Endpoint::parse(&match (service, fips, dual_stack) {
-        (Service::Ecr, FipsEndpoint::On, DualStackEndpoint::On) => {
+        (Service::Ecr, Fips::On, DualStack::On) => {
             format!("https://ecr-fips.{region}.{dual}")
         }
-        (Service::Ecr, FipsEndpoint::On, DualStackEndpoint::Off) => {
+        (Service::Ecr, Fips::On, DualStack::Off) => {
             format!("https://api.ecr-fips.{region}.{dns}")
         }
-        (Service::Ecr, FipsEndpoint::Off, DualStackEndpoint::On) => {
+        (Service::Ecr, Fips::Off, DualStack::On) => {
             format!("https://ecr.{region}.{dual}")
         }
-        (Service::Ecr, FipsEndpoint::Off, DualStackEndpoint::Off) => {
+        (Service::Ecr, Fips::Off, DualStack::Off) => {
             format!("https://api.ecr.{region}.{dns}")
         }
-        (Service::EcrPublic, FipsEndpoint::On, DualStackEndpoint::On) => {
+        (Service::EcrPublic, Fips::On, DualStack::On) => {
             format!("https://api.ecr-public-fips.{region}.{dual}")
         }
-        (Service::EcrPublic, FipsEndpoint::On, DualStackEndpoint::Off) => {
+        (Service::EcrPublic, Fips::On, DualStack::Off) => {
             format!("https://api.ecr-public-fips.{region}.{dns}")
         }
-        (Service::EcrPublic, FipsEndpoint::Off, DualStackEndpoint::On)
-            if p.id == PartitionId::Aws =>
-        {
+        (Service::EcrPublic, Fips::Off, DualStack::On) if p.id == PartitionId::Aws => {
             format!("https://ecr-public.{region}.api.aws")
         }
-        (Service::EcrPublic, FipsEndpoint::Off, DualStackEndpoint::On) => {
+        (Service::EcrPublic, Fips::Off, DualStack::On) => {
             format!("https://api.ecr-public.{region}.{dual}")
         }
-        (Service::EcrPublic, FipsEndpoint::Off, DualStackEndpoint::Off) => {
+        (Service::EcrPublic, Fips::Off, DualStack::Off) => {
             format!("https://api.ecr-public.{region}.{dns}")
         }
     })
@@ -218,10 +226,10 @@ mod tests {
     /// or fixed.
     #[test]
     fn matches_the_sdk_endpoint_rule_tests() {
-        use DualStackEndpoint as D;
-        use FipsEndpoint as F;
+        use DualStack as D;
+        use Fips as F;
         use Service::{Ecr, EcrPublic};
-        let cases: &[(Service, &str, FipsEndpoint, DualStackEndpoint, &str)] = &[
+        let cases: &[(Service, &str, Fips, DualStack, &str)] = &[
             (
                 Ecr,
                 "us-east-1",
@@ -510,8 +518,8 @@ mod tests {
     fn resolved(
         service: Service,
         region: &str,
-        fips: FipsEndpoint,
-        dual_stack: DualStackEndpoint,
+        fips: Fips,
+        dual_stack: DualStack,
         endpoint_url: Option<&str>,
     ) -> Result<String, String> {
         let endpoint_url = endpoint_url.map(|u| Endpoint::parse(u).unwrap());
@@ -525,34 +533,15 @@ mod tests {
         for service in [Service::Ecr, Service::EcrPublic] {
             let url = Some("https://example.com");
             assert_eq!(
-                resolved(
-                    service,
-                    "us-east-1",
-                    FipsEndpoint::Off,
-                    DualStackEndpoint::Off,
-                    url
-                )
-                .as_deref(),
+                resolved(service, "us-east-1", Fips::Off, DualStack::Off, url).as_deref(),
                 Ok("https://example.com")
             );
             assert_eq!(
-                resolved(
-                    service,
-                    "us-east-1",
-                    FipsEndpoint::On,
-                    DualStackEndpoint::Off,
-                    url
-                ),
+                resolved(service, "us-east-1", Fips::On, DualStack::Off, url),
                 Err("Invalid Configuration: FIPS and custom endpoint are not supported".into())
             );
             assert_eq!(
-                resolved(
-                    service,
-                    "us-east-1",
-                    FipsEndpoint::Off,
-                    DualStackEndpoint::On,
-                    url
-                ),
+                resolved(service, "us-east-1", Fips::Off, DualStack::On, url),
                 Err(
                     "Invalid Configuration: Dualstack and custom endpoint are not supported".into()
                 )
@@ -565,14 +554,7 @@ mod tests {
     #[test]
     fn an_unknown_region_falls_back_to_the_aws_partition() {
         assert_eq!(
-            resolved(
-                Service::Ecr,
-                "xx-mars-1",
-                FipsEndpoint::Off,
-                DualStackEndpoint::Off,
-                None
-            )
-            .as_deref(),
+            resolved(Service::Ecr, "xx-mars-1", Fips::Off, DualStack::Off, None).as_deref(),
             Ok("https://api.ecr.xx-mars-1.amazonaws.com")
         );
     }
@@ -594,8 +576,9 @@ mod tests {
         ] {
             assert_eq!(Endpoint::parse(text).unwrap_err().to_string(), error);
         }
-        let endpoint = Endpoint::parse("http://127.0.0.1:8080/base").unwrap();
+        let endpoint = Endpoint::parse("http://127.0.0.1:8080/base?x=1").unwrap();
         assert_eq!(endpoint.host(), "127.0.0.1:8080");
+        assert_eq!(endpoint.url().as_str(), "http://127.0.0.1:8080/base/");
         assert_eq!(
             Endpoint::parse("https://example.com:443").unwrap().host(),
             "example.com"

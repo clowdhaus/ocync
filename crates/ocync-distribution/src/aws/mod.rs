@@ -2,7 +2,7 @@
 //!
 //! Signing, endpoint resolution, retries, clock-skew correction and error
 //! parsing are owned here. Credentials and the FIPS, dual-stack, endpoint URL
-//! and attempt settings still come from `aws-config`'s [`SdkConfig`].
+//! and attempt settings still come from `aws-config`'s `SdkConfig`.
 
 mod endpoint;
 mod sigv4;
@@ -21,10 +21,9 @@ use http::{HeaderMap, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use self::endpoint::{DualStackEndpoint, Endpoint, FipsEndpoint};
-use crate::auth::ecr::SdkCredentialCache;
-use crate::error::Error;
-use crate::retry::{Transient, is_transient_transport, retrying};
+use self::endpoint::{DualStack, Endpoint, Fips};
+use crate::auth::ecr::{CredentialCache, remaining};
+use crate::retry::{MAX_TRANSIENT_RETRIES, Transient, is_transient_transport, retrying};
 
 /// The content type of the AWS JSON 1.1 protocol both APIs speak.
 const AWS_JSON_1_1: &str = "application/x-amz-json-1.1";
@@ -36,13 +35,19 @@ const X_AMZ_TARGET: &str = "x-amz-target";
 /// surfaces in seconds. It is the SDK's value.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
 
+/// A response that sends nothing for this long fails, so a stalled proxy
+/// or server cannot hold a call forever. It is the SDK's stalled-stream
+/// grace period.
+const STALL_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Attempts per call when the configuration sets none, as in the SDK.
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
 /// A credential load that takes longer fails. This is the SDK's bound for
 /// its default retry and connect settings: backoffs of 1 and 2 seconds plus
 /// three attempts of twice [`CONNECT_TIMEOUT`].
-const CREDENTIALS_LOAD_TIMEOUT: Duration = Duration::from_millis(21_600);
+const CREDENTIALS_LOAD_TIMEOUT: Duration =
+    Duration::from_millis(1_000 + 2_000 + 3 * 2 * CONNECT_TIMEOUT.as_millis() as u64);
 
 /// How long a credential without an expiry is reused, as the SDK's identity
 /// cache does.
@@ -56,7 +61,7 @@ const SKEW_THRESHOLD: Duration = Duration::from_secs(4 * 60);
 const MAX_MEASURED_ROUND_TRIP: Duration = Duration::from_secs(15 * 60);
 
 /// Statuses the SDK re-sends whatever the error code.
-const RETRYABLE_STATUSES: &[StatusCode] = &[
+const TRANSIENT_STATUSES: &[StatusCode] = &[
     StatusCode::TOO_MANY_REQUESTS,
     StatusCode::INTERNAL_SERVER_ERROR,
     StatusCode::BAD_GATEWAY,
@@ -182,16 +187,6 @@ pub(crate) enum ConfigError {
     HttpClient(#[source] reqwest::Error),
 }
 
-impl ConfigError {
-    /// This failure as the crate error an auth provider for `registry` returns.
-    pub(crate) fn into_auth_failed(self, registry: &str) -> Error {
-        Error::AuthFailed {
-            registry: registry.to_owned(),
-            reason: self.to_string(),
-        }
-    }
-}
-
 /// What an AWS error code means for the request that drew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeKind {
@@ -298,7 +293,9 @@ impl ClockSkew {
         if round_trip > MAX_MEASURED_ROUND_TRIP {
             return None;
         }
-        let millis = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
+        let millis = |d: Duration| {
+            i64::try_from(d.as_millis()).expect("a skew within year 9999 fits i64 milliseconds")
+        };
         Some(match server.duration_since(sent + round_trip / 2) {
             Ok(ahead) => Self(millis(ahead)),
             Err(behind) => Self(-millis(behind.duration())),
@@ -410,7 +407,7 @@ impl Transient for Failure {
         match self {
             Self::Transport(e) => is_transient_transport(e),
             Self::Service(e) => {
-                RETRYABLE_STATUSES.contains(&e.status)
+                TRANSIENT_STATUSES.contains(&e.status)
                     || e.code
                         .as_ref()
                         .is_some_and(|c| c.kind == CodeKind::Transient)
@@ -431,21 +428,11 @@ pub(crate) struct CallError {
     source: Failure,
 }
 
-impl CallError {
-    /// This failure as the crate error an auth provider for `registry` returns.
-    pub(crate) fn into_auth_failed(self, registry: &str) -> Error {
-        Error::AuthFailed {
-            registry: registry.to_owned(),
-            reason: self.to_string(),
-        }
-    }
-}
-
 /// A client for one AWS JSON API in one region.
 pub(crate) struct Client {
     http: reqwest::Client,
     provider: SharedCredentialsProvider,
-    credentials: SdkCredentialCache<Credentials>,
+    credentials: CredentialCache<Credentials>,
     /// The last [`ClockSkew`] measured, which every signature corrects for.
     skew: AtomicI64,
     max_attempts: u32,
@@ -490,18 +477,33 @@ impl Client {
             .map(|url| Endpoint::parse(&url))
             .transpose()?;
         let fips = match config.use_fips() {
-            Some(true) => FipsEndpoint::On,
-            _ => FipsEndpoint::Off,
+            Some(true) => Fips::On,
+            _ => Fips::Off,
         };
         let dual_stack = match config.use_dual_stack() {
-            Some(true) => DualStackEndpoint::On,
-            _ => DualStackEndpoint::Off,
+            Some(true) => DualStack::On,
+            _ => DualStack::Off,
         };
         let endpoint = endpoint::resolve(service, &region, fips, dual_stack, endpoint_url)?;
         let max_attempts = config
             .retry_config()
             .map_or(DEFAULT_MAX_ATTEMPTS, |r| r.max_attempts());
-        Self::with_endpoint(provider, service, region, endpoint, max_attempts)
+        if max_attempts > MAX_TRANSIENT_RETRIES + 1 {
+            tracing::warn!(
+                %service,
+                configured = max_attempts,
+                used = MAX_TRANSIENT_RETRIES + 1,
+                "AWS max attempts is above what ocync makes; using the lower count"
+            );
+        }
+        Self::with_endpoint(
+            provider,
+            service,
+            region,
+            endpoint,
+            max_attempts,
+            STALL_TIMEOUT,
+        )
     }
 
     fn with_endpoint(
@@ -510,18 +512,20 @@ impl Client {
         region: String,
         endpoint: Endpoint,
         max_attempts: u32,
+        stall_timeout: Duration,
     ) -> Result<Self, ConfigError> {
         crate::install_crypto_provider();
         // Signed requests never follow a redirect: the signature names the
         // host it was made for.
-        let http = crate::auth::token_exchange::no_redirect_builder()
+        let http = crate::client::no_redirect_builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(stall_timeout)
             .build()
             .map_err(ConfigError::HttpClient)?;
         Ok(Self {
             http,
             provider,
-            credentials: SdkCredentialCache::new(),
+            credentials: CredentialCache::new(),
             skew: AtomicI64::new(0),
             max_attempts,
             service,
@@ -553,10 +557,7 @@ impl Client {
     async fn send<T: DeserializeOwned>(&self, target: &str, body: Bytes) -> Result<T, Failure> {
         let credentials = self.credentials().await?;
         let headers = [("content-type", AWS_JSON_1_1), (X_AMZ_TARGET, target)];
-        let signed_headers: Vec<(&str, &str)> = headers
-            .into_iter()
-            .chain([("host", self.endpoint.host())])
-            .collect();
+        let signed_headers = [headers[0], headers[1], ("host", self.endpoint.host())];
         let sent = SystemTime::now();
         let skew = ClockSkew(self.skew.load(Ordering::Relaxed));
         let signed = sigv4::sign(
@@ -624,11 +625,7 @@ impl Client {
                 )
                 .await
                 .map_err(|_| CredentialsError::provider_timed_out(CREDENTIALS_LOAD_TIMEOUT))??;
-                let ttl = loaded.expiry().map_or(DEFAULT_EXPIRATION, |expiry| {
-                    expiry
-                        .duration_since(SystemTime::now())
-                        .unwrap_or(Duration::ZERO)
-                });
+                let ttl = loaded.expiry().map_or(DEFAULT_EXPIRATION, remaining);
                 Ok((loaded, ttl))
             })
             .await
@@ -677,6 +674,7 @@ mod tests {
             "us-east-1".into(),
             Endpoint::parse(&server.uri()).unwrap(),
             max_attempts,
+            STALL_TIMEOUT,
         )
         .unwrap()
     }
@@ -718,6 +716,7 @@ mod tests {
             "us-east-1".into(),
             Endpoint::parse(&server.uri()).unwrap(),
             DEFAULT_MAX_ATTEMPTS,
+            STALL_TIMEOUT,
         )
         .unwrap();
         assert_eq!(
@@ -739,7 +738,7 @@ mod tests {
     /// ECR answers a throttle with 400 and `ThrottlingException`, which the
     /// SDK re-sends, up to the configured attempts (`AWS_MAX_ATTEMPTS`) and
     /// no further: one attempt means no retry at all.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn retries_a_throttle_up_to_the_configured_attempts() {
         for (max_attempts, sent) in [(3, 3), (1, 1)] {
             let server = MockServer::start().await;
@@ -777,6 +776,38 @@ mod tests {
                 .unwrap(),
             ProbeOutput { ok: true }
         );
+    }
+
+    /// A server or proxy that accepts the request and then sends nothing
+    /// fails the call once the stall limit passes, rather than holding it.
+    #[tokio::test]
+    async fn fails_a_call_whose_answer_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let client = Client::with_endpoint(
+            static_credentials(None),
+            Service::Ecr,
+            "us-east-1".into(),
+            Endpoint::parse(&format!("http://{address}")).unwrap(),
+            1,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(10), client.call(&Probe {}))
+            .await
+            .expect("the stall limit ends the call")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("ECR GetAuthorizationToken failed: request failed"),
+            "{err}"
+        );
+        held.abort();
     }
 
     /// A refused request is final: re-sending an access denial only spends
@@ -1023,6 +1054,7 @@ mod tests {
                 "us-east-1".into(),
                 Endpoint::parse("https://example.com").unwrap(),
                 DEFAULT_MAX_ATTEMPTS,
+                STALL_TIMEOUT,
             )
             .unwrap();
             client.credentials().await.unwrap();
@@ -1056,6 +1088,7 @@ mod tests {
             "us-east-1".into(),
             Endpoint::parse("https://example.com").unwrap(),
             DEFAULT_MAX_ATTEMPTS,
+            STALL_TIMEOUT,
         )
         .unwrap();
         let started = tokio::time::Instant::now();

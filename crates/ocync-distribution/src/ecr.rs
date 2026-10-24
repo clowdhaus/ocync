@@ -6,7 +6,7 @@
 //! round-trips by up to 98%.
 //!
 //! `AWS_USE_FIPS_ENDPOINT=true` routes the calls to the FIPS endpoint,
-//! resolved in [`crate::aws::endpoint`].
+//! resolved in `aws/endpoint.rs`.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -311,19 +311,30 @@ struct LayerFailure {
 }
 
 impl From<BatchCheckOutput> for BatchCheckResponse {
+    /// An available digest ocync cannot parse joins the failures, so it is
+    /// logged and transferred.
     fn from(output: BatchCheckOutput) -> Self {
+        let mut failures: Vec<String> = output
+            .failures
+            .into_iter()
+            .filter_map(|f| f.layer_digest)
+            .collect();
+        let mut available = Vec::new();
+        for layer in output.layers {
+            if layer.layer_availability != LayerAvailability::Available {
+                continue;
+            }
+            let Some(text) = layer.layer_digest else {
+                continue;
+            };
+            match text.parse() {
+                Ok(digest) => available.push(digest),
+                Err(_) => failures.push(text),
+            }
+        }
         Self {
-            available: output
-                .layers
-                .into_iter()
-                .filter(|layer| layer.layer_availability == LayerAvailability::Available)
-                .filter_map(|layer| layer.layer_digest?.parse().ok())
-                .collect(),
-            failures: output
-                .failures
-                .into_iter()
-                .filter_map(|f| f.layer_digest)
-                .collect(),
+            available,
+            failures,
         }
     }
 }
@@ -445,11 +456,12 @@ impl BatchChecker {
             // Only available blobs this batch asked about enter the set, so a
             // stray digest in the answer cannot skip a transfer. Absent,
             // unavailable and failed digests are all treated as missing.
+            let asked: HashSet<&Digest> = chunk.iter().collect();
             existing.extend(
                 response
                     .available
                     .into_iter()
-                    .filter(|digest| chunk.contains(digest)),
+                    .filter(|digest| asked.contains(digest)),
             );
         }
 
@@ -604,7 +616,7 @@ mod tests {
             BatchCheckResponse::from(output),
             BatchCheckResponse {
                 available: vec![a],
-                failures: vec!["sha256:bad".to_owned()],
+                failures: vec!["sha256:bad".to_owned(), "md5:nope".to_owned()],
             }
         );
     }
@@ -727,6 +739,24 @@ mod tests {
         assert!(result.contains(&d1));
         assert!(result.contains(&d2));
         assert_eq!(counts.check.load(Ordering::Relaxed), 1);
+    }
+
+    /// A digest in the answer that the request did not ask about is not
+    /// taken as present, so it cannot skip a transfer of a different blob.
+    #[tokio::test]
+    async fn ignores_an_available_digest_it_did_not_ask_about() {
+        let (asked, stray) = (test_digest(1), test_digest(2));
+        let mock = MockEcrBatchApi::new("my-repo", CallCounts::default()).with_check_responses(
+            vec![Ok(BatchCheckResponse {
+                available: vec![stray.clone()],
+                failures: vec![],
+            })],
+        );
+        let result = BatchChecker::with_api(mock)
+            .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &[asked])
+            .await
+            .unwrap();
+        assert!(result.is_empty(), "{result:?}");
     }
 
     #[tokio::test]

@@ -18,10 +18,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use super::ecr::SdkCredentialCache;
+use super::ecr::CredentialCache;
 use super::token_cache::TokenCache;
-use super::token_exchange::{no_redirect_builder, no_redirect_http_client};
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
+use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::error::Error;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -563,7 +563,7 @@ pub struct AcrAuth {
     service: String,
     exchange_http: reqwest::Client,
     api: Box<dyn AzureTokenSource>,
-    refresh_cache: SdkCredentialCache<String>,
+    refresh_cache: CredentialCache<String>,
     tokens: TokenCache,
 }
 
@@ -587,7 +587,7 @@ impl AcrAuth {
             service: hostname,
             exchange_http: no_redirect_http_client(),
             api,
-            refresh_cache: SdkCredentialCache::new(),
+            refresh_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
         })
     }
@@ -600,7 +600,7 @@ impl AcrAuth {
             service: service.to_owned(),
             exchange_http: no_redirect_http_client(),
             api: Box::new(api),
-            refresh_cache: SdkCredentialCache::new(),
+            refresh_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
         }
     }

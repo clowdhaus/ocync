@@ -166,6 +166,14 @@ pub enum Error {
 }
 
 impl Error {
+    /// An [`Error::AuthFailed`] for `registry`, with `reason` as its text.
+    pub(crate) fn auth_failed(registry: &str, reason: impl std::fmt::Display) -> Self {
+        Self::AuthFailed {
+            registry: registry.to_owned(),
+            reason: reason.to_string(),
+        }
+    }
+
     /// Extract the HTTP status code from this error, if applicable.
     pub fn status_code(&self) -> Option<http::StatusCode> {
         match self {

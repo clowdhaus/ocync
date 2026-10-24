@@ -19,7 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use super::ecr::SdkCredentialCache;
+use super::ecr::CredentialCache;
 use super::token_cache::TokenCache;
 use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
@@ -88,7 +88,7 @@ impl GcpTokenSource for GoogleCloudTokenSource {
 /// then uses them as HTTP Basic credentials (`oauth2accesstoken:<token>`)
 /// in the standard OCI Bearer token exchange flow.
 ///
-/// SDK credentials are cached via [`SdkCredentialCache`] with the same
+/// SDK credentials are cached via [`CredentialCache`] with the same
 /// read-lock fast path / write-lock refresh pattern as
 /// [`super::ecr::EcrAuth`], supporting long-running processes (watch mode).
 ///
@@ -103,7 +103,7 @@ pub struct GcpAuth {
     /// GCP token source for credential refresh.
     api: Box<dyn GcpTokenSource>,
     /// Cached SDK credentials (username/password) with TTL-based refresh.
-    sdk_credential_cache: SdkCredentialCache<Credentials>,
+    sdk_credential_cache: CredentialCache<Credentials>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
@@ -141,7 +141,7 @@ impl GcpAuth {
                 credentials,
                 hostname,
             }),
-            sdk_credential_cache: SdkCredentialCache::new(),
+            sdk_credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         })
@@ -158,7 +158,7 @@ impl GcpAuth {
             base_url: base_url.into(),
             http,
             api: Box::new(api),
-            sdk_credential_cache: SdkCredentialCache::new(),
+            sdk_credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
@@ -415,7 +415,7 @@ mod tests {
 
         // Overwrite the SDK cache with a near-zero TTL (10s < 30s
         // EARLY_REFRESH_WINDOW). This exercises the TTL-driven refresh
-        // path in SdkCredentialCache, simulating what happens when the
+        // path in CredentialCache, simulating what happens when the
         // underlying access token expires before our cache TTL.
         let stale = Credentials::Basic {
             username: GCP_USERNAME.to_owned(),
@@ -427,7 +427,7 @@ mod tests {
 
         // Clear the Bearer token cache so get_token() re-enters
         // ensure_credentials(). SDK creds are near-expiry, so
-        // SdkCredentialCache triggers a refresh -> "ya29.second".
+        // CredentialCache triggers a refresh -> "ya29.second".
         auth.tokens.clear().await;
 
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();

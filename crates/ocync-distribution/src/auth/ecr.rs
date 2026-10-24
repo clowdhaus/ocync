@@ -57,10 +57,15 @@ pub(super) struct Expiry(SystemTime);
 impl Expiry {
     /// Time until the expiry, or zero once it has passed.
     pub(super) fn remaining(self) -> Duration {
-        self.0
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO)
+        remaining(self.0)
     }
+}
+
+/// Time until `until`, or zero once it has passed.
+pub(crate) fn remaining(until: SystemTime) -> Duration {
+    until
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO)
 }
 
 impl<'de> Deserialize<'de> for Expiry {
@@ -107,7 +112,7 @@ impl EcrApi for AwsEcrApi {
                 .client
                 .call(&GetAuthorizationToken {})
                 .await
-                .map_err(|e| e.into_auth_failed(&self.registry))?;
+                .map_err(|e| Error::auth_failed(&self.registry, e))?;
 
             let auth_data = output
                 .authorization_data
@@ -136,24 +141,24 @@ impl EcrApi for AwsEcrApi {
     }
 }
 
-/// Cached SDK credential with TTL tracking.
+/// Cached credential with TTL tracking.
 ///
-/// Generic cache for ECR SDK credentials that uses a read-lock fast path
+/// Generic cache for credentials that uses a read-lock fast path
 /// for concurrent cache hits and a write-lock with double-check for
 /// refreshes. Used by [`EcrAuth`] (caching `Token`),
 /// [`super::ecr_public::EcrPublicAuth`] (caching `Credentials`) and the AWS
 /// API client (caching AWS keys).
-pub(crate) struct SdkCredentialCache<T> {
-    cached: RwLock<Option<SdkCacheEntry<T>>>,
+pub(crate) struct CredentialCache<T> {
+    cached: RwLock<Option<CacheEntry<T>>>,
 }
 
-struct SdkCacheEntry<T> {
+struct CacheEntry<T> {
     value: T,
     /// Tracks TTL via `is_valid()`.
     lifetime: Token,
 }
 
-impl<T: Clone + Send + Sync> SdkCredentialCache<T> {
+impl<T: Clone + Send + Sync> CredentialCache<T> {
     /// Create an empty cache.
     pub(crate) fn new() -> Self {
         Self {
@@ -195,7 +200,7 @@ impl<T: Clone + Send + Sync> SdkCredentialCache<T> {
 
         let (value, ttl) = refresh.await?;
 
-        *cached = Some(SdkCacheEntry {
+        *cached = Some(CacheEntry {
             value: value.clone(),
             lifetime: Token::with_ttl(label, ttl),
         });
@@ -212,7 +217,7 @@ impl<T: Clone + Send + Sync> SdkCredentialCache<T> {
     /// Replace the cached value (test helper).
     #[cfg(test)]
     pub(super) async fn set(&self, value: T, ttl: Duration) {
-        *self.cached.write().await = Some(SdkCacheEntry {
+        *self.cached.write().await = Some(CacheEntry {
             value,
             lifetime: Token::with_ttl("test-lifetime", ttl),
         });
@@ -249,7 +254,7 @@ pub(super) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Er
 ///
 /// Obtains authorization tokens via `GetAuthorizationToken`, through a
 /// client created once at construction time. Tokens are cached via
-/// [`SdkCredentialCache`] (read-lock fast path for concurrent cache hits,
+/// [`CredentialCache`] (read-lock fast path for concurrent cache hits,
 /// write-lock with double-check for fetches) and refreshed when they approach
 /// expiry. The actual token lifetime is read from the API response, falling
 /// back to 12 hours if not provided.
@@ -262,7 +267,7 @@ pub struct EcrAuth {
     /// The ECR registry hostname.
     hostname: String,
     /// Cached ECR token with TTL-based refresh.
-    credential_cache: SdkCredentialCache<Token>,
+    credential_cache: CredentialCache<Token>,
     /// ECR API implementation.
     api: Box<dyn EcrApi>,
 }
@@ -296,17 +301,13 @@ impl EcrAuth {
                 reason: format!("failed to load AWS config: {e}"),
             })?;
 
-        let client = crate::aws::Client::new(&config, crate::aws::Service::Ecr).map_err(|e| {
-            Error::AuthFailed {
-                registry: hostname.clone(),
-                reason: e.to_string(),
-            }
-        })?;
+        let client = crate::aws::Client::new(&config, crate::aws::Service::Ecr)
+            .map_err(|e| Error::auth_failed(&hostname, e))?;
         let registry = hostname.clone();
 
         Ok(Self {
             hostname,
-            credential_cache: SdkCredentialCache::new(),
+            credential_cache: CredentialCache::new(),
             api: Box::new(AwsEcrApi { client, registry }),
         })
     }
@@ -316,7 +317,7 @@ impl EcrAuth {
     fn with_api(hostname: impl Into<String>, api: impl EcrApi + 'static) -> Self {
         Self {
             hostname: hostname.into(),
-            credential_cache: SdkCredentialCache::new(),
+            credential_cache: CredentialCache::new(),
             api: Box::new(api),
         }
     }
