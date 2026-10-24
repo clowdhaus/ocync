@@ -34,6 +34,10 @@ Every change carries a negative assertion: a test that fails if the intended pat
 
 - Gate before push: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked && cargo deny check`.
 - One pull request at a time, merged before the next. Never stack.
+- A pull request title is the squash commit subject and, through `cliff.toml`, a line in the GitHub release notes. Write it for someone reading the release:
+  - The type picks the section. `fix` is only for a bug a user can hit, `feat` for something a user can now do, `perf` for a measured gain. Internal cleanup is `refactor`, docs-only is `docs`, tests-only is `test`. `chore`, `ci` and `style` are left out of the notes.
+  - The description says the effect a user sees, in plain words: "stop hanging after a burst of 429s", not "keep requests queued before an AIMD halving admissible". No internal type, function or field names.
+  - Retitle when the change's scope or kind changes, before merging.
 - On a `Cargo.lock` rebase conflict: `git checkout --theirs Cargo.lock && cargo generate-lockfile`.
 - Design lives in `docs/src/content/design/`. Unbuilt features carry `> **Status: Planned.**`, removed when implemented.
 - A run that changes what we know about a registry updates its page in `docs/src/content/registries/` in the same pull request.
