@@ -40,13 +40,13 @@ At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the ins
 
 `tests/fips_tls.rs` in `ocync-distribution` pins the behavior: the registry client fails the handshake against servers offering only TLS 1.3 ChaCha20-Poly1305, only TLS 1.2 ChaCha20-Poly1305, or only X25519, and succeeds against one offering AES-128-GCM.
 
-## The shipped module matches a validated certificate
+## The shipped module's certification is recorded
 
-> **Status: Planned.**
+`ocync` links AWS-LC FIPS module 4, which NIST lists as in process: lab-tested and submitted, not yet certified. Module 3.1 holds certificate #5314, but every `rustls` and `rustls-webpki` release that works with it carries published TLS advisories whose fixes require module 4. [FIPS 140-3](/fips#certification) lists each module's status and the FedRAMP documentation it implies.
 
-The v0.8.2 release binary `ocync-fips-linux-amd64` embeds `AWS-LC FIPS 4.2.0`. [FIPS 140-3](/fips) cites NIST Certificate #4816, which covers an earlier AWS-LC module. Confirm which certificate covers the shipped version. If none does, pin `aws-lc-fips-sys` to a validated line. Either way, the FIPS page names the certificate that matches the shipped module, and a check in the release workflow fails when the embedded version drifts from it.
+`certification()` in `ocync-distribution` maps the linked module to its status, and `ocync version` prints it. `linked_module_has_a_certification_record` fails when aws-lc-rs moves to a module with no record, so a module change cannot ship unrecorded. When NIST certifies module 4, the record gains its certificate number.
 
-Two claims on the FIPS page depend on this: that the module is FIPS 140-3 validated, and the X25519MLKEM768 key exchange group, which `rustls` treats as approved because ML-KEM in the AWS-LC FIPS module is FIPS-pending. Both are settled against the certificate that covers the shipped module.
+The X25519MLKEM768 key exchange group stays on: `rustls` treats it as approved because ML-KEM in the AWS-LC FIPS module is FIPS-pending, the reading FedRAMP Rev. 5 SC-13 allows.
 
 ## Releases carry a bill of materials
 

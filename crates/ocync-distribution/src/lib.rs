@@ -60,6 +60,27 @@ pub fn fips_module() -> Option<u32> {
     aws_lc_rs::fips_version()
 }
 
+/// NIST FIPS 140-3 certification status of an AWS-LC-FIPS module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Certification {
+    /// Tested by an accredited lab and submitted to NIST, but not yet
+    /// certified. Listed on [`MODULES_IN_PROCESS_URL`].
+    InProcess,
+}
+
+/// NIST's list of modules submitted for validation and not yet certified.
+pub const MODULES_IN_PROCESS_URL: &str = "https://csrc.nist.gov/Projects/Cryptographic-Module-Validation-Program/Modules-In-Process/Modules-In-Process-List";
+
+/// Certification status of the linked AWS-LC-FIPS module, from the
+/// validations AWS-LC lists in `crypto/fipsmodule/FIPS.md` for the static
+/// library, or `None` for a module this build has no record of.
+pub fn certification() -> Option<Certification> {
+    match fips_module()? {
+        4 => Some(Certification::InProcess),
+        _ => None,
+    }
+}
+
 /// The linked AWS-LC release, such as `4.2.0`.
 ///
 /// Distinguishes builds of one FIPS module. It does not identify a
@@ -115,10 +136,23 @@ pub use spec::{
     RegistryAuthority, RepositoryName,
 };
 
-#[cfg(all(test, not(feature = "fips")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Fails when aws-lc-rs moves to a module this crate has no
+    /// certification record for, so the change cannot ship unrecorded.
+    #[cfg(feature = "fips")]
+    #[test]
+    fn linked_module_has_a_certification_record() {
+        assert!(
+            certification().is_some(),
+            "no certification record for AWS-LC-FIPS module {:?}",
+            fips_module()
+        );
+    }
+
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn non_fips_build_reports_tls_not_approved() {
         install_crypto_provider();
