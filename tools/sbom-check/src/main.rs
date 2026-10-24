@@ -44,12 +44,11 @@ impl Crypto {
 #[derive(Parser)]
 #[command(name = "sbom-check")]
 struct Args {
-    /// The AWS-LC build every binary must link.
+    /// The AWS-LC build the binary must link.
     #[arg(long, value_enum)]
     crypto: Crypto,
-    /// CycloneDX JSON documents to check.
-    #[arg(required = true)]
-    paths: Vec<PathBuf>,
+    /// CycloneDX JSON document to check.
+    path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -66,24 +65,15 @@ struct Component {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let failures: Vec<String> = args
-        .paths
-        .iter()
-        .filter_map(|path| {
-            std::fs::read_to_string(path)
-                .map_err(|e| e.to_string())
-                .and_then(|text| check(&text, args.crypto))
-                .err()
-                .map(|e| format!("{}: {e}", path.display()))
-        })
-        .collect();
-    for failure in &failures {
-        eprintln!("error: {failure}");
-    }
-    if failures.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    let result = std::fs::read_to_string(&args.path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| check(&text, args.crypto));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {}: {e}", args.path.display());
+            ExitCode::FAILURE
+        }
     }
 }
 

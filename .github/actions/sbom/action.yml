@@ -1,16 +1,27 @@
 name: Bill of materials
-description: Write a CycloneDX bill of materials with syft and check it with sbom-check. Needs Rust on PATH.
+description: >-
+  Write a CycloneDX bill of materials with syft, check it with sbom-check and,
+  for a binary, attest it. Needs rustup on PATH.
 
 inputs:
-  source:
-    description: syft source, such as file:<path> or docker:<image>
+  subject:
+    description: Binary path, or image reference for an image
     required: true
-  output:
-    description: Path for the CycloneDX JSON document
+  kind:
+    description: binary or image
     required: true
   crypto:
     description: AWS-LC build the binary must link (fips or non-fips)
     required: true
+  attest:
+    description: attest or skip; attesting a binary needs id-token and attestations write
+    required: false
+    default: skip
+
+outputs:
+  path:
+    description: Path to the CycloneDX JSON document
+    value: ${{ steps.scan.outputs.path }}
 
 runs:
   using: composite
@@ -19,11 +30,25 @@ runs:
       with:
         tool: syft@1.55.0
 
-    - shell: bash
+    - id: scan
+      shell: bash
       env:
-        SOURCE: ${{ inputs.source }}
-        OUTPUT: ${{ inputs.output }}
+        SUBJECT: ${{ inputs.subject }}
+        KIND: ${{ inputs.kind }}
         CRYPTO: ${{ inputs.crypto }}
       run: |
-        syft scan "$SOURCE" --output "cyclonedx-json=$OUTPUT"
-        cargo run --locked --quiet -p sbom-check -- --crypto "$CRYPTO" "$OUTPUT"
+        set -euo pipefail
+        case "$KIND" in
+          binary) source="file:$SUBJECT"; path="$SUBJECT.cdx.json" ;;
+          image) source="docker:$SUBJECT"; path="image.cdx.json" ;;
+          *) echo "::error::kind must be binary or image, got $KIND"; exit 1 ;;
+        esac
+        syft scan "$source" --output "cyclonedx-json=$path"
+        cargo run --locked --quiet -p sbom-check -- --crypto "$CRYPTO" "$path"
+        echo "path=$path" >> "$GITHUB_OUTPUT"
+
+    - if: inputs.kind == 'binary' && inputs.attest == 'attest'
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      with:
+        subject-path: ${{ inputs.subject }}
+        sbom-path: ${{ steps.scan.outputs.path }}

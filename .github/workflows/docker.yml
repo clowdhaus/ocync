@@ -44,13 +44,10 @@ jobs:
       - if: needs.changes.outputs.docker == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: needs.changes.outputs.docker == 'true'
-        uses: ./.github/actions/setup-rust
-      - if: needs.changes.outputs.docker == 'true'
         run: docker build --tag ocync:check .
-      - name: Check bill of materials
-        if: needs.changes.outputs.docker == 'true'
+      - if: needs.changes.outputs.docker == 'true'
         uses: ./.github/actions/sbom
         with:
-          source: docker:ocync:check
-          output: image.cdx.json
+          subject: ocync:check
+          kind: image
           crypto: fips

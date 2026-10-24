@@ -103,7 +103,7 @@ jobs:
       - if: needs.changes.outputs.rust == 'true'
         uses: ./.github/actions/setup-rust
         with:
-          tools: cargo-auditable@0.7.7
+          cargo-auditable: install
       - name: Build release binary
         if: needs.changes.outputs.rust == 'true'
         run: cargo auditable build --release --locked
@@ -113,12 +113,11 @@ jobs:
       - name: Verify static binary
         if: needs.changes.outputs.rust == 'true'
         run: "! readelf -d target/${{ matrix.target }}/release/ocync | grep -q NEEDED"
-      - name: Check bill of materials
-        if: needs.changes.outputs.rust == 'true'
+      - if: needs.changes.outputs.rust == 'true'
         uses: ./.github/actions/sbom
         with:
-          source: file:target/${{ matrix.target }}/release/ocync
-          output: ocync.cdx.json
+          subject: target/${{ matrix.target }}/release/ocync
+          kind: binary
           crypto: fips
 
   check-non-fips:
