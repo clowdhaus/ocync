@@ -41,6 +41,7 @@ jobs:
               - 'deny.toml'
               - '.github/workflows/ci.yml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/sbom/**'
 
   format:
     name: Format
@@ -101,15 +102,25 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: needs.changes.outputs.rust == 'true'
         uses: ./.github/actions/setup-rust
+        with:
+          tools: cargo-auditable,syft
       - name: Build release binary
         if: needs.changes.outputs.rust == 'true'
-        run: cargo build --release --locked
+        run: cargo auditable build --release --locked
         env:
           CARGO_BUILD_RUSTFLAGS: "-C target-feature=+crt-static"
           CARGO_BUILD_TARGET: ${{ matrix.target }}
       - name: Verify static binary
         if: needs.changes.outputs.rust == 'true'
         run: "! readelf -d target/${{ matrix.target }}/release/ocync | grep -q NEEDED"
+      # One arch proves the recipe; the check compiles xtask, so the other
+      # arch skips it.
+      - name: Check bill of materials
+        if: needs.changes.outputs.rust == 'true' && matrix.runner == 'ubuntu-24.04'
+        uses: ./.github/actions/sbom
+        with:
+          binary: target/${{ matrix.target }}/release/ocync
+          crypto: fips
 
   check-non-fips:
     name: Check (non-fips)

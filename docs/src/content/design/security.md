@@ -17,7 +17,7 @@ order: 5
 - `aws-lc-rs` is the only TLS provider. `ring`, `openssl` and `native-tls` are banned in `deny.toml`.
 - Linux release binaries are built with the `fips` feature, statically linked against glibc. See [FIPS 140-3](/fips).
 - Content digests use `aws-lc-rs` (`crates/ocync-distribution/src/sha256.rs`).
-- Release images are signed with cosign and carry a build provenance attestation. GitHub Actions are pinned to commit SHAs.
+- Release binaries carry build provenance and a bill of materials attestation. Release images are signed with cosign and carry a bill of materials attestation. GitHub Actions are pinned to commit SHAs.
 - The Docker base images (`cgr.dev/chainguard/rust:latest-dev`, `cgr.dev/chainguard/static:latest`) float by design so every build picks up Chainguard's patches. They are not pinned by digest.
 
 ## Dependency weight
@@ -46,9 +46,12 @@ At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the ins
 
 ## Releases carry a bill of materials
 
-> **Status: Planned.**
+Release binaries and the image's binary are built with `cargo auditable`, which embeds the dependency list in the binary, so scanners such as grype and trivy read it from the shipped artifact. `syft` turns it into CycloneDX:
 
-Each release publishes a CycloneDX software bill of materials for the binaries and the image, signed and attested alongside the existing cosign signature and provenance.
+- Each binary ships with `<binary>.cdx.json`, attested on GitHub next to its build provenance.
+- Each platform image carries a cosign attestation of its bill of materials, which also lists the base image's packages.
+
+The list comes from cargo's dependency graph, so it can name crates that are not linked: `ring`, which a weak feature in `rustls-webpki` mentions, and `aws-lc-sys`, which `rustls` resolves in a FIPS build. `cargo deny` is the ban check. `cargo xtask sbom-check` fails CI and the release when a bill of materials lacks `ocync`, `aws-lc-rs` or the build's AWS-LC module crate, which catches a binary built without its dependency list or a FIPS binary built without the FIPS module.
 
 ## Owned Google authentication
 

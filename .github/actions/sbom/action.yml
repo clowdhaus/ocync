@@ -1,0 +1,32 @@
+name: Bill of materials
+description: Write a CycloneDX bill of materials for a binary built with cargo auditable and check it. Needs syft on PATH.
+
+inputs:
+  binary:
+    description: Path to the binary
+    required: true
+  crypto:
+    description: AWS-LC build the binary must link (fips or non-fips)
+    required: true
+
+outputs:
+  path:
+    description: Path to the CycloneDX JSON document
+    value: ${{ steps.scan.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        BINARY: ${{ inputs.binary }}
+      run: |
+        syft scan "file:$BINARY" --output "cyclonedx-json=$BINARY.cdx.json"
+        echo "path=$BINARY.cdx.json" >> "$GITHUB_OUTPUT"
+
+    - shell: bash
+      env:
+        CRYPTO: ${{ inputs.crypto }}
+        SBOM: ${{ steps.scan.outputs.path }}
+      run: cargo xtask sbom-check "$SBOM" --crypto "$CRYPTO"

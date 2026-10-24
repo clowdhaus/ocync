@@ -6,8 +6,9 @@ FROM cgr.dev/chainguard/rust:latest-dev AS builder
 USER root
 
 # FIPS build dependencies: Go, CMake, Perl (required by aws-lc-fips-sys).
-# Go builds the delocator that assembles the FIPS module.
-RUN apk add --no-cache cmake go perl
+# Go builds the delocator that assembles the FIPS module. cargo-auditable
+# embeds the dependency list the release bill of materials is read from.
+RUN apk add --no-cache cargo-auditable cmake go perl
 
 WORKDIR /src
 COPY . .
@@ -20,7 +21,7 @@ COPY . .
 ENV CARGO_BUILD_RUSTFLAGS="-C target-feature=+crt-static"
 RUN CARGO_BUILD_TARGET=$(rustc -vV | awk '/^host:/ { print $2 }') && \
     export CARGO_BUILD_TARGET && \
-    cargo build --release --locked -p ocync && \
+    cargo auditable build --release --locked -p ocync && \
     mv target/"$CARGO_BUILD_TARGET"/release/ocync /usr/local/bin/ocync
 
 # Verify the binary has no dynamic dependencies.

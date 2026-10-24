@@ -6,6 +6,10 @@ inputs:
     description: Additional components to install
     required: false
     default: ""
+  tools:
+    description: Comma-separated tools to install with taiki-e/install-action
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -26,6 +30,12 @@ runs:
       with:
         toolchain: "1.95"
         components: ${{ inputs.components }}
+
+    - name: Install tools
+      if: inputs.tools != ''
+      uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      with:
+        tool: ${{ inputs.tools }}
 
     - name: Cache cargo registry
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
