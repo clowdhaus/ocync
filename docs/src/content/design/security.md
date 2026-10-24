@@ -36,15 +36,17 @@ The duplicated hash crate versions (`digest`, `block-buffer`, `crypto-common`, `
 
 The `fips` feature enables `rustls/fips`. That feature applies to every `rustls` user in the build, so `aws_lc_rs::default_provider()` drops ChaCha20-Poly1305 and every key exchange group the module does not approve, for `reqwest` and for the TLS clients the AWS SDK and `google-cloud-auth` build themselves. TLS 1.2 also requires extended master secret.
 
-At startup a FIPS build checks `tls_fips()`, which builds a client configuration from the installed provider and asks `rustls` whether it is FIPS-approved, including whether the module is in approved mode. The build refuses to start if it is not. `ocync version` prints the result as `tls=approved` or `tls=not-approved`.
+At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the installed provider is FIPS-approved, including whether the module is in approved mode. Every command except `version` refuses to start if it is not, so `version` can still report the failing state. `ocync version` prints the linked module and its version (`module: AWS-LC FIPS 4.2.0`) and the result (`tls: approved`), in the shape `openssl list -providers` uses.
 
-`tests/fips_tls.rs` in `ocync-distribution` pins the behavior: a registry client fails the handshake against a server offering only ChaCha20-Poly1305 and succeeds against one offering AES-128-GCM.
+`tests/fips_tls.rs` in `ocync-distribution` pins the behavior: the registry client fails the handshake against servers offering only TLS 1.3 ChaCha20-Poly1305, only TLS 1.2 ChaCha20-Poly1305, or only X25519, and succeeds against one offering AES-128-GCM.
 
 ## The shipped module matches a validated certificate
 
 > **Status: Planned.**
 
 The v0.8.2 release binary `ocync-fips-linux-amd64` embeds `AWS-LC FIPS 4.2.0`. [FIPS 140-3](/fips) cites NIST Certificate #4816, which covers an earlier AWS-LC module. Confirm which certificate covers the shipped version. If none does, pin `aws-lc-fips-sys` to a validated line. Either way, the FIPS page names the certificate that matches the shipped module, and a check in the release workflow fails when the embedded version drifts from it.
+
+Two claims on the FIPS page depend on this: that the module is FIPS 140-3 validated, and the X25519MLKEM768 key exchange group, which `rustls` treats as approved because ML-KEM in the AWS-LC FIPS module is FIPS-pending. Both are settled against the certificate that covers the shipped module.
 
 ## Releases carry a bill of materials
 

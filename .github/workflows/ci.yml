@@ -122,6 +122,10 @@ jobs:
         uses: ./.github/actions/setup-rust
       - if: needs.changes.outputs.rust == 'true'
         run: cargo check --locked --no-default-features --features non-fips
+      - if: needs.changes.outputs.rust == 'true'
+        run: |
+          cargo test --locked --no-default-features --features non-fips -p ocync --bin ocync
+          cargo test --locked --no-default-features --features non-fips -p ocync-distribution --lib
 
   deny:
     name: Deny

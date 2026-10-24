@@ -305,12 +305,15 @@ pub(crate) struct WatchArgs {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     ocync_distribution::install_crypto_provider();
-    if cfg!(feature = "fips") && ocync_distribution::tls_fips() != TlsFips::Approved {
-        eprintln!("error: FIPS build, but TLS is not restricted to FIPS-approved algorithms");
-        return cli::ExitCode::Failure.into();
-    }
 
     let cli = Cli::parse();
+    if refuses_to_start(&cli.command, ocync_distribution::tls_fips()) {
+        eprintln!(
+            "error: FIPS build, but TLS is not restricted to FIPS-approved algorithms; \
+             run `ocync version` for details"
+        );
+        return cli::ExitCode::Failure.into();
+    }
     cli::setup_logging(&cli);
 
     // Install signal handlers for graceful shutdown.
@@ -361,10 +364,43 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// A FIPS build runs only when TLS is restricted to FIPS-approved
+/// algorithms. `version` always runs, so it can report a failing state.
+fn refuses_to_start(command: &Commands, tls: TlsFips) -> bool {
+    cfg!(feature = "fips") && tls != TlsFips::Approved && !matches!(command, Commands::Version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    fn command(args: &[&str]) -> Commands {
+        Cli::parse_from(args).command
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_build_refuses_to_start_without_approved_tls() {
+        let sync = command(&["ocync", "sync", "--config", "c.yaml"]);
+        assert!(refuses_to_start(&sync, TlsFips::NotApproved));
+        assert!(!refuses_to_start(&sync, TlsFips::Approved));
+    }
+
+    #[test]
+    fn version_runs_without_approved_tls() {
+        assert!(!refuses_to_start(
+            &command(&["ocync", "version"]),
+            TlsFips::NotApproved
+        ));
+    }
+
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn non_fips_build_starts_without_approved_tls() {
+        let sync = command(&["ocync", "sync", "--config", "c.yaml"]);
+        assert!(!refuses_to_start(&sync, TlsFips::NotApproved));
+    }
 
     #[test]
     fn verify_cli() {

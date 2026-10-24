@@ -36,6 +36,19 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+/// Name and version of the linked AWS-LC module, such as `AWS-LC FIPS 4.2.0`.
+///
+/// Identifies the module, not its certification status: the version is what
+/// maps to a NIST validation certificate.
+pub fn crypto_module() -> String {
+    let name = if cfg!(feature = "fips") {
+        "AWS-LC FIPS"
+    } else {
+        "AWS-LC"
+    };
+    format!("{name} {}", aws_lc_rs::awslc_version())
+}
+
 /// Whether TLS is restricted to algorithms the FIPS module approves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsFips {
@@ -48,25 +61,13 @@ pub enum TlsFips {
 
 /// Report whether TLS through the installed crypto provider is FIPS-approved.
 ///
-/// Checks a client configuration of the shape `reqwest` builds, so TLS 1.2
-/// extended master secret enforcement counts alongside the provider's
-/// algorithm lists.
+/// `rustls` derives the rest of a client configuration's FIPS state from the
+/// provider, including TLS 1.2 extended master secret enforcement, so the
+/// provider is the whole answer.
 pub fn tls_fips() -> TlsFips {
-    let Some(provider) = rustls::crypto::CryptoProvider::get_default() else {
-        return TlsFips::NotApproved;
-    };
-    let approved = rustls::ClientConfig::builder_with_provider(std::sync::Arc::clone(provider))
-        .with_safe_default_protocol_versions()
-        .is_ok_and(|builder| {
-            builder
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth()
-                .fips()
-        });
-    if approved {
-        TlsFips::Approved
-    } else {
-        TlsFips::NotApproved
+    match rustls::crypto::CryptoProvider::get_default() {
+        Some(provider) if provider.fips() => TlsFips::Approved,
+        _ => TlsFips::NotApproved,
     }
 }
 
@@ -95,10 +96,18 @@ pub use spec::{
     RegistryAuthority, RepositoryName,
 };
 
-#[cfg(all(test, feature = "fips"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn non_fips_build_reports_tls_not_approved() {
+        install_crypto_provider();
+        assert_eq!(tls_fips(), TlsFips::NotApproved);
+    }
+
+    #[cfg(feature = "fips")]
     #[test]
     fn fips_build_reports_tls_approved() {
         install_crypto_provider();
@@ -108,6 +117,7 @@ mod tests {
     /// The AWS SDK and `google-cloud-auth` build their own TLS clients from
     /// `aws_lc_rs::default_provider()`, so that function must drop the
     /// algorithms the FIPS module does not approve.
+    #[cfg(feature = "fips")]
     #[test]
     fn fips_build_drops_chacha20_from_the_provider_other_crates_use() {
         let provider = rustls::crypto::aws_lc_rs::default_provider();
