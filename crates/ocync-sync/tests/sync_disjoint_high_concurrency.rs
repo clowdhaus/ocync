@@ -334,7 +334,7 @@ impl BatchBlobChecker for EmptyExistingChecker {
     fn check_blob_existence<'a>(
         &'a self,
         repo: &'a RepositoryName,
-        _digests: &'a [Digest],
+        digests: &'a [Digest],
     ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
         assert_eq!(
             repo.as_str(),
@@ -343,7 +343,7 @@ impl BatchBlobChecker for EmptyExistingChecker {
         );
         Box::pin(async {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(BlobExistence::default())
+            Ok(BlobExistence::new(digests, []))
         })
     }
 }

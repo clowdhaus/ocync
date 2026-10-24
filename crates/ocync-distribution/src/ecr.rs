@@ -88,23 +88,41 @@ const MAX_DIGESTS_PER_BATCH: usize = 100;
 type CheckFuture<'a> = Pin<Box<dyn Future<Output = Result<BlobExistence, Error>> + 'a>>;
 
 /// What a batch check learned about the digests it was asked about.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+///
+/// A digest is known available, known missing, or unknown. An unknown digest
+/// still needs its own check, so a checker that learns less costs requests,
+/// never a needless upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobExistence {
-    /// The digests the target holds.
-    pub available: HashSet<Digest>,
-    /// The digests a failed batch left unchecked: neither known present nor
-    /// known missing, so each still needs its own check. Every other digest
-    /// asked about is missing.
-    pub unchecked: HashSet<Digest>,
+    available: HashSet<Digest>,
+    missing: HashSet<Digest>,
 }
 
-/// Every digest was checked, and those not in the set are missing.
-impl From<HashSet<Digest>> for BlobExistence {
-    fn from(available: HashSet<Digest>) -> Self {
-        Self {
-            available,
-            unchecked: HashSet::new(),
-        }
+impl BlobExistence {
+    /// Records a check of `checked` that found `found` available.
+    ///
+    /// Each checked digest is available when found and missing otherwise. A
+    /// found digest that was not checked is dropped, so a stray answer cannot
+    /// skip a transfer.
+    pub fn new(checked: &[Digest], found: impl IntoIterator<Item = Digest>) -> Self {
+        let found: HashSet<Digest> = found.into_iter().collect();
+        let (available, missing) = checked.iter().cloned().partition(|d| found.contains(d));
+        Self { available, missing }
+    }
+
+    /// Whether the check found `digest` available.
+    pub fn is_available(&self, digest: &Digest) -> bool {
+        self.available.contains(digest)
+    }
+
+    /// Whether the check learned if `digest` is available.
+    pub fn is_known(&self, digest: &Digest) -> bool {
+        self.available.contains(digest) || self.missing.contains(digest)
+    }
+
+    /// The digests the check found available.
+    pub fn into_available(self) -> HashSet<Digest> {
+        self.available
     }
 }
 
@@ -131,10 +149,9 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub trait BatchBlobChecker {
     /// Check which blobs exist in the given repository.
     ///
-    /// Returns the input digests that exist at the target and those a failed
-    /// batch left unchecked. The rest are missing and need transfer. Digests
-    /// that the API reports as failures are treated as missing. A check that
-    /// learned nothing is an error.
+    /// Returns what the check learned about the input digests. A failed batch
+    /// leaves its digests unknown. Digests that the API reports as failures
+    /// are treated as missing. A check that learned nothing is an error.
     fn check_blob_existence<'a>(
         &'a self,
         repo: &'a RepositoryName,
@@ -214,7 +231,7 @@ where
     loop {
         match checker.check_blob_existence(repo, &remaining).await {
             Ok(found) => {
-                remaining.retain(|d| !found.available.contains(d));
+                remaining.retain(|d| !found.is_available(d));
                 if remaining.is_empty() {
                     return Ok(());
                 }
@@ -266,8 +283,17 @@ trait EcrBatchApi {
 struct BatchCheckResponse {
     /// Layers the repository holds.
     available: Vec<Digest>,
-    /// Digests ECR could not check, as it named them. They are transferred.
-    failures: Vec<String>,
+    /// Layers that were not checked. They are transferred.
+    failures: Vec<LayerIssue>,
+}
+
+/// Why a layer in a batch answer was not checked.
+#[derive(Debug, PartialEq, Eq)]
+enum LayerIssue {
+    /// ECR reported a failure for the digest, as it named it.
+    Failed(String),
+    /// ECR reported a digest available that ocync cannot parse.
+    Unparsed(String),
 }
 
 /// Default [`EcrBatchApi`], calling ECR through [`crate::aws::Client`].
@@ -336,10 +362,10 @@ impl From<BatchCheckOutput> for BatchCheckResponse {
     /// An available digest ocync cannot parse joins the failures, so it is
     /// logged and transferred.
     fn from(output: BatchCheckOutput) -> Self {
-        let mut failures: Vec<String> = output
+        let mut failures: Vec<LayerIssue> = output
             .failures
             .into_iter()
-            .filter_map(|f| f.layer_digest)
+            .filter_map(|f| f.layer_digest.map(LayerIssue::Failed))
             .collect();
         let mut available = Vec::new();
         for layer in output.layers {
@@ -351,7 +377,7 @@ impl From<BatchCheckOutput> for BatchCheckResponse {
             };
             match text.parse() {
                 Ok(digest) => available.push(digest),
-                Err(_) => failures.push(text),
+                Err(_) => failures.push(LayerIssue::Unparsed(text)),
             }
         }
         Self {
@@ -438,8 +464,7 @@ impl BatchChecker {
         repo: &RepositoryName,
         digests: &[Digest],
     ) -> Result<BlobExistence, Error> {
-        let mut existing = HashSet::with_capacity(digests.len());
-        let mut unchecked = HashSet::new();
+        let mut found = Vec::with_capacity(digests.len());
         let mut checked = 0;
 
         for chunk in digests.chunks(MAX_DIGESTS_PER_BATCH) {
@@ -453,7 +478,7 @@ impl BatchChecker {
                     warn!(
                         repo = %repo,
                         checked,
-                        available = existing.len(),
+                        available = found.len(),
                         unchecked = digests.len() - checked,
                         error = %e,
                         "batch check failed mid-batch, returning partial results"
@@ -464,37 +489,33 @@ impl BatchChecker {
                         return Err(e);
                     }
                     // Keep what the earlier batches learned. The engine sends
-                    // a per-blob HEAD for each unchecked digest.
-                    unchecked.extend(digests[checked..].iter().cloned());
+                    // a per-blob HEAD for each digest left unknown.
                     break;
                 }
             };
 
-            for digest in &response.failures {
-                warn!(
-                    repo = %repo,
-                    digest = %digest,
-                    "ECR batch check reported failure for layer"
-                );
+            for issue in &response.failures {
+                match issue {
+                    LayerIssue::Failed(digest) => warn!(
+                        repo = %repo,
+                        digest = %digest,
+                        "ECR batch check reported failure for layer"
+                    ),
+                    LayerIssue::Unparsed(digest) => warn!(
+                        repo = %repo,
+                        digest = %digest,
+                        "ECR batch check reported a layer digest ocync cannot parse"
+                    ),
+                }
             }
 
-            // Only available blobs this batch asked about enter the set, so a
-            // stray digest in the answer cannot skip a transfer. Absent,
-            // unavailable and failed digests are all treated as missing.
+            // Absent, unavailable and failed digests are all treated as
+            // missing.
             checked += chunk.len();
-            let asked: HashSet<&Digest> = chunk.iter().collect();
-            existing.extend(
-                response
-                    .available
-                    .into_iter()
-                    .filter(|digest| asked.contains(digest)),
-            );
+            found.extend(response.available);
         }
 
-        Ok(BlobExistence {
-            available: existing,
-            unchecked,
-        })
+        Ok(BlobExistence::new(&digests[..checked], found))
     }
 }
 
@@ -646,7 +667,10 @@ mod tests {
             BatchCheckResponse::from(output),
             BatchCheckResponse {
                 available: vec![a],
-                failures: vec!["sha256:bad".to_owned(), "md5:nope".to_owned()],
+                failures: vec![
+                    LayerIssue::Failed("sha256:bad".to_owned()),
+                    LayerIssue::Unparsed("md5:nope".to_owned()),
+                ],
             }
         );
     }
@@ -787,9 +811,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.available.len(), 2);
-        assert!(result.available.contains(&d1));
-        assert!(result.available.contains(&d2));
+        assert_eq!(result.into_available(), HashSet::from([d1, d2]));
         assert_eq!(counts.calls(), 1);
     }
 
@@ -808,7 +830,7 @@ mod tests {
             .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &[asked])
             .await
             .unwrap();
-        assert!(result.available.is_empty(), "{result:?}");
+        assert!(result.into_available().is_empty());
     }
 
     #[tokio::test]
@@ -819,7 +841,7 @@ mod tests {
 
         let response = BatchCheckResponse {
             available: vec![d1.clone()],
-            failures: vec![d3.to_string()],
+            failures: vec![LayerIssue::Failed(d3.to_string())],
         };
 
         let counts = CallCounts::default();
@@ -835,11 +857,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Only d1 is available; d2 (unavailable) and d3 (failure) are absent.
-        assert_eq!(result.available.len(), 1);
-        assert!(result.available.contains(&d1));
-        assert!(!result.available.contains(&d2));
-        assert!(!result.available.contains(&d3));
+        // Only d1 is available; d2 (unavailable) and d3 (failure) are known
+        // missing.
+        assert!(result.is_known(&d2) && result.is_known(&d3));
+        assert_eq!(result.into_available(), HashSet::from([d1]));
     }
 
     #[tokio::test]
@@ -874,10 +895,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.available.len(), 250);
-        for d in &digests {
-            assert!(result.available.contains(d));
-        }
+        assert_eq!(result.into_available(), digests.iter().cloned().collect());
 
         // Verify exactly 3 API calls were made.
         assert_eq!(
@@ -898,7 +916,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.available.is_empty());
+        assert!(result.into_available().is_empty());
         assert_eq!(counts.calls(), 0);
     }
 
@@ -941,7 +959,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            result.available.is_empty(),
+            result.into_available().is_empty(),
             "no blobs should be reported as existing"
         );
     }
@@ -969,8 +987,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.available.contains(&d1));
-        assert!(!result.available.contains(&d2));
+        assert!(result.is_available(&d1));
+        assert!(!result.is_available(&d2));
     }
 
     #[tokio::test]
@@ -1004,29 +1022,25 @@ mod tests {
             .await
             .unwrap();
 
-        // First 100 digests should be present (all available in batch 1).
-        assert_eq!(
-            result.available.len(),
-            100,
-            "partial results from successful batch must be preserved"
-        );
-        for d in &digests[..100] {
-            assert!(result.available.contains(d));
-        }
-        // Remaining 50 not in the result (batch 2 failed, never checked).
+        // Remaining 50 are unknown (batch 2 failed, never checked).
         for d in &digests[100..] {
             assert!(
-                !result.available.contains(d),
-                "unchecked digests from failed batch must not appear"
+                !result.is_known(d),
+                "digests from the failed batch must stay unknown"
             );
         }
-        assert_eq!(result.unchecked, digests[100..].iter().cloned().collect());
+        // First 100 digests should be present (all available in batch 1).
+        assert_eq!(
+            result.into_available(),
+            digests[..100].iter().cloned().collect(),
+            "partial results from successful batch must be preserved"
+        );
         // 2 API calls were made (first succeeded, second failed).
         assert_eq!(counts.calls(), 2);
     }
 
     /// A batch that finds nothing still checked its digests: a later
-    /// failure leaves them known missing and only the rest unchecked. A
+    /// failure leaves them known missing and only the rest unknown. A
     /// failure before any batch answers learns nothing and is an error.
     #[tokio::test]
     async fn check_keeps_missing_digests_from_before_a_failed_batch() {
@@ -1050,8 +1064,12 @@ mod tests {
             .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &digests)
             .await
             .unwrap();
-        assert!(result.available.is_empty());
-        assert_eq!(result.unchecked, digests[100..].iter().cloned().collect());
+        for d in &digests[..100] {
+            assert!(result.is_known(d) && !result.is_available(d));
+        }
+        for d in &digests[100..] {
+            assert!(!result.is_known(d));
+        }
 
         let mock = MockEcrBatchApi::new("my-repo", CallCounts::default())
             .with_check_responses(vec![throttled()]);
