@@ -27,8 +27,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 
 use super::ecr::{
-    AuthorizationData, EcrApi, EcrTokenResponse, SdkCredentialCache, ttl_from_expiry,
-    validate_ecr_token,
+    AuthorizationData, EcrApi, EcrTokenResponse, Expiry, SdkCredentialCache, validate_ecr_token,
 };
 use super::token_cache::TokenCache;
 use super::token_exchange;
@@ -38,17 +37,29 @@ use crate::error::Error;
 /// Default ECR Public token lifetime (12 hours).
 const ECR_PUBLIC_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
+/// The ECR Public registry hostname.
+const REGISTRY: &str = "public.ecr.aws";
+
 /// Default [`EcrApi`], calling ECR Public through [`crate::aws::Client`].
 #[derive(Debug)]
 struct AwsEcrPublicApi {
     client: crate::aws::Client,
 }
 
-/// ECR Public returns one `authorizationData` object, not a list.
-#[derive(Deserialize)]
+/// ECR Public's `GetAuthorizationToken`, which takes no input.
+#[derive(serde::Serialize)]
+struct GetAuthorizationToken {}
+
+/// ECR Public answers with one `authorizationData` object, not a list.
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetAuthorizationTokenOutput {
     authorization_data: Option<AuthorizationData>,
+}
+
+impl crate::aws::Operation for GetAuthorizationToken {
+    const NAME: &'static str = "GetAuthorizationToken";
+    type Output = GetAuthorizationTokenOutput;
 }
 
 impl EcrApi for AwsEcrPublicApi {
@@ -56,28 +67,25 @@ impl EcrApi for AwsEcrPublicApi {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
         Box::pin(async move {
-            let output: GetAuthorizationTokenOutput = self
+            let output = self
                 .client
-                .call("GetAuthorizationToken", &serde_json::json!({}))
+                .call(&GetAuthorizationToken {})
                 .await
-                .map_err(|e| Error::AuthFailed {
-                    registry: "public.ecr.aws".to_owned(),
-                    reason: format!("ECR Public GetAuthorizationToken failed: {e}"),
-                })?;
+                .map_err(|e| e.into_auth_failed(REGISTRY))?;
 
             let auth_data = output.authorization_data.ok_or_else(|| Error::AuthFailed {
-                registry: "public.ecr.aws".to_owned(),
+                registry: REGISTRY.to_owned(),
                 reason: "ECR Public returned no authorization data".into(),
             })?;
 
             let encoded_token = auth_data
                 .authorization_token
                 .ok_or_else(|| Error::AuthFailed {
-                    registry: "public.ecr.aws".to_owned(),
+                    registry: REGISTRY.to_owned(),
                     reason: "ECR Public authorization data missing token".into(),
                 })?;
 
-            let expires_in = auth_data.expires_at.map(ttl_from_expiry);
+            let expires_in = auth_data.expires_at.map(Expiry::remaining);
 
             Ok(EcrTokenResponse {
                 encoded_token,
@@ -96,23 +104,23 @@ fn decode_ecr_credentials(
     encoded_token: &str,
     ttl: Option<Duration>,
 ) -> Result<(Credentials, Duration), Error> {
-    validate_ecr_token(encoded_token, "public.ecr.aws")?;
+    validate_ecr_token(encoded_token, REGISTRY)?;
 
     let decoded = BASE64
         .decode(encoded_token)
         .map_err(|e| Error::AuthFailed {
-            registry: "public.ecr.aws".to_owned(),
+            registry: REGISTRY.to_owned(),
             reason: format!("invalid base64 in ECR Public token: {e}"),
         })?;
     let text = String::from_utf8(decoded).map_err(|e| Error::AuthFailed {
-        registry: "public.ecr.aws".to_owned(),
+        registry: REGISTRY.to_owned(),
         reason: format!("ECR Public token is not valid UTF-8: {e}"),
     })?;
 
     let password = text
         .strip_prefix("AWS:")
         .ok_or_else(|| Error::AuthFailed {
-            registry: "public.ecr.aws".to_owned(),
+            registry: REGISTRY.to_owned(),
             reason: "ECR Public token missing 'AWS:' prefix".into(),
         })?
         .to_owned();
@@ -174,16 +182,11 @@ impl EcrPublicAuth {
             .load()
             .await;
 
-        let client =
-            crate::aws::Client::new(&config, crate::aws::Service::EcrPublic).map_err(|e| {
-                Error::AuthFailed {
-                    registry: "public.ecr.aws".to_owned(),
-                    reason: e.to_string(),
-                }
-            })?;
+        let client = crate::aws::Client::new(&config, crate::aws::Service::EcrPublic)
+            .map_err(|e| e.into_auth_failed(REGISTRY))?;
 
         Ok(Self {
-            base_url: "https://public.ecr.aws".to_owned(),
+            base_url: format!("https://{REGISTRY}"),
             http,
             api: Box::new(AwsEcrPublicApi { client }),
             sdk_credential_cache: SdkCredentialCache::new(),
@@ -291,6 +294,25 @@ mod tests {
     use wiremock::{Mock, ResponseTemplate};
 
     use super::*;
+
+    /// ECR Public answers with one authorization data object where ECR has
+    /// a list. Reading it as ECR's list, or ECR's list as it, fails.
+    #[test]
+    fn reads_the_get_authorization_token_output() {
+        let output: GetAuthorizationTokenOutput = serde_json::from_str(
+            r#"{"authorizationData":{"authorizationToken":"QVdTOnB3","expiresAt":4102444800}}"#,
+        )
+        .unwrap();
+        let data = output.authorization_data.unwrap();
+        assert_eq!(data.authorization_token.as_deref(), Some("QVdTOnB3"));
+        assert!(data.expires_at.is_some());
+        assert!(
+            serde_json::from_str::<GetAuthorizationTokenOutput>(
+                r#"{"authorizationData":[{"authorizationToken":"QVdTOnB3"}]}"#
+            )
+            .is_err()
+        );
+    }
 
     /// Mock ECR API that returns pre-configured responses in order.
     struct MockEcrApi {

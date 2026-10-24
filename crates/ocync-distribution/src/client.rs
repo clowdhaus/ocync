@@ -14,7 +14,8 @@ use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
-const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
+/// The `user-agent` every ocync HTTP client sends.
+pub(crate) const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
 
 /// Default cap on concurrent long-lived blob streams per registry.
 ///

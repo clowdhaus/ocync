@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use aws_config::BehaviorVersion;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::digest::Digest;
@@ -232,18 +232,19 @@ where
 /// without a network.
 trait EcrBatchApi {
     /// Call `BatchCheckLayerAvailability` for a single batch (up to 100 digests).
-    fn batch_check_layer_availability(
-        &self,
-        repo: &str,
-        digests: &[String],
-    ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + '_>>;
+    fn batch_check_layer_availability<'a>(
+        &'a self,
+        repo: &'a str,
+        digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + 'a>>;
 }
 
 /// Response from a single `BatchCheckLayerAvailability` call.
+#[derive(Debug, PartialEq, Eq)]
 struct BatchCheckResponse {
-    /// Layers that were successfully checked, with their availability status.
-    layers: Vec<(String, bool)>,
-    /// Digests that failed to check (treated as unavailable).
+    /// Layers the repository holds.
+    available: Vec<Digest>,
+    /// Digests ECR could not check, as it named them. They are transferred.
     failures: Vec<String>,
 }
 
@@ -254,8 +255,25 @@ struct AwsEcrBatchApi {
     registry_id: Option<String>,
 }
 
+/// ECR's `BatchCheckLayerAvailability` for one batch.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchCheckLayerAvailability<'a> {
+    layer_digests: &'a [Digest],
+    /// The account, when the hostname names one. Without it ECR checks the
+    /// caller's own account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registry_id: Option<&'a str>,
+    repository_name: &'a str,
+}
+
+impl crate::aws::Operation for BatchCheckLayerAvailability<'_> {
+    const NAME: &'static str = "BatchCheckLayerAvailability";
+    type Output = BatchCheckOutput;
+}
+
 /// The `BatchCheckLayerAvailability` output fields ocync reads.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct BatchCheckOutput {
     #[serde(default)]
     layers: Vec<Layer>,
@@ -263,67 +281,69 @@ struct BatchCheckOutput {
     failures: Vec<LayerFailure>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Layer {
+    /// Kept as text so one digest ocync cannot parse costs only that layer
+    /// its skip, not the whole batch.
     layer_digest: Option<String>,
-    layer_availability: Option<LayerAvailability>,
+    #[serde(default)]
+    layer_availability: LayerAvailability,
 }
 
 /// ECR's `layerAvailability` values.
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum LayerAvailability {
     /// The repository holds the layer.
     Available,
-    /// The layer is missing, or a value newer than this list: either way it
-    /// is transferred.
+    /// The layer is missing, absent from the answer, or a value newer than
+    /// this list: either way it is transferred.
+    #[default]
     #[serde(other)]
     Unavailable,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LayerFailure {
     layer_digest: Option<String>,
 }
 
-impl EcrBatchApi for AwsEcrBatchApi {
-    fn batch_check_layer_availability(
-        &self,
-        repo: &str,
-        digests: &[String],
-    ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + '_>> {
-        let mut input = serde_json::json!({ "repositoryName": repo, "layerDigests": digests });
-        if let Some(id) = &self.registry_id {
-            input["registryId"] = id.as_str().into();
-        }
-        let repo = repo.to_owned();
-        Box::pin(async move {
-            let output: BatchCheckOutput = self
-                .client
-                .call("BatchCheckLayerAvailability", &input)
-                .await
-                .map_err(|e| Error::EcrApi {
-                    reason: format!("BatchCheckLayerAvailability failed for '{repo}': {e}"),
-                })?;
-
-            let layers: Vec<(String, bool)> = output
+impl From<BatchCheckOutput> for BatchCheckResponse {
+    fn from(output: BatchCheckOutput) -> Self {
+        Self {
+            available: output
                 .layers
                 .into_iter()
-                .filter_map(|layer| {
-                    let available = layer.layer_availability == Some(LayerAvailability::Available);
-                    Some((layer.layer_digest?, available))
-                })
-                .collect();
-
-            let failures: Vec<String> = output
+                .filter(|layer| layer.layer_availability == LayerAvailability::Available)
+                .filter_map(|layer| layer.layer_digest?.parse().ok())
+                .collect(),
+            failures: output
                 .failures
                 .into_iter()
                 .filter_map(|f| f.layer_digest)
-                .collect();
+                .collect(),
+        }
+    }
+}
 
-            Ok(BatchCheckResponse { layers, failures })
+impl EcrBatchApi for AwsEcrBatchApi {
+    fn batch_check_layer_availability<'a>(
+        &'a self,
+        repo: &'a str,
+        digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + 'a>> {
+        Box::pin(async move {
+            let input = BatchCheckLayerAvailability {
+                layer_digests: digests,
+                registry_id: self.registry_id.as_deref(),
+                repository_name: repo,
+            };
+            let output = self.client.call(&input).await.map_err(|e| Error::EcrApi {
+                reason: format!("{e} for '{repo}'"),
+            })?;
+            Ok(output.into())
         })
     }
 }
@@ -388,15 +408,9 @@ impl BatchChecker {
         let mut existing = HashSet::with_capacity(digests.len());
 
         for chunk in digests.chunks(MAX_DIGESTS_PER_BATCH) {
-            // Build (String, &Digest) pairs once per chunk so we convert each
-            // digest to a string exactly once (used for both the API call and
-            // the availability lookup).
-            let pairs: Vec<(String, &Digest)> = chunk.iter().map(|d| (d.to_string(), d)).collect();
-            let digest_strings: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
-
             let response = match self
                 .api
-                .batch_check_layer_availability(repo.as_str(), &digest_strings)
+                .batch_check_layer_availability(repo.as_str(), chunk)
                 .await
             {
                 Ok(r) => r,
@@ -420,30 +434,23 @@ impl BatchChecker {
                 }
             };
 
-            // Collect digest strings that the API reports as available.
-            let available: HashSet<&str> = response
-                .layers
-                .iter()
-                .filter(|(_, available)| *available)
-                .map(|(digest_str, _)| digest_str.as_str())
-                .collect();
-
-            for digest_str in &response.failures {
+            for digest in &response.failures {
                 warn!(
                     repo = %repo,
-                    digest = %digest_str,
+                    digest = %digest,
                     "ECR batch check reported failure for layer"
                 );
             }
 
-            // Map back to Digest keys using the pre-computed string.
-            // Only available blobs enter the set. Absent, unavailable,
-            // and failed digests are all treated as missing.
-            for (digest_str, digest) in &pairs {
-                if available.contains(digest_str.as_str()) {
-                    existing.insert((*digest).clone());
-                }
-            }
+            // Only available blobs this batch asked about enter the set, so a
+            // stray digest in the answer cannot skip a transfer. Absent,
+            // unavailable and failed digests are all treated as missing.
+            existing.extend(
+                response
+                    .available
+                    .into_iter()
+                    .filter(|digest| chunk.contains(digest)),
+            );
         }
 
         Ok(existing)
@@ -572,26 +579,58 @@ mod tests {
         );
     }
 
-    /// Only `AVAILABLE` skips a transfer. A value ECR adds later must parse
-    /// and count as missing, not fail the whole batch.
+    /// Only `AVAILABLE` skips a transfer. A value ECR adds later, a missing
+    /// availability or a digest ocync cannot parse must count as missing,
+    /// not fail the whole batch.
     #[test]
     fn reads_layer_availability() {
-        let output: BatchCheckOutput = serde_json::from_str(
-            r#"{"layers":[
-                {"layerDigest":"a","layerAvailability":"AVAILABLE"},
-                {"layerDigest":"b","layerAvailability":"UNAVAILABLE"},
-                {"layerDigest":"c","layerAvailability":"ARCHIVED"},
-                {"layerDigest":"d"}
-            ]}"#,
-        )
-        .unwrap();
-        let available: Vec<bool> = output
-            .layers
-            .iter()
-            .map(|l| l.layer_availability == Some(LayerAvailability::Available))
-            .collect();
-        assert_eq!(available, [true, false, false, false]);
-        assert!(output.failures.is_empty());
+        let (a, b, c, d) = (
+            test_digest(1),
+            test_digest(2),
+            test_digest(3),
+            test_digest(4),
+        );
+        let body = format!(
+            r#"{{"layers":[
+                {{"layerDigest":"{a}","layerAvailability":"AVAILABLE"}},
+                {{"layerDigest":"{b}","layerAvailability":"UNAVAILABLE"}},
+                {{"layerDigest":"{c}","layerAvailability":"ARCHIVED"}},
+                {{"layerDigest":"{d}"}},
+                {{"layerDigest":"md5:nope","layerAvailability":"AVAILABLE"}}
+            ],"failures":[{{"layerDigest":"sha256:bad","failureCode":"InvalidLayerDigest"}}]}}"#
+        );
+        let output: BatchCheckOutput = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            BatchCheckResponse::from(output),
+            BatchCheckResponse {
+                available: vec![a],
+                failures: vec!["sha256:bad".to_owned()],
+            }
+        );
+    }
+
+    /// The request names the account from the hostname, and leaves it out
+    /// when the hostname names none, as the SDK does.
+    #[test]
+    fn writes_the_batch_check_request() {
+        let digests = [test_digest(1)];
+        for (registry_id, expected) in [
+            (
+                Some("123456789012"),
+                serde_json::json!({"layerDigests": [digests[0].to_string()], "registryId": "123456789012", "repositoryName": "app"}),
+            ),
+            (
+                None,
+                serde_json::json!({"layerDigests": [digests[0].to_string()], "repositoryName": "app"}),
+            ),
+        ] {
+            let input = BatchCheckLayerAvailability {
+                layer_digests: &digests,
+                registry_id,
+                repository_name: "app",
+            };
+            assert_eq!(serde_json::to_value(&input).unwrap(), expected);
+        }
     }
 
     // --- BatchBlobChecker tests ---
@@ -638,22 +677,15 @@ mod tests {
     }
 
     impl EcrBatchApi for MockEcrBatchApi {
-        fn batch_check_layer_availability(
-            &self,
-            repo: &str,
-            digests: &[String],
-        ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + '_>> {
+        fn batch_check_layer_availability<'a>(
+            &'a self,
+            repo: &'a str,
+            _digests: &'a [Digest],
+        ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + 'a>> {
             assert_eq!(
                 repo, self.expected_repo,
                 "mock: caller passed wrong repo to batch API"
             );
-            // Verify all digests have valid sha256: prefix (catches corruption).
-            for d in digests {
-                assert!(
-                    d.starts_with("sha256:"),
-                    "mock: invalid digest format passed to batch API: {d}"
-                );
-            }
             Box::pin(async move {
                 self.counts.check.fetch_add(1, Ordering::Relaxed);
                 let mut responses = self.check_responses.lock().await;
@@ -674,7 +706,7 @@ mod tests {
         let d2 = test_digest(2);
 
         let response = BatchCheckResponse {
-            layers: vec![(d1.to_string(), true), (d2.to_string(), true)],
+            available: vec![d1.clone(), d2.clone()],
             failures: vec![],
         };
 
@@ -704,7 +736,7 @@ mod tests {
         let d3 = test_digest(3);
 
         let response = BatchCheckResponse {
-            layers: vec![(d1.to_string(), true), (d2.to_string(), false)],
+            available: vec![d1.clone()],
             failures: vec![d3.to_string()],
         };
 
@@ -743,7 +775,7 @@ mod tests {
             .chunks(MAX_DIGESTS_PER_BATCH)
             .map(|chunk| {
                 Ok(BatchCheckResponse {
-                    layers: chunk.iter().map(|d| (d.to_string(), true)).collect(),
+                    available: chunk.to_vec(),
                     failures: vec![],
                 })
             })
@@ -813,7 +845,7 @@ mod tests {
 
         // API responds with entries but none are available.
         let response = BatchCheckResponse {
-            layers: vec![(d1.to_string(), false), (d2.to_string(), false)],
+            available: vec![],
             failures: vec![],
         };
 
@@ -836,7 +868,7 @@ mod tests {
 
         // Response only mentions d1, d2 is absent entirely.
         let response = BatchCheckResponse {
-            layers: vec![(d1.to_string(), true)],
+            available: vec![d1.clone()],
             failures: vec![],
         };
 
@@ -869,10 +901,7 @@ mod tests {
             .collect();
 
         let batch1_response = BatchCheckResponse {
-            layers: digests[..100]
-                .iter()
-                .map(|d| (d.to_string(), true))
-                .collect(),
+            available: digests[..100].to_vec(),
             failures: vec![],
         };
 
@@ -949,7 +978,7 @@ mod tests {
         let counts = CallCounts::default();
         let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(vec![Ok(
             BatchCheckResponse {
-                layers: vec![(d1.to_string(), true), (d2.to_string(), true)],
+                available: vec![d1.clone(), d2.clone()],
                 failures: vec![],
             },
         )]);
@@ -982,7 +1011,7 @@ mod tests {
         let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(vec![
             // Poll 1: only d1 is available.
             Ok(BatchCheckResponse {
-                layers: vec![(d1.to_string(), true), (d2.to_string(), false)],
+                available: vec![d1.clone()],
                 failures: vec![],
             }),
             // Poll 2: d2 now available.
@@ -990,7 +1019,7 @@ mod tests {
             // requested; if d1 were re-requested, the mock would still
             // accept it but the count test below pins the intent.
             Ok(BatchCheckResponse {
-                layers: vec![(d2.to_string(), true)],
+                available: vec![d2.clone()],
                 failures: vec![],
             }),
         ]);
@@ -1017,7 +1046,7 @@ mod tests {
         let responses: Vec<Result<BatchCheckResponse, Error>> = (0..50)
             .map(|_| {
                 Ok(BatchCheckResponse {
-                    layers: vec![(d1.to_string(), false)],
+                    available: vec![],
                     failures: vec![],
                 })
             })
@@ -1056,7 +1085,7 @@ mod tests {
             }),
             // Second poll succeeds with blob now available.
             Ok(BatchCheckResponse {
-                layers: vec![(d1.to_string(), true)],
+                available: vec![d1.clone()],
                 failures: vec![],
             }),
         ]);

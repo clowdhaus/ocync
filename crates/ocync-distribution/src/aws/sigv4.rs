@@ -5,6 +5,7 @@
 //! twice. That is the form every service ocync calls expects; S3 alone
 //! differs, and ocync does not call it.
 
+use std::fmt::{self, Write as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::{digest, hmac};
@@ -12,79 +13,104 @@ use aws_lc_rs::{digest, hmac};
 /// The signing algorithm named in the string to sign and the header.
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
-/// The header carrying the request time, in [`format_date_time`] form.
+/// The header carrying the request time, in [`AmzDate`] form.
 const X_AMZ_DATE: &str = "x-amz-date";
 
 /// The header carrying a temporary credential's session token.
 const X_AMZ_SECURITY_TOKEN: &str = "x-amz-security-token";
 
-/// AWS credentials to sign with.
-#[derive(Clone)]
-pub(crate) struct Credentials {
+/// The AWS key to sign with, borrowed from the credential that holds it.
+#[derive(Clone, Copy)]
+pub(super) struct AccessKey<'a> {
     /// The access key ID.
-    pub(crate) access_key_id: String,
+    pub(super) id: &'a str,
     /// The secret access key.
-    pub(crate) secret_access_key: String,
+    pub(super) secret: &'a str,
     /// The session token of a temporary credential.
-    pub(crate) session_token: Option<String>,
+    pub(super) session_token: Option<&'a str>,
 }
 
-impl std::fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credentials")
-            .field("access_key_id", &self.access_key_id)
+impl fmt::Debug for AccessKey<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessKey")
+            .field("id", &self.id)
             .finish_non_exhaustive()
     }
 }
 
 /// The parts of an HTTP request that are signed.
-pub(crate) struct Request<'a> {
+pub(super) struct Request<'a> {
     /// The HTTP method.
-    pub(crate) method: &'a http::Method,
+    pub(super) method: &'a http::Method,
     /// The path as sent, already percent-encoded once.
-    pub(crate) path: &'a str,
+    pub(super) path: &'a str,
     /// The query string as sent, without the `?`.
-    pub(crate) query: Option<&'a str>,
+    pub(super) query: Option<&'a str>,
     /// The headers to sign, including `host`. The signer adds
     /// [`X_AMZ_DATE`], [`X_AMZ_SECURITY_TOKEN`] and `authorization` itself.
-    pub(crate) headers: &'a [(&'a str, &'a str)],
+    pub(super) headers: &'a [(&'a str, &'a str)],
     /// The request body.
-    pub(crate) body: &'a [u8],
+    pub(super) body: &'a [u8],
 }
 
 /// Where a signature is valid: one region of one service.
-pub(crate) struct Scope<'a> {
+pub(super) struct CredentialScope<'a> {
     /// The region, such as `us-east-1`.
-    pub(crate) region: &'a str,
+    pub(super) region: &'a str,
     /// The signing name, such as `ecr`.
-    pub(crate) service: &'a str,
+    pub(super) service: &'a str,
+}
+
+/// A request time in the `YYYYMMDDTHHMMSSZ` form AWS signs, in UTC.
+struct AmzDate(String);
+
+impl AmzDate {
+    fn new(time: SystemTime) -> Self {
+        let secs = time
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        let (days, rem) = (secs / 86_400, secs % 86_400);
+        let (year, month, day) = civil_from_days(days);
+        Self(format!(
+            "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
+            rem / 3600,
+            rem % 3600 / 60,
+            rem % 60
+        ))
+    }
+
+    /// The `YYYYMMDD` date the credential scope names.
+    fn date(&self) -> &str {
+        &self.0[..8]
+    }
+}
+
+impl fmt::Display for AmzDate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Sign `request` and return the headers to add to it, in order.
-pub(crate) fn sign(
+pub(super) fn sign(
     request: &Request<'_>,
-    credentials: &Credentials,
-    scope: &Scope<'_>,
+    key: AccessKey<'_>,
+    scope: &CredentialScope<'_>,
     time: SystemTime,
 ) -> Vec<(&'static str, String)> {
-    let date_time = format_date_time(time);
-    let (canonical, signed_headers) =
-        canonical_request(request, &date_time, credentials.session_token.as_deref());
-    let string_to_sign = string_to_sign(&canonical, &date_time, scope);
-    let signature = signature(
-        &string_to_sign,
-        &credentials.secret_access_key,
-        &date_time,
-        scope,
-    );
+    let date = AmzDate::new(time);
+    let (canonical, signed_headers) = canonical_request(request, &date, key.session_token);
+    let string_to_sign = string_to_sign(&canonical, &date, scope);
+    let signature = signature(&signing_key(key.secret, &date, scope), &string_to_sign);
     let authorization = format!(
         "{ALGORITHM} Credential={}/{}, SignedHeaders={signed_headers}, Signature={signature}",
-        credentials.access_key_id,
-        credential_scope(&date_time, scope),
+        key.id,
+        credential_scope(&date, scope),
     );
-    let mut headers = vec![(X_AMZ_DATE, date_time)];
-    if let Some(token) = &credentials.session_token {
-        headers.push((X_AMZ_SECURITY_TOKEN, token.clone()));
+    let mut headers = vec![(X_AMZ_DATE, date.0)];
+    if let Some(token) = key.session_token {
+        headers.push((X_AMZ_SECURITY_TOKEN, token.to_owned()));
     }
     headers.push(("authorization", authorization));
     headers
@@ -93,15 +119,15 @@ pub(crate) fn sign(
 /// The canonical request and its signed header list.
 fn canonical_request(
     request: &Request<'_>,
-    date_time: &str,
+    date: &AmzDate,
     session_token: Option<&str>,
 ) -> (String, String) {
     let mut headers: Vec<(String, String)> = request
         .headers
         .iter()
         .map(|(name, value)| (name.to_ascii_lowercase(), trim_all(value)))
-        .chain([(X_AMZ_DATE.to_string(), date_time.to_string())])
-        .chain(session_token.map(|t| (X_AMZ_SECURITY_TOKEN.to_string(), t.to_string())))
+        .chain([(X_AMZ_DATE.to_owned(), date.0.clone())])
+        .chain(session_token.map(|t| (X_AMZ_SECURITY_TOKEN.to_owned(), t.to_owned())))
         .collect();
     // Stable, so repeated headers keep their order when joined below.
     headers.sort_by(|a, b| a.0.cmp(&b.0));
@@ -132,39 +158,38 @@ fn canonical_request(
     (canonical, signed_headers)
 }
 
-fn string_to_sign(canonical: &str, date_time: &str, scope: &Scope<'_>) -> String {
+fn string_to_sign(canonical: &str, date: &AmzDate, scope: &CredentialScope<'_>) -> String {
     format!(
-        "{ALGORITHM}\n{date_time}\n{}\n{}",
-        credential_scope(date_time, scope),
+        "{ALGORITHM}\n{date}\n{}\n{}",
+        credential_scope(date, scope),
         hex::encode(digest::digest(&digest::SHA256, canonical.as_bytes())),
     )
 }
 
-fn credential_scope(date_time: &str, scope: &Scope<'_>) -> String {
+fn credential_scope(date: &AmzDate, scope: &CredentialScope<'_>) -> String {
     format!(
         "{}/{}/{}/aws4_request",
-        &date_time[..8],
+        date.date(),
         scope.region,
         scope.service
     )
 }
 
-/// The signing key is derived from the secret, the date, the region and the
+/// The key is derived from the secret, the date, the region and the
 /// service, so it cannot sign for any other scope.
-fn signature(string_to_sign: &str, secret: &str, date_time: &str, scope: &Scope<'_>) -> String {
-    let mut key = format!("AWS4{secret}").into_bytes();
-    for part in [
-        &date_time[..8],
-        scope.region,
-        scope.service,
-        "aws4_request",
-        string_to_sign,
-    ] {
-        key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &key), part.as_bytes())
-            .as_ref()
-            .to_vec();
+fn signing_key(secret: &str, date: &AmzDate, scope: &CredentialScope<'_>) -> hmac::Key {
+    let mut key = hmac::Key::new(hmac::HMAC_SHA256, format!("AWS4{secret}").as_bytes());
+    for part in [date.date(), scope.region, scope.service, "aws4_request"] {
+        key = hmac::Key::new(
+            hmac::HMAC_SHA256,
+            hmac::sign(&key, part.as_bytes()).as_ref(),
+        );
     }
-    hex::encode(key)
+    key
+}
+
+fn signature(key: &hmac::Key, string_to_sign: &str) -> String {
+    hex::encode(hmac::sign(key, string_to_sign.as_bytes()))
 }
 
 /// Header values are trimmed of spaces and inner runs of spaces become one.
@@ -230,26 +255,10 @@ fn encode(value: &str, mode: Encode) -> String {
         {
             out.push(char::from(byte));
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            write!(out, "%{byte:02X}").expect("writing to a String cannot fail");
         }
     }
     out
-}
-
-/// `YYYYMMDDTHHMMSSZ` in UTC.
-fn format_date_time(time: SystemTime) -> String {
-    let secs = time
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_secs();
-    let (days, rem) = (secs / 86_400, secs % 86_400);
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
 }
 
 /// The proleptic Gregorian date `days` after 1970-01-01, from Howard
@@ -265,6 +274,18 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + u64::from(month <= 2);
     (year, month, day)
+}
+
+/// Days from 1970-01-01 to a proleptic Gregorian date, the inverse of
+/// [`civil_from_days`], from Howard Hinnant's `days_from_civil`. `None`
+/// before 1970.
+pub(super) fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
+    let year = year.checked_sub(u64::from(month <= 2))?;
+    let era = year / 400;
+    let yoe = year % 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe).checked_sub(719_468)
 }
 
 #[cfg(test)]
@@ -401,7 +422,7 @@ mod tests {
             headers: &headers,
             body: raw.body.as_bytes(),
         };
-        canonical_request(&request, &format_date_time(time), token).0
+        canonical_request(&request, &AmzDate::new(time), token).0
     }
 
     #[test]
@@ -412,7 +433,7 @@ mod tests {
             let time = UNIX_EPOCH + Duration::from_secs(SUITE_TIME);
             let raw = parse(&read(test, "request.txt"));
             let token = context.credentials.token.as_deref();
-            let scope = Scope {
+            let scope = CredentialScope {
                 region: &context.region,
                 service: &context.service,
             };
@@ -423,8 +444,8 @@ mod tests {
                 read(test, "header-canonical-request.txt"),
                 "{test}: canonical request"
             );
-            let date_time = format_date_time(time);
-            let to_sign = string_to_sign(&canonical, &date_time, &scope);
+            let date = AmzDate::new(time);
+            let to_sign = string_to_sign(&canonical, &date, &scope);
             assert_eq!(
                 to_sign,
                 read(test, "header-string-to-sign.txt"),
@@ -432,10 +453,8 @@ mod tests {
             );
             assert_eq!(
                 signature(
-                    &to_sign,
-                    &context.credentials.secret_access_key,
-                    &date_time,
-                    &scope
+                    &signing_key(&context.credentials.secret_access_key, &date, &scope),
+                    &to_sign
                 ),
                 read(test, "header-signature.txt"),
                 "{test}: signature"
@@ -465,12 +484,10 @@ mod tests {
     /// as well as signed.
     #[test]
     fn returns_the_headers_to_send() {
-        let credentials = Credentials {
-            access_key_id: "AKIDEXAMPLE".to_string(),
-            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-            session_token: Some(
-                "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267".to_string(),
-            ),
+        let key = AccessKey {
+            id: "AKIDEXAMPLE",
+            secret: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            session_token: Some("6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267"),
         };
         let request = Request {
             method: &http::Method::GET,
@@ -479,13 +496,13 @@ mod tests {
             headers: &[("Host", "example.amazonaws.com")],
             body: b"",
         };
-        let scope = Scope {
+        let scope = CredentialScope {
             region: "us-east-1",
             service: "service",
         };
         let headers = sign(
             &request,
-            &credentials,
+            key,
             &scope,
             UNIX_EPOCH + Duration::from_secs(SUITE_TIME),
         );
@@ -515,6 +532,17 @@ mod tests {
         assert_eq!(trim_all("  a   b\tc  "), "a b\tc");
     }
 
+    /// The two conversions invert each other across leap days and century
+    /// years, and nothing before 1970 converts.
+    #[test]
+    fn counts_days_from_a_date() {
+        for days in [0, 11_016, 19_782, 20_088, 47_541, 2_932_896] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), Some(days), "{y}-{m}-{d}");
+        }
+        assert_eq!(days_from_civil(1969, 12, 31), None);
+    }
+
     /// Leap days and year ends, where a hand-written date conversion breaks.
     #[test]
     fn formats_dates_across_calendar_edges() {
@@ -526,7 +554,7 @@ mod tests {
             (4_107_542_400, "21000301T000000Z"),
         ] {
             assert_eq!(
-                format_date_time(UNIX_EPOCH + Duration::from_secs(secs)),
+                AmzDate::new(UNIX_EPOCH + Duration::from_secs(secs)).to_string(),
                 expected,
                 "{secs}"
             );

@@ -52,15 +52,23 @@ pub fn is_transient_transport(error: &reqwest::Error) -> bool {
     error.is_request() || error.is_body() || error.is_decode()
 }
 
-/// Whether an error is worth re-sending: a throttle, or a transport failure.
+/// A failure that says whether the request behind it is worth re-sending.
+pub(crate) trait Transient {
+    /// Whether re-sending the request could succeed.
+    fn is_transient(&self) -> bool;
+}
+
+/// A throttle, or a transport failure.
 ///
 /// A 429 is backpressure rather than a refusal. AIMD has already halved the
 /// window by the time one surfaces, so the retry is paced by the throttle it
 /// caused.
-pub(crate) fn is_transient(error: &Error) -> bool {
-    match error {
-        Error::Http(e) => is_transient_transport(e),
-        other => other.status_code() == Some(http::StatusCode::TOO_MANY_REQUESTS),
+impl Transient for Error {
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Http(e) => is_transient_transport(e),
+            other => other.status_code() == Some(http::StatusCode::TOO_MANY_REQUESTS),
+        }
     }
 }
 
@@ -88,24 +96,9 @@ fn backoff(attempt: u32) -> Duration {
 /// listing may walk thousands of pages, and four retries on each of them is a
 /// bound only on paper: it permits hours of backing off against a registry that
 /// is plainly refusing to serve the listing.
-pub(crate) async fn retrying<T, F, Fut>(what: &str, budget: &AtomicU32, op: F) -> Result<T, Error>
+pub(crate) async fn retrying<T, E, F, Fut>(what: &str, budget: &AtomicU32, op: F) -> Result<T, E>
 where
-    F: Fn() -> Fut,
-    Fut: Future<Output = Result<T, Error>>,
-{
-    retrying_when(what, budget, is_transient, op).await
-}
-
-/// [`retrying`] for an operation with its own error type, re-run while
-/// `transient` says its failure is worth re-sending.
-pub(crate) async fn retrying_when<T, E, F, Fut>(
-    what: &str,
-    budget: &AtomicU32,
-    transient: fn(&E) -> bool,
-    op: F,
-) -> Result<T, E>
-where
-    E: std::fmt::Display,
+    E: Transient + std::fmt::Display,
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
@@ -114,7 +107,7 @@ where
         match op().await {
             Ok(value) => return Ok(value),
             Err(e)
-                if transient(&e)
+                if e.is_transient()
                     && attempt < MAX_TRANSIENT_RETRIES
                     && budget
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
@@ -239,7 +232,7 @@ mod tests {
             "a refused connection must be retryable: {err:?}"
         );
         assert!(
-            is_transient(&Error::Http(err)),
+            Error::Http(err).is_transient(),
             "and must stay retryable once wrapped"
         );
     }
@@ -273,7 +266,7 @@ mod tests {
             status: http::StatusCode::TOO_MANY_REQUESTS,
             message: "Rate exceeded".into(),
         };
-        assert!(is_transient(&throttled));
+        assert!(throttled.is_transient());
 
         for status in [
             http::StatusCode::NOT_FOUND,
@@ -284,14 +277,14 @@ mod tests {
                 status,
                 message: "no".into(),
             };
-            assert!(!is_transient(&err), "{status} must not be re-sent");
+            assert!(!err.is_transient(), "{status} must not be re-sent");
         }
     }
 
     #[tokio::test]
     async fn retrying_gives_up_and_surfaces_the_last_error() {
         let calls = Cell::new(0u32);
-        let err = retrying::<(), _, _>(
+        let err = retrying::<(), Error, _, _>(
             "always throttled",
             &AtomicU32::new(MAX_TRANSIENT_RETRIES),
             || {
@@ -317,15 +310,19 @@ mod tests {
     #[tokio::test]
     async fn retrying_does_not_re_run_a_permanent_failure() {
         let calls = Cell::new(0u32);
-        let _ = retrying::<(), _, _>("not found", &AtomicU32::new(MAX_TRANSIENT_RETRIES), || {
-            calls.set(calls.get() + 1);
-            async {
-                Err(Error::RegistryError {
-                    status: http::StatusCode::NOT_FOUND,
-                    message: "absent".into(),
-                })
-            }
-        })
+        let _ = retrying::<(), Error, _, _>(
+            "not found",
+            &AtomicU32::new(MAX_TRANSIENT_RETRIES),
+            || {
+                calls.set(calls.get() + 1);
+                async {
+                    Err(Error::RegistryError {
+                        status: http::StatusCode::NOT_FOUND,
+                        message: "absent".into(),
+                    })
+                }
+            },
+        )
         .await;
         assert_eq!(calls.get(), 1, "a 404 must be surfaced on the first answer");
     }

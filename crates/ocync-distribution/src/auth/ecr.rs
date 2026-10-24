@@ -41,20 +41,54 @@ pub(super) trait EcrApi: Send + Sync {
 
 /// One `authorizationData` entry of a `GetAuthorizationToken` output, the
 /// same shape in ECR and ECR Public.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AuthorizationData {
     /// The base64 `AWS:<password>` token.
     pub(super) authorization_token: Option<String>,
-    /// Expiry in seconds since the UNIX epoch.
-    pub(super) expires_at: Option<f64>,
+    /// When the token expires.
+    pub(super) expires_at: Option<Expiry>,
 }
 
-#[derive(Deserialize)]
+/// A token expiry, sent as seconds since the UNIX epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Expiry(SystemTime);
+
+impl Expiry {
+    /// Time until the expiry, or zero once it has passed.
+    pub(super) fn remaining(self) -> Duration {
+        self.0
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+impl<'de> Deserialize<'de> for Expiry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let secs = f64::deserialize(deserializer)?;
+        Duration::try_from_secs_f64(secs)
+            .ok()
+            .and_then(|since_epoch| SystemTime::UNIX_EPOCH.checked_add(since_epoch))
+            .map(Self)
+            .ok_or_else(|| serde::de::Error::custom(format!("expiry {secs} is not a time")))
+    }
+}
+
+/// ECR's `GetAuthorizationToken`, which takes no input.
+#[derive(serde::Serialize)]
+struct GetAuthorizationToken {}
+
+/// ECR answers with a list of authorization data, one per registry.
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetAuthorizationTokenOutput {
     #[serde(default)]
     authorization_data: Vec<AuthorizationData>,
+}
+
+impl crate::aws::Operation for GetAuthorizationToken {
+    const NAME: &'static str = "GetAuthorizationToken";
+    type Output = GetAuthorizationTokenOutput;
 }
 
 /// Default [`EcrApi`], calling ECR through [`crate::aws::Client`].
@@ -69,14 +103,11 @@ impl EcrApi for AwsEcrApi {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
         Box::pin(async move {
-            let output: GetAuthorizationTokenOutput = self
+            let output = self
                 .client
-                .call("GetAuthorizationToken", &serde_json::json!({}))
+                .call(&GetAuthorizationToken {})
                 .await
-                .map_err(|e| Error::AuthFailed {
-                    registry: self.registry.clone(),
-                    reason: format!("ECR GetAuthorizationToken failed: {e}"),
-                })?;
+                .map_err(|e| e.into_auth_failed(&self.registry))?;
 
             let auth_data = output
                 .authorization_data
@@ -95,7 +126,7 @@ impl EcrApi for AwsEcrApi {
                 })?;
 
             // Prefer the API-provided expiry over the hardcoded default.
-            let expires_in = auth_data.expires_at.map(ttl_from_expiry);
+            let expires_in = auth_data.expires_at.map(Expiry::remaining);
 
             Ok(EcrTokenResponse {
                 encoded_token,
@@ -105,25 +136,14 @@ impl EcrApi for AwsEcrApi {
     }
 }
 
-/// Compute remaining TTL from an expiry in seconds since the UNIX epoch.
-///
-/// Returns the duration between now and the expiry instant. If the expiry
-/// is in the past, returns [`Duration::ZERO`].
-pub(super) fn ttl_from_expiry(expires_at: f64) -> Duration {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_secs_f64();
-    Duration::try_from_secs_f64(expires_at - now).unwrap_or(Duration::ZERO)
-}
-
 /// Cached SDK credential with TTL tracking.
 ///
 /// Generic cache for ECR SDK credentials that uses a read-lock fast path
 /// for concurrent cache hits and a write-lock with double-check for
-/// refreshes. Used by both [`EcrAuth`] (caching `Token`) and
-/// [`super::ecr_public::EcrPublicAuth`] (caching `Credentials`).
-pub(super) struct SdkCredentialCache<T> {
+/// refreshes. Used by [`EcrAuth`] (caching `Token`),
+/// [`super::ecr_public::EcrPublicAuth`] (caching `Credentials`) and the AWS
+/// API client (caching AWS keys).
+pub(crate) struct SdkCredentialCache<T> {
     cached: RwLock<Option<SdkCacheEntry<T>>>,
 }
 
@@ -135,7 +155,7 @@ struct SdkCacheEntry<T> {
 
 impl<T: Clone + Send + Sync> SdkCredentialCache<T> {
     /// Create an empty cache.
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cached: RwLock::new(None),
         }
@@ -147,11 +167,11 @@ impl<T: Clone + Send + Sync> SdkCredentialCache<T> {
     /// `label` is used as the `Token` value for TTL tracking (not for auth).
     /// The refresh future is created at the call site but only polled on
     /// cache miss, so the API call is never issued when the cache is warm.
-    pub(super) async fn get_or_refresh(
+    pub(crate) async fn get_or_refresh<E>(
         &self,
         label: &str,
-        refresh: impl Future<Output = Result<(T, Duration), Error>>,
-    ) -> Result<T, Error> {
+        refresh: impl Future<Output = Result<(T, Duration), E>>,
+    ) -> Result<T, E> {
         // Fast path: read-lock check allows concurrent readers.
         {
             let cached = self.cached.read().await;
@@ -430,6 +450,35 @@ mod tests {
     }
 
     // --- validate_ecr_token tests ---
+
+    /// ECR answers with a list of authorization data. The expiry is read
+    /// as epoch seconds; one that is not a time fails the parse rather than
+    /// caching the token as already expired.
+    #[test]
+    fn reads_the_get_authorization_token_output() {
+        let output: GetAuthorizationTokenOutput = serde_json::from_str(
+            r#"{"authorizationData":[{"authorizationToken":"QVdTOnB3","expiresAt":4102444800.5,"proxyEndpoint":"https://x"}]}"#,
+        )
+        .unwrap();
+        let data = &output.authorization_data[0];
+        assert_eq!(data.authorization_token.as_deref(), Some("QVdTOnB3"));
+        assert_eq!(
+            data.expires_at,
+            Some(Expiry(
+                SystemTime::UNIX_EPOCH + Duration::from_millis(4_102_444_800_500)
+            ))
+        );
+        for bad in ["-1", "1e300"] {
+            let body = format!(r#"{{"authorizationData":[{{"expiresAt":{bad}}}]}}"#);
+            let err = serde_json::from_str::<GetAuthorizationTokenOutput>(&body).unwrap_err();
+            assert!(err.to_string().contains("is not a time"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_expiry_in_the_past_leaves_no_time() {
+        assert_eq!(Expiry(SystemTime::UNIX_EPOCH).remaining(), Duration::ZERO);
+    }
 
     #[test]
     fn validate_valid_token() {

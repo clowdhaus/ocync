@@ -18,7 +18,7 @@ No Docker config or static credentials are needed. See the [AWS credential prece
 
 Notable behaviors:
 
-- HTTP Basic, not Bearer exchange. SDK `GetAuthorizationToken` returns a base64-encoded `AWS:<password>` blob that the registry accepts directly; ocync sends `Authorization: Basic <token>` and skips the `/v2/token` round-trip.
+- HTTP Basic, not Bearer exchange. `GetAuthorizationToken` returns a base64-encoded `AWS:<password>` blob that the registry accepts directly; ocync sends `Authorization: Basic <token>` and skips the `/v2/token` round-trip.
 - FIPS endpoints: set `AWS_USE_FIPS_ENDPOINT=true` to send the ECR API calls to `api.ecr-fips.<region>.<partition domain>`. See the [FIPS guide](/fips) for crypto provider details.
 - The ECR API calls (`GetAuthorizationToken`, `BatchCheckLayerAvailability`) go through `HTTPS_PROXY` when it is set, like registry traffic, and `AWS_ENDPOINT_URL_ECR` overrides their endpoint.
 - Cross-repo blob mounting requires `BLOB_MOUNTING=ENABLED` on the account *and* a committed manifest in the source repo that references the specific blob. Enable per-account: `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`. Mount POSTs returning 202 (not yet fulfilled) fall back to a normal upload.

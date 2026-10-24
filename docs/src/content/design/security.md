@@ -83,7 +83,9 @@ Scanners that read the embedded list directly still see the dropped crates until
 
 - An owned signer on `aws-lc-rs` HMAC and SHA-256. It passes the cases of the AWS signing test suite that apply to header signing outside S3, and matched `aws-sigv4` on 60,000 random requests.
 - Endpoints from the AWS SDK's endpoint rules for every partition, with `AWS_USE_FIPS_ENDPOINT`, `AWS_USE_DUALSTACK_ENDPOINT`, `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_ECR` / `AWS_ENDPOINT_URL_ECR_PUBLIC` read from the AWS config as before.
-- The SDK's retry rules: throttling error codes (ECR throttles with HTTP 400) and 5xx responses are retried with jittered backoff, other errors are not.
+- The SDK's retry rules: throttling error codes (ECR throttles with HTTP 400) and 5xx responses are re-sent up to `AWS_MAX_ATTEMPTS` times (3 by default, at most 5), other errors are not. The wait between attempts is the crate's jittered schedule, and the SDK's retry quota shared across calls is not ported.
+- The SDK's clock-skew correction: the skew is measured from each answer's `Date` header, and a signature rejected while the clocks are more than 4 minutes apart is signed again on AWS's clock.
+- A credential source that does not answer within 21.6 seconds, the SDK's bound for its default settings, fails the call.
 - Requests honor `HTTPS_PROXY` and `NO_PROXY`, like registry traffic. The SDK client did not.
 
 Credentials still come from `aws-config`, which signs its own STS calls with `aws-sigv4`, so `aws-sigv4` stays in the build until the owned credential chain replaces `aws-config`.

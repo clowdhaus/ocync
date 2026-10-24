@@ -61,11 +61,17 @@ const BEARER_SCHEME: &str = "bearer";
 /// (realm auth headers, ACR exchange form bodies) to the redirect
 /// target. Also used by [`super::acr::AcrAuth`] for exchange POSTs.
 pub(crate) fn no_redirect_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(concat!("ocync/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::none())
+    no_redirect_builder()
         .build()
         .expect("no-redirect HTTP client builder should not fail")
+}
+
+/// The builder behind [`no_redirect_http_client`], for a client that also
+/// sets its own timeouts.
+pub(crate) fn no_redirect_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(crate::client::USER_AGENT_VALUE)
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 /// Shorthand for realm validation errors.

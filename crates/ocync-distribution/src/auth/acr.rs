@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use super::ecr::SdkCredentialCache;
 use super::token_cache::TokenCache;
-use super::token_exchange::no_redirect_http_client;
+use super::token_exchange::{no_redirect_builder, no_redirect_http_client};
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 use base64::Engine;
@@ -297,11 +297,9 @@ impl fmt::Debug for AzureCredentialChain {
 impl AzureCredentialChain {
     fn new(authority: &'static str, resource: &'static str) -> Self {
         crate::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("ocync/", env!("CARGO_PKG_VERSION")))
+        let http = no_redirect_builder()
             .connect_timeout(Duration::from_secs(1))
             .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build Azure credential HTTP client");
         Self {
