@@ -1,13 +1,19 @@
-//! `cargo xtask sbom-check`: confirm a release bill of materials lists the
-//! crates compiled into the binary, including the AWS-LC module it links.
+//! `sbom-check`: confirm release bills of materials list the crates compiled
+//! into the binary, including the AWS-LC module it links.
 //!
 //! The list comes from cargo's dependency graph, which also names crates a
 //! weak feature mentions (`ring` through `rustls-webpki`) and crates resolved
 //! but not linked (`aws-lc-sys` in a FIPS build). `cargo deny` is the ban
 //! check, so this checks only what must be present.
+//!
+//! A crate of its own so release jobs build it in seconds, before any
+//! registry credentials exist.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::Parser;
 
 use serde::Deserialize;
 
@@ -17,7 +23,7 @@ const CARGO_PURL: &str = "pkg:cargo/";
 
 /// Which AWS-LC build the binary must link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum Crypto {
+enum Crypto {
     /// The AWS-LC FIPS module, `aws-lc-fips-sys`.
     Fips,
     /// AWS-LC without the FIPS module, `aws-lc-sys`.
@@ -33,9 +39,11 @@ impl Crypto {
     }
 }
 
-/// Arguments for `sbom-check`.
-#[derive(clap::Args)]
-pub(crate) struct SbomCheckArgs {
+/// Check that CycloneDX bills of materials list `ocync` and the AWS-LC
+/// module the build links.
+#[derive(Parser)]
+#[command(name = "sbom-check")]
+struct Args {
     /// The AWS-LC build every binary must link.
     #[arg(long, value_enum)]
     crypto: Crypto,
@@ -56,8 +64,8 @@ struct Component {
     purl: Option<String>,
 }
 
-/// Check every document, reporting each one that fails.
-pub(crate) fn run(args: &SbomCheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
+    let args = Args::parse();
     let failures: Vec<String> = args
         .paths
         .iter()
@@ -69,10 +77,13 @@ pub(crate) fn run(args: &SbomCheckArgs) -> Result<(), Box<dyn std::error::Error>
                 .map(|e| format!("{}: {e}", path.display()))
         })
         .collect();
+    for failure in &failures {
+        eprintln!("error: {failure}");
+    }
     if failures.is_empty() {
-        Ok(())
+        ExitCode::SUCCESS
     } else {
-        Err(failures.join("\n").into())
+        ExitCode::FAILURE
     }
 }
 

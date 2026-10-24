@@ -2981,6 +2981,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbom-check"
+version = "0.8.2"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"

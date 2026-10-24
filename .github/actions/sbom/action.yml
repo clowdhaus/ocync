@@ -1,0 +1,29 @@
+name: Bill of materials
+description: Write a CycloneDX bill of materials with syft and check it with sbom-check. Needs Rust on PATH.
+
+inputs:
+  source:
+    description: syft source, such as file:<path> or docker:<image>
+    required: true
+  output:
+    description: Path for the CycloneDX JSON document
+    required: true
+  crypto:
+    description: AWS-LC build the binary must link (fips or non-fips)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      with:
+        tool: syft@1.55.0
+
+    - shell: bash
+      env:
+        SOURCE: ${{ inputs.source }}
+        OUTPUT: ${{ inputs.output }}
+        CRYPTO: ${{ inputs.crypto }}
+      run: |
+        syft scan "$SOURCE" --output "cyclonedx-json=$OUTPUT"
+        cargo run --locked --quiet -p sbom-check -- --crypto "$CRYPTO" "$OUTPUT"

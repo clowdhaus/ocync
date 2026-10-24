@@ -43,13 +43,13 @@ docker pull public.ecr.aws/clowdhaus/ocync:latest-fips
 
 Multi-arch image (`linux/amd64`, `linux/arm64`) based on `chainguard/static` with zero CVEs, no shell, and no package manager.
 
-The image is signed with cosign and carries a CycloneDX bill of materials attestation. Each platform image holds its own, and the multi-arch tag holds both:
+The image is signed with cosign. Each platform image carries its own CycloneDX bill of materials attestation, so verify the platform tag rather than the multi-arch one:
 
 ```bash
 cosign verify-attestation --type cyclonedx \
     --certificate-identity-regexp '^https://github.com/clowdhaus/ocync/' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    public.ecr.aws/clowdhaus/ocync:latest-fips
+    public.ecr.aws/clowdhaus/ocync:0.8.2-fips-amd64
 ```
 
 ### Helm

@@ -1,7 +1,6 @@
 //! xtask -- workspace automation commands.
 
 mod bench;
-mod sbom;
 
 use std::process::ExitCode;
 
@@ -15,9 +14,6 @@ enum Cli {
     Bench(bench::BenchArgs),
     /// Run benchmarks on a remote bench instance via SSH.
     BenchRemote(bench::remote::BenchRemoteArgs),
-    /// Check that release bills of materials list `ocync` and the AWS-LC
-    /// module the build links.
-    SbomCheck(sbom::SbomCheckArgs),
 }
 
 fn main() -> ExitCode {
@@ -30,7 +26,6 @@ fn main() -> ExitCode {
     let result = match cli {
         Cli::Bench(args) => rt.block_on(bench::run(args)),
         Cli::BenchRemote(args) => bench::remote::run(args),
-        Cli::SbomCheck(args) => sbom::run(&args),
     };
 
     match result {
