@@ -12,19 +12,6 @@ Benchmark infrastructure for comparing ocync against dregsy and regsync.
   - `/ocync/bench/dockerhub-access-token` - Docker Hub PAT for authenticated pulls
   - `/ocync/bench/dockerhub-username` - Docker Hub account name
 
-## Quick start
-
-```bash
-# 1. Spin up the bench instance
-cd bench/terraform/aws && terraform init && terraform apply
-
-# 2. Run benchmarks (reads bench.json automatically)
-cargo xtask bench-remote --provider aws --scenario sync --tools ocync,dregsy,regsync
-
-# 3. Tear down when done
-cd bench/terraform/aws && terraform destroy
-```
-
 ## bench-remote
 
 Single command for the full benchmark cycle.
@@ -73,27 +60,6 @@ Two of those exemptions are explicit in the harness rather than automatic, and b
 
 **A run whose instance metadata is unknown does not append to `bench/results/{registry}.json`.** That archive is tracked in git and read as a history of comparable runs; a laptop run landing in it puts uncomparable numbers under the same key. The timestamped summary is still written. This matters here more than elsewhere, because `prepare` is the scenario most likely to be run off the rig.
 
-## Metrics captured per tool per scenario
-
-| Metric | Source | Winner = |
-|--------|--------|----------|
-| Wall clock | Process timing | lowest |
-| Peak RSS | `/usr/bin/time -v` (kernel maxrss) | lowest |
-| Requests | Bench-proxy JSONL | lowest |
-| Response bytes | Bench-proxy JSONL | lowest |
-| Source blob GETs | Bench-proxy (non-target host) | lowest |
-| Source blob bytes | Bench-proxy (non-target host) | lowest |
-| Mounts (success/attempt) | Bench-proxy (POST with mount=) | highest |
-| Duplicate blob GETs | Bench-proxy (same URL fetched twice) | lowest |
-| CDN hits | Bench-proxy (X-Cache header, source requests only) | highest (after pre-warm) |
-| CDN misses | Bench-proxy (X-Cache header, source requests only) | lowest |
-| Rate-limit 429s | Bench-proxy (HTTP 429 responses) | lowest |
-| Referrer calls | Bench-proxy (`GET /v2/<repo>/referrers/...`) | n/a (fairness signal) |
-
-`ProxyMetrics::referrer_calls` counts `GET /v2/<repo>/referrers/...` requests. Used by `referrer_footnote()` in `report.rs` to inject a fairness note when any tool issues referrer calls. ocync issues these by default; comparable tools do not.
-
-Instance metadata (type, CPU, memory, network, region) is captured from `ec2:DescribeInstanceTypes`.
-
 ## Benchmark fairness invariants
 
 The harness enforces these automatically -- do not bypass them.
@@ -128,17 +94,6 @@ ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.us-east-2.amazonaws.com
 cargo xtask bench --tools ocync,dregsy,regsync sync
 ```
-
-## Instance details
-
-| What | Path |
-|------|------|
-| Source code | `/home/ec2-user/ocync/` |
-| Cargo binaries | `/home/ec2-user/.cargo/bin/` |
-| Bench-proxy CA | `/etc/bench-proxy/ca.pem`, `/etc/bench-proxy/ca-key.pem` |
-| Competitor tools | `/usr/local/bin/{dregsy,regsync,skopeo}` |
-| Results | `/home/ec2-user/ocync/bench/results/<timestamp>/` |
-| Run records | `/home/ec2-user/ocync/bench/results/{registry}.json` |
 
 `BENCH_TARGET_REGISTRY` is set automatically by `bench-remote`. When running manually, derive it from `aws sts get-caller-identity`.
 
@@ -184,15 +139,6 @@ The IAM role includes: `AmazonEC2ContainerRegistryFullAccess`, `ec2:DescribeInst
 
 ## Terraform structure
 
-Each cloud provider gets its own directory:
-
-```
-bench/terraform/
-  aws/     # VPC, public subnet, VPC endpoints, EC2, SSH key pair
-  gcp/     # (planned, does not exist yet) VPC, GCE, Private Google Access, GAR
-  azure/   # (planned, does not exist yet) VNet, VM, ACR private endpoint
-```
-
 Terraform writes `bench.json` to the provider directory with connection details. The xtask reads this file -- no manual copy-paste of IPs.
 
 ## Analyzing proxy logs
@@ -220,12 +166,6 @@ jq '[.response_bytes] | add' <tool>-proxy.jsonl
 ## Run record archive
 
 Each benchmark run appends a compact record to `bench/results/{registry}.json` (e.g. `ecr.json`). These files are tracked in git for longitudinal comparison across machines, cloud providers, and code versions.
-
-The registry key is derived from the target registry hostname:
-- `*.ecr.*.amazonaws.com` -> `ecr.json`
-- `gcr.io` / `*.gcr.io` / `*-docker.pkg.dev` -> `gcr.json`
-- `*.azurecr.io` -> `acr.json`
-- Anything else -> `other.json`
 
 Each record includes: timestamp, git ref, machine metadata (provider, instance type, arch, vCPUs, memory, network, region), corpus size, and all 9 per-tool metrics per scenario.
 
