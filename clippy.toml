@@ -1,2 +1,2 @@
 too-many-lines-threshold = 200
-doc-valid-idents = ["CycloneDX", "OpenVEX", ".."]
+doc-valid-idents = ["CycloneDX", ".."]

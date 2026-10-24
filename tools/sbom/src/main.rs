@@ -7,16 +7,13 @@
 //! names crates `ocync` never compiles. `finish` keeps only the crates cargo's resolver
 //! compiles for `ocync`, drops `aws-lc-sys` from a FIPS build once the binary
 //! shows it carries no non-FIPS AWS-LC, names the linked AWS-LC library, and
-//! checks the result describes the binary being released. Given grype's report
-//! on syft's document, it also writes OpenVEX statements for matches on the
-//! crates it dropped, for scanners that read the embedded list. A crate of its own
+//! checks the result describes the binary being released. A crate of its own
 //! so release jobs build it in seconds, before any registry credentials
 //! exist.
 
 mod binary;
 mod document;
 mod resolver;
-mod vex;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -77,15 +74,6 @@ struct Args {
     /// Where to write the finished CycloneDX JSON.
     #[arg(long)]
     out: PathBuf,
-    /// grype's JSON report for the raw document. With `--vex`, writes the
-    /// OpenVEX document for its matches on crates the binary does not
-    /// contain.
-    #[arg(long, requires = "vex")]
-    grype: Option<PathBuf>,
-    /// Where to write the OpenVEX document. Written only when a statement
-    /// applies; any existing file is removed otherwise.
-    #[arg(long, requires = "grype")]
-    vex: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -105,20 +93,7 @@ fn run(args: &Args) -> Result<(), String> {
     let raw = read(&args.raw)?;
     let compiled = resolver::compiled(args.crypto)?;
     let finished = document::finish(&raw, &compiled, &aws_lc, args.crypto)?;
-    write(&args.out, &finished.document)?;
-    let (Some(grype), Some(vex_path)) = (&args.grype, &args.vex) else {
-        return Ok(());
-    };
-    let id = format!("{}#vex", finished.serial);
-    match vex::document(&read(grype)?, &finished.absent, &id, &finished.timestamp)? {
-        Some(vex) => write(vex_path, &vex),
-        None => match std::fs::remove_file(vex_path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                Err(format!("{}: {e}", vex_path.display()))
-            }
-            _ => Ok(()),
-        },
-    }
+    write(&args.out, &finished)
 }
 
 fn read(path: &std::path::Path) -> Result<String, String> {

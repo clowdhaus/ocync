@@ -17,7 +17,7 @@ order: 5
 - `aws-lc-rs` is the only TLS provider. `ring`, `openssl` and `native-tls` are banned in `deny.toml`.
 - Linux release binaries are built with the `fips` feature, statically linked against glibc. See [FIPS 140-3](/fips).
 - Content digests use `aws-lc-rs` (`crates/ocync-distribution/src/sha256.rs`).
-- Release binaries and images carry build provenance, a bill of materials and, when a statement applies, an OpenVEX attestation. Images are also signed with cosign. GitHub Actions are pinned to commit SHAs.
+- Release binaries and images carry build provenance and a bill of materials attestation. Images are also signed with cosign. GitHub Actions are pinned to commit SHAs.
 - The Docker base images (`cgr.dev/chainguard/rust:latest-dev`, `cgr.dev/chainguard/static:latest`) float by design so every build picks up Chainguard's patches. They are not pinned by digest.
 
 ## Dependency weight
@@ -44,7 +44,7 @@ At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the ins
 
 `ocync` links AWS-LC FIPS module 4, which AWS has submitted to NIST and which awaits certification. The docs name module 4 and its status, not a certificate it does not hold yet.
 
-## Releases carry a bill of materials, provenance and VEX
+## Releases carry a bill of materials and provenance
 
 Release binaries and the image's binary are built with `cargo auditable`, which embeds the dependency list in the binary, so scanners such as grype and trivy read it from the shipped artifact.
 
@@ -55,16 +55,15 @@ That embedded list comes from `cargo metadata`, which lists an optional dependen
 - It keeps only the crates `cargo tree` compiles into `ocync` for that build, the same cross-check [cargo-auditable#210](https://github.com/rust-secure-code/cargo-auditable/pull/210) proposes upstream, and drops `aws-lc-sys` from a FIPS build.
 - It names the linked C library, read from the binary: `AWS-LC FIPS 4.2.0`, marked as FIPS 140-3 module 4, or `AWS-LC 5.11.0` (`pkg:github/aws/aws-lc@v5.11.0`).
 - It fails CI and the release when the binary links the wrong AWS-LC build, or when the bill of materials lacks `ocync` at the source tree's version, `aws-lc-rs` or the build's AWS-LC crate. That catches a binary built without its dependency list, a stale binary, and a FIPS binary built without the FIPS module.
-- For scanners that read the embedded list, it writes an OpenVEX document with a `not_affected` / `component_not_present` statement for every vulnerability grype matches on a dropped crate, aliases included. Each statement names the crate's versioned package URL, the form trivy and grype both honor. A release with no such match ships no VEX.
 
 What ships:
 
-- Each binary has `<binary>.cdx.json`, and `<binary>.vex.json` when a statement applies, both attested on GitHub by the job that built it. `sha256sums.txt` and the build provenance cover the binaries and these documents.
-- Each platform image carries cosign attestations of its bill of materials, which also lists the base image's packages, and of its VEX. trivy finds the VEX with `--vex oci`. The multi-arch index carries neither, since one document cannot describe two platforms.
+- Each binary has `<binary>.cdx.json`, attested on GitHub by the job that built it. `sha256sums.txt` and the build provenance cover the binaries and these documents.
+- Each platform image carries a cosign attestation of its bill of materials, which also lists the base image's packages. The multi-arch index carries none, since one document cannot describe two platforms.
 - Build provenance covers each platform image and the index, stored on GitHub and keyed by digest.
 - Nothing is pushed to the registry until every binary and image passes its check.
 
-The VEX covers advisories known when the release is built. A later advisory against a dropped crate needs a new release, or a scheduled rescan that re-attests the VEX.
+Scanners that read the embedded list directly still see the dropped crates until cargo-auditable#210 ships, at which point the pinned cargo-auditable version is bumped. If a scanner flags a dropped crate before then, the fix is an OpenVEX file in this repository's `.vex/` directory, which trivy reads through VEX Hub.
 
 ## Owned Google authentication
 

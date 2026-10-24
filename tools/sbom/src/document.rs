@@ -7,7 +7,6 @@ use serde_json::{Value, json};
 use crate::Crypto;
 use crate::binary::AwsLc;
 use crate::resolver::{Compiled, Crate};
-use crate::vex::{Absent, Reason};
 
 /// The package URL prefix CycloneDX gives a Rust crate. Image documents also
 /// list OS packages, which carry other prefixes and are kept as they are.
@@ -16,19 +15,6 @@ const CARGO_PURL: &str = "pkg:cargo/";
 /// The `bom-ref` of the AWS-LC library component this adds.
 const AWS_LC_REF: &str = "aws-lc";
 
-/// The release bill of materials, and what it dropped from syft's document.
-#[derive(Debug)]
-pub(crate) struct Finished {
-    /// The CycloneDX JSON.
-    pub(crate) document: String,
-    /// Crates syft listed that the binary does not contain.
-    pub(crate) absent: Vec<Absent>,
-    /// syft's `serialNumber`, which names the VEX document.
-    pub(crate) serial: String,
-    /// syft's `metadata.timestamp`, which dates the VEX document.
-    pub(crate) timestamp: String,
-}
-
 /// Keep only crates `compiled` lists, add the linked AWS-LC library, and
 /// confirm the result describes this source tree's `ocync` and AWS-LC build.
 pub(crate) fn finish(
@@ -36,7 +22,7 @@ pub(crate) fn finish(
     compiled: &Compiled,
     aws_lc: &AwsLc,
     crypto: Crypto,
-) -> Result<Finished, String> {
+) -> Result<String, String> {
     let mut doc: Value =
         serde_json::from_str(raw).map_err(|e| format!("not a CycloneDX document: {e}"))?;
     let components = doc
@@ -45,26 +31,16 @@ pub(crate) fn finish(
         .ok_or("the document lists no components")?;
 
     let mut removed: BTreeSet<String> = BTreeSet::new();
-    let mut absent: Vec<Absent> = Vec::new();
     components.retain(|component| {
         let Some(krate) = cargo_crate(component) else {
             return true;
         };
-        let reason = if !compiled.crates.contains(&krate) {
-            Reason::NotCompiled
-        } else if crypto.resolved_not_linked() == Some(krate.name.as_str()) {
-            Reason::NotLinked
-        } else {
-            return true;
-        };
-        if let Some(bom_ref) = component["bom-ref"].as_str() {
+        let keep = compiled.crates.contains(&krate)
+            && crypto.resolved_not_linked() != Some(krate.name.as_str());
+        if !keep && let Some(bom_ref) = component["bom-ref"].as_str() {
             removed.insert(bom_ref.to_string());
         }
-        absent.push(Absent {
-            purl: format!("{CARGO_PURL}{}@{}", krate.name, krate.version),
-            reason,
-        });
-        false
+        keep
     });
 
     let kept: Vec<Crate> = components.iter().filter_map(cargo_crate).collect();
@@ -120,13 +96,7 @@ pub(crate) fn finish(
         }
     }
 
-    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
-    Ok(Finished {
-        serial: text(&doc["serialNumber"]),
-        timestamp: text(&doc["metadata"]["timestamp"]),
-        document: serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?,
-        absent,
-    })
+    serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())
 }
 
 fn cargo_crate(component: &Value) -> Option<Crate> {
@@ -233,20 +203,7 @@ mod tests {
         let mut listed = FIPS_BUILD.to_vec();
         listed.push(("ring", "0.17.14"));
         let out = finish(&raw(&listed), &compiled(FIPS_BUILD), &fips(), Crypto::Fips).unwrap();
-        assert_eq!(
-            out.absent,
-            [
-                Absent {
-                    purl: "pkg:cargo/aws-lc-sys@0.46.0".to_string(),
-                    reason: Reason::NotLinked,
-                },
-                Absent {
-                    purl: "pkg:cargo/ring@0.17.14".to_string(),
-                    reason: Reason::NotCompiled,
-                },
-            ]
-        );
-        let doc: Value = serde_json::from_str(&out.document).unwrap();
+        let doc: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             names(&doc),
             [
@@ -263,9 +220,7 @@ mod tests {
     fn removes_dependency_edges_to_dropped_crates() {
         let mut listed = FIPS_BUILD.to_vec();
         listed.push(("ring", "0.17.14"));
-        let out = finish(&raw(&listed), &compiled(FIPS_BUILD), &fips(), Crypto::Fips)
-            .unwrap()
-            .document;
+        let out = finish(&raw(&listed), &compiled(FIPS_BUILD), &fips(), Crypto::Fips).unwrap();
         assert!(!out.contains("ring@0.17.14"), "{out}");
         let doc: Value = serde_json::from_str(&out).unwrap();
         let sys = doc["dependencies"]
@@ -286,7 +241,7 @@ mod tests {
             Crypto::Fips,
         )
         .unwrap();
-        let doc: Value = serde_json::from_str(&out.document).unwrap();
+        let doc: Value = serde_json::from_str(&out).unwrap();
         let aws_lc = doc["components"].as_array().unwrap().last().unwrap();
         assert_eq!(aws_lc["version"], "4.2.0");
         assert_eq!(aws_lc["properties"][0]["value"], "AWS-LC-FIPS 4");
@@ -305,8 +260,7 @@ mod tests {
             release: "5.11.0".to_string(),
         };
         let out = finish(&raw(&build), &compiled(&build), &aws_lc, Crypto::NonFips).unwrap();
-        assert!(out.absent.is_empty());
-        let doc: Value = serde_json::from_str(&out.document).unwrap();
+        let doc: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             names(&doc),
             [
@@ -326,7 +280,7 @@ mod tests {
     #[test]
     fn rejects_a_binary_built_without_its_dependency_list() {
         assert_eq!(
-            finish(&raw(&[]), &compiled(FIPS_BUILD), &fips(), Crypto::Fips).map(|f| f.document),
+            finish(&raw(&[]), &compiled(FIPS_BUILD), &fips(), Crypto::Fips),
             Err(
                 "bill of materials (0 crates) is missing `ocync@0.8.2`, `aws-lc-rs`, `aws-lc-fips-sys`"
                     .to_string()
@@ -341,7 +295,7 @@ mod tests {
         let mut build = FIPS_BUILD.to_vec();
         build.push(("ocync", "0.8.1"));
         assert_eq!(
-            finish(&raw(&listed), &compiled(&build), &fips(), Crypto::Fips).map(|f| f.document),
+            finish(&raw(&listed), &compiled(&build), &fips(), Crypto::Fips),
             Err("bill of materials (3 crates) is missing `ocync@0.8.2`".to_string())
         );
     }
@@ -354,7 +308,7 @@ mod tests {
             ("aws-lc-sys", "0.46.0"),
         ];
         assert_eq!(
-            finish(&raw(&listed), &compiled(FIPS_BUILD), &fips(), Crypto::Fips).map(|f| f.document),
+            finish(&raw(&listed), &compiled(FIPS_BUILD), &fips(), Crypto::Fips),
             Err("bill of materials (2 crates) is missing `aws-lc-fips-sys`".to_string())
         );
     }
