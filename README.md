@@ -25,7 +25,7 @@ ocync is purpose-built for one job: efficiently mirroring images from upstream r
 - **Streaming transfers** - bytes flow source to target with no intermediate disk (single-target mode)
 - **Adaptive rate limiting** - per-(registry, action) [AIMD](https://clowdhaus.github.io/ocync/design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency adapts to each registry's observed throttling, complemented by a token-bucket layer that enforces documented per-account TPS ceilings where the registry publishes them
 - **Transfer state cache** - persistent cache skips already-synced blobs across runs
-- **FIPS 140-3 by default** - the AWS-LC FIPS module and FIPS-only TLS, see [FIPS 140-3](https://clowdhaus.github.io/ocync/fips#certification)
+- **FIPS 140-3 by default** - the AWS-LC FIPS module and FIPS-only TLS, see [FIPS 140-3](https://clowdhaus.github.io/ocync/fips)
 - **Tag filtering** - glob patterns, semver ranges, exclude patterns, sort, latest-N
 - **Platform filtering** - sync only the architectures you need (e.g., `linux/amd64`, `linux/arm64`)
 - **Structured JSON output** - machine-readable sync reports for CI/CD pipelines

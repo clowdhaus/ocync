@@ -8,7 +8,7 @@ order: 5
 
 `ocync` targets regulated environments: FIPS, GovCloud and DoD. FedRAMP High is the bar each decision is measured against. Three principles follow from it:
 
-- **Every cryptographic operation runs inside the FIPS module.** TLS, request signing, token signing and digests all go through `aws-lc-rs` built against the AWS-LC FIPS module. No pure-Rust cryptography in a FIPS build. The module's NIST status is recorded, not assumed: see below.
+- **Every cryptographic operation runs inside the FIPS module.** TLS, request signing, token signing and digests all go through `aws-lc-rs` built against the FIPS module. No pure-Rust cryptography in a FIPS build.
 - **Own the code on the security path.** Cloud authentication is a small surface: a few API calls and a credential chain. Owning it keeps the dependency tree small and every cryptographic call on the FIPS module.
 - **Every release carries evidence.** Signatures, provenance and a bill of materials, so an assessor can check what shipped.
 
@@ -36,17 +36,13 @@ The duplicated hash crate versions (`digest`, `block-buffer`, `crypto-common`, `
 
 The `fips` feature enables `rustls/fips`. That feature applies to every `rustls` user in the build, so `aws_lc_rs::default_provider()` drops ChaCha20-Poly1305 and every key exchange group the module does not approve, for `reqwest`, which `google-cloud-auth` also uses, and for the TLS client the AWS SDK builds itself. TLS 1.2 also requires extended master secret.
 
-At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the installed provider is FIPS-approved, including whether the module is in approved mode. Every command except `version` refuses to start if it is not, so `version` can still report the failing state. `ocync version` prints the module the way AWS-LC's `openssl version -fips` names it (`module: AWS-LC FIPS module 4`), the AWS-LC release (`release: AWS-LC 4.2.0`), the module's certification status (`certificate: none yet, module in process (...)`) and the result (`tls: approved`), in the shape `openssl list -providers` uses. A FIPS build decides all of this from one constant, `CRYPTO_BUILD` in `ocync-distribution`, so the CLI cannot disagree with the linked module.
+At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the installed provider is FIPS-approved, including whether the module is in approved mode. Every command except `version` refuses to start if it is not, so `version` can still report the failing state. `ocync version` prints the AWS-LC-FIPS module number a certificate names (`module: AWS-LC-FIPS 4`), the AWS-LC release (`release: AWS-LC 4.2.0`) and the result (`tls: approved`), in the shape `openssl list -providers` uses. A FIPS build decides all of this from one constant, `CRYPTO_BUILD` in `ocync-distribution`, so the CLI cannot disagree with the linked module.
 
 `tests/fips_tls.rs` in `ocync-distribution` pins the behavior: the registry client fails the handshake against servers offering only TLS 1.3 ChaCha20-Poly1305, only TLS 1.2 ChaCha20-Poly1305, or only X25519, and succeeds against one offering AES-128-GCM.
 
-## The shipped module's certification is recorded
+## The shipped module's status is stated correctly
 
-`ocync` links AWS-LC FIPS module 4, which NIST lists as in process: lab-tested and submitted, not yet certified. Module 3 holds certificate #5314, but every `rustls` and `rustls-webpki` release that works with it carries published TLS advisories whose fixes require module 4. [FIPS 140-3](/fips#certification) lists each module's status and the FedRAMP documentation it implies.
-
-`certification()` in `ocync-distribution` maps the linked module to its status, and `ocync version` prints it. `linked_module_has_a_certification_record` fails when aws-lc-rs moves to a FIPS module number with no record, so a move to a new module branch cannot ship unrecorded. Patch releases within a branch are that module's update stream and share its record. When NIST certifies module 4, the record gains its certificate number.
-
-The X25519MLKEM768 key exchange group stays on: `rustls` treats it as approved because ML-KEM in the AWS-LC FIPS module is FIPS-pending, a reading `rustls` says FedRAMP Rev. 5 SC-13 allows. Whether it applies is the assessor's call, as [FIPS 140-3](/fips) says.
+`ocync` links AWS-LC FIPS module 4, which AWS has submitted to NIST and which awaits certification. The docs name module 4 and its status, not a certificate it does not hold yet.
 
 ## Releases carry a bill of materials
 

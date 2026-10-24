@@ -17,7 +17,7 @@ Download from [GitHub Releases](https://github.com/clowdhaus/ocync/releases):
 | macOS arm64 | `ocync-macos-arm64` | No |
 | Windows x86_64 | `ocync-windows-amd64.exe` | No |
 
-Linux binaries statically link the AWS-LC FIPS module (see [FIPS 140-3](/fips#certification)). macOS and Windows use aws-lc-rs without FIPS mode.
+Linux binaries statically link the AWS-LC FIPS module (see [FIPS 140-3](/fips)). macOS and Windows use aws-lc-rs without FIPS mode.
 
 ### Homebrew
 
