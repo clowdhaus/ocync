@@ -2154,15 +2154,10 @@ async fn sync_follower_mount_wait_no_deadlock() {
     // bounded-deadline guarantees correctness (both sync), not mount rate.
 }
 
-/// Batch-check `notify_blob` correctness: two images share a blob and
-/// run concurrently. Both complete without timeout, proving the batch
-/// check's `notify_blob` call correctly wakes any claim waiter so the
-/// second image can skip or mount the shared blob.
-///
-/// Without the `notify_blob` in the batch-check path, a blob transition
-/// from `InProgress` to `ExistsAtTarget` via batch check would violate
-/// the synchronization contract and delay waiters until the original
-/// uploader finishes its upload.
+/// Two images share a blob and run concurrently, and the blob already
+/// exists at one of their target repos. Both complete, proving that a task
+/// finding the blob present (`set_blob_verified`) never leaves a waiter on
+/// the shared blob's upload claim blocked.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_batch_check_notifies_in_progress_waiters() {
     let source_server = MockServer::start().await;
