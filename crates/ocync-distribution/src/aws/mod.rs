@@ -547,17 +547,18 @@ impl Client {
     pub(crate) async fn call<O: Operation>(&self, input: &O) -> Result<O::Output, CallError> {
         let body = Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize"));
         let target = format!("{}.{}", self.service.target_prefix(), O::NAME);
-        if let Some(delay) = self.partition.first_send_delay(self.retry.mode()) {
-            tokio::time::sleep(delay).await;
-        }
+        let (target, body) = (&target, &body);
         let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
-        retrying(O::NAME, &mut policy, || self.send(&target, body.clone()))
-            .await
-            .map_err(|source| CallError {
-                service: self.service,
-                operation: O::NAME,
-                source,
-            })
+        retrying(O::NAME, &mut policy, |attempt| async move {
+            self.partition.send_token(&self.retry, attempt).await;
+            self.send(target, body.clone()).await
+        })
+        .await
+        .map_err(|source| CallError {
+            service: self.service,
+            operation: O::NAME,
+            source,
+        })
     }
 
     async fn send<T: DeserializeOwned>(&self, target: &str, body: Bytes) -> Result<T, Failure> {
@@ -591,7 +592,11 @@ impl Client {
         for (name, value) in signed {
             request = request.header(name, value);
         }
-        let response = request.send().await.map_err(Failure::Transport)?;
+        // The endpoint URL may carry a key, so a transport error drops it.
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Failure::Transport(e.without_url()))?;
         let measured = ClockSkew::measure(response.headers(), sent, SystemTime::now());
         if let Some(skew) = measured {
             self.skew.store(skew.0, Ordering::Relaxed);
@@ -607,7 +612,10 @@ impl Client {
             .get(X_AMZ_RETRY_AFTER)
             .and_then(|v| v.to_str().ok()?.parse().ok())
             .map(Duration::from_millis);
-        let bytes = response.bytes().await.map_err(Failure::Transport)?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Failure::Transport(e.without_url()))?;
         if status.is_success() {
             return serde_json::from_slice(&bytes).map_err(Failure::Decode);
         }
@@ -1183,5 +1191,28 @@ mod tests {
             Duration::from_millis(SDK_INITIAL_BACKOFF_MS),
             standard.initial_backoff()
         );
+    }
+
+    /// A transport failure does not carry the endpoint URL, whose path may
+    /// hold a key, into the error.
+    #[tokio::test]
+    async fn keeps_the_endpoint_url_out_of_transport_errors() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = Client::from_parts(Parts {
+            retry: settings(1),
+            ..parts(&format!("http://{address}/secret-key"))
+        })
+        .unwrap();
+        let err = client.call(&Probe {}).await.unwrap_err();
+        let mut chain = format!("{err:?}");
+        let mut source: Option<&dyn std::error::Error> = Some(&err);
+        while let Some(e) = source {
+            chain.push_str(&e.to_string());
+            source = e.source();
+        }
+        assert!(chain.contains("error sending request"), "{chain}");
+        assert!(!chain.contains("secret-key"), "{chain}");
     }
 }

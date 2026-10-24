@@ -116,7 +116,7 @@ impl RegistryClient {
             // the body inside the retry matters because a connection reset
             // part way through a page is exactly the failure a re-send fixes.
             let (next_url, tag_list) =
-                retrying("tag listing", &mut Budgeted(&retry_budget), || async {
+                retrying("tag listing", &mut Budgeted(&retry_budget), |_| async {
                     let resp = self
                         .get(repository, &path, None, RegistryAction::TagList)
                         .await?;

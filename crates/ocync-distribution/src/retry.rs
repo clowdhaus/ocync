@@ -112,18 +112,19 @@ impl Policy<Error> for Budgeted<'_> {
 
 /// Run `op`, re-running it while `policy` says to.
 ///
-/// `what` names the operation in the retry log. `op` must be idempotent: the
-/// callers are reads and token exchanges, which are.
+/// `what` names the operation in the retry log. `op` is given the attempt
+/// number, 0 for the first, and must be idempotent: the callers are reads
+/// and token exchanges, which are.
 pub(crate) async fn retrying<T, E, P, F, Fut>(what: &str, policy: &mut P, op: F) -> Result<T, E>
 where
     E: std::fmt::Display,
     P: Policy<E>,
-    F: Fn() -> Fut,
+    F: Fn(u32) -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
     let mut attempt: u32 = 0;
     loop {
-        match op().await {
+        match op(attempt).await {
             Ok(value) => {
                 policy.succeeded();
                 return Ok(value);
@@ -300,12 +301,12 @@ mod tests {
 
     #[tokio::test]
     async fn retrying_gives_up_and_surfaces_the_last_error() {
-        let calls = Cell::new(0u32);
+        let attempts = std::cell::RefCell::new(Vec::new());
         let result: Result<(), Error> = retrying(
             "always throttled",
             &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
-            || {
-                calls.set(calls.get() + 1);
+            |attempt| {
+                attempts.borrow_mut().push(attempt);
                 async {
                     Err(Error::RegistryError {
                         status: http::StatusCode::TOO_MANY_REQUESTS,
@@ -317,9 +318,9 @@ mod tests {
         .await;
         let err = result.expect_err("a permanently throttled op must surface");
         assert_eq!(
-            calls.get(),
-            MAX_TRANSIENT_RETRIES + 1,
-            "one initial attempt plus every retry"
+            *attempts.borrow(),
+            (0..=MAX_TRANSIENT_RETRIES).collect::<Vec<_>>(),
+            "one initial attempt plus every retry, numbered from 0"
         );
         assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
     }
@@ -330,7 +331,7 @@ mod tests {
         let _: Result<(), Error> = retrying(
             "not found",
             &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
-            || {
+            |_| {
                 calls.set(calls.get() + 1);
                 async {
                     Err(Error::RegistryError {

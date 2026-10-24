@@ -80,7 +80,7 @@ impl Version {
 
 /// Whether sends are paced by the adaptive rate limiter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Mode {
+enum Mode {
     Standard,
     Adaptive,
 }
@@ -118,11 +118,6 @@ impl Settings {
                 _ => Mode::Standard,
             },
         }
-    }
-
-    /// Whether sends are paced.
-    pub(super) fn mode(&self) -> Mode {
-        self.mode
     }
 }
 
@@ -192,12 +187,24 @@ impl Partition {
         f(limiter.get_or_insert_with(|| Limiter::new(now)))
     }
 
-    /// The wait an adaptive client takes before a call's first attempt.
-    pub(super) fn first_send_delay(&self, mode: Mode) -> Option<Duration> {
-        let now = now();
-        (mode == Mode::Adaptive)
-            .then(|| self.with_limiter(now, |l| l.acquire(now, Paced::First).err()))
-            .flatten()
+    /// Wait until an adaptive client's limiter admits attempt `attempt`, 0
+    /// for the first, as the SDK's send token does: after each wait it asks
+    /// again, so calls that waited together do not all send at once and the
+    /// bucket never goes negative. Before retry behavior 2.1 a retry is paced
+    /// through its backoff instead.
+    pub(super) async fn send_token(&self, settings: &Settings, attempt: u32) {
+        let paced =
+            settings.mode == Mode::Adaptive && (attempt == 0 || settings.version == Version::V2_1);
+        if !paced {
+            return;
+        }
+        loop {
+            let now = now();
+            match self.with_limiter(now, |l| l.acquire(now, Paced::First)) {
+                Ok(()) => return,
+                Err(delay) => tokio::time::sleep(delay).await,
+            }
+        }
     }
 
     /// Record an attempt's outcome with an adaptive client's limiter.
@@ -750,16 +757,63 @@ mod tests {
         ));
     }
 
-    /// An adaptive client waits before a first attempt once a throttle has
-    /// turned its limiter on, and a standard client never does.
-    #[test]
-    fn only_an_adaptive_client_is_paced() {
+    /// A partition whose turned-on limiter holds `capacity` and refills at
+    /// `fill_rate` tokens a second.
+    fn limited(capacity: f64, fill_rate: f64) -> Partition {
         let partition = Partition::default();
-        assert_eq!(partition.first_send_delay(Mode::Adaptive), None);
-        partition.observe(Mode::Adaptive, Answer::Throttle);
-        partition.with_limiter(now(), |l| l.current_capacity = 0.0);
-        assert!(partition.first_send_delay(Mode::Adaptive).is_some());
-        assert_eq!(partition.first_send_delay(Mode::Standard), None);
+        partition.with_limiter(now(), |l| {
+            l.enabled = true;
+            l.current_capacity = capacity;
+            l.fill_rate = fill_rate;
+            l.last_timestamp = Some(now());
+        });
+        partition
+    }
+
+    /// The tokens `partition`'s limiter holds now.
+    fn capacity(partition: &Partition) -> f64 {
+        let now = now();
+        partition.with_limiter(now, |l| {
+            l.refill(now);
+            l.current_capacity
+        })
+    }
+
+    /// An adaptive client takes a send token for its first attempt, and for
+    /// each retry only under retry behavior 2.1, as the SDK does. A standard
+    /// client never takes one.
+    #[tokio::test]
+    async fn takes_a_send_token_as_the_sdk_does() {
+        let adaptive = RetryConfig::adaptive();
+        let adaptive_2_1 = RetryConfig::adaptive().with_retry_spec(RetrySpec::v2_1());
+        for (config, attempt, takes) in [
+            (&adaptive, 0, true),
+            (&adaptive, 1, false),
+            (&adaptive_2_1, 0, true),
+            (&adaptive_2_1, 1, true),
+            (&standard(), 0, false),
+        ] {
+            let partition = limited(5.0, 0.0);
+            partition.send_token(&Settings::new(config), attempt).await;
+            let expected = if takes { 4.0 } else { 5.0 };
+            assert_eq!(
+                capacity(&partition),
+                expected,
+                "{config:?} attempt {attempt}"
+            );
+        }
+    }
+
+    /// A send that had to wait takes its token after the wait, rather than
+    /// sending on the strength of the wait alone.
+    #[tokio::test]
+    async fn takes_the_token_after_waiting_for_it() {
+        let partition = limited(0.0, 100.0);
+        partition
+            .send_token(&Settings::new(&RetryConfig::adaptive()), 0)
+            .await;
+        let left = capacity(&partition);
+        assert!((0.0..0.5).contains(&left), "{left}");
     }
 
     fn assert_close(actual: f64, expected: f64) {
