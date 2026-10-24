@@ -1,4 +1,4 @@
-//! SHA-256 wrapper backed by aws-lc-rs (FIPS 140-3 validated, NIST Certificate #4816).
+//! SHA-256 wrapper backed by aws-lc-rs, the AWS-LC FIPS module in a FIPS build.
 
 /// SHA-256 hasher.
 pub struct Sha256 {

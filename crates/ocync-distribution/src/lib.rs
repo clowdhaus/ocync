@@ -39,7 +39,7 @@ pub fn install_crypto_provider() {
 /// Which AWS-LC module this build links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoBuild {
-    /// The FIPS 140-3 validated AWS-LC-FIPS module.
+    /// The AWS-LC FIPS module.
     Fips,
     /// AWS-LC without FIPS validation.
     NonFips,

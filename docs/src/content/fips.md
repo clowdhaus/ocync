@@ -1,12 +1,12 @@
 ---
 title: FIPS 140-3
-description: FIPS 140-3 validated cryptography in ocync using aws-lc-rs with NIST Certificate #4816.
+description: FIPS 140-3 cryptography in ocync using aws-lc-rs and the AWS-LC FIPS module.
 order: 7
 ---
 
 ## Overview
 
-`ocync` uses [aws-lc-rs](https://github.com/aws/aws-lc-rs) as its sole TLS crypto provider. On Linux, binaries ship with FIPS 140-3 validated cryptography (NIST Certificate #4816) enabled by default.
+`ocync` uses [aws-lc-rs](https://github.com/aws/aws-lc-rs) as its sole TLS crypto provider. On Linux, binaries link AWS-LC FIPS module 4 by default. AWS has submitted module 4 to NIST and it is [in process](https://csrc.nist.gov/Projects/Cryptographic-Module-Validation-Program/Modules-In-Process/Modules-In-Process-List), awaiting certification.
 
 ## Build variants
 
@@ -17,7 +17,7 @@ order: 7
 | macOS arm64 | `ocync-macos-arm64` | aws-lc-rs | No |
 | Windows x86_64 | `ocync-windows-amd64.exe` | aws-lc-rs | No |
 
-FIPS mode is a compile-time decision. The `fips` feature flag links against the FIPS-validated aws-lc module. The `non-fips` feature flag uses aws-lc-rs without FIPS validation.
+FIPS mode is a compile-time decision. The `fips` feature flag links the AWS-LC FIPS module. The `non-fips` feature flag uses aws-lc-rs without it.
 
 A FIPS build restricts TLS to FIPS-approved algorithms: AES-GCM cipher suites, key exchange over P-256, P-384 or the X25519MLKEM768 post-quantum hybrid, and extended master secret for TLS 1.2. ChaCha20-Poly1305 and plain X25519 are never offered. The restriction covers every TLS client in the binary: `reqwest`, which Google authentication also uses, and the client the AWS SDK builds itself. A FIPS build checks this at startup and refuses to run if TLS is not FIPS-approved.
 
@@ -48,7 +48,7 @@ cargo build --release --no-default-features --features non-fips
 
 ## Docker images
 
-The `latest-fips` Docker tag includes FIPS-validated cryptography:
+The `latest-fips` Docker tag ships the FIPS build:
 
 ```bash
 docker pull public.ecr.aws/clowdhaus/ocync:latest-fips

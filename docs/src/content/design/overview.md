@@ -142,11 +142,11 @@ Watch mode exposes `/healthz` (liveness) and `/readyz` (readiness) endpoints.
 
 ### FIPS 140-3
 
-FIPS is the default build (`--features fips`). Cryptography uses aws-lc-rs with NIST Certificate #4816.
+FIPS is the default build (`--features fips`). Cryptography uses aws-lc-rs on the AWS-LC FIPS module. See [FIPS 140-3](/fips) for the module's NIST status.
 
 Linux binaries use `x86_64-unknown-linux-gnu` (not musl) because FIPS certification is validated against glibc. The `+crt-static` flag statically links glibc so the final binary has no dynamic dependencies and runs on `chainguard/static` (zero CVEs, no shell, no package manager).
 
-At startup, `install_crypto_provider()` registers `aws-lc-rs` as the process-wide rustls crypto provider. The call is idempotent; subsequent calls are silently ignored. When built with `--features fips`, the provider uses the FIPS-validated aws-lc module; with `--features non-fips`, it uses the standard aws-lc backend.
+At startup, `install_crypto_provider()` registers `aws-lc-rs` as the process-wide rustls crypto provider. The call is idempotent; subsequent calls are silently ignored. When built with `--features fips`, the provider uses the AWS-LC FIPS module; with `--features non-fips`, it uses the standard aws-lc backend.
 
 macOS and Windows builds use `--no-default-features --features non-fips` (standard aws-lc-rs without FIPS mode) since FIPS certification is only relevant for Linux server deployments.
 

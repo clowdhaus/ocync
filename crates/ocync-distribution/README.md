@@ -23,7 +23,7 @@ Standalone client for the [OCI Distribution Spec](https://github.com/opencontain
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `fips` | Yes | FIPS 140-3 validated cryptography via aws-lc-rs |
+| `fips` | Yes | aws-lc-rs on the AWS-LC FIPS module, with TLS restricted to FIPS-approved algorithms |
 | `non-fips` | No | aws-lc-rs without FIPS mode |
 
 ## Minimum Rust version

@@ -25,7 +25,7 @@ ocync is purpose-built for one job: efficiently mirroring images from upstream r
 - **Streaming transfers** - bytes flow source to target with no intermediate disk (single-target mode)
 - **Adaptive rate limiting** - per-(registry, action) [AIMD](https://clowdhaus.github.io/ocync/design/overview#adaptive-concurrency-aimd) (additive increase, multiplicative decrease) concurrency adapts to each registry's observed throttling, complemented by a token-bucket layer that enforces documented per-account TPS ceilings where the registry publishes them
 - **Transfer state cache** - persistent cache skips already-synced blobs across runs
-- **FIPS 140-3 by default** - aws-lc-rs with NIST Certificate #4816
+- **FIPS 140-3 by default** - the AWS-LC FIPS module and FIPS-only TLS, see [FIPS 140-3](https://clowdhaus.github.io/ocync/fips)
 - **Tag filtering** - glob patterns, semver ranges, exclude patterns, sort, latest-N
 - **Platform filtering** - sync only the architectures you need (e.g., `linux/amd64`, `linux/arm64`)
 - **Structured JSON output** - machine-readable sync reports for CI/CD pipelines
@@ -109,7 +109,7 @@ Download from [GitHub Releases](https://github.com/clowdhaus/ocync/releases):
 | macOS arm64 | `ocync-macos-arm64` | No |
 | Windows x86_64 | `ocync-windows-amd64.exe` | No |
 
-Linux binaries are statically linked with FIPS 140-3 validated cryptography.
+Linux binaries statically link the AWS-LC FIPS module.
 
 </details>
 
@@ -120,7 +120,7 @@ Linux binaries are statically linked with FIPS 140-3 validated cryptography.
 brew install clowdhaus/taps/ocync
 ```
 
-macOS (arm64) and Linux (amd64, arm64). Linux builds use FIPS-validated AWS-LC.
+macOS (arm64) and Linux (amd64, arm64). Linux builds use the AWS-LC FIPS module.
 
 </details>
 

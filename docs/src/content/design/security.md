@@ -8,8 +8,8 @@ order: 5
 
 `ocync` targets regulated environments: FIPS, GovCloud and DoD. FedRAMP High is the bar each decision is measured against. Three principles follow from it:
 
-- **Every cryptographic operation runs inside a validated module.** TLS, request signing, token signing and digests all go through `aws-lc-rs` built against the FIPS module. No pure-Rust cryptography in a FIPS build.
-- **Own the code on the security path.** Cloud authentication is a small surface: a few API calls and a credential chain. Owning it keeps the dependency tree small and every cryptographic call on the validated module.
+- **Every cryptographic operation runs inside the FIPS module.** TLS, request signing, token signing and digests all go through `aws-lc-rs` built against the FIPS module. No pure-Rust cryptography in a FIPS build.
+- **Own the code on the security path.** Cloud authentication is a small surface: a few API calls and a credential chain. Owning it keeps the dependency tree small and every cryptographic call on the FIPS module.
 - **Every release carries evidence.** Signatures, provenance and a bill of materials, so an assessor can check what shipped.
 
 ## Current state
@@ -40,13 +40,9 @@ At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the ins
 
 `tests/fips_tls.rs` in `ocync-distribution` pins the behavior: the registry client fails the handshake against servers offering only TLS 1.3 ChaCha20-Poly1305, only TLS 1.2 ChaCha20-Poly1305, or only X25519, and succeeds against one offering AES-128-GCM.
 
-## The shipped module matches a validated certificate
+## The shipped module's status is stated correctly
 
-> **Status: Planned.**
-
-The v0.8.2 release binary `ocync-fips-linux-amd64` embeds `AWS-LC FIPS 4.2.0`. [FIPS 140-3](/fips) cites NIST Certificate #4816, which covers an earlier AWS-LC module. Confirm which certificate covers the shipped version. If none does, pin `aws-lc-fips-sys` to a validated line. Either way, the FIPS page names the certificate that matches the shipped module, and a check in the release workflow fails when the embedded version drifts from it.
-
-Two claims on the FIPS page depend on this: that the module is FIPS 140-3 validated, and the X25519MLKEM768 key exchange group, which `rustls` treats as approved because ML-KEM in the AWS-LC FIPS module is FIPS-pending. Both are settled against the certificate that covers the shipped module.
+`ocync` links AWS-LC FIPS module 4, which AWS has submitted to NIST and which awaits certification. The docs name module 4 and its status, not a certificate it does not hold yet.
 
 ## Releases carry a bill of materials
 
@@ -95,7 +91,7 @@ Lighter crates were evaluated before choosing to own the code:
 
 | Crate | Why it does not fit |
 |---|---|
-| `reqsign` (Apache OpenDAL) | The core crate depends on the pure-Rust `sha1`, `sha2` and `hmac` crates, so signing stays outside the validated module. |
+| `reqsign` (Apache OpenDAL) | The core crate depends on the pure-Rust `sha1`, `sha2` and `hmac` crates, so signing stays outside the FIPS module. |
 | `aws-sign-v4` | Built on `ring`, which `deny.toml` bans. |
 | `aws-creds` | Credentials only, blocking HTTP, and no IAM Identity Center, `source_profile` role chaining or `credential_process`. |
 | `gcp_auth` | Its cryptography runs on `aws-lc-rs`, but it has no Workload Identity Federation. Federation lets `ocync` outside Google Cloud reach Artifact Registry without a long-lived service account key. |
