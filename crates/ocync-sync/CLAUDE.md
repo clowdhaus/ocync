@@ -7,7 +7,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 - Single-threaded tokio (`current_thread`). Workload is ~100% network I/O.
 - All shared state uses `Rc<RefCell<>>`, never `Arc<Mutex<>>`.
 - Exception: `RegistryClient` is wrapped in `Arc` (not `Rc`) because the underlying HTTP client and AIMD controller must be `Send`/`Sync`. The `AimdController` uses `std::sync::Mutex` internally for the same reason. This is intentional -- the client is a leaf dependency that does not participate in the engine's shared mutable state.
-- `RefCell` borrows MUST be dropped before any `.await` point.
+- Drop every `RefCell` borrow before the next `.await` point.
 - The `!Send` constraint of `Rc<RefCell<>>` is a feature: prevents accidental `tokio::spawn`.
 - Intra-image blob concurrency: `FuturesUnordered` + local `Semaphore(6)`.
 
@@ -24,7 +24,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 
 - Greedy set-cover election in `elect_leaders()` provably covers every shared blob.
 - No "uncovered follower" path exists - all followers' shared blobs are in the leader union.
-- Do NOT add wave partitioning among followers (dead code).
+- Don't add wave partitioning among followers; it would be dead code.
 - All tasks promoted simultaneously after discovery (leaders ordered first by `elect_leaders`). Two-level synchronization:
   1. Per-(target, digest) upload claim via `ClaimAction::Wait`: whichever task claims a blob first uploads it, and every other task for that digest at that target, leader or follower, waits on `claim_notify` and re-checks.
   2. Per-repo `watch<bool>` subscribed through `unresolved_watches_for`: a task waits for a candidate source repo's manifest commit before mounting from it. ECR requires a committed manifest in the source repo for mount to succeed (201), and returns 202 (Not Fulfilled) otherwise, so `committed_mount_sources` offers only repos whose manifest is committed. Uses `watch` (not `Notify`) because committed status is boolean state, not an event -- `watch` retains the last value so late subscribers always see it.
@@ -41,12 +41,12 @@ The wait polls `BatchCheckLayerAvailability` with exponential backoff (`200ms ->
 
 Production default: 30s. Tests default to `Duration::ZERO` via `fast_retry()` so the wait does not fire (mock checkers don't reflect engine uploads). Tests that need to exercise the wait construct their own `RetryConfig` with `manifest_commit_wait > 0`.
 
-## Synchronization contracts (critical)
+## Synchronization contracts
 
-- Per-blob `Notify::notify_waiters()` does NOT store permits. Every path that ends an upload claim MUST call `release_blob_claim`, which notifies `claim_notify`. Source-pull dedup in staging holds a `ClaimGuard` from `shared.rs`, whose drop wakes waiters; drop it once the blob is staged or the pull fails. Missing notify = deadlock for concurrent waiters.
+- Per-blob `Notify::notify_waiters()` does NOT store permits. Every path that ends an upload claim must call `release_blob_claim`, which notifies `claim_notify`. Source-pull dedup in staging holds a `ClaimGuard` from `shared.rs`, whose drop wakes waiters; drop it once the blob is staged or the pull fails. Missing notify = deadlock for concurrent waiters.
 - Per-repo `watch::Sender::send_replace(true)` is called by `mark_repo_committed` (success) and `notify_repo_failed` (failure). Use `send_replace`, not `send`: `send` drops the value when no receiver exists yet, so a follower subscribing later would miss it. Stored that way, late subscribers see the value immediately.
 - No wait on another image's manifest commit may be unbounded. Multiple images can be elected as leaders when they share distinct blob subsets with different followers, so commit waits can form a cycle (A waits for B while B waits for A). `resolve_mount_source` waits at most `mount_source_wait_deadline` (default 60s) per blob, then falls back to push. Do not add a commit wait outside it.
-- **Semaphore safety boundary (enforced via function signature).** External waits (`Notify::notified()`, `watch::wait_for()`) MUST NOT hold the per-image blob semaphore. If all `BLOB_CONCURRENCY` permits are consumed by external waits, no other blob can make progress, creating a deadlock. After the semaphore is acquired, `run_under_semaphore` takes `BlobIoContext` (not `TransferContext`), so `TransferContext` (and its cache read/wait methods) is unreachable. `BlobSink` only exposes write/signal methods. All external waits happen in the pre-semaphore phase: `wait_for_blob_claim` (blob claim), `resolve_mount_source` (repo-committed watch), `resolve_staging` (staging dedup).
+- **Semaphore safety boundary (enforced via function signature).** External waits (`Notify::notified()`, `watch::wait_for()`) must not hold the per-image blob semaphore. If all `BLOB_CONCURRENCY` permits are consumed by external waits, no other blob can make progress, creating a deadlock. After the semaphore is acquired, `run_under_semaphore` takes `BlobIoContext` (not `TransferContext`), so `TransferContext` (and its cache read/wait methods) is unreachable. `BlobSink` only exposes write/signal methods. All external waits happen in the pre-semaphore phase: `wait_for_blob_claim` (blob claim), `resolve_mount_source` (repo-committed watch), `resolve_staging` (staging dedup).
 
 ## Transfer state cache
 
@@ -68,7 +68,6 @@ Production default: 30s. Tests default to `Duration::ZERO` via `fast_retry()` so
 
 - Integration tests live in `tests/sync_*.rs` (one file per subsystem). Shared helpers in `tests/helpers/`.
 - Do not write tests that capture tracing output via `set_default()` -- tracing's global `MAX_LEVEL` and callsite interest caching make per-test subscriber capture unreliable when `cargo test` runs tests in parallel within the same process. Test behavior via engine outcomes, not log messages.
-- Tests that capture tracing output via `set_default()` MUST use `#[tokio::test(flavor = "current_thread")]`. The subscriber is thread-local; `multi_thread` runtime may fire events on a different worker thread where the subscriber is not installed.
 - Each test file starts with `mod helpers; use helpers::*;` -- helpers are NOT auto-discovered.
 - Helper sub-modules use `#![allow(dead_code, unused_imports, unreachable_pub)]` (required for test module visibility).
 - `MockBatchChecker`/`FailingBatchChecker` live in `sync_cache.rs` (not in shared helpers) since only cache tests use them.
@@ -127,16 +126,6 @@ Use `SyncEngine::new(...)` directly when the test needs custom concurrency, stag
 - Concurrency tests: run at `max_concurrent > 1`. Serializing a flaky test hides a race.
 - At least one negative assertion per test (prove the unwanted path is NOT taken).
 - `assert_status!` macro for pattern-matching on `ImageStatus` with good diagnostics.
-
-## Commands
-
-```bash
-# Unit + integration tests
-cargo test --package ocync-sync
-
-# Run a single test file (fast iteration during development)
-cargo test --package ocync-sync --test sync_artifacts
-```
 
 ## Retry
 

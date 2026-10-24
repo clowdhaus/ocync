@@ -5,7 +5,6 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 ## Auth protocol
 
 - ECR private uses HTTP Basic auth (not Bearer token exchange). AWS SDK `GetAuthorizationToken` returns a pre-encoded base64 token used directly.
-- `EcrAuth::new(hostname, profile)` accepts an optional named AWS profile. When `Some(p)`, the SDK builder calls `.profile_name(p)`, scoping credential resolution to that profile in the shared credentials/config file. When `None`, the ambient default credential chain is used. Per-registry isolation is structural — each `EcrAuth` instance holds its own `SdkConfig` — so a profile override on one registry does not affect any other registry's credential resolution. `EcrPublicAuth` is unchanged (out of scope).
 - ECR Public uses SDK `GetAuthorizationToken` -> decode base64 -> OCI Bearer token exchange with those credentials. SDK tokens are NOT valid as direct Bearer tokens; they must drive standard `/v2/token` exchange.
 - Both ECR providers cache SDK credentials via `SdkCredentialCache<T>` in `auth/ecr.rs` (generic read-lock fast path / write-lock + double-check). New ECR-style providers must use this cache, not hand-roll the RwLock pattern.
 - GAR/GCR uses `google-cloud-auth` ADC (`devstorage.read_write` scope) -> `oauth2accesstoken:<token>` Basic creds -> `token_exchange::exchange()` -> Bearer token. Same flow as ECR Public. Auto-detected via `ProviderKind::Gar`/`Gcr`. SDK credential TTL is 600s (conservative: `google-cloud-auth` does not expose `expires_in`). Implementation in `auth/gcp.rs`.
@@ -21,19 +20,7 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 
 ## Provider dispatch (auto-detection)
 
-When `auth_type` is unset in registry config, `src/cli/mod.rs` selects the auth provider by `detect_provider_kind(hostname)`:
-
-| Detected `ProviderKind` | Auth provider |
-| --- | --- |
-| `Ecr` | `EcrAuth` |
-| `EcrPublic` | `EcrPublicAuth` |
-| `Gar` / `Gcr` | `GcpAuth` |
-| `Acr` | `AcrAuth` |
-| `Ghcr` / `DockerHub` / `Chainguard` / unknown | `DockerConfigAuth` (try `~/.docker/config.json`); falls back to `AnonymousAuth` if no config or no entry for the host |
-
-This means `cgr.dev`, `ghcr.io`, `docker.io`, and any unrecognized hostname all share the same default path: docker-config first, anonymous fallback. `docker login <host>` (or `chainctl auth login` for cgr.dev paid tags) is the supported way to supply credentials when `auth_type` is not set explicitly.
-
-When `auth_type` IS set in config, it overrides detection. Valid values: `ecr`, `gar`, `gcr`, `acr`, `basic`, `static_token`, `ghcr`, `docker_config`, `anonymous`. (`ghcr` and `docker_config` are equivalent.)
+With `auth_type` unset, `cgr.dev`, `ghcr.io`, `docker.io`, and any unrecognized hostname all share one default path: docker-config first, anonymous fallback. `docker login <host>` (or `chainctl auth login` for cgr.dev paid tags) is the supported way to supply credentials when `auth_type` is not set explicitly.
 
 ## Registry detection
 
@@ -43,13 +30,6 @@ When `auth_type` IS set in config, it overrides detection. Valid values: `ecr`, 
 ## AIMD concurrency controller
 
 - Per-(registry, action) AIMD windows, not per-host. `WindowKey` is a typed enum -- one variant per (provider, action-group) pair.
-- ECR private: 9 windows (each API action has an independent per-region TPS cap).
-- ECR Public: 5 windows (read paths share, plus 4 write windows; caps are 10x lower than private).
-- Docker Hub: 3 windows (HEADs unmetered/shared, manifest-read separate, rest shared).
-- GAR / GCR: 1 window (per-project quota is shared across all actions).
-- GHCR: 1 window. GitHub enforces a single 2000 RPM aggregate cap per authenticated principal across reads and writes; separate read/write windows would silently exceed the cap.
-- ACR: 2 windows (separate ReadOps and WriteOps quotas).
-- Unknown (Chainguard, Quay, generic): 5-window coarse grouping (heads, reads, uploads, manifest-write, tag-list).
 - AIMD congestion epochs: 100ms epoch prevents cascade collapse from burst 429s. Halving is only half the 429 response; see "Retry" below for the other half.
 - ECR Public's shared read window includes `TagList`, and its bucket value (8 TPS) is derived from AWS's 10 TPS authenticated *pull* quota. AWS publishes no TPS quota for tag listing, and a 2026-08-28 probe drew repeated 429s on `TagList` at that pacing with credentials loaded. Treat that value as measured-and-insufficient, not documented. See `docs/src/content/registries/ecr-public.md`.
 - Token-bucket layer (`TokenBucket` in `aimd.rs`) sits in front of the AIMD windows for registries with documented per-account TPS caps. Configured per `WindowKey` via `bucket_config_for_window()` returning a `BucketConfig { rate_per_sec, burst }`; ECR / ECR Public / GHCR / GAR / ACR get buckets, others fall back to AIMD-only. Bucket pacing happens BEFORE concurrency permits so a paced action does not occupy a slot another window could service.
@@ -64,7 +44,7 @@ When `auth_type` IS set in config, it overrides detection. Valid values: `ecr`, 
 - Retrying in the prepare phase: `list_tags` (body read included, so a mid-page reset is re-sent), `token_exchange::exchange` (both the `/v2/` ping and the realm token request), and `acr::exchange_post`. `analyze`'s manifest walk retries at its call site in `src/cli/commands/analyze.rs` using `ocync_sync::retry::with_retry`, because `manifest_pull` is shared with the engine and must not double-retry.
 - `is_transient_transport` is `pub` and is the **single** definition of the transient-transport predicate for the workspace. `ocync_sync::retry::should_retry_transport` delegates to it. Do not add a second copy: `is_request()` already covers connect failures and timeouts on the async hyper path, which is easy to get wrong from first principles.
 - Backoff is jittered. Up to 16 mappings hit one registry concurrently, so an unjittered schedule sends every throttled retry back in lockstep.
-- Do NOT add retry inside `send_with_aimd` or `manifest_pull`. Those are on the engine's path, which already retries; `tests/client_integration.rs::get_429_retries_and_succeeds` pins that layering.
+- Don't add retry inside `send_with_aimd` or `manifest_pull`. Those are on the engine's path, which already retries; `tests/client_integration.rs::get_429_retries_and_succeeds` pins that layering.
 
 ## Upload protocol quirks
 
@@ -95,18 +75,6 @@ When `auth_type` IS set in config, it overrides detection. Valid values: `ecr`, 
 
 `RegistryClient::auth_name()` (`client.rs`) returns the configured provider's `AuthProvider::name()` or `None`. Used by `src/cli/auth_dispatch_tests.rs` to assert that each `auth_type` config value (and each auto-detected hostname) routes to the expected provider. Provider-name strings are the public testability surface; keep them stable -- changing one from `"docker-config"` to `"docker_config"` would silently break every dispatch test row.
 
-Provider names:
-- `EcrAuth` -> `"ecr"`
-- `EcrPublicAuth` -> `"ecr-public"`
-- `GcpAuth` -> `"gcp"` (covers both `Gar` and `Gcr` `ProviderKind`s)
-- `AcrAuth` -> `"acr"`
-- `BasicAuth` -> `"basic"`
-- `StaticTokenAuth` -> `"static-token"`
-- `DockerConfigAuth` -> `"docker-config"` (covers `auth_type: docker_config` and the `auth_type: ghcr` alias)
-- `AnonymousAuth` -> `"anonymous"`
-
-`build_registry_client` (`src/cli/mod.rs`) calls `ocync_distribution::install_crypto_provider()` at the top -- production main does this too, but the dispatch entry point is also reached from tests that bypass main, so the install must be idempotent there.
-
 ## Perf-harness test hooks on `RegistryClientBuilder`
 
 Three `#[doc(hidden)] pub` builder methods exist on `RegistryClientBuilder` solely for in-repo perf and A/B harnesses (primarily `crates/ocync-sync/tests/perf_profile.rs`):
@@ -118,14 +86,3 @@ Three `#[doc(hidden)] pub` builder methods exist on `RegistryClientBuilder` sole
 These are **intentionally retained**. They look unused from a production-code grep because production code never reaches them (no CLI flag, no env var, no config setting). Removing them as "dead code" deletes load-bearing diagnostic infrastructure: any future perf investigation that needs to reproduce the HTTP/2 stall investigation (or any successor) would have to re-introduce the same plumbing from scratch.
 
 If you're tempted to delete them, search `tests/perf_profile.rs` first -- it references all three by name.
-
-## Commands
-
-```bash
-# Unit + wiremock tests
-cargo test --package ocync-distribution
-
-# Integration tests against local registry (requires Docker)
-cargo test --package ocync-distribution --test registry2_client
-cargo test --package ocync-distribution --test registry2_mount
-```
