@@ -722,14 +722,14 @@ mod tests {
         format!("sha256:{hex}").parse().unwrap()
     }
 
-    /// Shared counters for verifying API call counts in tests.
+    /// The digests each mock API call asked about, shared with the test.
     #[derive(Clone, Default)]
-    struct CallCounts {
+    struct CallLog {
         /// The digests each call asked about, in call order.
         asked: Arc<std::sync::Mutex<Vec<Vec<Digest>>>>,
     }
 
-    impl CallCounts {
+    impl CallLog {
         fn calls(&self) -> usize {
             self.asked.lock().unwrap().len()
         }
@@ -743,15 +743,15 @@ mod tests {
         /// Expected repository name - panics if caller passes a different repo.
         expected_repo: String,
         check_responses: Mutex<VecDeque<Result<BatchCheckResponse, Error>>>,
-        counts: CallCounts,
+        log: CallLog,
     }
 
     impl MockEcrBatchApi {
-        fn new(expected_repo: &str, counts: CallCounts) -> Self {
+        fn new(expected_repo: &str, log: CallLog) -> Self {
             Self {
                 expected_repo: expected_repo.to_owned(),
                 check_responses: Mutex::new(VecDeque::new()),
-                counts,
+                log,
             }
         }
 
@@ -774,7 +774,7 @@ mod tests {
                 repo, self.expected_repo,
                 "mock: caller passed wrong repo to batch API"
             );
-            self.counts.asked.lock().unwrap().push(digests.to_vec());
+            self.log.asked.lock().unwrap().push(digests.to_vec());
             Box::pin(async move {
                 let mut responses = self.check_responses.lock().await;
                 responses.pop_front().unwrap_or_else(|| {
@@ -798,9 +798,9 @@ mod tests {
             failures: vec![],
         };
 
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("my-repo", counts.clone())
-            .with_check_responses(vec![Ok(response)]);
+        let log = CallLog::default();
+        let mock =
+            MockEcrBatchApi::new("my-repo", log.clone()).with_check_responses(vec![Ok(response)]);
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
@@ -812,7 +812,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.into_available(), HashSet::from([d1, d2]));
-        assert_eq!(counts.calls(), 1);
+        assert_eq!(log.calls(), 1);
     }
 
     /// A digest in the answer that the request did not ask about is not
@@ -820,12 +820,13 @@ mod tests {
     #[tokio::test]
     async fn ignores_an_available_digest_it_did_not_ask_about() {
         let (asked, stray) = (test_digest(1), test_digest(2));
-        let mock = MockEcrBatchApi::new("my-repo", CallCounts::default()).with_check_responses(
-            vec![Ok(BatchCheckResponse {
-                available: vec![stray.clone()],
-                failures: vec![],
-            })],
-        );
+        let mock =
+            MockEcrBatchApi::new("my-repo", CallLog::default()).with_check_responses(vec![Ok(
+                BatchCheckResponse {
+                    available: vec![stray.clone()],
+                    failures: vec![],
+                },
+            )]);
         let result = BatchChecker::with_api(mock)
             .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &[asked])
             .await
@@ -844,9 +845,9 @@ mod tests {
             failures: vec![LayerIssue::Failed(d3.to_string())],
         };
 
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("my-repo", counts.clone())
-            .with_check_responses(vec![Ok(response)]);
+        let log = CallLog::default();
+        let mock =
+            MockEcrBatchApi::new("my-repo", log.clone()).with_check_responses(vec![Ok(response)]);
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
@@ -886,8 +887,8 @@ mod tests {
 
         assert_eq!(responses.len(), 3);
 
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("my-repo", counts.clone()).with_check_responses(responses);
+        let log = CallLog::default();
+        let mock = MockEcrBatchApi::new("my-repo", log.clone()).with_check_responses(responses);
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
@@ -898,17 +899,13 @@ mod tests {
         assert_eq!(result.into_available(), digests.iter().cloned().collect());
 
         // Verify exactly 3 API calls were made.
-        assert_eq!(
-            counts.calls(),
-            3,
-            "expected 3 batch API calls for 250 digests"
-        );
+        assert_eq!(log.calls(), 3, "expected 3 batch API calls for 250 digests");
     }
 
     #[tokio::test]
     async fn check_empty_digests() {
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("my-repo", counts.clone());
+        let log = CallLog::default();
+        let mock = MockEcrBatchApi::new("my-repo", log.clone());
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
@@ -917,17 +914,16 @@ mod tests {
             .unwrap();
 
         assert!(result.into_available().is_empty());
-        assert_eq!(counts.calls(), 0);
+        assert_eq!(log.calls(), 0);
     }
 
     #[tokio::test]
     async fn check_propagates_api_error() {
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("my-repo", counts).with_check_responses(vec![Err(
-            Error::EcrApi {
+        let log = CallLog::default();
+        let mock =
+            MockEcrBatchApi::new("my-repo", log).with_check_responses(vec![Err(Error::EcrApi {
                 reason: "throttled".into(),
-            },
-        )]);
+            })]);
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
@@ -949,8 +945,8 @@ mod tests {
             failures: vec![],
         };
 
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("my-repo", counts).with_check_responses(vec![Ok(response)]);
+        let log = CallLog::default();
+        let mock = MockEcrBatchApi::new("my-repo", log).with_check_responses(vec![Ok(response)]);
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
@@ -975,8 +971,8 @@ mod tests {
             failures: vec![],
         };
 
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("my-repo", counts).with_check_responses(vec![Ok(response)]);
+        let log = CallLog::default();
+        let mock = MockEcrBatchApi::new("my-repo", log).with_check_responses(vec![Ok(response)]);
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
@@ -1008,8 +1004,8 @@ mod tests {
             failures: vec![],
         };
 
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("my-repo", counts.clone()).with_check_responses(vec![
+        let log = CallLog::default();
+        let mock = MockEcrBatchApi::new("my-repo", log.clone()).with_check_responses(vec![
             Ok(batch1_response),
             Err(Error::EcrApi {
                 reason: "throttled on batch 2".into(),
@@ -1036,7 +1032,7 @@ mod tests {
             "partial results from successful batch must be preserved"
         );
         // 2 API calls were made (first succeeded, second failed).
-        assert_eq!(counts.calls(), 2);
+        assert_eq!(log.calls(), 2);
     }
 
     /// A batch that finds nothing still checked its digests: a later
@@ -1052,14 +1048,13 @@ mod tests {
                 reason: "throttled".into(),
             })
         };
-        let mock =
-            MockEcrBatchApi::new("my-repo", CallCounts::default()).with_check_responses(vec![
-                Ok(BatchCheckResponse {
-                    available: vec![],
-                    failures: vec![],
-                }),
-                throttled(),
-            ]);
+        let mock = MockEcrBatchApi::new("my-repo", CallLog::default()).with_check_responses(vec![
+            Ok(BatchCheckResponse {
+                available: vec![],
+                failures: vec![],
+            }),
+            throttled(),
+        ]);
         let result = BatchChecker::with_api(mock)
             .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &digests)
             .await
@@ -1071,7 +1066,7 @@ mod tests {
             assert!(!result.is_known(d));
         }
 
-        let mock = MockEcrBatchApi::new("my-repo", CallCounts::default())
+        let mock = MockEcrBatchApi::new("my-repo", CallLog::default())
             .with_check_responses(vec![throttled()]);
         BatchChecker::with_api(mock)
             .check_blob_existence(&RepositoryName::new("my-repo").unwrap(), &digests)
@@ -1092,8 +1087,8 @@ mod tests {
     /// Empty input must short-circuit without any API call.
     #[tokio::test]
     async fn wait_empty_digests_short_circuits() {
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("repo", counts.clone());
+        let log = CallLog::default();
+        let mock = MockEcrBatchApi::new("repo", log.clone());
         let checker = BatchChecker::with_api(mock);
         let result = checker
             .wait_for_blobs_available(
@@ -1104,7 +1099,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(
-            counts.calls(),
+            log.calls(),
             0,
             "empty input must NOT trigger an ECR API call"
         );
@@ -1115,8 +1110,8 @@ mod tests {
     async fn wait_all_available_on_first_poll() {
         let d1 = test_digest(1);
         let d2 = test_digest(2);
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(vec![Ok(
+        let log = CallLog::default();
+        let mock = MockEcrBatchApi::new("repo", log.clone()).with_check_responses(vec![Ok(
             BatchCheckResponse {
                 available: vec![d1.clone(), d2.clone()],
                 failures: vec![],
@@ -1131,11 +1126,7 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-        assert_eq!(
-            counts.calls(),
-            1,
-            "all-available on first poll must NOT loop"
-        );
+        assert_eq!(log.calls(), 1, "all-available on first poll must NOT loop");
     }
 
     /// First poll reports partial availability, second reports the rest.
@@ -1147,8 +1138,8 @@ mod tests {
         let d1 = test_digest(1);
         let d2 = test_digest(2);
 
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(vec![
+        let log = CallLog::default();
+        let mock = MockEcrBatchApi::new("repo", log.clone()).with_check_responses(vec![
             // Poll 1: only d1 is available.
             Ok(BatchCheckResponse {
                 available: vec![d1.clone()],
@@ -1169,11 +1160,8 @@ mod tests {
             )
             .await;
         assert!(result.is_ok(), "{:?}", result.err());
-        assert_eq!(counts.calls(), 2);
-        assert_eq!(
-            *counts.asked.lock().unwrap(),
-            [vec![d1, d2.clone()], vec![d2]]
-        );
+        assert_eq!(log.calls(), 2);
+        assert_eq!(*log.asked.lock().unwrap(), [vec![d1, d2.clone()], vec![d2]]);
     }
 
     /// Polls keep reporting blob missing until deadline expires.
@@ -1183,7 +1171,7 @@ mod tests {
         let d1 = test_digest(1);
         // Mock returns "missing" forever. Use a long response queue so
         // the test isn't flaky on number of polls.
-        let counts = CallCounts::default();
+        let log = CallLog::default();
         let responses: Vec<Result<BatchCheckResponse, Error>> = (0..50)
             .map(|_| {
                 Ok(BatchCheckResponse {
@@ -1192,7 +1180,7 @@ mod tests {
                 })
             })
             .collect();
-        let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(responses);
+        let mock = MockEcrBatchApi::new("repo", log.clone()).with_check_responses(responses);
         let checker = BatchChecker::with_api(mock);
 
         let result = checker
@@ -1218,8 +1206,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn wait_continues_through_transient_api_errors() {
         let d1 = test_digest(1);
-        let counts = CallCounts::default();
-        let mock = MockEcrBatchApi::new("repo", counts.clone()).with_check_responses(vec![
+        let log = CallLog::default();
+        let mock = MockEcrBatchApi::new("repo", log.clone()).with_check_responses(vec![
             // Transient API failure on first poll.
             Err(Error::EcrApi {
                 reason: "throttled".into(),
@@ -1243,7 +1231,7 @@ mod tests {
             "transient errors must not abort the wait: {:?}",
             result.err()
         );
-        assert_eq!(counts.calls(), 2);
+        assert_eq!(log.calls(), 2);
     }
 
     #[tokio::test]

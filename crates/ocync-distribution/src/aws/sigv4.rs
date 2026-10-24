@@ -2,13 +2,16 @@
 //!
 //! Signs in the `Authorization` header, with the session token signed as
 //! `x-amz-security-token`, URI path normalization on, the path encoded
-//! twice, and no query: the endpoint never carries one. That is the form every service ocync calls expects; S3 alone
-//! differs, and ocync does not call it.
+//! twice, and no query: the endpoint never carries one. That is the form
+//! every service ocync calls expects; S3 alone differs, and ocync does not
+//! call it.
 
 use std::fmt::{self, Write as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::{digest, hmac};
+
+use super::time::CivilDate;
 
 /// The signing algorithm named in the string to sign and the header.
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -69,7 +72,7 @@ impl AmzDate {
             .expect("system clock before UNIX epoch")
             .as_secs();
         let (days, rem) = (secs / 86_400, secs % 86_400);
-        let (year, month, day) = civil_from_days(days);
+        let CivilDate { year, month, day } = CivilDate::from_days(days);
         Self(format!(
             "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
             rem / 3600,
@@ -233,33 +236,6 @@ fn encode_path(value: &str) -> String {
         }
     }
     out
-}
-
-/// The proleptic Gregorian date `days` after 1970-01-01, from Howard
-/// Hinnant's `civil_from_days`.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z % 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-    (year, month, day)
-}
-
-/// Days from 1970-01-01 to a proleptic Gregorian date, the inverse of
-/// [`civil_from_days`], from Howard Hinnant's `days_from_civil`. `None`
-/// before 1970.
-pub(super) fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
-    let year = year.checked_sub(u64::from(month <= 2))?;
-    let era = year / 400;
-    let yoe = year % 400;
-    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146_097 + doe).checked_sub(719_468)
 }
 
 #[cfg(test)]
@@ -490,17 +466,6 @@ mod tests {
     #[test]
     fn folds_spaces_but_keeps_tabs() {
         assert_eq!(trim_all("  a   b\tc  "), "a b\tc");
-    }
-
-    /// The two conversions invert each other across leap days and century
-    /// years, and nothing before 1970 converts.
-    #[test]
-    fn counts_days_from_a_date() {
-        for days in [0, 11_016, 19_782, 20_088, 47_541, 2_932_896] {
-            let (y, m, d) = civil_from_days(days);
-            assert_eq!(days_from_civil(y, m, d), Some(days), "{y}-{m}-{d}");
-        }
-        assert_eq!(days_from_civil(1969, 12, 31), None);
     }
 
     /// Leap days and year ends, where a hand-written date conversion breaks.

@@ -26,7 +26,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::Deserialize;
 
-use super::detect::ECR_PUBLIC_HOST as REGISTRY;
+use super::detect::ECR_PUBLIC_HOST;
 use super::ecr::{
     AuthorizationData, CredentialCache, EcrApi, EcrTokenResponse, remaining, validate_ecr_token,
 };
@@ -69,14 +69,17 @@ impl EcrApi for AwsEcrPublicApi {
                 .client
                 .call(&GetAuthorizationToken {})
                 .await
-                .map_err(|e| Error::auth_failed(REGISTRY, e))?;
+                .map_err(|e| Error::auth_failed(ECR_PUBLIC_HOST, e))?;
 
             let auth_data = output.authorization_data.ok_or_else(|| {
-                Error::auth_failed(REGISTRY, "ECR Public returned no authorization data")
+                Error::auth_failed(ECR_PUBLIC_HOST, "ECR Public returned no authorization data")
             })?;
 
             let encoded_token = auth_data.authorization_token.ok_or_else(|| {
-                Error::auth_failed(REGISTRY, "ECR Public authorization data missing token")
+                Error::auth_failed(
+                    ECR_PUBLIC_HOST,
+                    "ECR Public authorization data missing token",
+                )
             })?;
 
             let expires_in = auth_data.expires_at.map(remaining);
@@ -98,21 +101,26 @@ fn decode_ecr_credentials(
     encoded_token: &str,
     ttl: Option<Duration>,
 ) -> Result<(Credentials, Duration), Error> {
-    validate_ecr_token(encoded_token, REGISTRY)?;
+    validate_ecr_token(encoded_token, ECR_PUBLIC_HOST)?;
 
     let decoded = BASE64.decode(encoded_token).map_err(|e| {
-        Error::auth_failed(REGISTRY, format!("invalid base64 in ECR Public token: {e}"))
+        Error::auth_failed(
+            ECR_PUBLIC_HOST,
+            format!("invalid base64 in ECR Public token: {e}"),
+        )
     })?;
     let text = String::from_utf8(decoded).map_err(|e| {
         Error::auth_failed(
-            REGISTRY,
+            ECR_PUBLIC_HOST,
             format!("ECR Public token is not valid UTF-8: {e}"),
         )
     })?;
 
     let password = text
         .strip_prefix("AWS:")
-        .ok_or_else(|| Error::auth_failed(REGISTRY, "ECR Public token missing 'AWS:' prefix"))?
+        .ok_or_else(|| {
+            Error::auth_failed(ECR_PUBLIC_HOST, "ECR Public token missing 'AWS:' prefix")
+        })?
         .to_owned();
 
     Ok((
@@ -173,10 +181,10 @@ impl EcrPublicAuth {
             .await;
 
         let client = crate::aws::Client::new(&config, crate::aws::Service::EcrPublic)
-            .map_err(|e| Error::auth_failed(REGISTRY, e))?;
+            .map_err(|e| Error::auth_failed(ECR_PUBLIC_HOST, e))?;
 
         Ok(Self {
-            base_url: format!("https://{REGISTRY}"),
+            base_url: format!("https://{ECR_PUBLIC_HOST}"),
             http,
             api: Box::new(AwsEcrPublicApi { client }),
             credential_cache: CredentialCache::new(),
@@ -334,7 +342,7 @@ mod tests {
                     .lock()
                     .await
                     .pop_front()
-                    .ok_or_else(|| Error::auth_failed("public.ecr.aws", "mock: no more responses"))
+                    .ok_or_else(|| Error::auth_failed(ECR_PUBLIC_HOST, "mock: no more responses"))
             })
         }
     }

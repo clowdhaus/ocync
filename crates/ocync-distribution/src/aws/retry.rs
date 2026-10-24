@@ -80,7 +80,7 @@ impl Version {
 
 /// Whether sends are paced by the adaptive rate limiter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(super) enum Mode {
     Standard,
     Adaptive,
 }
@@ -118,6 +118,11 @@ impl Settings {
                 _ => Mode::Standard,
             },
         }
+    }
+
+    /// Whether sends are paced.
+    pub(super) fn mode(&self) -> Mode {
+        self.mode
     }
 }
 
@@ -188,16 +193,16 @@ impl Partition {
     }
 
     /// The wait an adaptive client takes before a call's first attempt.
-    pub(super) fn first_send_delay(&self, settings: &Settings) -> Option<Duration> {
+    pub(super) fn first_send_delay(&self, mode: Mode) -> Option<Duration> {
         let now = now();
-        (settings.mode == Mode::Adaptive)
+        (mode == Mode::Adaptive)
             .then(|| self.with_limiter(now, |l| l.acquire(now, Paced::First).err()))
             .flatten()
     }
 
     /// Record an attempt's outcome with an adaptive client's limiter.
-    fn observe(&self, settings: &Settings, answer: Answer) {
-        if settings.mode == Mode::Adaptive {
+    fn observe(&self, mode: Mode, answer: Answer) {
+        if mode == Mode::Adaptive {
             let now = now();
             self.with_limiter(now, |l| l.update(now, answer));
         }
@@ -266,7 +271,7 @@ impl<'a> CallPolicy<'a> {
 impl Policy<Failure> for CallPolicy<'_> {
     fn retry(&mut self, attempt: u32, error: &Failure) -> Option<Duration> {
         let kind = error.retry_kind();
-        self.partition.observe(self.settings, Answer::of(kind));
+        self.partition.observe(self.settings.mode, Answer::of(kind));
         let kind = kind?;
         let attempts = attempt + 1;
         if attempts >= self.settings.max_attempts {
@@ -283,7 +288,7 @@ impl Policy<Failure> for CallPolicy<'_> {
     }
 
     fn succeeded(&mut self) {
-        self.partition.observe(self.settings, Answer::Other);
+        self.partition.observe(self.settings.mode, Answer::Other);
         self.partition
             .refund(self.held.take().unwrap_or(FIRST_TRY_REWARD));
     }
@@ -750,15 +755,11 @@ mod tests {
     #[test]
     fn only_an_adaptive_client_is_paced() {
         let partition = Partition::default();
-        let adaptive = Settings::new(&RetryConfig::adaptive());
-        assert_eq!(partition.first_send_delay(&adaptive), None);
-        partition.observe(&adaptive, Answer::Throttle);
+        assert_eq!(partition.first_send_delay(Mode::Adaptive), None);
+        partition.observe(Mode::Adaptive, Answer::Throttle);
         partition.with_limiter(now(), |l| l.current_capacity = 0.0);
-        assert!(partition.first_send_delay(&adaptive).is_some());
-        assert_eq!(
-            partition.first_send_delay(&Settings::new(&standard())),
-            None
-        );
+        assert!(partition.first_send_delay(Mode::Adaptive).is_some());
+        assert_eq!(partition.first_send_delay(Mode::Standard), None);
     }
 
     fn assert_close(actual: f64, expected: f64) {

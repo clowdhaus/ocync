@@ -7,6 +7,7 @@
 mod endpoint;
 mod retry;
 mod sigv4;
+mod time;
 
 use std::fmt;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use self::endpoint::{DualStack, Endpoint, Fips};
+use self::time::parse_imf_fixdate;
 use crate::auth::ecr::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
 
@@ -43,10 +45,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
 /// the SDK's stalled-stream grace period.
 const STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Attempts per call when the configuration sets none, as in the SDK.
+/// The SDK's default attempts per call, which size
+/// [`CREDENTIALS_LOAD_TIMEOUT`]. A call's own attempts come from its
+/// `RetryConfig`.
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
-/// The SDK's first backoff, which doubles for each later retry.
+/// The SDK's default first backoff, which sizes
+/// [`CREDENTIALS_LOAD_TIMEOUT`].
 const SDK_INITIAL_BACKOFF_MS: u64 = 1_000;
 
 /// A credential load that takes longer fails. This is the SDK's bound for
@@ -353,53 +358,6 @@ impl fmt::Display for ClockSkew {
     }
 }
 
-/// Month names as an IMF-fixdate spells them.
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// Read an IMF-fixdate, `Sun, 06 Nov 1994 08:49:37 GMT`, the `Date` form
-/// RFC 9110 requires of senders. Fractional seconds, which the SDK also
-/// accepts, are dropped. Any other text is `None`.
-fn parse_imf_fixdate(text: &str) -> Option<SystemTime> {
-    let (weekday, rest) = text.split_once(", ")?;
-    let mut fields = rest.split(' ');
-    let (day, month, year, time, zone) = (
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-        fields.next()?,
-    );
-    if weekday.len() != 3 || zone != "GMT" || fields.next().is_some() || day.len() != 2 {
-        return None;
-    }
-    let number = |field: &str| -> Option<u64> {
-        field
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| field.parse().ok())
-            .flatten()
-    };
-    let month = MONTHS.iter().position(|m| *m == month)? as u64 + 1;
-    let (day, year) = (number(day)?, number(year)?);
-    let time = time.split_once('.').map_or(time, |(whole, _)| whole);
-    let mut clock = time.split(':').map(number);
-    let (hour, minute, second) = (clock.next()??, clock.next()??, clock.next()??);
-    if clock.next().is_some()
-        || !(1..=31).contains(&day)
-        || year > 9999
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let days = sigv4::days_from_civil(year, month, day)?;
-    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second;
-    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
-}
-
 /// Why one attempt at a call failed.
 #[derive(Debug, thiserror::Error)]
 enum Failure {
@@ -491,6 +449,17 @@ impl fmt::Debug for Client {
     }
 }
 
+/// Everything a [`Client`] is built from.
+struct Parts {
+    provider: SharedCredentialsProvider,
+    service: Service,
+    region: String,
+    endpoint: Endpoint,
+    retry: retry::Settings,
+    partition: Arc<retry::Partition>,
+    stall_timeout: Duration,
+}
+
 impl Client {
     /// A client for `service` in the region and with the credentials,
     /// endpoint settings, endpoint URL override and attempt count `config`
@@ -530,27 +499,27 @@ impl Client {
             || retry::Settings::new(&RetryConfig::standard()),
             retry::Settings::new,
         );
-        let partition = retry::partition(service, &region);
-        Self::with_endpoint(
+        Self::from_parts(Parts {
+            provider,
+            service,
+            partition: retry::partition(service, &region),
+            region,
+            endpoint,
+            retry,
+            stall_timeout: STALL_TIMEOUT,
+        })
+    }
+
+    fn from_parts(parts: Parts) -> Result<Self, ConfigError> {
+        let Parts {
             provider,
             service,
             region,
             endpoint,
             retry,
             partition,
-            STALL_TIMEOUT,
-        )
-    }
-
-    fn with_endpoint(
-        provider: SharedCredentialsProvider,
-        service: Service,
-        region: String,
-        endpoint: Endpoint,
-        retry: retry::Settings,
-        partition: Arc<retry::Partition>,
-        stall_timeout: Duration,
-    ) -> Result<Self, ConfigError> {
+            stall_timeout,
+        } = parts;
         crate::install_crypto_provider();
         // Signed requests never follow a redirect: the signature names the
         // host it was made for.
@@ -578,7 +547,7 @@ impl Client {
     pub(crate) async fn call<O: Operation>(&self, input: &O) -> Result<O::Output, CallError> {
         let body = Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize"));
         let target = format!("{}.{}", self.service.target_prefix(), O::NAME);
-        if let Some(delay) = self.partition.first_send_delay(&self.retry) {
+        if let Some(delay) = self.partition.first_send_delay(self.retry.mode()) {
             tokio::time::sleep(delay).await;
         }
         let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
@@ -727,16 +696,25 @@ mod tests {
         )
     }
 
+    /// The parts of an ECR client in `us-east-1` at `endpoint`, with static
+    /// credentials, the SDK's default attempts and its own retry quota.
+    fn parts(endpoint: &str) -> Parts {
+        Parts {
+            provider: static_credentials(None),
+            service: Service::Ecr,
+            region: "us-east-1".into(),
+            endpoint: Endpoint::parse(endpoint).unwrap(),
+            retry: settings(DEFAULT_MAX_ATTEMPTS),
+            partition: Arc::default(),
+            stall_timeout: STALL_TIMEOUT,
+        }
+    }
+
     fn client(server: &MockServer, max_attempts: u32) -> Client {
-        Client::with_endpoint(
-            static_credentials(None),
-            Service::Ecr,
-            "us-east-1".into(),
-            Endpoint::parse(&server.uri()).unwrap(),
-            settings(max_attempts),
-            Arc::default(),
-            STALL_TIMEOUT,
-        )
+        Client::from_parts(Parts {
+            retry: settings(max_attempts),
+            ..parts(&server.uri())
+        })
         .unwrap()
     }
 
@@ -771,15 +749,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = Client::with_endpoint(
-            static_credentials(Some("session")),
-            Service::Ecr,
-            "us-east-1".into(),
-            Endpoint::parse(&server.uri()).unwrap(),
-            settings(DEFAULT_MAX_ATTEMPTS),
-            Arc::default(),
-            STALL_TIMEOUT,
-        )
+        let client = Client::from_parts(Parts {
+            provider: static_credentials(Some("session")),
+            ..parts(&server.uri())
+        })
         .unwrap();
         assert_eq!(
             client.call(&Probe {}).await.unwrap(),
@@ -851,15 +824,11 @@ mod tests {
             std::future::pending::<()>().await;
             drop(socket);
         });
-        let client = Client::with_endpoint(
-            static_credentials(None),
-            Service::Ecr,
-            "us-east-1".into(),
-            Endpoint::parse(&format!("http://{address}")).unwrap(),
-            settings(1),
-            Arc::default(),
-            Duration::from_millis(200),
-        )
+        let client = Client::from_parts(Parts {
+            retry: settings(1),
+            stall_timeout: Duration::from_millis(200),
+            ..parts(&format!("http://{address}"))
+        })
         .unwrap();
         let err = tokio::time::timeout(Duration::from_secs(10), client.call(&Probe {}))
             .await
@@ -960,15 +929,11 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let client = Client::with_endpoint(
-            static_credentials(None),
-            Service::Ecr,
-            "us-east-1".into(),
-            Endpoint::parse(&server.uri()).unwrap(),
-            settings(10),
-            Arc::new(retry::Partition::with_capacity(5)),
-            STALL_TIMEOUT,
-        )
+        let client = Client::from_parts(Parts {
+            retry: settings(10),
+            partition: Arc::new(retry::Partition::with_capacity(5)),
+            ..parts(&server.uri())
+        })
         .unwrap();
         client.call(&Probe {}).await.unwrap_err();
     }
@@ -1086,35 +1051,6 @@ mod tests {
         assert_eq!(ClockSkew(-5000).apply(sent), sent - Duration::from_secs(5));
     }
 
-    /// The parser agrees with `httpdate` on what `httpdate` writes, takes
-    /// the SDK's fractional seconds, and refuses the obsolete forms and
-    /// anything not in GMT.
-    #[test]
-    fn reads_an_imf_fixdate() {
-        for secs in [0, 951_782_400, 1_709_251_199, 1_735_689_599, 4_107_542_400] {
-            let time = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-            let text = httpdate::fmt_http_date(time);
-            assert_eq!(parse_imf_fixdate(&text), Some(time), "{text}");
-        }
-        assert_eq!(
-            parse_imf_fixdate("Mon, 16 Dec 2019 23:48:18.123 GMT"),
-            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_576_540_098))
-        );
-        for bad in [
-            "Sunday, 06-Nov-94 08:49:37 GMT",
-            "Sun Nov  6 08:49:37 1994",
-            "Sun, 06 Nov 1994 08:49:37 UTC",
-            "Sun, 06 Nov 1994 08:49 GMT",
-            "Sun, 32 Nov 1994 08:49:37 GMT",
-            "Sun, 06 Foo 1994 08:49:37 GMT",
-            "Sun, 06 Nov 1994 24:00:00 GMT",
-            "Sun, +6 Nov 1994 08:49:37 GMT",
-            "Sat, 01 Jan 0000 00:00:00 GMT",
-        ] {
-            assert_eq!(parse_imf_fixdate(bad), None, "{bad}");
-        }
-    }
-
     #[test]
     fn reads_the_error_code_as_the_sdk_does() {
         let parse = |header: Option<&str>, body: &str| {
@@ -1194,15 +1130,10 @@ mod tests {
         }
         for (lifetime, loads) in [(Duration::from_secs(3600), 1), (Duration::from_secs(5), 2)] {
             let count = Arc::new(AtomicUsize::new(0));
-            let client = Client::with_endpoint(
-                SharedCredentialsProvider::new(Counting(count.clone(), lifetime)),
-                Service::Ecr,
-                "us-east-1".into(),
-                Endpoint::parse("https://example.com").unwrap(),
-                settings(DEFAULT_MAX_ATTEMPTS),
-                Arc::default(),
-                STALL_TIMEOUT,
-            )
+            let client = Client::from_parts(Parts {
+                provider: SharedCredentialsProvider::new(Counting(count.clone(), lifetime)),
+                ..parts("https://example.com")
+            })
             .unwrap();
             client.credentials().await.unwrap();
             client.credentials().await.unwrap();
@@ -1229,15 +1160,10 @@ mod tests {
                 )
             }
         }
-        let client = Client::with_endpoint(
-            SharedCredentialsProvider::new(Hangs),
-            Service::Ecr,
-            "us-east-1".into(),
-            Endpoint::parse("https://example.com").unwrap(),
-            settings(DEFAULT_MAX_ATTEMPTS),
-            Arc::default(),
-            STALL_TIMEOUT,
-        )
+        let client = Client::from_parts(Parts {
+            provider: SharedCredentialsProvider::new(Hangs),
+            ..parts("https://example.com")
+        })
         .unwrap();
         let started = tokio::time::Instant::now();
         let err = client.call(&Probe {}).await.unwrap_err();
@@ -1246,5 +1172,16 @@ mod tests {
             "ECR GetAuthorizationToken failed: failed to load AWS credentials: credentials provider timed out after 21 seconds"
         );
         assert_eq!(started.elapsed(), CREDENTIALS_LOAD_TIMEOUT);
+    }
+    /// The defaults that size the credential load timeout are the SDK's
+    /// standard retry defaults.
+    #[test]
+    fn sizes_the_credential_timeout_from_the_sdk_defaults() {
+        let standard = RetryConfig::standard();
+        assert_eq!(DEFAULT_MAX_ATTEMPTS, standard.max_attempts());
+        assert_eq!(
+            Duration::from_millis(SDK_INITIAL_BACKOFF_MS),
+            standard.initial_backoff()
+        );
     }
 }
