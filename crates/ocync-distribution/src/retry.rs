@@ -7,8 +7,8 @@
 //! through [`retrying`], and share one schedule and one predicate so they
 //! cannot drift apart.
 
-use std::cell::Cell;
 use std::future::Future;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::error::Error;
@@ -88,17 +88,38 @@ fn backoff(attempt: u32) -> Duration {
 /// listing may walk thousands of pages, and four retries on each of them is a
 /// bound only on paper: it permits hours of backing off against a registry that
 /// is plainly refusing to serve the listing.
-pub(crate) async fn retrying<T, F, Fut>(what: &str, budget: &Cell<u32>, op: F) -> Result<T, Error>
+pub(crate) async fn retrying<T, F, Fut>(what: &str, budget: &AtomicU32, op: F) -> Result<T, Error>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, Error>>,
+{
+    retrying_when(what, budget, is_transient, op).await
+}
+
+/// [`retrying`] for an operation with its own error type, re-run while
+/// `transient` says its failure is worth re-sending.
+pub(crate) async fn retrying_when<T, E, F, Fut>(
+    what: &str,
+    budget: &AtomicU32,
+    transient: fn(&E) -> bool,
+    op: F,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
 {
     let mut attempt: u32 = 0;
     loop {
         match op().await {
             Ok(value) => return Ok(value),
-            Err(e) if is_transient(&e) && attempt < MAX_TRANSIENT_RETRIES && budget.get() > 0 => {
-                budget.set(budget.get() - 1);
+            Err(e)
+                if transient(&e)
+                    && attempt < MAX_TRANSIENT_RETRIES
+                    && budget
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
+                        .is_ok() =>
+            {
                 let delay = backoff(attempt);
                 tracing::debug!(
                     what,
@@ -168,6 +189,8 @@ pub(crate) async fn send_retrying(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     /// Bounds rather than equality: the schedule is jittered on purpose.
@@ -270,7 +293,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let err = retrying::<(), _, _>(
             "always throttled",
-            &Cell::new(MAX_TRANSIENT_RETRIES),
+            &AtomicU32::new(MAX_TRANSIENT_RETRIES),
             || {
                 calls.set(calls.get() + 1);
                 async {
@@ -294,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn retrying_does_not_re_run_a_permanent_failure() {
         let calls = Cell::new(0u32);
-        let _ = retrying::<(), _, _>("not found", &Cell::new(MAX_TRANSIENT_RETRIES), || {
+        let _ = retrying::<(), _, _>("not found", &AtomicU32::new(MAX_TRANSIENT_RETRIES), || {
             calls.set(calls.get() + 1);
             async {
                 Err(Error::RegistryError {

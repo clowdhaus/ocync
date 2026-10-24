@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use crate::auth::{AuthProvider, AuthScheme, Scope, Token};
@@ -29,9 +30,8 @@ pub(super) struct EcrTokenResponse {
 
 /// Abstraction over ECR `GetAuthorizationToken` for testability.
 ///
-/// Implementations are pre-configured with a specific registry and SDK client.
-/// The default ([`AwsEcrApi`]) holds a cached AWS SDK client constructed once
-/// at [`EcrAuth::new`] time.
+/// Implementations are pre-configured with a specific registry. The default
+/// ([`AwsEcrApi`]) holds a client constructed once at [`EcrAuth::new`] time.
 pub(super) trait EcrApi: Send + Sync {
     /// Fetch an authorization token from ECR.
     fn get_authorization_token(
@@ -39,20 +39,29 @@ pub(super) trait EcrApi: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>>;
 }
 
-/// Default [`EcrApi`] backed by the AWS SDK.
-///
-/// Holds the ECR SDK client created once during [`EcrAuth::new`].
-struct AwsEcrApi {
-    ecr_client: aws_sdk_ecr::Client,
-    registry: String,
+/// One `authorizationData` entry of a `GetAuthorizationToken` output, the
+/// same shape in ECR and ECR Public.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AuthorizationData {
+    /// The base64 `AWS:<password>` token.
+    pub(super) authorization_token: Option<String>,
+    /// Expiry in seconds since the UNIX epoch.
+    pub(super) expires_at: Option<f64>,
 }
 
-impl std::fmt::Debug for AwsEcrApi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AwsEcrApi")
-            .field("registry", &self.registry)
-            .finish_non_exhaustive()
-    }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetAuthorizationTokenOutput {
+    #[serde(default)]
+    authorization_data: Vec<AuthorizationData>,
+}
+
+/// Default [`EcrApi`], calling ECR through [`crate::aws::Client`].
+#[derive(Debug)]
+struct AwsEcrApi {
+    client: crate::aws::Client,
+    registry: String,
 }
 
 impl EcrApi for AwsEcrApi {
@@ -60,35 +69,33 @@ impl EcrApi for AwsEcrApi {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
         Box::pin(async move {
-            let auth_output = self
-                .ecr_client
-                .get_authorization_token()
-                .send()
+            let output: GetAuthorizationTokenOutput = self
+                .client
+                .call("GetAuthorizationToken", &serde_json::json!({}))
                 .await
                 .map_err(|e| Error::AuthFailed {
                     registry: self.registry.clone(),
                     reason: format!("ECR GetAuthorizationToken failed: {e}"),
                 })?;
 
-            let auth_data =
-                auth_output
-                    .authorization_data()
-                    .first()
-                    .ok_or_else(|| Error::AuthFailed {
-                        registry: self.registry.clone(),
-                        reason: "ECR returned empty authorization data".into(),
-                    })?;
+            let auth_data = output
+                .authorization_data
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::AuthFailed {
+                    registry: self.registry.clone(),
+                    reason: "ECR returned empty authorization data".into(),
+                })?;
 
             let encoded_token = auth_data
-                .authorization_token()
-                .map(|s| s.to_owned())
+                .authorization_token
                 .ok_or_else(|| Error::AuthFailed {
                     registry: self.registry.clone(),
                     reason: "ECR authorization data missing token".into(),
                 })?;
 
             // Prefer the API-provided expiry over the hardcoded default.
-            let expires_in = auth_data.expires_at().map(ttl_from_expiry);
+            let expires_in = auth_data.expires_at.map(ttl_from_expiry);
 
             Ok(EcrTokenResponse {
                 encoded_token,
@@ -98,21 +105,16 @@ impl EcrApi for AwsEcrApi {
     }
 }
 
-/// Compute remaining TTL from an AWS SDK `DateTime` expiry.
+/// Compute remaining TTL from an expiry in seconds since the UNIX epoch.
 ///
 /// Returns the duration between now and the expiry instant. If the expiry
 /// is in the past, returns [`Duration::ZERO`].
-pub(super) fn ttl_from_expiry(exp: &aws_sdk_ecr::primitives::DateTime) -> Duration {
-    let now_secs = SystemTime::now()
+pub(super) fn ttl_from_expiry(expires_at: f64) -> Duration {
+    let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
-        .as_secs() as i64;
-    let remaining = exp.secs() - now_secs;
-    if remaining > 0 {
-        Duration::from_secs(remaining as u64)
-    } else {
-        Duration::ZERO
-    }
+        .as_secs_f64();
+    Duration::try_from_secs_f64(expires_at - now).unwrap_or(Duration::ZERO)
 }
 
 /// Cached SDK credential with TTL tracking.
@@ -225,8 +227,8 @@ pub(super) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Er
 
 /// AWS ECR authentication provider.
 ///
-/// Uses the AWS SDK to obtain authorization tokens via `GetAuthorizationToken`.
-/// The SDK client is created once at construction time. Tokens are cached via
+/// Obtains authorization tokens via `GetAuthorizationToken`, through a
+/// client created once at construction time. Tokens are cached via
 /// [`SdkCredentialCache`] (read-lock fast path for concurrent cache hits,
 /// write-lock with double-check for fetches) and refreshed when they approach
 /// expiry. The actual token lifetime is read from the API response, falling
@@ -256,8 +258,9 @@ impl std::fmt::Debug for EcrAuth {
 impl EcrAuth {
     /// Create a new ECR auth provider for the given registry hostname.
     ///
-    /// Loads AWS credentials and constructs the ECR SDK client once. Returns
-    /// an error if the region cannot be extracted from the hostname.
+    /// Loads the AWS config and constructs the ECR client once. Returns
+    /// an error if the region cannot be extracted from the hostname, or if
+    /// a configured endpoint URL is combined with FIPS or dual-stack.
     ///
     /// When `profile` is `Some`, credential resolution is scoped to that
     /// named profile in the shared credentials/config file. When `None`,
@@ -270,19 +273,21 @@ impl EcrAuth {
             .await
             .map_err(|e| Error::AuthFailed {
                 registry: hostname.clone(),
-                reason: format!("failed to load AWS SDK config: {e}"),
+                reason: format!("failed to load AWS config: {e}"),
             })?;
 
-        let ecr_client = aws_sdk_ecr::Client::new(&config);
+        let client = crate::aws::Client::new(&config, crate::aws::Service::Ecr).map_err(|e| {
+            Error::AuthFailed {
+                registry: hostname.clone(),
+                reason: e.to_string(),
+            }
+        })?;
         let registry = hostname.clone();
 
         Ok(Self {
             hostname,
             credential_cache: SdkCredentialCache::new(),
-            api: Box::new(AwsEcrApi {
-                ecr_client,
-                registry,
-            }),
+            api: Box::new(AwsEcrApi { client, registry }),
         })
     }
 

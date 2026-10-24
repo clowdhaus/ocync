@@ -21,9 +21,9 @@ workspace = true
 
 [dependencies]
 aws-config.workspace = true
+aws-credential-types.workspace = true
 aws-lc-rs = { workspace = true }
-aws-sdk-ecr = { workspace = true }
-aws-sdk-ecrpublic = { workspace = true }
+aws-types.workspace = true
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 bytes.workspace = true
 fastrand.workspace = true

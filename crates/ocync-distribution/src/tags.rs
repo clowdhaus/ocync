@@ -1,6 +1,6 @@
 //! Tag listing with pagination for OCI repositories.
 
-use std::cell::Cell;
+use std::sync::atomic::AtomicU32;
 
 use serde::Deserialize;
 
@@ -99,7 +99,7 @@ impl RegistryClient {
         // worst case only nominally: a listing may run to MAX_TAG_PAGES, and
         // four retries on each of those is hours of backing off at a registry
         // that has stopped serving the listing.
-        let retry_budget = Cell::new(MAX_LISTING_RETRIES);
+        let retry_budget = AtomicU32::new(MAX_LISTING_RETRIES);
 
         loop {
             page_count += 1;

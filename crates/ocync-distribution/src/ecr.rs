@@ -5,10 +5,8 @@
 //! distribution API with ECR-native batch operations that reduce API
 //! round-trips by up to 98%.
 //!
-//! FIPS endpoint support is handled at the SDK config level: set
-//! `AWS_USE_FIPS_ENDPOINT=true` in the environment before loading the
-//! `SdkConfig`, and the SDK will route requests to FIPS endpoints
-//! automatically.
+//! `AWS_USE_FIPS_ENDPOINT=true` routes the calls to the FIPS endpoint,
+//! resolved in [`crate::aws::endpoint`].
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -16,7 +14,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use aws_config::BehaviorVersion;
-use aws_sdk_ecr::types::LayerAvailability;
+use serde::Deserialize;
 use tracing::warn;
 
 use crate::digest::Digest;
@@ -58,9 +56,8 @@ fn ecr_registry_id(hostname: &str) -> Option<&str> {
 
 /// Load an SDK config for the given ECR hostname.
 ///
-/// Extracts the region from the hostname and configures the SDK with it.
-/// FIPS endpoint support is handled at the SDK level: set
-/// `AWS_USE_FIPS_ENDPOINT=true` before calling this function.
+/// Extracts the region from the hostname. The config also carries the
+/// credentials and the FIPS, dual-stack and endpoint URL settings.
 ///
 /// When `profile` is `Some`, credential resolution is scoped to that named
 /// profile; when `None`, the ambient credential chain is used. Profile-not-found
@@ -232,7 +229,7 @@ where
 /// Abstraction over ECR batch API calls for testability.
 ///
 /// Wraps `BatchCheckLayerAvailability` so tests can inject mock responses
-/// without an SDK client.
+/// without a network.
 trait EcrBatchApi {
     /// Call `BatchCheckLayerAvailability` for a single batch (up to 100 digests).
     fn batch_check_layer_availability(
@@ -250,18 +247,45 @@ struct BatchCheckResponse {
     failures: Vec<String>,
 }
 
-/// Default [`EcrBatchApi`] backed by the AWS SDK.
+/// Default [`EcrBatchApi`], calling ECR through [`crate::aws::Client`].
+#[derive(Debug)]
 struct AwsEcrBatchApi {
-    client: aws_sdk_ecr::Client,
+    client: crate::aws::Client,
     registry_id: Option<String>,
 }
 
-impl std::fmt::Debug for AwsEcrBatchApi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AwsEcrBatchApi")
-            .field("registry_id", &self.registry_id)
-            .finish_non_exhaustive()
-    }
+/// The `BatchCheckLayerAvailability` output fields ocync reads.
+#[derive(Deserialize)]
+struct BatchCheckOutput {
+    #[serde(default)]
+    layers: Vec<Layer>,
+    #[serde(default)]
+    failures: Vec<LayerFailure>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Layer {
+    layer_digest: Option<String>,
+    layer_availability: Option<LayerAvailability>,
+}
+
+/// ECR's `layerAvailability` values.
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum LayerAvailability {
+    /// The repository holds the layer.
+    Available,
+    /// The layer is missing, or a value newer than this list: either way it
+    /// is transferred.
+    #[serde(other)]
+    Unavailable,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LayerFailure {
+    layer_digest: Option<String>,
 }
 
 impl EcrBatchApi for AwsEcrBatchApi {
@@ -270,39 +294,33 @@ impl EcrBatchApi for AwsEcrBatchApi {
         repo: &str,
         digests: &[String],
     ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + '_>> {
+        let mut input = serde_json::json!({ "repositoryName": repo, "layerDigests": digests });
+        if let Some(id) = &self.registry_id {
+            input["registryId"] = id.as_str().into();
+        }
         let repo = repo.to_owned();
-        let digests: Vec<String> = digests.to_vec();
         Box::pin(async move {
-            let mut builder = self
+            let output: BatchCheckOutput = self
                 .client
-                .batch_check_layer_availability()
-                .repository_name(&repo)
-                .set_layer_digests(Some(digests));
-
-            if let Some(ref id) = self.registry_id {
-                builder = builder.registry_id(id);
-            }
-
-            let output = builder.send().await.map_err(|e| Error::EcrApi {
-                reason: format!("BatchCheckLayerAvailability failed for '{repo}': {e}"),
-            })?;
+                .call("BatchCheckLayerAvailability", &input)
+                .await
+                .map_err(|e| Error::EcrApi {
+                    reason: format!("BatchCheckLayerAvailability failed for '{repo}': {e}"),
+                })?;
 
             let layers: Vec<(String, bool)> = output
-                .layers()
-                .iter()
+                .layers
+                .into_iter()
                 .filter_map(|layer| {
-                    let digest = layer.layer_digest()?.to_owned();
-                    let available = layer
-                        .layer_availability()
-                        .is_some_and(|a| *a == LayerAvailability::Available);
-                    Some((digest, available))
+                    let available = layer.layer_availability == Some(LayerAvailability::Available);
+                    Some((layer.layer_digest?, available))
                 })
                 .collect();
 
             let failures: Vec<String> = output
-                .failures()
-                .iter()
-                .filter_map(|f| f.layer_digest().map(|d| d.to_owned()))
+                .failures
+                .into_iter()
+                .filter_map(|f| f.layer_digest)
                 .collect();
 
             Ok(BatchCheckResponse { layers, failures })
@@ -310,14 +328,12 @@ impl EcrBatchApi for AwsEcrBatchApi {
     }
 }
 
-/// ECR batch checker backed by the AWS SDK.
+/// ECR batch checker.
 ///
 /// Provides bulk blob existence checking via `BatchCheckLayerAvailability`,
 /// splitting large batches into chunks of 100 (the ECR API limit per call).
 ///
 /// Construct via [`BatchChecker::from_hostname`] with an ECR hostname.
-/// FIPS support is handled at the SDK config level: set
-/// `AWS_USE_FIPS_ENDPOINT=true` before loading.
 pub struct BatchChecker {
     api: Box<dyn EcrBatchApi>,
 }
@@ -332,7 +348,7 @@ impl BatchChecker {
     /// Create a batch checker from an ECR hostname.
     ///
     /// Extracts the AWS region and 12-digit registry ID from the hostname,
-    /// then builds an SDK config and ECR client internally. Returns an error
+    /// then loads the AWS config and builds the ECR client. Returns an error
     /// if the region cannot be determined from the hostname.
     ///
     /// `profile` must match the value passed to the corresponding
@@ -343,7 +359,12 @@ impl BatchChecker {
     pub async fn from_hostname(hostname: &str, profile: Option<&str>) -> Result<Self, Error> {
         let sdk_config = load_sdk_config(hostname, profile).await?;
         let registry_id = ecr_registry_id(hostname).map(|s| s.to_owned());
-        let client = aws_sdk_ecr::Client::new(&sdk_config);
+        let client =
+            crate::aws::Client::new(&sdk_config, crate::aws::Service::Ecr).map_err(|e| {
+                Error::EcrApi {
+                    reason: e.to_string(),
+                }
+            })?;
         Ok(Self {
             api: Box::new(AwsEcrBatchApi {
                 client,
@@ -549,6 +570,28 @@ mod tests {
             ecr_registry_id("1234567890123.dkr.ecr.us-east-1.amazonaws.com"),
             None
         );
+    }
+
+    /// Only `AVAILABLE` skips a transfer. A value ECR adds later must parse
+    /// and count as missing, not fail the whole batch.
+    #[test]
+    fn reads_layer_availability() {
+        let output: BatchCheckOutput = serde_json::from_str(
+            r#"{"layers":[
+                {"layerDigest":"a","layerAvailability":"AVAILABLE"},
+                {"layerDigest":"b","layerAvailability":"UNAVAILABLE"},
+                {"layerDigest":"c","layerAvailability":"ARCHIVED"},
+                {"layerDigest":"d"}
+            ]}"#,
+        )
+        .unwrap();
+        let available: Vec<bool> = output
+            .layers
+            .iter()
+            .map(|l| l.layer_availability == Some(LayerAvailability::Available))
+            .collect();
+        assert_eq!(available, [true, false, false, false]);
+        assert!(output.failures.is_empty());
     }
 
     // --- BatchBlobChecker tests ---
@@ -1050,7 +1093,7 @@ mod tests {
     async fn load_sdk_config_accepts_named_profile() {
         // SdkConfig has no public profile accessor, so this only verifies the
         // load path itself does not reject an unknown profile name (resolution
-        // is deferred to the first SDK API call).
+        // is deferred to the first ECR API call).
         let cfg = load_sdk_config(
             "123456789012.dkr.ecr.us-east-1.amazonaws.com",
             Some("nonexistent-profile-for-test"),

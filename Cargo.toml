@@ -11,9 +11,10 @@ repository = "https://github.com/clowdhaus/ocync"
 
 [workspace.dependencies]
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "rt-tokio", "rustls", "sso"] }
+aws-credential-types = { version = "1", default-features = false }
 aws-lc-rs = { version = "1", default-features = false }
 aws-sdk-ecr = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
-aws-sdk-ecrpublic = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
+aws-types = { version = "1", default-features = false }
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 google-cloud-auth = { version = "1.18", default-features = false }
 bytes = { version = "1", default-features = false }

@@ -1,6 +1,6 @@
 //! AWS ECR Public authentication provider.
 //!
-//! Uses `aws-sdk-ecrpublic` to obtain authorization credentials via
+//! Obtains authorization credentials via ECR Public's
 //! `GetAuthorizationToken`, then performs standard OCI Bearer token
 //! exchange using those credentials. This is the Rust equivalent of:
 //!
@@ -24,8 +24,11 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use serde::Deserialize;
+
 use super::ecr::{
-    EcrApi, EcrTokenResponse, SdkCredentialCache, ttl_from_expiry, validate_ecr_token,
+    AuthorizationData, EcrApi, EcrTokenResponse, SdkCredentialCache, ttl_from_expiry,
+    validate_ecr_token,
 };
 use super::token_cache::TokenCache;
 use super::token_exchange;
@@ -35,17 +38,17 @@ use crate::error::Error;
 /// Default ECR Public token lifetime (12 hours).
 const ECR_PUBLIC_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
-/// Default [`EcrApi`] backed by the `aws-sdk-ecrpublic` SDK.
-///
-/// Holds the ECR Public SDK client created once during [`EcrPublicAuth::new`].
+/// Default [`EcrApi`], calling ECR Public through [`crate::aws::Client`].
+#[derive(Debug)]
 struct AwsEcrPublicApi {
-    client: aws_sdk_ecrpublic::Client,
+    client: crate::aws::Client,
 }
 
-impl fmt::Debug for AwsEcrPublicApi {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AwsEcrPublicApi").finish_non_exhaustive()
-    }
+/// ECR Public returns one `authorizationData` object, not a list.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetAuthorizationTokenOutput {
+    authorization_data: Option<AuthorizationData>,
 }
 
 impl EcrApi for AwsEcrPublicApi {
@@ -53,32 +56,28 @@ impl EcrApi for AwsEcrPublicApi {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
         Box::pin(async move {
-            let output = self
+            let output: GetAuthorizationTokenOutput = self
                 .client
-                .get_authorization_token()
-                .send()
+                .call("GetAuthorizationToken", &serde_json::json!({}))
                 .await
                 .map_err(|e| Error::AuthFailed {
                     registry: "public.ecr.aws".to_owned(),
                     reason: format!("ECR Public GetAuthorizationToken failed: {e}"),
                 })?;
 
-            let auth_data = output
-                .authorization_data()
-                .ok_or_else(|| Error::AuthFailed {
-                    registry: "public.ecr.aws".to_owned(),
-                    reason: "ECR Public returned no authorization data".into(),
-                })?;
+            let auth_data = output.authorization_data.ok_or_else(|| Error::AuthFailed {
+                registry: "public.ecr.aws".to_owned(),
+                reason: "ECR Public returned no authorization data".into(),
+            })?;
 
             let encoded_token = auth_data
-                .authorization_token()
-                .map(|s| s.to_owned())
+                .authorization_token
                 .ok_or_else(|| Error::AuthFailed {
                     registry: "public.ecr.aws".to_owned(),
                     reason: "ECR Public authorization data missing token".into(),
                 })?;
 
-            let expires_in = auth_data.expires_at().map(ttl_from_expiry);
+            let expires_in = auth_data.expires_at.map(ttl_from_expiry);
 
             Ok(EcrTokenResponse {
                 encoded_token,
@@ -166,7 +165,7 @@ impl fmt::Debug for EcrPublicAuth {
 impl EcrPublicAuth {
     /// Create a new ECR Public auth provider.
     ///
-    /// Constructs the ECR Public SDK client targeting `us-east-1`.
+    /// Constructs the ECR Public client targeting `us-east-1`.
     /// Credentials are fetched lazily on the first `get_token` call and
     /// refreshed automatically when approaching expiry.
     pub async fn new(http: reqwest::Client) -> Result<Self, Error> {
@@ -175,12 +174,18 @@ impl EcrPublicAuth {
             .load()
             .await;
 
+        let client =
+            crate::aws::Client::new(&config, crate::aws::Service::EcrPublic).map_err(|e| {
+                Error::AuthFailed {
+                    registry: "public.ecr.aws".to_owned(),
+                    reason: e.to_string(),
+                }
+            })?;
+
         Ok(Self {
             base_url: "https://public.ecr.aws".to_owned(),
             http,
-            api: Box::new(AwsEcrPublicApi {
-                client: aws_sdk_ecrpublic::Client::new(&config),
-            }),
+            api: Box::new(AwsEcrPublicApi { client }),
             sdk_credential_cache: SdkCredentialCache::new(),
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),

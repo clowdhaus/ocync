@@ -4,6 +4,8 @@
 pub mod aimd;
 /// Authentication providers and token management.
 pub mod auth;
+/// Signed calls to the AWS APIs (ECR, ECR Public).
+mod aws;
 /// Blob operations (upload, download, existence checks, mounting).
 pub mod blob;
 /// OCI registry HTTP client.
