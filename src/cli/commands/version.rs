@@ -1,6 +1,6 @@
 //! The `version` subcommand - shows version and build information.
 
-use ocync_distribution::TlsFips;
+use ocync_distribution::{CRYPTO_BUILD, CryptoBuild, TlsFips};
 
 use crate::cli::ExitCode;
 
@@ -10,22 +10,29 @@ pub(crate) fn run() -> ExitCode {
     ExitCode::Success
 }
 
-/// The version report. A FIPS build names the linked module, so the
-/// matching validation certificate can be looked up, and the runtime TLS
-/// state, in the shape `openssl list -providers` uses.
+/// The version report, in the shape `openssl list -providers` uses. A FIPS
+/// build names the AWS-LC-FIPS module number, which is what a NIST
+/// certificate names, and the runtime TLS state.
 fn report() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    if !cfg!(feature = "fips") {
-        return format!("ocync {version}\nFIPS 140-3: disabled");
+    let release = ocync_distribution::awslc_release();
+    match CRYPTO_BUILD {
+        CryptoBuild::NonFips => {
+            format!("ocync {version}\nFIPS 140-3: disabled\n  release: AWS-LC {release}")
+        }
+        CryptoBuild::Fips => {
+            let module = ocync_distribution::fips_module()
+                .map_or_else(|| "unknown".to_string(), |m| m.to_string());
+            let tls = match ocync_distribution::tls_fips() {
+                TlsFips::Approved => "approved",
+                TlsFips::NotApproved => "not-approved",
+            };
+            format!(
+                "ocync {version}\nFIPS 140-3: enabled\n  module: AWS-LC-FIPS {module}\n  \
+                 release: AWS-LC {release}\n  tls: {tls}"
+            )
+        }
     }
-    let tls = match ocync_distribution::tls_fips() {
-        TlsFips::Approved => "approved",
-        TlsFips::NotApproved => "not-approved",
-    };
-    format!(
-        "ocync {version}\nFIPS 140-3: enabled\n  module: {}\n  tls: {tls}",
-        ocync_distribution::crypto_module()
-    )
 }
 
 #[cfg(test)]
@@ -44,13 +51,19 @@ mod tests {
         let report = report();
         let lines: Vec<&str> = report.lines().collect();
         assert_eq!(lines[1], "FIPS 140-3: enabled");
-        assert!(lines[2].starts_with("  module: AWS-LC FIPS "), "{report}");
-        assert_eq!(lines[3], "  tls: approved");
+        assert!(lines[2].starts_with("  module: AWS-LC-FIPS "), "{report}");
+        assert!(!lines[2].ends_with("unknown"), "{report}");
+        assert!(lines[3].starts_with("  release: AWS-LC "), "{report}");
+        assert_eq!(lines[4], "  tls: approved");
     }
 
     #[cfg(not(feature = "fips"))]
     #[test]
     fn non_fips_report_says_disabled() {
-        assert!(report().ends_with("\nFIPS 140-3: disabled"));
+        let report = report();
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines[1], "FIPS 140-3: disabled");
+        assert!(lines[2].starts_with("  release: AWS-LC "), "{report}");
+        assert_eq!(lines.len(), 3, "{report}");
     }
 }

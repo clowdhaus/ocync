@@ -19,7 +19,7 @@ order: 7
 
 FIPS mode is a compile-time decision. The `fips` feature flag links against the FIPS-validated aws-lc module. The `non-fips` feature flag uses aws-lc-rs without FIPS validation.
 
-A FIPS build restricts TLS to FIPS-approved algorithms: AES-GCM cipher suites, key exchange over P-256, P-384 or the X25519MLKEM768 post-quantum hybrid, and extended master secret for TLS 1.2. ChaCha20-Poly1305 and plain X25519 are never offered. The restriction covers every TLS client in the binary, including the ones the AWS and Google SDKs build. A FIPS build checks this at startup and refuses to run if TLS is not FIPS-approved.
+A FIPS build restricts TLS to FIPS-approved algorithms: AES-GCM cipher suites, key exchange over P-256, P-384 or the X25519MLKEM768 post-quantum hybrid, and extended master secret for TLS 1.2. ChaCha20-Poly1305 and plain X25519 are never offered. The restriction covers every TLS client in the binary: `reqwest`, which Google authentication also uses, and the client the AWS SDK builds itself. A FIPS build checks this at startup and refuses to run if TLS is not FIPS-approved.
 
 `rustls` counts X25519MLKEM768 as approved through its ML-KEM part, although its own source notes that ML-KEM in the AWS-LC FIPS module is FIPS-pending and that it follows the interpretation some regimes (such as FedRAMP Rev. 5 SC-13) allow for modules in that state. Treat the hybrid as approved only if your assessor accepts that interpretation.
 
@@ -56,17 +56,18 @@ docker pull public.ecr.aws/clowdhaus/ocync:latest-fips
 
 ## Verifying FIPS status
 
-The `ocync version` command reports whether the binary is a FIPS build, the linked cryptographic module and its version, and whether TLS is restricted to FIPS-approved algorithms at runtime:
+The `ocync version` command reports whether the binary is a FIPS build, the linked cryptographic module, and whether TLS is restricted to FIPS-approved algorithms at runtime:
 
 ```
 $ ocync version
 ocync 0.8.2
 FIPS 140-3: enabled
-  module: AWS-LC FIPS 4.2.0
+  module: AWS-LC-FIPS 4
+  release: AWS-LC 4.2.0
   tls: approved
 ```
 
-The module version is what maps to a NIST validation certificate. Non-FIPS builds show `FIPS 140-3: disabled`. FIPS is a compile-time selection; there is no runtime toggle.
+`module` is the AWS-LC-FIPS module number, which is what a NIST validation certificate names. `release` is the AWS-LC release, which tells builds of one module apart but does not identify a certificate. Non-FIPS builds show `FIPS 140-3: disabled` and the release. FIPS is a compile-time selection; there is no runtime toggle.
 
 ## Banned dependencies
 
