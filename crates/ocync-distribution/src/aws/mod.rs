@@ -440,7 +440,9 @@ pub(crate) struct Client {
     provider: SharedCredentialsProvider,
     credentials: CredentialCache<Credentials>,
     /// The last [`ClockSkew`] measured, which every signature corrects for.
+    /// Stays 0 when `skew_correction` is off.
     skew: AtomicI64,
+    /// Whether answers are measured for skew at all.
     skew_correction: SkewCorrection,
     retry: retry::Strategy,
     /// The retry quota and rate limiter shared with every client for the

@@ -382,19 +382,20 @@ enum Paced {
 impl Paced {
     fn cost(self) -> f64 {
         match self {
-            Self::Send => INITIAL_REQUEST_COST,
-            Self::Retry => RETRY_COST,
-            Self::ThrottledRetry => RETRY_TIMEOUT_COST,
+            Self::Send => LIMITER_INITIAL_REQUEST_COST,
+            Self::Retry => LIMITER_RETRY_COST,
+            Self::ThrottledRetry => LIMITER_RETRY_TIMEOUT_COST,
         }
     }
 }
 
 /// The limiter tokens a send token takes.
-const INITIAL_REQUEST_COST: f64 = 1.0;
+const LIMITER_INITIAL_REQUEST_COST: f64 = 1.0;
 /// The limiter tokens a retry paced through its backoff takes.
-const RETRY_COST: f64 = 5.0;
+const LIMITER_RETRY_COST: f64 = 5.0;
 /// The limiter tokens a throttled retry paced through its backoff takes.
-const RETRY_TIMEOUT_COST: f64 = RETRY_COST * 2.0;
+const LIMITER_RETRY_TIMEOUT_COST: f64 = LIMITER_RETRY_COST * 2.0;
+
 /// The lowest send rate the limiter allows, per second.
 const MIN_FILL_RATE: f64 = 0.5;
 /// The smallest capacity the limiter keeps.
