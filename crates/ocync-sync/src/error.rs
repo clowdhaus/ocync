@@ -104,14 +104,31 @@ impl Error {
         }
     }
 
-    /// Whether a registry refused a manifest because it lacks a blob the
-    /// manifest references.
-    pub(crate) fn is_unknown_blob_refusal(&self) -> bool {
-        match self {
-            Self::Manifest { source, .. } => crate::retry::names_unknown_blob(source),
-            Self::Shared(err) => err.is_unknown_blob_refusal(),
-            _ => false,
-        }
+    /// Whether the registry refused a manifest for what it references:
+    /// HTTP 400 or 404, which a registry answers when it lacks a referenced
+    /// blob, whatever error code it names. Throttling, access and server
+    /// errors are not, nor is ECR's immutable-tag refusal.
+    pub(crate) fn is_reference_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Manifest {
+                source: ocync_distribution::Error::RegistryError { status, .. },
+                ..
+            } if matches!(*status, http::StatusCode::BAD_REQUEST | http::StatusCode::NOT_FOUND)
+        ) && !self.is_immutable_tag()
+    }
+
+    /// Whether ECR refused a manifest because its tag is immutable and
+    /// already set.
+    pub(crate) fn is_immutable_tag(&self) -> bool {
+        matches!(
+            self,
+            Self::Manifest {
+                source: ocync_distribution::Error::RegistryError { status, message },
+                ..
+            } if *status == http::StatusCode::BAD_REQUEST
+                && message.contains("ImageTagAlreadyExistsException")
+        )
     }
 
     /// Whether this error represents a required-artifacts-missing condition.
@@ -123,6 +140,62 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest_error(status: http::StatusCode, message: &str) -> Error {
+        Error::Manifest {
+            reference: "v1.0".into(),
+            source: ocync_distribution::Error::RegistryError {
+                status,
+                message: message.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn classifies_manifest_refusals() {
+        use http::StatusCode;
+        const IMMUTABLE: &str = "ImageTagAlreadyExistsException: tag already exists";
+        // (status, message, reference refusal, immutable tag)
+        let cases = [
+            (
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_BLOB_UNKNOWN",
+                true,
+                false,
+            ),
+            (StatusCode::BAD_REQUEST, "MANIFEST_INVALID", true, false),
+            (StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", true, false),
+            (StatusCode::BAD_REQUEST, IMMUTABLE, false, true),
+            (StatusCode::FORBIDDEN, "DENIED", false, false),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+                false,
+                false,
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, IMMUTABLE, false, false),
+        ];
+        for (status, message, refusal, immutable) in cases {
+            let err = manifest_error(status, message);
+            assert_eq!(err.is_reference_refusal(), refusal, "{status} {message}");
+            assert_eq!(err.is_immutable_tag(), immutable, "{status} {message}");
+        }
+    }
+
+    #[test]
+    fn blob_error_is_not_a_manifest_refusal() {
+        let err = Error::BlobTransfer {
+            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap(),
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::BAD_REQUEST,
+                message: "ImageTagAlreadyExistsException".into(),
+            },
+        };
+        assert!(!err.is_reference_refusal());
+        assert!(!err.is_immutable_tag());
+    }
 
     #[test]
     fn display_invalid_glob() {

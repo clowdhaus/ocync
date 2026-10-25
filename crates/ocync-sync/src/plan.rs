@@ -267,16 +267,15 @@ impl BlobDedupMap {
         }
     }
 
-    /// Record the blob as `Verified` at `repo` when it is unknown there or
-    /// known only from an earlier run. State this run recorded, including an
-    /// upload claim, is left alone.
+    /// Record the blob as `Verified` at `repo` when it is known there only
+    /// from an earlier run. A blob this run has not seen there, and state this
+    /// run recorded, including an upload claim, are left alone.
     pub(crate) fn confirm(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
-        let entry = self.entry_mut(target, digest);
-        match entry.repos.get(repo) {
-            None | Some(RepoBlobState::Remembered) => {
-                entry.repos.insert(repo.clone(), RepoBlobState::Verified);
-            }
-            Some(_) => {}
+        let Some(info) = self.inner.get_mut(target).and_then(|m| m.get_mut(digest)) else {
+            return;
+        };
+        if let Some(state @ RepoBlobState::Remembered) = info.repos.get_mut(repo) {
+            *state = RepoBlobState::Verified;
         }
     }
 

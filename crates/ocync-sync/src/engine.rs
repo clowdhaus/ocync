@@ -1789,22 +1789,14 @@ async fn execute_item(
     }
 
     // Push manifests (children first, then top-level by tag).
-    match push_manifests(retry, &item, shared).await {
+    match push_manifests(retry, &item, cache, shared).await {
         Ok(()) => {
             // Mark this repo as having a committed manifest so it becomes
             // a valid cross-repo mount source. ECR requires a committed
             // manifest in the source repo for mount to succeed.
-            {
-                let mut c = cache.borrow_mut();
-                c.mark_repo_committed(&item.target_name, &item.target.repo);
-                c.confirm_blobs(
-                    &item.target_name,
-                    &item.target.repo,
-                    blobs_from_manifest(&item.source_data)
-                        .into_iter()
-                        .map(|b| &b.digest),
-                );
-            }
+            cache
+                .borrow_mut()
+                .mark_repo_committed(&item.target_name, &item.target.repo);
 
             // Discover and sync artifacts (signatures, SBOMs, attestations).
             let artifacts_skipped = match discover_and_sync_artifacts(&ctx, &item).await {
@@ -1868,24 +1860,12 @@ async fn execute_item(
         }
         Err(err) => {
             // Unblock any followers waiting for this repo's manifest commit
-            // so they fall through to HEAD+push. A registry that lost a blob
-            // an earlier run's cache still lists refuses the manifest, so
-            // those entries are dropped and the next run checks the blobs.
-            {
-                let mut c = cache.borrow_mut();
-                c.notify_repo_failed(&item.target_name, &item.target.repo);
-                if err.is_unknown_blob_refusal() {
-                    c.forget_remembered_blobs(
-                        &item.target_name,
-                        &item.target.repo,
-                        blobs_from_manifest(&item.source_data)
-                            .into_iter()
-                            .map(|b| &b.digest),
-                    );
-                }
-            }
+            // so they fall through to HEAD+push.
+            cache
+                .borrow_mut()
+                .notify_repo_failed(&item.target_name, &item.target.repo);
 
-            if is_immutable_tag_error(&err) {
+            if err.is_immutable_tag() {
                 debug!(
                     source_repo = %item.source.repo,
                     target_repo = %item.target.repo,
@@ -2307,8 +2287,9 @@ async fn transfer_image_blobs(
                 // gets its HEAD.
                 let total = all_digests.len();
                 let checked: HashSet<Digest> = all_digests
-                    .into_iter()
+                    .iter()
                     .filter(|d| existence.is_known(d))
+                    .cloned()
                     .collect();
                 let available = existence.into_available();
                 debug!(
@@ -2320,12 +2301,14 @@ async fn transfer_image_blobs(
                     "batch check pre-populated cache"
                 );
                 let mut c = ctx.cache.borrow_mut();
-                // A blob the check finds missing is not trusted from an
-                // earlier run: the repository may have lost it.
+                // Only a blob the check confirms present is trusted: an
+                // earlier run's entry for any other is dropped, since the
+                // repository may have lost it. A missing blob is pushed; one
+                // the check left unknown gets its HEAD.
                 c.forget_remembered_blobs(
                     ctx.target_name,
                     ctx.target_repo,
-                    checked.iter().filter(|d| !available.contains(*d)),
+                    all_digests.iter().filter(|d| !available.contains(*d)),
                 );
                 for digest in available {
                     c.set_blob_verified(ctx.target_name, digest, ctx.target_repo.to_owned());
@@ -2338,10 +2321,16 @@ async fn transfer_image_blobs(
                     error = %e,
                     "batch check failed, falling back to per-blob HEAD"
                 );
-                // Graceful degradation: blobs the cache does not know get a
-                // per-blob HEAD. The cache is trusted for the rest rather
-                // than checking every blob against a throttling registry; a
-                // manifest refused for a lost blob still heals the next run.
+                // Graceful degradation: every blob gets a per-blob HEAD, an
+                // earlier run's entries included. A HEAD goes to the
+                // registry, not the API that failed, and trusting those
+                // entries would instead wait out the manifest commit gate
+                // on that API for a blob that may be gone.
+                ctx.cache.borrow_mut().forget_remembered_blobs(
+                    ctx.target_name,
+                    ctx.target_repo,
+                    &all_digests,
+                );
                 HashSet::new()
             }
         }
@@ -2823,6 +2812,7 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
 async fn push_manifests(
     retry: &RetryConfig,
     item: &TransferTask,
+    cache: &RefCell<TransferStateCache>,
     shared: &PerRun,
 ) -> Result<(), crate::Error> {
     let target_repo = &item.target.repo;
@@ -2862,7 +2852,7 @@ async fn push_manifests(
     // Push claimed children concurrently. join_all, not try_join_all: a
     // transient failure on one child must not cancel the others.
     let pushes = claimed.into_iter().map(|(child, guard)| async move {
-        let outcome = push_manifest(retry, item, &child.digest.to_string(), child)
+        let outcome = push_manifest(retry, item, cache, &child.digest.to_string(), child)
             .await
             .map_err(Arc::new);
         guard.finish(outcome.clone());
@@ -2882,7 +2872,7 @@ async fn push_manifests(
     let awaited = held_elsewhere.iter().map(|child| {
         run_once(&shared.child_pushes, child_key(child), move || {
             let reference = child.digest.to_string();
-            async move { push_manifest(retry, item, &reference, child).await }
+            async move { push_manifest(retry, item, cache, &reference, child).await }
         })
     });
     for result in futures_util::future::join_all(awaited).await {
@@ -2890,7 +2880,7 @@ async fn push_manifests(
     }
 
     // Push top-level manifest by tag.
-    push_manifest(retry, item, &item.target.tag, &source_data.pull).await
+    push_manifest(retry, item, cache, &item.target.tag, &source_data.pull).await
 }
 
 /// Wait until the target reports every blob in `digests` visible, when it
@@ -2927,13 +2917,19 @@ async fn wait_for_commit(item: &TransferTask, retry: &RetryConfig, digests: &[Di
 
 /// Push `manifest` to the task's target repo as `reference` (a tag, or a
 /// child's digest).
+///
+/// A committed manifest proves the blobs it references are in the repo, so
+/// an earlier run's entries for them are confirmed. A manifest refused for
+/// what it references, the answer to a blob the registry has lost, drops
+/// them, so the next run checks those blobs instead of trusting the cache.
 async fn push_manifest(
     retry: &RetryConfig,
     item: &TransferTask,
+    cache: &RefCell<TransferStateCache>,
     reference: &str,
     manifest: &ManifestPull,
 ) -> Result<(), crate::Error> {
-    with_retry(retry, "manifest push", || {
+    let pushed = with_retry(retry, "manifest push", || {
         item.target_client.manifest_push(
             &item.target.repo,
             reference,
@@ -2946,7 +2942,17 @@ async fn push_manifest(
     .map_err(|e| crate::Error::Manifest {
         reference: reference.to_owned(),
         source: e,
-    })
+    });
+    let blobs = child_blobs(manifest).into_iter().map(|b| &b.digest);
+    let mut c = cache.borrow_mut();
+    match &pushed {
+        Ok(()) => c.confirm_blobs(&item.target_name, &item.target.repo, blobs),
+        Err(e) if e.is_reference_refusal() => {
+            c.forget_remembered_blobs(&item.target_name, &item.target.repo, blobs);
+        }
+        Err(_) => {}
+    }
+    pushed
 }
 
 /// Discover referrers for a synced manifest and transfer matching artifacts.
@@ -3100,23 +3106,13 @@ async fn sync_artifact(
 
     wait_for_commit(item, retry, &blob_digests).await;
 
-    // Push artifact manifest by digest (not by tag). Its blobs are
-    // confirmed or, on a refusal for a lost blob, dropped, as for an image.
-    let pushed = push_manifest(retry, item, &artifact_digest_str, &artifact_pull).await;
-    {
-        let mut c = ctx.cache.borrow_mut();
-        match &pushed {
-            Ok(()) => c.confirm_blobs(ctx.target_name, ctx.target_repo, &blob_digests),
-            Err(e) if e.is_unknown_blob_refusal() => {
-                c.forget_remembered_blobs(ctx.target_name, ctx.target_repo, &blob_digests);
-            }
-            Err(_) => {}
-        }
-    }
-    pushed.map_err(|e| crate::Error::ArtifactSync {
-        reference: artifact_digest_str.clone(),
-        reason: format!("manifest push failed: {e}"),
-    })?;
+    // Push artifact manifest by digest (not by tag).
+    push_manifest(retry, item, ctx.cache, &artifact_digest_str, &artifact_pull)
+        .await
+        .map_err(|e| crate::Error::ArtifactSync {
+            reference: artifact_digest_str.clone(),
+            reason: format!("manifest push failed: {e}"),
+        })?;
 
     debug!(
         repo = %source_repo,
@@ -3265,22 +3261,6 @@ fn compute_stats(images: &[ImageResult]) -> SyncStats {
         }
     }
     stats
-}
-
-/// Check if a manifest push error is an ECR immutable tag rejection.
-///
-/// ECR returns HTTP 400 with `ImageTagAlreadyExistsException` when a
-/// manifest push targets a tag that already exists on a repository with
-/// immutable tag settings enabled.
-fn is_immutable_tag_error(err: &crate::Error) -> bool {
-    matches!(
-        err,
-        crate::Error::Manifest {
-            source: ocync_distribution::Error::RegistryError { status, message },
-            ..
-        } if *status == http::StatusCode::BAD_REQUEST
-            && message.contains("ImageTagAlreadyExistsException")
-    )
 }
 
 #[cfg(test)]
@@ -3501,58 +3481,6 @@ mod tests {
             "a disk error must not fail other tasks"
         );
         assert!(!is_local_io(&registry));
-    }
-
-    #[test]
-    fn immutable_tag_error_detected() {
-        let err = crate::Error::Manifest {
-            reference: "v1.0".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::BAD_REQUEST,
-                message: "ImageTagAlreadyExistsException: tag already exists".into(),
-            },
-        };
-        assert!(is_immutable_tag_error(&err));
-    }
-
-    #[test]
-    fn non_immutable_400_not_detected() {
-        let err = crate::Error::Manifest {
-            reference: "v1.0".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::BAD_REQUEST,
-                message: "some other 400 error".into(),
-            },
-        };
-        assert!(!is_immutable_tag_error(&err));
-    }
-
-    #[test]
-    fn non_400_not_detected_as_immutable() {
-        let err = crate::Error::Manifest {
-            reference: "v1.0".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::INTERNAL_SERVER_ERROR,
-                message: "ImageTagAlreadyExistsException".into(),
-            },
-        };
-        assert!(!is_immutable_tag_error(&err));
-    }
-
-    #[test]
-    fn blob_error_not_detected_as_immutable() {
-        let digest: ocync_distribution::Digest =
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                .parse()
-                .unwrap();
-        let err = crate::Error::BlobTransfer {
-            digest,
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::BAD_REQUEST,
-                message: "ImageTagAlreadyExistsException".into(),
-            },
-        };
-        assert!(!is_immutable_tag_error(&err));
     }
 
     // --- elect_leaders tests ---

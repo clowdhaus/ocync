@@ -112,7 +112,7 @@ The cache eliminates redundant API calls by recording what is known about blob l
 
 **Tier 2 - warm cache (persistent disk).** Serialized on sync completion using binary format (~1 MB at typical scale). Only confirmed states are persisted. The warm cache enables CronJob deployments to skip HEAD checks for known blobs on every run.
 
-Stale entries are handled by lazy invalidation: on ECR, the per-image batch check overrides what an earlier run recorded; on any registry, a manifest refused for a missing blob drops its blobs' entries so the next run checks them; and a mount source that fails is excluded. See [transfer state cache in the engine doc](/design/engine#transfer-state-cache) for persistence rules, corruption detection, cold start behavior, and [lazy invalidation](/design/engine#lazy-invalidation).
+Stale entries are handled by lazy invalidation: on ECR, the per-image batch check overrides what an earlier run recorded, and a blob it cannot answer for gets a HEAD; on any registry, a manifest the registry refuses as invalid drops its blobs' entries so the next run checks them; and a mount source that fails is excluded. See [transfer state cache in the engine doc](/design/engine#transfer-state-cache) for persistence rules, corruption detection, cold start behavior, and [lazy invalidation](/design/engine#lazy-invalidation).
 
 ## Streaming transfers
 

@@ -316,8 +316,8 @@ impl TransferStateCache {
         }
     }
 
-    /// Record each of `digests` as present at `repo`, after a manifest that
-    /// references them was committed there.
+    /// Confirm each of `digests` known at `repo` only from an earlier run,
+    /// after a manifest that references them was committed there.
     pub(crate) fn confirm_blobs<'a>(
         &mut self,
         target: &str,
