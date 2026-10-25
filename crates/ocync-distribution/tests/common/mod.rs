@@ -15,14 +15,17 @@ pub async fn start_registry() -> (
     testcontainers::ContainerAsync<testcontainers::GenericImage>,
     Url,
 ) {
-    use testcontainers::GenericImage;
     use testcontainers::runners::AsyncRunner;
+    use testcontainers::{GenericImage, ImageExt};
 
     let container = GenericImage::new("registry", "2")
         .with_exposed_port(5000.into())
         .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
             "listening on",
         ))
+        // Without an init process to reap it, the registry can be left a
+        // zombie Docker cannot kill, and the container is never removed.
+        .with_host_config_modifier(|config| config.init = Some(true))
         .start()
         .await
         .expect("failed to start registry container");

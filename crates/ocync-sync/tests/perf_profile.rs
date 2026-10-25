@@ -74,6 +74,9 @@ async fn start_registry_http() -> (ContainerAsync<GenericImage>, Url) {
     let container = GenericImage::new("registry", "2")
         .with_exposed_port(5000.into())
         .with_wait_for(WaitFor::message_on_stderr("listening on"))
+        // Without an init process to reap it, the registry can be left a
+        // zombie Docker cannot kill, and the container is never removed.
+        .with_host_config_modifier(|config| config.init = Some(true))
         .start()
         .await
         .expect("registry:2 container failed to start");
@@ -108,6 +111,8 @@ async fn start_registry_tls() -> (ContainerAsync<GenericImage>, Url) {
         .with_env_var("REGISTRY_HTTP_TLS_KEY", "/certs/tls.key")
         .with_copy_to("/certs/tls.crt", cert_pem)
         .with_copy_to("/certs/tls.key", key_pem)
+        // As in `start_registry_http`.
+        .with_host_config_modifier(|config| config.init = Some(true))
         .start()
         .await
         .expect("registry:2 (TLS) container failed to start");
