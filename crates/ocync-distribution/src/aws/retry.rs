@@ -103,13 +103,21 @@ pub(super) struct Settings {
     max_backoff: Duration,
     version: Version,
     mode: Mode,
+    /// The jitter factor in `[0, 1)` each backoff is scaled by.
+    jitter: fn() -> f64,
 }
 
 impl Settings {
     /// The settings `config` carries, as the SDK reads them.
     pub(super) fn new(config: &RetryConfig) -> Self {
         let spec = config.retry_spec();
+        let jitter: fn() -> f64 = if config.use_static_exponential_base() {
+            || 1.0
+        } else {
+            fastrand::f64
+        };
         Self {
+            jitter,
             max_attempts: config.max_attempts(),
             initial_backoff: config.initial_backoff(),
             non_throttling_initial_backoff: spec.map_or(
@@ -252,8 +260,6 @@ pub(super) struct CallPolicy<'a> {
     /// What the latest retry spent, returned to the quota if the call then
     /// succeeds. What earlier retries spent stays spent.
     held: Option<u32>,
-    /// The jitter factor in `[0, 1)` each backoff is scaled by.
-    jitter: fn() -> f64,
 }
 
 impl<'a> CallPolicy<'a> {
@@ -262,7 +268,6 @@ impl<'a> CallPolicy<'a> {
             settings,
             partition,
             held: None,
-            jitter: fastrand::f64,
         }
     }
 
@@ -285,7 +290,7 @@ impl<'a> CallPolicy<'a> {
             Kind::Throttling => s.initial_backoff,
             Kind::Transient | Kind::Server => s.non_throttling_initial_backoff,
         };
-        let computed = exponential_backoff((self.jitter)(), initial, retry - 1, s.max_backoff);
+        let computed = exponential_backoff((s.jitter)(), initial, retry - 1, s.max_backoff);
         match (retry_after, s.version) {
             (None, _) => computed,
             (Some(after), Version::V2_0) => after.min(s.max_backoff),
@@ -516,20 +521,25 @@ mod tests {
         failure
     }
 
-    /// The SDK's tests run with the jitter factor fixed at 1.
     fn policy<'a>(settings: &'a Settings, partition: &'a Partition) -> CallPolicy<'a> {
-        CallPolicy {
-            jitter: || 1.0,
-            ..CallPolicy::new(settings, partition)
-        }
+        CallPolicy::new(settings, partition)
     }
 
+    /// The SDK's tests run with the jitter factor fixed at 1.
     fn standard() -> RetryConfig {
-        RetryConfig::standard()
+        RetryConfig::standard().with_use_static_exponential_base(true)
     }
 
     fn v2_1() -> RetryConfig {
-        RetryConfig::standard().with_retry_spec(RetrySpec::v2_1())
+        standard().with_retry_spec(RetrySpec::v2_1())
+    }
+
+    fn adaptive() -> RetryConfig {
+        RetryConfig::adaptive().with_use_static_exponential_base(true)
+    }
+
+    fn v2_1_adaptive() -> RetryConfig {
+        adaptive().with_retry_spec(RetrySpec::v2_1())
     }
 
     fn secs(s: u64) -> Option<Duration> {
@@ -738,7 +748,7 @@ mod tests {
             Duration::from_millis(50)
         );
         assert_eq!(v2_1.initial_backoff, Duration::from_secs(1));
-        let adaptive = Settings::new(&RetryConfig::adaptive());
+        let adaptive = Settings::new(&adaptive());
         assert_eq!(adaptive.mode, Mode::Adaptive);
         assert_eq!(Settings::new(&standard()).mode, Mode::Standard);
     }
@@ -809,8 +819,8 @@ mod tests {
     /// client never takes one.
     #[tokio::test]
     async fn takes_a_send_token_as_the_sdk_does() {
-        let adaptive = RetryConfig::adaptive();
-        let adaptive_2_1 = RetryConfig::adaptive().with_retry_spec(RetrySpec::v2_1());
+        let adaptive = adaptive();
+        let adaptive_2_1 = v2_1_adaptive();
         for (config, attempt, takes) in [
             (&adaptive, 0, true),
             (&adaptive, 1, false),
@@ -834,9 +844,8 @@ mod tests {
     /// the send token.
     #[test]
     fn only_a_pre_2_1_backoff_waits_on_the_limiter() {
-        let adaptive = Settings::new(&RetryConfig::adaptive());
-        let adaptive_2_1 =
-            Settings::new(&RetryConfig::adaptive().with_retry_spec(RetrySpec::v2_1()));
+        let adaptive = Settings::new(&adaptive());
+        let adaptive_2_1 = Settings::new(&v2_1_adaptive());
         for (settings, waits) in [(&adaptive, true), (&adaptive_2_1, false)] {
             let partition = limited(0.0, 1.0);
             let backoff = policy(settings, &partition).backoff(1, Kind::Throttling, None);
@@ -857,9 +866,7 @@ mod tests {
     #[tokio::test]
     async fn takes_the_token_after_waiting_for_it() {
         let partition = limited(0.0, 10.0);
-        partition
-            .send_token(&Settings::new(&RetryConfig::adaptive()), 0)
-            .await;
+        partition.send_token(&Settings::new(&adaptive()), 0).await;
         let left = capacity(&partition);
         assert!((0.0..0.5).contains(&left), "{left}");
     }
