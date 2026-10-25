@@ -964,7 +964,8 @@ mod tests {
     /// without that, every call fails until the clock is fixed. A skew under
     /// the threshold, or a `Date` from a cache, is a real signature error
     /// and is not re-sent, nor is a rejection of a signature already made on
-    /// AWS's clock.
+    /// AWS's clock. With correction off, a skewed signature is a plain
+    /// signature error too.
     #[tokio::test]
     async fn signs_on_the_aws_clock_after_a_skewed_signature() {
         let rejected = |ahead: Duration, cached: bool| {
@@ -988,10 +989,11 @@ mod tests {
         corrected.skew.store(600_000, Ordering::Relaxed);
         corrected.call(&Probe {}).await.unwrap_err();
 
-        for (ahead, cached, sent) in [
-            (Duration::from_secs(600), false, 2),
-            (Duration::from_secs(120), false, 1),
-            (Duration::from_secs(600), true, 1),
+        for (ahead, cached, skew_correction, sent) in [
+            (Duration::from_secs(600), false, SkewCorrection::On, 2),
+            (Duration::from_secs(120), false, SkewCorrection::On, 1),
+            (Duration::from_secs(600), true, SkewCorrection::On, 1),
+            (Duration::from_secs(600), false, SkewCorrection::Off, 1),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
@@ -1005,8 +1007,17 @@ mod tests {
                 .expect(sent - 1)
                 .mount(&server)
                 .await;
-            let result = client(&server, DEFAULT_MAX_ATTEMPTS).call(&Probe {}).await;
-            assert_eq!(result.is_ok(), sent == 2, "{ahead:?} cached={cached}");
+            let client = Client::from_parts(Parts {
+                skew_correction,
+                ..parts(&server.uri())
+            })
+            .unwrap();
+            let result = client.call(&Probe {}).await;
+            assert_eq!(
+                result.is_ok(),
+                sent == 2,
+                "{ahead:?} cached={cached} {skew_correction:?}"
+            );
 
             let requests = server.received_requests().await.unwrap();
             if let [first, second] = requests.as_slice() {
@@ -1020,30 +1031,6 @@ mod tests {
                 assert!((598..=602).contains(&shift), "signed {shift}s later");
             }
         }
-    }
-
-    /// With correction disabled, a skewed signature is a plain signature
-    /// error: not re-sent, and no later signature shifts.
-    #[tokio::test]
-    async fn leaves_the_clock_alone_when_skew_correction_is_off() {
-        let server = MockServer::start().await;
-        let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(600));
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(400)
-                    .insert_header("date", date.as_str())
-                    .set_body_json(serde_json::json!({"__type": "InvalidSignatureException"})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let client = Client::from_parts(Parts {
-            skew_correction: SkewCorrection::Off,
-            ..parts(&server.uri())
-        })
-        .unwrap();
-        client.call(&Probe {}).await.unwrap_err();
-        assert_eq!(client.skew.load(Ordering::Relaxed), 0);
     }
 
     /// The skew is the server's `Date` against the midpoint of the round
@@ -1231,6 +1218,27 @@ mod tests {
         Client::new(&config("us-west-2"), Service::Ecr).unwrap();
         let err = Client::new(&config("evil.example/x"), Service::Ecr).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidRegion(_)), "{err}");
+    }
+
+    /// `disable_clock_skew_correction` in the SDK's configuration turns
+    /// correction off; unset or false leaves it on.
+    #[test]
+    fn reads_the_skew_correction_switch() {
+        let config = |disable: Option<bool>| {
+            let mut builder = SdkConfig::builder()
+                .region(aws_config::Region::new("us-west-2"))
+                .credentials_provider(static_credentials(None));
+            builder.set_disable_clock_skew_correction(disable);
+            builder.build()
+        };
+        for (disable, expected) in [
+            (None, SkewCorrection::On),
+            (Some(false), SkewCorrection::On),
+            (Some(true), SkewCorrection::Off),
+        ] {
+            let client = Client::new(&config(disable), Service::Ecr).unwrap();
+            assert_eq!(client.skew_correction, expected, "{disable:?}");
+        }
     }
 
     /// The defaults that size the credential load timeout are the SDK's

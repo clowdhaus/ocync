@@ -25,14 +25,16 @@ const QUOTA_CAPACITY: u32 = 500;
 /// permit.
 const PERMIT_REGENERATION_AMOUNT: u32 = 1;
 
-/// What a throttled retry spends from the quota.
-const THROTTLING_RETRY_COST: u32 = 5;
-/// What any other retry spends before retry behavior 2.1.
+/// What a non-transient retry spends before retry behavior 2.1.
 const LEGACY_RETRY_COST: u32 = 5;
 /// What a transient retry spends before retry behavior 2.1.
-const LEGACY_RETRY_TIMEOUT_COST: u32 = 10;
-/// What a non-throttled retry spends under retry behavior 2.1.
+const LEGACY_RETRY_TIMEOUT_COST: u32 = LEGACY_RETRY_COST * 2;
+/// What a throttled retry spends under retry behavior 2.1.
+const THROTTLING_RETRY_COST: u32 = 5;
+/// What a server-error retry spends under retry behavior 2.1.
 const DEFAULT_RETRY_COST: u32 = 14;
+/// What a transient retry spends under retry behavior 2.1.
+const DEFAULT_RETRY_TIMEOUT_COST: u32 = 14;
 
 /// Under retry behavior 2.1, a server-sent `x-amz-retry-after` may lengthen
 /// the computed backoff by at most this.
@@ -82,10 +84,11 @@ impl Version {
     /// What a retry of `kind` spends from the quota.
     fn cost(self, kind: Kind) -> u32 {
         match (self, kind) {
-            (_, Kind::Throttling) => THROTTLING_RETRY_COST,
-            (Self::V2_0, Kind::Server) => LEGACY_RETRY_COST,
+            (Self::V2_0, Kind::Throttling | Kind::Server) => LEGACY_RETRY_COST,
             (Self::V2_0, Kind::Transient) => LEGACY_RETRY_TIMEOUT_COST,
-            (Self::V2_1, Kind::Transient | Kind::Server) => DEFAULT_RETRY_COST,
+            (Self::V2_1, Kind::Throttling) => THROTTLING_RETRY_COST,
+            (Self::V2_1, Kind::Server) => DEFAULT_RETRY_COST,
+            (Self::V2_1, Kind::Transient) => DEFAULT_RETRY_TIMEOUT_COST,
         }
     }
 }
@@ -391,7 +394,7 @@ const INITIAL_REQUEST_COST: f64 = 1.0;
 /// The limiter tokens a retry paced through its backoff takes.
 const RETRY_COST: f64 = 5.0;
 /// The limiter tokens a throttled retry paced through its backoff takes.
-const RETRY_TIMEOUT_COST: f64 = 10.0;
+const RETRY_TIMEOUT_COST: f64 = RETRY_COST * 2.0;
 /// The lowest send rate the limiter allows, per second.
 const MIN_FILL_RATE: f64 = 0.5;
 /// The smallest capacity the limiter keeps.
@@ -698,18 +701,22 @@ mod tests {
         policy(&strategy, &partition).succeeded();
         assert_eq!(left(&partition), 500, "the next success returns the permit");
 
-        run(
+        let mut older = run(
             &strategy,
             &partition,
             &[(failure(Kind::Transient, None), secs(1), 490)],
         );
-        let mut call = run(
+        run(
             &strategy,
             &partition,
             &[(failure(Kind::Server, None), secs(1), 485)],
         );
-        call.succeeded();
-        assert_eq!(left(&partition), 490, "the replaced permit stays spent");
+        older.succeeded();
+        assert_eq!(
+            left(&partition),
+            490,
+            "the older call's 10 stays spent; the newer permit's 5 returns"
+        );
         policy(&strategy, &partition).succeeded();
         assert_eq!(
             left(&partition),
