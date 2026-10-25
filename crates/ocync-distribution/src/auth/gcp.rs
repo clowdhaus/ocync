@@ -167,7 +167,7 @@ impl GcpAuth {
     /// Get or refresh GCP `OAuth2` credentials.
     async fn ensure_credentials(&self) -> Result<Credentials, Error> {
         self.credential_cache
-            .get_or_refresh("gcp-oauth2-credential", async {
+            .get_or_refresh(async {
                 tracing::debug!("GCP OAuth2 credentials expired or missing, refreshing");
                 let access_token = self.api.access_token().await.map_err(|e| {
                     tracing::warn!(error = %e, "GCP access token request failed");

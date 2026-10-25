@@ -1,5 +1,6 @@
-//! The process environment, file system and platform the AWS settings and
-//! credentials are read from, behind enums so tests can supply fixed values.
+//! The process environment, file system, platform, clock and network the
+//! AWS settings and credentials come from, behind enums so tests can supply
+//! fixed values and recorded HTTP exchanges.
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -8,6 +9,12 @@ use std::io;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Arc;
+use std::time::SystemTime;
+
+#[cfg(test)]
+use super::replay::Replay;
 
 /// Everything the settings and credentials are read from.
 #[derive(Debug, Clone)]
@@ -15,6 +22,8 @@ pub(super) struct Host {
     pub(super) env: Env,
     pub(super) fs: Fs,
     pub(super) platform: Platform,
+    pub(super) clock: Clock,
+    pub(super) network: Network,
 }
 
 impl Host {
@@ -24,6 +33,80 @@ impl Host {
             env: Env::Process,
             fs: Fs::Real,
             platform: Platform::current(),
+            clock: Clock::System,
+            network: Network::Real,
+        }
+    }
+}
+
+/// Where the time comes from.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Clock {
+    /// The system clock.
+    System,
+    /// A fixed instant.
+    #[cfg(test)]
+    Fixed(SystemTime),
+}
+
+impl Clock {
+    /// The time now.
+    pub(super) fn now(self) -> SystemTime {
+        match self {
+            Self::System => SystemTime::now(),
+            #[cfg(test)]
+            Self::Fixed(time) => time,
+        }
+    }
+}
+
+/// Where HTTP requests go.
+#[derive(Debug, Clone)]
+pub(super) enum Network {
+    /// The network, through a client each source configures.
+    Real,
+    /// Recorded exchanges, answered in order.
+    #[cfg(test)]
+    Replay(Arc<Replay>),
+}
+
+impl Network {
+    /// The transport for a source whose client `builder` configures.
+    pub(super) fn transport(
+        &self,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Transport, reqwest::Error> {
+        match self {
+            Self::Real => {
+                crate::install_crypto_provider();
+                builder.build().map(Transport::Client)
+            }
+            #[cfg(test)]
+            Self::Replay(replay) => Ok(Transport::Replay(Arc::clone(replay))),
+        }
+    }
+}
+
+/// Sends a source's requests.
+#[derive(Debug, Clone)]
+pub(super) enum Transport {
+    /// Over the network.
+    Client(reqwest::Client),
+    /// To recorded exchanges.
+    #[cfg(test)]
+    Replay(Arc<Replay>),
+}
+
+impl Transport {
+    /// Send `request` and return the answer's head; the body streams.
+    pub(super) async fn send(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        match self {
+            Self::Client(client) => client.execute(request).await,
+            #[cfg(test)]
+            Self::Replay(replay) => Ok(replay.answer(&request).await),
         }
     }
 }

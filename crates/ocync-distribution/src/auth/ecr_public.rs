@@ -188,7 +188,7 @@ impl EcrPublicAuth {
     /// Get or refresh registry credentials from `GetAuthorizationToken`.
     async fn ensure_credentials(&self) -> Result<Credentials, Error> {
         self.credential_cache
-            .get_or_refresh("ecr-public-credential", async {
+            .get_or_refresh(async {
                 tracing::debug!("ECR Public registry credentials expired or missing, refreshing");
                 let response = self.api.get_authorization_token().await.map_err(|e| {
                     tracing::warn!(error = %e, "ECR Public GetAuthorizationToken failed");

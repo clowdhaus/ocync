@@ -10,6 +10,8 @@ mod credentials;
 mod endpoint;
 mod host;
 mod profile;
+#[cfg(test)]
+mod replay;
 mod retry;
 mod sigv4;
 
@@ -396,9 +398,8 @@ impl From<reqwest::Error> for Failure {
     }
 }
 
-impl Failure {
-    /// How the SDK retries this failure, or `None` when it does not. A throttle
-    /// code wins over the status it came with, as in the SDK.
+impl retry::Retryable for Failure {
+    /// A throttle code wins over the status it came with, as in the SDK.
     fn retry_kind(&self) -> Option<retry::Kind> {
         match self {
             Self::Transport(e) => is_transient_transport(e).then_some(retry::Kind::Transient),
@@ -417,7 +418,6 @@ impl Failure {
         }
     }
 
-    /// The wait the service asked for before a retry.
     fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Service(error) | Self::ClockSkewed { error, .. } => error.retry_after,
@@ -571,7 +571,7 @@ impl Api {
 /// Where a client's credentials come from.
 enum Provider {
     /// The default credential chain.
-    Chain(Chain),
+    Chain(Box<Chain>),
     /// A test's own loader, to count or stall loads.
     #[cfg(test)]
     Test(tests::Loader),
@@ -646,7 +646,9 @@ impl Client {
             config.endpoint_url(service.service_id())?,
         )?;
         Self::from_parts(Parts {
-            provider: Provider::Chain(Chain::new(&host.env, &region, &config)),
+            provider: Provider::Chain(Box::new(
+                Chain::new(host, &region, &config).map_err(ConfigError::HttpClient)?,
+            )),
             service,
             partition: retry::partition(service, &region),
             region,
@@ -705,7 +707,7 @@ impl Client {
     /// Concurrent callers share one load instead of each asking IMDS or STS.
     async fn credentials(&self) -> Result<Credentials, Failure> {
         self.credentials
-            .get_or_refresh("aws-credentials", async {
+            .get_or_refresh(async {
                 let loaded = tokio::time::timeout(CREDENTIALS_LOAD_TIMEOUT, self.provider.load())
                     .await
                     .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))??;
@@ -739,6 +741,7 @@ mod tests {
     use wiremock::matchers::{body_json, header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use super::retry::Retryable as _;
     use super::*;
 
     /// An operation the tests call, answered with `{"ok": true}`.

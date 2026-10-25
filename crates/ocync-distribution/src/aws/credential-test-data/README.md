@@ -9,3 +9,6 @@ Each case directory holds the process environment (`env.json`), the files the
 chain may read (`fs/`), the recorded HTTP exchanges (`http-traffic.json`) and
 the expected credentials or error text (`test-case.json`). The cases run
 through `credentials::fixtures` in this crate, unchanged.
+
+`imds-config/imds-endpoint-tests.json` holds the instance metadata endpoint
+cases, run by the tests of `credentials::imds`.

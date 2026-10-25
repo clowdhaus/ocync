@@ -13,12 +13,13 @@ use serde::Deserialize;
 
 use super::super::config::Config;
 use super::super::endpoint::Region;
-use super::super::host::{Env, Fs, Host, Platform};
+use super::super::host::{Clock, Env, Fs, Host, Network, Platform};
 use super::super::profile::{self, Location};
-use super::{Chain, Credentials};
+use super::super::replay::Replay;
+use super::{Chain, Credentials, Source, error_chain};
 
 /// Where the cases are.
-const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/aws/credential-test-data");
+pub(super) const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/aws/credential-test-data");
 
 /// The region STS is called in when neither the environment nor the profile
 /// names one, as when a registry gives none.
@@ -35,11 +36,6 @@ const EXCLUDED: &[&str] = &[
     "eks_pod_identity_no_token_file",
     "environment_variables_blank",
     "imds_assume_role",
-    "imds_config_with_no_creds",
-    "imds_default_chain_error",
-    "imds_default_chain_retries",
-    "imds_default_chain_success",
-    "imds_disabled",
     "imds_no_iam_role",
     "imds_token_fail",
     "profile_name",
@@ -54,6 +50,25 @@ const EXCLUDED: &[&str] = &[
     "web_identity_token_invalid_jwt",
     "web_identity_token_profile",
     "web_identity_token_source_profile",
+];
+
+/// Cases that start at a later source than the environment, by directory
+/// name: the sources before it are loaded through `aws-config`, and these
+/// cases expect each of them not to be configured.
+const STARTS_AT: &[(&str, Source)] = &[
+    ("imds_config_with_no_creds", Source::Imds),
+    ("imds_default_chain_error", Source::Imds),
+    ("imds_default_chain_retries", Source::Imds),
+    ("imds_default_chain_success", Source::Imds),
+    ("imds_disabled", Source::Imds),
+];
+
+/// Cases run at the UNIX epoch, as upstream runs them, so the expiry they
+/// record has not passed.
+const AT_THE_EPOCH: &[&str] = &[
+    "imds_config_with_no_creds",
+    "imds_default_chain_retries",
+    "imds_default_chain_success",
 ];
 
 /// The credentials a case expects. The account ID upstream also checks is
@@ -97,19 +112,16 @@ struct TestCase {
     result: Outcome,
 }
 
-/// A case's `http-traffic.json`.
-#[derive(Debug, Deserialize)]
-struct Traffic {
-    events: Vec<serde_json::Value>,
-}
-
 /// One case, ready to run.
 struct Case {
     name: String,
     host: Host,
     region: Region,
     outcome: Outcome,
-    traffic: Traffic,
+    /// The case's recorded HTTP traffic, which the host's network answers.
+    replay: Arc<Replay>,
+    /// The sources the chain tries.
+    order: &'static [Source],
     /// The case allows secrets in the logs, as `EXPOSE_SECRETS_FOR_TESTS`
     /// does upstream.
     secrets_in_logs: SecretsInLogs,
@@ -134,35 +146,47 @@ impl Case {
         } else {
             SecretsInLogs::Forbidden
         };
-        let env = Env::Fixed(vars);
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         let mut files = HashMap::new();
         read_tree(&dir.join("fs"), Path::new("/"), &mut files);
+        let replay = Arc::new(Replay::from_json(&read("http-traffic.json")));
         let host = Host {
-            env,
+            env: Env::Fixed(vars),
             fs: Fs::Fixed(files),
             platform: Platform::Unix,
+            clock: if AT_THE_EPOCH.contains(&name.as_str()) {
+                Clock::Fixed(UNIX_EPOCH)
+            } else {
+                Clock::System
+            },
+            network: Network::Replay(Arc::clone(&replay)),
         };
+        let start = STARTS_AT
+            .iter()
+            .find(|(case, _)| *case == name)
+            .map_or(Source::Environment, |&(_, source)| source);
+        let all: &'static [Source] = &Source::ORDER;
+        let at = all.iter().position(|&source| source == start).unwrap();
         let test_case: TestCase = serde_json::from_str(&read("test-case.json")).unwrap();
         Self {
-            name: dir.file_name().unwrap().to_string_lossy().into_owned(),
+            name,
             region: default_region(&host),
             host,
             outcome: test_case.result,
-            traffic: serde_json::from_str(&read("http-traffic.json")).unwrap(),
+            replay,
+            order: &all[at..],
             secrets_in_logs,
         }
     }
 
-    /// Run the case and check the answer and the logs.
+    /// Run the case and check the answer, the logs, and that every recorded
+    /// request was sent.
     async fn run(self) {
         let name = &self.name;
-        assert!(
-            self.traffic.events.is_empty(),
-            "{name}: recorded HTTP traffic needs the replay transport"
-        );
         let config = Config::load(&self.host, None);
-        let chain = Chain::new(&self.host.env, &self.region, &config);
-        let (result, logs) = capture_logs(chain.load()).await;
+        let chain = Chain::new(&self.host, &self.region, &config).unwrap();
+        let (result, logs) = capture_logs(chain.load_in(self.order)).await;
+        self.replay.assert_done();
         match (&self.outcome, &result) {
             (Outcome::Ok(expected), Ok(loaded)) => {
                 assert_eq!(&Expected::from(loaded), expected, "{name}");
@@ -221,18 +245,6 @@ fn default_region(host: &Host) -> Region {
     Region::parse(&region).unwrap()
 }
 
-/// `error` and each of its sources, joined as upstream prints them.
-fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(e) = source {
-        text.push_str(": ");
-        text.push_str(&e.to_string());
-        source = e.source();
-    }
-    text
-}
-
 /// Await `future` with every log line at any level captured.
 async fn capture_logs<T>(future: impl Future<Output = T>) -> (T, String) {
     #[derive(Clone, Default)]
@@ -259,9 +271,10 @@ async fn capture_logs<T>(future: impl Future<Output = T>) -> (T, String) {
 }
 
 /// Every default chain case not excluded passes, and every case is either
-/// run or excluded with a reason. Breaks if a source answers differently
-/// from upstream, or a case is dropped or excluded twice.
-#[tokio::test(flavor = "current_thread")]
+/// run or excluded with a reason. Time is paused, so retries back off
+/// without waiting. Breaks if a source answers or sends differently from
+/// upstream, or a case is dropped or excluded twice.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn upstream_default_chain_cases() {
     let suite = Path::new(DATA).join("default-credential-provider-chain");
     let mut names: Vec<_> = std::fs::read_dir(&suite)
@@ -269,8 +282,12 @@ async fn upstream_default_chain_cases() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    for excluded in EXCLUDED {
-        assert!(names.iter().any(|n| n == excluded), "no case {excluded}");
+    let listed = EXCLUDED
+        .iter()
+        .chain(AT_THE_EPOCH)
+        .chain(STARTS_AT.iter().map(|(name, _)| name));
+    for case in listed {
+        assert!(names.iter().any(|n| n == case), "no case {case}");
     }
     let mut run = 0;
     for name in &names {

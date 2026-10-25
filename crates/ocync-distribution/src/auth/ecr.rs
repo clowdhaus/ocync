@@ -235,7 +235,7 @@ impl EcrAuth {
 
     async fn get_token_inner(&self) -> Result<Token, Error> {
         self.credential_cache
-            .get_or_refresh("ecr-token", async {
+            .get_or_refresh(async {
                 tracing::debug!(registry = %self.hostname, "token cache miss, calling GetAuthorizationToken");
                 let response = self.api.get_authorization_token().await.map_err(|e| {
                     tracing::warn!(registry = %self.hostname, error = %e, "ECR GetAuthorizationToken failed");

@@ -607,7 +607,7 @@ impl AcrAuth {
 
     async fn ensure_refresh_token(&self) -> Result<String, Error> {
         self.refresh_cache
-            .get_or_refresh("acr-refresh-token", async {
+            .get_or_refresh(async {
                 tracing::debug!(service = %self.service, "ACR refresh token expired, re-acquiring");
                 let aad_access_token = self.api.get_token().await?;
                 let refresh_token = exchange_refresh_token(

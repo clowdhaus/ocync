@@ -59,6 +59,55 @@ const RETRY_MODE: Setting = Setting {
 /// Selects retry behavior 2.1. Read only from the environment.
 const NEW_RETRIES_2026: &str = "AWS_NEW_RETRIES_2026";
 
+const IMDS_ENDPOINT: Setting = Setting {
+    env: "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+    profile: "ec2_metadata_service_endpoint",
+};
+
+const IMDS_ENDPOINT_MODE: Setting = Setting {
+    env: "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
+    profile: "ec2_metadata_service_endpoint_mode",
+};
+
+/// The instance metadata service over IPv4.
+const IMDS_IPV4: &str = "http://169.254.169.254";
+
+/// The instance metadata service over IPv6.
+const IMDS_IPV6: &str = "http://[fd00:ec2::254]";
+
+/// Which address the instance metadata service is reached at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImdsMode {
+    IpV4,
+    IpV6,
+}
+
+impl std::str::FromStr for ImdsMode {
+    type Err = ImdsEndpointError;
+
+    /// `IPv4` or `IPv6`, any case.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.eq_ignore_ascii_case("ipv4") {
+            Ok(Self::IpV4)
+        } else if text.eq_ignore_ascii_case("ipv6") {
+            Ok(Self::IpV6)
+        } else {
+            Err(ImdsEndpointError::Mode(text.to_owned()))
+        }
+    }
+}
+
+/// Why the instance metadata endpoint settings do not resolve.
+#[derive(Debug, Clone, thiserror::Error)]
+pub(super) enum ImdsEndpointError {
+    /// The endpoint mode is not `IPv4` or `IPv6`.
+    #[error("`{0}` is not a valid endpoint mode")]
+    Mode(String),
+    /// The endpoint is not a URL.
+    #[error("invalid IMDS endpoint URI: {0}")]
+    Uri(#[source] url::ParseError),
+}
+
 /// A service's name in its endpoint URL settings, as each source spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ServiceId {
@@ -176,6 +225,24 @@ impl Config {
             .transpose()
     }
 
+    /// The instance metadata service's base URL: `AWS_EC2_METADATA_SERVICE_ENDPOINT`
+    /// or `ec2_metadata_service_endpoint`, else the address the endpoint
+    /// mode (`AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE` or
+    /// `ec2_metadata_service_endpoint_mode`) names, IPv4 by default.
+    pub(super) fn imds_endpoint(&self) -> Result<url::Url, ImdsEndpointError> {
+        let url = match self.value(IMDS_ENDPOINT, None) {
+            Some(url) => url::Url::parse(&url),
+            None => {
+                let mode = self.value(IMDS_ENDPOINT_MODE, None);
+                match mode.map(|m| m.parse()).transpose()? {
+                    Some(ImdsMode::IpV6) => url::Url::parse(IMDS_IPV6),
+                    Some(ImdsMode::IpV4) | None => url::Url::parse(IMDS_IPV4),
+                }
+            }
+        };
+        url.map_err(ImdsEndpointError::Uri)
+    }
+
     /// `AWS_MAX_ATTEMPTS` or `max_attempts`, `AWS_RETRY_MODE` or
     /// `retry_mode`, and `AWS_NEW_RETRIES_2026`. An invalid attempt count
     /// or mode is an error.
@@ -218,11 +285,14 @@ fn parse_flag(name: &str, value: &str) -> Option<bool> {
 pub(super) mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
-    use super::super::host::{Fs, Platform};
+    use super::super::host::{Clock, Fs, Network, Platform};
+    use super::super::replay::Replay;
     use super::*;
 
-    /// A Unix host with `vars` set and a config file holding `config_file`.
+    /// A Unix host with `vars` set and a config file holding `config_file`,
+    /// on the system clock, that sends no request: any request panics.
     pub(in crate::aws) fn host(vars: &[(&str, &str)], config_file: &str) -> Host {
         let mut env: HashMap<_, _> = vars
             .iter()
@@ -236,6 +306,8 @@ pub(super) mod tests {
                 config_file.as_bytes().to_vec(),
             )])),
             platform: Platform::Unix,
+            clock: Clock::System,
+            network: Network::Replay(Arc::new(Replay::from_json(r#"{"events": []}"#))),
         }
     }
 

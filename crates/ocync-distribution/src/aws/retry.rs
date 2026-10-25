@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::endpoint::Region;
-use super::{ConfigError, Failure, Service};
+use super::{ConfigError, Service};
 use crate::retry::Policy;
 
 /// The quota a partition starts with and never exceeds.
@@ -369,8 +369,19 @@ impl<'a> CallPolicy<'a> {
     }
 }
 
-impl Policy<Failure> for CallPolicy<'_> {
-    fn retry(&mut self, attempt: u32, error: &Failure) -> Option<Duration> {
+/// A failure the SDK's retry policy classifies.
+pub(super) trait Retryable {
+    /// How the SDK retries this failure, or `None` when it does not.
+    fn retry_kind(&self) -> Option<Kind>;
+
+    /// The wait the service asked for before a retry.
+    fn retry_after(&self) -> Option<Duration> {
+        None
+    }
+}
+
+impl<E: Retryable> Policy<E> for CallPolicy<'_> {
+    fn retry(&mut self, attempt: u32, error: &E) -> Option<Duration> {
         let kind = error.retry_kind();
         self.partition.observe(self.strategy.mode, Answer::of(kind));
         let kind = kind?;
@@ -388,6 +399,8 @@ impl Policy<Failure> for CallPolicy<'_> {
         Some(backoff)
     }
 
+    /// The call succeeded: the limiter grows back, and the quota gets back
+    /// the call's permit, or 1 when it holds none.
     fn succeeded(&mut self) {
         self.partition.observe(self.strategy.mode, Answer::Other);
         self.partition
@@ -563,7 +576,7 @@ impl Limiter {
 mod tests {
     use http::StatusCode;
 
-    use super::super::{ClockSkew, CodeKind, ErrorCode, ServiceError};
+    use super::super::{ClockSkew, CodeKind, ErrorCode, Failure, ServiceError};
     use super::*;
 
     /// A failure the SDK classifies as `kind`, with the server's
@@ -718,7 +731,7 @@ mod tests {
                 (failure(Kind::Transient, secs(1)), secs(1), 80),
             ],
         );
-        call.succeeded();
+        Policy::<Failure>::succeeded(&mut call);
         assert_eq!(left(&partition), 90);
     }
 
@@ -740,10 +753,10 @@ mod tests {
             ],
         );
         let other_client = fixed(&standard());
-        policy(&other_client, &partition).succeeded();
+        Policy::<Failure>::succeeded(&mut policy(&other_client, &partition));
         assert_eq!(left(&partition), 1);
         for _ in 0..20 {
-            policy(&other_client, &partition).succeeded();
+            Policy::<Failure>::succeeded(&mut policy(&other_client, &partition));
         }
         assert_eq!(left(&partition), 20);
     }
@@ -768,7 +781,7 @@ mod tests {
                 (failure(Kind::Transient, None), None, 490),
             ],
         );
-        policy(&strategy, &partition).succeeded();
+        Policy::<Failure>::succeeded(&mut policy(&strategy, &partition));
         assert_eq!(
             left(&partition),
             491,
@@ -785,9 +798,9 @@ mod tests {
             &partition,
             &[(failure(Kind::Server, None), secs(1), 476)],
         );
-        older.succeeded();
+        Policy::<Failure>::succeeded(&mut older);
         assert_eq!(left(&partition), 486, "the older call returns its 10");
-        newer.succeeded();
+        Policy::<Failure>::succeeded(&mut newer);
         assert_eq!(left(&partition), 491, "the newer call returns its 5");
     }
 
@@ -806,7 +819,7 @@ mod tests {
                 (failure(Kind::Server, None), millis(100), 472),
             ],
         );
-        call.succeeded();
+        Policy::<Failure>::succeeded(&mut call);
         assert_eq!(left(&partition), 486);
 
         let partition = Partition::default();
@@ -845,7 +858,7 @@ mod tests {
             &partition,
             &[(failure(Kind::Throttling, None), secs(1), 495)],
         );
-        call.succeeded();
+        Policy::<Failure>::succeeded(&mut call);
         assert_eq!(left(&partition), 500);
 
         let partition = Partition::with_capacity(20);

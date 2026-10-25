@@ -78,35 +78,153 @@ pub(super) fn parse_imf_fixdate(text: &str) -> Option<SystemTime> {
     if weekday.len() != 3 || zone != "GMT" || fields.next().is_some() || day.len() != 2 {
         return None;
     }
-    let number = |field: &str| -> Option<u64> {
-        field
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| field.parse().ok())
-            .flatten()
-    };
     let month = MONTHS.iter().position(|m| *m == month)? as u64 + 1;
-    let (day, year) = (number(day)?, number(year)?);
+    let (day, year) = (digits(day.as_bytes())?, digits(year.as_bytes())?);
     let time = time.split_once('.').map_or(time, |(whole, _)| whole);
-    let mut clock = time.split(':').map(number);
+    let mut clock = time.split(':').map(|field| digits(field.as_bytes()));
     let (hour, minute, second) = (clock.next()??, clock.next()??, clock.next()??);
-    if clock.next().is_some()
-        || !(1..=31).contains(&day)
-        || year > 9999
+    if clock.next().is_some() || year > 9999 {
+        return None;
+    }
+    let time = TimeOfDay {
+        hour,
+        minute,
+        second,
+        nanos: 0,
+    };
+    instant(CivilDate { year, month, day }, time)
+}
+
+/// `field` read as a decimal number. Empty text, any byte that is not an
+/// ASCII digit, or a value past `u64` is `None`.
+fn digits(field: &[u8]) -> Option<u64> {
+    if field.is_empty() {
+        return None;
+    }
+    field.iter().try_fold(0u64, |n, &d| {
+        d.is_ascii_digit()
+            .then(|| n.checked_mul(10)?.checked_add(u64::from(d - b'0')))
+            .flatten()
+    })
+}
+
+/// A time of day, as read from a timestamp.
+#[derive(Debug, Clone, Copy)]
+struct TimeOfDay {
+    hour: u64,
+    minute: u64,
+    second: u64,
+    nanos: u32,
+}
+
+/// The time at `time` on `date`, in UTC. A date that does not exist, a
+/// time out of range, a leap second or a time before 1970 is `None`, as
+/// the SDK's parsers refuse them.
+fn instant(date: CivilDate, time: TimeOfDay) -> Option<SystemTime> {
+    let TimeOfDay {
+        hour,
+        minute,
+        second,
+        nanos,
+    } = time;
+    if !(1..=12).contains(&date.month)
+        || date.day == 0
+        || date.day > days_in_month(date.year, date.month)
         || hour > 23
         || minute > 59
-        || second > 60
+        || second > 59
     {
         return None;
     }
-    let days = CivilDate { year, month, day }.to_days()?;
+    let days = date.to_days()?;
     let seconds = days * SECONDS_PER_DAY + hour * 3600 + minute * 60 + second;
-    UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
+    UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
+}
+
+/// Read an RFC 3339 date-time in UTC, `2021-09-21T04:16:53Z`, with
+/// optional fractional seconds, as the SDK reads metadata and container
+/// answers: `T` or `t` between date and time, and `Z` as the only offset.
+/// Any other text, a date that does not exist, a leap second or a time
+/// before 1970 is `None`.
+pub(super) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    let bytes = text.as_bytes();
+    let field = |range: std::ops::Range<usize>| digits(bytes.get(range)?);
+    let separators = [(4, b'-'), (7, b'-'), (13, b':'), (16, b':')];
+    if separators.iter().any(|&(i, c)| bytes.get(i) != Some(&c))
+        || !matches!(bytes.get(10), Some(b'T' | b't'))
+    {
+        return None;
+    }
+    let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (hour, minute, second) = (field(11..13)?, field(14..16)?, field(17..19)?);
+    let mut rest = &text[19..];
+    let mut nanos = 0;
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let len = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if len == 0 {
+            return None;
+        }
+        let kept = &fraction[..len.min(9)];
+        nanos = kept.parse::<u32>().ok()? * 10u32.pow(9 - kept.len() as u32);
+        rest = &fraction[len..];
+    }
+    if rest != "Z" {
+        return None;
+    }
+    let time = TimeOfDay {
+        hour,
+        minute,
+        second,
+        nanos,
+    };
+    instant(CivilDate { year, month, day }, time)
+}
+
+/// The days in `month` of `year`.
+fn days_in_month(year: u64, month: u64) -> u64 {
+    match month {
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The forms the SDK reads: `Z`, either case of `T`, and fractional
+    /// seconds kept to the nanosecond. Breaks if an offset or a lowercase
+    /// `z` is taken, or if an impossible date reads.
+    #[test]
+    fn reads_rfc3339_as_the_sdk_does() {
+        let at = |secs, nanos| Some(UNIX_EPOCH + Duration::new(secs, nanos));
+        let cases = [
+            ("2021-09-21T04:16:53Z", at(1_632_197_813, 0)),
+            ("2021-09-21t04:16:53Z", at(1_632_197_813, 0)),
+            ("2021-09-21T04:16:53.5Z", at(1_632_197_813, 500_000_000)),
+            (
+                "2021-09-21T04:16:53.1234567891Z",
+                at(1_632_197_813, 123_456_789),
+            ),
+            ("2024-02-29T00:00:00Z", at(1_709_164_800, 0)),
+            ("2021-09-21T06:16:53+02:00", None),
+            ("2021-09-21T04:16:53z", None),
+            ("2021-09-21T04:16:53", None),
+            ("2021-09-21 04:16:53Z", None),
+            ("2023-02-29T00:00:00Z", None),
+            ("2021-09-21T04:16:60Z", None),
+            ("2021-09-21T04:16:53.Z", None),
+            ("1969-12-31T23:59:59Z", None),
+            ("2021-9-21T04:16:53Z", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(parse_rfc3339(text), expected, "{text}");
+        }
+    }
 
     /// The two conversions invert each other across leap days and century
     /// years, and nothing before 1970 converts.
@@ -125,8 +243,9 @@ mod tests {
     }
 
     /// The parser agrees with `httpdate` on what `httpdate` writes, takes
-    /// the SDK's fractional seconds, and refuses the obsolete forms and
-    /// anything not in GMT.
+    /// the SDK's fractional seconds, and refuses the obsolete forms,
+    /// anything not in GMT, a day the month does not have and a leap
+    /// second, as the SDK does.
     #[test]
     fn reads_an_imf_fixdate() {
         for secs in [0, 951_782_400, 1_709_251_199, 1_735_689_599, 4_107_542_400] {
@@ -148,6 +267,9 @@ mod tests {
             "Sun, 06 Nov 1994 24:00:00 GMT",
             "Sun, +6 Nov 1994 08:49:37 GMT",
             "Sat, 01 Jan 0000 00:00:00 GMT",
+            "Fri, 30 Feb 2024 00:00:00 GMT",
+            "Sat, 31 Dec 2016 23:59:60 GMT",
+            "Sun, 06 Nov 99999999999999999999 08:49:37 GMT",
         ] {
             assert_eq!(parse_imf_fixdate(bad), None, "{bad}");
         }

@@ -8,14 +8,19 @@
 mod environment;
 #[cfg(test)]
 mod fixtures;
+mod imds;
+mod json;
 mod sdk;
+
+#[cfg(test)]
+pub(super) use imds::TOKEN_HEADER;
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use super::config::Config;
 use super::endpoint::Region;
-use super::host::Env;
+use super::host::{Env, Host};
 
 /// What a redacted value prints as, as elsewhere in this crate.
 const REDACTED: &str = "[REDACTED]";
@@ -84,9 +89,25 @@ pub(super) enum Error {
     /// The chain did not answer in time.
     #[error("credentials provider timed out after {} seconds", .0.as_secs())]
     TimedOut(Duration),
+    /// The instance metadata service failed.
+    #[error("failed to load credentials from IMDS")]
+    Imds(#[source] imds::Error),
     /// A source loaded through `aws-config` failed.
     #[error(transparent)]
     Sdk(aws_credential_types::provider::error::CredentialsError),
+}
+
+/// `error` and each of its sources, joined as upstream prints them, so a
+/// reason kept as text still names its cause.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(e) = source {
+        text.push_str(": ");
+        text.push_str(&e.to_string());
+        source = e.source();
+    }
+    text
 }
 
 /// Each source and why it was not configured, as `source: reason; ...`.
@@ -139,23 +160,34 @@ impl fmt::Display for Source {
 /// The default credential chain for one environment, region and profile.
 pub(super) struct Chain {
     env: Env,
-    /// The profile, web identity, container and instance metadata sources.
+    /// The profile, web identity and container sources.
     sdk: sdk::Sources,
+    imds: imds::Imds,
 }
 
 impl Chain {
-    /// The chain `env` and `config` configure, for calls in `region`.
-    pub(super) fn new(env: &Env, region: &Region, config: &Config) -> Self {
-        Self {
-            sdk: sdk::Sources::new(env, region, config),
-            env: env.clone(),
-        }
+    /// The chain `host` and `config` configure, for calls in `region`.
+    pub(super) fn new(
+        host: &Host,
+        region: &Region,
+        config: &Config,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            sdk: sdk::Sources::new(&host.env, region, config),
+            imds: imds::Imds::new(host, config)?,
+            env: host.env.clone(),
+        })
     }
 
     /// Credentials from the first configured source.
     pub(super) async fn load(&self) -> Result<Credentials, Error> {
+        self.load_in(&Source::ORDER).await
+    }
+
+    /// Credentials from the first configured source of `order`.
+    async fn load_in(&self, order: &[Source]) -> Result<Credentials, Error> {
         let mut skipped = Vec::new();
-        for source in Source::ORDER {
+        for &source in order {
             match self.load_from(source).await {
                 Err(Error::NotLoaded(reason)) => {
                     tracing::debug!(%source, reason, "AWS credential source not configured");
@@ -177,7 +209,9 @@ impl Chain {
             Source::Profile => self.sdk.load(sdk::Slot::Profile).await,
             Source::WebIdentity => self.sdk.load(sdk::Slot::WebIdentity).await,
             Source::Container => self.sdk.load(sdk::Slot::Container).await,
-            Source::Imds => self.sdk.load(sdk::Slot::Imds).await,
+            // Its nested retries and timeouts make a future too large to
+            // inline in every API call's frame.
+            Source::Imds => Box::pin(self.imds.load()).await,
         }
     }
 }
@@ -206,10 +240,14 @@ pub(super) mod tests {
         }
     }
 
-    /// A chain with no environment key and `answer` for the other sources.
-    fn chain(answer: fn(sdk::Slot) -> Result<Credentials, Error>) -> Chain {
+    /// A chain with `vars` set and no environment key, `answer` for the
+    /// sources still loaded through `aws-config`, and an instance metadata
+    /// source that panics if it sends a request.
+    fn chain(vars: &[(&str, &str)], answer: fn(sdk::Slot) -> Result<Credentials, Error>) -> Chain {
+        let host = super::super::config::tests::host(vars, "");
         Chain {
-            env: Env::Fixed(std::collections::HashMap::new()),
+            imds: imds::Imds::new(&host, &Config::load(&host, None)).unwrap(),
+            env: host.env,
             sdk: sdk::Sources::Scripted(answer),
         }
     }
@@ -222,25 +260,24 @@ pub(super) mod tests {
     /// answers. Breaks if a skip stops the chain.
     #[tokio::test]
     async fn skips_sources_that_are_not_configured() {
-        let loaded = chain(|slot| match slot {
-            sdk::Slot::Imds => Ok(key(Some("imds"), None)),
+        let loaded = chain(&[], |slot| match slot {
+            sdk::Slot::Container => Ok(key(Some("container"), None)),
             other => Err(not_loaded(other)),
         })
         .load()
         .await
         .unwrap();
-        assert_eq!(loaded.session_token(), Some("imds"));
+        assert_eq!(loaded.session_token(), Some("container"));
     }
 
-    /// A configured source that fails stops the chain: the sources after it
-    /// are never asked. Breaks if a failure is skipped like a source that is
-    /// not configured.
+    /// A configured source that fails stops the chain: the instance metadata
+    /// source after it sends no request. Breaks if a failure is skipped like
+    /// a source that is not configured.
     #[tokio::test]
     async fn stops_at_a_source_that_fails() {
-        let err = chain(|slot| match slot {
+        let err = chain(&[], |slot| match slot {
             sdk::Slot::Profile | sdk::Slot::WebIdentity => Err(not_loaded(slot)),
             sdk::Slot::Container => Err(Error::TimedOut(Duration::from_secs(1))),
-            sdk::Slot::Imds => panic!("the chain went past a failed source"),
         })
         .load()
         .await
@@ -252,17 +289,19 @@ pub(super) mod tests {
     /// with its reason, in the text upstream reports.
     #[tokio::test]
     async fn names_every_source_when_none_is_configured() {
-        let err = chain(|slot| Err(not_loaded(slot)))
-            .load()
-            .await
-            .unwrap_err();
+        let err = chain(&[("AWS_EC2_METADATA_DISABLED", "TRUE")], |slot| {
+            Err(not_loaded(slot))
+        })
+        .load()
+        .await
+        .unwrap_err();
         assert!(matches!(err, Error::NoSource(_)), "{err}");
         assert_eq!(
             err.to_string(),
             "the credential provider was not enabled: no source in the AWS credential chain \
              is configured (environment: environment variable not set; \
-             profile: no Profile; web identity: no WebIdentity; \
-             container: no Container; instance metadata: no Imds)"
+             profile: no Profile; web identity: no WebIdentity; container: no Container; \
+             instance metadata: IMDS disabled by AWS_EC2_METADATA_DISABLED env var set to `true`)"
         );
     }
 

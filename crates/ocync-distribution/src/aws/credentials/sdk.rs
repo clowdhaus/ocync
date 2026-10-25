@@ -1,5 +1,5 @@
-//! The profile, web identity, container and instance metadata sources,
-//! each loaded through its `aws-config` provider.
+//! The profile, web identity and container sources, each loaded through
+//! its `aws-config` provider.
 
 use aws_config::provider_config::ProviderConfig;
 use aws_credential_types::provider::ProvideCredentials;
@@ -19,8 +19,6 @@ pub(super) enum Slot {
     WebIdentity,
     /// The container endpoint.
     Container,
-    /// The instance metadata service.
-    Imds,
 }
 
 /// The `aws-config` providers of the slots.
@@ -42,7 +40,6 @@ pub(super) struct Providers {
     profile: aws_config::profile::ProfileFileCredentialsProvider,
     web_identity: aws_config::web_identity_token::WebIdentityTokenCredentialsProvider,
     container: aws_config::ecs::EcsCredentialsProvider,
-    imds: aws_config::imds::credentials::ImdsCredentialsProvider,
 }
 
 impl Sources {
@@ -67,9 +64,6 @@ impl Sources {
                     container: aws_config::ecs::EcsCredentialsProvider::builder()
                         .configure(&conf)
                         .build(),
-                    imds: aws_config::imds::credentials::ImdsCredentialsProvider::builder()
-                        .configure(&conf)
-                        .build(),
                 }))
             }
             #[cfg(test)]
@@ -90,7 +84,6 @@ impl Sources {
             Slot::Profile => providers.profile.provide_credentials().await,
             Slot::WebIdentity => providers.web_identity.provide_credentials().await,
             Slot::Container => providers.container.provide_credentials().await,
-            Slot::Imds => providers.imds.provide_credentials().await,
         };
         match loaded {
             Ok(credentials) => Ok(Credentials {
