@@ -116,6 +116,15 @@ pub struct BlobTransferStats {
     pub mounted: u64,
 }
 
+impl BlobTransferStats {
+    /// Add `other`'s counts to these.
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.transferred += other.transferred;
+        self.skipped += other.skipped;
+        self.mounted += other.mounted;
+    }
+}
+
 /// Outcome status for a single image transfer.
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]

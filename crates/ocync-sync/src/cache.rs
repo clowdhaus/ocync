@@ -306,16 +306,17 @@ impl TransferStateCache {
     }
 
     /// Drop `repo`'s state for each of `digests` that is known only from an
-    /// earlier run.
+    /// earlier run, returning how many were.
     pub(crate) fn forget_remembered_blobs<'a>(
         &mut self,
         target: &str,
         repo: &RepositoryName,
         digests: impl IntoIterator<Item = &'a Digest>,
-    ) {
-        for digest in digests {
-            self.dedup.forget_remembered(target, digest, repo);
-        }
+    ) -> usize {
+        digests
+            .into_iter()
+            .filter(|digest| self.dedup.forget_remembered(target, digest, repo))
+            .count()
     }
 
     /// Record each of `digests` present at `repo`, after a manifest that

@@ -250,21 +250,23 @@ impl BlobDedupMap {
         }
     }
 
-    /// Drop `repo`'s state for the blob if it is only [`RepoBlobState::Remembered`].
-    /// State this run recorded is kept: a batch check can lag an upload
-    /// made seconds before it.
+    /// Drop `repo`'s state for the blob if it is only [`RepoBlobState::Remembered`],
+    /// returning whether it was. State this run recorded is kept: a batch
+    /// check can lag an upload made seconds before it.
     pub(crate) fn forget_remembered(
         &mut self,
         target: &str,
         digest: &Digest,
         repo: &RepositoryName,
-    ) {
+    ) -> bool {
         let Some(info) = self.inner.get_mut(target).and_then(|m| m.get_mut(digest)) else {
-            return;
+            return false;
         };
-        if info.repos.get(repo) == Some(&RepoBlobState::Remembered) {
-            info.repos.remove(repo);
+        if info.repos.get(repo) != Some(&RepoBlobState::Remembered) {
+            return false;
         }
+        info.repos.remove(repo);
+        true
     }
 
     /// Record the blob as `Verified` at `repo`, which a manifest committed
