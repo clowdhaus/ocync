@@ -1413,6 +1413,79 @@ async fn sync_batch_checker_empty_result_transfers_all() {
     );
 }
 
+/// A cache loaded from disk says both blobs are at the target, but the
+/// repository has since lost them (deleted and recreated, or layers expired),
+/// and the batch check finds them missing. The batch answer wins over the
+/// earlier run's cache: both blobs are pushed again. Trusting the cache
+/// would skip them and leave a manifest the registry refuses.
+#[tokio::test]
+async fn sync_batch_checker_overrides_a_stale_loaded_cache() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let config_data = b"config-stale-cache";
+    let layer_data = b"layer-stale-cache";
+    let parts = ManifestBuilder::new(config_data).layer(layer_data).build();
+    let repo = RepositoryName::new("repo").unwrap();
+
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
+    for (digest, data) in [
+        (&parts.config_desc.digest, &config_data[..]),
+        (&parts.layer_descs[0].digest, &layer_data[..]),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/repo/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(data.to_vec())
+                    .insert_header("content-length", data.len().to_string()),
+            )
+            .expect(1)
+            .mount(&source_server)
+            .await;
+    }
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_blob_push(&target_server, "repo").await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let mut earlier_run = TransferStateCache::new();
+    earlier_run.set_blob_completed("target", parts.config_desc.digest.clone(), repo.clone());
+    earlier_run.set_blob_completed("target", parts.layer_descs[0].digest.clone(), repo.clone());
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let cache_path = tmp_dir.path().join("sync_cache.bin");
+    earlier_run.persist(&cache_path).unwrap();
+    let loaded = TransferStateCache::load(&cache_path, std::time::Duration::from_secs(3600));
+    assert!(loaded.blob_present_at("target", &parts.config_desc.digest, &repo));
+
+    let (checker, batch_call_count) = MockBatchChecker::new("repo", HashSet::new());
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![TargetEntry {
+            name: RegistryAlias::new("target"),
+            client: mock_client(&target_server),
+            batch_checker: Some(Rc::new(checker)),
+            existing_tags: HashSet::new(),
+        }],
+        vec![TagPair::same("v1")],
+    );
+
+    let report = run_sync_with_cache(vec![mapping], Rc::new(std::cell::RefCell::new(loaded))).await;
+
+    assert_eq!(batch_call_count.load(Ordering::Relaxed), 1);
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(
+        report.stats.blobs_skipped, 0,
+        "the stale cache must not skip"
+    );
+    assert_eq!(report.stats.blobs_transferred, 2);
+    assert_eq!(
+        report.stats.bytes_transferred,
+        (config_data.len() + layer_data.len()) as u64,
+    );
+}
+
 /// Mixed batch/no-batch multi-target: one ECR target with a batch checker,
 /// one non-ECR target without. Both see the same image.
 ///

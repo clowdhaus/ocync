@@ -30,12 +30,17 @@ pub enum RepoBlobState {
     /// Excluded from future mount-source selection regardless of how it
     /// was reached. Transient; stripped before persistence.
     Failed(String),
+    /// Present according to a cache loaded from disk, not yet confirmed by
+    /// this run. A batch check that finds the blob missing drops it, since
+    /// the repository may have been deleted or its layers expired since.
+    /// Persisted as `Verified`.
+    Remembered,
 }
 
 impl RepoBlobState {
     /// Whether this state means "blob is present at this repo for skip purposes".
     pub fn is_present(&self) -> bool {
-        matches!(self, Self::Verified | Self::Completed)
+        matches!(self, Self::Verified | Self::Completed | Self::Remembered)
     }
 
     /// Whether this state means "blob is unusable at this repo for mount purposes".
@@ -46,7 +51,10 @@ impl RepoBlobState {
     /// Whether this state means "still active or resolvable in this run".
     /// Used by `unresolved_watches_for` to filter dead-end candidates.
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Verified | Self::Uploading | Self::Completed)
+        matches!(
+            self,
+            Self::Verified | Self::Uploading | Self::Completed | Self::Remembered
+        )
     }
 }
 
@@ -242,17 +250,43 @@ impl BlobDedupMap {
         }
     }
 
-    /// Remove the entry for the given blob at the target.
-    /// Used for lazy invalidation when a complete cache entry is stale.
-    pub(crate) fn invalidate(&mut self, target: &str, digest: &Digest) {
-        if let Some(index) = self.inner.get_mut(target) {
-            index.remove(digest);
+    /// Drop `repo`'s state for the blob if it is only [`RepoBlobState::Remembered`].
+    /// State this run recorded is kept: a batch check can lag an upload
+    /// made seconds before it.
+    pub(crate) fn forget_remembered(
+        &mut self,
+        target: &str,
+        digest: &Digest,
+        repo: &RepositoryName,
+    ) {
+        let Some(info) = self.inner.get_mut(target).and_then(|m| m.get_mut(digest)) else {
+            return;
+        };
+        if info.repos.get(repo) == Some(&RepoBlobState::Remembered) {
+            info.repos.remove(repo);
         }
     }
 
+    /// Mark every present state as [`RepoBlobState::Remembered`], for a map
+    /// loaded from disk.
+    pub(crate) fn into_remembered(mut self) -> Self {
+        for state in self
+            .inner
+            .values_mut()
+            .flat_map(HashMap::values_mut)
+            .flat_map(|info| info.repos.values_mut())
+        {
+            if state.is_present() {
+                *state = RepoBlobState::Remembered;
+            }
+        }
+        self
+    }
+
     /// Return a copy with only persistable per-(repo) state entries.
-    /// `Verified` and `Completed` survive; `Uploading` and `Failed` are stripped.
-    /// The `claim` slot is also stripped.
+    /// `Verified` and `Completed` survive and `Remembered` is kept as
+    /// `Verified`; `Uploading` and `Failed` are stripped. The `claim` slot is
+    /// also stripped.
     pub(crate) fn filter_persistable(&self) -> BlobDedupMap {
         let inner = self
             .inner
@@ -264,10 +298,18 @@ impl BlobDedupMap {
                         let kept_repos: BTreeMap<RepositoryName, RepoBlobState> = info
                             .repos
                             .iter()
-                            .filter(|(_, state)| {
-                                matches!(state, RepoBlobState::Verified | RepoBlobState::Completed)
+                            .filter_map(|(r, state)| {
+                                let kept = match state {
+                                    RepoBlobState::Verified | RepoBlobState::Remembered => {
+                                        RepoBlobState::Verified
+                                    }
+                                    RepoBlobState::Completed => RepoBlobState::Completed,
+                                    RepoBlobState::Uploading | RepoBlobState::Failed(_) => {
+                                        return None;
+                                    }
+                                };
+                                Some((r.clone(), kept))
                             })
-                            .map(|(r, s)| (r.clone(), s.clone()))
                             .collect();
                         if kept_repos.is_empty() {
                             None
@@ -332,6 +374,43 @@ mod tests {
 
     fn repo(name: &str) -> RepositoryName {
         RepositoryName::new(name).unwrap()
+    }
+
+    /// A loaded map's present states become `Remembered`, which a missing
+    /// batch answer drops. State this run recorded, at the same repo or
+    /// another, is kept, and `Remembered` persists as `Verified`.
+    #[test]
+    fn forgets_only_remembered_state() {
+        let d = test_digest();
+        let mut loaded = BlobDedupMap::default();
+        loaded.set_blob_completed("reg.io", &d, &repo("x"));
+        loaded.set_blob_verified("reg.io", &d, &repo("y"));
+        let mut map = loaded.into_remembered();
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Remembered)
+        );
+        assert!(map.blob_present_at("reg.io", &d, &repo("x")));
+        assert_eq!(
+            map.filter_persistable()
+                .repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Verified)
+        );
+
+        map.forget_remembered("reg.io", &d, &repo("x"));
+        assert!(!map.blob_present_at("reg.io", &d, &repo("x")));
+        assert!(
+            map.blob_present_at("reg.io", &d, &repo("y")),
+            "another repo is untouched"
+        );
+
+        map.set_blob_completed("reg.io", &d, &repo("x"));
+        map.forget_remembered("reg.io", &d, &repo("x"));
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Completed),
+            "state this run recorded is kept"
+        );
     }
 
     /// Per-(repo) state independence: writing Y's state must not disturb X's

@@ -294,9 +294,15 @@ impl TransferStateCache {
         }
     }
 
-    /// Lazy invalidation: drop the entire entry for the blob.
-    pub fn invalidate_blob(&mut self, target: &str, digest: &Digest) {
-        self.dedup.invalidate(target, digest);
+    /// Drop `repo`'s state for the blob if it came only from a cache loaded
+    /// from disk.
+    pub(crate) fn forget_remembered_blob(
+        &mut self,
+        target: &str,
+        digest: &Digest,
+        repo: &RepositoryName,
+    ) {
+        self.dedup.forget_remembered(target, digest, repo);
     }
 
     /// Look up a cached source snapshot.
@@ -458,7 +464,7 @@ impl TransferStateCache {
         })?;
 
         Ok(Self {
-            dedup,
+            dedup: dedup.into_remembered(),
             snapshots,
             committed_repos: HashMap::new(),
             repo_committed_watches: HashMap::new(),
@@ -693,14 +699,6 @@ mod tests {
                 "{name}: a subscriber after the signal finds nothing to wait on"
             );
         }
-    }
-
-    #[test]
-    fn invalidate_removes_entry() {
-        let mut cache = TransferStateCache::new();
-        cache.set_blob_verified("reg.io", digest(), repo("repo/a"));
-        cache.invalidate_blob("reg.io", &digest());
-        assert!(!cache.blob_present_at("reg.io", &digest(), &repo("repo/a")));
     }
 
     #[test]

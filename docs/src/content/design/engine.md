@@ -260,15 +260,17 @@ Step 2 is the key optimization: when the cache knows a blob exists at a differen
 
 **Tier 2, warm cache (persistent disk, cross-run).** Serialized to disk on sync completion using a binary format (postcard + CRC32 integrity check). Loaded on startup for CronJob deployments. Watch mode keeps the hot tier in memory naturally; the warm tier provides crash recovery.
 
-At typical scale (~50K entries), the file is ~1MB and loads in <5ms. At extreme scale (600K entries), ~8MB with sub-100ms load. Deserialization uses `spawn_blocking` to avoid blocking the async runtime. The binary header stores a version field for forward compatibility (unknown versions discard and rebuild) and a `written_at: u64` timestamp. On load, if `now - written_at > cache_ttl`, the entire file is discarded and rebuilt. Per-entry timestamps are unnecessary because the entire file is written atomically at one point in time, and lazy invalidation handles individual stale entries regardless of age.
+At typical scale (~50K entries), the file is ~1MB and loads in <5ms. At extreme scale (600K entries), ~8MB with sub-100ms load. Deserialization uses `spawn_blocking` to avoid blocking the async runtime. The binary header stores a version field for forward compatibility (unknown versions discard and rebuild) and a `written_at: u64` timestamp. On load, if `now - written_at > cache_ttl`, the entire file is discarded and rebuilt. Per-entry timestamps are unnecessary because the entire file is written atomically at one point in time, and [lazy invalidation](/design/engine#lazy-invalidation) handles individual stale entries regardless of age.
 
 Corruption detection uses a CRC32 checksum appended to the file. Failed check discards and rebuilds. Concurrent access from overlapping CronJob runs is detected via advisory file lock; log warning and skip persistence if locked. `concurrencyPolicy: Forbid` is recommended for K8s CronJobs sharing a PVC.
 
 ### Lazy invalidation
 
-Staleness is handled by lazy invalidation. If a mount or push fails for a blob the cache claims exists, the entry is invalidated and the operation retries with a fresh HEAD check. Self-healing, zero configuration. Handles external actors deleting blobs, ECR lifecycle policies garbage-collecting images, and registry GC between runs. An optional TTL on persistent entries provides an additional safeguard via `global.cache_ttl`.
+An entry loaded from disk is `Remembered`: present for skip and mount decisions, but not confirmed by this run. On a target with a batch checker (ECR), each image's blobs are checked in one call before transfer, and a blob the check finds missing drops its `Remembered` entry for that repository, so the blob is pushed again. That covers a repository deleted and recreated, lifecycle policies expiring layers and registry GC between runs, with no extra request. An entry this run recorded is kept, because the batch check can lag an upload made seconds before it. `Remembered` is persisted as `Verified`.
 
-On double failure (retry also fails, e.g., source blob GC'd), the blob is marked as permanently unknown and the engine proceeds to full HEAD -> pull -> push. Failed status from a stale cache is never propagated to a new sync.
+A stale mount source is excluded by `mark_blob_repo_stale` (see [bounded-deadline mount-source resolution](/design/engine#bounded-deadline-mount-source-resolution)). `Failed` state is never persisted, so it never carries into a new sync.
+
+On a target without a batch checker, a `Remembered` blob is skipped without a check. If that registry has lost the blob, the manifest push is refused until `global.cache_ttl` expires the cache file.
 
 ### Persistence rules
 

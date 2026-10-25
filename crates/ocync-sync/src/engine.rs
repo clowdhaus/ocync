@@ -2290,6 +2290,8 @@ async fn transfer_image_blobs(
                     .filter(|d| existence.is_known(d))
                     .collect();
                 let available = existence.into_available();
+                let missing: Vec<&Digest> =
+                    checked.iter().filter(|d| !available.contains(*d)).collect();
                 debug!(
                     target_name = %ctx.target_name,
                     repo = %ctx.target_repo,
@@ -2299,9 +2301,15 @@ async fn transfer_image_blobs(
                     "batch check pre-populated cache"
                 );
                 let mut c = ctx.cache.borrow_mut();
+                // A blob the check finds missing is not trusted from an
+                // earlier run's cache: the repository may have lost it.
+                for digest in missing {
+                    c.forget_remembered_blob(ctx.target_name, digest, ctx.target_repo);
+                }
                 for digest in available {
                     c.set_blob_verified(ctx.target_name, digest, ctx.target_repo.to_owned());
                 }
+                drop(c);
                 checked
             }
             Err(e) => {
