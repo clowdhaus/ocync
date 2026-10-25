@@ -12,8 +12,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::ConfigError;
+use super::config::ServiceId;
 use super::endpoint::Region;
-use super::{ConfigError, Service};
 use crate::retry::Policy;
 
 /// The quota a partition starts with and never exceeds.
@@ -231,7 +232,7 @@ impl Default for Partition {
 }
 
 /// Partitions by service and region.
-type Partitions = HashMap<(Service, Region), Arc<Partition>>;
+type Partitions = HashMap<(ServiceId, Region), Arc<Partition>>;
 
 /// Every partition in the process. Synchronized, not `Rc<RefCell<_>>`,
 /// because the AWS client is a `Send + Sync` leaf like `RegistryClient`:
@@ -240,7 +241,7 @@ type Partitions = HashMap<(Service, Region), Arc<Partition>>;
 static PARTITIONS: LazyLock<Mutex<Partitions>> = LazyLock::new(Mutex::default);
 
 /// The partition of `service` in `region`, shared by every client for it.
-pub(super) fn partition(service: Service, region: &Region) -> Arc<Partition> {
+pub(super) fn partition(service: ServiceId, region: &Region) -> Arc<Partition> {
     let mut partitions = PARTITIONS.lock().expect("no panic while held");
     Arc::clone(partitions.entry((service, region.clone())).or_default())
 }
@@ -589,6 +590,7 @@ mod tests {
             code: code.map(|(text, kind)| ErrorCode {
                 text: text.to_owned(),
                 kind,
+                modeled: None,
             }),
             message: None,
             retry_after,
@@ -947,18 +949,18 @@ mod tests {
     #[test]
     fn shares_a_partition_per_service_and_region() {
         let region = |text| Region::parse(text).unwrap();
-        let a = partition(Service::Ecr, &region("eu-west-3"));
+        let a = partition(ServiceId::ECR, &region("eu-west-3"));
         assert!(Arc::ptr_eq(
             &a,
-            &partition(Service::Ecr, &region("eu-west-3"))
+            &partition(ServiceId::ECR, &region("eu-west-3"))
         ));
         assert!(!Arc::ptr_eq(
             &a,
-            &partition(Service::Ecr, &region("eu-west-2"))
+            &partition(ServiceId::ECR, &region("eu-west-2"))
         ));
         assert!(!Arc::ptr_eq(
             &a,
-            &partition(Service::EcrPublic, &region("eu-west-3"))
+            &partition(ServiceId::ECR_PUBLIC, &region("eu-west-3"))
         ));
     }
 

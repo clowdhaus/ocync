@@ -1,5 +1,5 @@
 //! Endpoint resolution for the AWS APIs ocync calls, matching the endpoint
-//! rules the AWS SDK generates for ECR and ECR Public.
+//! rules the AWS SDK generates for ECR, ECR Public and STS.
 
 use std::sync::LazyLock;
 
@@ -227,11 +227,7 @@ pub(super) fn resolve(
     endpoint_url: Option<Endpoint>,
 ) -> Result<Endpoint, ConfigError> {
     if let Some(url) = endpoint_url {
-        return match (fips, dual_stack) {
-            (Fips::On, _) => Err(ConfigError::FipsWithEndpointUrl),
-            (_, DualStack::On) => Err(ConfigError::DualStackWithEndpointUrl),
-            (Fips::Off, DualStack::Off) => Ok(url),
-        };
+        return configured(url, fips, dual_stack);
     }
     let p = partition(region);
     let (dns, dual) = (p.dns_suffix, p.dual_stack_dns_suffix);
@@ -263,6 +259,42 @@ pub(super) fn resolve(
         (Service::EcrPublic, Fips::Off, DualStack::Off) => {
             format!("https://api.ecr-public.{region}.{dns}")
         }
+    })
+}
+
+/// A configured endpoint URL, which cannot be combined with FIPS or
+/// dual-stack.
+fn configured(url: Endpoint, fips: Fips, dual_stack: DualStack) -> Result<Endpoint, ConfigError> {
+    match (fips, dual_stack) {
+        (Fips::On, _) => Err(ConfigError::FipsWithEndpointUrl),
+        (_, DualStack::On) => Err(ConfigError::DualStackWithEndpointUrl),
+        (Fips::Off, DualStack::Off) => Ok(url),
+    }
+}
+
+/// Resolve the STS endpoint URL in `region`, as the SDK's endpoint rules
+/// for STS do. The global endpoint is never chosen: the region is always a
+/// registry's own.
+pub(super) fn resolve_sts(
+    region: &Region,
+    fips: Fips,
+    dual_stack: DualStack,
+    endpoint_url: Option<Endpoint>,
+) -> Result<Endpoint, ConfigError> {
+    if let Some(url) = endpoint_url {
+        return configured(url, fips, dual_stack);
+    }
+    let p = partition(region);
+    let (dns, dual) = (p.dns_suffix, p.dual_stack_dns_suffix);
+    Endpoint::parse(&match (fips, dual_stack) {
+        (Fips::On, DualStack::On) => format!("https://sts-fips.{region}.{dual}"),
+        // GovCloud's standard endpoints are already FIPS endpoints.
+        (Fips::On, DualStack::Off) if p.id == PartitionId::AwsUsGov => {
+            format!("https://sts.{region}.{dns}")
+        }
+        (Fips::On, DualStack::Off) => format!("https://sts-fips.{region}.{dns}"),
+        (Fips::Off, DualStack::On) => format!("https://sts.{region}.{dual}"),
+        (Fips::Off, DualStack::Off) => format!("https://sts.{region}.{dns}"),
     })
 }
 
@@ -667,5 +699,300 @@ mod tests {
             Endpoint::parse("https://example.com:443").unwrap().host(),
             "example.com"
         );
+    }
+
+    /// The endpoint rule tests generated into `aws-sdk-sts` 1.122.0, less
+    /// the global endpoint cases (`aws-global` or `UseGlobalEndpoint`), the
+    /// configured endpoint cases, which share [`configured`] with ECR, and
+    /// "Missing Region". Breaks if a partition, FIPS or dual-stack host
+    /// differs from the SDK's, such as the `us-gov` FIPS host, which is the
+    /// standard one.
+    #[test]
+    fn matches_the_sdk_sts_endpoint_rule_tests() {
+        use DualStack as D;
+        use Fips as F;
+        let cases: &[(&str, Fips, DualStack, &str)] = &[
+            (
+                "af-south-1",
+                F::Off,
+                D::Off,
+                "https://sts.af-south-1.amazonaws.com",
+            ),
+            (
+                "ap-east-1",
+                F::Off,
+                D::Off,
+                "https://sts.ap-east-1.amazonaws.com",
+            ),
+            (
+                "ap-northeast-1",
+                F::Off,
+                D::Off,
+                "https://sts.ap-northeast-1.amazonaws.com",
+            ),
+            (
+                "ap-northeast-2",
+                F::Off,
+                D::Off,
+                "https://sts.ap-northeast-2.amazonaws.com",
+            ),
+            (
+                "ap-northeast-3",
+                F::Off,
+                D::Off,
+                "https://sts.ap-northeast-3.amazonaws.com",
+            ),
+            (
+                "ap-south-1",
+                F::Off,
+                D::Off,
+                "https://sts.ap-south-1.amazonaws.com",
+            ),
+            (
+                "ap-southeast-1",
+                F::Off,
+                D::Off,
+                "https://sts.ap-southeast-1.amazonaws.com",
+            ),
+            (
+                "ap-southeast-2",
+                F::Off,
+                D::Off,
+                "https://sts.ap-southeast-2.amazonaws.com",
+            ),
+            (
+                "ap-southeast-3",
+                F::Off,
+                D::Off,
+                "https://sts.ap-southeast-3.amazonaws.com",
+            ),
+            (
+                "ca-central-1",
+                F::Off,
+                D::Off,
+                "https://sts.ca-central-1.amazonaws.com",
+            ),
+            (
+                "eu-central-1",
+                F::Off,
+                D::Off,
+                "https://sts.eu-central-1.amazonaws.com",
+            ),
+            (
+                "eu-north-1",
+                F::Off,
+                D::Off,
+                "https://sts.eu-north-1.amazonaws.com",
+            ),
+            (
+                "eu-south-1",
+                F::Off,
+                D::Off,
+                "https://sts.eu-south-1.amazonaws.com",
+            ),
+            (
+                "eu-west-1",
+                F::Off,
+                D::Off,
+                "https://sts.eu-west-1.amazonaws.com",
+            ),
+            (
+                "eu-west-2",
+                F::Off,
+                D::Off,
+                "https://sts.eu-west-2.amazonaws.com",
+            ),
+            (
+                "eu-west-3",
+                F::Off,
+                D::Off,
+                "https://sts.eu-west-3.amazonaws.com",
+            ),
+            (
+                "me-south-1",
+                F::Off,
+                D::Off,
+                "https://sts.me-south-1.amazonaws.com",
+            ),
+            (
+                "sa-east-1",
+                F::Off,
+                D::Off,
+                "https://sts.sa-east-1.amazonaws.com",
+            ),
+            (
+                "us-east-1",
+                F::Off,
+                D::Off,
+                "https://sts.us-east-1.amazonaws.com",
+            ),
+            (
+                "us-east-1",
+                F::On,
+                D::Off,
+                "https://sts-fips.us-east-1.amazonaws.com",
+            ),
+            (
+                "us-east-2",
+                F::Off,
+                D::Off,
+                "https://sts.us-east-2.amazonaws.com",
+            ),
+            (
+                "us-east-2",
+                F::On,
+                D::Off,
+                "https://sts-fips.us-east-2.amazonaws.com",
+            ),
+            (
+                "us-west-1",
+                F::Off,
+                D::Off,
+                "https://sts.us-west-1.amazonaws.com",
+            ),
+            (
+                "us-west-1",
+                F::On,
+                D::Off,
+                "https://sts-fips.us-west-1.amazonaws.com",
+            ),
+            (
+                "us-west-2",
+                F::Off,
+                D::Off,
+                "https://sts.us-west-2.amazonaws.com",
+            ),
+            (
+                "us-west-2",
+                F::On,
+                D::Off,
+                "https://sts-fips.us-west-2.amazonaws.com",
+            ),
+            (
+                "us-east-1",
+                F::On,
+                D::On,
+                "https://sts-fips.us-east-1.api.aws",
+            ),
+            ("us-east-1", F::Off, D::On, "https://sts.us-east-1.api.aws"),
+            (
+                "cn-north-1",
+                F::Off,
+                D::Off,
+                "https://sts.cn-north-1.amazonaws.com.cn",
+            ),
+            (
+                "cn-northwest-1",
+                F::Off,
+                D::Off,
+                "https://sts.cn-northwest-1.amazonaws.com.cn",
+            ),
+            (
+                "cn-north-1",
+                F::On,
+                D::On,
+                "https://sts-fips.cn-north-1.api.amazonwebservices.com.cn",
+            ),
+            (
+                "cn-north-1",
+                F::On,
+                D::Off,
+                "https://sts-fips.cn-north-1.amazonaws.com.cn",
+            ),
+            (
+                "cn-north-1",
+                F::Off,
+                D::On,
+                "https://sts.cn-north-1.api.amazonwebservices.com.cn",
+            ),
+            (
+                "us-gov-east-1",
+                F::Off,
+                D::Off,
+                "https://sts.us-gov-east-1.amazonaws.com",
+            ),
+            (
+                "us-gov-east-1",
+                F::On,
+                D::Off,
+                "https://sts.us-gov-east-1.amazonaws.com",
+            ),
+            (
+                "us-gov-west-1",
+                F::Off,
+                D::Off,
+                "https://sts.us-gov-west-1.amazonaws.com",
+            ),
+            (
+                "us-gov-west-1",
+                F::On,
+                D::Off,
+                "https://sts.us-gov-west-1.amazonaws.com",
+            ),
+            (
+                "us-gov-east-1",
+                F::On,
+                D::On,
+                "https://sts-fips.us-gov-east-1.api.aws",
+            ),
+            (
+                "us-gov-east-1",
+                F::Off,
+                D::On,
+                "https://sts.us-gov-east-1.api.aws",
+            ),
+            (
+                "us-iso-east-1",
+                F::Off,
+                D::Off,
+                "https://sts.us-iso-east-1.c2s.ic.gov",
+            ),
+            (
+                "us-iso-west-1",
+                F::Off,
+                D::Off,
+                "https://sts.us-iso-west-1.c2s.ic.gov",
+            ),
+            (
+                "us-iso-east-1",
+                F::On,
+                D::Off,
+                "https://sts-fips.us-iso-east-1.c2s.ic.gov",
+            ),
+            (
+                "us-isob-east-1",
+                F::Off,
+                D::Off,
+                "https://sts.us-isob-east-1.sc2s.sgov.gov",
+            ),
+            (
+                "us-isob-east-1",
+                F::On,
+                D::Off,
+                "https://sts-fips.us-isob-east-1.sc2s.sgov.gov",
+            ),
+        ];
+        assert_eq!(cases.len(), 44);
+        for &(region, fips, dual_stack, expected) in cases {
+            let region = Region::parse(region).unwrap();
+            let endpoint = resolve_sts(&region, fips, dual_stack, None).unwrap();
+            assert_eq!(
+                endpoint.url().as_str().trim_end_matches('/'),
+                expected,
+                "{region} {fips:?} {dual_stack:?}"
+            );
+        }
+    }
+
+    /// A configured URL replaces the rule's host, and FIPS with it is an
+    /// error, as for ECR. Breaks if STS skips the check.
+    #[test]
+    fn sts_honors_a_configured_url() {
+        let region = Region::parse("us-east-1").unwrap();
+        let url = || Some(Endpoint::parse("https://example.com").unwrap());
+        let resolve = |fips| resolve_sts(&region, fips, DualStack::Off, url());
+        assert_eq!(resolve(Fips::Off).unwrap().host(), "example.com");
+        let err = resolve(Fips::On).unwrap_err();
+        assert!(matches!(err, ConfigError::FipsWithEndpointUrl), "{err}");
     }
 }

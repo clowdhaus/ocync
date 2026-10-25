@@ -142,7 +142,7 @@ fn canonical_request(
     let canonical = format!(
         "{}\n{}\n\n{canonical_headers}\n{signed_headers}\n{}",
         request.method,
-        encode_path(&normalize_path(request.path)),
+        percent_encode(&normalize_path(request.path), Keep::PathSeparators),
         hex::encode(digest::digest(&digest::SHA256, request.body)),
     );
     (canonical, signed_headers)
@@ -213,12 +213,25 @@ fn normalize_path(path: &str) -> String {
     normalized
 }
 
-/// Percent-encode every byte outside the RFC 3986 unreserved set but the
-/// `/` separators.
-fn encode_path(value: &str) -> String {
+/// What [`percent_encode`] leaves as it is, beside the RFC 3986 unreserved
+/// set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Keep {
+    /// Nothing else: a query or form value.
+    Unreserved,
+    /// The `/` separators of a path.
+    PathSeparators,
+}
+
+/// Percent-encode every byte outside the RFC 3986 unreserved set but what
+/// `keep` names, as AWS encodes paths and query and form values.
+pub(super) fn percent_encode(value: &str, keep: Keep) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            || (byte == b'/' && keep == Keep::PathSeparators)
+        {
             out.push(char::from(byte));
         } else {
             write!(out, "%{byte:02X}").expect("writing to a String cannot fail");

@@ -128,6 +128,11 @@ impl ServiceId {
         env: "ECR_PUBLIC",
         profile: "ecr-public",
     };
+    /// AWS STS.
+    pub(super) const STS: Self = Self {
+        env: "STS",
+        profile: "sts",
+    };
 }
 
 /// The environment and shared files the AWS settings are read from, with
@@ -315,7 +320,8 @@ pub(super) mod tests {
     const SERVICES_FILE: &str = "[default]\nendpoint_url = http://profile-global\nservices = local\n\
         [services local]\necr =\n  endpoint_url = http://profile-ecr\n\
         ecr_public =\n  endpoint_url = http://wrong-spelling\n\
-        ecr-public =\n  endpoint_url = http://profile-ecr-public\n";
+        ecr-public =\n  endpoint_url = http://profile-ecr-public\n\
+        sts =\n  endpoint_url = http://profile-sts\n";
 
     /// A service with no setting of its own, so only global values apply.
     const OTHER: ServiceId = ServiceId {
@@ -325,8 +331,8 @@ pub(super) mod tests {
 
     /// The endpoint URL precedence `aws-config` applies: service env, global
     /// env, service profile, global profile; ECR Public spelled
-    /// `ECR_PUBLIC` in the environment and `ecr-public` in the file; the
-    /// ignore switch drops all of them. Breaks if any step is reordered or
+    /// `ECR_PUBLIC` in the environment and `ecr-public` in the file, STS
+    /// `STS` and `sts`; the ignore switch drops all of them. Breaks if any step is reordered or
     /// a spelling differs.
     #[test]
     fn endpoint_url_precedence() {
@@ -355,6 +361,12 @@ pub(super) mod tests {
                 &[("AWS_ENDPOINT_URL_ECR_PUBLIC", "http://env-ecr-public")],
                 ServiceId::ECR_PUBLIC,
                 Some("http://env-ecr-public"),
+            ),
+            (&[], ServiceId::STS, Some("http://profile-sts")),
+            (
+                &[("AWS_ENDPOINT_URL_STS", "http://env-sts")],
+                ServiceId::STS,
+                Some("http://env-sts"),
             ),
             (&[], OTHER, Some("http://profile-global")),
             (

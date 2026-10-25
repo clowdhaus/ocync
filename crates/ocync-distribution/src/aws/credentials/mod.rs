@@ -12,6 +12,8 @@ mod fixtures;
 mod imds;
 mod json;
 mod sdk;
+mod sts;
+mod web_identity;
 
 #[cfg(test)]
 pub(super) use imds::TOKEN_HEADER;
@@ -21,7 +23,8 @@ use std::time::{Duration, SystemTime};
 
 use super::config::Config;
 use super::endpoint::Region;
-use super::host::{Env, Host};
+use super::host::Host;
+use super::retry;
 
 /// What a redacted value prints as, as elsewhere in this crate.
 const REDACTED: &str = "[REDACTED]";
@@ -90,6 +93,9 @@ pub(super) enum Error {
     /// The chain did not answer in time.
     #[error("credentials provider timed out after {} seconds", .0.as_secs())]
     TimedOut(Duration),
+    /// The web identity token was not exchanged for credentials.
+    #[error("failed to load credentials from web identity")]
+    WebIdentity(#[source] web_identity::Error),
     /// The container endpoint failed.
     #[error("failed to load credentials from the container endpoint")]
     Container(#[source] container::Error),
@@ -163,25 +169,29 @@ impl fmt::Display for Source {
 
 /// The default credential chain for one environment, region and profile.
 pub(super) struct Chain {
-    env: Env,
-    /// The profile and web identity sources.
-    sdk: sdk::Sources,
+    host: Host,
+    profile: sdk::Profile,
+    /// STS in the region of the calls the chain signs.
+    sts: sts::Client,
     container: container::Provider,
     imds: imds::Provider,
 }
 
 impl Chain {
-    /// The chain `host` and `config` configure, for calls in `region`.
+    /// The chain `host` and `config` configure, for calls in `region` with
+    /// the `retry` settings STS calls share.
     pub(super) fn new(
         host: &Host,
         region: &Region,
         config: &Config,
+        retry: &retry::Settings,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            sdk: sdk::Sources::new(&host.env, region, config),
+            profile: sdk::Profile::new(&host.env, region, config),
+            sts: sts::Client::new(host, region, config, retry)?,
             container: container::Provider::new(host)?,
             imds: imds::Provider::new(host, config)?,
-            env: host.env.clone(),
+            host: host.clone(),
         })
     }
 
@@ -211,9 +221,9 @@ impl Chain {
 
     async fn load_from(&self, source: Source) -> Result<Credentials, Error> {
         match source {
-            Source::Environment => environment::load(&self.env),
-            Source::Profile => self.sdk.load(sdk::Slot::Profile).await,
-            Source::WebIdentity => self.sdk.load(sdk::Slot::WebIdentity).await,
+            Source::Environment => environment::load(&self.host.env),
+            Source::Profile => self.profile.load().await,
+            Source::WebIdentity => web_identity::load(&self.host, &self.sts).await,
             Source::Container => self.container.load().await,
             // Its nested retries and timeouts make a future too large to
             // inline in every API call's frame.
@@ -246,70 +256,111 @@ pub(super) mod tests {
         }
     }
 
-    /// A chain with `vars` set and no environment key, `answer` for the
-    /// sources still loaded through `aws-config`, and container and
-    /// instance metadata sources that panic if they send a request.
-    fn chain(vars: &[(&str, &str)], answer: fn(sdk::Slot) -> Result<Credentials, Error>) -> Chain {
+    /// A chain with `vars` set and `answer` for the profile source, loaded
+    /// through `aws-config`, whose STS, container and instance metadata
+    /// sources panic if they send a request.
+    fn chain(vars: &[(&str, &str)], answer: fn() -> Result<Credentials, Error>) -> Chain {
         let host = super::super::config::tests::host(vars, "");
+        let config = Config::load(&host, None);
+        let region = Region::parse("us-east-1").unwrap();
         Chain {
+            sts: sts::Client::new(&host, &region, &config, &retry::Settings::default()).unwrap(),
             container: container::Provider::new(&host).unwrap(),
-            imds: imds::Provider::new(&host, &Config::load(&host, None)).unwrap(),
-            env: host.env,
-            sdk: sdk::Sources::Scripted(answer),
+            imds: imds::Provider::new(&host, &config).unwrap(),
+            host,
+            profile: sdk::Profile::Scripted(answer),
         }
     }
 
-    fn not_loaded(slot: sdk::Slot) -> Error {
-        Error::NotLoaded(format!("no {slot:?}"))
+    fn profile_not_loaded() -> Result<Credentials, Error> {
+        Err(Error::NotLoaded("no profile".to_owned()))
     }
 
-    /// Sources that are not configured are skipped, in order, until one
-    /// answers. Breaks if a skip stops the chain.
+    /// A source that is not configured is skipped for the next one. Breaks
+    /// if a skip stops the chain.
     #[tokio::test]
     async fn skips_sources_that_are_not_configured() {
-        let loaded = chain(&[], |slot| match slot {
-            sdk::Slot::WebIdentity => Ok(key(Some("web identity"), None)),
-            other => Err(not_loaded(other)),
-        })
-        .load()
-        .await
-        .unwrap();
-        assert_eq!(loaded.session_token(), Some("web identity"));
+        let loaded = chain(&[], || Ok(key(Some("profile"), None)))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(loaded.session_token(), Some("profile"));
     }
 
-    /// A configured source that fails stops the chain: the container and
-    /// instance metadata sources after it send no request, though the
-    /// container endpoint is set. Breaks if a failure is skipped like a
-    /// source that is not configured.
+    /// A configured source that fails stops the chain: web identity with a
+    /// token file that does not read fails, and the container source after
+    /// it sends no request, though its endpoint is set. Breaks if a failure
+    /// is skipped like a source that is not configured.
     #[tokio::test]
     async fn stops_at_a_source_that_fails() {
-        let vars = [("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/creds")];
-        let err = chain(&vars, |slot| match slot {
-            sdk::Slot::Profile => Err(not_loaded(slot)),
-            sdk::Slot::WebIdentity => Err(Error::TimedOut(Duration::from_secs(1))),
-        })
+        let vars = [
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/missing.jwt"),
+            ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test-role"),
+            ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/creds"),
+        ];
+        let err = chain(&vars, profile_not_loaded).load().await.unwrap_err();
+        assert!(matches!(err, Error::WebIdentity(_)), "{err}");
+        assert_eq!(
+            error_chain(&err),
+            "failed to load credentials from web identity: \
+             failed to read the web identity token file /missing.jwt: \
+             No such file or directory (os error 2)"
+        );
+    }
+
+    /// STS endpoint settings that do not resolve fail only a source that
+    /// calls STS: keys in the environment still load. Breaks if the STS
+    /// endpoint is resolved where the chain is built.
+    #[tokio::test]
+    async fn an_sts_endpoint_that_does_not_resolve_fails_only_web_identity() {
+        let unresolved = [
+            ("AWS_USE_FIPS_ENDPOINT", "true"),
+            ("AWS_ENDPOINT_URL_STS", "https://sts.example"),
+        ];
+        let keys = [
+            ("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ];
+        let loaded = chain(&[unresolved.as_slice(), &keys].concat(), profile_not_loaded)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(loaded.access_key_id(), "AKIDEXAMPLE");
+
+        let web_identity = [
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/home/.aws/config"),
+            ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test-role"),
+        ];
+        let err = chain(
+            &[unresolved.as_slice(), &web_identity].concat(),
+            profile_not_loaded,
+        )
         .load()
         .await
         .unwrap_err();
-        assert!(matches!(err, Error::TimedOut(_)), "{err}");
+        assert_eq!(
+            error_chain(&err),
+            "failed to load credentials from web identity: \
+             failed to assume the role with the web identity token: \
+             failed to resolve the STS endpoint: \
+             Invalid Configuration: FIPS and custom endpoint are not supported"
+        );
     }
 
     /// With no source configured, the error is final and names each source
     /// with its reason, in the text upstream reports.
     #[tokio::test]
     async fn names_every_source_when_none_is_configured() {
-        let err = chain(&[("AWS_EC2_METADATA_DISABLED", "TRUE")], |slot| {
-            Err(not_loaded(slot))
-        })
-        .load()
-        .await
-        .unwrap_err();
+        let err = chain(&[("AWS_EC2_METADATA_DISABLED", "TRUE")], profile_not_loaded)
+            .load()
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::NoSource(_)), "{err}");
         assert_eq!(
             err.to_string(),
             "the credential provider was not enabled: no source in the AWS credential chain \
              is configured (environment: environment variable not set; \
-             profile: no Profile; web identity: no WebIdentity; \
+             profile: no profile; web identity: $AWS_WEB_IDENTITY_TOKEN_FILE was not set; \
              container: No environment variables were set to configure ECS provider; \
              instance metadata: IMDS disabled by AWS_EC2_METADATA_DISABLED env var set to `true`)"
         );

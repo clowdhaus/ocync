@@ -42,7 +42,6 @@ const EXCLUDED: &[&str] = &[
     "sso_no_token_file",
     "sso_server_error",
     "web_identity_source_profile_no_env",
-    "web_identity_token_env",
     "web_identity_token_invalid_jwt",
     "web_identity_token_profile",
     "web_identity_token_source_profile",
@@ -61,6 +60,7 @@ const STARTS_AT: &[(&str, Source)] = &[
     ("imds_default_chain_retries", Source::Imds),
     ("imds_default_chain_success", Source::Imds),
     ("imds_disabled", Source::Imds),
+    ("web_identity_token_env", Source::WebIdentity),
 ];
 
 /// Cases run at the UNIX epoch, as upstream runs them, so the expiry they
@@ -184,7 +184,8 @@ impl Case {
     async fn run(self) {
         let name = &self.name;
         let config = Config::load(&self.host, None);
-        let chain = Chain::new(&self.host, &self.region, &config).unwrap();
+        let retry = config.retry().unwrap();
+        let chain = Chain::new(&self.host, &self.region, &config, &retry).unwrap();
         let (result, logs) = capture_logs(chain.load_in(self.order)).await;
         self.replay.assert_done();
         match (&self.outcome, &result) {
