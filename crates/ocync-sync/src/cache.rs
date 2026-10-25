@@ -294,8 +294,10 @@ impl TransferStateCache {
         }
     }
 
-    /// Start a run: what an earlier run learned about blobs may no longer
-    /// hold, so every present blob becomes known only from an earlier run.
+    /// Start a run from the blob state a reload from disk would give: what
+    /// an earlier run learned may no longer hold, so every present blob
+    /// becomes known only from an earlier run, and failures and upload claims
+    /// are dropped.
     /// Committed repositories are kept: a mount from one that has since lost
     /// the blob fails and falls back to a push, which costs a request, while
     /// forgetting them would push blobs a mount could have saved.
@@ -316,8 +318,8 @@ impl TransferStateCache {
         }
     }
 
-    /// Confirm each of `digests` known at `repo` only from an earlier run,
-    /// after a manifest that references them was committed there.
+    /// Record each of `digests` present at `repo`, after a manifest that
+    /// references them was committed there.
     pub(crate) fn confirm_blobs<'a>(
         &mut self,
         target: &str,

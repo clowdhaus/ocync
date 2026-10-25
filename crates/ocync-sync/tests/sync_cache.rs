@@ -1615,7 +1615,10 @@ async fn sync_committed_manifest_confirms_its_blobs() {
         .build();
     assert_eq!(first.layer_descs[0].digest, second.layer_descs[0].digest);
     // The engine runs the second listed tag first at one image at a time,
-    // so the committed image is listed second.
+    // so the committed image is listed second. Were that order to change,
+    // the committed tag would find the shared layer dropped and have no blob
+    // push to fall back to, failing this test rather than passing on another
+    // path.
     first
         .mount_source(&source_server, "repo", "committed")
         .await;

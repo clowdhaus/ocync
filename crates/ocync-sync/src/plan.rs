@@ -267,30 +267,33 @@ impl BlobDedupMap {
         }
     }
 
-    /// Record the blob as `Verified` at `repo` when it is known there only
-    /// from an earlier run. A blob this run has not seen there, and state this
-    /// run recorded, including an upload claim, are left alone.
+    /// Record the blob as `Verified` at `repo`, which a manifest committed
+    /// there proves. A live upload claim and presence this run recorded are
+    /// left alone.
     pub(crate) fn confirm(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
-        let Some(info) = self.inner.get_mut(target).and_then(|m| m.get_mut(digest)) else {
-            return;
-        };
-        if let Some(state @ RepoBlobState::Remembered) = info.repos.get_mut(repo) {
-            *state = RepoBlobState::Verified;
+        if let None | Some(RepoBlobState::Remembered | RepoBlobState::Failed(_)) =
+            self.repo_state(target, digest, repo)
+        {
+            self.set_blob_verified(target, digest, repo);
         }
     }
 
-    /// Mark every present state as [`RepoBlobState::Remembered`].
+    /// Start a run from what persisting and reloading would give: every
+    /// present state becomes [`RepoBlobState::Remembered`], and `Uploading`,
+    /// `Failed` and upload claims are dropped.
     pub(crate) fn remember_present(&mut self) {
-        for state in self
-            .inner
-            .values_mut()
-            .flat_map(HashMap::values_mut)
-            .flat_map(|info| info.repos.values_mut())
-        {
-            if state.is_present() {
-                *state = RepoBlobState::Remembered;
-            }
+        for index in self.inner.values_mut() {
+            index.retain(|_, info| {
+                info.repos.retain(|_, state| state.is_present());
+                for state in info.repos.values_mut() {
+                    *state = RepoBlobState::Remembered;
+                }
+                info.claim = None;
+                info.claim_notify = None;
+                !info.repos.is_empty()
+            });
         }
+        self.inner.retain(|_, index| !index.is_empty());
     }
 
     /// Return a copy with only persistable per-(repo) state entries.
@@ -428,6 +431,13 @@ mod tests {
             map.repo_state("reg.io", &d, &repo("x")),
             Some(&RepoBlobState::Verified)
         );
+        map.forget_remembered("reg.io", &d, &repo("y"));
+        map.confirm("reg.io", &d, &repo("y"));
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("y")),
+            Some(&RepoBlobState::Verified),
+            "a commit records a blob a refusal dropped"
+        );
         assert!(matches!(
             map.claim_blob_upload("reg.io", &d, &repo("z")),
             ClaimAction::Claimed
@@ -438,6 +448,43 @@ mod tests {
             Some(&RepoBlobState::Uploading),
             "a commit never overwrites a live upload claim"
         );
+    }
+
+    /// A new run, such as a watch-mode cycle, starts from what persisting
+    /// and reloading would give: a failure, an upload or a claim from the
+    /// last run does not carry over.
+    #[test]
+    fn run_start_drops_what_persistence_drops() {
+        let d = test_digest();
+        let other: Digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap();
+        let mut map = BlobDedupMap::default();
+        map.set_blob_completed("reg.io", &d, &repo("x"));
+        map.set_blob_failed("reg.io", &d, &repo("y"), "mount refused".into());
+        assert!(matches!(
+            map.claim_blob_upload("reg.io", &d, &repo("z")),
+            ClaimAction::Claimed
+        ));
+        map.set_blob_failed("reg.io", &other, &repo("x"), "upload failed".into());
+
+        map.remember_present();
+
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Remembered)
+        );
+        assert_eq!(map.repo_state("reg.io", &d, &repo("y")), None);
+        assert_eq!(map.repo_state("reg.io", &d, &repo("z")), None);
+        assert!(
+            matches!(
+                map.claim_blob_upload("reg.io", &d, &repo("y")),
+                ClaimAction::Claimed
+            ),
+            "the last run's claim is released"
+        );
+        assert_eq!(map.repo_state("reg.io", &other, &repo("x")), None);
     }
 
     /// Per-(repo) state independence: writing Y's state must not disturb X's

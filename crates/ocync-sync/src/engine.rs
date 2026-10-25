@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
+use crate::error::ManifestRefusal;
 use crate::progress::RunProgress;
 use crate::retry::{RetryConfig, count_retries, retries_made, with_retry};
 use crate::shared::{
@@ -1865,7 +1866,7 @@ async fn execute_item(
                 .borrow_mut()
                 .notify_repo_failed(&item.target_name, &item.target.repo);
 
-            if err.is_immutable_tag() {
+            if err.manifest_refusal() == Some(ManifestRefusal::ImmutableTag) {
                 debug!(
                     source_repo = %item.source.repo,
                     target_repo = %item.target.repo,
@@ -2919,9 +2920,9 @@ async fn wait_for_commit(item: &TransferTask, retry: &RetryConfig, digests: &[Di
 /// child's digest).
 ///
 /// A committed manifest proves the blobs it references are in the repo, so
-/// an earlier run's entries for them are confirmed. A manifest refused for
-/// what it references, the answer to a blob the registry has lost, drops
-/// them, so the next run checks those blobs instead of trusting the cache.
+/// they are recorded present. A manifest refused as invalid, the answer to a
+/// blob the registry has lost, drops an earlier run's entries for them, so
+/// the next run checks those blobs instead of trusting the cache.
 async fn push_manifest(
     retry: &RetryConfig,
     item: &TransferTask,
@@ -2947,7 +2948,7 @@ async fn push_manifest(
     let mut c = cache.borrow_mut();
     match &pushed {
         Ok(()) => c.confirm_blobs(&item.target_name, &item.target.repo, blobs),
-        Err(e) if e.is_reference_refusal() => {
+        Err(e) if e.manifest_refusal() == Some(ManifestRefusal::Invalid) => {
             c.forget_remembered_blobs(&item.target_name, &item.target.repo, blobs);
         }
         Err(_) => {}
