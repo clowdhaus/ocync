@@ -285,10 +285,8 @@ fn parse_flag(name: &str, value: &str) -> Option<bool> {
 pub(super) mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
 
-    use super::super::host::{Clock, Fs, Network, Platform};
-    use super::super::replay::Replay;
+    use super::super::host::Fs;
     use super::*;
 
     /// A Unix host with `vars` set and a config file holding `config_file`,
@@ -305,9 +303,7 @@ pub(super) mod tests {
                 PathBuf::from("/home/.aws/config"),
                 config_file.as_bytes().to_vec(),
             )])),
-            platform: Platform::Unix,
-            clock: Clock::System,
-            network: Network::Replay(Arc::new(Replay::from_json(r#"{"events": []}"#))),
+            ..Host::fixed()
         }
     }
 

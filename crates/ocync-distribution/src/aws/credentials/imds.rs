@@ -20,7 +20,7 @@ use http::{HeaderValue, Method, StatusCode};
 use url::Url;
 
 use super::super::config::{Config, ImdsEndpointError};
-use super::super::host::{Clock, Env, Host, Transport};
+use super::super::host::{Clock, Env, Host, Timeouts, Transport, credential_endpoint_client};
 use super::super::retry::{self, Kind, Retryable};
 use super::json::{self, Code, Document};
 use super::{Credentials, Error as ChainError, error_chain};
@@ -52,12 +52,13 @@ const TOKEN_REFRESH_BUFFER: Duration = Duration::from_secs(120);
 /// The attempts each request makes, the first included.
 const MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(4).expect("4 is not 0");
 
-/// A connection not made within this fails. Off EC2 the address answers
-/// nothing, so this bounds what the chain spends on this source.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// A read that waits longer fails.
-const READ_TIMEOUT: Duration = Duration::from_secs(1);
+/// A connection not made within a second fails, and so does a read that
+/// waits longer. Off EC2 the address answers nothing, so this bounds what
+/// the chain spends on this source.
+const TIMEOUTS: Timeouts = Timeouts {
+    connect: Duration::from_secs(1),
+    read: Duration::from_secs(1),
+};
 
 /// An attempt that takes longer fails.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -228,7 +229,7 @@ enum Access {
 }
 
 /// The instance metadata source.
-pub(super) struct Imds {
+pub(super) struct Provider {
     access: Access,
     clock: Clock,
     retry: retry::Strategy,
@@ -238,7 +239,7 @@ pub(super) struct Imds {
     last: Mutex<Option<Credentials>>,
 }
 
-impl Imds {
+impl Provider {
     /// The source `host` and `config` configure.
     pub(super) fn new(host: &Host, config: &Config) -> Result<Self, reqwest::Error> {
         let access = if disabled(&host.env) {
@@ -248,12 +249,9 @@ impl Imds {
                 Err(e) => Access::Misconfigured(e),
                 Ok(endpoint) => Access::Ready {
                     endpoint,
-                    transport: host.network.transport(
-                        crate::client::no_redirect_builder()
-                            .no_proxy()
-                            .connect_timeout(CONNECT_TIMEOUT)
-                            .read_timeout(READ_TIMEOUT),
-                    )?,
+                    transport: host
+                        .network
+                        .transport(credential_endpoint_client(TIMEOUTS))?,
                 },
             }
         };
@@ -456,12 +454,11 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
-    use base64::Engine as _;
     use serde::Deserialize;
     use serde_json::json;
 
-    use super::super::super::host::{Fs, Network, Platform};
-    use super::super::super::replay::Replay;
+    use super::super::super::host::{Fs, Network};
+    use super::super::super::replay::{Recorded, Replay, record};
     use super::super::fixtures::DATA;
     use super::*;
 
@@ -479,9 +476,6 @@ mod tests {
     /// 2021-09-21T04:16:53Z, when [`DOCUMENT`] expires.
     const EXPIRY: Duration = Duration::from_secs(1_632_197_813);
 
-    /// A recorded exchange, as the traffic files hold it.
-    type Exchange = [serde_json::Value; 3];
-
     /// A Unix host with `vars` set and `files`, at `clock`, on `network`.
     fn host(
         vars: HashMap<String, String>,
@@ -492,9 +486,9 @@ mod tests {
         Host {
             env: Env::Fixed(vars),
             fs: Fs::Fixed(files),
-            platform: Platform::Unix,
             clock,
             network,
+            ..Host::fixed()
         }
     }
 
@@ -511,66 +505,38 @@ mod tests {
     }
 
     /// The source `host` configures.
-    fn imds(host: &Host) -> Imds {
-        Imds::new(host, &Config::load(host, None)).unwrap()
-    }
-
-    /// One exchange: a `method` request to `uri` carrying `token`, answered
-    /// with `status`, `headers` and `body`.
-    fn exchange(
-        id: u64,
-        method: Method,
-        uri: &str,
-        token: Option<&str>,
-        status: StatusCode,
-        headers: serde_json::Value,
-        body: &[u8],
-    ) -> Exchange {
-        let request_headers = token.map_or_else(|| json!({}), |t| json!({ TOKEN_HEADER: [t] }));
-        let body = base64::engine::general_purpose::STANDARD.encode(body);
-        [
-            json!({"connection_id": id, "action": {"Request": {"request":
-                {"uri": uri, "method": method.as_str(), "headers": request_headers}}}}),
-            json!({"connection_id": id, "action": {"Response": {"response":
-                {"Ok": {"status": status.as_u16(), "headers": headers}}}}}),
-            json!({"connection_id": id, "action": {"Data":
-                {"data": {"Base64": body}, "direction": "Response"}}}),
-        ]
+    fn imds(host: &Host) -> Provider {
+        Provider::new(host, &Config::load(host, None)).unwrap()
     }
 
     /// A token request answered with `status`, a lifetime of `ttl` when
     /// given, and `token`.
-    fn put_token(id: u64, status: StatusCode, ttl: Option<&str>, token: &[u8]) -> Exchange {
+    fn put_token(id: u64, status: StatusCode, ttl: Option<&str>, token: &[u8]) -> Recorded {
         let headers = ttl.map_or_else(|| json!({}), |ttl| json!({ TOKEN_TTL_HEADER: [ttl] }));
         let uri = format!("{BASE}{TOKEN_PATH}");
-        exchange(id, Method::PUT, &uri, None, status, headers, token)
+        record(id, &Method::PUT, &uri, json!({}), status, headers, token)
     }
 
     /// A six-hour token request answered with [`TOKEN`].
-    fn granted(id: u64) -> Exchange {
+    fn granted(id: u64) -> Recorded {
         put_token(id, StatusCode::OK, Some("21600"), TOKEN.as_bytes())
     }
 
     /// A read of `path` under the credentials path with [`TOKEN`], answered
     /// with `status` and `body`.
-    fn get(id: u64, path: &str, status: StatusCode, body: &[u8]) -> Exchange {
+    fn get(id: u64, path: &str, status: StatusCode, body: &[u8]) -> Recorded {
         let uri = format!("{BASE}{CREDENTIALS_PATH}{path}");
-        exchange(id, Method::GET, &uri, Some(TOKEN), status, json!({}), body)
+        let token = json!({ TOKEN_HEADER: [TOKEN] });
+        record(id, &Method::GET, &uri, token, status, json!({}), body)
     }
 
     /// `exchanges`, answered in order.
-    fn traffic(exchanges: impl IntoIterator<Item = Exchange>) -> Arc<Replay> {
-        Arc::new(recorded(exchanges))
-    }
-
-    /// `exchanges`, answered in order, to be delayed before use.
-    fn recorded(exchanges: impl IntoIterator<Item = Exchange>) -> Replay {
-        let events: Vec<_> = exchanges.into_iter().flatten().collect();
-        Replay::from_json(&json!({ "events": events }).to_string())
+    fn traffic(exchanges: impl IntoIterator<Item = Recorded>) -> Arc<Replay> {
+        Arc::new(Replay::of(exchanges))
     }
 
     /// The role listing and credentials read of a load with a token held.
-    fn reads(first: u64) -> [Exchange; 2] {
+    fn reads(first: u64) -> [Recorded; 2] {
         [
             get(first, "", StatusCode::OK, b"role"),
             get(first + 1, "role", StatusCode::OK, DOCUMENT.as_bytes()),
@@ -612,11 +578,11 @@ mod tests {
                 continue;
             }
             let refused = case.result.as_ref().ok().map(|uri| {
-                exchange(
+                record(
                     0,
-                    Method::PUT,
+                    &Method::PUT,
                     uri,
-                    None,
+                    json!({}),
                     StatusCode::FORBIDDEN,
                     json!({}),
                     b"",
@@ -692,7 +658,7 @@ mod tests {
         );
         assert_eq!(connections.get(), 1);
         assert!(
-            (READ_TIMEOUT..ATTEMPT_TIMEOUT).contains(&elapsed),
+            (TIMEOUTS.read..ATTEMPT_TIMEOUT).contains(&elapsed),
             "{elapsed:?}"
         );
     }
@@ -780,7 +746,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn refuses_a_malformed_token() {
         type Check = fn(&TokenError) -> bool;
-        let cases: [(Exchange, Check); 4] = [
+        let cases: [(Recorded, Check); 4] = [
             (put_token(0, StatusCode::OK, None, b"t"), |e| {
                 matches!(e, TokenError::NoTtl)
             }),
@@ -881,7 +847,7 @@ mod tests {
         let timed_out =
             |limit| move |e: &RequestError| matches!(e, RequestError::TimedOut(l) if *l == limit);
 
-        let replay = Arc::new(recorded([granted(0)]).delayed(0, late));
+        let replay = Arc::new(Replay::of([granted(0)]).delayed(0, late));
         let err = imds(&replaying(&replay)).load().await.unwrap_err();
         replay.assert_done();
         assert!(
@@ -890,7 +856,7 @@ mod tests {
         );
 
         let listing = get(1, "", StatusCode::OK, b"role");
-        let replay = Arc::new(recorded([granted(0), listing]).delayed(1, late));
+        let replay = Arc::new(Replay::of([granted(0), listing]).delayed(1, late));
         let err = imds(&replaying(&replay)).load().await.unwrap_err();
         replay.assert_done();
         assert!(
@@ -904,7 +870,7 @@ mod tests {
         let slow = Duration::from_millis(7600);
         let failures = (1..=4).map(|id| get(id, "", StatusCode::INTERNAL_SERVER_ERROR, b""));
         let replay = (1..=4).fold(
-            recorded([granted(0)].into_iter().chain(failures)),
+            Replay::of([granted(0)].into_iter().chain(failures)),
             |replay, index| replay.delayed(index, slow),
         );
         let replay = Arc::new(replay);

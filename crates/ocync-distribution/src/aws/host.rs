@@ -1,4 +1,4 @@
-//! The process environment, file system, platform, clock and network the
+//! The process environment, file system, platform, clock, network and DNS the
 //! AWS settings and credentials come from, behind enums so tests can supply
 //! fixed values and recorded HTTP exchanges.
 
@@ -6,12 +6,13 @@
 use std::collections::HashMap;
 use std::env::VarError;
 use std::io;
+use std::net::IpAddr;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[cfg(test)]
 use super::replay::Replay;
@@ -24,6 +25,7 @@ pub(super) struct Host {
     pub(super) platform: Platform,
     pub(super) clock: Clock,
     pub(super) network: Network,
+    pub(super) dns: Dns,
 }
 
 impl Host {
@@ -35,6 +37,51 @@ impl Host {
             platform: Platform::current(),
             clock: Clock::System,
             network: Network::Real,
+            dns: Dns::System,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Host {
+    /// A Unix host on the system clock with no variables, files or names,
+    /// whose network fails the test on any request. Tests override only
+    /// what they set.
+    pub(super) fn fixed() -> Self {
+        Self {
+            env: Env::Fixed(HashMap::new()),
+            fs: Fs::Fixed(HashMap::new()),
+            platform: Platform::Unix,
+            clock: Clock::System,
+            network: Network::Replay(Arc::new(Replay::of(std::iter::empty()))),
+            dns: Dns::Fixed(HashMap::new()),
+        }
+    }
+}
+
+/// Where host names are resolved.
+#[derive(Debug, Clone)]
+pub(super) enum Dns {
+    /// The system resolver.
+    System,
+    /// A fixed set of names. A name not in the map does not resolve.
+    #[cfg(test)]
+    Fixed(HashMap<String, Vec<IpAddr>>),
+}
+
+impl Dns {
+    /// The addresses `name` resolves to.
+    pub(super) async fn resolve(&self, name: &str) -> io::Result<Vec<IpAddr>> {
+        match self {
+            Self::System => Ok(tokio::net::lookup_host((name, 0))
+                .await?
+                .map(|address| address.ip())
+                .collect()),
+            #[cfg(test)]
+            Self::Fixed(names) => names
+                .get(name)
+                .cloned()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)),
         }
     }
 }
@@ -85,6 +132,23 @@ impl Network {
             Self::Replay(replay) => Ok(Transport::Replay(Arc::clone(replay))),
         }
     }
+}
+
+/// How long a connection and each read may take.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Timeouts {
+    pub(super) connect: Duration,
+    pub(super) read: Duration,
+}
+
+/// The client settings for a credential endpoint the token is meant for
+/// alone, the instance metadata service or the container endpoint: no
+/// proxy, so a token never reaches an `HTTP_PROXY` host, and no redirect.
+pub(super) fn credential_endpoint_client(timeouts: Timeouts) -> reqwest::ClientBuilder {
+    crate::client::no_redirect_builder()
+        .no_proxy()
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
 }
 
 /// Sends a source's requests.
@@ -145,10 +209,15 @@ impl Env {
 pub(super) enum Fs {
     /// The real file system.
     Real,
-    /// A fixed set of files. A path not in the map is not found.
+    /// A fixed set of files. A path not in the map is not found, as the
+    /// operating system reports it.
     #[cfg(test)]
     Fixed(HashMap<PathBuf, Vec<u8>>),
 }
+
+/// The `errno` of a missing file on Linux and macOS, where the tests run.
+#[cfg(test)]
+const ENOENT: i32 = 2;
 
 impl Fs {
     /// The whole contents of `path`. The files read here are a few
@@ -160,7 +229,7 @@ impl Fs {
             Self::Fixed(files) => files
                 .get(path)
                 .cloned()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)),
+                .ok_or_else(|| io::Error::from_raw_os_error(ENOENT)),
         }
     }
 }

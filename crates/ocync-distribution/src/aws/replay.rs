@@ -10,11 +10,38 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use serde::Deserialize;
+use serde_json::json;
 
 use super::credentials::TOKEN_HEADER;
 
 /// The request headers compared, as upstream compares them.
 const COMPARED_HEADERS: &[&str] = &["content-type", TOKEN_HEADER];
+
+/// One exchange as a traffic file records it: the request, the answer's
+/// head and the answer's body.
+pub(super) type Recorded = [serde_json::Value; 3];
+
+/// Exchange `id`: a `method` request to `uri` with `headers`, answered with
+/// `status`, `response_headers` and `body`.
+pub(super) fn record(
+    id: u64,
+    method: &http::Method,
+    uri: &str,
+    headers: serde_json::Value,
+    status: http::StatusCode,
+    response_headers: serde_json::Value,
+    body: &[u8],
+) -> Recorded {
+    let body = base64::engine::general_purpose::STANDARD.encode(body);
+    [
+        json!({"connection_id": id, "action": {"Request": {"request":
+            {"uri": uri, "method": method.as_str(), "headers": headers}}}}),
+        json!({"connection_id": id, "action": {"Response": {"response":
+            {"Ok": {"status": status.as_u16(), "headers": response_headers}}}}}),
+        json!({"connection_id": id, "action": {"Data":
+            {"data": {"Base64": body}, "direction": "Response"}}}),
+    ]
+}
 
 /// One recorded request and its answer.
 #[derive(Debug)]
@@ -145,6 +172,12 @@ impl Replay {
         Self {
             pending: Mutex::new(pending),
         }
+    }
+
+    /// `exchanges`, answered in order.
+    pub(super) fn of(exchanges: impl IntoIterator<Item = Recorded>) -> Self {
+        let events: Vec<_> = exchanges.into_iter().flatten().collect();
+        Self::from_json(&json!({ "events": events }).to_string())
     }
 
     /// The same exchanges, with the one at `index` answered after `delay`.

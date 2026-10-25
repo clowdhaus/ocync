@@ -26,6 +26,8 @@ pub mod manifest;
 pub mod reference;
 /// Bounded retry for transient failures in the prepare phase.
 pub mod retry;
+/// The URL schemes requests are sent over.
+mod scheme;
 /// SHA-256 wrapper backed by aws-lc-rs.
 pub mod sha256;
 /// OCI image spec types - manifests, descriptors, and platforms.

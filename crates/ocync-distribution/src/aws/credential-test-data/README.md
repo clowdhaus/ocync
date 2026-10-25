@@ -12,3 +12,6 @@ through `credentials::fixtures` in this crate, unchanged.
 
 `imds-config/imds-endpoint-tests.json` holds the instance metadata endpoint
 cases, run by the tests of `credentials::imds`.
+
+`ecs-tests.json` holds the container endpoint cases, run by the tests of
+`credentials::container`.

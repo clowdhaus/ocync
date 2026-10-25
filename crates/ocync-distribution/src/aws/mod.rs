@@ -34,6 +34,7 @@ use self::calendar::parse_imf_fixdate;
 use self::endpoint::{Endpoint, Region};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
+use crate::scheme::UnsupportedScheme;
 
 /// The content type of the AWS JSON 1.1 protocol both APIs speak.
 const AWS_JSON_1_1: &str = "application/x-amz-json-1.1";
@@ -197,11 +198,8 @@ pub(crate) enum ConfigError {
     #[error("invalid AWS endpoint URL: {0}")]
     InvalidEndpoint(#[source] url::ParseError),
     /// The endpoint is a URL with no host to send to, such as `unix:`.
-    #[error("AWS endpoint URL scheme '{scheme}' is not http or https")]
-    EndpointNotHttp {
-        /// The configured scheme.
-        scheme: String,
-    },
+    #[error("invalid AWS endpoint URL: {0}")]
+    EndpointNotHttp(#[source] UnsupportedScheme),
     /// The HTTP client could not be built.
     #[error("failed to build the AWS HTTP client: {0}")]
     HttpClient(#[source] reqwest::Error),

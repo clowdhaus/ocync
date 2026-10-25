@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use super::super::config::Config;
 use super::super::endpoint::Region;
-use super::super::host::{Clock, Env, Fs, Host, Network, Platform};
+use super::super::host::{Clock, Env, Fs, Host, Network};
 use super::super::profile::{self, Location};
 use super::super::replay::Replay;
 use super::{Chain, Credentials, Source, error_chain};
@@ -30,10 +30,6 @@ const DEFAULT_REGION: &str = "us-east-1";
 const EXCLUDED: &[&str] = &[
     "e2e_fips_and_dual_stack_sso",
     "ecs_assume_role",
-    "ecs_credentials",
-    "ecs_credentials_invalid_profile",
-    "eks_pod_identity_credentials",
-    "eks_pod_identity_no_token_file",
     "environment_variables_blank",
     "imds_assume_role",
     "imds_no_iam_role",
@@ -56,6 +52,10 @@ const EXCLUDED: &[&str] = &[
 /// name: the sources before it are loaded through `aws-config`, and these
 /// cases expect each of them not to be configured.
 const STARTS_AT: &[(&str, Source)] = &[
+    ("ecs_credentials", Source::Container),
+    ("ecs_credentials_invalid_profile", Source::Container),
+    ("eks_pod_identity_credentials", Source::Container),
+    ("eks_pod_identity_no_token_file", Source::Container),
     ("imds_config_with_no_creds", Source::Imds),
     ("imds_default_chain_error", Source::Imds),
     ("imds_default_chain_retries", Source::Imds),
@@ -153,13 +153,13 @@ impl Case {
         let host = Host {
             env: Env::Fixed(vars),
             fs: Fs::Fixed(files),
-            platform: Platform::Unix,
             clock: if AT_THE_EPOCH.contains(&name.as_str()) {
                 Clock::Fixed(UNIX_EPOCH)
             } else {
                 Clock::System
             },
             network: Network::Replay(Arc::clone(&replay)),
+            ..Host::fixed()
         };
         let start = STARTS_AT
             .iter()
@@ -246,7 +246,7 @@ fn default_region(host: &Host) -> Region {
 }
 
 /// Await `future` with every log line at any level captured.
-async fn capture_logs<T>(future: impl Future<Output = T>) -> (T, String) {
+pub(super) async fn capture_logs<T>(future: impl Future<Output = T>) -> (T, String) {
     #[derive(Clone, Default)]
     struct Buffer(Arc<Mutex<Vec<u8>>>);
     impl Write for Buffer {

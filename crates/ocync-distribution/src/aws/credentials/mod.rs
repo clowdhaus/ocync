@@ -5,6 +5,7 @@
 //! the chain tries the next one. Any other error stops the chain: a source
 //! that is configured and fails is reported, never skipped.
 
+mod container;
 mod environment;
 #[cfg(test)]
 mod fixtures;
@@ -89,6 +90,9 @@ pub(super) enum Error {
     /// The chain did not answer in time.
     #[error("credentials provider timed out after {} seconds", .0.as_secs())]
     TimedOut(Duration),
+    /// The container endpoint failed.
+    #[error("failed to load credentials from the container endpoint")]
+    Container(#[source] container::Error),
     /// The instance metadata service failed.
     #[error("failed to load credentials from IMDS")]
     Imds(#[source] imds::Error),
@@ -160,9 +164,10 @@ impl fmt::Display for Source {
 /// The default credential chain for one environment, region and profile.
 pub(super) struct Chain {
     env: Env,
-    /// The profile, web identity and container sources.
+    /// The profile and web identity sources.
     sdk: sdk::Sources,
-    imds: imds::Imds,
+    container: container::Provider,
+    imds: imds::Provider,
 }
 
 impl Chain {
@@ -174,7 +179,8 @@ impl Chain {
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             sdk: sdk::Sources::new(&host.env, region, config),
-            imds: imds::Imds::new(host, config)?,
+            container: container::Provider::new(host)?,
+            imds: imds::Provider::new(host, config)?,
             env: host.env.clone(),
         })
     }
@@ -208,7 +214,7 @@ impl Chain {
             Source::Environment => environment::load(&self.env),
             Source::Profile => self.sdk.load(sdk::Slot::Profile).await,
             Source::WebIdentity => self.sdk.load(sdk::Slot::WebIdentity).await,
-            Source::Container => self.sdk.load(sdk::Slot::Container).await,
+            Source::Container => self.container.load().await,
             // Its nested retries and timeouts make a future too large to
             // inline in every API call's frame.
             Source::Imds => Box::pin(self.imds.load()).await,
@@ -241,12 +247,13 @@ pub(super) mod tests {
     }
 
     /// A chain with `vars` set and no environment key, `answer` for the
-    /// sources still loaded through `aws-config`, and an instance metadata
-    /// source that panics if it sends a request.
+    /// sources still loaded through `aws-config`, and container and
+    /// instance metadata sources that panic if they send a request.
     fn chain(vars: &[(&str, &str)], answer: fn(sdk::Slot) -> Result<Credentials, Error>) -> Chain {
         let host = super::super::config::tests::host(vars, "");
         Chain {
-            imds: imds::Imds::new(&host, &Config::load(&host, None)).unwrap(),
+            container: container::Provider::new(&host).unwrap(),
+            imds: imds::Provider::new(&host, &Config::load(&host, None)).unwrap(),
             env: host.env,
             sdk: sdk::Sources::Scripted(answer),
         }
@@ -261,23 +268,25 @@ pub(super) mod tests {
     #[tokio::test]
     async fn skips_sources_that_are_not_configured() {
         let loaded = chain(&[], |slot| match slot {
-            sdk::Slot::Container => Ok(key(Some("container"), None)),
+            sdk::Slot::WebIdentity => Ok(key(Some("web identity"), None)),
             other => Err(not_loaded(other)),
         })
         .load()
         .await
         .unwrap();
-        assert_eq!(loaded.session_token(), Some("container"));
+        assert_eq!(loaded.session_token(), Some("web identity"));
     }
 
-    /// A configured source that fails stops the chain: the instance metadata
-    /// source after it sends no request. Breaks if a failure is skipped like
-    /// a source that is not configured.
+    /// A configured source that fails stops the chain: the container and
+    /// instance metadata sources after it send no request, though the
+    /// container endpoint is set. Breaks if a failure is skipped like a
+    /// source that is not configured.
     #[tokio::test]
     async fn stops_at_a_source_that_fails() {
-        let err = chain(&[], |slot| match slot {
-            sdk::Slot::Profile | sdk::Slot::WebIdentity => Err(not_loaded(slot)),
-            sdk::Slot::Container => Err(Error::TimedOut(Duration::from_secs(1))),
+        let vars = [("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/creds")];
+        let err = chain(&vars, |slot| match slot {
+            sdk::Slot::Profile => Err(not_loaded(slot)),
+            sdk::Slot::WebIdentity => Err(Error::TimedOut(Duration::from_secs(1))),
         })
         .load()
         .await
@@ -300,7 +309,8 @@ pub(super) mod tests {
             err.to_string(),
             "the credential provider was not enabled: no source in the AWS credential chain \
              is configured (environment: environment variable not set; \
-             profile: no Profile; web identity: no WebIdentity; container: no Container; \
+             profile: no Profile; web identity: no WebIdentity; \
+             container: No environment variables were set to configure ECS provider; \
              instance metadata: IMDS disabled by AWS_EC2_METADATA_DISABLED env var set to `true`)"
         );
     }

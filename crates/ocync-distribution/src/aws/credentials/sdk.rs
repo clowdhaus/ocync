@@ -1,5 +1,5 @@
-//! The profile, web identity and container sources, each loaded through
-//! its `aws-config` provider.
+//! The profile and web identity sources, each loaded through its
+//! `aws-config` provider.
 
 use aws_config::provider_config::ProviderConfig;
 use aws_credential_types::provider::ProvideCredentials;
@@ -17,8 +17,6 @@ pub(super) enum Slot {
     Profile,
     /// Web identity from the environment.
     WebIdentity,
-    /// The container endpoint.
-    Container,
 }
 
 /// The `aws-config` providers of the slots.
@@ -39,7 +37,6 @@ pub(super) enum Sources {
 pub(super) struct Providers {
     profile: aws_config::profile::ProfileFileCredentialsProvider,
     web_identity: aws_config::web_identity_token::WebIdentityTokenCredentialsProvider,
-    container: aws_config::ecs::EcsCredentialsProvider,
 }
 
 impl Sources {
@@ -61,9 +58,6 @@ impl Sources {
                         aws_config::web_identity_token::WebIdentityTokenCredentialsProvider::builder()
                             .configure(&conf)
                             .build(),
-                    container: aws_config::ecs::EcsCredentialsProvider::builder()
-                        .configure(&conf)
-                        .build(),
                 }))
             }
             #[cfg(test)]
@@ -83,7 +77,6 @@ impl Sources {
         let loaded = match slot {
             Slot::Profile => providers.profile.provide_credentials().await,
             Slot::WebIdentity => providers.web_identity.provide_credentials().await,
-            Slot::Container => providers.container.provide_credentials().await,
         };
         match loaded {
             Ok(credentials) => Ok(Credentials {

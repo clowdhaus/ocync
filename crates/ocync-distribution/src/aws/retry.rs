@@ -59,7 +59,9 @@ pub(super) enum Kind {
     /// A connection, timeout or I/O failure, a timeout error code, or HTTP
     /// 500, 502, 503 or 504.
     Transient,
-    /// A signature rejected for clock skew.
+    /// A failure the SDK classifies as a server error: a signature rejected
+    /// for clock skew, an instance metadata 5xx or 401, or a container
+    /// endpoint success whose body does not read.
     Server,
 }
 

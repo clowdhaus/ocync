@@ -7,6 +7,7 @@ use regex_lite::Regex;
 use url::Url;
 
 use super::{ConfigError, Service};
+use crate::scheme::Scheme;
 
 /// The longest label a host name may hold.
 const MAX_LABEL_LEN: usize = 63;
@@ -161,11 +162,7 @@ impl Endpoint {
     /// error.
     pub(super) fn parse(text: &str) -> Result<Self, ConfigError> {
         let mut url = Url::parse(text).map_err(ConfigError::InvalidEndpoint)?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(ConfigError::EndpointNotHttp {
-                scheme: url.scheme().to_owned(),
-            });
-        }
+        Scheme::try_from(&url).map_err(ConfigError::EndpointNotHttp)?;
         if url.query().is_some() || !url.username().is_empty() || url.password().is_some() {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
@@ -649,7 +646,7 @@ mod tests {
             ),
             (
                 "unix:/run/ecr.sock?key=secret",
-                "AWS endpoint URL scheme 'unix' is not http or https",
+                "invalid AWS endpoint URL: unsupported scheme 'unix', not http or https",
             ),
         ] {
             assert_eq!(Endpoint::parse(text).unwrap_err().to_string(), error);
