@@ -5,30 +5,31 @@
 //! and attempt settings still come from `aws-config`'s `SdkConfig`.
 
 mod calendar;
+mod config;
 mod endpoint;
 mod env;
 mod profile;
 mod retry;
 mod sigv4;
 
+use self::config::Config;
+use self::env::{Env, Fs, Platform};
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use aws_config::SdkConfig;
-use aws_config::retry::RetryConfig;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
-use aws_types::service_config::ServiceConfigKey;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use self::calendar::parse_imf_fixdate;
-use self::endpoint::{DualStack, Endpoint, Fips, Region};
+use self::endpoint::{Endpoint, Region};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
 
@@ -47,22 +48,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
 /// the SDK's stalled-stream grace period.
 const STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The SDK's default attempts per call, which size
-/// [`CREDENTIALS_LOAD_TIMEOUT`]. A call's own attempts come from its
-/// `RetryConfig`.
-const DEFAULT_MAX_ATTEMPTS: u32 = 3;
-
-/// The SDK's default first backoff, which sizes
-/// [`CREDENTIALS_LOAD_TIMEOUT`].
-const SDK_INITIAL_BACKOFF_MS: u64 = 1_000;
-
 /// A credential load that takes longer fails. This is the SDK's bound for
-/// its default retry and connect settings: every backoff between
-/// [`DEFAULT_MAX_ATTEMPTS`] attempts, plus each attempt at twice
-/// [`CONNECT_TIMEOUT`].
+/// its default retry and connect settings: every backoff between the
+/// default attempts, plus each attempt at twice [`CONNECT_TIMEOUT`].
 const CREDENTIALS_LOAD_TIMEOUT: Duration = Duration::from_millis(
-    SDK_INITIAL_BACKOFF_MS * ((1 << (DEFAULT_MAX_ATTEMPTS - 1)) - 1)
-        + DEFAULT_MAX_ATTEMPTS as u64 * 2 * CONNECT_TIMEOUT.as_millis() as u64,
+    retry::INITIAL_BACKOFF.as_millis() as u64 * ((1 << (retry::DEFAULT_MAX_ATTEMPTS - 1)) - 1)
+        + retry::DEFAULT_MAX_ATTEMPTS as u64 * 2 * CONNECT_TIMEOUT.as_millis() as u64,
 );
 
 /// How long a credential without an expiry is reused, as the SDK's identity
@@ -176,15 +167,15 @@ pub(crate) trait Operation: Serialize {
 /// Why a [`Client`] could not be built from the AWS configuration.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConfigError {
-    /// The configuration names no region.
-    #[error("no AWS region configured")]
-    MissingRegion,
     /// The configured region is not a valid host label.
     #[error("invalid AWS region '{0}': must be a valid host label")]
     InvalidRegion(String),
-    /// The configuration has no credentials provider.
-    #[error("no AWS credentials provider configured")]
-    MissingCredentialsProvider,
+    /// `AWS_MAX_ATTEMPTS` or `max_attempts` is not a whole number above 0.
+    #[error("invalid AWS max attempts '{0}': must be a whole number of at least 1")]
+    InvalidMaxAttempts(String),
+    /// `AWS_RETRY_MODE` or `retry_mode` is not `standard` or `adaptive`.
+    #[error("invalid AWS retry mode '{0}': must be standard or adaptive")]
+    InvalidRetryMode(String),
     /// An endpoint URL is configured together with FIPS endpoints.
     #[error("Invalid Configuration: FIPS and custom endpoint are not supported")]
     FipsWithEndpointUrl,
@@ -477,53 +468,56 @@ struct Parts {
 }
 
 impl Client {
-    /// A client for `service` in the region and with the credentials,
-    /// endpoint settings, endpoint URL override and attempt count `config`
-    /// carries.
-    pub(crate) fn new(config: &SdkConfig, service: Service) -> Result<Self, ConfigError> {
-        let region = Region::parse(config.region().ok_or(ConfigError::MissingRegion)?.as_ref())?;
-        let provider = config
+    /// A client for `service` in `region`, configured from the process
+    /// environment and the shared AWS files, `profile` naming the profile
+    /// to use in place of `AWS_PROFILE`.
+    pub(crate) async fn from_env(
+        region: &str,
+        profile: Option<&str>,
+        service: Service,
+    ) -> Result<Self, ConfigError> {
+        let config = Config::load(Env::Process, Fs::Real, Platform::current(), profile);
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.to_owned()));
+        if let Some(profile) = profile {
+            loader = loader.profile_name(profile);
+        }
+        let provider = loader
+            .load()
+            .await
             .credentials_provider()
-            .ok_or(ConfigError::MissingCredentialsProvider)?;
+            .expect("the default loader sets a credentials provider");
+        Self::new(&config, region, provider, service)
+    }
+
+    /// A client for `service` in `region`, with the endpoint, retry and
+    /// clock-skew settings `config` carries.
+    fn new(
+        config: &Config,
+        region: &str,
+        provider: SharedCredentialsProvider,
+        service: Service,
+    ) -> Result<Self, ConfigError> {
+        let region = Region::parse(region)?;
         let endpoint_url = config
-            .service_config()
-            .and_then(|c| {
-                let key = ServiceConfigKey::builder()
-                    .service_id(service.service_id())
-                    .env("AWS_ENDPOINT_URL")
-                    .profile("endpoint_url")
-                    .build()
-                    .expect("every key part is set");
-                c.load_config(key)
-            })
-            .or_else(|| config.endpoint_url().map(str::to_owned))
+            .endpoint_url(service.service_id())
             .map(|url| Endpoint::parse(&url))
             .transpose()?;
-        let fips = match config.use_fips() {
-            Some(true) => Fips::On,
-            _ => Fips::Off,
-        };
-        let dual_stack = match config.use_dual_stack() {
-            Some(true) => DualStack::On,
-            _ => DualStack::Off,
-        };
-        let endpoint = endpoint::resolve(service, &region, fips, dual_stack, endpoint_url)?;
-        let skew_correction = match config.disable_clock_skew_correction() {
-            Some(true) => SkewCorrection::Off,
-            _ => SkewCorrection::On,
-        };
-        let retry = config.retry_config().map_or_else(
-            || retry::Strategy::new(&RetryConfig::standard()),
-            retry::Strategy::new,
-        );
+        let endpoint = endpoint::resolve(
+            service,
+            &region,
+            config.fips(),
+            config.dual_stack(),
+            endpoint_url,
+        )?;
         Self::from_parts(Parts {
             provider,
             service,
             partition: retry::partition(service, &region),
             region,
             endpoint,
-            retry,
-            skew_correction,
+            retry: retry::Strategy::new(&config.retry()?),
+            skew_correction: config.skew_correction(),
             stall_timeout: STALL_TIMEOUT,
         })
     }
@@ -713,11 +707,11 @@ mod tests {
     /// The SDK's settings with `max_attempts` and a 1 ms first backoff, so a
     /// test's retries take milliseconds.
     fn strategy(max_attempts: u32) -> retry::Strategy {
-        retry::Strategy::new(
-            &RetryConfig::standard()
-                .with_max_attempts(max_attempts)
-                .with_initial_backoff(Duration::from_millis(1)),
-        )
+        retry::Strategy::new(&retry::Config {
+            max_attempts,
+            initial_backoff: Duration::from_millis(1),
+            ..retry::Config::default()
+        })
     }
 
     /// The parts of an ECR client in `us-east-1` at `endpoint`, with static
@@ -728,7 +722,7 @@ mod tests {
             service: Service::Ecr,
             region: Region::parse("us-east-1").unwrap(),
             endpoint: Endpoint::parse(endpoint).unwrap(),
-            retry: strategy(DEFAULT_MAX_ATTEMPTS),
+            retry: strategy(retry::DEFAULT_MAX_ATTEMPTS),
             partition: Arc::default(),
             skew_correction: SkewCorrection::On,
             stall_timeout: STALL_TIMEOUT,
@@ -830,7 +824,7 @@ mod tests {
             .mount(&server)
             .await;
         assert_eq!(
-            client(&server, DEFAULT_MAX_ATTEMPTS)
+            client(&server, retry::DEFAULT_MAX_ATTEMPTS)
                 .call(&Probe {})
                 .await
                 .unwrap(),
@@ -885,7 +879,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client(&server, DEFAULT_MAX_ATTEMPTS)
+        let err = client(&server, retry::DEFAULT_MAX_ATTEMPTS)
             .call(&Probe {})
             .await
             .unwrap_err();
@@ -942,7 +936,7 @@ mod tests {
             .mount(&server)
             .await;
         let started = std::time::Instant::now();
-        client(&server, DEFAULT_MAX_ATTEMPTS)
+        client(&server, retry::DEFAULT_MAX_ATTEMPTS)
             .call(&Probe {})
             .await
             .unwrap();
@@ -989,7 +983,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let corrected = client(&server, DEFAULT_MAX_ATTEMPTS);
+        let corrected = client(&server, retry::DEFAULT_MAX_ATTEMPTS);
         corrected.skew.store(600_000, Ordering::Relaxed);
         corrected.call(&Probe {}).await.unwrap_err();
 
@@ -1213,48 +1207,37 @@ mod tests {
     /// built, before it can reach an endpoint host name.
     #[test]
     fn refuses_a_region_that_is_not_a_host_label() {
-        let config = |region: &'static str| {
-            SdkConfig::builder()
-                .region(aws_config::Region::new(region))
-                .credentials_provider(static_credentials(None))
-                .build()
-        };
-        Client::new(&config("us-west-2"), Service::Ecr).unwrap();
-        let err = Client::new(&config("evil.example/x"), Service::Ecr).unwrap_err();
+        let config = config::tests::config(&[], "");
+        let client = |region| Client::new(&config, region, static_credentials(None), Service::Ecr);
+        client("us-west-2").unwrap();
+        let err = client("evil.example/x").unwrap_err();
         assert!(matches!(err, ConfigError::InvalidRegion(_)), "{err}");
     }
 
-    /// `disable_clock_skew_correction` in the SDK's configuration turns
-    /// correction off; unset or false leaves it on.
+    /// The settings reach the client: the skew switch, FIPS on the
+    /// endpoint and the attempt count. Breaks if `new` drops one.
     #[test]
-    fn reads_the_skew_correction_switch() {
-        let config = |disable: Option<bool>| {
-            let mut builder = SdkConfig::builder()
-                .region(aws_config::Region::new("us-west-2"))
-                .credentials_provider(static_credentials(None));
-            builder.set_disable_clock_skew_correction(disable);
-            builder.build()
-        };
-        for (disable, expected) in [
-            (None, SkewCorrection::On),
-            (Some(false), SkewCorrection::On),
-            (Some(true), SkewCorrection::Off),
-        ] {
-            let client = Client::new(&config(disable), Service::Ecr).unwrap();
-            assert_eq!(client.skew_correction, expected, "{disable:?}");
-        }
-    }
-
-    /// The defaults that size the credential load timeout are the SDK's
-    /// standard retry defaults.
-    #[test]
-    fn sizes_the_credential_timeout_from_the_sdk_defaults() {
-        let standard = RetryConfig::standard();
-        assert_eq!(DEFAULT_MAX_ATTEMPTS, standard.max_attempts());
-        assert_eq!(
-            Duration::from_millis(SDK_INITIAL_BACKOFF_MS),
-            standard.initial_backoff()
+    fn new_applies_the_settings() {
+        let config = config::tests::config(
+            &[
+                ("AWS_DISABLE_CLOCK_SKEW_CORRECTION", "true"),
+                ("AWS_USE_FIPS_ENDPOINT", "true"),
+                ("AWS_MAX_ATTEMPTS", "1"),
+            ],
+            "",
         );
+        let client =
+            Client::new(&config, "us-west-2", static_credentials(None), Service::Ecr).unwrap();
+        assert_eq!(client.skew_correction, SkewCorrection::Off);
+        assert_eq!(
+            client.endpoint.host(),
+            "api.ecr-fips.us-west-2.amazonaws.com"
+        );
+        assert_eq!(client.retry.max_attempts(), 1);
+        let bad = config::tests::config(&[("AWS_RETRY_MODE", "legacy")], "");
+        let err =
+            Client::new(&bad, "us-west-2", static_credentials(None), Service::Ecr).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidRetryMode(_)), "{err}");
     }
 
     /// A transport failure does not carry the endpoint URL, whose path may

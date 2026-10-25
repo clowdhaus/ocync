@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 /// Where environment variables come from.
 #[derive(Debug, Clone)]
-pub(crate) enum Env {
+pub(super) enum Env {
     /// The running process's environment.
     Process,
     /// A fixed set, for tests.
@@ -17,7 +17,7 @@ pub(crate) enum Env {
 
 impl Env {
     /// The value of `key`, or `None` when unset or not UTF-8.
-    pub(crate) fn get(&self, key: &str) -> Option<String> {
+    pub(super) fn get(&self, key: &str) -> Option<String> {
         match self {
             Self::Process => std::env::var(key).ok(),
             Self::Fixed(vars) => vars.get(key).cloned(),
@@ -27,7 +27,7 @@ impl Env {
 
 /// Where files come from.
 #[derive(Debug, Clone)]
-pub(crate) enum Fs {
+pub(super) enum Fs {
     /// The real file system.
     Real,
     /// A fixed set of files, for tests. A path not in the map is not found.
@@ -38,7 +38,7 @@ pub(crate) enum Fs {
 impl Fs {
     /// The whole contents of `path`. The files read here are a few
     /// kilobytes on local disk, so a blocking read is used.
-    pub(crate) fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+    pub(super) fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         match self {
             Self::Real => std::fs::read(path),
             Self::Fixed(files) => files
@@ -51,7 +51,7 @@ impl Fs {
 
 /// The platform rules for finding the home directory and joining paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Platform {
+pub(super) enum Platform {
     /// Linux, macOS and other Unix-like systems.
     Unix,
     /// Windows.
@@ -60,7 +60,7 @@ pub(crate) enum Platform {
 
 impl Platform {
     /// The platform this binary runs on.
-    pub(crate) fn current() -> Self {
+    pub(super) fn current() -> Self {
         if cfg!(windows) {
             Self::Windows
         } else {
@@ -69,7 +69,7 @@ impl Platform {
     }
 
     /// The path separator.
-    pub(crate) fn separator(self) -> char {
+    pub(super) fn separator(self) -> char {
         match self {
             Self::Unix => '/',
             Self::Windows => '\\',
@@ -78,7 +78,7 @@ impl Platform {
 
     /// The home directory: `HOME`, then on Windows `USERPROFILE`, then
     /// `HOMEDRIVE` followed by `HOMEPATH`.
-    pub(crate) fn home_dir(self, env: &Env) -> Option<String> {
+    pub(super) fn home_dir(self, env: &Env) -> Option<String> {
         if let Some(home) = env.get("HOME") {
             return Some(home);
         }

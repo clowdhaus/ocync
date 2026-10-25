@@ -200,17 +200,12 @@ impl EcrAuth {
     /// When `profile` is `Some`, credential resolution is scoped to that
     /// named profile in the shared credentials/config file. When `None`,
     /// the ambient default credential chain is used unchanged. Each
-    /// `EcrAuth` instance holds its own [`aws_config::SdkConfig`], so
-    /// per-instance profile overrides do not leak across registries.
+    /// `EcrAuth` instance holds its own AWS client, so per-instance profile
+    /// overrides do not leak across registries.
     pub async fn new(hostname: impl Into<String>, profile: Option<&str>) -> Result<Self, Error> {
         let hostname = hostname.into();
-        let config = crate::ecr::load_sdk_config(&hostname, profile)
+        let client = crate::ecr::api_client(&hostname, profile)
             .await
-            .map_err(|e| {
-                Error::auth_failed(&hostname, format!("failed to load AWS config: {e}"))
-            })?;
-
-        let client = crate::aws::Client::new(&config, crate::aws::Service::Ecr)
             .map_err(|e| Error::auth_failed(&hostname, e))?;
         let registry = hostname.clone();
 

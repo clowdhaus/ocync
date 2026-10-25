@@ -31,11 +31,11 @@ const PROFILE_PREFIX: &str = "profile";
 const SSO_SESSION_PREFIX: &str = "sso-session";
 
 /// One section's properties, keyed by lowercased name.
-pub(crate) type Properties = HashMap<String, String>;
+pub(super) type Properties = HashMap<String, String>;
 
 /// Which of the two files a body of text came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FileKind {
+pub(super) enum FileKind {
     /// The config file, `~/.aws/config`.
     Config,
     /// The credentials file, `~/.aws/credentials`.
@@ -63,32 +63,32 @@ impl FileKind {
 /// A sub-property of a section other than a profile or an SSO session, such
 /// as `endpoint_url` under `ecr` in `[services name]`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct OtherKey {
+pub(super) struct OtherKey {
     /// The section prefix, such as `services`.
-    pub(crate) section_key: String,
+    pub(super) section_key: String,
     /// The section name after the prefix.
-    pub(crate) section_name: String,
+    pub(super) section_name: String,
     /// The property holding the sub-properties, such as `ecr`.
-    pub(crate) property: String,
+    pub(super) property: String,
     /// The sub-property, such as `endpoint_url`.
-    pub(crate) sub_property: String,
+    pub(super) sub_property: String,
 }
 
 /// Everything read from the two files.
 #[derive(Debug, Default)]
-pub(crate) struct Sections {
+pub(super) struct Sections {
     /// Profiles by name.
-    pub(crate) profiles: HashMap<String, Properties>,
+    pub(super) profiles: HashMap<String, Properties>,
     /// IAM Identity Center sessions by name.
-    pub(crate) sso_sessions: HashMap<String, Properties>,
+    pub(super) sso_sessions: HashMap<String, Properties>,
     /// Sub-properties of every other prefixed section.
-    pub(crate) other: HashMap<OtherKey, String>,
+    pub(super) other: HashMap<OtherKey, String>,
 }
 
 /// A file that does not parse.
 #[derive(Debug, thiserror::Error)]
 #[error("error parsing {path} on line {line}: {message}")]
-pub(crate) struct ParseError {
+pub(super) struct ParseError {
     path: String,
     line: usize,
     message: String,
@@ -96,19 +96,19 @@ pub(crate) struct ParseError {
 
 /// Where the two files are and which profile is selected.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Location {
+pub(super) struct Location {
     /// The config file.
-    pub(crate) config: PathBuf,
+    pub(super) config: PathBuf,
     /// The credentials file.
-    pub(crate) credentials: PathBuf,
+    pub(super) credentials: PathBuf,
     /// `AWS_PROFILE`, or `default`.
-    pub(crate) profile: String,
+    pub(super) profile: String,
 }
 
 impl Location {
     /// Finds the files from `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`
     /// and the home directory, expanding a leading `~`.
-    pub(crate) fn find(env: &Env, platform: Platform) -> Self {
+    pub(super) fn find(env: &Env, platform: Platform) -> Self {
         let home = platform.home_dir(env);
         let path = |kind: FileKind| {
             let path = env
@@ -157,7 +157,7 @@ fn expand_home(path: &str, home: Option<&str>, platform: Platform) -> String {
 /// Reads and merges the config and credentials files. A file that cannot
 /// be read or is not UTF-8 counts as empty, with a warning unless it is a
 /// default location that does not exist.
-pub(crate) fn load(env: &Env, fs: &Fs, location: &Location) -> Result<Sections, ParseError> {
+pub(super) fn load(env: &Env, fs: &Fs, location: &Location) -> Result<Sections, ParseError> {
     let mut sections = Sections::default();
     for (kind, path) in [
         (FileKind::Config, &location.config),
@@ -193,7 +193,7 @@ pub(crate) fn load(env: &Env, fs: &Fs, location: &Location) -> Result<Sections, 
 type RawSection<'a> = (&'a str, Vec<(String, String)>);
 
 /// Parses `contents` as a file of `kind` and merges it into `sections`.
-pub(crate) fn merge(
+pub(super) fn merge(
     sections: &mut Sections,
     contents: &str,
     kind: FileKind,
