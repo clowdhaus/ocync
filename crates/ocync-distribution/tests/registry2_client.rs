@@ -66,6 +66,22 @@ async fn ping() {
     client.ping().await.expect("ping /v2/ failed");
 }
 
+/// The registry runs under Docker's init process, which reaps it so the
+/// container can be removed. Breaks if `start_registry` drops `--init`.
+#[tokio::test]
+async fn registry_runs_under_init() {
+    let (container, _url) = start_registry().await;
+    let mut exec = container
+        .exec(testcontainers::core::ExecCommand::new([
+            "cat",
+            "/proc/1/comm",
+        ]))
+        .await
+        .expect("exec in registry container failed");
+    let pid1 = exec.stdout_to_vec().await.expect("read exec output");
+    assert_eq!(String::from_utf8_lossy(&pid1).trim(), "docker-init");
+}
+
 /// Push a small blob via the monolithic (POST+PUT) path and verify it exists.
 #[tokio::test]
 async fn blob_push_monolithic_and_exists() {
