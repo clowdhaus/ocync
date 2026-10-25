@@ -98,12 +98,15 @@ const ECR_IMMUTABLE_TAG_CODE: &str = "ImageTagAlreadyExistsException";
 
 /// OCI distribution-spec error codes that refuse a manifest for something
 /// other than a blob the registry lacks.
-const CODES_NOT_ABOUT_BLOBS: [&str; 6] = [
+const CODES_NOT_ABOUT_BLOBS: [&str; 9] = [
+    "DENIED",
     "DIGEST_INVALID",
+    "MANIFEST_UNKNOWN",
     "NAME_INVALID",
     "NAME_UNKNOWN",
     "SIZE_INVALID",
     "TAG_INVALID",
+    "UNAUTHORIZED",
     "UNSUPPORTED",
 ];
 
@@ -221,6 +224,11 @@ mod tests {
             (
                 StatusCode::BAD_REQUEST,
                 r#"{"errors":[{"code":"TAG_INVALID"},{"code":"UNSUPPORTED"}]}"#,
+                None,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"errors":[{"code":"DENIED"}]}"#,
                 None,
             ),
             (StatusCode::FORBIDDEN, "DENIED", None),

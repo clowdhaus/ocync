@@ -270,12 +270,11 @@ impl BlobDedupMap {
     }
 
     /// Record the blob as `Verified` at `repo`, which a manifest committed
-    /// there proves. A live upload claim and presence this run recorded are
-    /// left alone.
+    /// there proves. A live upload claim, presence this run recorded, and a
+    /// `Failed` mark are left alone: the mark also excludes a mount source
+    /// the registry refused, which a commit does not make mountable.
     pub(crate) fn confirm(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
-        if let None | Some(RepoBlobState::Remembered | RepoBlobState::Failed(_)) =
-            self.repo_state(target, digest, repo)
-        {
+        if let None | Some(RepoBlobState::Remembered) = self.repo_state(target, digest, repo) {
             self.set_blob_verified(target, digest, repo);
         }
     }
@@ -449,6 +448,13 @@ mod tests {
             map.repo_state("reg.io", &d, &repo("z")),
             Some(&RepoBlobState::Uploading),
             "a commit never overwrites a live upload claim"
+        );
+        map.set_blob_failed("reg.io", &d, &repo("w"), "mount refused".into());
+        map.confirm("reg.io", &d, &repo("w"));
+        assert!(
+            map.repo_state("reg.io", &d, &repo("w"))
+                .is_some_and(RepoBlobState::is_failed),
+            "a commit keeps a refused mount source excluded"
         );
     }
 
