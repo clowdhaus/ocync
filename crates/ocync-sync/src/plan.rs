@@ -31,8 +31,8 @@ pub enum RepoBlobState {
     /// was reached. Transient; stripped before persistence.
     Failed(String),
     /// Present according to an earlier run, not yet confirmed by this one.
-    /// A batch check that does not confirm the blob, or a refused manifest,
-    /// drops it, since the repository may have lost the blob since.
+    /// A batch check that finds the blob missing, or a manifest refused for
+    /// a missing blob, drops it, since the repository may have lost it.
     /// Persisted as `Verified`.
     Remembered,
 }
@@ -267,6 +267,19 @@ impl BlobDedupMap {
         }
     }
 
+    /// Record the blob as `Verified` at `repo` when it is unknown there or
+    /// known only from an earlier run. State this run recorded, including an
+    /// upload claim, is left alone.
+    pub(crate) fn confirm(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
+        let entry = self.entry_mut(target, digest);
+        match entry.repos.get(repo) {
+            None | Some(RepoBlobState::Remembered) => {
+                entry.repos.insert(repo.clone(), RepoBlobState::Verified);
+            }
+            Some(_) => {}
+        }
+    }
+
     /// Mark every present state as [`RepoBlobState::Remembered`].
     pub(crate) fn remember_present(&mut self) {
         for state in self
@@ -408,6 +421,23 @@ mod tests {
             map.repo_state("reg.io", &d, &repo("x")),
             Some(&RepoBlobState::Completed),
             "state this run recorded is kept"
+        );
+
+        map.remember_present();
+        map.confirm("reg.io", &d, &repo("x"));
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Verified)
+        );
+        assert!(matches!(
+            map.claim_blob_upload("reg.io", &d, &repo("z")),
+            ClaimAction::Claimed
+        ));
+        map.confirm("reg.io", &d, &repo("z"));
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("z")),
+            Some(&RepoBlobState::Uploading),
+            "a commit never overwrites a live upload claim"
         );
     }
 

@@ -294,21 +294,39 @@ impl TransferStateCache {
         }
     }
 
-    /// Mark every present blob as known only from an earlier run, at the
-    /// start of a run: what a run learned may no longer hold by the next.
-    pub(crate) fn remember_present(&mut self) {
+    /// Start a run: what an earlier run learned about blobs may no longer
+    /// hold, so every present blob becomes known only from an earlier run.
+    /// Committed repositories are kept: a mount from one that has since lost
+    /// the blob fails and falls back to a push, which costs a request, while
+    /// forgetting them would push blobs a mount could have saved.
+    pub(crate) fn start_run(&mut self) {
         self.dedup.remember_present();
     }
 
-    /// Drop `repo`'s state for the blob if it is known only from an earlier
-    /// run.
-    pub(crate) fn forget_remembered_blob(
+    /// Drop `repo`'s state for each of `digests` that is known only from an
+    /// earlier run.
+    pub(crate) fn forget_remembered_blobs<'a>(
         &mut self,
         target: &str,
-        digest: &Digest,
         repo: &RepositoryName,
+        digests: impl IntoIterator<Item = &'a Digest>,
     ) {
-        self.dedup.forget_remembered(target, digest, repo);
+        for digest in digests {
+            self.dedup.forget_remembered(target, digest, repo);
+        }
+    }
+
+    /// Record each of `digests` as present at `repo`, after a manifest that
+    /// references them was committed there.
+    pub(crate) fn confirm_blobs<'a>(
+        &mut self,
+        target: &str,
+        repo: &RepositoryName,
+        digests: impl IntoIterator<Item = &'a Digest>,
+    ) {
+        for digest in digests {
+            self.dedup.confirm(target, digest, repo);
+        }
     }
 
     /// Look up a cached source snapshot.

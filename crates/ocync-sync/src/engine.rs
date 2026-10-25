@@ -860,7 +860,7 @@ impl SyncEngine {
     ) -> SyncReport {
         let run_start = Instant::now();
         let run_id = Uuid::now_v7();
-        cache.borrow_mut().remember_present();
+        cache.borrow_mut().start_run();
 
         // Synchronous writes are fine: current_thread runtime, file is tiny.
         let mut timing_file = std::env::var("OCYNC_TIMING_FILE")
@@ -1794,9 +1794,17 @@ async fn execute_item(
             // Mark this repo as having a committed manifest so it becomes
             // a valid cross-repo mount source. ECR requires a committed
             // manifest in the source repo for mount to succeed.
-            cache
-                .borrow_mut()
-                .mark_repo_committed(&item.target_name, &item.target.repo);
+            {
+                let mut c = cache.borrow_mut();
+                c.mark_repo_committed(&item.target_name, &item.target.repo);
+                c.confirm_blobs(
+                    &item.target_name,
+                    &item.target.repo,
+                    blobs_from_manifest(&item.source_data)
+                        .into_iter()
+                        .map(|b| &b.digest),
+                );
+            }
 
             // Discover and sync artifacts (signatures, SBOMs, attestations).
             let artifacts_skipped = match discover_and_sync_artifacts(&ctx, &item).await {
@@ -1866,8 +1874,14 @@ async fn execute_item(
             {
                 let mut c = cache.borrow_mut();
                 c.notify_repo_failed(&item.target_name, &item.target.repo);
-                for blob in blobs_from_manifest(&item.source_data) {
-                    c.forget_remembered_blob(&item.target_name, &blob.digest, &item.target.repo);
+                if err.is_unknown_blob_refusal() {
+                    c.forget_remembered_blobs(
+                        &item.target_name,
+                        &item.target.repo,
+                        blobs_from_manifest(&item.source_data)
+                            .into_iter()
+                            .map(|b| &b.digest),
+                    );
                 }
             }
 
@@ -2293,9 +2307,8 @@ async fn transfer_image_blobs(
                 // gets its HEAD.
                 let total = all_digests.len();
                 let checked: HashSet<Digest> = all_digests
-                    .iter()
+                    .into_iter()
                     .filter(|d| existence.is_known(d))
-                    .cloned()
                     .collect();
                 let available = existence.into_available();
                 debug!(
@@ -2307,12 +2320,13 @@ async fn transfer_image_blobs(
                     "batch check pre-populated cache"
                 );
                 let mut c = ctx.cache.borrow_mut();
-                // Only a blob the check confirms present is trusted: an
-                // earlier run's entry for any other is dropped, since the
-                // repository may have lost it.
-                for digest in all_digests.iter().filter(|d| !available.contains(*d)) {
-                    c.forget_remembered_blob(ctx.target_name, digest, ctx.target_repo);
-                }
+                // A blob the check finds missing is not trusted from an
+                // earlier run: the repository may have lost it.
+                c.forget_remembered_blobs(
+                    ctx.target_name,
+                    ctx.target_repo,
+                    checked.iter().filter(|d| !available.contains(*d)),
+                );
                 for digest in available {
                     c.set_blob_verified(ctx.target_name, digest, ctx.target_repo.to_owned());
                 }
@@ -2324,12 +2338,10 @@ async fn transfer_image_blobs(
                     error = %e,
                     "batch check failed, falling back to per-blob HEAD"
                 );
-                // An earlier run's entries are dropped so the per-blob HEAD
-                // runs for them too.
-                let mut c = ctx.cache.borrow_mut();
-                for digest in &all_digests {
-                    c.forget_remembered_blob(ctx.target_name, digest, ctx.target_repo);
-                }
+                // Graceful degradation: blobs the cache does not know get a
+                // per-blob HEAD. The cache is trusted for the rest rather
+                // than checking every blob against a throttling registry; a
+                // manifest refused for a lost blob still heals the next run.
                 HashSet::new()
             }
         }
@@ -3088,13 +3100,23 @@ async fn sync_artifact(
 
     wait_for_commit(item, retry, &blob_digests).await;
 
-    // Push artifact manifest by digest (not by tag).
-    push_manifest(retry, item, &artifact_digest_str, &artifact_pull)
-        .await
-        .map_err(|e| crate::Error::ArtifactSync {
-            reference: artifact_digest_str.clone(),
-            reason: format!("manifest push failed: {e}"),
-        })?;
+    // Push artifact manifest by digest (not by tag). Its blobs are
+    // confirmed or, on a refusal for a lost blob, dropped, as for an image.
+    let pushed = push_manifest(retry, item, &artifact_digest_str, &artifact_pull).await;
+    {
+        let mut c = ctx.cache.borrow_mut();
+        match &pushed {
+            Ok(()) => c.confirm_blobs(ctx.target_name, ctx.target_repo, &blob_digests),
+            Err(e) if e.is_unknown_blob_refusal() => {
+                c.forget_remembered_blobs(ctx.target_name, ctx.target_repo, &blob_digests);
+            }
+            Err(_) => {}
+        }
+    }
+    pushed.map_err(|e| crate::Error::ArtifactSync {
+        reference: artifact_digest_str.clone(),
+        reason: format!("manifest push failed: {e}"),
+    })?;
 
     debug!(
         repo = %source_repo,

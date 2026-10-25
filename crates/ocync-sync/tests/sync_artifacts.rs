@@ -6,7 +6,7 @@ mod helpers;
 
 use std::rc::Rc;
 
-use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType};
+use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
 use ocync_sync::engine::{ResolvedArtifacts, ResolvedMapping, TagPair};
 use ocync_sync::{ErrorKind, ImageStatus};
 use wiremock::matchers::{method, path};
@@ -706,6 +706,72 @@ async fn artifact_transfer_failure_reports_artifact_sync_error() {
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+}
+
+/// An earlier run's cache lists an artifact's blobs at the target, but the
+/// registry has lost them and refuses the artifact manifest for a missing
+/// blob. The run drops the artifact's cached blobs, as it does for an
+/// image, so the next run checks them instead of failing again.
+#[tokio::test]
+async fn artifact_refused_for_a_lost_blob_drops_its_cached_blobs() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let parent = ManifestBuilder::new(b"lost-parent-config")
+        .layer(b"lost-parent-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
+    let sig = ArtifactBuilder::new(b"lost-sig-config", b"lost-sig-layer").build();
+    let referrers = ReferrersIndexBuilder::new().artifact(&sig).build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
+    sig.mount_source(&source_server, "repo").await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/repo/manifests/{}", sig.digest)))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#,
+        ))
+        .mount(&target_server)
+        .await;
+
+    let repo = RepositoryName::new("repo").unwrap();
+    let sig_blobs = [&sig.config_desc.digest, &sig.layer_desc.digest];
+    let cache = empty_cache();
+    for digest in sig_blobs {
+        cache
+            .borrow_mut()
+            .set_blob_completed("target", digest.clone(), repo.clone());
+    }
+    let mapping = ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts::default()),
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
+            "repo",
+            vec![TagPair::same("v1.0.0")],
+        )
+    };
+    let report = run_sync_with_cache(vec![mapping], Rc::clone(&cache)).await;
+
+    assert_status!(
+        report,
+        0,
+        ImageStatus::Failed {
+            kind: ErrorKind::ArtifactSync,
+            ..
+        }
+    );
+    for digest in sig_blobs {
+        assert!(
+            !cache.borrow().blob_present_at("target", digest, &repo),
+            "{digest}"
+        );
+    }
+    assert!(
+        cache
+            .borrow()
+            .blob_present_at("target", &parent.config_desc.digest, &repo),
+        "the parent image's pushed blobs stay cached"
+    );
 }
 
 /// When the same image is synced to two targets and the referrers API

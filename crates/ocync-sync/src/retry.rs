@@ -108,6 +108,27 @@ pub fn is_blob_upload_unknown(error: &ocync_distribution::Error) -> bool {
     body.errors.iter().any(|e| e.code == "BLOB_UPLOAD_UNKNOWN")
 }
 
+/// The codes a registry refuses a manifest with when it lacks a blob the
+/// manifest references: the distribution spec's, and ECR's.
+const UNKNOWN_BLOB_CODES: [&str; 3] = [
+    "MANIFEST_BLOB_UNKNOWN",
+    "BLOB_UNKNOWN",
+    "BLOB_UPLOAD_UNKNOWN",
+];
+
+/// Whether a registry refused a manifest because it lacks a blob the
+/// manifest references.
+pub(crate) fn names_unknown_blob(error: &ocync_distribution::Error) -> bool {
+    let ocync_distribution::Error::RegistryError { message, .. } = error else {
+        return false;
+    };
+    serde_json::from_str::<OciErrorBody>(message).is_ok_and(|body| {
+        body.errors
+            .iter()
+            .any(|e| UNKNOWN_BLOB_CODES.contains(&e.code.as_str()))
+    })
+}
+
 /// OCI distribution-spec error response body shape.
 #[derive(serde::Deserialize)]
 struct OciErrorBody {

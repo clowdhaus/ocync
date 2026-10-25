@@ -104,6 +104,16 @@ impl Error {
         }
     }
 
+    /// Whether a registry refused a manifest because it lacks a blob the
+    /// manifest references.
+    pub(crate) fn is_unknown_blob_refusal(&self) -> bool {
+        match self {
+            Self::Manifest { source, .. } => crate::retry::names_unknown_blob(source),
+            Self::Shared(err) => err.is_unknown_blob_refusal(),
+            _ => false,
+        }
+    }
+
     /// Whether this error represents a required-artifacts-missing condition.
     pub fn is_required_artifacts_missing(&self) -> bool {
         matches!(self, Self::RequiredArtifactsMissing { .. })
