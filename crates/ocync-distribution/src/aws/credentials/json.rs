@@ -104,19 +104,29 @@ impl std::fmt::Display for Required {
     }
 }
 
-/// Read `body`. Keys match in any case; only string values count, and a
-/// later key wins. A document with no `Code`, or `Code` of `Success`, must
-/// carry a key, token and expiry.
+/// The value of the field `names` spell in `document`: keys match in any
+/// case and only values `read` takes count, as upstream's JSON readers
+/// find one. Of several matches the key last in byte order wins, as the
+/// map is key-sorted, where upstream takes the last one written.
+pub(super) fn field<'a, T>(
+    document: &'a serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+    read: impl Fn(&'a serde_json::Value) -> Option<T>,
+) -> Option<T> {
+    document
+        .iter()
+        .filter(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
+        .filter_map(|(_, value)| read(value))
+        .next_back()
+}
+
+/// Read `body`. Fields are found as [`field`] finds them, string values
+/// only. A document with no `Code`, or `Code` of `Success`, must carry a
+/// key, token and expiry.
 pub(super) fn parse(body: &[u8]) -> Result<Document, Error> {
     let fields: serde_json::Map<String, serde_json::Value> =
         serde_json::from_slice(body).map_err(Error::Json)?;
-    let field = |names: &[&str]| {
-        fields
-            .iter()
-            .filter(|(key, _)| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
-            .filter_map(|(_, value)| value.as_str())
-            .next_back()
-    };
+    let field = |names: &[&str]| field(&fields, names, serde_json::Value::as_str);
     let required = |name: Required| field(name.names()).ok_or(Error::Missing(name));
     match field(CODE) {
         Some(code) if code != SUCCESS => Ok(Document::Error {
@@ -145,6 +155,23 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+
+    /// Of two string values under keys that differ only in case, the key
+    /// last in byte order wins, whatever order the document writes them
+    /// in. Breaks if the first match wins or the order starts to depend on
+    /// the document.
+    #[test]
+    fn takes_the_key_last_in_byte_order() {
+        for text in [
+            r#"{"AccessKeyId": "upper", "accesskeyid": "lower"}"#,
+            r#"{"accesskeyid": "lower", "AccessKeyId": "upper"}"#,
+        ] {
+            let document: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(text).unwrap();
+            let found = field(&document, &["AccessKeyId"], serde_json::Value::as_str);
+            assert_eq!(found, Some("lower"), "{text}");
+        }
+    }
 
     /// The upstream parser cases: keys in any case, either spelling of the
     /// token and expiry, an error document, and each missing field named.

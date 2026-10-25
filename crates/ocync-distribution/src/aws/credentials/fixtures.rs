@@ -35,12 +35,8 @@ const EXCLUDED: &[&str] = &[
 ];
 
 /// The profile source cases not run, by directory name: each reaches an SSO
-/// or `credential_process` profile, loaded through `aws-config`.
+/// profile, loaded through `aws-config`.
 const PROFILE_EXCLUDED: &[&str] = &[
-    "credential_process",
-    "credential_process_account_id_fallback",
-    "credential_process_failure",
-    "credential_process_invalid",
     "invalid_sso_credentials_config",
     "sso_credentials",
     "sso_override_global_env_url",

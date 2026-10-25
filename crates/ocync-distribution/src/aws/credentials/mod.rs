@@ -11,6 +11,7 @@ mod environment;
 mod fixtures;
 mod imds;
 mod json;
+mod process;
 mod profile;
 mod sdk;
 mod sts;
@@ -271,6 +272,9 @@ impl Chain {
             profile::Base::WebIdentity(role) => web_identity::assume(&self.host, &self.sts, &role)
                 .await
                 .map_err(|e| failed(Error::WebIdentity(e)))?,
+            profile::Base::Process(command) => process::load(command)
+                .await
+                .map_err(profile::Error::Process)?,
         };
         for role in &roles {
             credentials = role

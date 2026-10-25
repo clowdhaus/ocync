@@ -5,7 +5,7 @@
 use super::super::host::Clock;
 use super::super::profile::{DEFAULT_PROFILE, ParseError, Properties, Sections};
 use super::web_identity::{self, Origin};
-use super::{Credentials, Error as ChainError, Source, sts};
+use super::{Credentials, Error as ChainError, Source, process, sts};
 
 const ROLE_ARN: &str = "role_arn";
 const EXTERNAL_ID: &str = "external_id";
@@ -74,6 +74,8 @@ pub(super) enum Base<'a> {
     Keys(Credentials),
     /// A role assumed with a web identity token file.
     WebIdentity(web_identity::Role<'a>),
+    /// The command `credential_process` names.
+    Process(process::Command<'a>),
 }
 
 /// A role assumed with the credentials before it.
@@ -118,8 +120,7 @@ pub(super) enum Plan<'a> {
         base: Base<'a>,
         roles: Vec<AssumedRole<'a>>,
     },
-    /// SSO or `credential_process`: the whole profile, roles included,
-    /// loads through `aws-config`.
+    /// SSO: the whole profile, roles included, loads through `aws-config`.
     Sdk,
 }
 
@@ -127,9 +128,12 @@ pub(super) enum Plan<'a> {
 enum Found<'a> {
     /// A base the owned sources load.
     Base(Base<'a>),
-    /// SSO or `credential_process`.
+    /// SSO.
     Sdk,
 }
+
+/// What upstream prints when a profile's base credentials do not load.
+const BASE_FAILED: &str = "an error occurred while loading credentials";
 
 /// Why a profile gave no credentials. The texts are upstream's.
 #[derive(Debug, thiserror::Error)]
@@ -167,9 +171,12 @@ pub(in crate::aws) enum Error {
     /// `login_session`, which ocync does not support.
     #[error("profile `{0}` uses login_session, which is not supported")]
     LoginSession(String),
-    /// The base credentials did not load.
-    #[error("failed to load the base credentials")]
+    /// The base credentials did not load from a source of the chain.
+    #[error("{BASE_FAILED}")]
     Base(#[source] Box<ChainError>),
+    /// The base credentials did not load from `credential_process`.
+    #[error("{BASE_FAILED}")]
+    Process(#[source] process::Error),
     /// A role was not assumed.
     #[error("failed to assume role {arn}")]
     AssumeRole {
@@ -333,8 +340,8 @@ fn base<'a>(name: &str, profile: &'a Properties) -> Result<Found<'a>, Error> {
     if profile.contains_key(LOGIN_SESSION) {
         return Err(Error::LoginSession(name.to_owned()));
     }
-    if profile.contains_key(CREDENTIAL_PROCESS) {
-        return Ok(Found::Sdk);
+    if let Some(command) = get(profile, CREDENTIAL_PROCESS) {
+        return Ok(Found::Base(Base::Process(process::Command::new(command))));
     }
     keys(name, profile).map(|keys| Found::Base(Base::Keys(keys)))
 }
@@ -401,6 +408,9 @@ mod tests {
             web_identity_token_file: String,
             role_session_name: Option<String>,
         },
+        CredentialProcess {
+            command: String,
+        },
         AssumeRole {
             role_arn: String,
             external_id: Option<String>,
@@ -416,7 +426,7 @@ mod tests {
 
     fn steps(plan: &Plan<'_>) -> Vec<Step> {
         let Plan::Owned { base, roles } = plan else {
-            panic!("an excluded SSO or credential_process row");
+            panic!("an excluded SSO row");
         };
         let base = match base {
             Base::Named(named) => Step::NamedSource(format!("{named:?}")),
@@ -429,6 +439,9 @@ mod tests {
                 role_arn: role.arn.to_owned(),
                 web_identity_token_file: role.token_file.to_owned(),
                 role_session_name: role.session_name.map(str::to_owned),
+            },
+            Base::Process(command) => Step::CredentialProcess {
+                command: command.unredacted().to_owned(),
             },
         };
         let roles = roles.iter().map(|role| Step::AssumeRole {
@@ -477,16 +490,30 @@ mod tests {
         assert_eq!(run + EXCLUDED.len(), 28);
     }
 
-    /// An SSO or `credential_process` profile, as a base or a source
-    /// profile, is left to `aws-config` whole, and `login_session` is
-    /// refused. Breaks if either kind is read as keys.
+    /// An SSO profile, as a base or a source profile, is left to
+    /// `aws-config` whole, a `credential_process` source profile is the
+    /// base of the role, and `login_session` is refused. Breaks if either
+    /// kind is read as keys.
     #[test]
-    fn leaves_sso_and_credential_process_to_the_sdk() {
-        for base in [("sso_session", "dev"), (CREDENTIAL_PROCESS, "/bin/creds")] {
-            let sections = role_from(base);
-            let plan = resolve(&sections, "A").unwrap();
-            assert!(matches!(plan, Plan::Sdk), "{base:?}: {plan:?}");
-        }
+    fn reads_sso_credential_process_and_login_session_bases() {
+        let sections = role_from(("sso_session", "dev"));
+        let plan = resolve(&sections, "A").unwrap();
+        assert!(matches!(plan, Plan::Sdk), "{plan:?}");
+        let sections = role_from((CREDENTIAL_PROCESS, "/bin/creds --profile x"));
+        let plan = resolve(&sections, "A").unwrap();
+        assert_eq!(
+            steps(&plan),
+            [
+                Step::CredentialProcess {
+                    command: "/bin/creds --profile x".to_owned()
+                },
+                Step::AssumeRole {
+                    role_arn: "arn:aws:iam::1:role/A".to_owned(),
+                    external_id: None,
+                    role_session_name: None,
+                },
+            ]
+        );
         let sections = role_from((LOGIN_SESSION, "arn:aws:signin::1:session"));
         let error = resolve(&sections, "B").unwrap_err();
         assert!(matches!(error, Error::LoginSession(_)), "{error}");

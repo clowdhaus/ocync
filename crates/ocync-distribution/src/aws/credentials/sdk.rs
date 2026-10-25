@@ -1,5 +1,4 @@
-//! The SSO and `credential_process` profiles, loaded through the
-//! `aws-config` profile provider.
+//! The SSO profiles, loaded through the `aws-config` profile provider.
 
 use aws_config::provider_config::ProviderConfig;
 use aws_credential_types::provider::ProvideCredentials;

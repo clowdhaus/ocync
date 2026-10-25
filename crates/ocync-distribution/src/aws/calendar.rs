@@ -147,12 +147,59 @@ fn instant(date: CivilDate, time: TimeOfDay) -> Option<SystemTime> {
 /// Any other text, a date that does not exist, a leap second or a time
 /// before 1970 is `None`.
 pub(super) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    let (date, time, offset) = date_time(text, Separator::T)?;
+    if offset != "Z" {
+        return None;
+    }
+    instant(date, time)
+}
+
+/// Read an RFC 3339 date-time with its offset, as the `time` crate reads a
+/// `credential_process` expiry: any byte between date and time, then `Z`,
+/// `z`, or `+HH:MM` or `-HH:MM` with the hour at most 23. Any other text, a
+/// date that does not exist, a leap second or a local time before 1970 is
+/// `None`. A month-end leap second, which `time` reads as the nanosecond
+/// before the next second, is refused like any other.
+pub(super) fn parse_rfc3339_with_offset(text: &str) -> Option<SystemTime> {
+    let (date, time, offset) = date_time(text, Separator::AnyByte)?;
+    let local = instant(date, time)?;
+    if offset.eq_ignore_ascii_case("z") {
+        return Some(local);
+    }
+    let [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] = *offset.as_bytes() else {
+        return None;
+    };
+    let (hour, minute) = (digits(&[h1, h2])?, digits(&[m1, m2])?);
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    let offset = Duration::from_secs(hour * 3600 + minute * 60);
+    match sign {
+        b'+' => local.checked_sub(offset),
+        _ => local.checked_add(offset),
+    }
+}
+
+/// What may separate the date from the time.
+#[derive(Debug, Clone, Copy)]
+enum Separator {
+    /// `T` or `t`.
+    T,
+    /// Any one byte.
+    AnyByte,
+}
+
+/// The date, the time of day and the offset text of an RFC 3339
+/// date-time, with fractional seconds kept to the nanosecond.
+fn date_time(text: &str, separator: Separator) -> Option<(CivilDate, TimeOfDay, &str)> {
     let bytes = text.as_bytes();
     let field = |range: std::ops::Range<usize>| digits(bytes.get(range)?);
     let separators = [(4, b'-'), (7, b'-'), (13, b':'), (16, b':')];
-    if separators.iter().any(|&(i, c)| bytes.get(i) != Some(&c))
-        || !matches!(bytes.get(10), Some(b'T' | b't'))
-    {
+    let separated = match separator {
+        Separator::T => matches!(bytes.get(10), Some(b'T' | b't')),
+        Separator::AnyByte => bytes.len() > 10,
+    };
+    if separators.iter().any(|&(i, c)| bytes.get(i) != Some(&c)) || !separated {
         return None;
     }
     let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
@@ -168,16 +215,13 @@ pub(super) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
         nanos = kept.parse::<u32>().ok()? * 10u32.pow(9 - kept.len() as u32);
         rest = &fraction[len..];
     }
-    if rest != "Z" {
-        return None;
-    }
     let time = TimeOfDay {
         hour,
         minute,
         second,
         nanos,
     };
-    instant(CivilDate { year, month, day }, time)
+    Some((CivilDate { year, month, day }, time, rest))
 }
 
 /// The days in `month` of `year`.
@@ -223,6 +267,31 @@ mod tests {
         ];
         for (text, expected) in cases {
             assert_eq!(parse_rfc3339(text), expected, "{text}");
+        }
+    }
+
+    /// The forms the `time` crate reads for a `credential_process` expiry:
+    /// an offset moves the instant, `z` and any separator byte are taken,
+    /// and an offset hour past 23 is refused. Breaks if an offset is
+    /// ignored or applied the wrong way, or the UTC reader's rules leak in.
+    #[test]
+    fn reads_rfc3339_with_an_offset_as_time_does() {
+        let at = |secs| Some(UNIX_EPOCH + Duration::from_secs(secs));
+        let cases = [
+            ("2022-05-02T18:36:00+00:00", at(1_651_516_560)),
+            ("2022-05-02T20:36:00+02:00", at(1_651_516_560)),
+            ("2022-05-02T16:06:00-02:30", at(1_651_516_560)),
+            ("2022-05-02T18:36:00z", at(1_651_516_560)),
+            ("2022-05-02 18:36:00Z", at(1_651_516_560)),
+            ("2022-05-02T18:36:00+24:00", None),
+            ("2022-05-02T18:36:00+02:60", None),
+            ("2022-05-02T18:36:00+0200", None),
+            ("2022-05-02T18:36:00", None),
+            ("2022-05-02T18:36:60Z", None),
+            ("2016-12-31T23:59:60Z", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(parse_rfc3339_with_offset(text), expected, "{text}");
         }
     }
 
