@@ -149,7 +149,7 @@ impl TransferStateCache {
         self.dedup.is_empty() && self.snapshots.is_empty()
     }
 
-    /// Whether the blob is present (Verified or Completed) at the given (target, repo).
+    /// Whether the blob is present (Verified, Completed or Remembered) at the given (target, repo).
     pub fn blob_present_at(&self, target: &str, digest: &Digest, repo: &RepositoryName) -> bool {
         self.dedup.blob_present_at(target, digest, repo)
     }
@@ -197,7 +197,7 @@ impl TransferStateCache {
     }
 
     /// Iterator over committed mount sources for a blob, excluding `current_repo`.
-    /// Yields only repos with state in `{Verified, Completed}` AND a committed
+    /// Yields only repos with a present state AND a committed
     /// manifest at `target`. Iteration is in `BTreeMap` order (deterministic).
     pub fn committed_mount_sources<'a>(
         &'a self,
@@ -217,7 +217,7 @@ impl TransferStateCache {
     }
 
     /// `Watch::Receivers` for repos that:
-    ///   1. Have the blob with state in {Verified, Completed, Uploading} (NOT Failed)
+    ///   1. Have the blob with an active state (present or Uploading, NOT Failed)
     ///   2. Have not yet had their manifest-commit watch fire
     ///
     /// Used by the resolver to subscribe only to repos still able to become a
@@ -294,8 +294,14 @@ impl TransferStateCache {
         }
     }
 
-    /// Drop `repo`'s state for the blob if it came only from a cache loaded
-    /// from disk.
+    /// Mark every present blob as known only from an earlier run, at the
+    /// start of a run: what a run learned may no longer hold by the next.
+    pub(crate) fn remember_present(&mut self) {
+        self.dedup.remember_present();
+    }
+
+    /// Drop `repo`'s state for the blob if it is known only from an earlier
+    /// run.
     pub(crate) fn forget_remembered_blob(
         &mut self,
         target: &str,
@@ -464,7 +470,7 @@ impl TransferStateCache {
         })?;
 
         Ok(Self {
-            dedup: dedup.into_remembered(),
+            dedup,
             snapshots,
             committed_repos: HashMap::new(),
             repo_committed_watches: HashMap::new(),
@@ -648,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_present_at_returns_true_for_verified_and_completed_only() {
+    fn blob_present_at_excludes_uploading_and_failed() {
         let mut cache = TransferStateCache::new();
         cache.set_blob_verified("reg.io", digest(), repo("a"));
         cache.set_blob_completed("reg.io", digest(), repo("b"));

@@ -30,9 +30,9 @@ pub enum RepoBlobState {
     /// Excluded from future mount-source selection regardless of how it
     /// was reached. Transient; stripped before persistence.
     Failed(String),
-    /// Present according to a cache loaded from disk, not yet confirmed by
-    /// this run. A batch check that finds the blob missing drops it, since
-    /// the repository may have been deleted or its layers expired since.
+    /// Present according to an earlier run, not yet confirmed by this one.
+    /// A batch check that does not confirm the blob, or a refused manifest,
+    /// drops it, since the repository may have lost the blob since.
     /// Persisted as `Verified`.
     Remembered,
 }
@@ -126,7 +126,7 @@ impl BlobDedupMap {
         self.inner.get(target)?.get(digest)?.repos.get(repo)
     }
 
-    /// Whether the blob is present (Verified or Completed) at the given (target, repo).
+    /// Whether the blob is present (Verified, Completed or Remembered) at the given (target, repo).
     pub(crate) fn blob_present_at(
         &self,
         target: &str,
@@ -267,9 +267,8 @@ impl BlobDedupMap {
         }
     }
 
-    /// Mark every present state as [`RepoBlobState::Remembered`], for a map
-    /// loaded from disk.
-    pub(crate) fn into_remembered(mut self) -> Self {
+    /// Mark every present state as [`RepoBlobState::Remembered`].
+    pub(crate) fn remember_present(&mut self) {
         for state in self
             .inner
             .values_mut()
@@ -280,7 +279,6 @@ impl BlobDedupMap {
                 *state = RepoBlobState::Remembered;
             }
         }
-        self
     }
 
     /// Return a copy with only persistable per-(repo) state entries.
@@ -376,16 +374,16 @@ mod tests {
         RepositoryName::new(name).unwrap()
     }
 
-    /// A loaded map's present states become `Remembered`, which a missing
-    /// batch answer drops. State this run recorded, at the same repo or
+    /// A new run marks present states `Remembered`, which a missing batch
+    /// answer drops. State this run recorded, at the same repo or
     /// another, is kept, and `Remembered` persists as `Verified`.
     #[test]
     fn forgets_only_remembered_state() {
         let d = test_digest();
-        let mut loaded = BlobDedupMap::default();
-        loaded.set_blob_completed("reg.io", &d, &repo("x"));
-        loaded.set_blob_verified("reg.io", &d, &repo("y"));
-        let mut map = loaded.into_remembered();
+        let mut map = BlobDedupMap::default();
+        map.set_blob_completed("reg.io", &d, &repo("x"));
+        map.set_blob_verified("reg.io", &d, &repo("y"));
+        map.remember_present();
         assert_eq!(
             map.repo_state("reg.io", &d, &repo("x")),
             Some(&RepoBlobState::Remembered)

@@ -266,11 +266,11 @@ Corruption detection uses a CRC32 checksum appended to the file. Failed check di
 
 ### Lazy invalidation
 
-An entry loaded from disk is `Remembered`: present for skip and mount decisions, but not confirmed by this run. On a target with a batch checker (ECR), each image's blobs are checked in one call before transfer, and a blob the check finds missing drops its `Remembered` entry for that repository, so the blob is pushed again. That covers a repository deleted and recreated, lifecycle policies expiring layers and registry GC between runs, with no extra request. An entry this run recorded is kept, because the batch check can lag an upload made seconds before it. `Remembered` is persisted as `Verified`.
+Each run starts by marking every present entry `Remembered`: present for skip and mount decisions, but not confirmed by this run. That covers a cache loaded from disk and one watch mode keeps in memory between cycles. On a target with a batch checker (ECR), each image's blobs are checked in one call before transfer, and a blob the check does not confirm present drops its `Remembered` entry for that repository: a missing blob is pushed again, and a blob the check could not answer for, or every blob when the check fails, gets a HEAD. That covers a repository deleted and recreated, lifecycle policies expiring layers and registry GC between runs, with no extra request when the check answers. An entry this run recorded is kept, because the batch check can lag an upload made seconds before it. `Remembered` is persisted as `Verified`.
 
 A stale mount source is excluded by `mark_blob_repo_stale` (see [bounded-deadline mount-source resolution](/design/engine#bounded-deadline-mount-source-resolution)). `Failed` state is never persisted, so it never carries into a new sync.
 
-On a target without a batch checker, a `Remembered` blob is skipped without a check. If that registry has lost the blob, the manifest push is refused until `global.cache_ttl` expires the cache file.
+On a target without a batch checker, a `Remembered` blob is skipped without a check. If that registry has lost the blob, it refuses the manifest, and the run drops the `Remembered` entries for that image's blobs at that repository. The image fails that run, and the next run checks those blobs and pushes them.
 
 ### Persistence rules
 

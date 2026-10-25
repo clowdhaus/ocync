@@ -860,6 +860,7 @@ impl SyncEngine {
     ) -> SyncReport {
         let run_start = Instant::now();
         let run_id = Uuid::now_v7();
+        cache.borrow_mut().remember_present();
 
         // Synchronous writes are fine: current_thread runtime, file is tiny.
         let mut timing_file = std::env::var("OCYNC_TIMING_FILE")
@@ -1859,10 +1860,16 @@ async fn execute_item(
         }
         Err(err) => {
             // Unblock any followers waiting for this repo's manifest commit
-            // so they fall through to HEAD+push.
-            cache
-                .borrow_mut()
-                .notify_repo_failed(&item.target_name, &item.target.repo);
+            // so they fall through to HEAD+push. A registry that lost a blob
+            // an earlier run's cache still lists refuses the manifest, so
+            // those entries are dropped and the next run checks the blobs.
+            {
+                let mut c = cache.borrow_mut();
+                c.notify_repo_failed(&item.target_name, &item.target.repo);
+                for blob in blobs_from_manifest(&item.source_data) {
+                    c.forget_remembered_blob(&item.target_name, &blob.digest, &item.target.repo);
+                }
+            }
 
             if is_immutable_tag_error(&err) {
                 debug!(
@@ -2286,12 +2293,11 @@ async fn transfer_image_blobs(
                 // gets its HEAD.
                 let total = all_digests.len();
                 let checked: HashSet<Digest> = all_digests
-                    .into_iter()
+                    .iter()
                     .filter(|d| existence.is_known(d))
+                    .cloned()
                     .collect();
                 let available = existence.into_available();
-                let missing: Vec<&Digest> =
-                    checked.iter().filter(|d| !available.contains(*d)).collect();
                 debug!(
                     target_name = %ctx.target_name,
                     repo = %ctx.target_repo,
@@ -2301,15 +2307,15 @@ async fn transfer_image_blobs(
                     "batch check pre-populated cache"
                 );
                 let mut c = ctx.cache.borrow_mut();
-                // A blob the check finds missing is not trusted from an
-                // earlier run's cache: the repository may have lost it.
-                for digest in missing {
+                // Only a blob the check confirms present is trusted: an
+                // earlier run's entry for any other is dropped, since the
+                // repository may have lost it.
+                for digest in all_digests.iter().filter(|d| !available.contains(*d)) {
                     c.forget_remembered_blob(ctx.target_name, digest, ctx.target_repo);
                 }
                 for digest in available {
                     c.set_blob_verified(ctx.target_name, digest, ctx.target_repo.to_owned());
                 }
-                drop(c);
                 checked
             }
             Err(e) => {
@@ -2318,7 +2324,12 @@ async fn transfer_image_blobs(
                     error = %e,
                     "batch check failed, falling back to per-blob HEAD"
                 );
-                // Graceful degradation: continue with per-blob HEAD checks.
+                // An earlier run's entries are dropped so the per-blob HEAD
+                // runs for them too.
+                let mut c = ctx.cache.borrow_mut();
+                for digest in &all_digests {
+                    c.forget_remembered_blob(ctx.target_name, digest, ctx.target_repo);
+                }
                 HashSet::new()
             }
         }
