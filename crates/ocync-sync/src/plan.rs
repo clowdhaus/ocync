@@ -30,12 +30,17 @@ pub enum RepoBlobState {
     /// Excluded from future mount-source selection regardless of how it
     /// was reached. Transient; stripped before persistence.
     Failed(String),
+    /// Present according to an earlier run, not yet confirmed by this one.
+    /// A batch check that finds the blob missing, or a manifest refused for
+    /// a missing blob, drops it, since the repository may have lost it.
+    /// Persisted as `Verified`.
+    Remembered,
 }
 
 impl RepoBlobState {
     /// Whether this state means "blob is present at this repo for skip purposes".
     pub fn is_present(&self) -> bool {
-        matches!(self, Self::Verified | Self::Completed)
+        matches!(self, Self::Verified | Self::Completed | Self::Remembered)
     }
 
     /// Whether this state means "blob is unusable at this repo for mount purposes".
@@ -46,7 +51,10 @@ impl RepoBlobState {
     /// Whether this state means "still active or resolvable in this run".
     /// Used by `unresolved_watches_for` to filter dead-end candidates.
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Verified | Self::Uploading | Self::Completed)
+        matches!(
+            self,
+            Self::Verified | Self::Uploading | Self::Completed | Self::Remembered
+        )
     }
 }
 
@@ -118,7 +126,7 @@ impl BlobDedupMap {
         self.inner.get(target)?.get(digest)?.repos.get(repo)
     }
 
-    /// Whether the blob is present (Verified or Completed) at the given (target, repo).
+    /// Whether the blob is present (Verified, Completed or Remembered) at the given (target, repo).
     pub(crate) fn blob_present_at(
         &self,
         target: &str,
@@ -242,17 +250,57 @@ impl BlobDedupMap {
         }
     }
 
-    /// Remove the entry for the given blob at the target.
-    /// Used for lazy invalidation when a complete cache entry is stale.
-    pub(crate) fn invalidate(&mut self, target: &str, digest: &Digest) {
-        if let Some(index) = self.inner.get_mut(target) {
-            index.remove(digest);
+    /// Drop `repo`'s state for the blob if it is only [`RepoBlobState::Remembered`],
+    /// returning whether it was. State this run recorded is kept: a batch
+    /// check can lag an upload made seconds before it.
+    pub(crate) fn forget_remembered(
+        &mut self,
+        target: &str,
+        digest: &Digest,
+        repo: &RepositoryName,
+    ) -> bool {
+        let Some(info) = self.inner.get_mut(target).and_then(|m| m.get_mut(digest)) else {
+            return false;
+        };
+        if info.repos.get(repo) != Some(&RepoBlobState::Remembered) {
+            return false;
+        }
+        info.repos.remove(repo);
+        true
+    }
+
+    /// Record the blob as `Verified` at `repo`, which a manifest committed
+    /// there proves. A live upload claim, presence this run recorded, and a
+    /// `Failed` mark are left alone: the mark also excludes a mount source
+    /// the registry refused, which a commit does not make mountable.
+    pub(crate) fn confirm(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
+        if let None | Some(RepoBlobState::Remembered) = self.repo_state(target, digest, repo) {
+            self.set_blob_verified(target, digest, repo);
         }
     }
 
+    /// Start a run from what persisting and reloading would give: every
+    /// present state becomes [`RepoBlobState::Remembered`], and `Uploading`,
+    /// `Failed` and upload claims are dropped.
+    pub(crate) fn remember_present(&mut self) {
+        for index in self.inner.values_mut() {
+            index.retain(|_, info| {
+                info.repos.retain(|_, state| state.is_present());
+                for state in info.repos.values_mut() {
+                    *state = RepoBlobState::Remembered;
+                }
+                info.claim = None;
+                info.claim_notify = None;
+                !info.repos.is_empty()
+            });
+        }
+        self.inner.retain(|_, index| !index.is_empty());
+    }
+
     /// Return a copy with only persistable per-(repo) state entries.
-    /// `Verified` and `Completed` survive; `Uploading` and `Failed` are stripped.
-    /// The `claim` slot is also stripped.
+    /// `Verified` and `Completed` survive and `Remembered` is kept as
+    /// `Verified`; `Uploading` and `Failed` are stripped. The `claim` slot is
+    /// also stripped.
     pub(crate) fn filter_persistable(&self) -> BlobDedupMap {
         let inner = self
             .inner
@@ -264,10 +312,18 @@ impl BlobDedupMap {
                         let kept_repos: BTreeMap<RepositoryName, RepoBlobState> = info
                             .repos
                             .iter()
-                            .filter(|(_, state)| {
-                                matches!(state, RepoBlobState::Verified | RepoBlobState::Completed)
+                            .filter_map(|(r, state)| {
+                                let kept = match state {
+                                    RepoBlobState::Verified | RepoBlobState::Remembered => {
+                                        RepoBlobState::Verified
+                                    }
+                                    RepoBlobState::Completed => RepoBlobState::Completed,
+                                    RepoBlobState::Uploading | RepoBlobState::Failed(_) => {
+                                        return None;
+                                    }
+                                };
+                                Some((r.clone(), kept))
                             })
-                            .map(|(r, s)| (r.clone(), s.clone()))
                             .collect();
                         if kept_repos.is_empty() {
                             None
@@ -332,6 +388,111 @@ mod tests {
 
     fn repo(name: &str) -> RepositoryName {
         RepositoryName::new(name).unwrap()
+    }
+
+    /// A new run marks present states `Remembered`, which a missing batch
+    /// answer drops. State this run recorded, at the same repo or
+    /// another, is kept, and `Remembered` persists as `Verified`.
+    #[test]
+    fn forgets_only_remembered_state() {
+        let d = test_digest();
+        let mut map = BlobDedupMap::default();
+        map.set_blob_completed("reg.io", &d, &repo("x"));
+        map.set_blob_verified("reg.io", &d, &repo("y"));
+        map.remember_present();
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Remembered)
+        );
+        assert!(map.blob_present_at("reg.io", &d, &repo("x")));
+        assert_eq!(
+            map.filter_persistable()
+                .repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Verified)
+        );
+
+        map.forget_remembered("reg.io", &d, &repo("x"));
+        assert!(!map.blob_present_at("reg.io", &d, &repo("x")));
+        assert!(
+            map.blob_present_at("reg.io", &d, &repo("y")),
+            "another repo is untouched"
+        );
+
+        map.set_blob_completed("reg.io", &d, &repo("x"));
+        map.forget_remembered("reg.io", &d, &repo("x"));
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Completed),
+            "state this run recorded is kept"
+        );
+
+        map.remember_present();
+        map.confirm("reg.io", &d, &repo("x"));
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Verified)
+        );
+        map.forget_remembered("reg.io", &d, &repo("y"));
+        map.confirm("reg.io", &d, &repo("y"));
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("y")),
+            Some(&RepoBlobState::Verified),
+            "a commit records a blob a refusal dropped"
+        );
+        assert!(matches!(
+            map.claim_blob_upload("reg.io", &d, &repo("z")),
+            ClaimAction::Claimed
+        ));
+        map.confirm("reg.io", &d, &repo("z"));
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("z")),
+            Some(&RepoBlobState::Uploading),
+            "a commit never overwrites a live upload claim"
+        );
+        map.set_blob_failed("reg.io", &d, &repo("w"), "mount refused".into());
+        map.confirm("reg.io", &d, &repo("w"));
+        assert!(
+            map.repo_state("reg.io", &d, &repo("w"))
+                .is_some_and(RepoBlobState::is_failed),
+            "a commit keeps a refused mount source excluded"
+        );
+    }
+
+    /// A new run, such as a watch-mode cycle, starts from what persisting
+    /// and reloading would give: a failure, an upload or a claim from the
+    /// last run does not carry over.
+    #[test]
+    fn run_start_drops_what_persistence_drops() {
+        let d = test_digest();
+        let other: Digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap();
+        let mut map = BlobDedupMap::default();
+        map.set_blob_completed("reg.io", &d, &repo("x"));
+        map.set_blob_failed("reg.io", &d, &repo("y"), "mount refused".into());
+        assert!(matches!(
+            map.claim_blob_upload("reg.io", &d, &repo("z")),
+            ClaimAction::Claimed
+        ));
+        map.set_blob_failed("reg.io", &other, &repo("x"), "upload failed".into());
+
+        map.remember_present();
+
+        assert_eq!(
+            map.repo_state("reg.io", &d, &repo("x")),
+            Some(&RepoBlobState::Remembered)
+        );
+        assert_eq!(map.repo_state("reg.io", &d, &repo("y")), None);
+        assert_eq!(map.repo_state("reg.io", &d, &repo("z")), None);
+        assert!(
+            matches!(
+                map.claim_blob_upload("reg.io", &d, &repo("y")),
+                ClaimAction::Claimed
+            ),
+            "the last run's claim is released"
+        );
+        assert_eq!(map.repo_state("reg.io", &other, &repo("x")), None);
     }
 
     /// Per-(repo) state independence: writing Y's state must not disturb X's

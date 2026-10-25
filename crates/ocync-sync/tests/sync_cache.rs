@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ocync_distribution::spec::{MediaType, RepositoryName};
 use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
-use ocync_sync::ImageStatus;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{RegistryAlias, TagPair, TargetEntry};
-use wiremock::matchers::{method, path, query_param};
+use ocync_sync::{ErrorKind, ImageStatus};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use helpers::*;
@@ -1413,6 +1413,507 @@ async fn sync_batch_checker_empty_result_transfers_all() {
     );
 }
 
+/// The answer refusing a manifest because the registry lacks a blob it
+/// references.
+const MANIFEST_BLOB_UNKNOWN: &str =
+    r#"{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#;
+
+/// The cache an earlier run left, as watch mode keeps it between cycles:
+/// each of `digests` present at `repo` on target `target`.
+fn earlier_run_cache(digests: &[&Digest]) -> Rc<std::cell::RefCell<TransferStateCache>> {
+    let cache = empty_cache();
+    for digest in digests {
+        cache.borrow_mut().set_blob_completed(
+            "target",
+            (*digest).clone(),
+            RepositoryName::new("repo").unwrap(),
+        );
+    }
+    cache
+}
+
+/// What the batch check answers about the blobs an earlier run cached.
+#[derive(Clone, Copy, Debug)]
+enum BatchAnswer {
+    /// Checked and missing.
+    Missing,
+    /// Left unknown by a partial failure.
+    Unknown,
+    /// The whole call failed.
+    Failed,
+}
+
+/// An earlier run's cache says both blobs are at the target, but the
+/// repository has lost them (deleted and recreated, or layers expired). A
+/// batch check that finds them missing wins over the cache with no further
+/// request. One that cannot answer sends a HEAD to the registry per blob
+/// rather than trusting the cache. Either way each blob is pulled once and
+/// pushed; trusting the cache would skip them and leave a manifest the
+/// registry refuses.
+#[tokio::test]
+async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
+    for answer in [
+        BatchAnswer::Missing,
+        BatchAnswer::Unknown,
+        BatchAnswer::Failed,
+    ] {
+        let source_server = MockServer::start().await;
+        let target_server = MockServer::start().await;
+        let config_data = b"config-stale-cache";
+        let layer_data = b"layer-stale-cache";
+        let parts = ManifestBuilder::new(config_data).layer(layer_data).build();
+        let digests = [&parts.config_desc.digest, &parts.layer_descs[0].digest];
+
+        mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
+        for (digest, data) in digests.into_iter().zip([&config_data[..], &layer_data[..]]) {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/repo/blobs/{digest}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(data.to_vec())
+                        .insert_header("content-length", data.len().to_string()),
+                )
+                .expect(1)
+                .mount(&source_server)
+                .await;
+            Mock::given(method("HEAD"))
+                .and(path(format!("/v2/repo/blobs/{digest}")))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(match answer {
+                    BatchAnswer::Missing => 0,
+                    BatchAnswer::Unknown | BatchAnswer::Failed => 1,
+                })
+                .mount(&target_server)
+                .await;
+        }
+        mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+        mount_blob_push(&target_server, "repo").await;
+        mount_manifest_push(&target_server, "repo", "v1").await;
+
+        let (checker, batch_call_count): (Rc<dyn BatchBlobChecker>, _) = match answer {
+            BatchAnswer::Missing | BatchAnswer::Unknown => {
+                let (mut checker, count) = MockBatchChecker::new("repo", HashSet::new());
+                if matches!(answer, BatchAnswer::Unknown) {
+                    checker.unknown = digests.into_iter().cloned().collect();
+                }
+                (Rc::new(checker), count)
+            }
+            BatchAnswer::Failed => {
+                let (checker, count) = FailingBatchChecker::new("repo");
+                (Rc::new(checker), count)
+            }
+        };
+        let mapping = resolved_mapping(
+            mock_client(&source_server),
+            "repo",
+            "repo",
+            vec![TargetEntry {
+                name: RegistryAlias::new("target"),
+                client: mock_client(&target_server),
+                batch_checker: Some(checker),
+                existing_tags: HashSet::new(),
+            }],
+            vec![TagPair::same("v1")],
+        );
+        let report = run_sync_with_cache(vec![mapping], earlier_run_cache(&digests)).await;
+
+        assert_eq!(batch_call_count.load(Ordering::Relaxed), 1, "{answer:?}");
+        assert_status!(report, 0, ImageStatus::Synced);
+        assert_eq!(
+            report.stats.blobs_skipped, 0,
+            "{answer:?}: the stale cache must not skip"
+        );
+        assert_eq!(report.stats.blobs_transferred, 2, "{answer:?}");
+        assert_eq!(
+            report.stats.bytes_transferred,
+            (config_data.len() + layer_data.len()) as u64,
+            "{answer:?}",
+        );
+    }
+}
+
+/// What the cache holds when a run starts.
+#[derive(Clone, Copy, Debug)]
+enum CacheAtStart {
+    /// An earlier run recorded both blobs at the target.
+    EarlierRun,
+    /// An earlier run recorded only the layer, so the config is sent before
+    /// the refusal.
+    LayerOnly,
+    /// Nothing.
+    Empty,
+}
+
+/// How often the target refuses the manifest before accepting it.
+#[derive(Clone, Copy, Debug)]
+enum Refusals {
+    Once,
+    Always,
+}
+
+/// Without a batch check the earlier run's cache is trusted, so no blob gets
+/// a HEAD. A manifest refused as invalid (400 or 404, whatever code the
+/// registry names for the lost blob) drops those entries, and the run copies
+/// the blobs again and pushes the manifest once more, so the image syncs in
+/// the same run. A refusal for access, throttling or a server fault, or one
+/// that dropped nothing from the cache, is not repaired, and the manifest is
+/// pushed again at most once.
+#[tokio::test]
+async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
+    const MANIFEST_INVALID: &str =
+        r#"{"errors":[{"code":"MANIFEST_INVALID","message":"layer missing"}]}"#;
+    const DENIED: &str = r#"{"errors":[{"code":"DENIED","message":"denied"}]}"#;
+    /// One refusal scenario and what the run must do.
+    struct Case {
+        cache: CacheAtStart,
+        status: u16,
+        body: &'static str,
+        refusals: Refusals,
+        synced: bool,
+        blob_heads: u64,
+        manifest_puts: usize,
+        blobs_sent: u64,
+    }
+    let repaired = |cache, body| Case {
+        cache,
+        status: 400,
+        body,
+        refusals: Refusals::Once,
+        synced: true,
+        blob_heads: 2,
+        manifest_puts: 2,
+        blobs_sent: 2,
+    };
+    let cases = [
+        repaired(CacheAtStart::EarlierRun, MANIFEST_BLOB_UNKNOWN),
+        repaired(CacheAtStart::EarlierRun, MANIFEST_INVALID),
+        repaired(CacheAtStart::LayerOnly, MANIFEST_BLOB_UNKNOWN),
+        Case {
+            refusals: Refusals::Always,
+            synced: false,
+            ..repaired(CacheAtStart::EarlierRun, MANIFEST_BLOB_UNKNOWN)
+        },
+        Case {
+            status: 403,
+            synced: false,
+            blob_heads: 0,
+            manifest_puts: 1,
+            blobs_sent: 0,
+            ..repaired(CacheAtStart::EarlierRun, DENIED)
+        },
+        Case {
+            refusals: Refusals::Always,
+            synced: false,
+            manifest_puts: 1,
+            ..repaired(CacheAtStart::Empty, MANIFEST_BLOB_UNKNOWN)
+        },
+    ];
+    for Case {
+        cache: cache_at_start,
+        status,
+        body,
+        refusals,
+        synced,
+        blob_heads: heads,
+        manifest_puts: puts,
+        blobs_sent: sent,
+    } in cases
+    {
+        let case = format!("{cache_at_start:?} {status} {refusals:?}");
+        let source_server = MockServer::start().await;
+        let target_server = MockServer::start().await;
+        let config_data = b"config-refused";
+        let layer_data = b"layer-refused";
+        let parts = ManifestBuilder::new(config_data).layer(layer_data).build();
+        let digests = [&parts.config_desc.digest, &parts.layer_descs[0].digest];
+        parts.mount_source(&source_server, "repo", "v1").await;
+        mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+        Mock::given(method("HEAD"))
+            .and(path_regex("^/v2/repo/blobs/"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(heads)
+            .mount(&target_server)
+            .await;
+        mount_blob_push(&target_server, "repo").await;
+        let refusal = Mock::given(method("PUT"))
+            .and(path("/v2/repo/manifests/v1"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body));
+        match refusals {
+            Refusals::Once => refusal.up_to_n_times(1),
+            Refusals::Always => refusal,
+        }
+        .mount(&target_server)
+        .await;
+        mount_manifest_push(&target_server, "repo", "v1").await;
+
+        let mapping = resolved_mapping(
+            mock_client(&source_server),
+            "repo",
+            "repo",
+            vec![target_entry("target", mock_client(&target_server))],
+            vec![TagPair::same("v1")],
+        );
+        let cache = match cache_at_start {
+            CacheAtStart::EarlierRun => earlier_run_cache(&digests),
+            CacheAtStart::LayerOnly => earlier_run_cache(&digests[1..]),
+            CacheAtStart::Empty => empty_cache(),
+        };
+        let report = run_sync_with_cache(vec![mapping], Rc::clone(&cache)).await;
+
+        assert_eq!(
+            matches!(report.images[0].status, ImageStatus::Synced),
+            synced,
+            "{case}: {:?}",
+            report.images[0].status
+        );
+        let manifest_puts = target_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == wiremock::http::Method::PUT && r.url.path() == "/v2/repo/manifests/v1"
+            })
+            .count();
+        assert_eq!(manifest_puts, puts, "{case}");
+        assert_eq!(report.stats.blobs_transferred, sent, "{case}");
+        assert_eq!(report.stats.blobs_skipped, 2 - sent, "{case}");
+        assert_eq!(
+            report.images[0].bytes_transferred,
+            if sent == 0 {
+                0
+            } else {
+                (config_data.len() + layer_data.len()) as u64
+            },
+            "{case}"
+        );
+        let repo = RepositoryName::new("repo").unwrap();
+        for digest in digests {
+            assert!(
+                cache.borrow().blob_present_at("target", digest, &repo),
+                "{case}: {digest}"
+            );
+        }
+    }
+}
+
+/// A repair whose blob copy fails reports that failure and does not push
+/// the manifest again: the registry would only refuse it once more.
+#[tokio::test]
+async fn sync_failed_repair_does_not_push_the_manifest_again() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let parts = ManifestBuilder::new(b"config-unrepaired")
+        .layer(b"layer-unrepaired")
+        .build();
+    parts.mount_source(&source_server, "repo", "v1").await;
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/manifests/v1"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(MANIFEST_BLOB_UNKNOWN))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::same("v1")],
+    );
+    let cache = earlier_run_cache(&[&parts.config_desc.digest, &parts.layer_descs[0].digest]);
+    let report = run_sync_with_cache(vec![mapping], cache).await;
+
+    match &report.images[0].status {
+        ImageStatus::Failed { kind, error, .. } => {
+            assert!(matches!(kind, ErrorKind::BlobTransfer), "{kind:?}: {error}");
+            assert!(
+                !error.contains("MANIFEST_BLOB_UNKNOWN"),
+                "the blob copy's failure is reported, not the refusal: {error}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+/// Two tags of one image share the blobs an earlier run cached and the
+/// registry has lost. Each tag's manifest is refused once. The first refusal
+/// drops the cached blobs; the other finds nothing left to drop but is
+/// repaired too, so both tags sync and each blob is sent once.
+#[tokio::test]
+async fn sync_refused_sibling_is_repaired_after_another_tasks_drop() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let parts = ManifestBuilder::new(b"config-siblings")
+        .layer(b"layer-siblings")
+        .build();
+    let tags = ["latest", "v1"];
+    for tag in tags {
+        parts.mount_source(&source_server, "repo", tag).await;
+        mount_manifest_head_not_found(&target_server, "repo", tag).await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/repo/manifests/{tag}")))
+            .respond_with(ResponseTemplate::new(400).set_body_string(MANIFEST_BLOB_UNKNOWN))
+            .up_to_n_times(1)
+            .mount(&target_server)
+            .await;
+        mount_manifest_push(&target_server, "repo", tag).await;
+    }
+    mount_blob_push(&target_server, "repo").await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        tags.into_iter().map(TagPair::same).collect(),
+    );
+    let cache = earlier_run_cache(&[&parts.config_desc.digest, &parts.layer_descs[0].digest]);
+    let report = run_sync_with_cache(vec![mapping], cache).await;
+
+    assert_eq!(report.stats.images_synced, 2, "{:?}", report.images);
+    assert_eq!(report.stats.blobs_transferred, 2, "each blob is sent once");
+    let blob_uploads = target_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST)
+        .count();
+    assert_eq!(blob_uploads, 2);
+}
+
+/// The repair runs for an index child too: a child refused for a blob an
+/// earlier run cached gets its blobs copied again and is pushed once more,
+/// before the index.
+#[tokio::test]
+async fn sync_refused_index_child_is_repaired_in_the_same_run() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let child = ManifestBuilder::new(b"config-child")
+        .layer(b"layer-child")
+        .build();
+    let index = IndexBuilder::new().manifest(&child, None).build();
+    index.mount_source(&source_server, "repo", "v1").await;
+    let child_manifest = format!("/v2/repo/manifests/{}", child.digest);
+    Mock::given(method("PUT"))
+        .and(path(child_manifest.as_str()))
+        .respond_with(ResponseTemplate::new(400).set_body_string(MANIFEST_BLOB_UNKNOWN))
+        .up_to_n_times(1)
+        .mount(&target_server)
+        .await;
+    index.mount_target(&target_server, "repo", "v1").await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::same("v1")],
+    );
+    let cache = earlier_run_cache(&[&child.config_desc.digest, &child.layer_descs[0].digest]);
+    let report = run_sync_with_cache(vec![mapping], cache).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    let child_pushes = target_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::PUT && r.url.path() == child_manifest)
+        .count();
+    assert_eq!(child_pushes, 2, "refused once, then pushed again");
+    assert_eq!(report.stats.blobs_transferred, 2);
+    assert_eq!(report.stats.blobs_skipped, 0);
+}
+
+/// A committed manifest proves its blobs are in the repository. When a
+/// second tag in the same repository is then refused for a lost blob, the
+/// layer the first tag's commit proved stays cached, so the repair resends
+/// only the blob the second tag alone references.
+#[tokio::test]
+async fn sync_committed_manifest_confirms_its_blobs() {
+    use ocync_sync::engine::SyncEngine;
+    use ocync_sync::progress::NullProgress;
+    use ocync_sync::staging::BlobStage;
+
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let first = ManifestBuilder::new(b"config-first")
+        .layer(b"shared-layer")
+        .build();
+    let second_config = b"config-second";
+    let second = ManifestBuilder::new(second_config)
+        .layer(b"shared-layer")
+        .build();
+    assert_eq!(first.layer_descs[0].digest, second.layer_descs[0].digest);
+    // The engine runs the second listed tag first at one image at a time,
+    // so the committed image is listed second. Were that order to change,
+    // the committed tag would find the shared layer dropped and have no blob
+    // push to fall back to, failing this test rather than passing on another
+    // path.
+    first
+        .mount_source(&source_server, "repo", "committed")
+        .await;
+    second.mount_source(&source_server, "repo", "refused").await;
+    for tag in ["committed", "refused"] {
+        mount_manifest_head_not_found(&target_server, "repo", tag).await;
+    }
+    mount_manifest_push(&target_server, "repo", "committed").await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/manifests/refused"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(MANIFEST_BLOB_UNKNOWN))
+        .up_to_n_times(1)
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo", "refused").await;
+    for (digest, heads) in [
+        (&second.config_desc.digest, 1),
+        (&first.layer_descs[0].digest, 0),
+    ] {
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/repo/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(heads)
+            .mount(&target_server)
+            .await;
+    }
+    mount_blob_push(&target_server, "repo").await;
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", mock_client(&target_server))],
+        vec![TagPair::same("refused"), TagPair::same("committed")],
+    );
+    let cache = earlier_run_cache(&[
+        &first.config_desc.digest,
+        &second.config_desc.digest,
+        &first.layer_descs[0].digest,
+    ]);
+    let report = SyncEngine::new(fast_retry(), 1)
+        .run(
+            vec![mapping],
+            Rc::clone(&cache),
+            BlobStage::disabled(),
+            &NullProgress,
+            None,
+        )
+        .await;
+
+    assert_eq!(report.stats.images_synced, 2);
+    assert_eq!(report.stats.blobs_transferred, 1);
+    assert_eq!(report.stats.bytes_transferred, second_config.len() as u64);
+    let repo = RepositoryName::new("repo").unwrap();
+    let cache = cache.borrow();
+    assert!(cache.blob_present_at("target", &first.layer_descs[0].digest, &repo));
+    assert!(cache.blob_present_at("target", &second.config_desc.digest, &repo));
+}
+
 /// Mixed batch/no-batch multi-target: one ECR target with a batch checker,
 /// one non-ECR target without. Both see the same image.
 ///
@@ -2130,9 +2631,9 @@ async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
     );
 }
 
-/// A repo-failed watch is cleared at the end of a run even when cache
-/// pruning is off, so the next run in the same process does not see a stale
-/// fired watch and wait on, or mount from, a repo that never committed.
+/// A repo-failed watch is cleared when a run starts, with cache pruning off
+/// too, so a run in the same process does not see a stale fired watch and
+/// wait on, or mount from, a repo that never committed.
 #[tokio::test]
 async fn run_clears_repo_watches_without_cache_pruning() {
     use ocync_sync::engine::SyncEngine;

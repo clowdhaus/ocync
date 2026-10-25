@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
+use crate::error::ManifestRefusal;
 use crate::progress::RunProgress;
 use crate::retry::{RetryConfig, count_retries, retries_made, with_retry};
 use crate::shared::{
@@ -383,6 +384,19 @@ struct TargetBlobOutcome {
     stats: BlobTransferStats,
     /// `Some` if a target-specific push failed. Other targets are unaffected.
     error: Option<crate::Error>,
+}
+
+impl TargetBlobOutcome {
+    /// Fold in a refused manifest's repair. A blob the repair sent was
+    /// skipped earlier on an earlier run's word, so it moves from skipped to
+    /// sent; one the repair skipped is already counted.
+    fn absorb_repair(&mut self, repair: &TargetBlobOutcome) {
+        let sent = repair.stats.transferred + repair.stats.mounted;
+        self.bytes_transferred += repair.bytes_transferred;
+        self.stats.skipped = self.stats.skipped.saturating_sub(sent);
+        self.stats.transferred += repair.stats.transferred;
+        self.stats.mounted += repair.stats.mounted;
+    }
 }
 
 /// Outcome of transferring a single blob to one target.
@@ -860,6 +874,7 @@ impl SyncEngine {
     ) -> SyncReport {
         let run_start = Instant::now();
         let run_id = Uuid::now_v7();
+        cache.borrow_mut().start_run();
 
         // Synchronous writes are fine: current_thread runtime, file is tiny.
         let mut timing_file = std::env::var("OCYNC_TIMING_FILE")
@@ -1234,7 +1249,6 @@ impl SyncEngine {
             cache_mut.prune_snapshots(&live_keys);
             cache_mut.prune_dedup(&live_targets);
         }
-        cache.borrow_mut().clear_notifies();
 
         let mut stats = compute_stats(&results);
         stats.discovery_cache_hits = discovery_counters.cache_hits;
@@ -1788,7 +1802,10 @@ async fn execute_item(
     }
 
     // Push manifests (children first, then top-level by tag).
-    match push_manifests(retry, &item, shared).await {
+    let outcome = RefCell::new(outcome);
+    let pushed = push_manifests(&ctx, &item, &outcome).await;
+    let outcome = outcome.into_inner();
+    match pushed {
         Ok(()) => {
             // Mark this repo as having a committed manifest so it becomes
             // a valid cross-repo mount source. ECR requires a committed
@@ -1864,7 +1881,7 @@ async fn execute_item(
                 .borrow_mut()
                 .notify_repo_failed(&item.target_name, &item.target.repo);
 
-            if is_immutable_tag_error(&err) {
+            if err.manifest_refusal() == Some(ManifestRefusal::ImmutableTag) {
                 debug!(
                     source_repo = %item.source.repo,
                     target_repo = %item.target.repo,
@@ -1890,7 +1907,12 @@ async fn execute_item(
                     source: item.source.to_string(),
                     target: item.target.to_string(),
                     status: ImageStatus::Failed {
-                        kind: ErrorKind::ManifestPush,
+                        // A refused manifest's repair can fail copying a blob.
+                        kind: if err.is_blob_transfer() {
+                            ErrorKind::BlobTransfer
+                        } else {
+                            ErrorKind::ManifestPush
+                        },
                         error: err.to_string(),
                         retries: retries_made(),
                         status_code: err.status_code().map(|s| s.as_u16()),
@@ -2286,8 +2308,9 @@ async fn transfer_image_blobs(
                 // gets its HEAD.
                 let total = all_digests.len();
                 let checked: HashSet<Digest> = all_digests
-                    .into_iter()
+                    .iter()
                     .filter(|d| existence.is_known(d))
+                    .cloned()
                     .collect();
                 let available = existence.into_available();
                 debug!(
@@ -2299,6 +2322,15 @@ async fn transfer_image_blobs(
                     "batch check pre-populated cache"
                 );
                 let mut c = ctx.cache.borrow_mut();
+                // Only a blob the check confirms present is trusted: an
+                // earlier run's entry for any other is dropped, since the
+                // repository may have lost it. A missing blob is pushed; one
+                // the check left unknown gets its HEAD.
+                c.forget_remembered_blobs(
+                    ctx.target_name,
+                    ctx.target_repo,
+                    all_digests.iter().filter(|d| !available.contains(*d)),
+                );
                 for digest in available {
                     c.set_blob_verified(ctx.target_name, digest, ctx.target_repo.to_owned());
                 }
@@ -2310,7 +2342,16 @@ async fn transfer_image_blobs(
                     error = %e,
                     "batch check failed, falling back to per-blob HEAD"
                 );
-                // Graceful degradation: continue with per-blob HEAD checks.
+                // Graceful degradation: every blob gets a per-blob HEAD, an
+                // earlier run's entries included. A HEAD goes to the
+                // registry, not the API that failed, and trusting those
+                // entries would instead wait out the manifest commit gate
+                // on that API for a blob that may be gone.
+                ctx.cache.borrow_mut().forget_remembered_blobs(
+                    ctx.target_name,
+                    ctx.target_repo,
+                    &all_digests,
+                );
                 HashSet::new()
             }
         }
@@ -2790,10 +2831,11 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
 /// wait entirely; setting `manifest_commit_wait` to `Duration::ZERO` also
 /// skips the wait.
 async fn push_manifests(
-    retry: &RetryConfig,
+    ctx: &TransferContext<'_>,
     item: &TransferTask,
-    shared: &PerRun,
+    outcome: &RefCell<TargetBlobOutcome>,
 ) -> Result<(), crate::Error> {
+    let (retry, shared) = (ctx.retry, ctx.shared);
     let target_repo = &item.target.repo;
     let source_data = &item.source_data;
     let child_key =
@@ -2831,7 +2873,7 @@ async fn push_manifests(
     // Push claimed children concurrently. join_all, not try_join_all: a
     // transient failure on one child must not cancel the others.
     let pushes = claimed.into_iter().map(|(child, guard)| async move {
-        let outcome = push_manifest(retry, item, &child.digest.to_string(), child)
+        let outcome = push_manifest(ctx, &child.digest.to_string(), child, Some(outcome))
             .await
             .map_err(Arc::new);
         guard.finish(outcome.clone());
@@ -2851,7 +2893,7 @@ async fn push_manifests(
     let awaited = held_elsewhere.iter().map(|child| {
         run_once(&shared.child_pushes, child_key(child), move || {
             let reference = child.digest.to_string();
-            async move { push_manifest(retry, item, &reference, child).await }
+            async move { push_manifest(ctx, &reference, child, Some(outcome)).await }
         })
     });
     for result in futures_util::future::join_all(awaited).await {
@@ -2859,7 +2901,7 @@ async fn push_manifests(
     }
 
     // Push top-level manifest by tag.
-    push_manifest(retry, item, &item.target.tag, &source_data.pull).await
+    push_manifest(ctx, &item.target.tag, &source_data.pull, Some(outcome)).await
 }
 
 /// Wait until the target reports every blob in `digests` visible, when it
@@ -2896,15 +2938,55 @@ async fn wait_for_commit(item: &TransferTask, retry: &RetryConfig, digests: &[Di
 
 /// Push `manifest` to the task's target repo as `reference` (a tag, or a
 /// child's digest).
+///
+/// A manifest refused as invalid, the answer to a blob the registry has
+/// lost, drops an earlier run's entries for its blobs. When any of its blobs
+/// was dropped this run, by this refusal or another task's, they are copied
+/// again and the manifest is pushed once more. The repair's blob work is
+/// folded into `outcome`, when the caller reports it.
 async fn push_manifest(
-    retry: &RetryConfig,
-    item: &TransferTask,
+    ctx: &TransferContext<'_>,
+    reference: &str,
+    manifest: &ManifestPull,
+    outcome: Option<&RefCell<TargetBlobOutcome>>,
+) -> Result<(), crate::Error> {
+    let blobs = child_blobs(manifest);
+    let pushed = put_manifest(ctx, reference, manifest).await;
+    if !settle_blobs(ctx, &blobs, &pushed) {
+        return pushed;
+    }
+    warn!(
+        target_name = %ctx.target_name,
+        target_repo = %ctx.target_repo,
+        reference,
+        "manifest refused for blobs an earlier run cached, copying them again"
+    );
+    // A blob still recorded present is skipped from the cache, so only the
+    // lost ones cost a request.
+    let repair = transfer_image_blobs(ctx, blobs, &HashMap::new()).await;
+    if let Some(outcome) = outcome {
+        outcome.borrow_mut().absorb_repair(&repair);
+    }
+    if let Some(err) = repair.error {
+        return Err(err);
+    }
+    // No commit wait here: a batch check settles every earlier run's entry
+    // before the push, so only a target without one reaches the repair. The
+    // blobs copied again are recorded present, so this push has nothing left
+    // to settle, and a second refusal is returned as is.
+    put_manifest(ctx, reference, manifest).await
+}
+
+/// Push `manifest` to the task's target repo as `reference`, retrying
+/// transient failures.
+async fn put_manifest(
+    ctx: &TransferContext<'_>,
     reference: &str,
     manifest: &ManifestPull,
 ) -> Result<(), crate::Error> {
-    with_retry(retry, "manifest push", || {
-        item.target_client.manifest_push(
-            &item.target.repo,
+    with_retry(ctx.retry, "manifest push", || {
+        ctx.target_client.manifest_push(
+            ctx.target_repo,
             reference,
             &manifest.media_type,
             &manifest.raw_bytes,
@@ -2916,6 +2998,38 @@ async fn push_manifest(
         reference: reference.to_owned(),
         source: e,
     })
+}
+
+/// Record what a manifest push proves about the blobs it references, and
+/// return whether it calls for a repair: a refusal as invalid of a manifest
+/// referencing a blob a refusal dropped from the cache this run. A
+/// committed manifest proves its blobs are in the repo.
+fn settle_blobs(
+    ctx: &TransferContext<'_>,
+    blobs: &[&Descriptor],
+    pushed: &Result<(), crate::Error>,
+) -> bool {
+    let digests = blobs.iter().map(|b| &b.digest);
+    let key = |digest: &Digest| target_key(ctx.target_name, ctx.target_repo, digest);
+    match pushed {
+        Ok(()) => {
+            ctx.cache
+                .borrow_mut()
+                .confirm_blobs(ctx.target_name, ctx.target_repo, digests);
+            false
+        }
+        Err(e) if e.manifest_refusal() == Some(ManifestRefusal::Invalid) => {
+            let dropped = ctx.cache.borrow_mut().forget_remembered_blobs(
+                ctx.target_name,
+                ctx.target_repo,
+                digests,
+            );
+            let mut lost = ctx.shared.lost_blobs.borrow_mut();
+            lost.extend(dropped.into_iter().map(key));
+            blobs.iter().any(|b| lost.contains(&key(&b.digest)))
+        }
+        Err(_) => false,
+    }
 }
 
 /// Discover referrers for a synced manifest and transfer matching artifacts.
@@ -3069,8 +3183,9 @@ async fn sync_artifact(
 
     wait_for_commit(item, retry, &blob_digests).await;
 
-    // Push artifact manifest by digest (not by tag).
-    push_manifest(retry, item, &artifact_digest_str, &artifact_pull)
+    // Push artifact manifest by digest (not by tag). Its blob work stays
+    // out of the image's report, like the copy above.
+    push_manifest(ctx, &artifact_digest_str, &artifact_pull, None)
         .await
         .map_err(|e| crate::Error::ArtifactSync {
             reference: artifact_digest_str.clone(),
@@ -3224,22 +3339,6 @@ fn compute_stats(images: &[ImageResult]) -> SyncStats {
         }
     }
     stats
-}
-
-/// Check if a manifest push error is an ECR immutable tag rejection.
-///
-/// ECR returns HTTP 400 with `ImageTagAlreadyExistsException` when a
-/// manifest push targets a tag that already exists on a repository with
-/// immutable tag settings enabled.
-fn is_immutable_tag_error(err: &crate::Error) -> bool {
-    matches!(
-        err,
-        crate::Error::Manifest {
-            source: ocync_distribution::Error::RegistryError { status, message },
-            ..
-        } if *status == http::StatusCode::BAD_REQUEST
-            && message.contains("ImageTagAlreadyExistsException")
-    )
 }
 
 #[cfg(test)]
@@ -3460,58 +3559,6 @@ mod tests {
             "a disk error must not fail other tasks"
         );
         assert!(!is_local_io(&registry));
-    }
-
-    #[test]
-    fn immutable_tag_error_detected() {
-        let err = crate::Error::Manifest {
-            reference: "v1.0".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::BAD_REQUEST,
-                message: "ImageTagAlreadyExistsException: tag already exists".into(),
-            },
-        };
-        assert!(is_immutable_tag_error(&err));
-    }
-
-    #[test]
-    fn non_immutable_400_not_detected() {
-        let err = crate::Error::Manifest {
-            reference: "v1.0".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::BAD_REQUEST,
-                message: "some other 400 error".into(),
-            },
-        };
-        assert!(!is_immutable_tag_error(&err));
-    }
-
-    #[test]
-    fn non_400_not_detected_as_immutable() {
-        let err = crate::Error::Manifest {
-            reference: "v1.0".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::INTERNAL_SERVER_ERROR,
-                message: "ImageTagAlreadyExistsException".into(),
-            },
-        };
-        assert!(!is_immutable_tag_error(&err));
-    }
-
-    #[test]
-    fn blob_error_not_detected_as_immutable() {
-        let digest: ocync_distribution::Digest =
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                .parse()
-                .unwrap();
-        let err = crate::Error::BlobTransfer {
-            digest,
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::BAD_REQUEST,
-                message: "ImageTagAlreadyExistsException".into(),
-            },
-        };
-        assert!(!is_immutable_tag_error(&err));
     }
 
     // --- elect_leaders tests ---

@@ -6,7 +6,7 @@ mod helpers;
 
 use std::rc::Rc;
 
-use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType};
+use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
 use ocync_sync::engine::{ResolvedArtifacts, ResolvedMapping, TagPair};
 use ocync_sync::{ErrorKind, ImageStatus};
 use wiremock::matchers::{method, path};
@@ -706,6 +706,78 @@ async fn artifact_transfer_failure_reports_artifact_sync_error() {
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+}
+
+/// An earlier run's cache lists an artifact's blobs at the target, but the
+/// registry has lost them and refuses the artifact manifest for a missing
+/// blob. As for an image, the run copies the artifact's blobs again and
+/// pushes its manifest once more, so the image syncs in the same run.
+#[tokio::test]
+async fn artifact_refused_for_a_lost_blob_is_repaired_in_the_same_run() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let parent = ManifestBuilder::new(b"lost-parent-config")
+        .layer(b"lost-parent-layer")
+        .build();
+    parent.mount_source(&source_server, "repo", "v1.0.0").await;
+    let sig = ArtifactBuilder::new(b"lost-sig-config", b"lost-sig-layer").build();
+    let referrers = ReferrersIndexBuilder::new().artifact(&sig).build();
+    mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
+    sig.mount_source(&source_server, "repo").await;
+    let sig_manifest = format!("/v2/repo/manifests/{}", sig.digest);
+    Mock::given(method("PUT"))
+        .and(path(sig_manifest.as_str()))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#,
+        ))
+        .up_to_n_times(1)
+        .mount(&target_server)
+        .await;
+    parent.mount_target(&target_server, "repo", "v1.0.0").await;
+    sig.mount_target(&target_server, "repo").await;
+
+    let repo = RepositoryName::new("repo").unwrap();
+    let sig_blobs = [&sig.config_desc.digest, &sig.layer_desc.digest];
+    let cache = empty_cache();
+    for digest in sig_blobs {
+        cache
+            .borrow_mut()
+            .set_blob_completed("target", digest.clone(), repo.clone());
+    }
+    let mapping = ResolvedMapping {
+        artifacts_config: Rc::new(ResolvedArtifacts::default()),
+        ..mapping_from_servers(
+            &source_server,
+            &target_server,
+            "repo",
+            vec![TagPair::same("v1.0.0")],
+        )
+    };
+    let report = run_sync_with_cache(vec![mapping], Rc::clone(&cache)).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    let requests = target_server.received_requests().await.unwrap();
+    let pushes_of = |p: &str| {
+        requests
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::PUT && r.url.path() == p)
+            .count()
+    };
+    assert_eq!(
+        pushes_of(&sig_manifest),
+        2,
+        "refused once, then pushed again"
+    );
+    let sig_heads = requests
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::HEAD
+                && sig_blobs
+                    .iter()
+                    .any(|d| r.url.path() == format!("/v2/repo/blobs/{d}"))
+        })
+        .count();
+    assert_eq!(sig_heads, 2, "each dropped blob is checked again once");
 }
 
 /// When the same image is synced to two targets and the referrers API

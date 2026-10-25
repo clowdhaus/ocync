@@ -92,6 +92,35 @@ pub enum Error {
     Shared(Arc<Error>),
 }
 
+/// The error code ECR answers a push to an immutable tag that is already
+/// set with.
+const ECR_IMMUTABLE_TAG_CODE: &str = "ImageTagAlreadyExistsException";
+
+/// OCI distribution-spec error codes that refuse a manifest for something
+/// other than a blob the registry lacks.
+const CODES_NOT_ABOUT_BLOBS: [&str; 9] = [
+    "DENIED",
+    "DIGEST_INVALID",
+    "MANIFEST_UNKNOWN",
+    "NAME_INVALID",
+    "NAME_UNKNOWN",
+    "SIZE_INVALID",
+    "TAG_INVALID",
+    "UNAUTHORIZED",
+    "UNSUPPORTED",
+];
+
+/// Why a registry refused a manifest push.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManifestRefusal {
+    /// ECR refused it because the tag is immutable and already set.
+    ImmutableTag,
+    /// Refused as invalid (HTTP 400 or 404). A registry that lacks a
+    /// referenced blob answers this way, though not all with the same error
+    /// code, so only codes plainly about something else rule it out.
+    Invalid,
+}
+
 impl Error {
     /// Extract the HTTP status code from the underlying distribution error, if any.
     pub fn status_code(&self) -> Option<http::StatusCode> {
@@ -104,6 +133,39 @@ impl Error {
         }
     }
 
+    /// Why the registry refused a manifest push, when the engine acts on
+    /// the reason. Throttling, access and server errors are `None`.
+    pub(crate) fn manifest_refusal(&self) -> Option<ManifestRefusal> {
+        let Self::Manifest {
+            source: ocync_distribution::Error::RegistryError { status, message },
+            ..
+        } = self
+        else {
+            return None;
+        };
+        match *status {
+            http::StatusCode::BAD_REQUEST if message.contains(ECR_IMMUTABLE_TAG_CODE) => {
+                Some(ManifestRefusal::ImmutableTag)
+            }
+            http::StatusCode::BAD_REQUEST | http::StatusCode::NOT_FOUND => {
+                let mut codes = crate::retry::oci_error_codes(message).peekable();
+                let about_something_else = codes.peek().is_some()
+                    && codes.all(|code| CODES_NOT_ABOUT_BLOBS.contains(&code.as_str()));
+                (!about_something_else).then_some(ManifestRefusal::Invalid)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a blob copy failed, rather than a manifest operation.
+    pub(crate) fn is_blob_transfer(&self) -> bool {
+        match self {
+            Self::BlobTransfer { .. } => true,
+            Self::Shared(err) => err.is_blob_transfer(),
+            _ => false,
+        }
+    }
+
     /// Whether this error represents a required-artifacts-missing condition.
     pub fn is_required_artifacts_missing(&self) -> bool {
         matches!(self, Self::RequiredArtifactsMissing { .. })
@@ -113,6 +175,88 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest_error(status: http::StatusCode, message: &str) -> Error {
+        Error::Manifest {
+            reference: "v1.0".into(),
+            source: ocync_distribution::Error::RegistryError {
+                status,
+                message: message.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn classifies_manifest_refusals() {
+        use http::StatusCode;
+        let immutable = format!("{ECR_IMMUTABLE_TAG_CODE}: tag already exists");
+        let cases = [
+            (
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_BLOB_UNKNOWN",
+                Some(ManifestRefusal::Invalid),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                Some(ManifestRefusal::Invalid),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                Some(ManifestRefusal::Invalid),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                &immutable,
+                Some(ManifestRefusal::ImmutableTag),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"errors":[{"code":"BLOB_UNKNOWN"},{"code":"NAME_UNKNOWN"}]}"#,
+                Some(ManifestRefusal::Invalid),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"errors":[{"code":"NAME_UNKNOWN","message":"repository name not known"}]}"#,
+                None,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"errors":[{"code":"TAG_INVALID"},{"code":"UNSUPPORTED"}]}"#,
+                None,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"errors":[{"code":"DENIED"}]}"#,
+                None,
+            ),
+            (StatusCode::FORBIDDEN, "DENIED", None),
+            (StatusCode::TOO_MANY_REQUESTS, "TOOMANYREQUESTS", None),
+            (StatusCode::INTERNAL_SERVER_ERROR, &immutable, None),
+        ];
+        for (status, message, refusal) in cases {
+            assert_eq!(
+                manifest_error(status, message).manifest_refusal(),
+                refusal,
+                "{status} {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_error_is_not_a_manifest_refusal() {
+        let err = Error::BlobTransfer {
+            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap(),
+            source: ocync_distribution::Error::RegistryError {
+                status: http::StatusCode::BAD_REQUEST,
+                message: ECR_IMMUTABLE_TAG_CODE.into(),
+            },
+        };
+        assert_eq!(err.manifest_refusal(), None);
+    }
 
     #[test]
     fn display_invalid_glob() {

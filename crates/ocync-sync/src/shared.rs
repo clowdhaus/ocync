@@ -6,8 +6,8 @@
 //! one run, so a failure or a target-side deletion never carries into the next.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::rc::Rc;
@@ -234,6 +234,10 @@ pub(crate) struct PerRun {
     /// blob between the same repos reports this error instead of repeating
     /// the copy.
     pub(crate) blob_failures: RefCell<HashMap<CopyKey, Arc<crate::Error>>>,
+    /// Blobs a manifest refusal dropped from the cache in this run. A
+    /// manifest referencing one is repaired even when another task's refusal
+    /// did the dropping.
+    pub(crate) lost_blobs: RefCell<HashSet<TargetDigestKey>>,
 }
 
 #[cfg(test)]

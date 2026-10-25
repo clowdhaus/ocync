@@ -149,7 +149,7 @@ impl TransferStateCache {
         self.dedup.is_empty() && self.snapshots.is_empty()
     }
 
-    /// Whether the blob is present (Verified or Completed) at the given (target, repo).
+    /// Whether the blob is present (Verified, Completed or Remembered) at the given (target, repo).
     pub fn blob_present_at(&self, target: &str, digest: &Digest, repo: &RepositoryName) -> bool {
         self.dedup.blob_present_at(target, digest, repo)
     }
@@ -197,7 +197,7 @@ impl TransferStateCache {
     }
 
     /// Iterator over committed mount sources for a blob, excluding `current_repo`.
-    /// Yields only repos with state in `{Verified, Completed}` AND a committed
+    /// Yields only repos with a present state AND a committed
     /// manifest at `target`. Iteration is in `BTreeMap` order (deterministic).
     pub fn committed_mount_sources<'a>(
         &'a self,
@@ -217,7 +217,7 @@ impl TransferStateCache {
     }
 
     /// `Watch::Receivers` for repos that:
-    ///   1. Have the blob with state in {Verified, Completed, Uploading} (NOT Failed)
+    ///   1. Have the blob with an active state (present or Uploading, NOT Failed)
     ///   2. Have not yet had their manifest-commit watch fire
     ///
     /// Used by the resolver to subscribe only to repos still able to become a
@@ -284,19 +284,43 @@ impl TransferStateCache {
             .is_some_and(|set| set.contains(repo))
     }
 
-    /// Drop runtime-only watch handles. Called between sync runs in long-lived
-    /// processes to prevent monotonic growth of the watch map.
-    pub fn clear_notifies(&mut self) {
-        if !self.repo_committed_watches.is_empty() {
-            let count: usize = self.repo_committed_watches.values().map(|m| m.len()).sum();
-            tracing::debug!(count, "clearing stale repo-committed watch handles");
-            self.repo_committed_watches.clear();
-        }
+    /// Start a run from the blob state a reload from disk would give: what
+    /// an earlier run learned may no longer hold, so every present blob
+    /// becomes known only from an earlier run, and failures, upload claims
+    /// and the last run's watch handles are dropped.
+    /// Committed repositories are kept: a mount from one that has since lost
+    /// the blob fails and falls back to a push, which costs a request, while
+    /// forgetting them would push blobs a mount could have saved.
+    pub(crate) fn start_run(&mut self) {
+        self.repo_committed_watches.clear();
+        self.dedup.remember_present();
     }
 
-    /// Lazy invalidation: drop the entire entry for the blob.
-    pub fn invalidate_blob(&mut self, target: &str, digest: &Digest) {
-        self.dedup.invalidate(target, digest);
+    /// Drop `repo`'s state for each of `digests` that is known only from an
+    /// earlier run, returning the digests dropped.
+    pub(crate) fn forget_remembered_blobs<'a>(
+        &mut self,
+        target: &str,
+        repo: &RepositoryName,
+        digests: impl IntoIterator<Item = &'a Digest>,
+    ) -> Vec<&'a Digest> {
+        digests
+            .into_iter()
+            .filter(|digest| self.dedup.forget_remembered(target, digest, repo))
+            .collect()
+    }
+
+    /// Record each of `digests` present at `repo`, after a manifest that
+    /// references them was committed there.
+    pub(crate) fn confirm_blobs<'a>(
+        &mut self,
+        target: &str,
+        repo: &RepositoryName,
+        digests: impl IntoIterator<Item = &'a Digest>,
+    ) {
+        for digest in digests {
+            self.dedup.confirm(target, digest, repo);
+        }
     }
 
     /// Look up a cached source snapshot.
@@ -642,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_present_at_returns_true_for_verified_and_completed_only() {
+    fn blob_present_at_excludes_uploading_and_failed() {
         let mut cache = TransferStateCache::new();
         cache.set_blob_verified("reg.io", digest(), repo("a"));
         cache.set_blob_completed("reg.io", digest(), repo("b"));
@@ -693,14 +717,6 @@ mod tests {
                 "{name}: a subscriber after the signal finds nothing to wait on"
             );
         }
-    }
-
-    #[test]
-    fn invalidate_removes_entry() {
-        let mut cache = TransferStateCache::new();
-        cache.set_blob_verified("reg.io", digest(), repo("repo/a"));
-        cache.invalidate_blob("reg.io", &digest());
-        assert!(!cache.blob_present_at("reg.io", &digest(), &repo("repo/a")));
     }
 
     #[test]

@@ -300,34 +300,6 @@ fn only_stable_entries_survive_persist() {
 }
 
 // ---------------------------------------------------------------------------
-// Invalidation
-// ---------------------------------------------------------------------------
-
-#[test]
-fn invalidate_blob_removes_entry() {
-    let mut cache = TransferStateCache::new();
-    cache.set_blob_verified("reg.io", digest_a(), repo("repo/a"));
-    assert!(
-        cache.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
-        "blob should be present before invalidation"
-    );
-
-    cache.invalidate_blob("reg.io", &digest_a());
-    assert!(
-        !cache.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
-        "blob should not be present after invalidation"
-    );
-}
-
-#[test]
-fn invalidate_nonexistent_is_noop() {
-    let mut cache = TransferStateCache::new();
-    // Should not panic
-    cache.invalidate_blob("reg.io", &digest_a());
-    assert!(cache.is_empty());
-}
-
-// ---------------------------------------------------------------------------
 // Persist creates parent dirs
 // ---------------------------------------------------------------------------
 
