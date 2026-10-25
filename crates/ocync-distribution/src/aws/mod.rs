@@ -6,6 +6,8 @@
 
 mod calendar;
 mod endpoint;
+mod env;
+mod profile;
 mod retry;
 mod sigv4;
 
