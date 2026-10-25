@@ -2280,28 +2280,28 @@ async fn transfer_image_blobs(
             .check_blob_existence(ctx.target_repo, &all_digests)
             .await
         {
-            Ok(existing) => {
-                let existing_count = existing.len();
-                {
-                    let mut c = ctx.cache.borrow_mut();
-                    for digest in &existing {
-                        c.set_blob_verified(
-                            ctx.target_name,
-                            digest.clone(),
-                            ctx.target_repo.to_owned(),
-                        );
-                    }
-                }
-                // Record all checked digests so the per-blob loop can skip
-                // HEAD for absent blobs too (batch already confirmed absent).
-                let checked: HashSet<Digest> = all_digests.into_iter().collect();
+            Ok(existence) => {
+                // Record the known digests so the per-blob loop skips HEAD
+                // for absent blobs too. A digest the check left unknown still
+                // gets its HEAD.
+                let total = all_digests.len();
+                let checked: HashSet<Digest> = all_digests
+                    .into_iter()
+                    .filter(|d| existence.is_known(d))
+                    .collect();
+                let available = existence.into_available();
                 debug!(
                     target_name = %ctx.target_name,
                     repo = %ctx.target_repo,
-                    total = checked.len(),
-                    existing = existing_count,
+                    checked = checked.len(),
+                    existing = available.len(),
+                    unknown = total - checked.len(),
                     "batch check pre-populated cache"
                 );
+                let mut c = ctx.cache.borrow_mut();
+                for digest in available {
+                    c.set_blob_verified(ctx.target_name, digest, ctx.target_repo.to_owned());
+                }
                 checked
             }
             Err(e) => {

@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use url::Host;
 
 use super::{Credentials, Scope, Token};
+use crate::client::no_redirect_http_client;
 use crate::error::Error;
 use crate::retry::send_retrying;
 
@@ -53,20 +54,6 @@ impl ChallengeCache {
 
 /// The `Bearer` auth scheme prefix used in `WWW-Authenticate` challenges.
 const BEARER_SCHEME: &str = "bearer";
-
-/// Build a no-redirect HTTP client for token-bearing requests.
-///
-/// Uses `redirect::Policy::none()` to prevent open-redirect SSRF: a
-/// 307 redirect from a malicious endpoint would forward credentials
-/// (realm auth headers, ACR exchange form bodies) to the redirect
-/// target. Also used by [`super::acr::AcrAuth`] for exchange POSTs.
-pub(crate) fn no_redirect_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(concat!("ocync/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("no-redirect HTTP client builder should not fail")
-}
 
 /// Shorthand for realm validation errors.
 fn realm_err(registry: &str, reason: String) -> Error {

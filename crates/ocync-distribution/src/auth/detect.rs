@@ -69,6 +69,9 @@ static GAR_RE: LazyLock<Regex> =
 static ACR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9]+\.azurecr\.(?:io|cn|us)$").unwrap());
 
+/// The ECR Public registry hostname.
+pub(crate) const ECR_PUBLIC_HOST: &str = "public.ecr.aws";
+
 /// Detect the registry provider kind from a hostname.
 ///
 /// Normalizes the hostname to lowercase, strips any port number and trailing
@@ -81,7 +84,7 @@ pub fn detect_provider_kind(hostname: &str) -> Option<ProviderKind> {
     let hostname = hostname.trim_end_matches('.');
 
     match hostname {
-        "public.ecr.aws" => Some(ProviderKind::EcrPublic),
+        ECR_PUBLIC_HOST => Some(ProviderKind::EcrPublic),
         "ghcr.io" => Some(ProviderKind::Ghcr),
         "cgr.dev" => Some(ProviderKind::Chainguard),
         "docker.io" | "index.docker.io" | "registry-1.docker.io" => Some(ProviderKind::DockerHub),

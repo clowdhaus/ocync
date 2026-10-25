@@ -4,16 +4,22 @@
 pub mod aimd;
 /// Authentication providers and token management.
 pub mod auth;
+/// Signed calls to the AWS APIs (ECR, ECR Public).
+mod aws;
 /// Blob operations (upload, download, existence checks, mounting).
 pub mod blob;
 /// OCI registry HTTP client.
 pub mod client;
+/// A credential cached until it nears expiry.
+mod credential_cache;
 /// OCI content-addressable digest type.
 pub mod digest;
 /// AWS ECR batch operations - bulk blob existence checks.
 pub mod ecr;
 /// Error types for OCI distribution operations.
 pub mod error;
+/// JSON decoding shared by the registry and AWS clients.
+mod json;
 /// Manifest operations (pull, push, head, referrers).
 pub mod manifest;
 /// OCI image reference parser.
@@ -106,7 +112,7 @@ pub fn test_http_client() -> reqwest::Client {
 pub use blob::MountResult;
 pub use client::{RegistryClient, RegistryClientBuilder};
 pub use digest::Digest;
-pub use ecr::BatchBlobChecker;
+pub use ecr::{BatchBlobChecker, BlobExistence};
 pub use error::Error;
 pub use manifest::{ManifestHead, ManifestPull};
 pub use reference::Reference;

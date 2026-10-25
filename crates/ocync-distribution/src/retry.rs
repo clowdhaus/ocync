@@ -5,7 +5,8 @@
 //! it runs before the engine exists, so a transient failure there fails a
 //! whole mapping or image. The operations that run there retry themselves,
 //! through [`retrying`], and share one schedule and one predicate so they
-//! cannot drift apart.
+//! cannot drift apart. The AWS API calls run the same loop under the AWS
+//! SDK's retry policy instead (see `crate::aws`).
 
 use std::cell::Cell;
 use std::future::Future;
@@ -78,28 +79,60 @@ fn backoff(attempt: u32) -> Duration {
     base.mul_f64(0.75 + fastrand::f64() * 0.5)
 }
 
-/// Run `op`, re-running it while it fails transiently.
+/// Decides, after each attempt of a call, whether and when to send it again.
+pub(crate) trait Policy<E> {
+    /// The wait before sending again after `error` ended attempt `attempt`
+    /// (0-indexed), or `None` to surface `error`.
+    fn retry(&mut self, attempt: u32, error: &E) -> Option<Duration>;
+
+    /// The call succeeded.
+    fn succeeded(&mut self) {}
+}
+
+/// The crate's policy: an [`is_transient`] failure is sent again on the jittered
+/// schedule, at most [`MAX_TRANSIENT_RETRIES`] times per call, and each retry
+/// is drawn from the budget.
 ///
-/// `what` names the operation in the retry log. `op` must be idempotent: the
-/// callers are reads and token exchanges, which are.
+/// The budget may be shared across calls, which is the bound that matters for
+/// an operation made of many of them. A tag listing may walk thousands of
+/// pages, and four retries on each of them is a bound only on paper: it
+/// permits hours of backing off against a registry that is plainly refusing to
+/// serve the listing.
+pub(crate) struct Budgeted<'a>(pub(crate) &'a Cell<u32>);
+
+impl Policy<Error> for Budgeted<'_> {
+    fn retry(&mut self, attempt: u32, error: &Error) -> Option<Duration> {
+        if !is_transient(error) || attempt >= MAX_TRANSIENT_RETRIES || self.0.get() == 0 {
+            return None;
+        }
+        self.0.set(self.0.get() - 1);
+        Some(backoff(attempt))
+    }
+}
+
+/// Run `op`, re-running it while `policy` says to.
 ///
-/// `budget` is drawn down by every retry and may be shared across calls, which
-/// is the bound that matters for an operation made of many of them. A tag
-/// listing may walk thousands of pages, and four retries on each of them is a
-/// bound only on paper: it permits hours of backing off against a registry that
-/// is plainly refusing to serve the listing.
-pub(crate) async fn retrying<T, F, Fut>(what: &str, budget: &Cell<u32>, op: F) -> Result<T, Error>
+/// `what` names the operation in the retry log. `op` is given the attempt
+/// number, 0 for the first, and must be idempotent: the callers are reads
+/// and token exchanges, which are.
+pub(crate) async fn retrying<T, E, P, F, Fut>(what: &str, policy: &mut P, op: F) -> Result<T, E>
 where
-    F: Fn() -> Fut,
-    Fut: Future<Output = Result<T, Error>>,
+    E: std::fmt::Display,
+    P: Policy<E>,
+    F: Fn(u32) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
 {
     let mut attempt: u32 = 0;
     loop {
-        match op().await {
-            Ok(value) => return Ok(value),
-            Err(e) if is_transient(&e) && attempt < MAX_TRANSIENT_RETRIES && budget.get() > 0 => {
-                budget.set(budget.get() - 1);
-                let delay = backoff(attempt);
+        match op(attempt).await {
+            Ok(value) => {
+                policy.succeeded();
+                return Ok(value);
+            }
+            Err(e) => {
+                let Some(delay) = policy.retry(attempt, &e) else {
+                    return Err(e);
+                };
                 tracing::debug!(
                     what,
                     attempt,
@@ -110,7 +143,6 @@ where
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -168,6 +200,8 @@ pub(crate) async fn send_retrying(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     /// Bounds rather than equality: the schedule is jittered on purpose.
@@ -267,12 +301,12 @@ mod tests {
 
     #[tokio::test]
     async fn retrying_gives_up_and_surfaces_the_last_error() {
-        let calls = Cell::new(0u32);
-        let err = retrying::<(), _, _>(
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let result: Result<(), Error> = retrying(
             "always throttled",
-            &Cell::new(MAX_TRANSIENT_RETRIES),
-            || {
-                calls.set(calls.get() + 1);
+            &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
+            |attempt| {
+                attempts.borrow_mut().push(attempt);
                 async {
                     Err(Error::RegistryError {
                         status: http::StatusCode::TOO_MANY_REQUESTS,
@@ -281,12 +315,12 @@ mod tests {
                 }
             },
         )
-        .await
-        .expect_err("a permanently throttled op must surface");
+        .await;
+        let err = result.expect_err("a permanently throttled op must surface");
         assert_eq!(
-            calls.get(),
-            MAX_TRANSIENT_RETRIES + 1,
-            "one initial attempt plus every retry"
+            *attempts.borrow(),
+            (0..=MAX_TRANSIENT_RETRIES).collect::<Vec<_>>(),
+            "one initial attempt plus every retry, numbered from 0"
         );
         assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
     }
@@ -294,15 +328,19 @@ mod tests {
     #[tokio::test]
     async fn retrying_does_not_re_run_a_permanent_failure() {
         let calls = Cell::new(0u32);
-        let _ = retrying::<(), _, _>("not found", &Cell::new(MAX_TRANSIENT_RETRIES), || {
-            calls.set(calls.get() + 1);
-            async {
-                Err(Error::RegistryError {
-                    status: http::StatusCode::NOT_FOUND,
-                    message: "absent".into(),
-                })
-            }
-        })
+        let _: Result<(), Error> = retrying(
+            "not found",
+            &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
+            |_| {
+                calls.set(calls.get() + 1);
+                async {
+                    Err(Error::RegistryError {
+                        status: http::StatusCode::NOT_FOUND,
+                        message: "absent".into(),
+                    })
+                }
+            },
+        )
         .await;
         assert_eq!(calls.get(), 1, "a 404 must be surfaced on the first answer");
     }

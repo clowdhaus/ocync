@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::aimd::RegistryAction;
 use crate::client::RegistryClient;
 use crate::error::Error;
-use crate::retry::{MAX_LISTING_RETRIES, retrying};
+use crate::retry::{Budgeted, MAX_LISTING_RETRIES, retrying};
 use crate::spec::RepositoryName;
 
 /// Maximum number of tag list pages to follow before treating the pagination
@@ -41,17 +41,8 @@ pub(crate) struct TagListResponse {
     #[allow(dead_code)]
     name: String,
     /// The list of tags, or empty if none exist.
-    #[serde(default, deserialize_with = "deserialize_null_as_empty")]
+    #[serde(default, deserialize_with = "crate::json::null_as_default")]
     pub(crate) tags: Vec<String>,
-}
-
-/// Deserialize a `Vec<String>` that may be `null` or missing as an empty vec.
-fn deserialize_null_as_empty<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let opt: Option<Vec<String>> = Option::deserialize(deserializer)?;
-    Ok(opt.unwrap_or_default())
 }
 
 /// Parse a `Link` header to extract the URL for the `rel="next"` page.
@@ -115,22 +106,23 @@ impl RegistryClient {
             // phase would re-send it: the mapping would just fail. Reading
             // the body inside the retry matters because a connection reset
             // part way through a page is exactly the failure a re-send fixes.
-            let (next_url, tag_list) = retrying("tag listing", &retry_budget, || async {
-                let resp = self
-                    .get(repository, &path, None, RegistryAction::TagList)
-                    .await?;
+            let (next_url, tag_list) =
+                retrying("tag listing", &mut Budgeted(&retry_budget), |_| async {
+                    let resp = self
+                        .get(repository, &path, None, RegistryAction::TagList)
+                        .await?;
 
-                // Check for the Link header before consuming the body.
-                let next_url = resp
-                    .headers()
-                    .get("link")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(parse_next_link);
+                    // Check for the Link header before consuming the body.
+                    let next_url = resp
+                        .headers()
+                        .get("link")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_next_link);
 
-                let tag_list: TagListResponse = resp.json().await?;
-                Ok((next_url, tag_list))
-            })
-            .await?;
+                    let tag_list: TagListResponse = resp.json().await?;
+                    Ok((next_url, tag_list))
+                })
+                .await?;
             all_tags.extend(tag_list.tags);
 
             match next_url {

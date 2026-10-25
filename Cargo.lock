@@ -329,29 +329,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-ecrpublic"
-version = "1.120.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34237f256b61f8ba70a576e29001238f3e4c98a2acb5733cb63c4669fb0262fa"
-dependencies = [
- "arc-swap",
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-observability",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-schema",
- "aws-smithy-types",
- "aws-types",
- "fastrand",
- "regex-lite",
- "tracing",
-]
-
-[[package]]
 name = "aws-sdk-sso"
 version = "1.117.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2372,9 +2349,10 @@ name = "ocync-distribution"
 version = "0.8.2"
 dependencies = [
  "aws-config",
+ "aws-credential-types",
  "aws-lc-rs",
- "aws-sdk-ecr",
- "aws-sdk-ecrpublic",
+ "aws-smithy-types",
+ "aws-types",
  "base64 0.23.1",
  "bytes",
  "fastrand",
@@ -2382,6 +2360,7 @@ dependencies = [
  "google-cloud-auth",
  "hex",
  "http",
+ "httpdate",
  "pin-project-lite",
  "rcgen",
  "regex-lite",

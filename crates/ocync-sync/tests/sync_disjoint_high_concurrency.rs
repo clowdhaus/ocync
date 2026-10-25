@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ocync_distribution::spec::RepositoryName;
-use ocync_distribution::{BatchBlobChecker, Digest};
+use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
 use ocync_sync::ImageStatus;
 use ocync_sync::engine::{RegistryAlias, SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
@@ -334,9 +334,8 @@ impl BatchBlobChecker for EmptyExistingChecker {
     fn check_blob_existence<'a>(
         &'a self,
         repo: &'a RepositoryName,
-        _digests: &'a [Digest],
-    ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
-    {
+        digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
         assert_eq!(
             repo.as_str(),
             self.expected_repo,
@@ -344,7 +343,7 @@ impl BatchBlobChecker for EmptyExistingChecker {
         );
         Box::pin(async {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(HashSet::new())
+            Ok(BlobExistence::new(digests, &HashSet::new()))
         })
     }
 }

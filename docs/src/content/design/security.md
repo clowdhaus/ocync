@@ -22,13 +22,13 @@ order: 5
 
 ## Dependency weight
 
-The FIPS build of the `ocync` binary resolves 244 crates (normal and build dependencies). The cloud SDKs account for most of what can be removed:
+The FIPS build of the `ocync` binary resolves 242 crates (normal and build dependencies). The cloud SDKs account for most of what can be removed:
 
 | Dependency | Used for | Crates only it brings |
 |---|---|---|
-| `aws-config`, `aws-sdk-ecr`, `aws-sdk-ecrpublic` | `GetAuthorizationToken` (ECR, ECR Public), `BatchCheckLayerAvailability`, the credential chain | 41 |
+| `aws-config` | the credential chain | 39 |
 | `google-cloud-auth` | one access token | 21 |
-| Both together | | 80 |
+| Both together | | 78 |
 
 The duplicated hash crate versions (`digest`, `block-buffer`, `crypto-common`, `cpufeatures`) all come from these SDKs, and four of the `skip` entries in `deny.toml` exist for them.
 
@@ -73,15 +73,22 @@ Scanners that read the embedded list directly still see the dropped crates until
 
 - `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud well-known file, then the GCE and GKE metadata server.
 - Credential file types: service account keys (RS256 signed assertion via `aws-lc-rs`), authorized user (refresh token), and external account (Workload Identity Federation).
-- Federation subject tokens from a file (such as a projected Kubernetes service account token), a URL, or AWS. The AWS source signs `GetCallerIdentity` with the owned AWS signer and credential chain, so `ocync` on EKS reaches Artifact Registry with no long-lived key.
+- Federation subject tokens from a file (such as a projected Kubernetes service account token), a URL, or AWS. The AWS source signs `GetCallerIdentity` with the owned AWS signer, so `ocync` on EKS reaches Artifact Registry with no long-lived key.
 - Service account impersonation after the federation exchange (`service_account_impersonation_url`).
 - The real token lifetime from `expires_in`, replacing the fixed 10-minute assumption in `auth/gcp.rs`.
 
 ## Owned AWS request signing
 
-> **Status: Planned.**
+`aws-sigv4` computes Signature Version 4 with the pure-Rust `sha2` and `hmac` crates. `ocync` makes its ECR and ECR Public calls (`GetAuthorizationToken`, `BatchCheckLayerAvailability`) itself, in `crates/ocync-distribution/src/aws/`:
 
-`aws-sigv4` computes Signature Version 4 with the pure-Rust `sha2` and `hmac` crates. Replace it with an owned signer on `aws-lc-rs` HMAC and SHA-256. The signer covers the calls `ocync` makes: ECR and ECR Public (`GetAuthorizationToken`, `BatchCheckLayerAvailability`) and STS (`AssumeRole` for role chaining).
+- An owned signer on `aws-lc-rs` HMAC and SHA-256. It signs no query, since an endpoint never carries one. It passes the cases of the AWS signing test suite that apply to header signing of such requests outside S3, and matched `aws-sigv4` on 60,000 random requests.
+- Endpoints from the AWS SDK's endpoint rules for every partition, with `AWS_USE_FIPS_ENDPOINT`, `AWS_USE_DUALSTACK_ENDPOINT`, `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_ECR` / `AWS_ENDPOINT_URL_ECR_PUBLIC` read from the AWS config as before. A query or user and password in a configured endpoint URL is dropped with a warning, as the SDK sends neither, and the URL is never logged.
+- The SDK's retry policy, ported from `aws-smithy-runtime` with its test cases and read from the same settings: `AWS_MAX_ATTEMPTS` (3 by default), `AWS_RETRY_MODE` and `AWS_NEW_RETRIES_2026`. Throttling error codes (ECR throttles with HTTP 400) are retried as throttles; timeout codes, HTTP 500, 502, 503 and 504, and connection, timeout and I/O failures as transient; other errors are not retried. Each retry waits a jittered exponential backoff from 1 second, at most 20 seconds, or what `x-amz-retry-after` asks, and spends from a quota of 500 shared by every call to one service in one region: 5 for a throttle or skewed signature and 10 for a transient failure. As in the SDK, each client holds one retry permit: the latest retry's cost on any of its calls, which a newer retry replaces and leaves the older cost spent. The client's next success returns the held cost, or 1 when none is held, and with too little left the call stops retrying. Retry behavior 2.1 starts other failures at 50 ms, costs 14 for them and bounds `x-amz-retry-after` to 5 seconds past the backoff. Adaptive mode paces sends with the SDK's CUBIC rate limiter once a throttle is seen. One deliberate difference: an HTTP 429 without a throttling code is retried as a throttle, since a proxy on `HTTPS_PROXY` sends one and a batch check given up on transfers every blob it covered. A call that receives nothing for 20 seconds after it is sent, or between reads, fails. The SDK applies that limit only to a response body once it is streaming, so this is stricter.
+- The SDK's clock-skew correction: the skew is measured from each answer's `Date` header, and a signature rejected while the clocks are more than 4 minutes apart is signed again on AWS's clock. `AWS_DISABLE_CLOCK_SKEW_CORRECTION=true`, or the profile's `disable_clock_skew_correction`, turns it off.
+- A credential source that does not answer within 21.6 seconds, the SDK's bound for its default settings, fails the call.
+- Requests honor `HTTPS_PROXY` and `NO_PROXY`, like registry traffic. The SDK client did not.
+
+Credentials still come from `aws-config`, which signs its own STS calls with `aws-sigv4`, so `aws-sigv4` stays in the build until the owned credential chain replaces `aws-config`.
 
 ## Owned AWS credential chain
 

@@ -6,9 +6,10 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use tokio::sync::RwLock;
+use serde::Deserialize;
 
 use crate::auth::{AuthProvider, AuthScheme, Scope, Token};
+use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::Error;
 
 /// Default ECR token lifetime (12 hours).
@@ -29,9 +30,8 @@ pub(super) struct EcrTokenResponse {
 
 /// Abstraction over ECR `GetAuthorizationToken` for testability.
 ///
-/// Implementations are pre-configured with a specific registry and SDK client.
-/// The default ([`AwsEcrApi`]) holds a cached AWS SDK client constructed once
-/// at [`EcrAuth::new`] time.
+/// Implementations are pre-configured with a specific registry. The default
+/// ([`AwsEcrApi`]) holds a client constructed once at [`EcrAuth::new`] time.
 pub(super) trait EcrApi: Send + Sync {
     /// Fetch an authorization token from ECR.
     fn get_authorization_token(
@@ -39,20 +39,54 @@ pub(super) trait EcrApi: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>>;
 }
 
-/// Default [`EcrApi`] backed by the AWS SDK.
-///
-/// Holds the ECR SDK client created once during [`EcrAuth::new`].
-struct AwsEcrApi {
-    ecr_client: aws_sdk_ecr::Client,
-    registry: String,
+/// One `authorizationData` entry of a `GetAuthorizationToken` output, the
+/// same shape in ECR and ECR Public.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AuthorizationData {
+    /// The base64 `AWS:<password>` token.
+    pub(super) authorization_token: Option<String>,
+    /// When the token expires.
+    #[serde(default, deserialize_with = "epoch_seconds")]
+    pub(super) expires_at: Option<SystemTime>,
 }
 
-impl std::fmt::Debug for AwsEcrApi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AwsEcrApi")
-            .field("registry", &self.registry)
-            .finish_non_exhaustive()
-    }
+/// Read an expiry sent as seconds since the UNIX epoch. One before the
+/// epoch has passed; one too far ahead to represent reads as no expiry, so
+/// the default lifetime applies rather than the token failing.
+fn epoch_seconds<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SystemTime>, D::Error> {
+    let Some(secs) = Option::<f64>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(Duration::try_from_secs_f64(secs.max(0.0))
+        .ok()
+        .and_then(|since_epoch| SystemTime::UNIX_EPOCH.checked_add(since_epoch)))
+}
+
+/// ECR's `GetAuthorizationToken`, which takes no input.
+#[derive(serde::Serialize)]
+struct GetAuthorizationToken {}
+
+/// ECR answers with a list of authorization data, one per registry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetAuthorizationTokenOutput {
+    #[serde(default, deserialize_with = "crate::json::null_as_default")]
+    authorization_data: Vec<AuthorizationData>,
+}
+
+impl crate::aws::Operation for GetAuthorizationToken {
+    const NAME: &'static str = "GetAuthorizationToken";
+    type Output = GetAuthorizationTokenOutput;
+}
+
+/// Default [`EcrApi`], calling ECR through [`crate::aws::Client`].
+#[derive(Debug)]
+struct AwsEcrApi {
+    client: crate::aws::Client,
+    registry: String,
 }
 
 impl EcrApi for AwsEcrApi {
@@ -60,35 +94,26 @@ impl EcrApi for AwsEcrApi {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
         Box::pin(async move {
-            let auth_output = self
-                .ecr_client
-                .get_authorization_token()
-                .send()
+            let output = self
+                .client
+                .call(&GetAuthorizationToken {})
                 .await
-                .map_err(|e| Error::AuthFailed {
-                    registry: self.registry.clone(),
-                    reason: format!("ECR GetAuthorizationToken failed: {e}"),
+                .map_err(|e| Error::auth_failed(&self.registry, e))?;
+
+            let auth_data = output
+                .authorization_data
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    Error::auth_failed(&self.registry, "ECR returned empty authorization data")
                 })?;
 
-            let auth_data =
-                auth_output
-                    .authorization_data()
-                    .first()
-                    .ok_or_else(|| Error::AuthFailed {
-                        registry: self.registry.clone(),
-                        reason: "ECR returned empty authorization data".into(),
-                    })?;
-
-            let encoded_token = auth_data
-                .authorization_token()
-                .map(|s| s.to_owned())
-                .ok_or_else(|| Error::AuthFailed {
-                    registry: self.registry.clone(),
-                    reason: "ECR authorization data missing token".into(),
-                })?;
+            let encoded_token = auth_data.authorization_token.ok_or_else(|| {
+                Error::auth_failed(&self.registry, "ECR authorization data missing token")
+            })?;
 
             // Prefer the API-provided expiry over the hardcoded default.
-            let expires_in = auth_data.expires_at().map(ttl_from_expiry);
+            let expires_in = auth_data.expires_at.map(remaining);
 
             Ok(EcrTokenResponse {
                 encoded_token,
@@ -98,136 +123,48 @@ impl EcrApi for AwsEcrApi {
     }
 }
 
-/// Compute remaining TTL from an AWS SDK `DateTime` expiry.
-///
-/// Returns the duration between now and the expiry instant. If the expiry
-/// is in the past, returns [`Duration::ZERO`].
-pub(super) fn ttl_from_expiry(exp: &aws_sdk_ecr::primitives::DateTime) -> Duration {
-    let now_secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_secs() as i64;
-    let remaining = exp.secs() - now_secs;
-    if remaining > 0 {
-        Duration::from_secs(remaining as u64)
-    } else {
-        Duration::ZERO
-    }
+/// An ECR authorization token: base64 of `AWS:<password>`.
+pub(super) struct AuthorizationToken {
+    /// The token as ECR sent it, which ECR takes back as
+    /// `Authorization: Basic <encoded>`.
+    encoded: String,
+    /// The password the token carries, which ECR Public's token exchange
+    /// takes.
+    password: String,
 }
 
-/// Cached SDK credential with TTL tracking.
-///
-/// Generic cache for ECR SDK credentials that uses a read-lock fast path
-/// for concurrent cache hits and a write-lock with double-check for
-/// refreshes. Used by both [`EcrAuth`] (caching `Token`) and
-/// [`super::ecr_public::EcrPublicAuth`] (caching `Credentials`).
-pub(super) struct SdkCredentialCache<T> {
-    cached: RwLock<Option<SdkCacheEntry<T>>>,
-}
-
-struct SdkCacheEntry<T> {
-    value: T,
-    /// Tracks TTL via `is_valid()`.
-    lifetime: Token,
-}
-
-impl<T: Clone + Send + Sync> SdkCredentialCache<T> {
-    /// Create an empty cache.
-    pub(super) fn new() -> Self {
-        Self {
-            cached: RwLock::new(None),
-        }
+impl AuthorizationToken {
+    /// Read `encoded`, naming `registry` in any error.
+    pub(super) fn parse(encoded: String, registry: &str) -> Result<Self, Error> {
+        let decoded = BASE64.decode(&encoded).map_err(|e| {
+            Error::auth_failed(registry, format!("invalid base64 in ECR token: {e}"))
+        })?;
+        let text = String::from_utf8(decoded).map_err(|e| {
+            Error::auth_failed(registry, format!("ECR token is not valid UTF-8: {e}"))
+        })?;
+        let password = text
+            .strip_prefix("AWS:")
+            .ok_or_else(|| Error::auth_failed(registry, "ECR token does not start with 'AWS:'"))?
+            .to_owned();
+        Ok(Self { encoded, password })
     }
 
-    /// Return the cached value if still valid, otherwise await `refresh` to
-    /// obtain a new one.
-    ///
-    /// `label` is used as the `Token` value for TTL tracking (not for auth).
-    /// The refresh future is created at the call site but only polled on
-    /// cache miss, so the API call is never issued when the cache is warm.
-    pub(super) async fn get_or_refresh(
-        &self,
-        label: &str,
-        refresh: impl Future<Output = Result<(T, Duration), Error>>,
-    ) -> Result<T, Error> {
-        // Fast path: read-lock check allows concurrent readers.
-        {
-            let cached = self.cached.read().await;
-            if let Some(ref entry) = *cached {
-                if entry.lifetime.is_valid() {
-                    return Ok(entry.value.clone());
-                }
-            }
-        }
-
-        // Slow path: write-lock for refresh.
-        let mut cached = self.cached.write().await;
-
-        // Double-check after acquiring write lock -- another task may have
-        // already refreshed while we waited.
-        if let Some(ref entry) = *cached {
-            if entry.lifetime.is_valid() {
-                return Ok(entry.value.clone());
-            }
-        }
-
-        let (value, ttl) = refresh.await?;
-
-        *cached = Some(SdkCacheEntry {
-            value: value.clone(),
-            lifetime: Token::with_ttl(label, ttl),
-        });
-
-        Ok(value)
+    /// The token as ECR sent it.
+    pub(super) fn into_encoded(self) -> String {
+        self.encoded
     }
 
-    /// Clear the cached value, forcing the next `get_or_refresh` to call
-    /// the refresh function.
-    pub(super) async fn clear(&self) {
-        *self.cached.write().await = None;
+    /// The password the token carries.
+    pub(super) fn into_password(self) -> String {
+        self.password
     }
-
-    /// Replace the cached value (test helper).
-    #[cfg(test)]
-    pub(super) async fn set(&self, value: T, ttl: Duration) {
-        *self.cached.write().await = Some(SdkCacheEntry {
-            value,
-            lifetime: Token::with_ttl("test-lifetime", ttl),
-        });
-    }
-}
-
-/// Validate an ECR authorization token.
-///
-/// ECR tokens are base64-encoded strings in the format `AWS:<token>`.
-/// Validates the format and returns the original encoded string unchanged --
-/// ECR expects it sent as `Authorization: Basic <encoded>`.
-pub(super) fn validate_ecr_token(encoded: &str, registry: &str) -> Result<(), Error> {
-    let decoded = BASE64.decode(encoded).map_err(|e| Error::AuthFailed {
-        registry: registry.to_owned(),
-        reason: format!("invalid base64 in ECR token: {e}"),
-    })?;
-
-    let text = String::from_utf8(decoded).map_err(|e| Error::AuthFailed {
-        registry: registry.to_owned(),
-        reason: format!("ECR token is not valid UTF-8: {e}"),
-    })?;
-
-    if !text.starts_with("AWS:") {
-        return Err(Error::AuthFailed {
-            registry: registry.to_owned(),
-            reason: "ECR token does not start with 'AWS:'".into(),
-        });
-    }
-
-    Ok(())
 }
 
 /// AWS ECR authentication provider.
 ///
-/// Uses the AWS SDK to obtain authorization tokens via `GetAuthorizationToken`.
-/// The SDK client is created once at construction time. Tokens are cached via
-/// [`SdkCredentialCache`] (read-lock fast path for concurrent cache hits,
+/// Obtains authorization tokens via `GetAuthorizationToken`, through a
+/// client created once at construction time. Tokens are cached via
+/// [`CredentialCache`] (read-lock fast path for concurrent cache hits,
 /// write-lock with double-check for fetches) and refreshed when they approach
 /// expiry. The actual token lifetime is read from the API response, falling
 /// back to 12 hours if not provided.
@@ -240,7 +177,7 @@ pub struct EcrAuth {
     /// The ECR registry hostname.
     hostname: String,
     /// Cached ECR token with TTL-based refresh.
-    credential_cache: SdkCredentialCache<Token>,
+    credential_cache: CredentialCache<Token>,
     /// ECR API implementation.
     api: Box<dyn EcrApi>,
 }
@@ -256,8 +193,9 @@ impl std::fmt::Debug for EcrAuth {
 impl EcrAuth {
     /// Create a new ECR auth provider for the given registry hostname.
     ///
-    /// Loads AWS credentials and constructs the ECR SDK client once. Returns
-    /// an error if the region cannot be extracted from the hostname.
+    /// Loads the AWS config and constructs the ECR client once. Returns
+    /// an error if the region cannot be extracted from the hostname, or if
+    /// a configured endpoint URL is combined with FIPS or dual-stack.
     ///
     /// When `profile` is `Some`, credential resolution is scoped to that
     /// named profile in the shared credentials/config file. When `None`,
@@ -268,21 +206,18 @@ impl EcrAuth {
         let hostname = hostname.into();
         let config = crate::ecr::load_sdk_config(&hostname, profile)
             .await
-            .map_err(|e| Error::AuthFailed {
-                registry: hostname.clone(),
-                reason: format!("failed to load AWS SDK config: {e}"),
+            .map_err(|e| {
+                Error::auth_failed(&hostname, format!("failed to load AWS config: {e}"))
             })?;
 
-        let ecr_client = aws_sdk_ecr::Client::new(&config);
+        let client = crate::aws::Client::new(&config, crate::aws::Service::Ecr)
+            .map_err(|e| Error::auth_failed(&hostname, e))?;
         let registry = hostname.clone();
 
         Ok(Self {
             hostname,
-            credential_cache: SdkCredentialCache::new(),
-            api: Box::new(AwsEcrApi {
-                ecr_client,
-                registry,
-            }),
+            credential_cache: CredentialCache::new(),
+            api: Box::new(AwsEcrApi { client, registry }),
         })
     }
 
@@ -291,7 +226,7 @@ impl EcrAuth {
     fn with_api(hostname: impl Into<String>, api: impl EcrApi + 'static) -> Self {
         Self {
             hostname: hostname.into(),
-            credential_cache: SdkCredentialCache::new(),
+            credential_cache: CredentialCache::new(),
             api: Box::new(api),
         }
     }
@@ -312,13 +247,12 @@ impl EcrAuth {
                     tracing::warn!(registry = %self.hostname, error = %e, "ECR GetAuthorizationToken failed");
                     e
                 })?;
-                validate_ecr_token(&response.encoded_token, &self.hostname)?;
+                let token = AuthorizationToken::parse(response.encoded_token, &self.hostname)?;
                 let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
                 tracing::debug!(registry = %self.hostname, ttl_secs = ttl.as_secs(), "ECR token refreshed");
                 // ECR expects `Authorization: Basic <base64(AWS:password)>`. The encoded
                 // token from GetAuthorizationToken is already in the right format.
-                let token =
-                    Token::with_ttl(response.encoded_token, ttl).with_scheme(AuthScheme::Basic);
+                let token = Token::with_ttl(token.into_encoded(), ttl).with_scheme(AuthScheme::Basic);
                 Ok((token, ttl))
             })
             .await
@@ -415,44 +349,72 @@ mod tests {
                 let mut responses = self.responses.lock().await;
                 match responses.pop_front() {
                     Some(Some(response)) => Ok(response),
-                    _ => Err(Error::AuthFailed {
-                        registry: "mock".into(),
-                        reason: "mock: no token available".into(),
-                    }),
+                    _ => Err(Error::auth_failed("mock", "mock: no token available")),
                 }
             })
         }
     }
 
-    // --- validate_ecr_token tests ---
+    // --- AuthorizationToken tests ---
 
+    /// ECR answers with a list of authorization data. The expiry is read
+    /// as epoch seconds. A negative one has passed, and one too large to
+    /// represent or null is no expiry; none of them fails the token.
     #[test]
-    fn validate_valid_token() {
+    fn reads_the_get_authorization_token_output() {
+        let output: GetAuthorizationTokenOutput = serde_json::from_str(
+            r#"{"authorizationData":[{"authorizationToken":"QVdTOnB3","expiresAt":4102444800.5,"proxyEndpoint":"https://x"}]}"#,
+        )
+        .unwrap();
+        let data = &output.authorization_data[0];
+        assert_eq!(data.authorization_token.as_deref(), Some("QVdTOnB3"));
+        assert_eq!(
+            data.expires_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(4_102_444_800_500))
+        );
+        for (sent, expected) in [
+            ("-1", Some(SystemTime::UNIX_EPOCH)),
+            ("1e300", None),
+            ("null", None),
+        ] {
+            let body = format!(r#"{{"authorizationData":[{{"expiresAt":{sent}}}]}}"#);
+            let output: GetAuthorizationTokenOutput = serde_json::from_str(&body).unwrap();
+            assert_eq!(output.authorization_data[0].expires_at, expected, "{sent}");
+        }
+        let output: GetAuthorizationTokenOutput =
+            serde_json::from_str(r#"{"authorizationData":null}"#).unwrap();
+        assert!(output.authorization_data.is_empty());
+    }
+
+    /// A token keeps its encoded form for ECR and yields its password for
+    /// ECR Public.
+    #[test]
+    fn parses_a_token() {
         let encoded = BASE64.encode("AWS:my-secret-token");
-        validate_ecr_token(&encoded, "test-registry").unwrap();
+        let parse = || AuthorizationToken::parse(encoded.clone(), "test-registry").unwrap();
+        assert_eq!(parse().into_encoded(), encoded);
+        assert_eq!(parse().into_password(), "my-secret-token");
     }
 
     #[test]
-    fn validate_token_invalid_prefix() {
+    fn parse_token_invalid_prefix() {
         let encoded = BASE64.encode("NOTAWS:token");
-        let result = validate_ecr_token(&encoded, "test-registry");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = AuthorizationToken::parse(encoded, "test-registry")
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("AWS:"));
         assert!(err.contains("test-registry"));
     }
 
     #[test]
-    fn validate_token_invalid_base64() {
-        let result = validate_ecr_token("not-valid-base64!!!", "test-registry");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("test-registry"));
-    }
-
-    #[test]
-    fn validate_token_includes_registry_in_error() {
+    fn parse_token_invalid_base64() {
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let err = validate_ecr_token("!!!", host).unwrap_err().to_string();
+        let err = AuthorizationToken::parse("not-valid-base64!!!".into(), host)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("invalid base64"));
         assert!(err.contains(host));
     }
 

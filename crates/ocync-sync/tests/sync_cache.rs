@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ocync_distribution::spec::{MediaType, RepositoryName};
-use ocync_distribution::{BatchBlobChecker, Digest};
+use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
 use ocync_sync::ImageStatus;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{RegistryAlias, TagPair, TargetEntry};
@@ -36,6 +36,8 @@ struct MockBatchChecker {
     expected_repo: String,
     /// Set of digests that the mock reports as existing at the target.
     existing: HashSet<Digest>,
+    /// Set of digests that the mock reports a failed batch left unknown.
+    unknown: HashSet<Digest>,
     /// Tracks how many times `check_blob_existence` was called.
     call_count: Arc<AtomicUsize>,
 }
@@ -47,6 +49,7 @@ impl MockBatchChecker {
             Self {
                 expected_repo: expected_repo.to_owned(),
                 existing,
+                unknown: HashSet::new(),
                 call_count: Arc::clone(&count),
             },
             count,
@@ -59,8 +62,7 @@ impl BatchBlobChecker for MockBatchChecker {
         &'a self,
         repo: &'a RepositoryName,
         digests: &'a [Digest],
-    ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
         assert_eq!(
             repo.as_str(),
             self.expected_repo,
@@ -68,11 +70,12 @@ impl BatchBlobChecker for MockBatchChecker {
         );
         Box::pin(async {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(digests
+            let checked: Vec<Digest> = digests
                 .iter()
-                .filter(|d| self.existing.contains(d))
+                .filter(|d| !self.unknown.contains(d))
                 .cloned()
-                .collect())
+                .collect();
+            Ok(BlobExistence::new(&checked, &self.existing))
         })
     }
 }
@@ -105,8 +108,7 @@ impl BatchBlobChecker for FailingBatchChecker {
         &'a self,
         repo: &'a RepositoryName,
         _digests: &'a [Digest],
-    ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
         assert_eq!(
             repo.as_str(),
             self.expected_repo,
@@ -159,16 +161,11 @@ impl BatchBlobChecker for WaitTrackingChecker {
         &'a self,
         repo: &'a RepositoryName,
         digests: &'a [Digest],
-    ) -> Pin<Box<dyn Future<Output = Result<HashSet<Digest>, ocync_distribution::Error>> + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
         assert_eq!(repo.as_str(), self.expected_repo);
         Box::pin(async move {
             self.check_count.fetch_add(1, Ordering::Relaxed);
-            Ok(digests
-                .iter()
-                .filter(|d| self.existing.contains(d))
-                .cloned()
-                .collect())
+            Ok(BlobExistence::new(digests, &self.existing))
         })
     }
 
@@ -899,6 +896,112 @@ async fn sync_batch_checker_partial_existence_transfers_missing() {
     assert_eq!(report.stats.bytes_transferred, layer1_data.len() as u64);
     // wiremock expect(1) assertions on source pull and target push verify
     // exactly 1 blob was pulled and 1 was pushed (enforced on MockServer drop).
+}
+
+/// A digest a failed batch left unchecked still gets its own HEAD, while a
+/// digest the batch found missing does not.
+///
+/// The config exists, layer1 is known missing and layer2 is unchecked. The
+/// target holds layer2, so its HEAD answers 200 and it is neither pulled nor
+/// pushed. Layer1 is transferred without a HEAD.
+#[tokio::test]
+async fn sync_batch_checker_heads_unchecked_digests() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let layer1_data = b"layer1-missing";
+    let parts = ManifestBuilder::new(b"config-unchecked")
+        .layer(layer1_data)
+        .layer(b"layer2-unchecked")
+        .build();
+    let layer1 = &parts.layer_descs[0].digest;
+    let layer2 = &parts.layer_descs[1].digest;
+
+    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{layer1}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(layer1_data.to_vec())
+                .insert_header("content-length", layer1_data.len().to_string()),
+        )
+        .expect(1)
+        .mount(&source_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/repo/blobs/{layer2}")))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&source_server)
+        .await;
+
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{layer2}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", parts.layer_descs[1].size.to_string()),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/repo/blobs/{layer1}")))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/repo/blobs/uploads/upload-id"),
+        )
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v2/repo/blobs/uploads/upload-id"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("location", "/v2/repo/blobs/uploads/upload-id"),
+        )
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v2/repo/blobs/uploads/upload-id"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let (checker, _) =
+        MockBatchChecker::new("repo", HashSet::from([parts.config_desc.digest.clone()]));
+    let checker = MockBatchChecker {
+        unknown: HashSet::from([layer2.clone()]),
+        ..checker
+    };
+
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![TargetEntry {
+            name: RegistryAlias::new("target"),
+            client: mock_client(&target_server),
+            batch_checker: Some(Rc::new(checker)),
+            existing_tags: HashSet::new(),
+        }],
+        vec![TagPair::same("v1")],
+    );
+
+    let report = run_sync(vec![mapping]).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(report.images[0].blob_stats.skipped, 2);
+    assert_eq!(report.images[0].blob_stats.transferred, 1);
+    assert_eq!(report.stats.bytes_transferred, layer1_data.len() as u64);
 }
 
 /// Without a batch checker, per-blob HEAD is used for existence checks.

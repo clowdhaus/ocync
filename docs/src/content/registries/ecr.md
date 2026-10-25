@@ -18,8 +18,9 @@ No Docker config or static credentials are needed. See the [AWS credential prece
 
 Notable behaviors:
 
-- HTTP Basic, not Bearer exchange. SDK `GetAuthorizationToken` returns a base64-encoded `AWS:<password>` blob that the registry accepts directly; ocync sends `Authorization: Basic <token>` and skips the `/v2/token` round-trip.
-- FIPS endpoints: set `AWS_USE_FIPS_ENDPOINT=true` to route SDK calls through `*.dkr.ecr-fips.<region>.amazonaws.com`. See the [FIPS guide](/fips) for crypto provider details.
+- HTTP Basic, not Bearer exchange. `GetAuthorizationToken` returns a base64-encoded `AWS:<password>` blob that the registry accepts directly; ocync sends `Authorization: Basic <token>` and skips the `/v2/token` round-trip.
+- FIPS endpoints: set `AWS_USE_FIPS_ENDPOINT=true` to send the ECR API calls to `api.ecr-fips.<region>.<partition domain>`. See the [FIPS guide](/fips) for crypto provider details.
+- The ECR API calls (`GetAuthorizationToken`, `BatchCheckLayerAvailability`) go through `HTTPS_PROXY` when it is set, like registry traffic, and `AWS_ENDPOINT_URL_ECR` overrides their endpoint.
 - Cross-repo blob mounting requires `BLOB_MOUNTING=ENABLED` on the account *and* a committed manifest in the source repo that references the specific blob. Enable per-account: `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`. Mount POSTs returning 202 (not yet fulfilled) fall back to a normal upload.
 - Batch existence checks use `BatchCheckLayerAvailability` (up to 100 digests per call) instead of per-blob HEADs, reducing API volume on cold syncs.
 - Per-action rate limits: ECR enforces independent quotas per API action (`UploadLayerPart` 500 TPS, `InitiateLayerUpload` / `CompleteLayerUpload` 100 TPS, `PutImage` 10 TPS). ocync tracks 9 separate AIMD windows so a 429 on uploads does not throttle manifest reads.
@@ -116,7 +117,7 @@ The IAM role's trust policy must allow the cluster's OIDC provider to federate t
 
 ### FIPS endpoints
 
-Set `AWS_USE_FIPS_ENDPOINT=true` to route ECR calls through `*.dkr.ecr-fips.<region>.amazonaws.com`:
+Set `AWS_USE_FIPS_ENDPOINT=true` to send the ECR API calls to the FIPS endpoint, such as `api.ecr-fips.us-gov-west-1.amazonaws.com`:
 
 ```yaml
 env:
