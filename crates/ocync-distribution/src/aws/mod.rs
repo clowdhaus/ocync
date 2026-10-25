@@ -11,11 +11,13 @@ mod env;
 mod profile;
 mod retry;
 mod sigv4;
+mod xml;
 
 use self::config::Config;
 use self::env::{Env, Fs, Platform};
 
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -279,6 +281,20 @@ impl ServiceError {
     }
 }
 
+impl ServiceError {
+    /// The code and message of a query protocol `ErrorResponse`. A body that
+    /// is not one still leaves the status.
+    fn parse_xml(status: StatusCode, body: &[u8]) -> Self {
+        let body = std::str::from_utf8(body).unwrap_or_default();
+        Self {
+            status,
+            code: xml::text(body, &["Error", "Code"]).and_then(|c| ErrorCode::parse(&c)),
+            message: xml::text(body, &["Error", "Message"]),
+            retry_after: None,
+        }
+    }
+}
+
 impl fmt::Display for ServiceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let code = self
@@ -427,11 +443,30 @@ pub(crate) struct CallError {
     source: Failure,
 }
 
-/// A client for one AWS JSON API in one region.
-pub(crate) struct Client {
+/// How an API writes its error answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorFormat {
+    /// The JSON protocols: `x-amzn-errortype`, `code` or `__type`.
+    Json,
+    /// The query protocol: `<Error><Code>` in an `ErrorResponse`.
+    Xml,
+}
+
+/// A request to an [`Api`], relative to its endpoint.
+struct ApiRequest<'a> {
+    method: http::Method,
+    /// The path and query after the endpoint's own path, with no leading
+    /// slash. Empty for the endpoint itself.
+    path: &'a str,
+    /// Headers to send, signed when the request is.
+    headers: &'a [(&'a str, &'a str)],
+    body: Bytes,
+}
+
+/// One AWS API in one region: where its requests go, and the retry, clock
+/// skew and error handling every call to it shares.
+struct Api {
     http: reqwest::Client,
-    provider: SharedCredentialsProvider,
-    credentials: CredentialCache<Credentials>,
     /// The last [`ClockSkew`] measured, which every signature corrects for.
     /// Stays 0 when `skew_correction` is off.
     skew: AtomicI64,
@@ -441,16 +476,146 @@ pub(crate) struct Client {
     /// The retry quota and rate limiter shared with every client for the
     /// same service and region.
     partition: Arc<retry::Partition>,
-    service: Service,
     region: Region,
     endpoint: Endpoint,
+    /// The name requests are signed under, such as `ecr`.
+    signing_name: &'static str,
+    errors: ErrorFormat,
+}
+
+impl Api {
+    /// Send `request`, re-sending throttles, transient faults and
+    /// clock-skewed signatures as the SDK's retry policy allows (see
+    /// [`retry`]), and return the successful answer's body. `credentials`
+    /// is asked before each attempt for the key to sign with, or `None` to
+    /// send unsigned.
+    async fn call<F, Fut>(
+        &self,
+        operation: &'static str,
+        request: &ApiRequest<'_>,
+        credentials: F,
+    ) -> Result<Bytes, Failure>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Option<Credentials>, Failure>>,
+    {
+        let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
+        let credentials = &credentials;
+        retrying(operation, &mut policy, |attempt| async move {
+            self.partition.send_token(&self.retry, attempt).await;
+            let credentials = credentials().await?;
+            self.send(request, credentials.as_ref()).await
+        })
+        .await
+    }
+
+    async fn send(
+        &self,
+        request: &ApiRequest<'_>,
+        credentials: Option<&Credentials>,
+    ) -> Result<Bytes, Failure> {
+        let url = self
+            .endpoint
+            .url()
+            .join(request.path)
+            .expect("a relative path joins onto an http URL");
+        let sent = SystemTime::now();
+        let applied = ClockSkew(self.skew.load(Ordering::Relaxed));
+        let mut builder = self
+            .http
+            .request(request.method.clone(), url.clone())
+            .body(request.body.clone());
+        for (name, value) in request.headers {
+            builder = builder.header(*name, *value);
+        }
+        if let Some(credentials) = credentials {
+            let mut signed_headers = request.headers.to_vec();
+            signed_headers.push(("host", self.endpoint.host()));
+            let signed = sigv4::sign(
+                &sigv4::Request {
+                    method: &request.method,
+                    path: url.path(),
+                    headers: &signed_headers,
+                    body: &request.body,
+                },
+                sigv4::AccessKey {
+                    id: credentials.access_key_id(),
+                    secret: credentials.secret_access_key(),
+                    session_token: credentials.session_token(),
+                },
+                &sigv4::CredentialScope {
+                    region: self.region.as_str(),
+                    service: self.signing_name,
+                },
+                applied.apply(sent),
+            );
+            for (name, value) in signed {
+                builder = builder.header(name, value);
+            }
+        }
+        let response = builder.send().await?;
+        let measured = match self.skew_correction {
+            SkewCorrection::On => ClockSkew::measure(response.headers(), sent, SystemTime::now()),
+            SkewCorrection::Off => None,
+        };
+        if let Some(skew) = measured {
+            self.skew.store(skew.0, Ordering::Relaxed);
+        }
+        let status = response.status();
+        let header_code = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|v| v.to_str().ok())
+            .and_then(ErrorCode::parse);
+        let retry_after = response
+            .headers()
+            .get(X_AMZ_RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()?.parse().ok())
+            .map(Duration::from_millis);
+        let bytes = response.bytes().await?;
+        if status.is_success() {
+            return Ok(bytes);
+        }
+        let error = ServiceError {
+            retry_after,
+            ..match self.errors {
+                ErrorFormat::Json => ServiceError::parse(status, header_code, &bytes),
+                ErrorFormat::Xml => ServiceError::parse_xml(status, &bytes),
+            }
+        };
+        let signature_rejected = error
+            .code
+            .as_ref()
+            .is_some_and(|c| c.kind == CodeKind::ClockSkew);
+        // The SDK compares the whole skew. Once a signature is already on
+        // AWS's clock, a rejection is real (a denied role or a bad key), so
+        // only the skew this signature left uncorrected counts.
+        Err(match measured {
+            Some(skew)
+                if credentials.is_some()
+                    && signature_rejected
+                    && ClockSkew(skew.0 - applied.0).magnitude() > SKEW_THRESHOLD =>
+            {
+                Failure::ClockSkewed { error, skew }
+            }
+            _ => Failure::Service(error),
+        })
+    }
+}
+
+/// A client for one AWS JSON API in one region.
+pub(crate) struct Client {
+    api: Api,
+    provider: SharedCredentialsProvider,
+    credentials: CredentialCache<Credentials>,
+    service: Service,
 }
 
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
             .field("service", &self.service)
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &self.api.endpoint)
             .finish_non_exhaustive()
     }
 }
@@ -513,7 +678,7 @@ impl Client {
         Self::from_parts(Parts {
             provider,
             service,
-            partition: retry::partition(service, &region),
+            partition: retry::partition(service.service_id(), &region),
             region,
             endpoint,
             retry: retry::Strategy::new(&config.retry()?),
@@ -533,122 +698,49 @@ impl Client {
             skew_correction,
             stall_timeout,
         } = parts;
-        crate::install_crypto_provider();
-        // Signed requests never follow a redirect: the signature names the
-        // host it was made for.
-        let http = crate::client::no_redirect_builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(stall_timeout)
-            .build()
-            .map_err(ConfigError::HttpClient)?;
         Ok(Self {
-            http,
+            api: Api {
+                http: api_http_client(stall_timeout)?,
+                skew: AtomicI64::new(0),
+                skew_correction,
+                retry,
+                partition,
+                region,
+                endpoint,
+                signing_name: service.signing_name(),
+                errors: ErrorFormat::Json,
+            },
             provider,
             credentials: CredentialCache::new(),
-            skew: AtomicI64::new(0),
-            skew_correction,
-            retry,
-            partition,
             service,
-            region,
-            endpoint,
         })
     }
 
-    /// Call `O` with `input`, re-sending throttles, transient faults and
-    /// clock-skewed signatures as the SDK's retry policy allows (see
-    /// [`retry`]), and decode its output.
+    /// Call `O` with `input`, retried as [`Api::call`] does, and decode its
+    /// output.
     pub(crate) async fn call<O: Operation>(&self, input: &O) -> Result<O::Output, CallError> {
-        let body = Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize"));
         let target = format!("{}.{}", self.service.target_prefix(), O::NAME);
-        let (target, body) = (&target, &body);
-        let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
-        retrying(O::NAME, &mut policy, |attempt| async move {
-            self.partition.send_token(&self.retry, attempt).await;
-            self.send(target, body.clone()).await
-        })
-        .await
-        .map_err(|source| CallError {
-            service: self.service,
-            operation: O::NAME,
-            source,
-        })
-    }
-
-    async fn send<T: DeserializeOwned>(&self, target: &str, body: Bytes) -> Result<T, Failure> {
-        let credentials = self.credentials().await?;
-        let headers = [("content-type", AWS_JSON_1_1), (X_AMZ_TARGET, target)];
-        let signed_headers = [headers[0], headers[1], ("host", self.endpoint.host())];
-        let sent = SystemTime::now();
-        let applied = ClockSkew(self.skew.load(Ordering::Relaxed));
-        let signed = sigv4::sign(
-            &sigv4::Request {
-                method: &http::Method::POST,
-                path: self.endpoint.url().path(),
-                headers: &signed_headers,
-                body: &body,
-            },
-            sigv4::AccessKey {
-                id: credentials.access_key_id(),
-                secret: credentials.secret_access_key(),
-                session_token: credentials.session_token(),
-            },
-            &sigv4::CredentialScope {
-                region: self.region.as_str(),
-                service: self.service.signing_name(),
-            },
-            applied.apply(sent),
-        );
-        let mut request = self.http.post(self.endpoint.url().clone()).body(body);
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        for (name, value) in signed {
-            request = request.header(name, value);
-        }
-        let response = request.send().await?;
-        let measured = match self.skew_correction {
-            SkewCorrection::On => ClockSkew::measure(response.headers(), sent, SystemTime::now()),
-            SkewCorrection::Off => None,
+        let headers = [
+            ("content-type", AWS_JSON_1_1),
+            (X_AMZ_TARGET, target.as_str()),
+        ];
+        let request = ApiRequest {
+            method: http::Method::POST,
+            path: "",
+            headers: &headers,
+            body: Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize")),
         };
-        if let Some(skew) = measured {
-            self.skew.store(skew.0, Ordering::Relaxed);
-        }
-        let status = response.status();
-        let header_code = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|v| v.to_str().ok())
-            .and_then(ErrorCode::parse);
-        let retry_after = response
-            .headers()
-            .get(X_AMZ_RETRY_AFTER)
-            .and_then(|v| v.to_str().ok()?.parse().ok())
-            .map(Duration::from_millis);
-        let bytes = response.bytes().await?;
-        if status.is_success() {
-            return serde_json::from_slice(&bytes).map_err(Failure::Decode);
-        }
-        let error = ServiceError {
-            retry_after,
-            ..ServiceError::parse(status, header_code, &bytes)
-        };
-        let signature_rejected = error
-            .code
-            .as_ref()
-            .is_some_and(|c| c.kind == CodeKind::ClockSkew);
-        // The SDK compares the whole skew. Once a signature is already on
-        // AWS's clock, a rejection is real (a denied role or a bad key), so
-        // only the skew this signature left uncorrected counts.
-        Err(match measured {
-            Some(skew)
-                if signature_rejected
-                    && ClockSkew(skew.0 - applied.0).magnitude() > SKEW_THRESHOLD =>
-            {
-                Failure::ClockSkewed { error, skew }
-            }
-            _ => Failure::Service(error),
-        })
+        self.api
+            .call(O::NAME, &request, || async {
+                self.credentials().await.map(Some)
+            })
+            .await
+            .and_then(|body| serde_json::from_slice(&body).map_err(Failure::Decode))
+            .map_err(|source| CallError {
+                service: self.service,
+                operation: O::NAME,
+                source,
+            })
     }
 
     /// The cached credential, loaded again shortly before it expires.
@@ -668,6 +760,18 @@ impl Client {
             .await
             .map_err(Failure::Credentials)
     }
+}
+
+/// The HTTP client for AWS API calls. It never follows a redirect, since a
+/// signature names the host it was made for, and it uses `HTTPS_PROXY` and
+/// `NO_PROXY` as the rest of ocync does.
+fn api_http_client(stall_timeout: Duration) -> Result<reqwest::Client, ConfigError> {
+    crate::install_crypto_provider();
+    crate::client::no_redirect_builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(stall_timeout)
+        .build()
+        .map_err(ConfigError::HttpClient)
 }
 
 #[cfg(test)]
@@ -984,7 +1088,7 @@ mod tests {
             .mount(&server)
             .await;
         let corrected = client(&server, retry::DEFAULT_MAX_ATTEMPTS);
-        corrected.skew.store(600_000, Ordering::Relaxed);
+        corrected.api.skew.store(600_000, Ordering::Relaxed);
         corrected.call(&Probe {}).await.unwrap_err();
 
         for (ahead, cached, skew_correction, sent) in [
@@ -1228,12 +1332,12 @@ mod tests {
         );
         let client =
             Client::new(&config, "us-west-2", static_credentials(None), Service::Ecr).unwrap();
-        assert_eq!(client.skew_correction, SkewCorrection::Off);
+        assert_eq!(client.api.skew_correction, SkewCorrection::Off);
         assert_eq!(
-            client.endpoint.host(),
+            client.api.endpoint.host(),
             "api.ecr-fips.us-west-2.amazonaws.com"
         );
-        assert_eq!(client.retry.max_attempts(), 1);
+        assert_eq!(client.api.retry.max_attempts(), 1);
         let bad = config::tests::config(&[("AWS_RETRY_MODE", "legacy")], "");
         let err =
             Client::new(&bad, "us-west-2", static_credentials(None), Service::Ecr).unwrap_err();
