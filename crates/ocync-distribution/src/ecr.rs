@@ -41,16 +41,21 @@ fn ecr_region(hostname: &str) -> Option<&str> {
     None
 }
 
-/// Extract the 12-digit registry ID from an ECR hostname.
-///
-/// The registry ID is the first segment of the hostname (before `.dkr`).
-/// Returns `None` if the first segment isn't exactly 12 ASCII digits.
-fn ecr_registry_id(hostname: &str) -> Option<&str> {
-    let first = hostname.split('.').next()?;
-    if first.len() == 12 && first.bytes().all(|b| b.is_ascii_digit()) {
-        Some(first)
-    } else {
-        None
+/// The digits in an AWS account ID.
+const ACCOUNT_ID_LEN: usize = 12;
+
+/// The AWS account ID that names an ECR registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct RegistryId(String);
+
+impl RegistryId {
+    /// The registry ID an ECR hostname starts with, the segment before
+    /// `.dkr`, or `None` when that segment is not exactly 12 ASCII digits.
+    fn from_hostname(hostname: &str) -> Option<Self> {
+        let first = hostname.split('.').next()?;
+        (first.len() == ACCOUNT_ID_LEN && first.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| Self(first.to_owned()))
     }
 }
 
@@ -272,7 +277,7 @@ trait EcrBatchApi {
     /// Call `BatchCheckLayerAvailability` for a single batch (up to 100 digests).
     fn batch_check_layer_availability<'a>(
         &'a self,
-        repo: &'a str,
+        repo: &'a RepositoryName,
         digests: &'a [Digest],
     ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + 'a>>;
 }
@@ -300,7 +305,7 @@ enum LayerIssue {
 #[derive(Debug)]
 struct AwsEcrBatchApi {
     client: crate::aws::Client,
-    registry_id: Option<String>,
+    registry_id: Option<RegistryId>,
 }
 
 /// ECR's `BatchCheckLayerAvailability` for one batch.
@@ -311,8 +316,8 @@ struct BatchCheckLayerAvailability<'a> {
     /// The account, when the hostname names one. Without it ECR checks the
     /// caller's own account.
     #[serde(skip_serializing_if = "Option::is_none")]
-    registry_id: Option<&'a str>,
-    repository_name: &'a str,
+    registry_id: Option<&'a RegistryId>,
+    repository_name: &'a RepositoryName,
 }
 
 impl crate::aws::Operation for BatchCheckLayerAvailability<'_> {
@@ -387,13 +392,13 @@ impl From<BatchCheckOutput> for BatchCheckResponse {
 impl EcrBatchApi for AwsEcrBatchApi {
     fn batch_check_layer_availability<'a>(
         &'a self,
-        repo: &'a str,
+        repo: &'a RepositoryName,
         digests: &'a [Digest],
     ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + 'a>> {
         Box::pin(async move {
             let input = BatchCheckLayerAvailability {
                 layer_digests: digests,
-                registry_id: self.registry_id.as_deref(),
+                registry_id: self.registry_id.as_ref(),
                 repository_name: repo,
             };
             let output = self.client.call(&input).await.map_err(|e| Error::EcrApi {
@@ -434,7 +439,7 @@ impl BatchChecker {
     /// named profile.
     pub async fn from_hostname(hostname: &str, profile: Option<&str>) -> Result<Self, Error> {
         let sdk_config = load_sdk_config(hostname, profile).await?;
-        let registry_id = ecr_registry_id(hostname).map(|s| s.to_owned());
+        let registry_id = RegistryId::from_hostname(hostname);
         let client =
             crate::aws::Client::new(&sdk_config, crate::aws::Service::Ecr).map_err(|e| {
                 Error::EcrApi {
@@ -465,11 +470,7 @@ impl BatchChecker {
         let mut checked = 0;
 
         for chunk in digests.chunks(MAX_DIGESTS_PER_BATCH) {
-            let response = match self
-                .api
-                .batch_check_layer_availability(repo.as_str(), chunk)
-                .await
-            {
+            let response = match self.api.batch_check_layer_availability(repo, chunk).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
@@ -591,30 +592,30 @@ mod tests {
         assert_eq!(ecr_region(""), None);
     }
 
-    // --- ecr_registry_id tests ---
+    // --- RegistryId tests ---
 
     #[test]
     fn registry_id_standard() {
         assert_eq!(
-            ecr_registry_id("123456789012.dkr.ecr.us-east-1.amazonaws.com"),
-            Some("123456789012")
+            RegistryId::from_hostname("123456789012.dkr.ecr.us-east-1.amazonaws.com"),
+            Some(RegistryId("123456789012".into()))
         );
     }
 
     #[test]
     fn registry_id_empty() {
-        assert_eq!(ecr_registry_id(""), None);
+        assert_eq!(RegistryId::from_hostname(""), None);
     }
 
     #[test]
     fn registry_id_dotless_hostname() {
-        assert_eq!(ecr_registry_id("localhost"), None);
+        assert_eq!(RegistryId::from_hostname("localhost"), None);
     }
 
     #[test]
     fn registry_id_non_numeric() {
         assert_eq!(
-            ecr_registry_id("not-a-number.dkr.ecr.us-east-1.amazonaws.com"),
+            RegistryId::from_hostname("not-a-number.dkr.ecr.us-east-1.amazonaws.com"),
             None
         );
     }
@@ -623,7 +624,7 @@ mod tests {
     fn registry_id_too_short() {
         // 11 digits - too short
         assert_eq!(
-            ecr_registry_id("12345678901.dkr.ecr.us-east-1.amazonaws.com"),
+            RegistryId::from_hostname("12345678901.dkr.ecr.us-east-1.amazonaws.com"),
             None
         );
     }
@@ -632,7 +633,7 @@ mod tests {
     fn registry_id_too_long() {
         // 13 digits - too long
         assert_eq!(
-            ecr_registry_id("1234567890123.dkr.ecr.us-east-1.amazonaws.com"),
+            RegistryId::from_hostname("1234567890123.dkr.ecr.us-east-1.amazonaws.com"),
             None
         );
     }
@@ -694,7 +695,7 @@ mod tests {
         let digests = [test_digest(1)];
         for (registry_id, expected) in [
             (
-                Some("123456789012"),
+                Some(RegistryId("123456789012".into())),
                 serde_json::json!({"layerDigests": [digests[0].to_string()], "registryId": "123456789012", "repositoryName": "app"}),
             ),
             (
@@ -704,8 +705,8 @@ mod tests {
         ] {
             let input = BatchCheckLayerAvailability {
                 layer_digests: &digests,
-                registry_id,
-                repository_name: "app",
+                registry_id: registry_id.as_ref(),
+                repository_name: &RepositoryName::new("app").unwrap(),
             };
             assert_eq!(serde_json::to_value(&input).unwrap(), expected);
         }
@@ -764,11 +765,12 @@ mod tests {
     impl EcrBatchApi for MockEcrBatchApi {
         fn batch_check_layer_availability<'a>(
             &'a self,
-            repo: &'a str,
+            repo: &'a RepositoryName,
             digests: &'a [Digest],
         ) -> Pin<Box<dyn Future<Output = Result<BatchCheckResponse, Error>> + 'a>> {
             assert_eq!(
-                repo, self.expected_repo,
+                repo.as_str(),
+                self.expected_repo,
                 "mock: caller passed wrong repo to batch API"
             );
             self.log.asked.lock().unwrap().push(digests.to_vec());

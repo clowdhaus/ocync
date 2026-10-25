@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_config::retry::{RetryConfig, RetryMode};
 use aws_smithy_types::retry::RetrySpec;
 
+use super::endpoint::Region;
 use super::{Failure, Service};
 use crate::retry::Policy;
 
@@ -165,7 +166,7 @@ impl Default for Partition {
 }
 
 /// Partitions by service and region.
-type Partitions = HashMap<(Service, String), Arc<Partition>>;
+type Partitions = HashMap<(Service, Region), Arc<Partition>>;
 
 /// Every partition in the process. Synchronized, not `Rc<RefCell<_>>`,
 /// because the AWS client is a `Send + Sync` leaf like `RegistryClient`:
@@ -174,9 +175,9 @@ type Partitions = HashMap<(Service, String), Arc<Partition>>;
 static PARTITIONS: LazyLock<Mutex<Partitions>> = LazyLock::new(Mutex::default);
 
 /// The partition of `service` in `region`, shared by every client for it.
-pub(super) fn partition(service: Service, region: &str) -> Arc<Partition> {
+pub(super) fn partition(service: Service, region: &Region) -> Arc<Partition> {
     let mut partitions = PARTITIONS.lock().expect("no panic while held");
-    Arc::clone(partitions.entry((service, region.to_owned())).or_default())
+    Arc::clone(partitions.entry((service, region.clone())).or_default())
 }
 
 impl Partition {
@@ -783,12 +784,19 @@ mod tests {
     /// watch cycle's new clients keep the quota the last ones spent.
     #[test]
     fn shares_a_partition_per_service_and_region() {
-        let a = partition(Service::Ecr, "eu-west-3");
-        assert!(Arc::ptr_eq(&a, &partition(Service::Ecr, "eu-west-3")));
-        assert!(!Arc::ptr_eq(&a, &partition(Service::Ecr, "eu-west-2")));
+        let region = |text| Region::parse(text).unwrap();
+        let a = partition(Service::Ecr, &region("eu-west-3"));
+        assert!(Arc::ptr_eq(
+            &a,
+            &partition(Service::Ecr, &region("eu-west-3"))
+        ));
         assert!(!Arc::ptr_eq(
             &a,
-            &partition(Service::EcrPublic, "eu-west-3")
+            &partition(Service::Ecr, &region("eu-west-2"))
+        ));
+        assert!(!Arc::ptr_eq(
+            &a,
+            &partition(Service::EcrPublic, &region("eu-west-3"))
         ));
     }
 

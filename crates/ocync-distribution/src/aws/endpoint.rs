@@ -8,6 +8,45 @@ use url::Url;
 
 use super::{ConfigError, Service};
 
+/// The longest label a host name may hold.
+const MAX_LABEL_LEN: usize = 63;
+
+/// An AWS region, such as `us-east-1`.
+///
+/// It is spliced into endpoint host names and signatures, so it must be a
+/// valid host label, dots allowed, as the SDK's endpoint rules require.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct Region(String);
+
+impl Region {
+    /// Read `text` as a region.
+    pub(super) fn parse(text: &str) -> Result<Self, ConfigError> {
+        let valid_label = |label: &str| {
+            (1..=MAX_LABEL_LEN).contains(&label.len())
+                && !label.starts_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        };
+        if text.split('.').all(valid_label) {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(ConfigError::InvalidRegion(text.to_owned()))
+        }
+    }
+
+    /// The region as text.
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Region {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// The AWS partitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PartitionId {
@@ -90,10 +129,10 @@ static REGION_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         .collect()
 });
 
-fn partition(region: &str) -> &'static Partition {
+fn partition(region: &Region) -> &'static Partition {
     REGION_PATTERNS
         .iter()
-        .position(|pattern| pattern.is_match(region))
+        .position(|pattern| pattern.is_match(region.as_str()))
         .map_or(&PARTITIONS[0], |i| &PARTITIONS[i])
 }
 
@@ -185,7 +224,7 @@ pub(super) enum DualStack {
 /// `endpoint_url` wins, and cannot be combined with FIPS or dual-stack.
 pub(super) fn resolve(
     service: Service,
-    region: &str,
+    region: &Region,
     fips: Fips,
     dual_stack: DualStack,
     endpoint_url: Option<Endpoint>,
@@ -537,7 +576,8 @@ mod tests {
         endpoint_url: Option<&str>,
     ) -> Result<String, String> {
         let endpoint_url = endpoint_url.map(|u| Endpoint::parse(u).unwrap());
-        resolve(service, region, fips, dual_stack, endpoint_url)
+        let region = Region::parse(region).unwrap();
+        resolve(service, &region, fips, dual_stack, endpoint_url)
             .map(|endpoint| endpoint.url().as_str().trim_end_matches('/').to_owned())
             .map_err(|e| e.to_string())
     }
@@ -559,6 +599,30 @@ mod tests {
                 Err(
                     "Invalid Configuration: Dualstack and custom endpoint are not supported".into()
                 )
+            );
+        }
+    }
+
+    /// A region is a host label, dots allowed, as the SDK's endpoint rules
+    /// require, so nothing else can reach an endpoint host name.
+    #[test]
+    fn reads_a_region_as_a_host_label() {
+        for good in ["us-east-1", "a.b", "x", &"a".repeat(63)] {
+            assert_eq!(Region::parse(good).unwrap().as_str(), good);
+        }
+        for bad in [
+            "",
+            "-us",
+            "us_east_1",
+            "us east 1",
+            "a.b.",
+            ".a",
+            "evil.com/x",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(
+                Region::parse(bad).unwrap_err().to_string(),
+                format!("invalid AWS region '{bad}': must be a valid host label"),
             );
         }
     }

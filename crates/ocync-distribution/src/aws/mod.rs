@@ -26,7 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use self::calendar::parse_imf_fixdate;
-use self::endpoint::{DualStack, Endpoint, Fips};
+use self::endpoint::{DualStack, Endpoint, Fips, Region};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
 
@@ -188,6 +188,9 @@ pub(crate) enum ConfigError {
     /// The configuration names no region.
     #[error("no AWS region configured")]
     MissingRegion,
+    /// The configured region is not a valid host label.
+    #[error("invalid AWS region '{0}': must be a valid host label")]
+    InvalidRegion(String),
     /// The configuration has no credentials provider.
     #[error("no AWS credentials provider configured")]
     MissingCredentialsProvider,
@@ -444,7 +447,7 @@ pub(crate) struct Client {
     /// same service and region.
     partition: Arc<retry::Partition>,
     service: Service,
-    region: String,
+    region: Region,
     endpoint: Endpoint,
 }
 
@@ -461,7 +464,7 @@ impl fmt::Debug for Client {
 struct Parts {
     provider: SharedCredentialsProvider,
     service: Service,
-    region: String,
+    region: Region,
     endpoint: Endpoint,
     retry: retry::Settings,
     partition: Arc<retry::Partition>,
@@ -473,10 +476,7 @@ impl Client {
     /// endpoint settings, endpoint URL override and attempt count `config`
     /// carries.
     pub(crate) fn new(config: &SdkConfig, service: Service) -> Result<Self, ConfigError> {
-        let region = config
-            .region()
-            .ok_or(ConfigError::MissingRegion)?
-            .to_string();
+        let region = Region::parse(config.region().ok_or(ConfigError::MissingRegion)?.as_ref())?;
         let provider = config
             .credentials_provider()
             .ok_or(ConfigError::MissingCredentialsProvider)?;
@@ -588,7 +588,7 @@ impl Client {
                 session_token: credentials.session_token(),
             },
             &sigv4::CredentialScope {
-                region: &self.region,
+                region: self.region.as_str(),
                 service: self.service.signing_name(),
             },
             applied.apply(sent),
@@ -711,7 +711,7 @@ mod tests {
         Parts {
             provider: static_credentials(None),
             service: Service::Ecr,
-            region: "us-east-1".into(),
+            region: Region::parse("us-east-1").unwrap(),
             endpoint: Endpoint::parse(endpoint).unwrap(),
             retry: settings(DEFAULT_MAX_ATTEMPTS),
             partition: Arc::default(),
@@ -1182,6 +1182,21 @@ mod tests {
         );
         assert_eq!(started.elapsed(), CREDENTIALS_LOAD_TIMEOUT);
     }
+    /// A configured region that is not a host label fails when the client is
+    /// built, before it can reach an endpoint host name.
+    #[test]
+    fn refuses_a_region_that_is_not_a_host_label() {
+        let config = |region: &'static str| {
+            SdkConfig::builder()
+                .region(aws_config::Region::new(region))
+                .credentials_provider(static_credentials(None))
+                .build()
+        };
+        Client::new(&config("us-west-2"), Service::Ecr).unwrap();
+        let err = Client::new(&config("evil.example/x"), Service::Ecr).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidRegion(_)), "{err}");
+    }
+
     /// The defaults that size the credential load timeout are the SDK's
     /// standard retry defaults.
     #[test]
