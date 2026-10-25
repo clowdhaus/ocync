@@ -60,13 +60,13 @@ impl RegistryId {
 
 /// The AWS API client for the ECR registry at `hostname`, in the region the
 /// hostname names, with credentials from `profile` or the default chain.
-pub(crate) async fn api_client(
+pub(crate) fn api_client(
     hostname: &str,
     profile: Option<&str>,
 ) -> Result<crate::aws::Client, crate::aws::ConfigError> {
     let region = ecr_region(hostname)
         .ok_or_else(|| crate::aws::ConfigError::NoRegionInHostname(hostname.to_owned()))?;
-    crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr).await
+    crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr)
 }
 
 /// Maximum number of layer digests per `BatchCheckLayerAvailability` API call.
@@ -423,12 +423,10 @@ impl BatchChecker {
     /// as a different identity than the auth provider, which silently breaks
     /// `BatchCheckLayerAvailability` for registries reachable only via the
     /// named profile.
-    pub async fn from_hostname(hostname: &str, profile: Option<&str>) -> Result<Self, Error> {
-        let client = api_client(hostname, profile)
-            .await
-            .map_err(|e| Error::EcrApi {
-                reason: e.to_string(),
-            })?;
+    pub fn from_hostname(hostname: &str, profile: Option<&str>) -> Result<Self, Error> {
+        let client = api_client(hostname, profile).map_err(|e| Error::EcrApi {
+            reason: e.to_string(),
+        })?;
         let registry_id = RegistryId::from_hostname(hostname);
         Ok(Self {
             api: Box::new(AwsEcrBatchApi {
@@ -1217,16 +1215,15 @@ mod tests {
         assert_eq!(log.calls(), 2);
     }
 
-    #[tokio::test]
-    async fn batch_checker_from_hostname_accepts_named_profile() {
+    #[test]
+    fn batch_checker_from_hostname_accepts_named_profile() {
         // Pins the BatchChecker / EcrAuth symmetry: both must thread the same
         // profile, otherwise sync runs against profile-scoped registries get
         // split-brain auth.
         let checker = BatchChecker::from_hostname(
             "123456789012.dkr.ecr.us-east-1.amazonaws.com",
             Some("nonexistent-profile-for-test"),
-        )
-        .await;
+        );
         assert!(checker.is_ok(), "{:?}", checker.err());
     }
 }

@@ -202,10 +202,9 @@ impl EcrAuth {
     /// the ambient default credential chain is used unchanged. Each
     /// `EcrAuth` instance holds its own AWS client, so per-instance profile
     /// overrides do not leak across registries.
-    pub async fn new(hostname: impl Into<String>, profile: Option<&str>) -> Result<Self, Error> {
+    pub fn new(hostname: impl Into<String>, profile: Option<&str>) -> Result<Self, Error> {
         let hostname = hostname.into();
         let client = crate::ecr::api_client(&hostname, profile)
-            .await
             .map_err(|e| Error::auth_failed(&hostname, e))?;
         let registry = hostname.clone();
 
@@ -591,23 +590,22 @@ mod tests {
         assert_eq!(token.value(), encoded);
     }
 
-    #[tokio::test]
-    async fn new_rejects_non_ecr_hostname() {
-        let result = EcrAuth::new("ghcr.io", None).await;
+    #[test]
+    fn new_rejects_non_ecr_hostname() {
+        let result = EcrAuth::new("ghcr.io", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("region"));
     }
 
-    #[tokio::test]
-    async fn new_accepts_optional_profile() {
-        // Profile name does not validate here; SDK config load is permissive
-        // about unknown profile names. This test asserts the signature and that
-        // construction itself does not fail.
+    #[test]
+    fn new_accepts_optional_profile() {
+        // Profile name does not validate here: credentials load lazily, so
+        // an unknown profile surfaces on the first call. This test asserts
+        // the signature and that construction itself does not fail.
         let auth = EcrAuth::new(
             "123456789012.dkr.ecr.us-east-1.amazonaws.com",
             Some("nonexistent-test-profile"),
-        )
-        .await;
+        );
         assert!(
             auth.is_ok(),
             "EcrAuth::new with profile should succeed: {:?}",

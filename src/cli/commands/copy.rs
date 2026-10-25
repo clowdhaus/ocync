@@ -72,7 +72,6 @@ pub(crate) async fn run(
     let batch_checker: Option<Rc<dyn BatchBlobChecker>> = if dst_is_ecr {
         let profile = dst_reg_config.and_then(|r| r.aws_profile.as_deref());
         let checker = BatchChecker::from_hostname(dst_hostname, profile)
-            .await
             .map_err(|e| CliError::Input(format!("ECR batch checker for '{dst_hostname}': {e}")))?;
         Some(Rc::new(checker))
     } else {

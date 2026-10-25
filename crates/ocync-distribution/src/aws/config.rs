@@ -107,6 +107,11 @@ impl Config {
         }
     }
 
+    /// The selected profile's name.
+    pub(super) fn profile_name(&self) -> &str {
+        &self.profile
+    }
+
     /// The selected profile's properties, if it exists.
     fn profile(&self) -> Option<&Properties> {
         self.sections.profiles.get(&self.profile)

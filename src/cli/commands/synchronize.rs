@@ -638,7 +638,7 @@ pub(crate) async fn run(
     let resolution = with_prepare_progress(&tracker, "sync", async {
         let referenced = referenced_registries(&config);
         let clients = build_clients(&config, &referenced, &tracker).await;
-        let batch_checkers = build_batch_checkers(&config, &clients, &referenced, &tracker).await;
+        let batch_checkers = build_batch_checkers(&config, &clients, &referenced, &tracker);
         resolve_all(
             &config,
             &clients,
@@ -1283,7 +1283,7 @@ fn client_for(
 /// Targets only: the map is read in exactly one place, keyed by target alias,
 /// so a checker for a source-only registry is an AWS round trip per cycle that
 /// nothing can consume.
-async fn build_batch_checkers(
+fn build_batch_checkers(
     config: &Config,
     clients: &ClientMap,
     referenced: &Referenced,
@@ -1324,7 +1324,7 @@ async fn build_batch_checkers(
         // API. Losing it costs an optimization, not correctness -- `with_retry`
         // still catches the `BLOB_UPLOAD_UNKNOWN` this would have avoided -- so
         // a failure here degrades rather than aborting the run.
-        match BatchChecker::from_hostname(hostname, reg.aws_profile.as_deref()).await {
+        match BatchChecker::from_hostname(hostname, reg.aws_profile.as_deref()) {
             Ok(checker) => {
                 checkers.insert(name.clone(), Rc::new(checker));
             }
@@ -3640,7 +3640,7 @@ mappings:
         let tracker = PrepareTracker::default();
         let referenced = referenced_registries(&config);
         let clients = build_clients(&config, &referenced, &tracker).await;
-        let checkers = build_batch_checkers(&config, &clients, &referenced, &tracker).await;
+        let checkers = build_batch_checkers(&config, &clients, &referenced, &tracker);
 
         assert!(checkers.is_empty(), "neither registry is ECR");
         let p = tracker.snapshot();

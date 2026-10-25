@@ -1,10 +1,12 @@
 //! Signed calls to the AWS JSON APIs ocync uses: ECR and ECR Public.
 //!
 //! Settings, signing, endpoint resolution, retries, clock-skew correction
-//! and error parsing are owned here. Credentials come from `aws-config`.
+//! and error parsing are owned here, and the credential chain in
+//! [`credentials`].
 
 mod calendar;
 mod config;
+mod credentials;
 mod endpoint;
 mod host;
 mod profile;
@@ -12,6 +14,7 @@ mod retry;
 mod sigv4;
 
 use self::config::{Config, ServiceId};
+use self::credentials::{Chain, Credentials};
 use self::host::Host;
 
 use std::fmt;
@@ -20,9 +23,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use aws_credential_types::Credentials;
-use aws_credential_types::provider::error::CredentialsError;
-use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use serde::Serialize;
@@ -367,7 +367,7 @@ impl fmt::Display for ClockSkew {
 enum Failure {
     /// No credentials could be loaded.
     #[error("failed to load AWS credentials: {0}")]
-    Credentials(#[source] CredentialsError),
+    Credentials(#[source] credentials::Error),
     /// The request did not complete. Built only through `From`, which drops
     /// the URL.
     #[error("request failed: {0}")]
@@ -568,10 +568,29 @@ impl Api {
     }
 }
 
+/// Where a client's credentials come from.
+enum Provider {
+    /// The default credential chain.
+    Chain(Chain),
+    /// A test's own loader, to count or stall loads.
+    #[cfg(test)]
+    Test(tests::Loader),
+}
+
+impl Provider {
+    async fn load(&self) -> Result<Credentials, credentials::Error> {
+        match self {
+            Self::Chain(chain) => chain.load().await,
+            #[cfg(test)]
+            Self::Test(loader) => loader().await,
+        }
+    }
+}
+
 /// A client for one AWS JSON API in one region.
 pub(crate) struct Client {
     api: Api,
-    provider: SharedCredentialsProvider,
+    provider: Provider,
     credentials: CredentialCache<Credentials>,
     service: Service,
 }
@@ -587,7 +606,7 @@ impl fmt::Debug for Client {
 
 /// Everything a [`Client`] is built from.
 struct Parts {
-    provider: SharedCredentialsProvider,
+    provider: Provider,
     service: Service,
     region: Region,
     endpoint: Endpoint,
@@ -601,31 +620,20 @@ impl Client {
     /// A client for `service` in `region`, configured from the process
     /// environment and the shared AWS files, `profile` naming the profile
     /// to use in place of `AWS_PROFILE`.
-    pub(crate) async fn from_env(
+    pub(crate) fn from_env(
         region: &str,
         profile: Option<&str>,
         service: Service,
     ) -> Result<Self, ConfigError> {
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_owned()));
-        if let Some(profile) = profile {
-            loader = loader.profile_name(profile);
-        }
-        let provider = loader
-            .load()
-            .await
-            .credentials_provider()
-            .expect("the default loader sets a credentials provider");
-        Self::new(&Host::current(), region, profile, provider, service)
+        Self::new(&Host::current(), region, profile, service)
     }
 
-    /// A client for `service` in `region`, with the endpoint, retry and
-    /// clock-skew settings `host` holds for `profile`.
+    /// A client for `service` in `region`, with the endpoint, retry,
+    /// clock-skew and credential settings `host` holds for `profile`.
     fn new(
         host: &Host,
         region: &str,
         profile: Option<&str>,
-        provider: SharedCredentialsProvider,
         service: Service,
     ) -> Result<Self, ConfigError> {
         let config = Config::load(host, profile);
@@ -638,7 +646,7 @@ impl Client {
             config.endpoint_url(service.service_id())?,
         )?;
         Self::from_parts(Parts {
-            provider,
+            provider: Provider::Chain(Chain::new(&host.env, &region, &config)),
             service,
             partition: retry::partition(service, &region),
             region,
@@ -698,12 +706,9 @@ impl Client {
     async fn credentials(&self) -> Result<Credentials, Failure> {
         self.credentials
             .get_or_refresh("aws-credentials", async {
-                let loaded = tokio::time::timeout(
-                    CREDENTIALS_LOAD_TIMEOUT,
-                    self.provider.provide_credentials(),
-                )
-                .await
-                .map_err(|_| CredentialsError::provider_timed_out(CREDENTIALS_LOAD_TIMEOUT))??;
+                let loaded = tokio::time::timeout(CREDENTIALS_LOAD_TIMEOUT, self.provider.load())
+                    .await
+                    .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))??;
                 let ttl = loaded.expiry().map_or(DEFAULT_EXPIRATION, remaining);
                 Ok((loaded, ttl))
             })
@@ -727,6 +732,7 @@ fn api_http_client(stall_timeout: Duration) -> Result<reqwest::Client, ConfigErr
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
@@ -749,14 +755,20 @@ mod tests {
         type Output = ProbeOutput;
     }
 
-    fn static_credentials(session_token: Option<&str>) -> SharedCredentialsProvider {
-        SharedCredentialsProvider::new(Credentials::new(
-            "AKIDEXAMPLE",
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            session_token.map(str::to_owned),
-            None,
-            "test",
-        ))
+    /// A test's own credential loader.
+    pub(super) type Loader = Box<
+        dyn Fn() -> Pin<Box<dyn Future<Output = Result<Credentials, credentials::Error>> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    /// A provider answering with the example key and `session_token`.
+    fn static_credentials(session_token: Option<&str>) -> Provider {
+        let credentials = credentials::tests::key(session_token, None);
+        Provider::Test(Box::new(move || {
+            let credentials = credentials.clone();
+            Box::pin(async move { Ok(credentials) })
+        }))
     }
 
     /// The SDK's settings with `max_attempts` and a 1 ms first backoff, so a
@@ -1198,25 +1210,15 @@ mod tests {
     /// layer checks does not reload it from IMDS or STS on every call.
     #[tokio::test]
     async fn reuses_a_credential_until_it_nears_expiry() {
-        #[derive(Debug)]
-        struct Counting(Arc<AtomicUsize>, Duration);
-        impl ProvideCredentials for Counting {
-            fn provide_credentials<'a>(
-                &'a self,
-            ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
-            where
-                Self: 'a,
-            {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                aws_credential_types::provider::future::ProvideCredentials::ready(Ok(
-                    Credentials::new("id", "secret", None, Some(SystemTime::now() + self.1), "t"),
-                ))
-            }
-        }
         for (lifetime, loads) in [(Duration::from_secs(3600), 1), (Duration::from_secs(5), 2)] {
             let count = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&count);
             let client = Client::from_parts(Parts {
-                provider: SharedCredentialsProvider::new(Counting(count.clone(), lifetime)),
+                provider: Provider::Test(Box::new(move || {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    let expiry = SystemTime::now() + lifetime;
+                    Box::pin(async move { Ok(credentials::tests::key(None, Some(expiry))) })
+                })),
                 ..parts("https://example.com")
             })
             .unwrap();
@@ -1231,22 +1233,8 @@ mod tests {
     /// holding it forever.
     #[tokio::test(start_paused = true)]
     async fn gives_up_on_a_credential_source_that_hangs() {
-        #[derive(Debug)]
-        struct Hangs;
-        impl ProvideCredentials for Hangs {
-            fn provide_credentials<'a>(
-                &'a self,
-            ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
-            where
-                Self: 'a,
-            {
-                aws_credential_types::provider::future::ProvideCredentials::new(
-                    std::future::pending(),
-                )
-            }
-        }
         let client = Client::from_parts(Parts {
-            provider: SharedCredentialsProvider::new(Hangs),
+            provider: Provider::Test(Box::new(|| Box::pin(std::future::pending()))),
             ..parts("https://example.com")
         })
         .unwrap();
@@ -1258,13 +1246,13 @@ mod tests {
         );
         assert_eq!(started.elapsed(), CREDENTIALS_LOAD_TIMEOUT);
     }
+
     /// A configured region that is not a host label fails when the client is
     /// built, before it can reach an endpoint host name.
     #[test]
     fn refuses_a_region_that_is_not_a_host_label() {
         let host = config::tests::host(&[], "");
-        let client =
-            |region| Client::new(&host, region, None, static_credentials(None), Service::Ecr);
+        let client = |region| Client::new(&host, region, None, Service::Ecr);
         client("us-west-2").unwrap();
         let err = client("evil.example/x").unwrap_err();
         assert!(matches!(err, ConfigError::InvalidRegion(_)), "{err}");
@@ -1282,15 +1270,7 @@ mod tests {
             ],
             "",
         );
-        let new = |host| {
-            Client::new(
-                host,
-                "us-west-2",
-                None,
-                static_credentials(None),
-                Service::Ecr,
-            )
-        };
+        let new = |host| Client::new(host, "us-west-2", None, Service::Ecr);
         let client = new(&host).unwrap();
         assert_eq!(client.api.skew_correction, SkewCorrection::Off);
         assert_eq!(
@@ -1312,18 +1292,12 @@ mod tests {
             "[default]\nuse_fips_endpoint = true\n[profile other]\nuse_fips_endpoint = false\n",
         );
         let host_name = |profile| {
-            Client::new(
-                &host,
-                "us-west-2",
-                profile,
-                static_credentials(None),
-                Service::Ecr,
-            )
-            .unwrap()
-            .api
-            .endpoint
-            .host()
-            .to_owned()
+            Client::new(&host, "us-west-2", profile, Service::Ecr)
+                .unwrap()
+                .api
+                .endpoint
+                .host()
+                .to_owned()
         };
         assert_eq!(host_name(None), "api.ecr-fips.us-west-2.amazonaws.com");
         assert_eq!(host_name(Some("other")), "api.ecr.us-west-2.amazonaws.com");
