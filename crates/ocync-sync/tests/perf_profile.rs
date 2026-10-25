@@ -58,7 +58,7 @@ use ocync_sync::staging::BlobStage;
 use rcgen::{CertificateParams, DnType, KeyPair};
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{ContainerAsync, ContainerRequest, GenericImage, ImageExt};
 use url::Url;
 
 use helpers::*;
@@ -70,13 +70,22 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-async fn start_registry_http() -> (ContainerAsync<GenericImage>, Url) {
-    let container = GenericImage::new("registry", "2")
+/// A `registry:2` container listening on port 5000.
+fn registry() -> ContainerRequest<GenericImage> {
+    GenericImage::new("registry", "2")
         .with_exposed_port(5000.into())
         .with_wait_for(WaitFor::message_on_stderr("listening on"))
         // Without an init process to reap it, the registry can be left a
         // zombie Docker cannot kill, and the container is never removed.
         .with_host_config_modifier(|config| config.init = Some(true))
+}
+
+/// Starts `request` and returns the container with its `scheme` base URL.
+async fn start(
+    request: ContainerRequest<GenericImage>,
+    scheme: &str,
+) -> (ContainerAsync<GenericImage>, Url) {
+    let container = request
         .start()
         .await
         .expect("registry:2 container failed to start");
@@ -84,8 +93,12 @@ async fn start_registry_http() -> (ContainerAsync<GenericImage>, Url) {
         .get_host_port_ipv4(5000)
         .await
         .expect("get_host_port_ipv4 failed");
-    let url = Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+    let url = Url::parse(&format!("{scheme}://127.0.0.1:{port}")).unwrap();
     (container, url)
+}
+
+async fn start_registry_http() -> (ContainerAsync<GenericImage>, Url) {
+    start(registry(), "http").await
 }
 
 /// Self-signed cert covering `localhost` + `127.0.0.1`, valid for the
@@ -104,24 +117,12 @@ fn self_signed_localhost() -> (Vec<u8>, Vec<u8>) {
 
 async fn start_registry_tls() -> (ContainerAsync<GenericImage>, Url) {
     let (cert_pem, key_pem) = self_signed_localhost();
-    let container = GenericImage::new("registry", "2")
-        .with_exposed_port(5000.into())
-        .with_wait_for(WaitFor::message_on_stderr("listening on"))
+    let request = registry()
         .with_env_var("REGISTRY_HTTP_TLS_CERTIFICATE", "/certs/tls.crt")
         .with_env_var("REGISTRY_HTTP_TLS_KEY", "/certs/tls.key")
         .with_copy_to("/certs/tls.crt", cert_pem)
-        .with_copy_to("/certs/tls.key", key_pem)
-        // As in `start_registry_http`.
-        .with_host_config_modifier(|config| config.init = Some(true))
-        .start()
-        .await
-        .expect("registry:2 (TLS) container failed to start");
-    let port = container
-        .get_host_port_ipv4(5000)
-        .await
-        .expect("get_host_port_ipv4 failed");
-    let url = Url::parse(&format!("https://127.0.0.1:{port}")).unwrap();
-    (container, url)
+        .with_copy_to("/certs/tls.key", key_pem);
+    start(request, "https").await
 }
 
 fn make_client(url: Url, accept_invalid_certs: bool) -> Arc<RegistryClient> {
