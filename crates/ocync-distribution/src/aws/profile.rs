@@ -22,7 +22,7 @@ const WHITESPACE: &[char] = &[' ', '\t'];
 const COMMENT: &[char] = &['#', ';'];
 
 /// The profile used when none is named.
-const DEFAULT_PROFILE: &str = "default";
+pub(super) const DEFAULT_PROFILE: &str = "default";
 
 /// The prefix of a profile section in the config file.
 const PROFILE_PREFIX: &str = "profile";
@@ -74,7 +74,7 @@ pub(super) struct Sections {
 }
 
 /// A file that does not parse.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("error parsing {} on line {line}: {message}", path.display())]
 pub(super) struct ParseError {
     path: PathBuf,

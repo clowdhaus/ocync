@@ -1,0 +1,13 @@
+{
+  "name": "region-override",
+  "docs": "region is overridden externally, overriding the value set in the environment",
+  "result": {
+    "Ok": {
+      "access_key_id": "ASIARTESTID",
+      "secret_access_key": "TESTSECRETKEY",
+      "session_token": "TESTSESSIONTOKEN",
+      "account_id": "123456789012",
+      "expiry": 1628193482
+    }
+  }
+}

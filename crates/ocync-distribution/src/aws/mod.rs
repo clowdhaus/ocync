@@ -769,20 +769,21 @@ impl Client {
             config.endpoint_url(service.api_id().service_id)?,
         )?;
         let retry = config.retry()?;
+        let api = ApiParts {
+            partition: retry::partition(service.api_id().service_id, &region),
+            endpoint,
+            retry: retry::Strategy::new(&retry),
+            skew_correction: config.skew_correction(),
+            stall_timeout: STALL_TIMEOUT,
+            region,
+        };
+        let chain =
+            Chain::new(host, &api.region, config, &retry).map_err(ConfigError::HttpClient)?;
         Self::from_parts(Parts {
-            provider: Provider::Chain(Box::new(
-                Chain::new(host, &region, &config, &retry).map_err(ConfigError::HttpClient)?,
-            )),
+            provider: Provider::Chain(Box::new(chain)),
             service,
             network: host.network.clone(),
-            api: ApiParts {
-                partition: retry::partition(service.api_id().service_id, &region),
-                region,
-                endpoint,
-                retry: retry::Strategy::new(&retry),
-                skew_correction: config.skew_correction(),
-                stall_timeout: STALL_TIMEOUT,
-            },
+            api,
         })
     }
 

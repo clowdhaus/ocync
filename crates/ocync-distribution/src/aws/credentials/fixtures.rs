@@ -25,42 +25,26 @@ pub(super) const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/aws/cred
 /// names one, as when a registry gives none.
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// The default chain cases not run, by directory name: each reaches a
-/// source loaded through `aws-config`, which reads the real host.
+/// The default chain cases not run, by directory name: each reaches an SSO
+/// profile, loaded through `aws-config`, which reads the real host.
 const EXCLUDED: &[&str] = &[
     "e2e_fips_and_dual_stack_sso",
-    "ecs_assume_role",
-    "environment_variables_blank",
-    "imds_assume_role",
-    "imds_no_iam_role",
-    "imds_token_fail",
-    "profile_name",
-    "profile_overrides_web_identity",
-    "profile_static_keys",
-    "profile_static_keys_case_insensitive",
     "sso_assume_role",
     "sso_no_token_file",
     "sso_server_error",
-    "web_identity_source_profile_no_env",
-    "web_identity_token_invalid_jwt",
-    "web_identity_token_profile",
-    "web_identity_token_source_profile",
 ];
 
-/// Cases that start at a later source than the environment, by directory
-/// name: the sources before it are loaded through `aws-config`, and these
-/// cases expect each of them not to be configured.
-const STARTS_AT: &[(&str, Source)] = &[
-    ("ecs_credentials", Source::Container),
-    ("ecs_credentials_invalid_profile", Source::Container),
-    ("eks_pod_identity_credentials", Source::Container),
-    ("eks_pod_identity_no_token_file", Source::Container),
-    ("imds_config_with_no_creds", Source::Imds),
-    ("imds_default_chain_error", Source::Imds),
-    ("imds_default_chain_retries", Source::Imds),
-    ("imds_default_chain_success", Source::Imds),
-    ("imds_disabled", Source::Imds),
-    ("web_identity_token_env", Source::WebIdentity),
+/// The profile source cases not run, by directory name: each reaches an SSO
+/// or `credential_process` profile, loaded through `aws-config`.
+const PROFILE_EXCLUDED: &[&str] = &[
+    "credential_process",
+    "credential_process_account_id_fallback",
+    "credential_process_failure",
+    "credential_process_invalid",
+    "invalid_sso_credentials_config",
+    "sso_credentials",
+    "sso_override_global_env_url",
+    "sso_token",
 ];
 
 /// Cases run at the UNIX epoch, as upstream runs them, so the expiry they
@@ -135,7 +119,8 @@ enum SecretsInLogs {
 }
 
 impl Case {
-    fn load(dir: &Path) -> Self {
+    /// The case in `dir`, trying the sources of `order`.
+    fn load(dir: &Path, order: &'static [Source]) -> Self {
         let read = |file: &str| {
             let path = dir.join(file);
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -161,12 +146,6 @@ impl Case {
             network: Network::Replay(Arc::clone(&replay)),
             ..Host::fixed()
         };
-        let start = STARTS_AT
-            .iter()
-            .find(|(case, _)| *case == name)
-            .map_or(Source::Environment, |&(_, source)| source);
-        let all: &'static [Source] = &Source::ORDER;
-        let at = all.iter().position(|&source| source == start).unwrap();
         let test_case: TestCase = serde_json::from_str(&read("test-case.json")).unwrap();
         Self {
             name,
@@ -174,7 +153,7 @@ impl Case {
             host,
             outcome: test_case.result,
             replay,
-            order: &all[at..],
+            order,
             secrets_in_logs,
         }
     }
@@ -185,7 +164,7 @@ impl Case {
         let name = &self.name;
         let config = Config::load(&self.host, None);
         let retry = config.retry().unwrap();
-        let chain = Chain::new(&self.host, &self.region, &config, &retry).unwrap();
+        let chain = Chain::new(&self.host, &self.region, config, &retry).unwrap();
         let (result, logs) = capture_logs(chain.load_in(self.order)).await;
         self.replay.assert_done();
         match (&self.outcome, &result) {
@@ -271,35 +250,46 @@ pub(super) async fn capture_logs<T>(future: impl Future<Output = T>) -> (T, Stri
     (output, logs)
 }
 
-/// Every default chain case not excluded passes, and every case is either
-/// run or excluded with a reason. Time is paused, so retries back off
-/// without waiting. Breaks if a source answers or sends differently from
-/// upstream, or a case is dropped or excluded twice.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn upstream_default_chain_cases() {
-    let suite = Path::new(DATA).join("default-credential-provider-chain");
+/// Run every case of `suite` not `excluded` through the sources of `order`,
+/// and check that each listed case exists and the suite holds `cases`.
+async fn run_suite(suite: &str, excluded: &[&str], order: &'static [Source], cases: usize) {
+    let suite = Path::new(DATA).join(suite);
     let mut names: Vec<_> = std::fs::read_dir(&suite)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    let listed = EXCLUDED
-        .iter()
-        .chain(AT_THE_EPOCH)
-        .chain(STARTS_AT.iter().map(|(name, _)| name));
-    for case in listed {
+    assert_eq!(names.len(), cases);
+    for case in excluded {
         assert!(names.iter().any(|n| n == case), "no case {case}");
     }
-    let mut run = 0;
-    for name in &names {
-        if EXCLUDED.contains(&name.as_str()) {
-            continue;
-        }
-        Case::load(&suite.join(name)).run().await;
-        run += 1;
+    for name in names.iter().filter(|n| !excluded.contains(&n.as_str())) {
+        Case::load(&suite.join(name), order).run().await;
     }
-    assert_eq!(run + EXCLUDED.len(), names.len());
-    assert_eq!(names.len(), 29);
+}
+
+/// Every default chain case not excluded passes through the whole chain.
+/// Time is paused, so retries back off without waiting. Breaks if a source
+/// answers or sends differently from upstream, or a case is dropped.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn upstream_default_chain_cases() {
+    let suite = "default-credential-provider-chain";
+    for case in AT_THE_EPOCH {
+        let dir = Path::new(DATA).join(suite).join(case);
+        assert!(
+            dir.is_dir() && !EXCLUDED.contains(case),
+            "{case} does not run"
+        );
+    }
+    run_suite(suite, EXCLUDED, &Source::ORDER, 29).await;
+}
+
+/// Every profile source case not excluded passes through the profile
+/// source alone, as upstream runs them. Breaks if the profile resolves,
+/// assumes a role or reports differently from upstream.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn upstream_profile_cases() {
+    run_suite("profile-provider", PROFILE_EXCLUDED, &[Source::Profile], 18).await;
 }
 
 /// The harness itself: a case expecting other credentials fails. Breaks if
@@ -309,6 +299,7 @@ async fn upstream_default_chain_cases() {
 async fn a_wrong_answer_fails_the_case() {
     let mut case = Case::load(
         &Path::new(DATA).join("default-credential-provider-chain/environment_variables"),
+        &Source::ORDER,
     );
     case.outcome = Outcome::Ok(Expected {
         access_key_id: "other".to_owned(),

@@ -8,7 +8,12 @@ Version 2.0. Copyright Amazon.com, Inc. or its affiliates.
 Each case directory holds the process environment (`env.json`), the files the
 chain may read (`fs/`), the recorded HTTP exchanges (`http-traffic.json`) and
 the expected credentials or error text (`test-case.json`). The cases run
-through `credentials::fixtures` in this crate, unchanged.
+through `credentials::fixtures` in this crate, unchanged:
+`default-credential-provider-chain` through the whole chain, and
+`profile-provider` through the profile source alone.
+
+`assume-role-tests.json` holds the profile resolution cases, run by the tests
+of `credentials::profile`.
 
 `imds-config/imds-endpoint-tests.json` holds the instance metadata endpoint
 cases, run by the tests of `credentials::imds`.

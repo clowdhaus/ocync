@@ -1,12 +1,11 @@
-//! Credentials for the role `AWS_ROLE_ARN` names, assumed with the web
-//! identity token in `AWS_WEB_IDENTITY_TOKEN_FILE`, as EKS IAM roles for
-//! service accounts set them.
+//! Credentials for a role assumed with a web identity token: the role
+//! `AWS_ROLE_ARN` names with the token in `AWS_WEB_IDENTITY_TOKEN_FILE`, as
+//! EKS IAM roles for service accounts set them, or one a profile names.
 
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::str::Utf8Error;
-use std::time::UNIX_EPOCH;
 
 use super::super::host::{Fs, Host};
 use super::{Credentials, Error as ChainError, REDACTED, sts};
@@ -67,41 +66,82 @@ pub(in crate::aws) enum Error {
     Sts(#[source] sts::Error),
 }
 
-/// Credentials for the role, from STS in the region `sts` calls. Only an
-/// unset token file or role variable leaves the source not configured, as
-/// upstream. With no session name set, the SDK's is made:
-/// `web-identity-token-<milliseconds since the UNIX epoch>`.
+/// Who configured a role, which names the session the SDK makes for it.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Origin {
+    /// The variables IRSA sets.
+    Environment,
+    /// A profile's `role_arn` and `web_identity_token_file`.
+    Profile,
+}
+
+impl Origin {
+    /// The session name's prefix.
+    fn session_prefix(self) -> &'static str {
+        match self {
+            Self::Environment => "web-identity-token",
+            Self::Profile => "web-identity-token-profile",
+        }
+    }
+}
+
+/// A role to assume with the token in a file.
+#[derive(Debug)]
+pub(super) struct Role<'a> {
+    pub(super) arn: &'a str,
+    pub(super) token_file: &'a str,
+    pub(super) session_name: Option<&'a str>,
+    pub(super) origin: Origin,
+}
+
+/// Credentials for the role the environment names, from STS in the region
+/// `sts` calls. Only an unset token file or role variable leaves the source
+/// not configured, as upstream.
 pub(super) async fn load(host: &Host, sts: &sts::Client) -> Result<Credentials, ChainError> {
     let not_loaded = |reason: &str| ChainError::NotLoaded(reason.to_owned());
-    let path = host
+    let token_file = host
         .env
         .get(TOKEN_FILE)
         .ok_or_else(|| not_loaded("$AWS_WEB_IDENTITY_TOKEN_FILE was not set"))?;
-    let role_arn = host
+    let arn = host
         .env
         .get(ROLE_ARN)
         .ok_or_else(|| not_loaded("AWS_ROLE_ARN environment variable must be set"))?;
-    let session_name = host.env.get(SESSION_NAME).unwrap_or_else(|| {
-        let since_epoch = host.clock.now().duration_since(UNIX_EPOCH);
-        format!(
-            "web-identity-token-{}",
-            since_epoch.unwrap_or_default().as_millis()
-        )
-    });
-    let token = Token::read(&host.fs, PathBuf::from(path)).map_err(ChainError::WebIdentity)?;
+    let session_name = host.env.get(SESSION_NAME);
+    let role = Role {
+        arn: &arn,
+        token_file: &token_file,
+        session_name: session_name.as_deref(),
+        origin: Origin::Environment,
+    };
+    assume(host, sts, &role)
+        .await
+        .map_err(ChainError::WebIdentity)
+}
+
+/// Credentials for `role`, from STS in the region `sts` calls. With no
+/// session name set, the SDK's is made from the role's origin and the time.
+pub(super) async fn assume(
+    host: &Host,
+    sts: &sts::Client,
+    role: &Role<'_>,
+) -> Result<Credentials, Error> {
+    let session_name =
+        sts::session_name(role.session_name, role.origin.session_prefix(), host.clock);
+    let token = Token::read(&host.fs, PathBuf::from(role.token_file))?;
     sts.assume_role_with_web_identity(&sts::WebIdentity {
-        role_arn: &role_arn,
+        role_arn: role.arn,
         session_name: &session_name,
         token: &token,
     })
     .await
-    .map_err(|e| ChainError::WebIdentity(Error::Sts(e)))
+    .map_err(Error::Sts)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

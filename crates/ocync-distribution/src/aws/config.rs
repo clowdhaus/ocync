@@ -7,7 +7,7 @@ use std::num::NonZeroU32;
 
 use super::endpoint::{DualStack, Endpoint, Fips};
 use super::host::{Env, Host};
-use super::profile::{self, Location, Properties, Sections};
+use super::profile::{self, Location, ParseError, Properties, Sections};
 use super::{ConfigError, SkewCorrection, retry};
 
 /// The profile property naming the `[services name]` section that holds
@@ -140,7 +140,7 @@ impl ServiceId {
 #[derive(Debug)]
 pub(super) struct Config {
     env: Env,
-    sections: Sections,
+    sections: Result<Sections, ParseError>,
     profile: String,
 }
 
@@ -150,10 +150,10 @@ impl Config {
     /// the environment's settings in force, with a warning.
     pub(super) fn load(host: &Host, profile: Option<&str>) -> Self {
         let location = Location::find(&host.env, host.platform);
-        let sections = profile::load(&host.fs, &location).unwrap_or_else(|e| {
+        let sections = profile::load(&host.fs, &location);
+        if let Err(e) = &sections {
             tracing::warn!(error = %e, "AWS config files ignored for settings");
-            Sections::default()
-        });
+        }
         Self {
             profile: profile.map_or(location.profile, str::to_owned),
             env: host.env.clone(),
@@ -166,9 +166,14 @@ impl Config {
         &self.profile
     }
 
+    /// What the shared files hold, or why they do not parse.
+    pub(super) fn sections(&self) -> Result<&Sections, &ParseError> {
+        self.sections.as_ref()
+    }
+
     /// The selected profile's properties, if it exists.
     fn profile(&self) -> Option<&Properties> {
-        self.sections.profiles.get(&self.profile)
+        self.sections.as_ref().ok()?.profiles.get(&self.profile)
     }
 
     /// `setting`: for `service`, `<env>_<SERVICE>` first and the profile's
@@ -181,7 +186,8 @@ impl Config {
             let profile = self.profile()?;
             service
                 .and_then(|id| {
-                    let section = self.sections.services.get(profile.get(SERVICES)?)?;
+                    let sections = self.sections.as_ref().ok()?;
+                    let section = sections.services.get(profile.get(SERVICES)?)?;
                     section.get(id.profile)?.get(setting.profile).cloned()
                 })
                 .or_else(|| profile.get(setting.profile).cloned())

@@ -1,0 +1,13 @@
+{
+  "name": "e2e_fips_and_dual_stack_sts",
+  "docs": "end to end STS role assumption test with FIPS and dual stack enabled",
+  "result": {
+    "Ok": {
+      "access_key_id": "ASIARTESTID",
+      "secret_access_key": "TESTSECRETKEY",
+      "session_token": "TESTSESSIONTOKEN",
+      "account_id": "123456789012",
+      "expiry": 1628193482
+    }
+  }
+}

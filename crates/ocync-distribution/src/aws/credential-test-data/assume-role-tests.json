@@ -1,0 +1,647 @@
+[
+  {
+    "docs": "basic test case, a role_arn backed by a static credential",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "source_profile": "B"
+        },
+        "B": {
+          "aws_access_key_id": "abc123",
+          "aws_secret_access_key": "def456",
+          "aws_account_id": "123456789001"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "AccessKey": {
+            "access_key_id": "abc123",
+            "secret_access_key": "def456",
+            "account_id": "123456789001"
+          }
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "ignore explicit credentials when source profile is specified",
+    "input": {
+      "profiles": {
+        "A": {
+          "aws_access_key_id": "abc123",
+          "aws_secret_access_key": "def456",
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "source_profile": "B"
+        },
+        "B": {
+          "aws_access_key_id": "ghi890",
+          "aws_secret_access_key": "jkl123"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "AccessKey": {
+            "access_key_id": "ghi890",
+            "secret_access_key": "jkl123"
+          }
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "load role_session_name for the AssumeRole provider",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "role_session_name": "my_session_name",
+          "source_profile": "B"
+        },
+        "B": {
+          "aws_access_key_id": "abc123",
+          "aws_secret_access_key": "def456"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "AccessKey": {
+            "access_key_id": "abc123",
+            "secret_access_key": "def456"
+          }
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA",
+            "role_session_name": "my_session_name"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "load external id for the AssumeRole provider",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "external_id": "my_external_id",
+          "source_profile": "B"
+        },
+        "B": {
+          "aws_access_key_id": "abc123",
+          "aws_secret_access_key": "def456"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "AccessKey": {
+            "access_key_id": "abc123",
+            "secret_access_key": "def456"
+          }
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA",
+            "external_id": "my_external_id"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "self referential profile (first load base creds, then use for the role)",
+    "input": {
+      "profiles": {
+        "A": {
+          "aws_access_key_id": "abc123",
+          "aws_secret_access_key": "def456",
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "source_profile": "A"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "AccessKey": {
+            "access_key_id": "abc123",
+            "secret_access_key": "def456"
+          }
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "Load credentials from a credential_source",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "credential_source": "Ec2InstanceMetadata"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "NamedSource": "Ec2InstanceMetadata"
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "role_arn without source source_profile",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "profile must contain `source_profile`"
+    }
+  },
+  {
+    "docs": "source profile and credential source both present",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "credential_source": "Environment",
+          "source_profile": "B"
+        },
+        "B": {
+          "aws_access_key_id": "!23",
+          "aws_secret_access_key": "456"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "profile contained both source_profile and credential_source"
+    }
+  },
+  {
+    "docs": "partial credentials error (missing secret)",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:foo",
+          "source_profile": "B"
+        },
+        "B": {
+          "aws_access_key_id": "abc123"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "profile missing aws_secret_access_key"
+    }
+  },
+  {
+    "docs": "partial credentials error (missing access key)",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:foo",
+          "source_profile": "B"
+        },
+        "B": {
+          "aws_secret_access_key": "abc123"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "profile missing aws_access_key_id"
+    }
+  },
+  {
+    "docs": "missing credentials error (empty source profile)",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:foo",
+          "source_profile": "B"
+        },
+        "B": {}
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "profile `B` did not contain credential information"
+    }
+  },
+  {
+    "docs": "profile only contains configuration",
+    "input": {
+      "profiles": {
+        "A": {
+          "ec2_metadata_service_endpoint_mode": "IPv6"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "profile `A` did not contain credential information"
+    }
+  },
+  {
+    "docs": "missing source profile",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:foo",
+          "source_profile": "B"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "could not find source profile B referenced from A"
+    }
+  },
+  {
+    "docs": "missing root profile (should never happen in practice)",
+    "input": {
+      "profiles": {
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "No profiles were defined"
+    }
+  },
+  {
+    "docs": "multiple chained assume role profiles",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "source_profile": "B"
+        },
+        "B": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleB",
+          "source_profile": "C"
+        },
+        "C": {
+          "aws_access_key_id": "mno456",
+          "aws_secret_access_key": "pqr789"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "AccessKey": {
+            "access_key_id": "mno456",
+            "secret_access_key": "pqr789"
+          }
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleB"
+          }
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "chained assume role profiles with static credentials (ignore assume role when static credentials present)",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "aws_access_key_id": "bug_if_returned",
+          "aws_secret_access_key": "bug_if_returned",
+          "source_profile": "B"
+        },
+        "B": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleB",
+          "source_profile": "C",
+          "aws_access_key_id": "profile_b_key",
+          "aws_secret_access_key": "profile_b_secret"
+        },
+        "C": {
+          "aws_access_key_id": "bug_if_returned",
+          "aws_secret_access_key": "bug_if_returned"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "AccessKey": {
+            "access_key_id": "profile_b_key",
+            "secret_access_key": "profile_b_secret"
+          }
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "assume role profile infinite loop",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "source_profile": "B"
+        },
+        "B": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleB",
+          "source_profile": "A"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "profile formed an infinite loop"
+    }
+  },
+  {
+    "docs": "infinite loop with static credentials",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "aws_access_key_id": "bug_if_returned",
+          "aws_secret_access_key": "bug_if_returned",
+          "source_profile": "B"
+        },
+        "B": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleB",
+          "source_profile": "A"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "profile formed an infinite loop"
+    }
+  },
+  {
+    "docs": "web identity role",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "web_identity_token_file": "/var/token.jwt"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "WebIdentityToken": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA",
+            "web_identity_token_file": "/var/token.jwt"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "web identity role with session name",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "web_identity_token_file": "/var/token.jwt",
+          "role_session_name": "some_session_name"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "WebIdentityToken": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA",
+            "web_identity_token_file": "/var/token.jwt",
+            "role_session_name": "some_session_name"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "web identity role",
+    "input": {
+      "profiles": {
+        "A": {
+          "web_identity_token_file": "/var/token.jwt"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "Error": "`role_arn` was missing"
+    }
+  },
+  {
+    "docs": "web identity token as source profile",
+    "input": {
+      "profiles": {
+        "A": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleA",
+          "source_profile": "B"
+        },
+        "B": {
+          "role_arn": "arn:aws:iam::123456789:role/RoleB",
+          "web_identity_token_file": "/var/token.jwt",
+          "role_session_name": "some_session_name"
+        }
+      },
+      "selected_profile": "A"
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "WebIdentityToken": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleB",
+            "web_identity_token_file": "/var/token.jwt",
+            "role_session_name": "some_session_name"
+          }
+        },
+        {
+          "AssumeRole": {
+            "role_arn": "arn:aws:iam::123456789:role/RoleA"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "SSO credentials profile selected",
+    "input": {
+      "selected_profile": "A",
+      "profiles": {
+        "A": {
+          "sso_account_id": "0123",
+          "sso_region": "us-east-7",
+          "sso_role_name": "testrole",
+          "sso_start_url": "https://foo.bar"
+        }
+      }
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "Sso": {
+            "sso_account_id": "0123",
+            "sso_region": "us-east-7",
+            "sso_role_name": "testrole",
+            "sso_start_url": "https://foo.bar"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "invalid SSO credentials configuration: missing account ID",
+    "input": {
+      "selected_profile": "A",
+      "profiles": {
+        "A": {
+          "sso_region": "us-east-7",
+          "sso_role_name": "testrole",
+          "sso_start_url": "https://foo.bar"
+        }
+      }
+    },
+    "output": {
+      "Error": "if `sso_role_name` is set, then `sso_account_id` must also be set"
+    }
+  },
+  {
+    "docs": "invalid SSO credentials configuration: missing role name",
+    "input": {
+      "selected_profile": "A",
+      "profiles": {
+        "A": {
+          "sso_region": "us-east-7",
+          "sso_account_id": "012345678901",
+          "sso_start_url": "https://foo.bar"
+        }
+      }
+    },
+    "output": {
+      "Error": "if `sso_account_id` is set, then `sso_role_name` must also be set"
+    }
+  },
+  {
+    "docs": "invalid SSO token configuration: sso_region must be in sso-session",
+    "input": {
+      "selected_profile": "A",
+      "profiles": {
+        "A": {
+          "sso_session": "A",
+          "sso_region": "us-east-7"
+        }
+      },
+      "sso_sessions": {
+        "A": {
+          "sso_start_url": "https://foo.bar"
+        }
+      }
+    },
+    "output": {
+      "Error": "`sso_region` can only be specified in the [sso-session] config when a session name is given"
+    }
+  },
+  {
+    "docs": "SSO token profile selected",
+    "input": {
+      "selected_profile": "A",
+      "profiles": {
+        "A": {
+          "sso_session": "foo"
+        }
+      },
+      "sso_sessions": {
+        "foo": {
+          "sso_region": "us-east-7",
+          "sso_start_url": "https://foo.bar"
+        }
+      }
+    },
+    "output": {
+      "ProfileChain": [
+        {
+          "Sso": {
+            "sso_session": "foo",
+            "sso_region": "us-east-7",
+            "sso_start_url": "https://foo.bar"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "docs": "invalid SSO token configuration: sso-session not found",
+    "input": {
+      "selected_profile": "A",
+      "profiles": {
+        "A": {
+          "sso_session": "oops"
+        }
+      },
+      "sso_sessions": {
+      }
+    },
+    "output": {
+      "Error": "sso-session named `oops` (referenced by profile `A`) was not found"
+    }
+  }
+]

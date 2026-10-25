@@ -1,4 +1,5 @@
-//! The profile source, loaded through its `aws-config` provider.
+//! The SSO and `credential_process` profiles, loaded through the
+//! `aws-config` profile provider.
 
 use aws_config::provider_config::ProviderConfig;
 use aws_credential_types::provider::ProvideCredentials;
@@ -9,18 +10,15 @@ use super::super::endpoint::{DualStack, Fips, Region};
 use super::super::host::Env;
 use super::{Credentials, Error};
 
-/// The `aws-config` provider of the profile source.
+/// The `aws-config` provider of the selected profile.
 pub(super) enum Profile {
-    /// This process's profile source, configured as the SDK's default chain
-    /// configures it.
+    /// This process's profile provider, configured as the SDK's default
+    /// chain configures it.
     Sdk(Box<aws_config::profile::ProfileFileCredentialsProvider>),
     /// A test environment. `aws-config` reads the real environment, files
-    /// and network, so a test that reaches the profile source is a test bug.
+    /// and network, so a test that reaches it is a test bug.
     #[cfg(test)]
     Unreachable,
-    /// A test's answer for the profile source.
-    #[cfg(test)]
-    Scripted(fn() -> Result<Credentials, Error>),
 }
 
 impl Profile {
@@ -50,9 +48,7 @@ impl Profile {
         let provider = match self {
             Self::Sdk(provider) => provider,
             #[cfg(test)]
-            Self::Unreachable => panic!("a test reached the profile source"),
-            #[cfg(test)]
-            Self::Scripted(answer) => return answer(),
+            Self::Unreachable => panic!("a test reached the aws-config profile provider"),
         };
         match provider.provide_credentials().await {
             Ok(credentials) => Ok(Credentials {

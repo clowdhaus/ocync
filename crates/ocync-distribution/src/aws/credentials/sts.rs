@@ -1,17 +1,19 @@
 //! AWS STS, as the credential sources that assume a role call it: the query
 //! protocol, a form body and an XML answer.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Write as _;
 use std::str::Utf8Error;
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use http::header::CONTENT_TYPE;
 
 use super::super::config::{Config, ServiceId};
 use super::super::endpoint::{self, Region};
-use super::super::host::Host;
+use super::super::host::{Clock, Host};
 use super::super::sigv4::{Keep, percent_encode};
 use super::super::{
     Api, ApiId, ApiParts, ApiRequest, ConfigError, ErrorFormat, Failure, ModeledError,
@@ -33,29 +35,53 @@ const VERSION: &str = "2011-06-15";
 /// The content type of a query protocol request.
 const FORM: &str = "application/x-www-form-urlencoded";
 
-/// The operation that exchanges a web identity token for a role's
-/// credentials. Its answer is in `<ACTION>Result`.
-const ACTION: &str = "AssumeRoleWithWebIdentity";
+/// An STS operation a credential source calls.
+struct Operation {
+    /// The form's `Action`. The answer is in `<action>Result`.
+    action: &'static str,
+    /// The errors the operation models, as `aws-sdk-sts` generates them.
+    modeled_errors: &'static [ModeledError],
+}
 
-/// The errors [`ACTION`] models, as `aws-sdk-sts` generates them. The SDK
+/// Assume a role, signed with the credentials of the caller.
+const ASSUME_ROLE: Operation = Operation {
+    action: "AssumeRole",
+    modeled_errors: &[
+        EXPIRED_TOKEN,
+        MALFORMED_POLICY,
+        PACKED_POLICY_TOO_LARGE,
+        REGION_DISABLED,
+    ],
+};
+
+/// Exchange a web identity token for a role's credentials. The SDK
 /// re-sends `IDPCommunicationError`, an identity provider STS could not
 /// reach, for this operation alone.
-const MODELED_ERRORS: &[ModeledError] = &[
-    modeled("ExpiredTokenException", "ExpiredTokenException"),
-    ModeledError {
-        code: "IDPCommunicationError",
-        name: "IdpCommunicationErrorException",
-        retry: ModeledRetry::Transient,
-    },
-    modeled("IDPRejectedClaim", "IdpRejectedClaimException"),
-    modeled("InvalidIdentityToken", "InvalidIdentityTokenException"),
-    modeled(
-        "MalformedPolicyDocument",
-        "MalformedPolicyDocumentException",
-    ),
-    modeled("PackedPolicyTooLarge", "PackedPolicyTooLargeException"),
-    modeled("RegionDisabledException", "RegionDisabledException"),
-];
+const ASSUME_ROLE_WITH_WEB_IDENTITY: Operation = Operation {
+    action: "AssumeRoleWithWebIdentity",
+    modeled_errors: &[
+        EXPIRED_TOKEN,
+        ModeledError {
+            code: "IDPCommunicationError",
+            name: "IdpCommunicationErrorException",
+            retry: ModeledRetry::Transient,
+        },
+        modeled("IDPRejectedClaim", "IdpRejectedClaimException"),
+        modeled("InvalidIdentityToken", "InvalidIdentityTokenException"),
+        MALFORMED_POLICY,
+        PACKED_POLICY_TOO_LARGE,
+        REGION_DISABLED,
+    ],
+};
+
+const EXPIRED_TOKEN: ModeledError = modeled("ExpiredTokenException", "ExpiredTokenException");
+const MALFORMED_POLICY: ModeledError = modeled(
+    "MalformedPolicyDocument",
+    "MalformedPolicyDocumentException",
+);
+const PACKED_POLICY_TOO_LARGE: ModeledError =
+    modeled("PackedPolicyTooLarge", "PackedPolicyTooLargeException");
+const REGION_DISABLED: ModeledError = modeled("RegionDisabledException", "RegionDisabledException");
 
 /// An error the SDK retries only as the shared code lists say.
 const fn modeled(code: &'static str, name: &'static str) -> ModeledError {
@@ -64,6 +90,22 @@ const fn modeled(code: &'static str, name: &'static str) -> ModeledError {
         name,
         retry: ModeledRetry::Shared,
     }
+}
+
+/// The `configured` session name of a role, else the one the SDK makes:
+/// `prefix`, then the milliseconds since the UNIX epoch on `clock`.
+pub(super) fn session_name<'a>(
+    configured: Option<&'a str>,
+    prefix: &str,
+    clock: Clock,
+) -> Cow<'a, str> {
+    configured.map_or_else(
+        || {
+            let since_epoch = clock.now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            Cow::Owned(format!("{prefix}-{}", since_epoch.as_millis()))
+        },
+        Cow::Borrowed,
+    )
 }
 
 /// An error STS answered with that the operation models, as the SDK
@@ -135,6 +177,15 @@ pub(super) struct WebIdentity<'a> {
     pub(super) token: &'a Token,
 }
 
+/// An `AssumeRole` call.
+pub(super) struct AssumeRole<'a> {
+    pub(super) role_arn: &'a str,
+    pub(super) session_name: &'a str,
+    /// The value the role's trust policy may require, as `external_id`
+    /// sets it.
+    pub(super) external_id: Option<&'a str>,
+}
+
 /// STS in one region.
 pub(super) struct Client {
     /// The API, or why its endpoint settings do not resolve. The error is
@@ -179,49 +230,96 @@ impl Client {
         &self,
         call: &WebIdentity<'_>,
     ) -> Result<Credentials, Error> {
+        let body = web_identity_form(call);
+        self.call(&ASSUME_ROLE_WITH_WEB_IDENTITY, body, || async {
+            Ok(Signing::Unsigned)
+        })
+        .await
+    }
+
+    /// Assume a role with the credentials of `caller`, which sign the call.
+    pub(super) async fn assume_role(
+        &self,
+        caller: &Credentials,
+        call: &AssumeRole<'_>,
+    ) -> Result<Credentials, Error> {
+        let body = assume_role_form(call);
+        self.call(&ASSUME_ROLE, body, || async {
+            Ok(Signing::Signed(caller.clone()))
+        })
+        .await
+    }
+
+    /// Send `operation` with the form `body`, signed as `signing` says,
+    /// and read the credentials it answers with.
+    async fn call<F, Fut>(
+        &self,
+        operation: &Operation,
+        body: String,
+        signing: F,
+    ) -> Result<Credentials, Error>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Signing, Failure>>,
+    {
         let api = self
             .api
             .as_ref()
             .map_err(|e| Error::Endpoint(Arc::clone(e)))?;
         let request = ApiRequest {
-            operation: ACTION,
+            operation: operation.action,
             method: http::Method::POST,
             headers: &[(CONTENT_TYPE, FORM)],
-            body: Bytes::from(web_identity_form(call)),
-            modeled_errors: MODELED_ERRORS,
+            body: Bytes::from(body),
+            modeled_errors: operation.modeled_errors,
         };
-        let body = api
-            .call(&request, || async { Ok(Signing::Unsigned) })
-            .await?;
-        credentials(&body)
+        let answer = api.call(&request, signing).await?;
+        credentials(operation, &answer)
     }
 }
 
-/// The form body of `call`, fields in the SDK's order, every byte outside
-/// the unreserved set encoded, as the SDK encodes a query protocol request.
+/// The form body of `call`, fields in the SDK's order.
 fn web_identity_form(call: &WebIdentity<'_>) -> String {
+    form(
+        &ASSUME_ROLE_WITH_WEB_IDENTITY,
+        [
+            ("RoleArn", call.role_arn),
+            ("RoleSessionName", call.session_name),
+            ("WebIdentityToken", call.token.as_str()),
+        ],
+    )
+}
+
+/// The form body of `call`, fields in the SDK's order.
+fn assume_role_form(call: &AssumeRole<'_>) -> String {
     let fields = [
-        ("Action", ACTION),
-        ("Version", VERSION),
         ("RoleArn", call.role_arn),
         ("RoleSessionName", call.session_name),
-        ("WebIdentityToken", call.token.as_str()),
     ];
-    let mut body = String::new();
+    form(
+        &ASSUME_ROLE,
+        fields
+            .into_iter()
+            .chain(call.external_id.map(|id| ("ExternalId", id))),
+    )
+}
+
+/// The form body of `operation` with `fields` after its action and
+/// version, every byte outside the unreserved set encoded, as the SDK
+/// encodes a query protocol request.
+fn form<'a>(operation: &Operation, fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    let mut body = format!("Action={}&Version={VERSION}", operation.action);
     for (name, value) in fields {
-        if !body.is_empty() {
-            body.push('&');
-        }
-        write!(body, "{name}={}", percent_encode(value, Keep::Unreserved))
+        write!(body, "&{name}={}", percent_encode(value, Keep::Unreserved))
             .expect("writing to a String cannot fail");
     }
     body
 }
 
-/// The credentials in the answer's `<ACTION>Result` element.
-fn credentials(body: &[u8]) -> Result<Credentials, Error> {
+/// The credentials in the answer's `<action>Result` element.
+fn credentials(operation: &Operation, body: &[u8]) -> Result<Credentials, Error> {
     let document = std::str::from_utf8(body).map_err(Error::NotUtf8)?;
-    let result = format!("{ACTION}Result");
+    let result = format!("{}Result", operation.action);
     let inner = xml::find(document, &[&result, "Credentials"]).ok_or(Error::NoCredentials)?;
     let field = |name: &'static str| xml::text(inner, &[name]).ok_or(Error::Missing(name));
     let expiration = field("Expiration")?;
@@ -246,13 +344,15 @@ mod tests {
     use super::super::fixtures::DATA;
     use super::*;
 
-    /// The recorded `web_identity_token_invalid_jwt` case.
-    fn recorded_case() -> std::path::PathBuf {
-        Path::new(DATA).join("default-credential-provider-chain/web_identity_token_invalid_jwt")
+    /// The recorded default chain case `name`.
+    fn recorded_case(name: &str) -> std::path::PathBuf {
+        Path::new(DATA)
+            .join("default-credential-provider-chain")
+            .join(name)
     }
 
-    /// The body the SDK sent in a recorded case.
-    fn recorded_body(case: &Path) -> String {
+    /// The bodies the SDK sent in a recorded case, in order.
+    fn recorded_bodies(case: &Path) -> Vec<String> {
         let traffic: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(case.join("http-traffic.json")).unwrap())
                 .unwrap();
@@ -260,12 +360,12 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find_map(|event| {
+            .filter_map(|event| {
                 let data = &event["action"]["Data"];
                 (data["direction"] == "Request").then(|| data["data"]["Utf8"].as_str())?
             })
-            .unwrap()
-            .to_owned()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The form body is the one the SDK sent: fields in its order, `:`
@@ -274,14 +374,34 @@ mod tests {
     /// the token is trimmed.
     #[test]
     fn encodes_the_form_as_the_sdk_does() {
-        let case = recorded_case();
+        let case = recorded_case("web_identity_token_invalid_jwt");
         let token = Token::read(&Fs::Real, case.join("fs/token.jwt")).unwrap();
         let body = web_identity_form(&WebIdentity {
             role_arn: "arn:aws:iam::123456789:role/RoleB",
             session_name: "web-identity-token-profile-1629229438294",
             token: &token,
         });
-        assert_eq!(body, recorded_body(&case));
+        assert_eq!(recorded_bodies(&case), [body]);
+    }
+
+    /// The `AssumeRole` form is the one the SDK sent, with the session name
+    /// it makes, and `ExternalId` follows when set. Breaks if a field moves
+    /// or the external ID is dropped.
+    #[test]
+    fn encodes_the_assume_role_form_as_the_sdk_does() {
+        let case = recorded_case("web_identity_token_source_profile");
+        let mut call = AssumeRole {
+            role_arn: "arn:aws:iam::123456789:role/RoleA",
+            session_name: "assume-role-from-profile-1629230104880",
+            external_id: None,
+        };
+        assert_eq!(recorded_bodies(&case)[1], assume_role_form(&call));
+        call.external_id = Some("id/1");
+        assert_eq!(
+            assume_role_form(&call),
+            "Action=AssumeRole&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A123456789%3Arole%2FRoleA\
+             &RoleSessionName=assume-role-from-profile-1629230104880&ExternalId=id%2F1"
+        );
     }
 
     /// The credentials are read from the result element, and an answer
@@ -294,7 +414,7 @@ mod tests {
                 "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult>\
                  {inner}</AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>"
             );
-            credentials(answer.as_bytes())
+            credentials(&ASSUME_ROLE_WITH_WEB_IDENTITY, answer.as_bytes())
         };
         let loaded = read(
             "<Credentials><AccessKeyId>AKID</AccessKeyId><SecretAccessKey>secret</SecretAccessKey>\
@@ -323,7 +443,7 @@ mod tests {
         ] {
             assert_eq!(read(inner).unwrap_err().to_string(), error);
         }
-        let not_utf8 = credentials(b"\xff").unwrap_err();
+        let not_utf8 = credentials(&ASSUME_ROLE, b"\xff").unwrap_err();
         assert!(matches!(not_utf8, Error::NotUtf8(_)), "{not_utf8}");
     }
 
@@ -335,7 +455,7 @@ mod tests {
         let error = |code: &str, message: Option<&str>| {
             Error::from(Failure::Service(ServiceError {
                 status: StatusCode::BAD_REQUEST,
-                code: ErrorCode::parse(code, MODELED_ERRORS),
+                code: ErrorCode::parse(code, ASSUME_ROLE_WITH_WEB_IDENTITY.modeled_errors),
                 message: message.map(str::to_owned),
                 retry_after: None,
             }))
