@@ -63,15 +63,10 @@ impl RegistryId {
 pub(crate) async fn api_client(
     hostname: &str,
     profile: Option<&str>,
-) -> Result<crate::aws::Client, Error> {
-    let region = ecr_region(hostname).ok_or_else(|| Error::EcrApi {
-        reason: format!("cannot extract AWS region from ECR hostname '{hostname}'"),
-    })?;
-    crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr)
-        .await
-        .map_err(|e| Error::EcrApi {
-            reason: e.to_string(),
-        })
+) -> Result<crate::aws::Client, crate::aws::ConfigError> {
+    let region = ecr_region(hostname)
+        .ok_or_else(|| crate::aws::ConfigError::NoRegionInHostname(hostname.to_owned()))?;
+    crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr).await
 }
 
 /// Maximum number of layer digests per `BatchCheckLayerAvailability` API call.
@@ -429,7 +424,11 @@ impl BatchChecker {
     /// `BatchCheckLayerAvailability` for registries reachable only via the
     /// named profile.
     pub async fn from_hostname(hostname: &str, profile: Option<&str>) -> Result<Self, Error> {
-        let client = api_client(hostname, profile).await?;
+        let client = api_client(hostname, profile)
+            .await
+            .map_err(|e| Error::EcrApi {
+                reason: e.to_string(),
+            })?;
         let registry_id = RegistryId::from_hostname(hostname);
         Ok(Self {
             api: Box::new(AwsEcrBatchApi {

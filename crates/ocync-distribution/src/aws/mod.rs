@@ -1,20 +1,18 @@
 //! Signed calls to the AWS JSON APIs ocync uses: ECR and ECR Public.
 //!
-//! Signing, endpoint resolution, retries, clock-skew correction and error
-//! parsing are owned here. Credentials and the FIPS, dual-stack, endpoint URL
-//! and attempt settings still come from `aws-config`'s `SdkConfig`.
+//! Settings, signing, endpoint resolution, retries, clock-skew correction
+//! and error parsing are owned here. Credentials come from `aws-config`.
 
 mod calendar;
 mod config;
 mod endpoint;
-mod env;
+mod host;
 mod profile;
 mod retry;
 mod sigv4;
-mod xml;
 
-use self::config::Config;
-use self::env::{Env, Fs, Platform};
+use self::config::{Config, ServiceId};
+use self::host::Host;
 
 use std::fmt;
 use std::future::Future;
@@ -54,8 +52,9 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// its default retry and connect settings: every backoff between the
 /// default attempts, plus each attempt at twice [`CONNECT_TIMEOUT`].
 const CREDENTIALS_LOAD_TIMEOUT: Duration = Duration::from_millis(
-    retry::INITIAL_BACKOFF.as_millis() as u64 * ((1 << (retry::DEFAULT_MAX_ATTEMPTS - 1)) - 1)
-        + retry::DEFAULT_MAX_ATTEMPTS as u64 * 2 * CONNECT_TIMEOUT.as_millis() as u64,
+    retry::INITIAL_BACKOFF.as_millis() as u64
+        * ((1 << (retry::DEFAULT_MAX_ATTEMPTS.get() - 1)) - 1)
+        + retry::DEFAULT_MAX_ATTEMPTS.get() as u64 * 2 * CONNECT_TIMEOUT.as_millis() as u64,
 );
 
 /// How long a credential without an expiry is reused, as the SDK's identity
@@ -139,12 +138,12 @@ impl Service {
         }
     }
 
-    /// The service ID that names its endpoint URL setting, such as
-    /// `AWS_ENDPOINT_URL_ECR_PUBLIC`.
-    fn service_id(self) -> &'static str {
+    /// The service ID that names its endpoint URL settings and its retry
+    /// partition.
+    fn service_id(self) -> ServiceId {
         match self {
-            Self::Ecr => "ECR",
-            Self::EcrPublic => "ECR PUBLIC",
+            Self::Ecr => ServiceId::ECR,
+            Self::EcrPublic => ServiceId::ECR_PUBLIC,
         }
     }
 }
@@ -169,12 +168,20 @@ pub(crate) trait Operation: Serialize {
 /// Why a [`Client`] could not be built from the AWS configuration.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConfigError {
+    /// An ECR hostname that names no region.
+    #[error("cannot extract AWS region from ECR hostname '{0}'")]
+    NoRegionInHostname(String),
     /// The configured region is not a valid host label.
     #[error("invalid AWS region '{0}': must be a valid host label")]
     InvalidRegion(String),
     /// `AWS_MAX_ATTEMPTS` or `max_attempts` is not a whole number above 0.
-    #[error("invalid AWS max attempts '{0}': must be a whole number of at least 1")]
-    InvalidMaxAttempts(String),
+    #[error("invalid AWS max attempts '{text}': must be a whole number of at least 1")]
+    InvalidMaxAttempts {
+        /// The configured value.
+        text: String,
+        /// Why it did not parse.
+        source: std::num::ParseIntError,
+    },
     /// `AWS_RETRY_MODE` or `retry_mode` is not `standard` or `adaptive`.
     #[error("invalid AWS retry mode '{0}': must be standard or adaptive")]
     InvalidRetryMode(String),
@@ -276,20 +283,6 @@ impl ServiceError {
             status,
             code,
             message,
-            retry_after: None,
-        }
-    }
-}
-
-impl ServiceError {
-    /// The code and message of a query protocol `ErrorResponse`. A body that
-    /// is not one still leaves the status.
-    fn parse_xml(status: StatusCode, body: &[u8]) -> Self {
-        let body = std::str::from_utf8(body).unwrap_or_default();
-        Self {
-            status,
-            code: xml::text(body, &["Error", "Code"]).and_then(|c| ErrorCode::parse(&c)),
-            message: xml::text(body, &["Error", "Message"]),
             retry_after: None,
         }
     }
@@ -443,26 +436,6 @@ pub(crate) struct CallError {
     source: Failure,
 }
 
-/// How an API writes its error answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ErrorFormat {
-    /// The JSON protocols: `x-amzn-errortype`, `code` or `__type`.
-    Json,
-    /// The query protocol: `<Error><Code>` in an `ErrorResponse`.
-    Xml,
-}
-
-/// A request to an [`Api`], relative to its endpoint.
-struct ApiRequest<'a> {
-    method: http::Method,
-    /// The path and query after the endpoint's own path, with no leading
-    /// slash. Empty for the endpoint itself.
-    path: &'a str,
-    /// Headers to send, signed when the request is.
-    headers: &'a [(&'a str, &'a str)],
-    body: Bytes,
-}
-
 /// One AWS API in one region: where its requests go, and the retry, clock
 /// skew and error handling every call to it shares.
 struct Api {
@@ -480,78 +453,74 @@ struct Api {
     endpoint: Endpoint,
     /// The name requests are signed under, such as `ecr`.
     signing_name: &'static str,
-    errors: ErrorFormat,
 }
 
 impl Api {
-    /// Send `request`, re-sending throttles, transient faults and
-    /// clock-skewed signatures as the SDK's retry policy allows (see
-    /// [`retry`]), and return the successful answer's body. `credentials`
-    /// is asked before each attempt for the key to sign with, or `None` to
-    /// send unsigned.
+    /// POST `body` for the operation `target` names, re-sending throttles,
+    /// transient faults and clock-skewed signatures as the SDK's retry
+    /// policy allows (see [`retry`]), and return the successful answer's
+    /// body. `credentials` is asked before each attempt for the key to sign
+    /// with.
     async fn call<F, Fut>(
         &self,
         operation: &'static str,
-        request: &ApiRequest<'_>,
+        target: &str,
+        body: &Bytes,
         credentials: F,
     ) -> Result<Bytes, Failure>
     where
         F: Fn() -> Fut,
-        Fut: Future<Output = Result<Option<Credentials>, Failure>>,
+        Fut: Future<Output = Result<Credentials, Failure>>,
     {
         let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
         let credentials = &credentials;
         retrying(operation, &mut policy, |attempt| async move {
             self.partition.send_token(&self.retry, attempt).await;
             let credentials = credentials().await?;
-            self.send(request, credentials.as_ref()).await
+            self.send(target, body, &credentials).await
         })
         .await
     }
 
     async fn send(
         &self,
-        request: &ApiRequest<'_>,
-        credentials: Option<&Credentials>,
+        target: &str,
+        body: &Bytes,
+        credentials: &Credentials,
     ) -> Result<Bytes, Failure> {
-        let url = self
-            .endpoint
-            .url()
-            .join(request.path)
-            .expect("a relative path joins onto an http URL");
+        let url = self.endpoint.url();
         let sent = SystemTime::now();
         let applied = ClockSkew(self.skew.load(Ordering::Relaxed));
+        let signed = sigv4::sign(
+            &sigv4::Request {
+                method: &http::Method::POST,
+                path: url.path(),
+                headers: &[
+                    ("content-type", AWS_JSON_1_1),
+                    (X_AMZ_TARGET, target),
+                    ("host", self.endpoint.host()),
+                ],
+                body,
+            },
+            sigv4::AccessKey {
+                id: credentials.access_key_id(),
+                secret: credentials.secret_access_key(),
+                session_token: credentials.session_token(),
+            },
+            &sigv4::CredentialScope {
+                region: self.region.as_str(),
+                service: self.signing_name,
+            },
+            applied.apply(sent),
+        );
         let mut builder = self
             .http
-            .request(request.method.clone(), url.clone())
-            .body(request.body.clone());
-        for (name, value) in request.headers {
-            builder = builder.header(*name, *value);
-        }
-        if let Some(credentials) = credentials {
-            let mut signed_headers = request.headers.to_vec();
-            signed_headers.push(("host", self.endpoint.host()));
-            let signed = sigv4::sign(
-                &sigv4::Request {
-                    method: &request.method,
-                    path: url.path(),
-                    headers: &signed_headers,
-                    body: &request.body,
-                },
-                sigv4::AccessKey {
-                    id: credentials.access_key_id(),
-                    secret: credentials.secret_access_key(),
-                    session_token: credentials.session_token(),
-                },
-                &sigv4::CredentialScope {
-                    region: self.region.as_str(),
-                    service: self.signing_name,
-                },
-                applied.apply(sent),
-            );
-            for (name, value) in signed {
-                builder = builder.header(name, value);
-            }
+            .post(url.clone())
+            .header(http::header::CONTENT_TYPE, AWS_JSON_1_1)
+            .header(X_AMZ_TARGET, target)
+            .body(body.clone());
+        for (name, value) in signed {
+            builder = builder.header(name, value);
         }
         let response = builder.send().await?;
         let measured = match self.skew_correction {
@@ -578,10 +547,7 @@ impl Api {
         }
         let error = ServiceError {
             retry_after,
-            ..match self.errors {
-                ErrorFormat::Json => ServiceError::parse(status, header_code, &bytes),
-                ErrorFormat::Xml => ServiceError::parse_xml(status, &bytes),
-            }
+            ..ServiceError::parse(status, header_code, &bytes)
         };
         let signature_rejected = error
             .code
@@ -592,8 +558,7 @@ impl Api {
         // only the skew this signature left uncorrected counts.
         Err(match measured {
             Some(skew)
-                if credentials.is_some()
-                    && signature_rejected
+                if signature_rejected
                     && ClockSkew(skew.0 - applied.0).magnitude() > SKEW_THRESHOLD =>
             {
                 Failure::ClockSkewed { error, skew }
@@ -641,7 +606,6 @@ impl Client {
         profile: Option<&str>,
         service: Service,
     ) -> Result<Self, ConfigError> {
-        let config = Config::load(Env::Process, Fs::Real, Platform::current(), profile);
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new(region.to_owned()));
         if let Some(profile) = profile {
@@ -652,33 +616,31 @@ impl Client {
             .await
             .credentials_provider()
             .expect("the default loader sets a credentials provider");
-        Self::new(&config, region, provider, service)
+        Self::new(&Host::current(), region, profile, provider, service)
     }
 
     /// A client for `service` in `region`, with the endpoint, retry and
-    /// clock-skew settings `config` carries.
+    /// clock-skew settings `host` holds for `profile`.
     fn new(
-        config: &Config,
+        host: &Host,
         region: &str,
+        profile: Option<&str>,
         provider: SharedCredentialsProvider,
         service: Service,
     ) -> Result<Self, ConfigError> {
+        let config = Config::load(host, profile);
         let region = Region::parse(region)?;
-        let endpoint_url = config
-            .endpoint_url(service.service_id())
-            .map(|url| Endpoint::parse(&url))
-            .transpose()?;
         let endpoint = endpoint::resolve(
             service,
             &region,
             config.fips(),
             config.dual_stack(),
-            endpoint_url,
+            config.endpoint_url(service.service_id())?,
         )?;
         Self::from_parts(Parts {
             provider,
             service,
-            partition: retry::partition(service.service_id(), &region),
+            partition: retry::partition(service, &region),
             region,
             endpoint,
             retry: retry::Strategy::new(&config.retry()?),
@@ -708,7 +670,6 @@ impl Client {
                 region,
                 endpoint,
                 signing_name: service.signing_name(),
-                errors: ErrorFormat::Json,
             },
             provider,
             credentials: CredentialCache::new(),
@@ -720,20 +681,9 @@ impl Client {
     /// output.
     pub(crate) async fn call<O: Operation>(&self, input: &O) -> Result<O::Output, CallError> {
         let target = format!("{}.{}", self.service.target_prefix(), O::NAME);
-        let headers = [
-            ("content-type", AWS_JSON_1_1),
-            (X_AMZ_TARGET, target.as_str()),
-        ];
-        let request = ApiRequest {
-            method: http::Method::POST,
-            path: "",
-            headers: &headers,
-            body: Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize")),
-        };
+        let body = Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize"));
         self.api
-            .call(O::NAME, &request, || async {
-                self.credentials().await.map(Some)
-            })
+            .call(O::NAME, &target, &body, || self.credentials())
             .await
             .and_then(|body| serde_json::from_slice(&body).map_err(Failure::Decode))
             .map_err(|source| CallError {
@@ -776,6 +726,7 @@ fn api_http_client(stall_timeout: Duration) -> Result<reqwest::Client, ConfigErr
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
@@ -810,11 +761,11 @@ mod tests {
 
     /// The SDK's settings with `max_attempts` and a 1 ms first backoff, so a
     /// test's retries take milliseconds.
-    fn strategy(max_attempts: u32) -> retry::Strategy {
-        retry::Strategy::new(&retry::Config {
+    fn strategy(max_attempts: NonZeroU32) -> retry::Strategy {
+        retry::Strategy::new(&retry::Settings {
             max_attempts,
             initial_backoff: Duration::from_millis(1),
-            ..retry::Config::default()
+            ..retry::Settings::default()
         })
     }
 
@@ -833,7 +784,7 @@ mod tests {
         }
     }
 
-    fn client(server: &MockServer, max_attempts: u32) -> Client {
+    fn client(server: &MockServer, max_attempts: NonZeroU32) -> Client {
         Client::from_parts(Parts {
             retry: strategy(max_attempts),
             ..parts(&server.uri())
@@ -905,7 +856,7 @@ mod tests {
                 .expect(sent)
                 .mount(&server)
                 .await;
-            let err = client(&server, max_attempts)
+            let err = client(&server, NonZeroU32::new(max_attempts).unwrap())
                 .call(&Probe {})
                 .await
                 .unwrap_err();
@@ -948,7 +899,7 @@ mod tests {
             drop(socket);
         });
         let client = Client::from_parts(Parts {
-            retry: strategy(1),
+            retry: strategy(NonZeroU32::MIN),
             stall_timeout: Duration::from_millis(200),
             ..parts(&format!("http://{address}"))
         })
@@ -1053,7 +1004,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = Client::from_parts(Parts {
-            retry: strategy(10),
+            retry: strategy(NonZeroU32::new(10).unwrap()),
             partition: Arc::new(retry::Partition::with_capacity(5)),
             ..parts(&server.uri())
         })
@@ -1311,8 +1262,9 @@ mod tests {
     /// built, before it can reach an endpoint host name.
     #[test]
     fn refuses_a_region_that_is_not_a_host_label() {
-        let config = config::tests::config(&[], "");
-        let client = |region| Client::new(&config, region, static_credentials(None), Service::Ecr);
+        let host = config::tests::host(&[], "");
+        let client =
+            |region| Client::new(&host, region, None, static_credentials(None), Service::Ecr);
         client("us-west-2").unwrap();
         let err = client("evil.example/x").unwrap_err();
         assert!(matches!(err, ConfigError::InvalidRegion(_)), "{err}");
@@ -1322,7 +1274,7 @@ mod tests {
     /// endpoint and the attempt count. Breaks if `new` drops one.
     #[test]
     fn new_applies_the_settings() {
-        let config = config::tests::config(
+        let host = config::tests::host(
             &[
                 ("AWS_DISABLE_CLOCK_SKEW_CORRECTION", "true"),
                 ("AWS_USE_FIPS_ENDPOINT", "true"),
@@ -1330,18 +1282,51 @@ mod tests {
             ],
             "",
         );
-        let client =
-            Client::new(&config, "us-west-2", static_credentials(None), Service::Ecr).unwrap();
+        let new = |host| {
+            Client::new(
+                host,
+                "us-west-2",
+                None,
+                static_credentials(None),
+                Service::Ecr,
+            )
+        };
+        let client = new(&host).unwrap();
         assert_eq!(client.api.skew_correction, SkewCorrection::Off);
         assert_eq!(
             client.api.endpoint.host(),
             "api.ecr-fips.us-west-2.amazonaws.com"
         );
         assert_eq!(client.api.retry.max_attempts(), 1);
-        let bad = config::tests::config(&[("AWS_RETRY_MODE", "legacy")], "");
-        let err =
-            Client::new(&bad, "us-west-2", static_credentials(None), Service::Ecr).unwrap_err();
+        let bad = config::tests::host(&[("AWS_RETRY_MODE", "legacy")], "");
+        let err = new(&bad).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidRetryMode(_)), "{err}");
+    }
+
+    /// A named profile replaces `AWS_PROFILE` for the client's settings.
+    /// Breaks if `new` reads the selected profile instead of the named one.
+    #[test]
+    fn new_reads_the_named_profile() {
+        let host = config::tests::host(
+            &[("AWS_PROFILE", "default")],
+            "[default]\nuse_fips_endpoint = true\n[profile other]\nuse_fips_endpoint = false\n",
+        );
+        let host_name = |profile| {
+            Client::new(
+                &host,
+                "us-west-2",
+                profile,
+                static_credentials(None),
+                Service::Ecr,
+            )
+            .unwrap()
+            .api
+            .endpoint
+            .host()
+            .to_owned()
+        };
+        assert_eq!(host_name(None), "api.ecr-fips.us-west-2.amazonaws.com");
+        assert_eq!(host_name(Some("other")), "api.ecr.us-west-2.amazonaws.com");
     }
 
     /// A transport failure does not carry the endpoint URL, whose path may
@@ -1352,7 +1337,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let client = Client::from_parts(Parts {
-            retry: strategy(1),
+            retry: strategy(NonZeroU32::MIN),
             ..parts(&format!("http://{address}/secret-key"))
         })
         .unwrap();

@@ -3,128 +3,140 @@
 //! environment variable beats the selected profile, and a service-specific
 //! value beats a global one.
 
-use super::endpoint::{DualStack, Fips};
-use super::env::{Env, Fs, Platform};
-use super::profile::{self, Location, OtherKey, ParseError, Properties, Sections};
+use std::num::NonZeroU32;
+
+use super::endpoint::{DualStack, Endpoint, Fips};
+use super::host::{Env, Host};
+use super::profile::{self, Location, Properties, Sections};
 use super::{ConfigError, SkewCorrection, retry};
 
 /// The profile property naming the `[services name]` section that holds
 /// service-specific settings.
 const SERVICES: &str = "services";
 
-/// The environment and shared files the AWS settings and credentials are
-/// read from, with the selected profile.
+/// A setting's environment variable and profile property.
+#[derive(Debug, Clone, Copy)]
+struct Setting {
+    env: &'static str,
+    profile: &'static str,
+}
+
+const USE_FIPS: Setting = Setting {
+    env: "AWS_USE_FIPS_ENDPOINT",
+    profile: "use_fips_endpoint",
+};
+
+const USE_DUAL_STACK: Setting = Setting {
+    env: "AWS_USE_DUALSTACK_ENDPOINT",
+    profile: "use_dualstack_endpoint",
+};
+
+const DISABLE_SKEW_CORRECTION: Setting = Setting {
+    env: "AWS_DISABLE_CLOCK_SKEW_CORRECTION",
+    profile: "disable_clock_skew_correction",
+};
+
+const IGNORE_ENDPOINT_URLS: Setting = Setting {
+    env: "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS",
+    profile: "ignore_configured_endpoint_urls",
+};
+
+const ENDPOINT_URL: Setting = Setting {
+    env: "AWS_ENDPOINT_URL",
+    profile: "endpoint_url",
+};
+
+const MAX_ATTEMPTS: Setting = Setting {
+    env: "AWS_MAX_ATTEMPTS",
+    profile: "max_attempts",
+};
+
+const RETRY_MODE: Setting = Setting {
+    env: "AWS_RETRY_MODE",
+    profile: "retry_mode",
+};
+
+/// Selects retry behavior 2.1. Read only from the environment.
+const NEW_RETRIES_2026: &str = "AWS_NEW_RETRIES_2026";
+
+/// A service's name in its endpoint URL settings, as each source spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct ServiceId {
+    /// The suffix of `AWS_ENDPOINT_URL_<SERVICE>`, such as `ECR_PUBLIC`.
+    env: &'static str,
+    /// The property in a services section, such as `ecr-public`.
+    profile: &'static str,
+}
+
+impl ServiceId {
+    /// Amazon ECR.
+    pub(super) const ECR: Self = Self {
+        env: "ECR",
+        profile: "ecr",
+    };
+    /// Amazon ECR Public.
+    pub(super) const ECR_PUBLIC: Self = Self {
+        env: "ECR_PUBLIC",
+        profile: "ecr-public",
+    };
+}
+
+/// The environment and shared files the AWS settings are read from, with
+/// the selected profile.
 #[derive(Debug)]
 pub(super) struct Config {
     env: Env,
-    fs: Fs,
-    platform: Platform,
     sections: Sections,
-    /// Why the shared files did not parse. Settings then come from the
-    /// environment alone, and the profile credential source fails with it.
-    parse_error: Option<ParseError>,
     profile: String,
 }
 
 impl Config {
     /// Reads the shared files. `profile` names the profile to use, else
-    /// `AWS_PROFILE` does, else `default`.
-    pub(super) fn load(env: Env, fs: Fs, platform: Platform, profile: Option<&str>) -> Self {
-        let location = Location::find(&env, platform);
-        let (sections, parse_error) = match profile::load(&env, &fs, &location) {
-            Ok(sections) => (sections, None),
-            Err(e) => {
-                tracing::warn!(error = %e, "AWS config files ignored for settings");
-                (Sections::default(), Some(e))
-            }
-        };
+    /// `AWS_PROFILE` does, else `default`. Files that do not parse leave
+    /// the environment's settings in force, with a warning.
+    pub(super) fn load(host: &Host, profile: Option<&str>) -> Self {
+        let location = Location::find(&host.env, host.platform);
+        let sections = profile::load(&host.fs, &location).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "AWS config files ignored for settings");
+            Sections::default()
+        });
         Self {
             profile: profile.map_or(location.profile, str::to_owned),
-            env,
-            fs,
-            platform,
+            env: host.env.clone(),
             sections,
-            parse_error,
         }
-    }
-
-    /// The environment.
-    pub(super) fn env(&self) -> &Env {
-        &self.env
-    }
-
-    /// The file system.
-    pub(super) fn fs(&self) -> &Fs {
-        &self.fs
-    }
-
-    /// The platform rules for the home directory.
-    pub(super) fn platform(&self) -> Platform {
-        self.platform
-    }
-
-    /// The parsed shared files, or why they did not parse.
-    pub(super) fn sections(&self) -> Result<&Sections, &ParseError> {
-        self.parse_error.as_ref().map_or(Ok(&self.sections), Err)
-    }
-
-    /// The selected profile's name.
-    pub(super) fn profile_name(&self) -> &str {
-        &self.profile
     }
 
     /// The selected profile's properties, if it exists.
-    pub(super) fn profile(&self) -> Option<&Properties> {
+    fn profile(&self) -> Option<&Properties> {
         self.sections.profiles.get(&self.profile)
     }
 
-    /// A setting: `<env_key>_<SERVICE_ID>`, then `env_key`, then
-    /// `profile_key` under the service in the profile's services section,
-    /// then `profile_key` in the profile.
-    fn value(&self, env_key: &str, profile_key: &str, service_id: Option<&str>) -> Option<String> {
-        let from_env = service_id
-            .and_then(|id| {
-                let id = id.to_uppercase().replace(' ', "_");
-                self.env.get(&format!("{env_key}_{id}"))
-            })
-            .or_else(|| self.env.get(env_key));
+    /// `setting`: for `service`, `<env>_<SERVICE>` first and the profile's
+    /// services section after the environment; then the global values.
+    fn value(&self, setting: Setting, service: Option<ServiceId>) -> Option<String> {
+        let from_env = service
+            .and_then(|id| self.env.get(&format!("{}_{}", setting.env, id.env)))
+            .or_else(|| self.env.get(setting.env));
         from_env.or_else(|| {
             let profile = self.profile()?;
-            service_id
+            service
                 .and_then(|id| {
-                    let key = OtherKey {
-                        section_key: SERVICES.to_owned(),
-                        section_name: profile.get(SERVICES)?.clone(),
-                        property: id.to_lowercase().replace(' ', "-"),
-                        sub_property: profile_key.to_owned(),
-                    };
-                    self.sections.other.get(&key).cloned()
+                    let section = self.sections.services.get(profile.get(SERVICES)?)?;
+                    section.get(id.profile)?.get(setting.profile).cloned()
                 })
-                .or_else(|| profile.get(profile_key).cloned())
+                .or_else(|| profile.get(setting.profile).cloned())
         })
     }
 
-    /// A `true` or `false` setting, any case. Anything else is ignored with
-    /// a warning, as the SDK does.
-    fn flag(&self, env_key: &str, profile_key: &str) -> Option<bool> {
-        let value = self.value(env_key, profile_key, None)?;
-        if value.eq_ignore_ascii_case("true") {
-            Some(true)
-        } else if value.eq_ignore_ascii_case("false") {
-            Some(false)
-        } else {
-            tracing::warn!(
-                setting = env_key,
-                value,
-                "AWS setting ignored, not true or false"
-            );
-            None
-        }
+    /// A `true` or `false` setting.
+    fn flag(&self, setting: Setting) -> Option<bool> {
+        parse_flag(setting.env, &self.value(setting, None)?)
     }
 
     /// `AWS_USE_FIPS_ENDPOINT` or `use_fips_endpoint`.
     pub(super) fn fips(&self) -> Fips {
-        match self.flag("AWS_USE_FIPS_ENDPOINT", "use_fips_endpoint") {
+        match self.flag(USE_FIPS) {
             Some(true) => Fips::On,
             _ => Fips::Off,
         }
@@ -132,7 +144,7 @@ impl Config {
 
     /// `AWS_USE_DUALSTACK_ENDPOINT` or `use_dualstack_endpoint`.
     pub(super) fn dual_stack(&self) -> DualStack {
-        match self.flag("AWS_USE_DUALSTACK_ENDPOINT", "use_dualstack_endpoint") {
+        match self.flag(USE_DUAL_STACK) {
             Some(true) => DualStack::On,
             _ => DualStack::Off,
         }
@@ -141,55 +153,59 @@ impl Config {
     /// `AWS_DISABLE_CLOCK_SKEW_CORRECTION` or
     /// `disable_clock_skew_correction`.
     pub(super) fn skew_correction(&self) -> SkewCorrection {
-        match self.flag(
-            "AWS_DISABLE_CLOCK_SKEW_CORRECTION",
-            "disable_clock_skew_correction",
-        ) {
+        match self.flag(DISABLE_SKEW_CORRECTION) {
             Some(true) => SkewCorrection::Off,
             _ => SkewCorrection::On,
         }
     }
 
-    /// The endpoint URL configured for the service `service_id`, unless
+    /// The endpoint URL configured for `service`, unless
     /// `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS` or
     /// `ignore_configured_endpoint_urls` is true.
-    pub(super) fn endpoint_url(&self, service_id: &str) -> Option<String> {
-        let ignore = self.flag(
-            "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS",
-            "ignore_configured_endpoint_urls",
-        );
-        if ignore == Some(true) {
-            return None;
+    pub(super) fn endpoint_url(&self, service: ServiceId) -> Result<Option<Endpoint>, ConfigError> {
+        if self.flag(IGNORE_ENDPOINT_URLS) == Some(true) {
+            return Ok(None);
         }
-        self.value("AWS_ENDPOINT_URL", "endpoint_url", Some(service_id))
+        self.value(ENDPOINT_URL, Some(service))
+            .map(|url| Endpoint::parse(&url))
+            .transpose()
     }
 
     /// `AWS_MAX_ATTEMPTS` or `max_attempts`, `AWS_RETRY_MODE` or
     /// `retry_mode`, and `AWS_NEW_RETRIES_2026`. An invalid attempt count
     /// or mode is an error.
-    pub(super) fn retry(&self) -> Result<retry::Config, ConfigError> {
-        let mut config = retry::Config::default();
-        if let Some(text) = self.value("AWS_MAX_ATTEMPTS", "max_attempts", None) {
-            config.max_attempts = match text.parse::<u32>() {
-                Ok(n) if n > 0 => n,
-                _ => return Err(ConfigError::InvalidMaxAttempts(text)),
-            };
+    pub(super) fn retry(&self) -> Result<retry::Settings, ConfigError> {
+        let mut config = retry::Settings::default();
+        if let Some(text) = self.value(MAX_ATTEMPTS, None) {
+            config.max_attempts = text
+                .parse::<NonZeroU32>()
+                .map_err(|source| ConfigError::InvalidMaxAttempts { text, source })?;
         }
-        if let Some(text) = self.value("AWS_RETRY_MODE", "retry_mode", None) {
-            config.mode = match text.trim() {
-                m if m.eq_ignore_ascii_case("standard") => retry::Mode::Standard,
-                m if m.eq_ignore_ascii_case("adaptive") => retry::Mode::Adaptive,
-                _ => return Err(ConfigError::InvalidRetryMode(text)),
-            };
+        if let Some(text) = self.value(RETRY_MODE, None) {
+            config.mode = text.parse()?;
         }
-        if self
-            .env
-            .get("AWS_NEW_RETRIES_2026")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-        {
+        let new_retries = self.env.get(NEW_RETRIES_2026);
+        if new_retries.and_then(|v| parse_flag(NEW_RETRIES_2026, &v)) == Some(true) {
             config.version = retry::Version::V2_1;
         }
         Ok(config)
+    }
+}
+
+/// `true` or `false`, any case, for the setting named `name`. Anything else
+/// is ignored with a warning, as the SDK does.
+fn parse_flag(name: &str, value: &str) -> Option<bool> {
+    if value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        tracing::warn!(
+            setting = name,
+            value,
+            "AWS setting ignored, not true or false"
+        );
+        None
     }
 }
 
@@ -198,26 +214,41 @@ pub(super) mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
+    use super::super::host::{Fs, Platform};
     use super::*;
 
-    /// A config read from `vars` and a config file holding `config_file`.
-    pub(in crate::aws) fn config(vars: &[(&str, &str)], config_file: &str) -> Config {
+    /// A Unix host with `vars` set and a config file holding `config_file`.
+    pub(in crate::aws) fn host(vars: &[(&str, &str)], config_file: &str) -> Host {
         let mut env: HashMap<_, _> = vars
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         env.insert("HOME".to_owned(), "/home".to_owned());
-        let fs = Fs::Fixed(HashMap::from([(
-            PathBuf::from("/home/.aws/config"),
-            config_file.as_bytes().to_vec(),
-        )]));
-        Config::load(Env::Fixed(env), fs, Platform::Unix, None)
+        Host {
+            env: Env::Fixed(env),
+            fs: Fs::Fixed(HashMap::from([(
+                PathBuf::from("/home/.aws/config"),
+                config_file.as_bytes().to_vec(),
+            )])),
+            platform: Platform::Unix,
+        }
+    }
+
+    /// The config of [`host`] with no named profile.
+    fn config(vars: &[(&str, &str)], config_file: &str) -> Config {
+        Config::load(&host(vars, config_file), None)
     }
 
     const SERVICES_FILE: &str = "[default]\nendpoint_url = http://profile-global\nservices = local\n\
         [services local]\necr =\n  endpoint_url = http://profile-ecr\n\
         ecr_public =\n  endpoint_url = http://wrong-spelling\n\
         ecr-public =\n  endpoint_url = http://profile-ecr-public\n";
+
+    /// A service with no setting of its own, so only global values apply.
+    const OTHER: ServiceId = ServiceId {
+        env: "OTHER",
+        profile: "other",
+    };
 
     /// The endpoint URL precedence `aws-config` applies: service env, global
     /// env, service profile, global profile; ECR Public spelled
@@ -226,44 +257,52 @@ pub(super) mod tests {
     /// a spelling differs.
     #[test]
     fn endpoint_url_precedence() {
-        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, Option<&'a str>);
+        type Case<'a> = (&'a [(&'a str, &'a str)], ServiceId, Option<&'a str>);
         let cases: &[Case<'_>] = &[
             (
                 &[
                     ("AWS_ENDPOINT_URL_ECR", "http://env-ecr"),
                     ("AWS_ENDPOINT_URL", "http://env-global"),
                 ],
-                "ECR",
+                ServiceId::ECR,
                 Some("http://env-ecr"),
             ),
             (
                 &[("AWS_ENDPOINT_URL", "http://env-global")],
-                "ECR",
+                ServiceId::ECR,
                 Some("http://env-global"),
             ),
-            (&[], "ECR", Some("http://profile-ecr")),
-            (&[], "ECR PUBLIC", Some("http://profile-ecr-public")),
+            (&[], ServiceId::ECR, Some("http://profile-ecr")),
+            (
+                &[],
+                ServiceId::ECR_PUBLIC,
+                Some("http://profile-ecr-public"),
+            ),
             (
                 &[("AWS_ENDPOINT_URL_ECR_PUBLIC", "http://env-ecr-public")],
-                "ECR PUBLIC",
+                ServiceId::ECR_PUBLIC,
                 Some("http://env-ecr-public"),
             ),
-            (&[], "STS", Some("http://profile-global")),
+            (&[], OTHER, Some("http://profile-global")),
             (
                 &[
                     ("AWS_ENDPOINT_URL_ECR", "http://env-ecr"),
                     ("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "TRUE"),
                 ],
-                "ECR",
+                ServiceId::ECR,
                 None,
             ),
         ];
+        let url = |config: &Config, service| {
+            let endpoint = config.endpoint_url(service).unwrap()?;
+            Some(endpoint.url().as_str().trim_end_matches('/').to_owned())
+        };
         for (vars, service, expected) in cases {
             let config = config(vars, SERVICES_FILE);
             assert_eq!(
-                config.endpoint_url(service).as_deref(),
+                url(&config, *service).as_deref(),
                 *expected,
-                "{service} {vars:?}"
+                "{service:?} {vars:?}"
             );
         }
         let ignored_in_file = config(
@@ -273,7 +312,7 @@ pub(super) mod tests {
                 "ignore_configured_endpoint_urls = true\n[services local]",
             ),
         );
-        assert_eq!(ignored_in_file.endpoint_url("ECR"), None);
+        assert_eq!(url(&ignored_in_file, ServiceId::ECR), None);
     }
 
     /// The switches read `true` and `false` in any case from either source,
@@ -305,12 +344,12 @@ pub(super) mod tests {
     #[test]
     fn retry_settings() {
         let default = config(&[], "").retry().unwrap();
-        assert_eq!(default.max_attempts, 3);
+        assert_eq!(default.max_attempts.get(), 3);
         assert_eq!(default.mode, retry::Mode::Standard);
         assert_eq!(default.version, retry::Version::V2_0);
         let file = "[default]\nmax_attempts = 7\nretry_mode = Adaptive\n";
         let from_file = config(&[], file).retry().unwrap();
-        assert_eq!(from_file.max_attempts, 7);
+        assert_eq!(from_file.max_attempts.get(), 7);
         assert_eq!(from_file.mode, retry::Mode::Adaptive);
         assert_eq!(from_file.version, retry::Version::V2_0);
         let from_env = config(
@@ -323,11 +362,13 @@ pub(super) mod tests {
         )
         .retry()
         .unwrap();
-        assert_eq!(from_env.max_attempts, 2);
+        assert_eq!(from_env.max_attempts.get(), 2);
         assert_eq!(from_env.mode, retry::Mode::Standard);
         assert_eq!(from_env.version, retry::Version::V2_1);
         let profile_2026 = config(&[], "[default]\naws_new_retries_2026 = true\n");
         assert_eq!(profile_2026.retry().unwrap().version, retry::Version::V2_0);
+        let not_a_flag = config(&[("AWS_NEW_RETRIES_2026", "yes")], "");
+        assert_eq!(not_a_flag.retry().unwrap().version, retry::Version::V2_0);
 
         for (vars, error) in [
             (("AWS_MAX_ATTEMPTS", "0"), "invalid AWS max attempts '0'"),
@@ -345,29 +386,208 @@ pub(super) mod tests {
         }
     }
 
-    /// A named profile replaces `AWS_PROFILE` for every setting. Breaks if
-    /// the override is read only for credentials.
-    #[test]
-    fn named_profile_selects_settings() {
-        let file =
-            "[default]\nuse_fips_endpoint = true\n[profile other]\nuse_fips_endpoint = false\n";
-        let mut env = HashMap::from([("HOME".to_owned(), "/home".to_owned())]);
-        env.insert("AWS_PROFILE".to_owned(), "default".to_owned());
-        let fs = Fs::Fixed(HashMap::from([(
-            PathBuf::from("/home/.aws/config"),
-            file.as_bytes().to_vec(),
-        )]));
-        let named = Config::load(Env::Fixed(env), fs, Platform::Unix, Some("other"));
-        assert_eq!(named.profile_name(), "other");
-        assert_eq!(named.fips(), Fips::Off);
-    }
-
     /// A config file that does not parse leaves the environment's settings
-    /// in force and keeps the error for the profile credential source.
+    /// in force. Breaks if a parse error discards them too.
     #[test]
     fn unparsable_file_keeps_env_settings() {
         let config = config(&[("AWS_USE_FIPS_ENDPOINT", "true")], "[profile broken");
         assert_eq!(config.fips(), Fips::On);
-        assert!(config.sections().is_err());
+    }
+
+    /// The settings `aws-config` 1.13.0 resolves from the same environment,
+    /// config file and named profile, as `aws-sdk-ecr` and
+    /// `aws-sdk-ecrpublic` read them from its `SdkConfig`.
+    struct Sdk {
+        fips: bool,
+        dual_stack: bool,
+        skew_correction_disabled: bool,
+        max_attempts: u32,
+        mode: aws_smithy_types::retry::RetryMode,
+        version_2_1: bool,
+        ecr_endpoint: Option<String>,
+        ecr_public_endpoint: Option<String>,
+    }
+
+    async fn sdk(vars: &[(&str, &str)], config_file: &str, profile: Option<&str>) -> Sdk {
+        let mut vars = vars.to_vec();
+        vars.push(("HOME", "/home"));
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .env(aws_types::os_shim_internal::Env::from_slice(&vars))
+            .fs(aws_types::os_shim_internal::Fs::from_slice(&[(
+                "/home/.aws/config",
+                config_file,
+            )]))
+            .region(aws_config::Region::new("us-east-1"));
+        if let Some(profile) = profile {
+            loader = loader.profile_name(profile);
+        }
+        let sdk = loader.load().await;
+        let retry = sdk.retry_config().unwrap();
+        // How the generated clients pick an endpoint URL from `SdkConfig`.
+        let endpoint = |service_id| {
+            let key = aws_types::service_config::ServiceConfigKey::builder()
+                .service_id(service_id)
+                .env("AWS_ENDPOINT_URL")
+                .profile("endpoint_url")
+                .build()
+                .unwrap();
+            sdk.service_config()
+                .and_then(|c| c.load_config(key))
+                .or_else(|| sdk.endpoint_url().map(str::to_owned))
+        };
+        Sdk {
+            fips: sdk.use_fips() == Some(true),
+            dual_stack: sdk.use_dual_stack() == Some(true),
+            skew_correction_disabled: sdk.disable_clock_skew_correction() == Some(true),
+            max_attempts: retry.max_attempts(),
+            mode: retry.mode(),
+            version_2_1: retry.retry_spec().is_some(),
+            ecr_endpoint: endpoint("ECR"),
+            ecr_public_endpoint: endpoint("ECR PUBLIC"),
+        }
+    }
+
+    /// Every setting matches `aws-config` across valid inputs: each source
+    /// alone, the environment against the profile, service sections, the
+    /// ignore switch, a named profile, a missing profile and a file that
+    /// does not parse. Breaks on any difference from the dependency this
+    /// module replaces. Invalid attempts and modes are left out, where the
+    /// SDK fails to build a client and this module returns an error.
+    #[tokio::test]
+    async fn matches_aws_config() {
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, Option<&'a str>);
+        let cases: &[Case<'_>] = &[
+            (&[], "", None),
+            (
+                &[
+                    ("AWS_USE_FIPS_ENDPOINT", "TRUE"),
+                    ("AWS_USE_DUALSTACK_ENDPOINT", "true"),
+                    ("AWS_DISABLE_CLOCK_SKEW_CORRECTION", "true"),
+                    ("AWS_MAX_ATTEMPTS", "7"),
+                    ("AWS_RETRY_MODE", "adaptive"),
+                    ("AWS_NEW_RETRIES_2026", "True"),
+                ],
+                "",
+                None,
+            ),
+            (
+                &[],
+                "[default]\nuse_fips_endpoint = true\nuse_dualstack_endpoint = true\n\
+                 disable_clock_skew_correction = true\nmax_attempts = 2\n\
+                 retry_mode = Adaptive\naws_new_retries_2026 = true\n",
+                None,
+            ),
+            (
+                &[
+                    ("AWS_USE_FIPS_ENDPOINT", "false"),
+                    ("AWS_MAX_ATTEMPTS", "4"),
+                    ("AWS_RETRY_MODE", "standard"),
+                ],
+                "[default]\nuse_fips_endpoint = true\nmax_attempts = 2\nretry_mode = adaptive\n",
+                None,
+            ),
+            (
+                &[
+                    ("AWS_USE_FIPS_ENDPOINT", "yes"),
+                    ("AWS_NEW_RETRIES_2026", "yes"),
+                ],
+                "[default]\nuse_dualstack_endpoint = 1\n",
+                None,
+            ),
+            (&[], SERVICES_FILE, None),
+            (
+                &[("AWS_ENDPOINT_URL", "http://env-global")],
+                SERVICES_FILE,
+                None,
+            ),
+            (
+                &[
+                    ("AWS_ENDPOINT_URL_ECR", "http://env-ecr"),
+                    ("AWS_ENDPOINT_URL_ECR_PUBLIC", "http://env-ecr-public"),
+                ],
+                SERVICES_FILE,
+                None,
+            ),
+            (
+                &[
+                    ("AWS_ENDPOINT_URL_ECR", "http://env-ecr"),
+                    ("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true"),
+                ],
+                SERVICES_FILE,
+                None,
+            ),
+            (
+                &[],
+                &SERVICES_FILE.replace(
+                    "[services local]",
+                    "ignore_configured_endpoint_urls = true\n[services local]",
+                ),
+                None,
+            ),
+            (
+                &[("AWS_PROFILE", "default")],
+                "[default]\nuse_fips_endpoint = true\n\
+                 [profile other]\nuse_dualstack_endpoint = true\nmax_attempts = 9\n",
+                Some("other"),
+            ),
+            (
+                &[("AWS_PROFILE", "other")],
+                "[default]\nuse_fips_endpoint = true\n\
+                 [profile other]\nuse_dualstack_endpoint = true\n",
+                None,
+            ),
+            (
+                &[],
+                "[default]\nuse_fips_endpoint = true\n",
+                Some("missing"),
+            ),
+            (
+                &[("AWS_USE_FIPS_ENDPOINT", "true")],
+                "[profile broken",
+                None,
+            ),
+        ];
+        for (vars, file, profile) in cases {
+            let sdk = sdk(vars, file, *profile).await;
+            let ours = Config::load(&host(vars, file), *profile);
+            let retry = ours.retry().unwrap();
+            let url = |service| {
+                let endpoint = ours.endpoint_url(service).unwrap()?;
+                Some(endpoint.url().as_str().trim_end_matches('/').to_owned())
+            };
+            let case = format!("{vars:?} {file:?} {profile:?}");
+            assert_eq!(ours.fips() == Fips::On, sdk.fips, "fips: {case}");
+            assert_eq!(
+                ours.dual_stack() == DualStack::On,
+                sdk.dual_stack,
+                "dual-stack: {case}"
+            );
+            assert_eq!(
+                ours.skew_correction() == SkewCorrection::Off,
+                sdk.skew_correction_disabled,
+                "skew: {case}"
+            );
+            assert_eq!(
+                retry.max_attempts.get(),
+                sdk.max_attempts,
+                "attempts: {case}"
+            );
+            let mode = match retry.mode {
+                retry::Mode::Standard => aws_smithy_types::retry::RetryMode::Standard,
+                retry::Mode::Adaptive => aws_smithy_types::retry::RetryMode::Adaptive,
+            };
+            assert_eq!(mode, sdk.mode, "mode: {case}");
+            assert_eq!(
+                retry.version == retry::Version::V2_1,
+                sdk.version_2_1,
+                "2026: {case}"
+            );
+            assert_eq!(url(ServiceId::ECR), sdk.ecr_endpoint, "ECR: {case}");
+            assert_eq!(
+                url(ServiceId::ECR_PUBLIC),
+                sdk.ecr_public_endpoint,
+                "ECR Public: {case}"
+            );
+        }
     }
 }

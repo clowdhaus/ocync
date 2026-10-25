@@ -44,6 +44,7 @@ tracing.workspace = true
 url = { workspace = true }
 
 [dev-dependencies]
+aws-config = { workspace = true, features = ["test-util"] }
 aws-smithy-types = { workspace = true, features = ["test-util"] }
 httpdate = { version = "1", default-features = false }
 rcgen = { workspace = true, features = ["aws_lc_rs"] }

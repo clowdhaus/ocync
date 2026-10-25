@@ -11,9 +11,9 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::env::{Env, Fs, Platform};
+use super::host::{Env, Fs, Platform};
 
 /// Characters that count as whitespace in these files.
 const WHITESPACE: &[char] = &[' ', '\t'];
@@ -27,15 +27,15 @@ const DEFAULT_PROFILE: &str = "default";
 /// The prefix of a profile section in the config file.
 const PROFILE_PREFIX: &str = "profile";
 
-/// The prefix of an IAM Identity Center session section.
-const SSO_SESSION_PREFIX: &str = "sso-session";
+/// The prefix of a section holding per-service settings.
+const SERVICES_PREFIX: &str = "services";
 
 /// One section's properties, keyed by lowercased name.
 pub(super) type Properties = HashMap<String, String>;
 
 /// Which of the two files a body of text came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FileKind {
+enum FileKind {
     /// The config file, `~/.aws/config`.
     Config,
     /// The credentials file, `~/.aws/credentials`.
@@ -60,47 +60,49 @@ impl FileKind {
     }
 }
 
-/// A sub-property of a section other than a profile or an SSO session, such
-/// as `endpoint_url` under `ecr` in `[services name]`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct OtherKey {
-    /// The section prefix, such as `services`.
-    pub(super) section_key: String,
-    /// The section name after the prefix.
-    pub(super) section_name: String,
-    /// The property holding the sub-properties, such as `ecr`.
-    pub(super) property: String,
-    /// The sub-property, such as `endpoint_url`.
-    pub(super) sub_property: String,
-}
+/// A `[services name]` section: each service's settings, keyed by the
+/// service's profile spelling, such as `ecr-public`.
+pub(super) type Services = HashMap<String, Properties>;
 
 /// Everything read from the two files.
 #[derive(Debug, Default)]
 pub(super) struct Sections {
     /// Profiles by name.
     pub(super) profiles: HashMap<String, Properties>,
-    /// IAM Identity Center sessions by name.
-    pub(super) sso_sessions: HashMap<String, Properties>,
-    /// Sub-properties of every other prefixed section.
-    pub(super) other: HashMap<OtherKey, String>,
+    /// `[services name]` sections by name.
+    pub(super) services: HashMap<String, Services>,
 }
 
 /// A file that does not parse.
 #[derive(Debug, thiserror::Error)]
-#[error("error parsing {path} on line {line}: {message}")]
+#[error("error parsing {} on line {line}: {message}", path.display())]
 pub(super) struct ParseError {
-    path: String,
+    path: PathBuf,
     line: usize,
     message: String,
+}
+
+/// Who chose a file's location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// The default under the home directory.
+    Default,
+    /// An environment variable.
+    Env,
+}
+
+/// One of the two files and who chose its location.
+#[derive(Debug, PartialEq, Eq)]
+struct File {
+    path: PathBuf,
+    origin: Origin,
 }
 
 /// Where the two files are and which profile is selected.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Location {
-    /// The config file.
-    pub(super) config: PathBuf,
-    /// The credentials file.
-    pub(super) credentials: PathBuf,
+    config: File,
+    credentials: File,
     /// `AWS_PROFILE`, or `default`.
     pub(super) profile: String,
 }
@@ -111,10 +113,14 @@ impl Location {
     pub(super) fn find(env: &Env, platform: Platform) -> Self {
         let home = platform.home_dir(env);
         let path = |kind: FileKind| {
-            let path = env
-                .get(kind.override_var())
-                .unwrap_or_else(|| kind.default_path().to_owned());
-            PathBuf::from(expand_home(&path, home.as_deref(), platform))
+            let (path, origin) = match env.get(kind.override_var()) {
+                Some(path) => (path, Origin::Env),
+                None => (kind.default_path().to_owned(), Origin::Default),
+            };
+            File {
+                path: PathBuf::from(expand_home(&path, home.as_deref(), platform)),
+                origin,
+            }
         };
         Self {
             config: path(FileKind::Config),
@@ -157,19 +163,20 @@ fn expand_home(path: &str, home: Option<&str>, platform: Platform) -> String {
 /// Reads and merges the config and credentials files. A file that cannot
 /// be read or is not UTF-8 counts as empty, with a warning unless it is a
 /// default location that does not exist.
-pub(super) fn load(env: &Env, fs: &Fs, location: &Location) -> Result<Sections, ParseError> {
+pub(super) fn load(fs: &Fs, location: &Location) -> Result<Sections, ParseError> {
     let mut sections = Sections::default();
-    for (kind, path) in [
+    for (kind, file) in [
         (FileKind::Config, &location.config),
         (FileKind::Credentials, &location.credentials),
     ] {
+        let path = &file.path;
         let contents = match fs.read(path) {
             Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| {
                 tracing::warn!(path = %path.display(), "AWS config file is not UTF-8, ignored");
                 String::new()
             }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if env.get(kind.override_var()).is_some() {
+                if file.origin == Origin::Env {
                     tracing::warn!(
                         path = %path.display(),
                         var = kind.override_var(),
@@ -183,7 +190,7 @@ pub(super) fn load(env: &Env, fs: &Fs, location: &Location) -> Result<Sections, 
                 String::new()
             }
         };
-        merge(&mut sections, &contents, kind, &path.display().to_string())?;
+        merge(&mut sections, &contents, kind, path)?;
     }
     Ok(sections)
 }
@@ -193,11 +200,11 @@ pub(super) fn load(env: &Env, fs: &Fs, location: &Location) -> Result<Sections, 
 type RawSection<'a> = (&'a str, Vec<(String, String)>);
 
 /// Parses `contents` as a file of `kind` and merges it into `sections`.
-pub(super) fn merge(
+fn merge(
     sections: &mut Sections,
     contents: &str,
     kind: FileKind,
-    path: &str,
+    path: &Path,
 ) -> Result<(), ParseError> {
     let raw = parse(contents, path)?;
     let valid: Vec<_> = raw
@@ -220,9 +227,13 @@ pub(super) fn merge(
         }
         let target = match name.prefix {
             None | Some(PROFILE_PREFIX) => sections.profiles.entry(name.suffix.to_owned()),
-            Some(SSO_SESSION_PREFIX) => sections.sso_sessions.entry(name.suffix.to_owned()),
+            Some(SERVICES_PREFIX) => {
+                let services = sections.services.entry(name.suffix.to_owned()).or_default();
+                merge_services(services, name.suffix, properties);
+                continue;
+            }
             Some(prefix) => {
-                merge_other(&mut sections.other, prefix, name.suffix, properties);
+                tracing::debug!(prefix, section = name.suffix, "AWS config section not read");
                 continue;
             }
         }
@@ -242,35 +253,22 @@ pub(super) fn merge(
     Ok(())
 }
 
-/// Stores the sub-properties of each property of a section such as
-/// `[services name]`.
-fn merge_other(
-    other: &mut HashMap<OtherKey, String>,
-    prefix: &str,
-    suffix: &str,
-    properties: Vec<(String, String)>,
-) {
-    for (property, value) in properties {
-        if !is_identifier(&property) {
-            tracing::warn!(
-                section = suffix,
-                property,
-                "AWS config key ignored, not a valid name"
-            );
+/// Stores each service's sub-properties from the `[services section]`
+/// section, such as `endpoint_url` under `ecr`.
+fn merge_services(services: &mut Services, section: &str, properties: Vec<(String, String)>) {
+    for (service, value) in properties {
+        if !is_identifier(&service) {
+            tracing::warn!(section, service, "AWS config key ignored, not a valid name");
             continue;
         }
+        let settings = services.entry(service).or_default();
         for line in value.split('\n').filter(|l| !l.is_empty()) {
             let Some((key, value)) = line.split_once('=') else {
                 tracing::warn!(line, "AWS config sub-property ignored, no '='");
                 continue;
             };
-            other.insert(
-                OtherKey {
-                    section_key: prefix.to_owned(),
-                    section_name: suffix.to_owned(),
-                    property: property.clone(),
-                    sub_property: key.trim_matches(WHITESPACE).to_owned(),
-                },
+            settings.insert(
+                key.trim_matches(WHITESPACE).to_owned(),
                 value.trim_matches(WHITESPACE).to_owned(),
             );
         }
@@ -352,7 +350,7 @@ enum Open {
 
 /// Splits `contents` into sections and their raw properties, in file order.
 /// A section header repeated later in the file adds to the first.
-fn parse<'a>(contents: &'a str, path: &str) -> Result<Vec<RawSection<'a>>, ParseError> {
+fn parse<'a>(contents: &'a str, path: &Path) -> Result<Vec<RawSection<'a>>, ParseError> {
     let mut sections: Vec<RawSection<'a>> = Vec::new();
     let mut open = Open::Nothing;
     for (number, line) in contents.lines().enumerate() {
@@ -397,14 +395,14 @@ fn parse<'a>(contents: &'a str, path: &str) -> Result<Vec<RawSection<'a>>, Parse
             };
             let line = line.trim_matches(WHITESPACE);
             if sub_properties && !line.is_empty() {
-                property(line).map_err(|e| error(e.message("sub-property")))?;
+                property(line).map_err(|e| error(e.message(LineKind::SubProperty)))?;
             }
             let value = &mut properties[index].1;
             value.push('\n');
             value.push_str(line);
             continue;
         }
-        let (key, value) = property(line).map_err(|e| error(e.message("property")))?;
+        let (key, value) = property(line).map_err(|e| error(e.message(LineKind::Property)))?;
         let sub_properties = value.is_empty();
         let index = match properties.iter().position(|(k, _)| *k == key) {
             Some(index) => {
@@ -425,6 +423,15 @@ fn parse<'a>(contents: &'a str, path: &str) -> Result<Vec<RawSection<'a>>, Parse
     Ok(sections)
 }
 
+/// Which kind of `key = value` line failed, for the error message.
+#[derive(Clone, Copy)]
+enum LineKind {
+    /// A property of a section.
+    Property,
+    /// An indented property under a property with an empty value.
+    SubProperty,
+}
+
 /// Why a `key = value` line did not parse.
 enum PropertyError {
     NoEquals,
@@ -432,14 +439,15 @@ enum PropertyError {
 }
 
 impl PropertyError {
-    fn message(self, what: &str) -> String {
+    /// The upstream message for this error on a line of `kind`.
+    fn message(self, kind: LineKind) -> String {
+        let (lower, capitalized) = match kind {
+            LineKind::Property => ("property", "Property"),
+            LineKind::SubProperty => ("sub-property", "Sub-property"),
+        };
         match self {
-            Self::NoEquals => format!("Expected an '=' sign defining a {what}"),
-            Self::NoName => {
-                let mut what = what.to_owned();
-                what[..1].make_ascii_uppercase();
-                format!("{what} did not have a name")
-            }
+            Self::NoEquals => format!("Expected an '=' sign defining a {lower}"),
+            Self::NoName => format!("{capitalized} did not have a name"),
         }
     }
 }
@@ -505,9 +513,9 @@ mod tests {
         serde_json::from_value(value.clone()).unwrap_or_default()
     }
 
-    /// Every case of the upstream profile parser suite: the parsed profiles
-    /// and SSO sessions, or the error, match what the SDKs produce. Breaks
-    /// if any parse, normalize or merge rule differs from upstream.
+    /// Every case of the upstream profile parser suite: the parsed profiles,
+    /// or the error, match what the SDKs produce. Breaks if any parse,
+    /// normalize or merge rule differs from upstream.
     #[test]
     fn upstream_parser_cases() {
         let cases = cases("profile-parser-tests.json");
@@ -522,7 +530,9 @@ mod tests {
             ]
             .into_iter()
             .filter_map(|(field, kind)| Some((input[field].as_str()?, kind)))
-            .try_for_each(|(contents, kind)| merge(&mut sections, contents, kind, "test"));
+            .try_for_each(|(contents, kind)| {
+                merge(&mut sections, contents, kind, Path::new("test"))
+            });
             let output = &case["output"];
             if let Some(expected) = output["errorContaining"].as_str() {
                 let err = result.expect_err(name).to_string();
@@ -530,13 +540,8 @@ mod tests {
                 continue;
             }
             result.unwrap_or_else(|e| panic!("{name}: {e}"));
-            let config = &output["config"];
-            assert_eq!(sections.profiles, as_map(&config["profiles"]), "{name}");
-            assert_eq!(
-                sections.sso_sessions,
-                as_map(&config["sso_sessions"]),
-                "{name}"
-            );
+            let expected = as_map(&output["config"]["profiles"]);
+            assert_eq!(sections.profiles, expected, "{name}");
         }
     }
 
@@ -552,16 +557,17 @@ mod tests {
             let env = Env::Fixed(serde_json::from_value(case["environment"].clone()).unwrap());
             let platform = match case["platform"].as_str().unwrap() {
                 "windows" => Platform::Windows,
-                _ => Platform::Unix,
+                "linux" => Platform::Unix,
+                other => panic!("{name}: unknown platform {other}"),
             };
             let found = Location::find(&env, platform);
             assert_eq!(
-                found.config,
+                found.config.path,
                 PathBuf::from(case["configLocation"].as_str().unwrap()),
                 "{name}"
             );
             assert_eq!(
-                found.credentials,
+                found.credentials.path,
                 PathBuf::from(case["credentialsLocation"].as_str().unwrap()),
                 "{name}"
             );
@@ -571,9 +577,9 @@ mod tests {
         }
     }
 
-    /// `[services name]` sub-properties land in `other`, where the endpoint
-    /// URL lookup reads them, and never in a profile. Breaks if a services
-    /// section is dropped or read as a profile named `name`.
+    /// `[services name]` sub-properties land under the section and service,
+    /// where the endpoint URL lookup reads them, and never in a profile.
+    /// Breaks if a services section is dropped or read as a profile.
     #[test]
     fn services_section_sub_properties() {
         let mut sections = Sections::default();
@@ -581,18 +587,12 @@ mod tests {
             &mut sections,
             "[services local]\necr =\n  endpoint_url = http://localhost:4566\n",
             FileKind::Config,
-            "test",
+            Path::new("test"),
         )
         .unwrap();
-        let key = OtherKey {
-            section_key: "services".to_owned(),
-            section_name: "local".to_owned(),
-            property: "ecr".to_owned(),
-            sub_property: "endpoint_url".to_owned(),
-        };
         assert_eq!(
-            sections.other.get(&key).map(String::as_str),
-            Some("http://localhost:4566")
+            sections.services["local"]["ecr"]["endpoint_url"],
+            "http://localhost:4566"
         );
         assert!(sections.profiles.is_empty());
     }
@@ -614,12 +614,12 @@ mod tests {
             ),
         ]));
         let location = Location::find(&env, Platform::Unix);
-        let sections = load(&env, &fs, &location).unwrap();
+        let sections = load(&fs, &location).unwrap();
         let default = &sections.profiles["default"];
         assert_eq!(default["aws_access_key_id"], "from-credentials");
         assert_eq!(default["region"], "us-west-2");
 
-        let empty = load(&env, &Fs::Fixed(HashMap::new()), &location).unwrap();
+        let empty = load(&Fs::Fixed(HashMap::new()), &location).unwrap();
         assert!(empty.profiles.is_empty());
     }
 
@@ -632,7 +632,7 @@ mod tests {
             PathBuf::from("/h/.aws/config"),
             vec![0xff, 0xfe],
         )]));
-        let sections = load(&env, &fs, &Location::find(&env, Platform::Unix)).unwrap();
+        let sections = load(&fs, &Location::find(&env, Platform::Unix)).unwrap();
         assert!(sections.profiles.is_empty());
     }
 }
