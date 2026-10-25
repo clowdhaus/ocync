@@ -22,8 +22,8 @@ use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvid
 use aws_types::service_config::ServiceConfigKey;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 
 use self::calendar::parse_imf_fixdate;
 use self::endpoint::{DualStack, Endpoint, Fips, Region};
@@ -171,17 +171,6 @@ pub(crate) trait Operation: Serialize {
     type Output: DeserializeOwned;
 }
 
-/// Read a JSON `null` as the type's default, as the SDK reads a field that
-/// is null or absent. Use with `#[serde(default)]` so an absent field reads
-/// the same.
-pub(crate) fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Default + Deserialize<'de>,
-{
-    Ok(<Option<T>>::deserialize(deserializer)?.unwrap_or_default())
-}
-
 /// Why a [`Client`] could not be built from the AWS configuration.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConfigError {
@@ -306,6 +295,16 @@ impl fmt::Display for ServiceError {
         let message = self.message.as_deref().unwrap_or("no message");
         write!(f, "{code} (HTTP {}): {message}", self.status)
     }
+}
+
+/// Whether signatures correct for the measured [`ClockSkew`], off when
+/// `AWS_DISABLE_CLOCK_SKEW_CORRECTION` or the profile's
+/// `disable_clock_skew_correction` is true. Off, no skew is measured, so no
+/// signature is shifted and no skewed signature is re-sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkewCorrection {
+    On,
+    Off,
 }
 
 /// How far AWS's clock is ahead of this host's, in milliseconds; negative
@@ -442,7 +441,8 @@ pub(crate) struct Client {
     credentials: CredentialCache<Credentials>,
     /// The last [`ClockSkew`] measured, which every signature corrects for.
     skew: AtomicI64,
-    retry: retry::Settings,
+    skew_correction: SkewCorrection,
+    retry: retry::Strategy,
     /// The retry quota and rate limiter shared with every client for the
     /// same service and region.
     partition: Arc<retry::Partition>,
@@ -466,8 +466,9 @@ struct Parts {
     service: Service,
     region: Region,
     endpoint: Endpoint,
-    retry: retry::Settings,
+    retry: retry::Strategy,
     partition: Arc<retry::Partition>,
+    skew_correction: SkewCorrection,
     stall_timeout: Duration,
 }
 
@@ -503,9 +504,13 @@ impl Client {
             _ => DualStack::Off,
         };
         let endpoint = endpoint::resolve(service, &region, fips, dual_stack, endpoint_url)?;
+        let skew_correction = match config.disable_clock_skew_correction() {
+            Some(true) => SkewCorrection::Off,
+            _ => SkewCorrection::On,
+        };
         let retry = config.retry_config().map_or_else(
-            || retry::Settings::new(&RetryConfig::standard()),
-            retry::Settings::new,
+            || retry::Strategy::new(&RetryConfig::standard()),
+            retry::Strategy::new,
         );
         Self::from_parts(Parts {
             provider,
@@ -514,6 +519,7 @@ impl Client {
             region,
             endpoint,
             retry,
+            skew_correction,
             stall_timeout: STALL_TIMEOUT,
         })
     }
@@ -526,6 +532,7 @@ impl Client {
             endpoint,
             retry,
             partition,
+            skew_correction,
             stall_timeout,
         } = parts;
         crate::install_crypto_provider();
@@ -541,6 +548,7 @@ impl Client {
             provider,
             credentials: CredentialCache::new(),
             skew: AtomicI64::new(0),
+            skew_correction,
             retry,
             partition,
             service,
@@ -601,7 +609,10 @@ impl Client {
             request = request.header(name, value);
         }
         let response = request.send().await?;
-        let measured = ClockSkew::measure(response.headers(), sent, SystemTime::now());
+        let measured = match self.skew_correction {
+            SkewCorrection::On => ClockSkew::measure(response.headers(), sent, SystemTime::now()),
+            SkewCorrection::Off => None,
+        };
         if let Some(skew) = measured {
             self.skew.store(skew.0, Ordering::Relaxed);
         }
@@ -697,8 +708,8 @@ mod tests {
 
     /// The SDK's settings with `max_attempts` and a 1 ms first backoff, so a
     /// test's retries take milliseconds.
-    fn settings(max_attempts: u32) -> retry::Settings {
-        retry::Settings::new(
+    fn strategy(max_attempts: u32) -> retry::Strategy {
+        retry::Strategy::new(
             &RetryConfig::standard()
                 .with_max_attempts(max_attempts)
                 .with_initial_backoff(Duration::from_millis(1)),
@@ -713,15 +724,16 @@ mod tests {
             service: Service::Ecr,
             region: Region::parse("us-east-1").unwrap(),
             endpoint: Endpoint::parse(endpoint).unwrap(),
-            retry: settings(DEFAULT_MAX_ATTEMPTS),
+            retry: strategy(DEFAULT_MAX_ATTEMPTS),
             partition: Arc::default(),
+            skew_correction: SkewCorrection::On,
             stall_timeout: STALL_TIMEOUT,
         }
     }
 
     fn client(server: &MockServer, max_attempts: u32) -> Client {
         Client::from_parts(Parts {
-            retry: settings(max_attempts),
+            retry: strategy(max_attempts),
             ..parts(&server.uri())
         })
         .unwrap()
@@ -834,7 +846,7 @@ mod tests {
             drop(socket);
         });
         let client = Client::from_parts(Parts {
-            retry: settings(1),
+            retry: strategy(1),
             stall_timeout: Duration::from_millis(200),
             ..parts(&format!("http://{address}"))
         })
@@ -939,7 +951,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = Client::from_parts(Parts {
-            retry: settings(10),
+            retry: strategy(10),
             partition: Arc::new(retry::Partition::with_capacity(5)),
             ..parts(&server.uri())
         })
@@ -1008,6 +1020,30 @@ mod tests {
                 assert!((598..=602).contains(&shift), "signed {shift}s later");
             }
         }
+    }
+
+    /// With correction disabled, a skewed signature is a plain signature
+    /// error: not re-sent, and no later signature shifts.
+    #[tokio::test]
+    async fn leaves_the_clock_alone_when_skew_correction_is_off() {
+        let server = MockServer::start().await;
+        let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(600));
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("date", date.as_str())
+                    .set_body_json(serde_json::json!({"__type": "InvalidSignatureException"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::from_parts(Parts {
+            skew_correction: SkewCorrection::Off,
+            ..parts(&server.uri())
+        })
+        .unwrap();
+        client.call(&Probe {}).await.unwrap_err();
+        assert_eq!(client.skew.load(Ordering::Relaxed), 0);
     }
 
     /// The skew is the server's `Date` against the midpoint of the round
@@ -1217,7 +1253,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let client = Client::from_parts(Parts {
-            retry: settings(1),
+            retry: strategy(1),
             ..parts(&format!("http://{address}/secret-key"))
         })
         .unwrap();

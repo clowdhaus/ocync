@@ -328,9 +328,9 @@ impl crate::aws::Operation for BatchCheckLayerAvailability<'_> {
 /// The `BatchCheckLayerAvailability` output fields ocync reads.
 #[derive(Debug, Deserialize)]
 struct BatchCheckOutput {
-    #[serde(default, deserialize_with = "crate::aws::null_as_default")]
+    #[serde(default, deserialize_with = "crate::json::null_as_default")]
     layers: Vec<Layer>,
-    #[serde(default, deserialize_with = "crate::aws::null_as_default")]
+    #[serde(default, deserialize_with = "crate::json::null_as_default")]
     failures: Vec<LayerFailure>,
 }
 
@@ -340,7 +340,7 @@ struct Layer {
     /// Kept as text so one digest ocync cannot parse costs only that layer
     /// its skip, not the whole batch.
     layer_digest: Option<String>,
-    #[serde(default, deserialize_with = "crate::aws::null_as_default")]
+    #[serde(default, deserialize_with = "crate::json::null_as_default")]
     layer_availability: LayerAvailability,
 }
 

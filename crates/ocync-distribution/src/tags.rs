@@ -41,17 +41,8 @@ pub(crate) struct TagListResponse {
     #[allow(dead_code)]
     name: String,
     /// The list of tags, or empty if none exist.
-    #[serde(default, deserialize_with = "deserialize_null_as_empty")]
+    #[serde(default, deserialize_with = "crate::json::null_as_default")]
     pub(crate) tags: Vec<String>,
-}
-
-/// Deserialize a `Vec<String>` that may be `null` or missing as an empty vec.
-fn deserialize_null_as_empty<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let opt: Option<Vec<String>> = Option::deserialize(deserializer)?;
-    Ok(opt.unwrap_or_default())
 }
 
 /// Parse a `Link` header to extract the URL for the `rel="next"` page.

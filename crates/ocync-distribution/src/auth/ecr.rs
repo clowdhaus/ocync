@@ -73,7 +73,7 @@ struct GetAuthorizationToken {}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetAuthorizationTokenOutput {
-    #[serde(default, deserialize_with = "crate::aws::null_as_default")]
+    #[serde(default, deserialize_with = "crate::json::null_as_default")]
     authorization_data: Vec<AuthorizationData>,
 }
 
