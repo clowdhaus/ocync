@@ -284,39 +284,30 @@ impl TransferStateCache {
             .is_some_and(|set| set.contains(repo))
     }
 
-    /// Drop runtime-only watch handles. Called between sync runs in long-lived
-    /// processes to prevent monotonic growth of the watch map.
-    pub fn clear_notifies(&mut self) {
-        if !self.repo_committed_watches.is_empty() {
-            let count: usize = self.repo_committed_watches.values().map(|m| m.len()).sum();
-            tracing::debug!(count, "clearing stale repo-committed watch handles");
-            self.repo_committed_watches.clear();
-        }
-    }
-
     /// Start a run from the blob state a reload from disk would give: what
     /// an earlier run learned may no longer hold, so every present blob
-    /// becomes known only from an earlier run, and failures and upload claims
-    /// are dropped.
+    /// becomes known only from an earlier run, and failures, upload claims
+    /// and the last run's watch handles are dropped.
     /// Committed repositories are kept: a mount from one that has since lost
     /// the blob fails and falls back to a push, which costs a request, while
     /// forgetting them would push blobs a mount could have saved.
     pub(crate) fn start_run(&mut self) {
+        self.repo_committed_watches.clear();
         self.dedup.remember_present();
     }
 
     /// Drop `repo`'s state for each of `digests` that is known only from an
-    /// earlier run, returning how many were.
+    /// earlier run, returning the digests dropped.
     pub(crate) fn forget_remembered_blobs<'a>(
         &mut self,
         target: &str,
         repo: &RepositoryName,
         digests: impl IntoIterator<Item = &'a Digest>,
-    ) -> usize {
+    ) -> Vec<&'a Digest> {
         digests
             .into_iter()
             .filter(|digest| self.dedup.forget_remembered(target, digest, repo))
-            .count()
+            .collect()
     }
 
     /// Record each of `digests` present at `repo`, after a manifest that

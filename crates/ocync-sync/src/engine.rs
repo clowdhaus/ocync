@@ -387,23 +387,16 @@ struct TargetBlobOutcome {
 }
 
 impl TargetBlobOutcome {
-    /// Fold in the blob work that repaired refused manifests: a blob it
-    /// resent is no longer counted skipped.
-    fn absorb(&mut self, repair: RepairTally) {
+    /// Fold in a refused manifest's repair. A blob the repair sent was
+    /// skipped earlier on an earlier run's word, so it moves from skipped to
+    /// sent; one the repair skipped is already counted.
+    fn absorb_repair(&mut self, repair: &TargetBlobOutcome) {
+        let sent = repair.stats.transferred + repair.stats.mounted;
         self.bytes_transferred += repair.bytes_transferred;
-        self.stats.skipped = self.stats.skipped.saturating_sub(repair.resent);
-        self.stats.add(&repair.stats);
+        self.stats.skipped = self.stats.skipped.saturating_sub(sent);
+        self.stats.transferred += repair.stats.transferred;
+        self.stats.mounted += repair.stats.mounted;
     }
-}
-
-/// Blob work done to repair an image's refused manifests.
-#[derive(Default)]
-struct RepairTally {
-    /// Blobs the first pass skipped on an earlier run's word and the repair
-    /// copied again.
-    resent: u64,
-    bytes_transferred: u64,
-    stats: BlobTransferStats,
 }
 
 /// Outcome of transferring a single blob to one target.
@@ -1256,7 +1249,6 @@ impl SyncEngine {
             cache_mut.prune_snapshots(&live_keys);
             cache_mut.prune_dedup(&live_targets);
         }
-        cache.borrow_mut().clear_notifies();
 
         let mut stats = compute_stats(&results);
         stats.discovery_cache_hits = discovery_counters.cache_hits;
@@ -1782,7 +1774,7 @@ async fn execute_item(
         batch_checker: item.batch_checker.as_ref(),
         mount_source_wait_deadline,
     };
-    let mut outcome =
+    let outcome =
         transfer_image_blobs(&ctx, blobs_from_manifest(&item.source_data), freq_counts).await;
 
     if let Some(err) = outcome.error {
@@ -1810,9 +1802,9 @@ async fn execute_item(
     }
 
     // Push manifests (children first, then top-level by tag).
-    let repairs = RefCell::new(RepairTally::default());
-    let pushed = push_manifests(&ctx, &item, &repairs).await;
-    outcome.absorb(repairs.into_inner());
+    let outcome = RefCell::new(outcome);
+    let pushed = push_manifests(&ctx, &item, &outcome).await;
+    let outcome = outcome.into_inner();
     match pushed {
         Ok(()) => {
             // Mark this repo as having a committed manifest so it becomes
@@ -1915,7 +1907,12 @@ async fn execute_item(
                     source: item.source.to_string(),
                     target: item.target.to_string(),
                     status: ImageStatus::Failed {
-                        kind: ErrorKind::ManifestPush,
+                        // A refused manifest's repair can fail copying a blob.
+                        kind: if err.is_blob_transfer() {
+                            ErrorKind::BlobTransfer
+                        } else {
+                            ErrorKind::ManifestPush
+                        },
                         error: err.to_string(),
                         retries: retries_made(),
                         status_code: err.status_code().map(|s| s.as_u16()),
@@ -2836,7 +2833,7 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
 async fn push_manifests(
     ctx: &TransferContext<'_>,
     item: &TransferTask,
-    repairs: &RefCell<RepairTally>,
+    outcome: &RefCell<TargetBlobOutcome>,
 ) -> Result<(), crate::Error> {
     let (retry, shared) = (ctx.retry, ctx.shared);
     let target_repo = &item.target.repo;
@@ -2876,7 +2873,7 @@ async fn push_manifests(
     // Push claimed children concurrently. join_all, not try_join_all: a
     // transient failure on one child must not cancel the others.
     let pushes = claimed.into_iter().map(|(child, guard)| async move {
-        let outcome = push_manifest(ctx, &child.digest.to_string(), child, repairs)
+        let outcome = push_manifest(ctx, &child.digest.to_string(), child, Some(outcome))
             .await
             .map_err(Arc::new);
         guard.finish(outcome.clone());
@@ -2896,7 +2893,7 @@ async fn push_manifests(
     let awaited = held_elsewhere.iter().map(|child| {
         run_once(&shared.child_pushes, child_key(child), move || {
             let reference = child.digest.to_string();
-            async move { push_manifest(ctx, &reference, child, repairs).await }
+            async move { push_manifest(ctx, &reference, child, Some(outcome)).await }
         })
     });
     for result in futures_util::future::join_all(awaited).await {
@@ -2904,7 +2901,7 @@ async fn push_manifests(
     }
 
     // Push top-level manifest by tag.
-    push_manifest(ctx, &item.target.tag, &source_data.pull, repairs).await
+    push_manifest(ctx, &item.target.tag, &source_data.pull, Some(outcome)).await
 }
 
 /// Wait until the target reports every blob in `digests` visible, when it
@@ -2943,37 +2940,32 @@ async fn wait_for_commit(item: &TransferTask, retry: &RetryConfig, digests: &[Di
 /// child's digest).
 ///
 /// A manifest refused as invalid, the answer to a blob the registry has
-/// lost, drops an earlier run's entries for its blobs. When it drops any,
-/// this run skipped those blobs on that earlier run's word, so they are
-/// copied again, into `repairs`, and the manifest is pushed once more.
+/// lost, drops an earlier run's entries for its blobs. When any of its blobs
+/// was dropped this run, by this refusal or another task's, they are copied
+/// again and the manifest is pushed once more. The repair's blob work is
+/// folded into `outcome`, when the caller reports it.
 async fn push_manifest(
     ctx: &TransferContext<'_>,
     reference: &str,
     manifest: &ManifestPull,
-    repairs: &RefCell<RepairTally>,
+    outcome: Option<&RefCell<TargetBlobOutcome>>,
 ) -> Result<(), crate::Error> {
     let blobs = child_blobs(manifest);
     let pushed = put_manifest(ctx, reference, manifest).await;
-    let dropped = settle_blobs(ctx, &blobs, &pushed);
-    if dropped == 0 {
+    if !settle_blobs(ctx, &blobs, &pushed) {
         return pushed;
     }
     warn!(
         target_name = %ctx.target_name,
         target_repo = %ctx.target_repo,
         reference,
-        blobs = dropped,
         "manifest refused for blobs an earlier run cached, copying them again"
     );
     // A blob still recorded present is skipped from the cache, so only the
-    // dropped ones cost a request.
-    let resent = blobs.len() as u64;
+    // lost ones cost a request.
     let repair = transfer_image_blobs(ctx, blobs, &HashMap::new()).await;
-    {
-        let mut tally = repairs.borrow_mut();
-        tally.resent += resent;
-        tally.bytes_transferred += repair.bytes_transferred;
-        tally.stats.add(&repair.stats);
+    if let Some(outcome) = outcome {
+        outcome.borrow_mut().absorb_repair(&repair);
     }
     if let Some(err) = repair.error {
         return Err(err);
@@ -3009,24 +3001,34 @@ async fn put_manifest(
 }
 
 /// Record what a manifest push proves about the blobs it references, and
-/// return how many earlier run's entries a refusal as invalid dropped. A
+/// return whether it calls for a repair: a refusal as invalid of a manifest
+/// referencing a blob a refusal dropped from the cache this run. A
 /// committed manifest proves its blobs are in the repo.
 fn settle_blobs(
     ctx: &TransferContext<'_>,
     blobs: &[&Descriptor],
     pushed: &Result<(), crate::Error>,
-) -> usize {
+) -> bool {
     let digests = blobs.iter().map(|b| &b.digest);
-    let mut c = ctx.cache.borrow_mut();
+    let key = |digest: &Digest| target_key(ctx.target_name, ctx.target_repo, digest);
     match pushed {
         Ok(()) => {
-            c.confirm_blobs(ctx.target_name, ctx.target_repo, digests);
-            0
+            ctx.cache
+                .borrow_mut()
+                .confirm_blobs(ctx.target_name, ctx.target_repo, digests);
+            false
         }
         Err(e) if e.manifest_refusal() == Some(ManifestRefusal::Invalid) => {
-            c.forget_remembered_blobs(ctx.target_name, ctx.target_repo, digests)
+            let dropped = ctx.cache.borrow_mut().forget_remembered_blobs(
+                ctx.target_name,
+                ctx.target_repo,
+                digests,
+            );
+            let mut lost = ctx.shared.lost_blobs.borrow_mut();
+            lost.extend(dropped.into_iter().map(key));
+            blobs.iter().any(|b| lost.contains(&key(&b.digest)))
         }
-        Err(_) => 0,
+        Err(_) => false,
     }
 }
 
@@ -3183,8 +3185,7 @@ async fn sync_artifact(
 
     // Push artifact manifest by digest (not by tag). Its blob work stays
     // out of the image's report, like the copy above.
-    let repairs = RefCell::new(RepairTally::default());
-    push_manifest(ctx, &artifact_digest_str, &artifact_pull, &repairs)
+    push_manifest(ctx, &artifact_digest_str, &artifact_pull, None)
         .await
         .map_err(|e| crate::Error::ArtifactSync {
             reference: artifact_digest_str.clone(),

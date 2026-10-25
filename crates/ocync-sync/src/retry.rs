@@ -102,10 +102,17 @@ pub fn is_blob_upload_unknown(error: &ocync_distribution::Error) -> bool {
     if *status != StatusCode::NOT_FOUND {
         return false;
     }
-    let Ok(body) = serde_json::from_str::<OciErrorBody>(message) else {
-        return false;
-    };
-    body.errors.iter().any(|e| e.code == "BLOB_UPLOAD_UNKNOWN")
+    oci_error_codes(message).any(|code| code == "BLOB_UPLOAD_UNKNOWN")
+}
+
+/// The `errors[].code` values of an OCI distribution-spec error body; none
+/// when the body is not that shape.
+pub(crate) fn oci_error_codes(message: &str) -> impl Iterator<Item = String> {
+    serde_json::from_str::<OciErrorBody>(message)
+        .map(|body| body.errors)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.code)
 }
 
 /// OCI distribution-spec error response body shape.

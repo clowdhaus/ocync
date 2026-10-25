@@ -96,13 +96,25 @@ pub enum Error {
 /// set with.
 const ECR_IMMUTABLE_TAG_CODE: &str = "ImageTagAlreadyExistsException";
 
+/// OCI distribution-spec error codes that refuse a manifest for something
+/// other than a blob the registry lacks.
+const CODES_NOT_ABOUT_BLOBS: [&str; 6] = [
+    "DIGEST_INVALID",
+    "NAME_INVALID",
+    "NAME_UNKNOWN",
+    "SIZE_INVALID",
+    "TAG_INVALID",
+    "UNSUPPORTED",
+];
+
 /// Why a registry refused a manifest push.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ManifestRefusal {
     /// ECR refused it because the tag is immutable and already set.
     ImmutableTag,
     /// Refused as invalid (HTTP 400 or 404). A registry that lacks a
-    /// referenced blob answers this way, whatever error code it names.
+    /// referenced blob answers this way, though not all with the same error
+    /// code, so only codes plainly about something else rule it out.
     Invalid,
 }
 
@@ -133,9 +145,21 @@ impl Error {
                 Some(ManifestRefusal::ImmutableTag)
             }
             http::StatusCode::BAD_REQUEST | http::StatusCode::NOT_FOUND => {
-                Some(ManifestRefusal::Invalid)
+                let mut codes = crate::retry::oci_error_codes(message).peekable();
+                let about_something_else = codes.peek().is_some()
+                    && codes.all(|code| CODES_NOT_ABOUT_BLOBS.contains(&code.as_str()));
+                (!about_something_else).then_some(ManifestRefusal::Invalid)
             }
             _ => None,
+        }
+    }
+
+    /// Whether a blob copy failed, rather than a manifest operation.
+    pub(crate) fn is_blob_transfer(&self) -> bool {
+        match self {
+            Self::BlobTransfer { .. } => true,
+            Self::Shared(err) => err.is_blob_transfer(),
+            _ => false,
         }
     }
 
@@ -183,6 +207,21 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 &immutable,
                 Some(ManifestRefusal::ImmutableTag),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"errors":[{"code":"BLOB_UNKNOWN"},{"code":"NAME_UNKNOWN"}]}"#,
+                Some(ManifestRefusal::Invalid),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"errors":[{"code":"NAME_UNKNOWN","message":"repository name not known"}]}"#,
+                None,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"errors":[{"code":"TAG_INVALID"},{"code":"UNSUPPORTED"}]}"#,
+                None,
             ),
             (StatusCode::FORBIDDEN, "DENIED", None),
             (StatusCode::TOO_MANY_REQUESTS, "TOOMANYREQUESTS", None),
