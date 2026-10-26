@@ -196,7 +196,7 @@ mod tests {
             ..retry::Settings::default()
         };
         let region = Region::parse("us-east-1").unwrap();
-        let sts = sts::Client::new(&host, &region, &Config::load(&host, None), &retry).unwrap();
+        let sts = sts::Client::new(&host, &region, &Config::load(&host, None), &retry);
         (host, sts)
     }
 

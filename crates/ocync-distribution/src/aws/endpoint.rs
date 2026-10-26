@@ -1,12 +1,13 @@
 //! Endpoint resolution for the AWS APIs ocync calls, matching the endpoint
-//! rules the AWS SDK generates for ECR, ECR Public and STS.
+//! rules the AWS SDK generates for ECR, ECR Public, STS, SSO and SSO OIDC.
 
 use std::sync::LazyLock;
 
 use regex_lite::Regex;
 use url::Url;
 
-use super::{ConfigError, Service};
+use super::config::ServiceId;
+use super::{ApiId, ConfigError, ErrorFormat, Service};
 use crate::scheme::Scheme;
 
 /// The longest label a host name may hold.
@@ -272,10 +273,47 @@ fn configured(url: Endpoint, fips: Fips, dual_stack: DualStack) -> Result<Endpoi
     }
 }
 
-/// Resolve the STS endpoint URL in `region`, as the SDK's endpoint rules
-/// for STS do. The global endpoint is never chosen: the region is always a
-/// registry's own.
-pub(super) fn resolve_sts(
+/// The AWS APIs the credential chain calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CredentialApi {
+    /// AWS STS, to assume a role.
+    Sts,
+    /// The IAM Identity Center portal, for a role's credentials.
+    Sso,
+    /// IAM Identity Center OIDC, to refresh a login token.
+    SsoOidc,
+}
+
+impl CredentialApi {
+    /// How calls to the API are signed, partitioned and read.
+    pub(super) fn api_id(self) -> ApiId {
+        let (service_id, signing_name, error_format) = match self {
+            Self::Sts => (ServiceId::STS, "sts", ErrorFormat::Xml),
+            Self::Sso => (ServiceId::SSO, "awsssoportal", ErrorFormat::Json),
+            Self::SsoOidc => (ServiceId::SSO_OIDC, "sso-oauth", ErrorFormat::Json),
+        };
+        ApiId {
+            service_id,
+            signing_name,
+            error_format,
+        }
+    }
+
+    /// The host name before the region.
+    fn host_label(self) -> &'static str {
+        match self {
+            Self::Sts => "sts",
+            Self::Sso => "portal.sso",
+            Self::SsoOidc => "oidc",
+        }
+    }
+}
+
+/// Resolve the endpoint URL for `api` in `region`, as the SDK's endpoint
+/// rules for STS, SSO and SSO OIDC do. STS's global endpoint is never
+/// chosen: the region is always a registry's own.
+pub(super) fn resolve_credential_api(
+    api: CredentialApi,
     region: &Region,
     fips: Fips,
     dual_stack: DualStack,
@@ -285,16 +323,16 @@ pub(super) fn resolve_sts(
         return configured(url, fips, dual_stack);
     }
     let p = partition(region);
-    let (dns, dual) = (p.dns_suffix, p.dual_stack_dns_suffix);
+    let (label, dns, dual) = (api.host_label(), p.dns_suffix, p.dual_stack_dns_suffix);
     Endpoint::parse(&match (fips, dual_stack) {
-        (Fips::On, DualStack::On) => format!("https://sts-fips.{region}.{dual}"),
+        (Fips::On, DualStack::On) => format!("https://{label}-fips.{region}.{dual}"),
         // GovCloud's standard endpoints are already FIPS endpoints.
         (Fips::On, DualStack::Off) if p.id == PartitionId::AwsUsGov => {
-            format!("https://sts.{region}.{dns}")
+            format!("https://{label}.{region}.{dns}")
         }
-        (Fips::On, DualStack::Off) => format!("https://sts-fips.{region}.{dns}"),
-        (Fips::Off, DualStack::On) => format!("https://sts.{region}.{dual}"),
-        (Fips::Off, DualStack::Off) => format!("https://sts.{region}.{dns}"),
+        (Fips::On, DualStack::Off) => format!("https://{label}-fips.{region}.{dns}"),
+        (Fips::Off, DualStack::On) => format!("https://{label}.{region}.{dual}"),
+        (Fips::Off, DualStack::Off) => format!("https://{label}.{region}.{dns}"),
     })
 }
 
@@ -974,25 +1012,550 @@ mod tests {
         ];
         assert_eq!(cases.len(), 44);
         for &(region, fips, dual_stack, expected) in cases {
-            let region = Region::parse(region).unwrap();
-            let endpoint = resolve_sts(&region, fips, dual_stack, None).unwrap();
-            assert_eq!(
-                endpoint.url().as_str().trim_end_matches('/'),
-                expected,
-                "{region} {fips:?} {dual_stack:?}"
-            );
+            assert_resolves(CredentialApi::Sts, region, fips, dual_stack, expected);
         }
     }
 
-    /// A configured URL replaces the rule's host, and FIPS with it is an
-    /// error, as for ECR. Breaks if STS skips the check.
+    /// The endpoint rule tests generated into `aws-sdk-sso` 1.117.0 and
+    /// `aws-sdk-ssooidc` 1.119.0, less the configured endpoint cases, which
+    /// share [`configured`] with ECR, and "Missing Region". Breaks if a
+    /// host label, partition, FIPS or dual-stack host differs from the
+    /// SDK's.
     #[test]
-    fn sts_honors_a_configured_url() {
+    fn matches_the_sdk_sso_endpoint_rule_tests() {
+        use CredentialApi::{Sso, SsoOidc};
+        use DualStack as D;
+        use Fips as F;
+        let cases: &[(CredentialApi, &str, Fips, DualStack, &str)] = &[
+            (
+                Sso,
+                "ap-east-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.ap-east-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "ap-northeast-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.ap-northeast-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "ap-northeast-2",
+                F::Off,
+                D::Off,
+                "https://portal.sso.ap-northeast-2.amazonaws.com",
+            ),
+            (
+                Sso,
+                "ap-northeast-3",
+                F::Off,
+                D::Off,
+                "https://portal.sso.ap-northeast-3.amazonaws.com",
+            ),
+            (
+                Sso,
+                "ap-south-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.ap-south-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "ap-southeast-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.ap-southeast-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "ap-southeast-2",
+                F::Off,
+                D::Off,
+                "https://portal.sso.ap-southeast-2.amazonaws.com",
+            ),
+            (
+                Sso,
+                "ca-central-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.ca-central-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "eu-central-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.eu-central-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "eu-north-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.eu-north-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "eu-south-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.eu-south-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "eu-west-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.eu-west-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "eu-west-2",
+                F::Off,
+                D::Off,
+                "https://portal.sso.eu-west-2.amazonaws.com",
+            ),
+            (
+                Sso,
+                "eu-west-3",
+                F::Off,
+                D::Off,
+                "https://portal.sso.eu-west-3.amazonaws.com",
+            ),
+            (
+                Sso,
+                "me-south-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.me-south-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "sa-east-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.sa-east-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "us-east-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.us-east-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "us-east-2",
+                F::Off,
+                D::Off,
+                "https://portal.sso.us-east-2.amazonaws.com",
+            ),
+            (
+                Sso,
+                "us-west-2",
+                F::Off,
+                D::Off,
+                "https://portal.sso.us-west-2.amazonaws.com",
+            ),
+            (
+                Sso,
+                "us-east-1",
+                F::On,
+                D::On,
+                "https://portal.sso-fips.us-east-1.api.aws",
+            ),
+            (
+                Sso,
+                "us-east-1",
+                F::On,
+                D::Off,
+                "https://portal.sso-fips.us-east-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "us-east-1",
+                F::Off,
+                D::On,
+                "https://portal.sso.us-east-1.api.aws",
+            ),
+            (
+                Sso,
+                "cn-north-1",
+                F::On,
+                D::On,
+                "https://portal.sso-fips.cn-north-1.api.amazonwebservices.com.cn",
+            ),
+            (
+                Sso,
+                "cn-north-1",
+                F::On,
+                D::Off,
+                "https://portal.sso-fips.cn-north-1.amazonaws.com.cn",
+            ),
+            (
+                Sso,
+                "cn-north-1",
+                F::Off,
+                D::On,
+                "https://portal.sso.cn-north-1.api.amazonwebservices.com.cn",
+            ),
+            (
+                Sso,
+                "cn-north-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.cn-north-1.amazonaws.com.cn",
+            ),
+            (
+                Sso,
+                "us-gov-east-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.us-gov-east-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "us-gov-west-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.us-gov-west-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "us-gov-east-1",
+                F::On,
+                D::On,
+                "https://portal.sso-fips.us-gov-east-1.api.aws",
+            ),
+            (
+                Sso,
+                "us-gov-east-1",
+                F::On,
+                D::Off,
+                "https://portal.sso.us-gov-east-1.amazonaws.com",
+            ),
+            (
+                Sso,
+                "us-gov-east-1",
+                F::Off,
+                D::On,
+                "https://portal.sso.us-gov-east-1.api.aws",
+            ),
+            (
+                Sso,
+                "us-iso-east-1",
+                F::On,
+                D::Off,
+                "https://portal.sso-fips.us-iso-east-1.c2s.ic.gov",
+            ),
+            (
+                Sso,
+                "us-iso-east-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.us-iso-east-1.c2s.ic.gov",
+            ),
+            (
+                Sso,
+                "us-isob-east-1",
+                F::On,
+                D::Off,
+                "https://portal.sso-fips.us-isob-east-1.sc2s.sgov.gov",
+            ),
+            (
+                Sso,
+                "us-isob-east-1",
+                F::Off,
+                D::Off,
+                "https://portal.sso.us-isob-east-1.sc2s.sgov.gov",
+            ),
+            (
+                SsoOidc,
+                "ap-east-1",
+                F::Off,
+                D::Off,
+                "https://oidc.ap-east-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "ap-northeast-1",
+                F::Off,
+                D::Off,
+                "https://oidc.ap-northeast-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "ap-northeast-2",
+                F::Off,
+                D::Off,
+                "https://oidc.ap-northeast-2.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "ap-northeast-3",
+                F::Off,
+                D::Off,
+                "https://oidc.ap-northeast-3.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "ap-south-1",
+                F::Off,
+                D::Off,
+                "https://oidc.ap-south-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "ap-southeast-1",
+                F::Off,
+                D::Off,
+                "https://oidc.ap-southeast-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "ap-southeast-2",
+                F::Off,
+                D::Off,
+                "https://oidc.ap-southeast-2.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "ca-central-1",
+                F::Off,
+                D::Off,
+                "https://oidc.ca-central-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "eu-central-1",
+                F::Off,
+                D::Off,
+                "https://oidc.eu-central-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "eu-north-1",
+                F::Off,
+                D::Off,
+                "https://oidc.eu-north-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "eu-south-1",
+                F::Off,
+                D::Off,
+                "https://oidc.eu-south-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "eu-west-1",
+                F::Off,
+                D::Off,
+                "https://oidc.eu-west-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "eu-west-2",
+                F::Off,
+                D::Off,
+                "https://oidc.eu-west-2.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "eu-west-3",
+                F::Off,
+                D::Off,
+                "https://oidc.eu-west-3.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "me-south-1",
+                F::Off,
+                D::Off,
+                "https://oidc.me-south-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "sa-east-1",
+                F::Off,
+                D::Off,
+                "https://oidc.sa-east-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "us-east-1",
+                F::Off,
+                D::Off,
+                "https://oidc.us-east-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "us-east-2",
+                F::Off,
+                D::Off,
+                "https://oidc.us-east-2.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "us-west-2",
+                F::Off,
+                D::Off,
+                "https://oidc.us-west-2.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "us-east-1",
+                F::On,
+                D::On,
+                "https://oidc-fips.us-east-1.api.aws",
+            ),
+            (
+                SsoOidc,
+                "us-east-1",
+                F::On,
+                D::Off,
+                "https://oidc-fips.us-east-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "us-east-1",
+                F::Off,
+                D::On,
+                "https://oidc.us-east-1.api.aws",
+            ),
+            (
+                SsoOidc,
+                "cn-north-1",
+                F::On,
+                D::On,
+                "https://oidc-fips.cn-north-1.api.amazonwebservices.com.cn",
+            ),
+            (
+                SsoOidc,
+                "cn-north-1",
+                F::On,
+                D::Off,
+                "https://oidc-fips.cn-north-1.amazonaws.com.cn",
+            ),
+            (
+                SsoOidc,
+                "cn-north-1",
+                F::Off,
+                D::On,
+                "https://oidc.cn-north-1.api.amazonwebservices.com.cn",
+            ),
+            (
+                SsoOidc,
+                "cn-north-1",
+                F::Off,
+                D::Off,
+                "https://oidc.cn-north-1.amazonaws.com.cn",
+            ),
+            (
+                SsoOidc,
+                "us-gov-east-1",
+                F::Off,
+                D::Off,
+                "https://oidc.us-gov-east-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "us-gov-west-1",
+                F::Off,
+                D::Off,
+                "https://oidc.us-gov-west-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "us-gov-east-1",
+                F::On,
+                D::On,
+                "https://oidc-fips.us-gov-east-1.api.aws",
+            ),
+            (
+                SsoOidc,
+                "us-gov-east-1",
+                F::On,
+                D::Off,
+                "https://oidc.us-gov-east-1.amazonaws.com",
+            ),
+            (
+                SsoOidc,
+                "us-gov-east-1",
+                F::Off,
+                D::On,
+                "https://oidc.us-gov-east-1.api.aws",
+            ),
+            (
+                SsoOidc,
+                "us-iso-east-1",
+                F::On,
+                D::Off,
+                "https://oidc-fips.us-iso-east-1.c2s.ic.gov",
+            ),
+            (
+                SsoOidc,
+                "us-iso-east-1",
+                F::Off,
+                D::Off,
+                "https://oidc.us-iso-east-1.c2s.ic.gov",
+            ),
+            (
+                SsoOidc,
+                "us-isob-east-1",
+                F::On,
+                D::Off,
+                "https://oidc-fips.us-isob-east-1.sc2s.sgov.gov",
+            ),
+            (
+                SsoOidc,
+                "us-isob-east-1",
+                F::Off,
+                D::Off,
+                "https://oidc.us-isob-east-1.sc2s.sgov.gov",
+            ),
+        ];
+        assert_eq!(cases.len(), 70);
+        for &(api, region, fips, dual_stack, expected) in cases {
+            assert_resolves(api, region, fips, dual_stack, expected);
+        }
+    }
+
+    /// `api` in `region` resolves to `expected`.
+    fn assert_resolves(
+        api: CredentialApi,
+        region: &str,
+        fips: Fips,
+        dual_stack: DualStack,
+        expected: &str,
+    ) {
+        let region = Region::parse(region).unwrap();
+        let endpoint = resolve_credential_api(api, &region, fips, dual_stack, None).unwrap();
+        assert_eq!(
+            endpoint.url().as_str().trim_end_matches('/'),
+            expected,
+            "{api:?} {region} {fips:?} {dual_stack:?}"
+        );
+    }
+
+    /// A configured URL replaces the rule's host, and FIPS with it is an
+    /// error, as for ECR. Breaks if a credential API skips the check.
+    #[test]
+    fn credential_apis_honor_a_configured_url() {
         let region = Region::parse("us-east-1").unwrap();
         let url = || Some(Endpoint::parse("https://example.com").unwrap());
-        let resolve = |fips| resolve_sts(&region, fips, DualStack::Off, url());
-        assert_eq!(resolve(Fips::Off).unwrap().host(), "example.com");
-        let err = resolve(Fips::On).unwrap_err();
-        assert!(matches!(err, ConfigError::FipsWithEndpointUrl), "{err}");
+        for api in [
+            CredentialApi::Sts,
+            CredentialApi::Sso,
+            CredentialApi::SsoOidc,
+        ] {
+            let resolve = |fips| resolve_credential_api(api, &region, fips, DualStack::Off, url());
+            assert_eq!(resolve(Fips::Off).unwrap().host(), "example.com");
+            let err = resolve(Fips::On).unwrap_err();
+            assert!(matches!(err, ConfigError::FipsWithEndpointUrl), "{err}");
+        }
     }
 }

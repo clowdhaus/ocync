@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -25,23 +26,9 @@ pub(super) const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/aws/cred
 /// names one, as when a registry gives none.
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// The default chain cases not run, by directory name: each reaches an SSO
-/// profile, loaded through `aws-config`, which reads the real host.
-const EXCLUDED: &[&str] = &[
-    "e2e_fips_and_dual_stack_sso",
-    "sso_assume_role",
-    "sso_no_token_file",
-    "sso_server_error",
-];
-
-/// The profile source cases not run, by directory name: each reaches an SSO
-/// profile, loaded through `aws-config`.
-const PROFILE_EXCLUDED: &[&str] = &[
-    "invalid_sso_credentials_config",
-    "sso_credentials",
-    "sso_override_global_env_url",
-    "sso_token",
-];
+/// Cases run with one attempt per call, as upstream runs them, since each
+/// records a single answer to a call the client would otherwise retry.
+const UNRETRIED: &[&str] = &["sso_server_error"];
 
 /// Cases run at the UNIX epoch, as upstream runs them, so the expiry they
 /// record has not passed.
@@ -159,7 +146,10 @@ impl Case {
     async fn run(self) {
         let name = &self.name;
         let config = Config::load(&self.host, None);
-        let retry = config.retry().unwrap();
+        let mut retry = config.retry().unwrap();
+        if UNRETRIED.contains(&name.as_str()) {
+            retry.max_attempts = NonZeroU32::MIN;
+        }
         let chain = Chain::new(&self.host, &self.region, config, &retry).unwrap();
         let (result, logs) = capture_logs(chain.load_in(self.order)).await;
         self.replay.assert_done();
@@ -246,9 +236,9 @@ pub(super) async fn capture_logs<T>(future: impl Future<Output = T>) -> (T, Stri
     (output, logs)
 }
 
-/// Run every case of `suite` not `excluded` through the sources of `order`,
-/// and check that each listed case exists and the suite holds `cases`.
-async fn run_suite(suite: &str, excluded: &[&str], order: &'static [Source], cases: usize) {
+/// Run every case of `suite` through the sources of `order`, and check that
+/// the suite holds `cases`.
+async fn run_suite(suite: &str, order: &'static [Source], cases: usize) {
     let suite = Path::new(DATA).join(suite);
     let mut names: Vec<_> = std::fs::read_dir(&suite)
         .unwrap()
@@ -256,36 +246,29 @@ async fn run_suite(suite: &str, excluded: &[&str], order: &'static [Source], cas
         .collect();
     names.sort();
     assert_eq!(names.len(), cases);
-    for case in excluded {
-        assert!(names.iter().any(|n| n == case), "no case {case}");
-    }
-    for name in names.iter().filter(|n| !excluded.contains(&n.as_str())) {
+    for name in &names {
         Case::load(&suite.join(name), order).run().await;
     }
 }
 
-/// Every default chain case not excluded passes through the whole chain.
-/// Time is paused, so retries back off without waiting. Breaks if a source
-/// answers or sends differently from upstream, or a case is dropped.
+/// Every default chain case passes through the whole chain. Time is
+/// paused, so retries back off without waiting. Breaks if a source answers
+/// or sends differently from upstream, or a case is dropped.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn upstream_default_chain_cases() {
-    let suite = "default-credential-provider-chain";
-    for case in AT_THE_EPOCH {
-        let dir = Path::new(DATA).join(suite).join(case);
-        assert!(
-            dir.is_dir() && !EXCLUDED.contains(case),
-            "{case} does not run"
-        );
+    let suite = Path::new(DATA).join("default-credential-provider-chain");
+    for case in AT_THE_EPOCH.iter().chain(UNRETRIED) {
+        assert!(suite.join(case).is_dir(), "no case {case}");
     }
-    run_suite(suite, EXCLUDED, &Source::ORDER, 29).await;
+    run_suite("default-credential-provider-chain", &Source::ORDER, 29).await;
 }
 
-/// Every profile source case not excluded passes through the profile
-/// source alone, as upstream runs them. Breaks if the profile resolves,
-/// assumes a role or reports differently from upstream.
+/// Every profile source case passes through the profile source alone, as
+/// upstream runs them. Breaks if the profile resolves, assumes a role or
+/// reports differently from upstream.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn upstream_profile_cases() {
-    run_suite("profile-provider", PROFILE_EXCLUDED, &[Source::Profile], 18).await;
+    run_suite("profile-provider", &[Source::Profile], 18).await;
 }
 
 /// The harness itself: a case expecting other credentials fails. Breaks if

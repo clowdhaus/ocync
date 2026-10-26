@@ -1,4 +1,5 @@
-//! Calendar dates for signing and for reading the `Date` header.
+//! Calendar dates for signing, for reading the `Date` header and credential
+//! expiries, and for writing a cached SSO token's times.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,20 +42,32 @@ impl CivilDate {
     }
 }
 
-/// `time` in UTC in the `YYYYMMDDTHHMMSSZ` form AWS signs.
-pub(super) fn amz_date(time: SystemTime) -> String {
+/// `time` in UTC as its date and the hour, minute and second of that day.
+fn civil(time: SystemTime) -> (CivilDate, u64, u64, u64) {
     let secs = time
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
         .as_secs();
     let (days, rem) = (secs / SECONDS_PER_DAY, secs % SECONDS_PER_DAY);
-    let CivilDate { year, month, day } = CivilDate::from_days(days);
-    format!(
-        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
+    (
+        CivilDate::from_days(days),
         rem / 3600,
         rem % 3600 / 60,
-        rem % 60
+        rem % 60,
     )
+}
+
+/// `time` in UTC in the `YYYYMMDDTHHMMSSZ` form AWS signs.
+pub(super) fn amz_date(time: SystemTime) -> String {
+    let (CivilDate { year, month, day }, hour, minute, second) = civil(time);
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+/// `time` in UTC in the RFC 3339 form `YYYY-MM-DDTHH:MM:SSZ`, to the
+/// second, as the SDK writes a cached SSO token's times.
+pub(super) fn rfc3339(time: SystemTime) -> String {
+    let (CivilDate { year, month, day }, hour, minute, second) = civil(time);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Month names as an IMF-fixdate spells them.
@@ -239,6 +252,26 @@ fn days_in_month(year: u64, month: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A time is written to the second, as the SDK writes a cached SSO
+    /// token's, and reads back as the second it was written in. Breaks if
+    /// a field is unpadded or a fraction is written.
+    #[test]
+    fn writes_rfc3339_to_the_second() {
+        let cases = [
+            (50_000_000, 0, "1971-08-02T16:53:20Z"),
+            (100_000_000, 0, "1973-03-03T09:46:40Z"),
+            (1_640_467_800, 999_999_999, "2021-12-25T21:30:00Z"),
+        ];
+        for (secs, nanos, text) in cases {
+            let time = UNIX_EPOCH + Duration::new(secs, nanos);
+            assert_eq!(rfc3339(time), text);
+            assert_eq!(
+                parse_rfc3339(text),
+                Some(UNIX_EPOCH + Duration::from_secs(secs))
+            );
+        }
+    }
 
     /// The forms the SDK reads: `Z`, either case of `T`, and fractional
     /// seconds kept to the nanosecond. Breaks if an offset or a lowercase

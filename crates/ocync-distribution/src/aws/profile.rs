@@ -27,6 +27,9 @@ pub(super) const DEFAULT_PROFILE: &str = "default";
 /// The prefix of a profile section in the config file.
 const PROFILE_PREFIX: &str = "profile";
 
+/// The prefix of an IAM Identity Center session section.
+const SSO_SESSION_PREFIX: &str = "sso-session";
+
 /// The prefix of a section holding per-service settings.
 const SERVICES_PREFIX: &str = "services";
 
@@ -69,6 +72,8 @@ pub(super) type Services = HashMap<String, Properties>;
 pub(super) struct Sections {
     /// Profiles by name.
     pub(super) profiles: HashMap<String, Properties>,
+    /// `[sso-session name]` sections by name.
+    pub(super) sso_sessions: HashMap<String, Properties>,
     /// `[services name]` sections by name.
     pub(super) services: HashMap<String, Services>,
 }
@@ -134,7 +139,7 @@ impl Location {
 
 /// Replaces a leading `~` path component with the home directory, joining
 /// the rest with the platform's separator. Left as is without a home.
-fn expand_home(path: &str, home: Option<&str>, platform: Platform) -> String {
+pub(super) fn expand_home(path: &str, home: Option<&str>, platform: Platform) -> String {
     let is_separator = |c: char| c == '/' || c == platform.separator();
     let Some(rest) = path.strip_prefix('~') else {
         return path.to_owned();
@@ -227,6 +232,7 @@ fn merge(
         }
         let target = match name.prefix {
             None | Some(PROFILE_PREFIX) => sections.profiles.entry(name.suffix.to_owned()),
+            Some(SSO_SESSION_PREFIX) => sections.sso_sessions.entry(name.suffix.to_owned()),
             Some(SERVICES_PREFIX) => {
                 let services = sections.services.entry(name.suffix.to_owned()).or_default();
                 merge_services(services, name.suffix, properties);
@@ -513,9 +519,9 @@ mod tests {
         serde_json::from_value(value.clone()).unwrap_or_default()
     }
 
-    /// Every case of the upstream profile parser suite: the parsed profiles,
-    /// or the error, match what the SDKs produce. Breaks if any parse,
-    /// normalize or merge rule differs from upstream.
+    /// Every case of the upstream profile parser suite: the parsed profiles
+    /// and SSO sessions, or the error, match what the SDKs produce. Breaks
+    /// if any parse, normalize or merge rule differs from upstream.
     #[test]
     fn upstream_parser_cases() {
         let cases = cases("profile-parser-tests.json");
@@ -540,8 +546,13 @@ mod tests {
                 continue;
             }
             result.unwrap_or_else(|e| panic!("{name}: {e}"));
-            let expected = as_map(&output["config"]["profiles"]);
-            assert_eq!(sections.profiles, expected, "{name}");
+            let config = &output["config"];
+            assert_eq!(sections.profiles, as_map(&config["profiles"]), "{name}");
+            assert_eq!(
+                sections.sso_sessions,
+                as_map(&config["sso_sessions"]),
+                "{name}"
+            );
         }
     }
 

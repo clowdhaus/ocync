@@ -2,10 +2,15 @@
 //! credentials files, resolved as `aws-config` 1.13.0 resolves it into the
 //! source of its first credentials and the roles assumed from them.
 
+use std::collections::HashMap;
+
+use super::super::ConfigError;
+use super::super::endpoint::Region;
 use super::super::host::Clock;
 use super::super::profile::{DEFAULT_PROFILE, ParseError, Properties, Sections};
+use super::sso_token::Login;
 use super::web_identity::{self, Origin};
-use super::{Credentials, Error as ChainError, Source, process, sts};
+use super::{Credentials, Error as ChainError, Source, process, sso, sts};
 
 const ROLE_ARN: &str = "role_arn";
 const EXTERNAL_ID: &str = "external_id";
@@ -18,15 +23,11 @@ const SECRET_ACCESS_KEY: &str = "aws_secret_access_key";
 const SESSION_TOKEN: &str = "aws_session_token";
 const CREDENTIAL_PROCESS: &str = "credential_process";
 const LOGIN_SESSION: &str = "login_session";
-
-/// The properties any one of which makes a profile an SSO profile.
-const SSO: [&str; 5] = [
-    "sso_account_id",
-    "sso_region",
-    "sso_role_name",
-    "sso_start_url",
-    "sso_session",
-];
+const SSO_ACCOUNT_ID: &str = "sso_account_id";
+const SSO_REGION: &str = "sso_region";
+const SSO_ROLE_NAME: &str = "sso_role_name";
+const SSO_START_URL: &str = "sso_start_url";
+const SSO_SESSION: &str = "sso_session";
 
 /// The prefix of the session name the SDK makes for a role a profile
 /// assumes.
@@ -76,6 +77,8 @@ pub(super) enum Base<'a> {
     WebIdentity(web_identity::Role<'a>),
     /// The command `credential_process` names.
     Process(process::Command<'a>),
+    /// An IAM Identity Center role.
+    Sso(sso::Role<'a>),
 }
 
 /// A role assumed with the credentials before it.
@@ -111,25 +114,20 @@ impl AssumedRole<'_> {
     }
 }
 
-/// A resolved profile.
+/// A resolved profile: its base, and the roles assumed from the base's
+/// credentials, in order.
 #[derive(Debug)]
-pub(super) enum Plan<'a> {
-    /// A base the owned sources load, and the roles assumed from its
-    /// credentials, in order.
-    Owned {
-        base: Base<'a>,
-        roles: Vec<AssumedRole<'a>>,
-    },
-    /// SSO: the whole profile, roles included, loads through `aws-config`.
-    Sdk,
+pub(super) struct Plan<'a> {
+    pub(super) base: Base<'a>,
+    pub(super) roles: Vec<AssumedRole<'a>>,
 }
 
 /// What a profile's base settings name.
 enum Found<'a> {
-    /// A base the owned sources load.
+    /// A base of credentials.
     Base(Base<'a>),
-    /// SSO.
-    Sdk,
+    /// An SSO login token alone, which no credentials come from.
+    Token,
 }
 
 /// What upstream prints when a profile's base credentials do not load.
@@ -171,12 +169,36 @@ pub(in crate::aws) enum Error {
     /// `login_session`, which ocync does not support.
     #[error("profile `{0}` uses login_session, which is not supported")]
     LoginSession(String),
+    /// A profile's SSO settings do not fit together.
+    #[error("profile `{profile}` has invalid SSO config: {problem}")]
+    InvalidSso {
+        profile: String,
+        problem: SsoProblem,
+    },
+    /// `sso_session` names no `[sso-session]` section.
+    #[error("sso-session named `{session}` (referenced by profile `{profile}`) was not found")]
+    MissingSsoSession { profile: String, session: String },
+    /// An SSO profile lacks a setting it needs.
+    #[error("profile `{profile}` was not defined: `{field}` was missing")]
+    MissingField {
+        profile: String,
+        field: &'static str,
+    },
+    /// The SSO profile names a login token alone, for the services that
+    /// take one.
+    #[error(
+        "selected profile will resolve an access token instead of credentials since it doesn't have `sso_account_id` and `sso_role_name` set. Specify both `sso_account_id` and `sso_role_name` to let this profile resolve credentials."
+    )]
+    TokenProfile,
     /// The base credentials did not load from a source of the chain.
     #[error("{BASE_FAILED}")]
     Base(#[source] Box<ChainError>),
     /// The base credentials did not load from `credential_process`.
     #[error("{BASE_FAILED}")]
     Process(#[source] process::Error),
+    /// The base credentials did not load from IAM Identity Center.
+    #[error("{BASE_FAILED}")]
+    Sso(#[source] sso::Error),
     /// A role was not assumed.
     #[error("failed to assume role {arn}")]
     AssumeRole {
@@ -214,11 +236,29 @@ pub(in crate::aws) enum Problem {
     SourceProfile(Box<Error>),
 }
 
+/// What is wrong with a profile's SSO settings.
+#[derive(Debug, thiserror::Error)]
+pub(in crate::aws) enum SsoProblem {
+    /// A setting an `[sso-session]` holds, set on a profile that names
+    /// one.
+    #[error("`{0}` can only be specified in the [sso-session] config when a session name is given")]
+    OutsideSession(&'static str),
+    /// One of the account and role is set without the other.
+    #[error("if `{set}` is set, then `{missing}` must also be set")]
+    Unpaired {
+        set: &'static str,
+        missing: &'static str,
+    },
+    /// `sso_region` is not a region.
+    #[error("invalid `sso_region`")]
+    Region(#[source] ConfigError),
+}
+
 /// Resolve the profile `selected` in `sections` as upstream does: follow
 /// `source_profile`, each `role_arn` adding a role, until a profile gives
 /// the base. A source profile with keys is the base whatever else it holds.
 pub(super) fn resolve<'a>(sections: &'a Sections, selected: &'a str) -> Result<Plan<'a>, Error> {
-    let profiles = &sections.profiles;
+    let (profiles, sessions) = (&sections.profiles, &sections.sso_sessions);
     if profiles.is_empty() || (selected == DEFAULT_PROFILE && !profiles.contains_key(selected)) {
         return Err(Error::NoProfiles);
     }
@@ -242,7 +282,7 @@ pub(super) fn resolve<'a>(sections: &'a Sections, selected: &'a str) -> Result<P
             break Found::Base(Base::Keys(keys));
         }
         let Some(role) = assumed_role(profile) else {
-            break base(name, profile).map_err(|e| {
+            break base(name, profile, sessions).map_err(|e| {
                 if root {
                     e
                 } else {
@@ -252,17 +292,17 @@ pub(super) fn resolve<'a>(sections: &'a Sections, selected: &'a str) -> Result<P
         };
         roles.push(role);
         match next(name, profile)? {
-            Next::Itself => break base(name, profile)?,
+            Next::Itself => break base(name, profile, sessions)?,
             Next::Profile(source) => name = source,
         }
     };
-    Ok(match found {
+    match found {
         Found::Base(base) => {
             roles.reverse();
-            Plan::Owned { base, roles }
+            Ok(Plan { base, roles })
         }
-        Found::Sdk => Plan::Sdk,
-    })
+        Found::Token => Err(Error::TokenProfile),
+    }
 }
 
 /// The property `key` of `profile`.
@@ -312,8 +352,13 @@ fn next<'a>(name: &str, profile: &'a Properties) -> Result<Next<'a>, Error> {
 }
 
 /// The base `profile` names, in upstream's order: `credential_source`,
-/// web identity, SSO, `login_session`, `credential_process`, keys.
-fn base<'a>(name: &str, profile: &'a Properties) -> Result<Found<'a>, Error> {
+/// web identity, SSO with the `[sso-session]` sections `sessions`,
+/// `login_session`, `credential_process`, keys.
+fn base<'a>(
+    name: &str,
+    profile: &'a Properties,
+    sessions: &'a HashMap<String, Properties>,
+) -> Result<Found<'a>, Error> {
     if let Some(source) = get(profile, CREDENTIAL_SOURCE) {
         return Named::parse(source)
             .map(|named| Found::Base(Base::Named(named)))
@@ -334,8 +379,8 @@ fn base<'a>(name: &str, profile: &'a Properties) -> Result<Found<'a>, Error> {
         (None, Some(_)) => return Err(invalid(name, Problem::TokenFileWithoutRole)),
         (_, None) => {}
     }
-    if SSO.iter().any(|key| profile.contains_key(*key)) {
-        return Ok(Found::Sdk);
+    if let Some(found) = sso(name, profile, sessions)? {
+        return Ok(found);
     }
     if profile.contains_key(LOGIN_SESSION) {
         return Err(Error::LoginSession(name.to_owned()));
@@ -344,6 +389,82 @@ fn base<'a>(name: &str, profile: &'a Properties) -> Result<Found<'a>, Error> {
         return Ok(Found::Base(Base::Process(process::Command::new(command))));
     }
     keys(name, profile).map(|keys| Found::Base(Base::Keys(keys)))
+}
+
+/// The SSO base `profile` names, as upstream reads it, or `None` when it
+/// has no SSO setting. A profile that names an `[sso-session]` takes its
+/// region and start URL from it, and must not set them itself.
+fn sso<'a>(
+    name: &str,
+    profile: &'a Properties,
+    sessions: &'a HashMap<String, Properties>,
+) -> Result<Option<Found<'a>>, Error> {
+    let account_id = get(profile, SSO_ACCOUNT_ID);
+    let role_name = get(profile, SSO_ROLE_NAME);
+    let session = get(profile, SSO_SESSION);
+    let mut region = get(profile, SSO_REGION);
+    let mut start_url = get(profile, SSO_START_URL);
+    if [account_id, role_name, session, region, start_url]
+        .iter()
+        .all(Option::is_none)
+    {
+        return Ok(None);
+    }
+    let invalid_sso = |problem| Error::InvalidSso {
+        profile: name.to_owned(),
+        problem,
+    };
+    if let Some(session) = session {
+        for (key, value) in [(SSO_START_URL, start_url), (SSO_REGION, region)] {
+            if value.is_some() {
+                return Err(invalid_sso(SsoProblem::OutsideSession(key)));
+            }
+        }
+        let section = sessions
+            .get(session)
+            .ok_or_else(|| Error::MissingSsoSession {
+                profile: name.to_owned(),
+                session: session.to_owned(),
+            })?;
+        region = get(section, SSO_REGION);
+        start_url = get(section, SSO_START_URL);
+    }
+    let role = match (account_id, role_name) {
+        (Some(account_id), Some(role_name)) => Some((account_id, role_name)),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(invalid_sso(SsoProblem::Unpaired {
+                set: SSO_ACCOUNT_ID,
+                missing: SSO_ROLE_NAME,
+            }));
+        }
+        (None, Some(_)) => {
+            return Err(invalid_sso(SsoProblem::Unpaired {
+                set: SSO_ROLE_NAME,
+                missing: SSO_ACCOUNT_ID,
+            }));
+        }
+    };
+    let missing = |field| Error::MissingField {
+        profile: name.to_owned(),
+        field,
+    };
+    let region = region.ok_or_else(|| missing(SSO_REGION))?;
+    let start_url = start_url.ok_or_else(|| missing(SSO_START_URL))?;
+    let Some((account_id, role_name)) = role else {
+        return Ok(Some(Found::Token));
+    };
+    let region = Region::parse(region).map_err(|e| invalid_sso(SsoProblem::Region(e)))?;
+    let login = match session {
+        Some(name) => Login::Session { name, start_url },
+        None => Login::Legacy { start_url },
+    };
+    Ok(Some(Found::Base(Base::Sso(sso::Role {
+        login,
+        region,
+        account_id,
+        role_name,
+    }))))
 }
 
 /// The keys `profile` holds.
@@ -376,20 +497,17 @@ mod tests {
     use super::super::fixtures::DATA;
     use super::*;
 
-    /// The rows not run, by their `docs`: each needs the SSO settings
-    /// checked, which `aws-config` does for an SSO profile.
-    const EXCLUDED: &[&str] = &[
-        "SSO credentials profile selected",
-        "invalid SSO credentials configuration: missing account ID",
-        "invalid SSO credentials configuration: missing role name",
-        "invalid SSO token configuration: sso_region must be in sso-session",
-        "SSO token profile selected",
-        "invalid SSO token configuration: sso-session not found",
-    ];
+    /// The rows not run, by their `docs`. Upstream resolves a profile that
+    /// names only a login token and refuses it when it builds the
+    /// provider; here it is refused at once, as
+    /// [`reads_sso_bases_as_upstream_does`] checks.
+    const EXCLUDED: &[&str] = &["SSO token profile selected"];
 
     #[derive(Deserialize)]
     struct Input {
         profiles: HashMap<String, Properties>,
+        #[serde(default)]
+        sso_sessions: HashMap<String, Properties>,
         selected_profile: String,
     }
 
@@ -411,6 +529,13 @@ mod tests {
         CredentialProcess {
             command: String,
         },
+        Sso {
+            sso_session: Option<String>,
+            sso_region: String,
+            sso_start_url: String,
+            sso_account_id: String,
+            sso_role_name: String,
+        },
         AssumeRole {
             role_arn: String,
             external_id: Option<String>,
@@ -425,9 +550,7 @@ mod tests {
     }
 
     fn steps(plan: &Plan<'_>) -> Vec<Step> {
-        let Plan::Owned { base, roles } = plan else {
-            panic!("an excluded SSO row");
-        };
+        let Plan { base, roles } = plan;
         let base = match base {
             Base::Named(named) => Step::NamedSource(format!("{named:?}")),
             Base::Keys(keys) => Step::AccessKey {
@@ -443,6 +566,19 @@ mod tests {
             Base::Process(command) => Step::CredentialProcess {
                 command: command.unredacted().to_owned(),
             },
+            Base::Sso(role) => {
+                let (session, start_url) = match role.login {
+                    Login::Session { name, start_url } => (Some(name.to_owned()), start_url),
+                    Login::Legacy { start_url } => (None, start_url),
+                };
+                Step::Sso {
+                    sso_session: session,
+                    sso_region: role.region.as_str().to_owned(),
+                    sso_start_url: start_url.to_owned(),
+                    sso_account_id: role.account_id.to_owned(),
+                    sso_role_name: role.role_name.to_owned(),
+                }
+            }
         };
         let roles = roles.iter().map(|role| Step::AssumeRole {
             role_arn: role.arn.to_owned(),
@@ -469,6 +605,7 @@ mod tests {
             let input: Input = serde_json::from_value(case["input"].clone()).unwrap();
             let sections = Sections {
                 profiles: input.profiles,
+                sso_sessions: input.sso_sessions,
                 ..Sections::default()
             };
             let resolved = resolve(&sections, &input.selected_profile);
@@ -490,16 +627,95 @@ mod tests {
         assert_eq!(run + EXCLUDED.len(), 28);
     }
 
-    /// An SSO profile, as a base or a source profile, is left to
-    /// `aws-config` whole, a `credential_process` source profile is the
-    /// base of the role, and `login_session` is refused. Breaks if either
-    /// kind is read as keys.
+    /// An SSO source profile is the base of the role above it, its token
+    /// named for its session. One that names only a login token is not
+    /// configured at any depth, as upstream finds that after resolving. A
+    /// missing `sso_region` is not configured at the root and fails a
+    /// source profile. An `sso_region` that is not a region is refused as
+    /// the profile is read. Breaks if the role above SSO is dropped, a
+    /// token profile is read as credentials, the depth rule differs, or a
+    /// bad region reaches a load.
     #[test]
-    fn reads_sso_credential_process_and_login_session_bases() {
-        let sections = role_from(("sso_session", "dev"));
+    fn reads_sso_bases_as_upstream_does() {
+        let mut sections = role_from(&[
+            (SSO_SESSION, "dev"),
+            (SSO_ACCOUNT_ID, "1"),
+            (SSO_ROLE_NAME, "R"),
+        ]);
+        sections.sso_sessions.insert(
+            "dev".to_owned(),
+            HashMap::from([
+                (SSO_REGION.to_owned(), "us-east-1".to_owned()),
+                (
+                    SSO_START_URL.to_owned(),
+                    "https://d.awsapps.com/start".to_owned(),
+                ),
+            ]),
+        );
         let plan = resolve(&sections, "A").unwrap();
-        assert!(matches!(plan, Plan::Sdk), "{plan:?}");
-        let sections = role_from((CREDENTIAL_PROCESS, "/bin/creds --profile x"));
+        assert_eq!(
+            steps(&plan),
+            [
+                Step::Sso {
+                    sso_session: Some("dev".to_owned()),
+                    sso_region: "us-east-1".to_owned(),
+                    sso_start_url: "https://d.awsapps.com/start".to_owned(),
+                    sso_account_id: "1".to_owned(),
+                    sso_role_name: "R".to_owned(),
+                },
+                Step::AssumeRole {
+                    role_arn: "arn:aws:iam::1:role/A".to_owned(),
+                    external_id: None,
+                    role_session_name: None,
+                },
+            ]
+        );
+        let source = sections.profiles.get_mut("B").unwrap();
+        source.retain(|key, _| key == SSO_SESSION);
+        for selected in ["A", "B"] {
+            let error = resolve(&sections, selected).unwrap_err();
+            assert!(matches!(error, Error::TokenProfile), "{selected}: {error}");
+        }
+
+        let legacy = role_from(&[
+            (SSO_START_URL, "https://d.awsapps.com/start"),
+            (SSO_ACCOUNT_ID, "1"),
+            (SSO_ROLE_NAME, "R"),
+        ]);
+        let missing = "profile `B` was not defined: `sso_region` was missing";
+        let error = resolve(&legacy, "B").unwrap_err();
+        assert!(matches!(error, Error::MissingField { .. }), "{error}");
+        assert_eq!(error.to_string(), missing);
+        let error = resolve(&legacy, "A").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("invalid credential source in `B`: could not load source profile: {missing}")
+        );
+
+        let bad_region = role_from(&[
+            (SSO_START_URL, "https://d.awsapps.com/start"),
+            (SSO_REGION, "us east 1"),
+            (SSO_ACCOUNT_ID, "1"),
+            (SSO_ROLE_NAME, "R"),
+        ]);
+        let error = resolve(&bad_region, "B").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::InvalidSso {
+                    problem: SsoProblem::Region(_),
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    /// A `credential_process` source profile is the base of the role, and
+    /// `login_session` is refused. Breaks if either kind is read as keys.
+    #[test]
+    fn reads_credential_process_and_login_session_bases() {
+        let sections = role_from(&[(CREDENTIAL_PROCESS, "/bin/creds --profile x")]);
         let plan = resolve(&sections, "A").unwrap();
         assert_eq!(
             steps(&plan),
@@ -514,7 +730,7 @@ mod tests {
                 },
             ]
         );
-        let sections = role_from((LOGIN_SESSION, "arn:aws:signin::1:session"));
+        let sections = role_from(&[(LOGIN_SESSION, "arn:aws:signin::1:session")]);
         let error = resolve(&sections, "B").unwrap_err();
         assert!(matches!(error, Error::LoginSession(_)), "{error}");
     }
@@ -537,7 +753,7 @@ mod tests {
         assert!(
             matches!(
                 plan,
-                Plan::Owned {
+                Plan {
                     base: Base::Named(Named::Ec2InstanceMetadata),
                     ..
                 }
@@ -548,7 +764,7 @@ mod tests {
         let sections = profile("Bogus");
         let error = resolve(&sections, "A").unwrap_err();
         assert_eq!(error.to_string(), unknown);
-        let sections = role_from((CREDENTIAL_SOURCE, "Bogus"));
+        let sections = role_from(&[(CREDENTIAL_SOURCE, "Bogus")]);
         let error = resolve(&sections, "A").unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -558,7 +774,7 @@ mod tests {
 
     /// Profile `A` assuming a role from source profile `B`, which holds
     /// only `base`.
-    fn role_from(base: (&str, &str)) -> Sections {
+    fn role_from(base: &[(&str, &str)]) -> Sections {
         Sections {
             profiles: HashMap::from([
                 (
@@ -570,7 +786,9 @@ mod tests {
                 ),
                 (
                     "B".to_owned(),
-                    HashMap::from([(base.0.to_owned(), base.1.to_owned())]),
+                    base.iter()
+                        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                        .collect(),
                 ),
             ]),
             ..Sections::default()

@@ -3,7 +3,6 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::fmt::Write as _;
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -11,23 +10,16 @@ use std::time::UNIX_EPOCH;
 use bytes::Bytes;
 use http::header::CONTENT_TYPE;
 
-use super::super::config::{Config, ServiceId};
-use super::super::endpoint::{self, Region};
+use super::super::config::Config;
+use super::super::endpoint::{CredentialApi, Region};
 use super::super::host::{Clock, Host};
-use super::super::sigv4::{Keep, percent_encode};
+use super::super::sigv4::encode_pairs;
 use super::super::{
-    Api, ApiId, ApiParts, ApiRequest, ConfigError, ErrorFormat, Failure, ModeledError,
-    ModeledRetry, STALL_TIMEOUT, ServiceError, Signing, calendar, retry, xml,
+    Api, ApiRequest, ConfigError, Failure, ModeledError, ModeledRetry, ServiceError, Signing,
+    calendar, retry, xml,
 };
-use super::Credentials;
 use super::web_identity::Token;
-
-/// STS, to its calls.
-const STS: ApiId = ApiId {
-    service_id: ServiceId::STS,
-    signing_name: "sts",
-    error_format: ErrorFormat::Xml,
-};
+use super::{Credentials, credential_api};
 
 /// The STS API version every request names.
 const VERSION: &str = "2011-06-15";
@@ -129,9 +121,9 @@ impl fmt::Display for Exception {
 /// Why STS gave no credentials.
 #[derive(Debug, thiserror::Error)]
 pub(in crate::aws) enum Error {
-    /// The STS endpoint settings do not resolve.
-    #[error("failed to resolve the STS endpoint")]
-    Endpoint(#[source] Arc<ConfigError>),
+    /// The STS client could not be set up.
+    #[error("the STS client could not be set up")]
+    Setup(#[source] Arc<ConfigError>),
     /// STS answered with an error the operation models.
     #[error("{0}")]
     Exception(Exception),
@@ -188,9 +180,9 @@ pub(super) struct AssumeRole<'a> {
 
 /// STS in one region.
 pub(super) struct Client {
-    /// The API, or why its endpoint settings do not resolve. The error is
-    /// reported only by a source that calls STS, so a bad STS setting does
-    /// not fail a chain whose credentials come from elsewhere.
+    /// The API, or why it could not be set up. The error is reported only
+    /// by a source that calls STS, so a bad STS setting does not fail a
+    /// chain whose credentials come from elsewhere.
     api: Result<Api, Arc<ConfigError>>,
 }
 
@@ -202,26 +194,11 @@ impl Client {
         region: &Region,
         config: &Config,
         retry: &retry::Settings,
-    ) -> Result<Self, reqwest::Error> {
-        let endpoint = config
-            .endpoint_url(STS.service_id)
-            .and_then(|url| endpoint::resolve_sts(region, config.fips(), config.dual_stack(), url));
-        let api = match endpoint {
-            Ok(endpoint) => Ok(Api::new(
-                &host.network,
-                STS,
-                ApiParts {
-                    region: region.clone(),
-                    endpoint,
-                    retry: retry::Strategy::new(retry),
-                    partition: retry::partition(STS.service_id, region),
-                    skew_correction: config.skew_correction(),
-                    stall_timeout: STALL_TIMEOUT,
-                },
-            )?),
-            Err(e) => Err(Arc::new(e)),
-        };
-        Ok(Self { api })
+    ) -> Self {
+        let api = credential_api(host, config, retry, CredentialApi::Sts, region);
+        Self {
+            api: api.map_err(Arc::new),
+        }
     }
 
     /// Exchange a web identity token for a role's credentials. The call is
@@ -262,13 +239,11 @@ impl Client {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<Signing, Failure>>,
     {
-        let api = self
-            .api
-            .as_ref()
-            .map_err(|e| Error::Endpoint(Arc::clone(e)))?;
+        let api = self.api.as_ref().map_err(|e| Error::Setup(Arc::clone(e)))?;
         let request = ApiRequest {
             operation: operation.action,
             method: http::Method::POST,
+            path: "/",
             headers: &[(CONTENT_TYPE, FORM)],
             body: Bytes::from(body),
             modeled_errors: operation.modeled_errors,
@@ -308,12 +283,8 @@ fn assume_role_form(call: &AssumeRole<'_>) -> String {
 /// version, every byte outside the unreserved set encoded, as the SDK
 /// encodes a query protocol request.
 fn form<'a>(operation: &Operation, fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
-    let mut body = format!("Action={}&Version={VERSION}", operation.action);
-    for (name, value) in fields {
-        write!(body, "&{name}={}", percent_encode(value, Keep::Unreserved))
-            .expect("writing to a String cannot fail");
-    }
-    body
+    let head = [("Action", operation.action), ("Version", VERSION)];
+    encode_pairs(head.into_iter().chain(fields))
 }
 
 /// The credentials in the answer's `<action>Result` element.

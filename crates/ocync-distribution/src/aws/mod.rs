@@ -32,9 +32,11 @@ use http::header::{CONTENT_TYPE, InvalidHeaderValue};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use url::Url;
 
 use self::calendar::parse_imf_fixdate;
 use self::endpoint::{Endpoint, Region};
+use self::sigv4::encode_pairs;
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
 use crate::scheme::UnsupportedScheme;
@@ -146,6 +148,7 @@ impl Service {
         }
     }
 
+    /// How calls to the API are signed, partitioned and read.
     fn api_id(self) -> ApiId {
         let (service_id, signing_name) = match self {
             Self::Ecr => (ServiceId::ECR, "ecr"),
@@ -517,6 +520,8 @@ struct ApiRequest<'a> {
     /// The operation's name, for logs and errors.
     operation: &'static str,
     method: http::Method,
+    /// The operation's path, joined to the endpoint's.
+    path: &'static str,
     /// Headers to send, signed when the request is.
     headers: &'a [(HeaderName, &'a str)],
     body: Bytes,
@@ -585,6 +590,32 @@ impl Api {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<Signing, Failure>>,
     {
+        self.call_with(request, &[], signing).await
+    }
+
+    /// Send `request` unsigned with `query`, as an operation that proves
+    /// identity some other way is. Only an unsigned call takes a query, as
+    /// the signer signs none.
+    async fn call_unsigned(
+        &self,
+        request: &ApiRequest<'_>,
+        query: &[(&str, &str)],
+    ) -> Result<Bytes, Failure> {
+        self.call_with(request, query, || async { Ok(Signing::Unsigned) })
+            .await
+    }
+
+    async fn call_with<F, Fut>(
+        &self,
+        request: &ApiRequest<'_>,
+        query: &[(&str, &str)],
+        signing: F,
+    ) -> Result<Bytes, Failure>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Signing, Failure>>,
+    {
+        let url = self.url(request.path, query);
         let signed_headers: Vec<(&str, &str)> = request
             .headers
             .iter()
@@ -592,24 +623,42 @@ impl Api {
             .chain([("host", self.endpoint.host())])
             .collect();
         let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
-        let (signing, signed_headers) = (&signing, &signed_headers);
+        let (url, signing, signed_headers) = (&url, &signing, &signed_headers);
         retrying(request.operation, &mut policy, |attempt| async move {
             self.partition.send_token(&self.retry, attempt).await;
             let signing = signing().await?;
-            self.send(request, signed_headers, &signing).await
+            self.send(request, url, signed_headers, &signing).await
         })
         .await
     }
 
-    /// Send `request` once. `signed_headers` are its headers and `host`, as
-    /// a signature covers them.
+    /// The URL of the operation at `path` with `query`: `path` joined to
+    /// the endpoint's with one slash, as the SDK joins them, and each query
+    /// value encoded as the SDK encodes it.
+    fn url(&self, path: &str, query: &[(&str, &str)]) -> Url {
+        let mut url = self.endpoint.url().clone();
+        let base = url.path();
+        let joined = format!(
+            "{}/{}",
+            base.strip_suffix('/').unwrap_or(base),
+            path.strip_prefix('/').unwrap_or(path)
+        );
+        url.set_path(&joined);
+        if !query.is_empty() {
+            url.set_query(Some(&encode_pairs(query.iter().copied())));
+        }
+        url
+    }
+
+    /// Send `request` to `url` once. `signed_headers` are its headers and
+    /// `host`, as a signature covers them.
     async fn send(
         &self,
         request: &ApiRequest<'_>,
+        url: &Url,
         signed_headers: &[(&str, &str)],
         signing: &Signing,
     ) -> Result<Bytes, Failure> {
-        let url = self.endpoint.url();
         let sent = SystemTime::now();
         let applied = ClockSkew(self.skew.load(Ordering::Relaxed));
         let mut outgoing = reqwest::Request::new(request.method.clone(), url.clone());
@@ -809,6 +858,7 @@ impl Client {
         let request = ApiRequest {
             operation: O::NAME,
             method: http::Method::POST,
+            path: "/",
             headers: &[(CONTENT_TYPE, AWS_JSON_1_1), (X_AMZ_TARGET, &target)],
             body: Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize")),
             modeled_errors: &[],
@@ -858,7 +908,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
-    use wiremock::matchers::{body_json, header, header_exists, method, path};
+    use wiremock::matchers::{any, body_json, header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::retry::Retryable as _;
@@ -1261,6 +1311,7 @@ mod tests {
         let request = ApiRequest {
             operation: "Probe",
             method: http::Method::POST,
+            path: "/",
             headers: &[],
             body: Bytes::new(),
             modeled_errors: &[],
@@ -1270,6 +1321,57 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Failure::Service(_)), "{err}");
+    }
+
+    /// The operation's path joins a configured endpoint's path with one
+    /// slash, as the SDK joins them, and an unsigned call's query has every
+    /// byte outside the unreserved set encoded. Breaks if the endpoint's
+    /// path is dropped, a slash doubles, or a query value is sent as is.
+    #[tokio::test]
+    async fn joins_the_operation_path_to_the_endpoint_path() {
+        let server = MockServer::start().await;
+        Mock::given(any()).respond_with(ok()).mount(&server).await;
+        let api = Api::new(
+            &Network::Real,
+            Service::Ecr.api_id(),
+            api_parts(&format!("{}/prefix/", server.uri())),
+        )
+        .unwrap();
+        let request = |method, path| ApiRequest {
+            operation: "Probe",
+            method,
+            path,
+            headers: &[],
+            body: Bytes::new(),
+            modeled_errors: &[],
+        };
+        let query = [("role_name", "a b+c/d"), ("account_id", "1")];
+        api.call_unsigned(
+            &request(http::Method::GET, "/federation/credentials"),
+            &query,
+        )
+        .await
+        .unwrap();
+        api.call(&request(http::Method::POST, "/"), || async {
+            Ok(Signing::Signed(credentials::tests::key(None, None)))
+        })
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let sent: Vec<_> = requests
+            .iter()
+            .map(|r| (r.url.path(), r.url.query()))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (
+                    "/prefix/federation/credentials",
+                    Some("role_name=a%20b%2Bc%2Fd&account_id=1")
+                ),
+                ("/prefix/", None),
+            ]
+        );
     }
 
     /// The skew is the server's `Date` against the midpoint of the round

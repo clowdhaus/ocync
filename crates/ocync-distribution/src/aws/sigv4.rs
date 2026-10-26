@@ -240,6 +240,20 @@ pub(super) fn percent_encode(value: &str, keep: Keep) -> String {
     out
 }
 
+/// `pairs` as `name=value`, joined by `&`, each value encoded as AWS
+/// encodes a query or form value. Names are written as they are.
+pub(super) fn encode_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    let mut out = String::new();
+    for (name, value) in pairs {
+        if !out.is_empty() {
+            out.push('&');
+        }
+        write!(out, "{name}={}", percent_encode(value, Keep::Unreserved))
+            .expect("writing to a String cannot fail");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};

@@ -13,20 +13,22 @@ mod imds;
 mod json;
 mod process;
 mod profile;
-mod sdk;
+mod sso;
+mod sso_token;
 mod sts;
 mod web_identity;
 
 #[cfg(test)]
 pub(super) use imds::TOKEN_HEADER;
+pub(super) use sso_token::Sessions;
 
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use super::config::Config;
-use super::endpoint::Region;
+use super::endpoint::{self, CredentialApi, Region};
 use super::host::Host;
-use super::retry;
+use super::{Api, ApiParts, ConfigError, STALL_TIMEOUT, retry};
 
 /// What a redacted value prints as, as elsewhere in this crate.
 const REDACTED: &str = "[REDACTED]";
@@ -107,22 +109,47 @@ pub(super) enum Error {
     /// The instance metadata service failed.
     #[error("failed to load credentials from IMDS")]
     Imds(#[source] imds::Error),
-    /// A source loaded through `aws-config` failed.
-    #[error(transparent)]
-    Sdk(aws_credential_types::provider::error::CredentialsError),
 }
 
 impl From<profile::Error> for Error {
-    /// A profile that is missing or holds no credential settings is not
-    /// configured, as upstream; any other failure stops the chain.
+    /// A profile that is missing, holds no credential settings, lacks an
+    /// SSO setting or names only a login token is not configured, as
+    /// upstream; any other failure stops the chain.
     fn from(error: profile::Error) -> Self {
         match error {
             profile::Error::NoProfiles
             | profile::Error::NoCredentials(_)
-            | profile::Error::MissingProfile { .. } => Self::NotLoaded(error.to_string()),
+            | profile::Error::MissingProfile { .. }
+            | profile::Error::MissingField { .. }
+            | profile::Error::TokenProfile => Self::NotLoaded(error.to_string()),
             error => Self::Profile(error),
         }
     }
+}
+
+/// The credential API `api` in `region`, with the endpoint and clock-skew
+/// settings `config` holds and the `retry` settings of the calls the chain
+/// makes.
+fn credential_api(
+    host: &Host,
+    config: &Config,
+    retry: &retry::Settings,
+    api: CredentialApi,
+    region: &Region,
+) -> Result<Api, ConfigError> {
+    let id = api.api_id();
+    let url = config.endpoint_url(id.service_id)?;
+    let endpoint =
+        endpoint::resolve_credential_api(api, region, config.fips(), config.dual_stack(), url)?;
+    let parts = ApiParts {
+        region: region.clone(),
+        endpoint,
+        retry: retry::Strategy::new(retry),
+        partition: retry::partition(id.service_id, region),
+        skew_correction: config.skew_correction(),
+        stall_timeout: STALL_TIMEOUT,
+    };
+    Api::new(&host.network, id, parts).map_err(ConfigError::HttpClient)
 }
 
 /// `error` and each of its sources, joined as upstream prints them, so a
@@ -190,8 +217,8 @@ pub(super) struct Chain {
     host: Host,
     /// The shared files and the selected profile.
     config: Config,
-    /// The profiles loaded through `aws-config`.
-    sdk: sdk::Profile,
+    /// The retry settings of the calls the chain makes.
+    retry: retry::Settings,
     /// STS in the region of the calls the chain signs.
     sts: sts::Client,
     container: container::Provider,
@@ -200,7 +227,7 @@ pub(super) struct Chain {
 
 impl Chain {
     /// The chain `host` and `config` configure, for calls in `region` with
-    /// the `retry` settings STS calls share.
+    /// the `retry` settings the chain's calls share.
     pub(super) fn new(
         host: &Host,
         region: &Region,
@@ -208,8 +235,8 @@ impl Chain {
         retry: &retry::Settings,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            sdk: sdk::Profile::new(&host.env, region, &config),
-            sts: sts::Client::new(host, region, &config, retry)?,
+            retry: *retry,
+            sts: sts::Client::new(host, region, &config, retry),
             container: container::Provider::new(host)?,
             imds: imds::Provider::new(host, &config)?,
             host: host.clone(),
@@ -261,10 +288,7 @@ impl Chain {
             .config
             .sections()
             .map_err(|e| profile::Error::Parse(e.clone()))?;
-        let (base, roles) = match profile::resolve(sections, self.config.profile_name())? {
-            profile::Plan::Owned { base, roles } => (base, roles),
-            profile::Plan::Sdk => return self.sdk.load().await,
-        };
+        let profile::Plan { base, roles } = profile::resolve(sections, self.config.profile_name())?;
         let failed = |error| profile::Error::Base(Box::new(error));
         let mut credentials = match base {
             profile::Base::Named(named) => self.load_from(named.source()).await.map_err(failed)?,
@@ -275,6 +299,9 @@ impl Chain {
             profile::Base::Process(command) => process::load(command)
                 .await
                 .map_err(profile::Error::Process)?,
+            profile::Base::Sso(role) => sso::load(&self.host, &self.config, &self.retry, &role)
+                .await
+                .map_err(profile::Error::Sso)?,
         };
         for role in &roles {
             credentials = role
@@ -445,7 +472,7 @@ pub(super) mod tests {
             error_chain(&err),
             "failed to load credentials from web identity: \
              failed to assume the role with the web identity token: \
-             failed to resolve the STS endpoint: \
+             the STS client could not be set up: \
              Invalid Configuration: FIPS and custom endpoint are not supported"
         );
     }

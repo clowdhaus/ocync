@@ -133,6 +133,16 @@ impl ServiceId {
         env: "STS",
         profile: "sts",
     };
+    /// The IAM Identity Center portal.
+    pub(super) const SSO: Self = Self {
+        env: "SSO",
+        profile: "sso",
+    };
+    /// IAM Identity Center OIDC.
+    pub(super) const SSO_OIDC: Self = Self {
+        env: "SSO_OIDC",
+        profile: "sso-oidc",
+    };
 }
 
 /// The environment and shared files the AWS settings are read from, with
