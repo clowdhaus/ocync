@@ -34,11 +34,7 @@ deny = [
 # Transitive duplicates from AWS SDK + testcontainers ecosystem version splits.
 # These are unavoidable until upstream unifies major versions.
 skip = [
-  { crate = "block-buffer@0.10" },    # aws-config sso (sha1 0.10) vs chacha20 (RustCrypto 0.11)
   { crate = "core-foundation@0.9" },  # system-configuration (hyper-util) vs security-framework
-  { crate = "cpufeatures@0.2" },      # aws-config sso (sha1 0.10) vs chacha20 (RustCrypto 0.11)
-  { crate = "crypto-common@0.1" },    # aws-config sso (sha1 0.10) vs chacha20 (RustCrypto 0.11)
-  { crate = "digest@0.10" },          # aws-config sso (sha1 0.10) vs chacha20 (RustCrypto 0.11)
   { crate = "syn@2" },                # async-stream / aws-smithy macros (syn 2) vs serde/clap/schemars derives (syn 3)
 ]
 

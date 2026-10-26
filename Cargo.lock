@@ -299,7 +299,6 @@ dependencies = [
  "http-body",
  "percent-encoding",
  "pin-project-lite",
- "regex-lite",
  "tracing",
  "uuid",
 ]
@@ -2349,11 +2348,7 @@ dependencies = [
 name = "ocync-distribution"
 version = "0.8.2"
 dependencies = [
- "aws-config",
- "aws-credential-types",
  "aws-lc-rs",
- "aws-smithy-types",
- "aws-types",
  "base64 0.23.1",
  "bytes",
  "fastrand",
