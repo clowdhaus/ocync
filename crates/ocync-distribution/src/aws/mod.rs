@@ -1,8 +1,9 @@
-//! Calls to the AWS APIs ocync uses: ECR and ECR Public, signed, and STS
-//! for the credential chain.
+//! Calls to the AWS APIs ocync uses: ECR and ECR Public, signed, and for
+//! the credential chain STS, the IAM Identity Center portal and SSO OIDC.
 //!
-//! Settings, signing, endpoint resolution, retries, clock-skew correction
-//! and error parsing are owned here, and the credential chain in
+//! Settings, the shared config and credentials files, signing, endpoint
+//! resolution, retries, clock-skew correction and error parsing are owned
+//! here, with no AWS SDK crate, and the credential chain in
 //! [`credentials`].
 
 mod calendar;

@@ -22,19 +22,17 @@ order: 5
 
 ## Dependency weight
 
-The FIPS build of the `ocync` binary resolves 242 crates (normal and build dependencies). The cloud SDKs account for most of what can be removed:
+The FIPS build of the `ocync` binary resolves 201 crates (normal and build dependencies). The one cloud SDK left accounts for most of what can be removed:
 
 | Dependency | Used for | Crates only it brings |
 |---|---|---|
-| `aws-config` | the credential chain | 39 |
-| `google-cloud-auth` | one access token | 21 |
-| Both together | | 78 |
+| `google-cloud-auth` | one access token | 39 |
 
-The duplicated hash crate versions (`digest`, `block-buffer`, `crypto-common`, `cpufeatures`) all come from these SDKs, and four of the `skip` entries in `deny.toml` exist for them.
+The pure-Rust `sha2` and `hmac` crates in the build come from it alone. No AWS SDK crate is in the binary: `xtask`'s benchmark tooling still uses `aws-config` and `aws-sdk-ecr`, and is not shipped.
 
 ## TLS uses only FIPS-approved algorithms
 
-The `fips` feature enables `rustls/fips`. That feature applies to every `rustls` user in the build, so `aws_lc_rs::default_provider()` drops ChaCha20-Poly1305 and every key exchange group the module does not approve, for `reqwest`, which `google-cloud-auth` also uses, and for the TLS client the AWS SDK builds itself. TLS 1.2 also requires extended master secret.
+The `fips` feature enables `rustls/fips`. That feature applies to every `rustls` user in the build, so `aws_lc_rs::default_provider()` drops ChaCha20-Poly1305 and every key exchange group the module does not approve, for `reqwest`, which `google-cloud-auth` also uses. TLS 1.2 also requires extended master secret.
 
 At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the installed provider is FIPS-approved, including whether the module is in approved mode. Every command except `version` refuses to start if it is not, so `version` can still report the failing state. `ocync version` prints the AWS-LC-FIPS module number a certificate names (`module: AWS-LC-FIPS 4`), the AWS-LC release (`release: AWS-LC 4.2.0`) and the result (`tls: approved`), in the shape `openssl list -providers` uses. A FIPS build decides all of this from one constant, `CRYPTO_BUILD` in `ocync-distribution`, so the CLI cannot disagree with the linked module.
 
@@ -79,33 +77,41 @@ Scanners that read the embedded list directly still see the dropped crates until
 
 ## Owned AWS request signing
 
-`aws-sigv4` computes Signature Version 4 with the pure-Rust `sha2` and `hmac` crates. `ocync` makes its ECR and ECR Public calls (`GetAuthorizationToken`, `BatchCheckLayerAvailability`) itself, in `crates/ocync-distribution/src/aws/`:
+`aws-sigv4`, the SDK's signer, computes Signature Version 4 with the pure-Rust `sha2` and `hmac` crates, outside the FIPS module, so `ocync` makes its AWS calls itself, in `crates/ocync-distribution/src/aws/`: ECR and ECR Public (`GetAuthorizationToken`, `BatchCheckLayerAvailability`), and the credential chain's STS, IAM Identity Center and SSO OIDC calls.
 
-- An owned signer on `aws-lc-rs` HMAC and SHA-256. It signs no query, since an endpoint never carries one. It passes the cases of the AWS signing test suite that apply to header signing of such requests outside S3, and matched `aws-sigv4` on 60,000 random requests.
-- Endpoints from the AWS SDK's endpoint rules for every partition, with `AWS_USE_FIPS_ENDPOINT`, `AWS_USE_DUALSTACK_ENDPOINT`, `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_ECR` / `AWS_ENDPOINT_URL_ECR_PUBLIC` read from the AWS config as before. A query or user and password in a configured endpoint URL is dropped with a warning, as the SDK sends neither, and the URL is never logged.
-- The SDK's retry policy, ported from `aws-smithy-runtime` with its test cases and read from the same settings: `AWS_MAX_ATTEMPTS` (3 by default), `AWS_RETRY_MODE` and `AWS_NEW_RETRIES_2026`. Throttling error codes (ECR throttles with HTTP 400) are retried as throttles; timeout codes, HTTP 500, 502, 503 and 504, and connection, timeout and I/O failures as transient; other errors are not retried. Each retry waits a jittered exponential backoff from 1 second, at most 20 seconds, or what `x-amz-retry-after` asks, and spends from a quota of 500 shared by every call to one service in one region: 5 for a throttle or skewed signature and 10 for a transient failure. As in the SDK, each client holds one retry permit: the latest retry's cost on any of its calls, which a newer retry replaces and leaves the older cost spent. The client's next success returns the held cost, or 1 when none is held, and with too little left the call stops retrying. Retry behavior 2.1 starts other failures at 50 ms, costs 14 for them and bounds `x-amz-retry-after` to 5 seconds past the backoff. Adaptive mode paces sends with the SDK's CUBIC rate limiter once a throttle is seen. One deliberate difference: an HTTP 429 without a throttling code is retried as a throttle, since a proxy on `HTTPS_PROXY` sends one and a batch check given up on transfers every blob it covered. A call that receives nothing for 20 seconds after it is sent, or between reads, fails. The SDK applies that limit only to a response body once it is streaming, so this is stricter.
+- An owned signer on `aws-lc-rs` HMAC and SHA-256. It signs no query: the one call that sends a query, IAM Identity Center's `GetRoleCredentials`, is unsigned. It passes the cases of the AWS signing test suite that apply to header signing of such requests outside S3, and matched `aws-sigv4` on 60,000 random requests.
+- Endpoints from the AWS SDK's endpoint rules for every partition, for ECR, ECR Public, STS, IAM Identity Center and SSO OIDC, with `AWS_USE_FIPS_ENDPOINT`, `AWS_USE_DUALSTACK_ENDPOINT`, `AWS_ENDPOINT_URL` and each service's `AWS_ENDPOINT_URL_<SERVICE>` read from the AWS config. A query or user and password in a configured endpoint URL is dropped with a warning, as the SDK sends neither, and the URL is never logged. A configured URL's path is kept, and the operation's path is joined to it with one slash, as the SDK joins them.
+- The SDK's retry policy, ported from `aws-smithy-runtime` with its test cases and read from the same settings: `AWS_MAX_ATTEMPTS` (3 by default), `AWS_RETRY_MODE` and `AWS_NEW_RETRIES_2026`. Throttling error codes (ECR throttles with HTTP 400) are retried as throttles; timeout codes, HTTP 500, 502, 503 and 504, and connection, timeout and I/O failures as transient; other errors are not retried. Each retry waits a jittered exponential backoff from 1 second, at most 20 seconds, or what `x-amz-retry-after` asks, and spends from a quota of 500 shared by every call to one service in one region: 5 for a throttle or skewed signature and 10 for a transient failure. Each call holds one retry permit, the cost of its latest retry. Its success returns that cost, or 1 when it holds none, and with too little left the call stops retrying. The SDK holds one permit per client instead, so a retry on one call replaces another call's permit and leaves that cost spent. An `AWS_MAX_ATTEMPTS` or `AWS_RETRY_MODE` that does not parse is a configuration error, where the SDK panics. Retry behavior 2.1 starts other failures at 50 ms, costs 14 for them and bounds `x-amz-retry-after` to 5 seconds past the backoff. Adaptive mode paces sends with the SDK's CUBIC rate limiter once a throttle is seen. One deliberate difference: an HTTP 429 without a throttling code is retried as a throttle, since a proxy on `HTTPS_PROXY` sends one and a batch check given up on transfers every blob it covered. A call that receives nothing for 20 seconds after it is sent, or between reads, fails. The SDK applies that limit only to a response body once it is streaming, so this is stricter.
 - The SDK's clock-skew correction: the skew is measured from each answer's `Date` header, and a signature rejected while the clocks are more than 4 minutes apart is signed again on AWS's clock. `AWS_DISABLE_CLOCK_SKEW_CORRECTION=true`, or the profile's `disable_clock_skew_correction`, turns it off.
 - A credential source that does not answer within 21.6 seconds, the SDK's bound for its default settings, fails the call.
-- Requests honor `HTTPS_PROXY` and `NO_PROXY`, like registry traffic. The SDK client did not.
-
-Credentials still come from `aws-config`, which signs its own STS calls with `aws-sigv4`, so `aws-sigv4` stays in the build until the owned credential chain replaces `aws-config`.
+- Requests honor `HTTPS_PROXY` and `NO_PROXY`, like registry traffic, where the SDK's client does not.
 
 ## Owned AWS credential chain
 
-> **Status: Planned.**
-
-Replace `aws-config` and the AWS SDK crates with an owned credential chain that matches the documented behavior in [Amazon ECR](/registries/ecr), in AWS precedence order:
+`ocync` resolves AWS credentials itself, in `crates/ocync-distribution/src/aws/credentials/`, as `aws-config` 1.13.0 does. Every case of its `default-credential-provider-chain` and `profile-provider` test data runs against the owned chain, with its recorded HTTP traffic. The sources, in AWS precedence order, as [Amazon ECR](/registries/ecr) documents them:
 
 - Environment variables.
-- Shared config and credentials files, including `source_profile` and `role_arn` role chaining and the per-registry `aws_profile` field.
+- Shared config and credentials files, including `source_profile` and `role_arn` role chaining, `credential_source`, and the per-registry `aws_profile` field.
 - Web identity (IRSA) through `AssumeRoleWithWebIdentity`.
 - `credential_process`.
-- IAM Identity Center (`aws sso login`): read the cached token, exchange it with `GetRoleCredentials`, and refresh it with `CreateToken` within 5 minutes of expiry, at most once every 30 seconds, writing the refreshed token back to the shared cache in a form the AWS CLI still reads. Neither call is signed. The cache file name is a SHA-1 of the session name, computed with `aws-lc-rs`.
+- IAM Identity Center (`aws sso login`): the cached token is exchanged with `GetRoleCredentials`, and refreshed with `CreateToken` within 5 minutes of expiry, at most once every 30 seconds, then written back to the shared cache in a form the AWS CLI still reads. Neither call is signed. The cache file name is a SHA-1 of the session name, computed with `aws-lc-rs`. Loads of one token in a process take turns, so it is refreshed once.
 - The container credential endpoint (ECS task roles, EKS Pod Identity).
 - The EC2 instance metadata service, IMDSv2 only.
 - FIPS endpoints through `AWS_USE_FIPS_ENDPOINT`, and the GovCloud, China and ISO partitions.
 
-The SDK crates are removed once the owned chain and signer reach parity.
+A source that is not configured passes to the next, and any other failure stops the chain, as upstream. STS, IAM Identity Center and SSO OIDC calls honor `HTTPS_PROXY` and `NO_PROXY`. The instance metadata service and the container endpoint never use a proxy, so their tokens reach no proxy host.
+
+Deliberate differences from upstream:
+
+- Container endpoint: a plain HTTP host name is pinned to the addresses checked, so a second DNS answer cannot redirect the token. An empty DNS answer is refused, and so is a scheme other than `http` or `https`. The endpoint has its own retry quota.
+- The account ID a source reports is not kept: nothing in `ocync` uses it.
+- A `login_session` profile is refused.
+- `credential_process`: a command the chain gives up on is killed, so a hung helper does not outlive the timeout. An expiry with a leap second (`:60`) is refused.
+- `credential_process` and the JSON credential endpoints: when a key appears twice in different cases, the one that sorts last is read, where upstream reads the one written last.
+- IAM Identity Center write-back: fields the refresh does not set are kept, and only the fields it sets are rewritten. The file is written to a new file only its owner can read, then renamed over the old one. A write that fails is logged as a warning and the refreshed token is still used, where upstream fails the load. The new expiry is written to the second.
+- IAM Identity Center refresh: an answer with no token counts as a failed refresh, which keeps the cached token. A failed refresh is logged as a warning, where upstream logs it at debug level.
+- The cached token is read from disk on every load, so a token another process refreshed is picked up.
+- The profile resolver refuses a profile that names only a login token as it reads the profile, where upstream refuses it when it builds the provider. The upstream profile row that checks this is not run; an owned test checks the same outcome.
 
 ## Alternatives considered
 

@@ -6,13 +6,13 @@ order: 1
 
 ## Auth
 
-ocync auto-detects ECR private from the hostname (`*.dkr.ecr.*.amazonaws.com`) and uses ambient AWS credentials via the AWS SDK. The credential chain follows AWS conventions:
+ocync auto-detects ECR private from the hostname (`*.dkr.ecr.*.amazonaws.com`) and uses ambient AWS credentials. The credential chain follows AWS conventions:
 
-- Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
-- Shared credentials file (`~/.aws/credentials`)
-- SSO profiles in `~/.aws/config` (run `aws sso login` first to populate the OIDC token cache)
-- Container or instance role (ECS task role, EC2 instance profile, Lambda execution role)
-- IRSA or EKS Pod Identity (cluster-side identity binding)
+1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`), which is also how Lambda supplies its execution role
+2. The selected profile in `~/.aws/config` and `~/.aws/credentials`: static keys, `source_profile` and `role_arn` role chaining, `credential_process`, and IAM Identity Center profiles (run `aws sso login` first to populate the token cache)
+3. Web identity from `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN` (IRSA)
+4. The container credential endpoint (ECS task role, EKS Pod Identity)
+5. The EC2 instance metadata service, IMDSv2 only (EC2 instance profile)
 
 No Docker config or static credentials are needed. See the [AWS credential precedence docs](https://docs.aws.amazon.com/sdkref/latest/guide/standardized-credentials.html) for the full chain.
 
@@ -92,7 +92,7 @@ aws eks create-pod-identity-association \
 
 ### IAM Roles for Service Accounts (IRSA)
 
-The original EKS workload-identity mechanism. The chart's `workloadIdentity.aws.roleArn` adds the `eks.amazonaws.com/role-arn` annotation to the ServiceAccount; the AWS SDK uses the projected OIDC token to assume the role.
+The original EKS workload-identity mechanism. The chart's `workloadIdentity.aws.roleArn` adds the `eks.amazonaws.com/role-arn` annotation to the ServiceAccount; ocync uses the projected OIDC token to assume the role.
 
 ```yaml
 # values.yaml
@@ -133,7 +133,7 @@ ocync uses one ambient AWS credential chain per process. Syncing across accounts
 
 ### Cross-account ECR repository policies
 
-Simplest. Attach a repository policy on each destination ECR repository that grants pull/push permissions to the principal ocync runs as. No assume-role hop, one set of credentials, the AWS SDK does no extra work.
+Simplest. Attach a repository policy on each destination ECR repository that grants pull/push permissions to the principal ocync runs as. No assume-role hop, one set of credentials, no extra credential calls.
 
 ```json
 {
@@ -191,7 +191,7 @@ role_arn = arn:aws:iam::DESTINATION_ACCOUNT:role/ocync-target
 AWS_PROFILE=ocync-target ocync sync --config ocync.yaml
 ```
 
-The AWS SDK handles the `AssumeRole` call and credential refresh transparently. The whole-process `AWS_PROFILE` mechanism applies one profile to every ECR registry; for per-registry overrides, see the next section.
+ocync makes the `AssumeRole` call and refreshes the credentials before they expire. The whole-process `AWS_PROFILE` mechanism applies one profile to every ECR registry; for per-registry overrides, see the next section.
 
 ### Per-registry static credentials (third-party access)
 
@@ -221,7 +221,7 @@ aws_secret_access_key = ...
 # session_token = ...   # only if they issued STS temporary credentials
 ```
 
-The AWS SDK reads the file from `~/.aws/credentials` by default, or from the path in `AWS_SHARED_CREDENTIALS_FILE`. The file does not need a `[default]` section — the ambient chain skips the file entirely when no profile is named, so Pod Identity / IRSA still serves `my-source`.
+ocync reads the file from `~/.aws/credentials` by default, or from the path in `AWS_SHARED_CREDENTIALS_FILE`. The file does not need a `[default]` section: the ambient chain skips the file entirely when no profile is named, so Pod Identity / IRSA still serves `my-source`.
 
 For Kubernetes deployments, see the AWS shared-config files section of [Kubernetes secrets](/registries/secrets) for two production-grade injection patterns (External Secrets Operator and CSI Secrets Store).
 
