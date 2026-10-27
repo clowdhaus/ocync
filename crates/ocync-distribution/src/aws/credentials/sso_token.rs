@@ -32,6 +32,13 @@ const REFRESH_BUFFER: Duration = Duration::from_secs(5 * 60);
 /// The least time between two refreshes of one token.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The longest a refresh may take, well under the chain's 21.6 second bound,
+/// so a refresh that hangs still leaves time to use the cached token.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The path of SSO OIDC's `CreateToken`.
+const CREATE_TOKEN_PATH: &str = "/token";
+
 /// The content type of a `CreateToken` request.
 const JSON: &str = "application/json";
 
@@ -138,6 +145,9 @@ enum RefreshError {
     /// seconds.
     #[error("SSO OIDC CreateToken answer could not be read")]
     Answer(#[source] serde_json::Error),
+    /// The refresh did not finish in time.
+    #[error("SSO OIDC CreateToken timed out after {} seconds", .0.as_secs())]
+    TimedOut(Duration),
 }
 
 /// When this process last tried to refresh a token, if it has.
@@ -232,8 +242,14 @@ pub(super) async fn load(
         Decision::Refresh(registration) => registration,
     };
     tracing::debug!("refreshing the SSO token");
-    let refreshed = refresh(host, config, retry, region, registration).await;
+    // Recorded first, so a load cancelled mid-refresh still spaces the next.
     *last = LastRefresh(Some(now));
+    let refreshed = tokio::time::timeout(
+        REFRESH_TIMEOUT,
+        refresh(host, config, retry, region, registration),
+    )
+    .await
+    .unwrap_or(Err(RefreshError::TimedOut(REFRESH_TIMEOUT)));
     match refreshed {
         Ok(refreshed) => {
             let token = AccessToken(refreshed.access_token.clone());
@@ -344,7 +360,7 @@ async fn refresh(
     let request = ApiRequest {
         operation: "CreateToken",
         method: http::Method::POST,
-        path: "/token",
+        path: CREATE_TOKEN_PATH,
         headers: &[(CONTENT_TYPE, JSON)],
         body: Bytes::from(body),
         modeled_errors: &[],
@@ -833,6 +849,26 @@ mod tests {
             );
         }
         assert_eq!(home.document()[EXPIRES_AT], "2023-01-01T08:06:00Z");
+    }
+
+    /// A refresh that hangs is given up after [`REFRESH_TIMEOUT`] and the
+    /// still valid cached token is used. Breaks if the load waits on the
+    /// refresh, which the chain's timeout would cut off with no token.
+    #[tokio::test(start_paused = true)]
+    async fn uses_the_cached_token_when_a_refresh_hangs() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(created("newtoken", None).set_delay(Duration::from_secs(3600)))
+            .mount(&server)
+            .await;
+        let home = Home::new("hangs", &refreshable("2021-12-25T13:33:00Z"));
+        let host = home.host(&server, "2021-12-25T13:30:00Z");
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            load_on(&host, SESSION).await.unwrap().as_str(),
+            "cachedtoken"
+        );
+        assert_eq!(started.elapsed(), REFRESH_TIMEOUT);
     }
 
     /// Loads of one token at once refresh it once, and the load that waited

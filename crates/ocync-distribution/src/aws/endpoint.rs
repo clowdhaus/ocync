@@ -20,9 +20,14 @@ const MAX_LABEL_LEN: usize = 63;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct Region(String);
 
+/// A region that is not a valid host label.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("invalid AWS region '{0}': must be a valid host label")]
+pub(crate) struct InvalidRegion(String);
+
 impl Region {
     /// Read `text` as a region.
-    pub(super) fn parse(text: &str) -> Result<Self, ConfigError> {
+    pub(super) fn parse(text: &str) -> Result<Self, InvalidRegion> {
         let valid_label = |label: &str| {
             (1..=MAX_LABEL_LEN).contains(&label.len())
                 && !label.starts_with('-')
@@ -33,7 +38,7 @@ impl Region {
         if text.split('.').all(valid_label) {
             Ok(Self(text.to_owned()))
         } else {
-            Err(ConfigError::InvalidRegion(text.to_owned()))
+            Err(InvalidRegion(text.to_owned()))
         }
     }
 
@@ -334,6 +339,20 @@ pub(super) fn resolve_credential_api(
         (Fips::Off, DualStack::On) => format!("https://{label}.{region}.{dual}"),
         (Fips::Off, DualStack::Off) => format!("https://{label}.{region}.{dns}"),
     })
+}
+
+/// `path` joined to `endpoint`'s own path with one slash, as the SDK joins
+/// an operation's path to every endpoint, the instance metadata one
+/// included.
+pub(super) fn join_path(endpoint: &Url, path: &str) -> Url {
+    let mut url = endpoint.clone();
+    let base = endpoint.path();
+    url.set_path(&format!(
+        "{}/{}",
+        base.strip_suffix('/').unwrap_or(base),
+        path.strip_prefix('/').unwrap_or(path)
+    ));
+    url
 }
 
 #[cfg(test)]

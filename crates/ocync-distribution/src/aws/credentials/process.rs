@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use super::super::calendar;
 use super::{Credentials, json};
+use crate::error::truncate_body;
 
 /// The only document version upstream reads.
 const VERSION: i32 = 1;
@@ -99,7 +100,7 @@ pub(super) async fn load(command: Command<'_>) -> Result<Credentials, Error> {
             std::str::from_utf8(&output.stderr).unwrap_or("could not decode stderr as UTF-8");
         return Err(Error::Exited {
             status: output.status,
-            stderr: stderr.to_owned(),
+            stderr: truncate_body(stderr).to_owned(),
         });
     }
     let stdout = std::str::from_utf8(&output.stdout).map_err(Error::NotUtf8)?;
@@ -260,6 +261,20 @@ mod tests {
         );
         assert!(logs.contains("echo ** arguments redacted **"), "{logs}");
         assert!(!logs.contains("the-argument"), "{logs}");
+    }
+
+    /// A failing command's stderr is cut to its start, as it can hold a
+    /// token and the error reaches the report. Breaks if all of it is kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn keeps_only_the_start_of_a_failing_commands_stderr() {
+        let error = load(Command("printf 'a%.0s' $(seq 300) >&2; exit 1"))
+            .await
+            .unwrap_err();
+        let Error::Exited { stderr, .. } = error else {
+            panic!("{error}");
+        };
+        assert_eq!(stderr, "a".repeat(200));
     }
 
     /// A command still running when its load is dropped is killed, so a

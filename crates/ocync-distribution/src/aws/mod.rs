@@ -187,8 +187,8 @@ pub(crate) enum ConfigError {
     #[error("cannot extract AWS region from ECR hostname '{0}'")]
     NoRegionInHostname(String),
     /// The configured region is not a valid host label.
-    #[error("invalid AWS region '{0}': must be a valid host label")]
-    InvalidRegion(String),
+    #[error(transparent)]
+    InvalidRegion(#[from] endpoint::InvalidRegion),
     /// `AWS_MAX_ATTEMPTS` or `max_attempts` is not a whole number above 0.
     #[error("invalid AWS max attempts '{text}': must be a whole number of at least 1")]
     InvalidMaxAttempts {
@@ -424,9 +424,9 @@ impl fmt::Display for ClockSkew {
 enum Failure {
     /// No credentials could be loaded. The credential errors leave their
     /// causes to `source`, and this text is all a caller keeps, so it names
-    /// every cause.
+    /// every cause, and is not a source itself.
     #[error("failed to load AWS credentials: {}", credentials::error_chain(.0))]
-    Credentials(#[source] credentials::Error),
+    Credentials(credentials::Error),
     /// The request did not complete. Built only through `From`, which drops
     /// the URL.
     #[error("request failed: {0}")]
@@ -635,18 +635,10 @@ impl Api {
         .await
     }
 
-    /// The URL of the operation at `path` with `query`: `path` joined to
-    /// the endpoint's with one slash, as the SDK joins them, and each query
-    /// value encoded as the SDK encodes it.
+    /// The URL of the operation at `path` with `query`, each query value
+    /// encoded as the SDK encodes it.
     fn url(&self, path: &str, query: &[(&str, &str)]) -> Url {
-        let mut url = self.endpoint.url().clone();
-        let base = url.path();
-        let joined = format!(
-            "{}/{}",
-            base.strip_suffix('/').unwrap_or(base),
-            path.strip_prefix('/').unwrap_or(path)
-        );
-        url.set_path(&joined);
+        let mut url = endpoint::join_path(self.endpoint.url(), path);
         if !query.is_empty() {
             url.set_query(Some(&encode_pairs(query.iter().copied())));
         }
@@ -1517,7 +1509,7 @@ mod tests {
         let err = client.call(&Probe {}).await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ECR GetAuthorizationToken failed: failed to load AWS credentials: credentials provider timed out after 21 seconds"
+            "ECR GetAuthorizationToken failed: failed to load AWS credentials: credentials provider timed out after 21.6 seconds"
         );
         assert_eq!(started.elapsed(), CREDENTIALS_LOAD_TIMEOUT);
     }

@@ -29,9 +29,7 @@ use super::config::Config;
 use super::endpoint::{self, CredentialApi, Region};
 use super::host::Host;
 use super::{Api, ApiParts, ConfigError, STALL_TIMEOUT, retry};
-
-/// What a redacted value prints as, as elsewhere in this crate.
-const REDACTED: &str = "[REDACTED]";
+use crate::REDACTED;
 
 /// An access key, with the session token and expiry a temporary one
 /// carries.
@@ -95,7 +93,7 @@ pub(super) enum Error {
     )]
     NoSource(Vec<(Source, String)>),
     /// The chain did not answer in time.
-    #[error("credentials provider timed out after {} seconds", .0.as_secs())]
+    #[error("credentials provider timed out after {} seconds", .0.as_secs_f64())]
     TimedOut(Duration),
     /// The profile is configured and gave no credentials.
     #[error("failed to load credentials from the profile")]
@@ -153,13 +151,18 @@ fn credential_api(
 }
 
 /// `error` and each of its sources, joined as upstream prints them, so a
-/// reason kept as text still names its cause.
+/// reason kept as text still names its cause. A cause the text already ends
+/// with is not repeated: some errors print their cause and also return it as
+/// their source.
 pub(super) fn error_chain(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(e) = source {
-        text.push_str(": ");
-        text.push_str(&e.to_string());
+        let cause = e.to_string();
+        if !text.ends_with(&cause) {
+            text.push_str(": ");
+            text.push_str(&cause);
+        }
         source = e.source();
     }
     text
@@ -438,6 +441,17 @@ pub(super) mod tests {
             "failed to load credentials from web identity: \
              failed to read the web identity token file /missing.jwt: \
              No such file or directory (os error 2)"
+        );
+    }
+
+    /// A cause its error already prints is named once. Breaks if the chain
+    /// repeats it.
+    #[test]
+    fn names_a_printed_cause_once() {
+        let decode = serde_json::from_str::<u8>("x").unwrap_err();
+        assert_eq!(
+            error_chain(&super::super::Failure::Decode(decode)),
+            "unreadable response: expected value at line 1 column 1"
         );
     }
 

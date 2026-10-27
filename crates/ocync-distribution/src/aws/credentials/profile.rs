@@ -4,8 +4,7 @@
 
 use std::collections::HashMap;
 
-use super::super::ConfigError;
-use super::super::endpoint::Region;
+use super::super::endpoint::{InvalidRegion, Region};
 use super::super::host::Clock;
 use super::super::profile::{DEFAULT_PROFILE, ParseError, Properties, Sections};
 use super::sso_token::Login;
@@ -250,8 +249,8 @@ pub(in crate::aws) enum SsoProblem {
         missing: &'static str,
     },
     /// `sso_region` is not a region.
-    #[error("invalid `sso_region`")]
-    Region(#[source] ConfigError),
+    #[error("invalid `sso_region`: {0}")]
+    Region(InvalidRegion),
 }
 
 /// Resolve the profile `selected` in `sections` as upstream does: follow
@@ -709,6 +708,7 @@ mod tests {
             ),
             "{error}"
         );
+        assert!(error.to_string().contains("'us east 1'"), "{error}");
     }
 
     /// A `credential_process` source profile is the base of the role, and

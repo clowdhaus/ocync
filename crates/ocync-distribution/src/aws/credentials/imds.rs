@@ -20,6 +20,7 @@ use http::{HeaderValue, Method, StatusCode};
 use url::Url;
 
 use super::super::config::{Config, ImdsEndpointError};
+use super::super::endpoint::join_path;
 use super::super::host::{Clock, Env, Host, Timeouts, Transport, credential_endpoint_client};
 use super::super::retry::{self, Kind, Retryable};
 use super::json::{self, Code, Document};
@@ -122,7 +123,8 @@ pub(in crate::aws) enum TokenError {
     /// The lifetime does not read.
     #[error("the returned TTL was invalid")]
     InvalidTtl(#[source] TtlError),
-    /// The request did not complete, such as off EC2.
+    /// The request did not complete, such as off EC2. Built only through
+    /// `From`, which drops the URL.
     #[error("could not communicate with IMDS")]
     Transport(#[source] reqwest::Error),
     /// The answer failed the request.
@@ -148,7 +150,8 @@ pub(in crate::aws) enum Error {
     /// No session token.
     #[error("failed to load IMDS session token")]
     Token(#[source] TokenError),
-    /// The request did not complete.
+    /// The request did not complete. Built only through `From`, which drops
+    /// the URL.
     #[error("an IO error occurred communicating with IMDS")]
     Transport(#[source] reqwest::Error),
     /// The answer failed the request.
@@ -228,6 +231,20 @@ enum Access {
     Ready { endpoint: Url, transport: Transport },
 }
 
+/// The endpoint URL is configurable, so a transport error drops it.
+impl From<reqwest::Error> for TokenError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(error.without_url())
+    }
+}
+
+/// The endpoint URL is configurable, so a transport error drops it.
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(error.without_url())
+    }
+}
+
 /// The instance metadata source.
 pub(super) struct Provider {
     access: Access,
@@ -289,7 +306,7 @@ impl Provider {
         let mut last = self.last.lock().expect("no panic while held");
         match (loaded, last.as_mut()) {
             (Err(error), Some(last)) => {
-                tracing::warn!(%error, "IMDS refresh failed; using the last credentials loaded");
+                tracing::warn!(error = %error_chain(&error), "IMDS refresh failed; using the last credentials loaded");
                 // Kept extended, so the next failure reuses this expiry
                 // instead of drawing new jitter.
                 last.expiry = last.expiry.map(|expiry| self.extend(expiry));
@@ -358,7 +375,7 @@ impl Provider {
 
     /// The body at `path`, with a session token, retried as the SDK does.
     async fn get(&self, endpoint: &Url, transport: &Transport, path: &str) -> Result<Bytes, Error> {
-        let url = join(endpoint, path);
+        let url = join_path(endpoint, path);
         let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
         let attempts = retrying("IMDS request", &mut policy, |_| async {
             let token = self
@@ -368,12 +385,12 @@ impl Provider {
             let mut request = reqwest::Request::new(Method::GET, url.clone());
             request.headers_mut().insert(TOKEN_HEADER, token);
             within(ATTEMPT_TIMEOUT, async {
-                let response = transport.send(request).await.map_err(Error::Transport)?;
+                let response = transport.send(request).await.map_err(Error::from)?;
                 let status = response.status();
                 if !status.is_success() {
                     return Err(RequestError::Status(status).into());
                 }
-                response.bytes().await.map_err(Error::Transport)
+                response.bytes().await.map_err(Error::from)
             })
             .await
         });
@@ -391,7 +408,7 @@ impl Provider {
         self.token
             .get_or_refresh(async {
                 tracing::debug!("requesting an IMDS session token");
-                let url = join(endpoint, TOKEN_PATH);
+                let url = join_path(endpoint, TOKEN_PATH);
                 let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
                 let (token, ttl) = retrying("IMDS token request", &mut policy, |_| async {
                     let mut request = reqwest::Request::new(Method::PUT, url.clone());
@@ -412,10 +429,7 @@ async fn request_token(
     transport: &Transport,
     request: reqwest::Request,
 ) -> Result<(HeaderValue, Duration), TokenError> {
-    let response = transport
-        .send(request)
-        .await
-        .map_err(TokenError::Transport)?;
+    let response = transport.send(request).await.map_err(TokenError::from)?;
     match response.status() {
         StatusCode::BAD_REQUEST => return Err(TokenError::InvalidParameters),
         StatusCode::FORBIDDEN => return Err(TokenError::Forbidden),
@@ -432,7 +446,7 @@ async fn request_token(
         .and_then(|ttl| ttl.parse().map_err(TtlError::NotSeconds))
         .map(Duration::from_secs)
         .map_err(TokenError::InvalidTtl)?;
-    let body = response.bytes().await.map_err(TokenError::Transport)?;
+    let body = response.bytes().await.map_err(TokenError::from)?;
     let mut token = HeaderValue::from_bytes(&body).map_err(TokenError::InvalidToken)?;
     token.set_sensitive(true);
     Ok((token, ttl))
@@ -442,13 +456,6 @@ async fn request_token(
 fn disabled(env: &Env) -> bool {
     env.get(DISABLED)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-}
-
-/// `path` under `endpoint`'s own path.
-fn join(endpoint: &Url, path: &str) -> Url {
-    let mut url = endpoint.clone();
-    url.set_path(&format!("{}{path}", endpoint.path().trim_end_matches('/')));
-    url
 }
 
 #[cfg(test)]
@@ -955,6 +962,7 @@ mod tests {
             error.to_string(),
             "an IO error occurred communicating with IMDS"
         );
+        assert!(!error_chain(&err).contains("127.0.0.1"), "{err:?}");
         tokio::time::timeout(Duration::from_secs(5), local.run_until(server))
             .await
             .expect("the server saw both requests")

@@ -106,10 +106,11 @@ Deliberate differences from upstream:
 - Container endpoint: a plain HTTP host name is pinned to the addresses checked, so a second DNS answer cannot redirect the token. An empty DNS answer is refused, and so is a scheme other than `http` or `https`. The endpoint has its own retry quota.
 - The account ID a source reports is not kept: nothing in `ocync` uses it.
 - A `login_session` profile is refused.
-- `credential_process`: a command the chain gives up on is killed, so a hung helper does not outlive the timeout. An expiry with a leap second (`:60`) is refused.
+- `credential_process`: a command the chain gives up on is killed, so a hung helper does not outlive the timeout. An expiry with a leap second (`:60`) is refused. A failing command's stderr is cut to its first 200 bytes in the error, as it can hold a token and the error reaches the report.
 - `credential_process` and the JSON credential endpoints: when a key appears twice in different cases, the one that sorts last is read, where upstream reads the one written last.
 - IAM Identity Center write-back: fields the refresh does not set are kept, and only the fields it sets are rewritten. The file is written to a new file only its owner can read, then renamed over the old one. A write that fails is logged as a warning and the refreshed token is still used, where upstream fails the load. The new expiry is written to the second.
-- IAM Identity Center refresh: an answer with no token counts as a failed refresh, which keeps the cached token. A failed refresh is logged as a warning, where upstream logs it at debug level.
+- IAM Identity Center refresh: an answer with no token counts as a failed refresh, which keeps the cached token. A failed refresh is logged as a warning, where upstream logs it at debug level. A refresh is given up after 5 seconds and the cached token used, so a refresh that hangs cannot use up the 21.6 second bound and leave no token; the attempt is counted when it starts.
+- Instance metadata: when a refresh fails, the last credentials are served with a passed expiry pushed out 10 to 15 minutes, as fresh ones are, so the client does not reload them on every call while the service is down. Upstream serves them with the expiry they were stored with.
 - The cached token is read from disk on every load, so a token another process refreshed is picked up.
 - The profile resolver refuses a profile that names only a login token as it reads the profile, where upstream refuses it when it builds the provider. The upstream profile row that checks this is not run; an owned test checks the same outcome.
 

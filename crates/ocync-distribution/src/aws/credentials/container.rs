@@ -132,7 +132,8 @@ pub(in crate::aws) enum Error {
     /// The client pinned to a host's checked addresses could not be built.
     #[error("could not build the HTTP client for the container endpoint")]
     Client(#[source] reqwest::Error),
-    /// The request did not complete.
+    /// The request did not complete. Built only through `From`, which drops
+    /// the URL: it can carry a key.
     #[error("could not communicate with the container endpoint")]
     Transport(#[source] reqwest::Error),
     /// A failing status.
@@ -153,6 +154,13 @@ pub(in crate::aws) enum Error {
 
 /// The SDK retries a transport failure, a 500, 502, 503 or 504, and a
 /// success whose body does not read.
+/// The endpoint URL can carry a key, so a transport error drops it.
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(error.without_url())
+    }
+}
+
 impl Retryable for Error {
     fn retry_kind(&self) -> Option<Kind> {
         match self {
@@ -324,12 +332,12 @@ impl Provider {
             let response = transport
                 .send(request(url, token.as_ref()))
                 .await
-                .map_err(Error::Transport)?;
+                .map_err(Error::from)?;
             let status = response.status();
             if !status.is_success() {
                 return Err(Error::Status(status));
             }
-            let body = response.bytes().await.map_err(Error::Transport)?;
+            let body = response.bytes().await.map_err(Error::from)?;
             match json::parse(&body).map_err(Error::Json)? {
                 Document::Credentials(credentials) => Ok(credentials),
                 Document::Error { code, message } => Err(Error::Document { code, message }),
@@ -757,6 +765,23 @@ mod tests {
         let loaded = Provider::new(&host).unwrap().load().await.unwrap();
         assert_eq!(loaded.access_key_id(), "ASIARTEST");
         server.await.unwrap();
+    }
+
+    /// A request that does not complete names no part of the endpoint URL,
+    /// which can carry a key. Breaks if the URL reaches the error.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn keeps_the_url_out_of_a_transport_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let uri = format!("http://127.0.0.1:{port}/creds?key=secret-key");
+        let host = host(&[(FULL_URI, &uri)], &[], &[], Network::Real);
+        let err = Provider::new(&host).unwrap().load().await.unwrap_err();
+        assert!(
+            matches!(err, ChainError::Container(Error::Transport(_))),
+            "{err:?}"
+        );
+        assert!(!error_chain(&err).contains("secret-key"), "{err:?}");
     }
 
     /// A token file that does not read stops the chain even with no
