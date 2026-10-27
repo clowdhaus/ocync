@@ -2490,7 +2490,7 @@ async fn wait_for_blob_claim(
             let mountable = ctx
                 .cache
                 .borrow()
-                .committed_mount_sources(ctx.target_name, digest, ctx.target_repo)
+                .mount_sources(ctx.target_name, digest, ctx.target_repo)
                 .next()
                 .is_some();
             if !mountable {
@@ -2569,7 +2569,7 @@ async fn resolve_mount_source(
         let receivers: Vec<tokio::sync::watch::Receiver<bool>> = {
             let mut c = ctx.cache.borrow_mut();
             if let Some(r) = c
-                .committed_mount_sources(ctx.target_name, digest, ctx.target_repo)
+                .mount_sources(ctx.target_name, digest, ctx.target_repo)
                 .next()
                 .cloned()
             {

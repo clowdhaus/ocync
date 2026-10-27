@@ -176,7 +176,7 @@ impl BlobDedupMap {
 
     /// Mark a repo as a stale mount source (mount from this repo was rejected).
     /// Sets the repo's state to `Failed` so it is excluded from future
-    /// `committed_mount_sources` and `unresolved_watches_for` results.
+    /// `mount_sources` and `unresolved_watches_for` results.
     pub(crate) fn mark_blob_repo_stale(
         &mut self,
         target: &str,
