@@ -27,7 +27,7 @@ Sync orchestration engine - pipelined discovery/execution, leader-follower blob 
 - Don't add wave partitioning among followers; it would be dead code.
 - All tasks promoted simultaneously after discovery (leaders ordered first by `elect_leaders`). Two-level synchronization:
   1. Per-(target, digest) upload claim via `ClaimAction::Wait`: whichever task claims a blob first uploads it, and every other task for that digest at that target, leader or follower, waits on `claim_notify` and re-checks.
-  2. Per-repo `watch<bool>` subscribed through `unresolved_watches_for`: a task waits for a candidate source repo's manifest commit before mounting from it. ECR requires a committed manifest in the source repo for mount to succeed (201), and returns 202 (Not Fulfilled) otherwise, so `committed_mount_sources` offers only repos whose manifest is committed. Uses `watch` (not `Notify`) because committed status is boolean state, not an event -- `watch` retains the last value so late subscribers always see it.
+  2. Per-repo `watch<bool>` subscribed through `unresolved_watches_for`: a task waits for a source repo recorded this run to commit its manifest before mounting from it. ECR requires a committed manifest in the source repo for mount to succeed (201), and returns 202 (Not Fulfilled) otherwise. `mount_sources` offers committed repos first, then repos known to hold the blob only from an earlier run (`Remembered`), without waiting: nothing in this run commits them, and a refused mount marks the source stale and falls back to a push. Uses `watch` (not `Notify`) because committed status is boolean state, not an event -- `watch` retains the last value so late subscribers always see it.
 
 ## Manifest commit gating (ECR consistency window)
 
