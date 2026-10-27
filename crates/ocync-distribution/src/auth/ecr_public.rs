@@ -31,6 +31,9 @@ use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::Error;
 
+/// The only region ECR Public's API serves.
+const ECR_PUBLIC_REGION: &str = "us-east-1";
+
 /// Default ECR Public token lifetime (12 hours).
 const ECR_PUBLIC_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
@@ -150,14 +153,10 @@ impl EcrPublicAuth {
     /// Constructs the ECR Public client targeting `us-east-1`.
     /// Credentials are fetched lazily on the first `get_token` call and
     /// refreshed automatically when approaching expiry.
-    pub async fn new(http: reqwest::Client) -> Result<Self, Error> {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new("us-east-1"))
-            .load()
-            .await;
-
-        let client = crate::aws::Client::new(&config, crate::aws::Service::EcrPublic)
-            .map_err(|e| Error::auth_failed(ECR_PUBLIC_HOST, e))?;
+    pub fn new(http: reqwest::Client) -> Result<Self, Error> {
+        let client =
+            crate::aws::Client::from_env(ECR_PUBLIC_REGION, None, crate::aws::Service::EcrPublic)
+                .map_err(|e| Error::auth_failed(ECR_PUBLIC_HOST, e))?;
 
         Ok(Self {
             base_url: format!("https://{ECR_PUBLIC_HOST}"),
@@ -189,7 +188,7 @@ impl EcrPublicAuth {
     /// Get or refresh registry credentials from `GetAuthorizationToken`.
     async fn ensure_credentials(&self) -> Result<Credentials, Error> {
         self.credential_cache
-            .get_or_refresh("ecr-public-credential", async {
+            .get_or_refresh(async {
                 tracing::debug!("ECR Public registry credentials expired or missing, refreshing");
                 let response = self.api.get_authorization_token().await.map_err(|e| {
                     tracing::warn!(error = %e, "ECR Public GetAuthorizationToken failed");

@@ -1,0 +1,13 @@
+{
+  "name": "sso-role",
+  "docs": "load creds from SSO role",
+  "result": {
+    "Ok": {
+      "access_key_id": "ASIARCORRECT",
+      "secret_access_key": "secretkeycorrect",
+      "session_token": "tokencorrect",
+      "account_id": "123456789",
+      "expiry": 1234567890
+    }
+  }
+}

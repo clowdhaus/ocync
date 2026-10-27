@@ -1,6 +1,6 @@
 ---
 title: Amazon ECR Public
-description: Using ocync with public.ecr.aws via SDK auth or anonymous pulls.
+description: Using ocync with public.ecr.aws via AWS credentials or anonymous pulls.
 order: 2
 ---
 
@@ -39,4 +39,4 @@ For authenticated pulls, ensure ambient AWS credentials are present (env vars, s
 
 ## Kubernetes deployment
 
-Anonymous pulls require no AWS identity, so the simplest pod has no `workloadIdentity` block at all -- accept the lower per-IP rate limit. For authenticated reads (higher rate limit), the SDK uses whatever AWS identity the workload has, exactly as for ECR private. See [ECR Kubernetes deployment](/registries/ecr#kubernetes-deployment) for the EKS Pod Identity and IRSA setups; both apply unchanged.
+Anonymous pulls require no AWS identity, so the simplest pod has no `workloadIdentity` block at all -- accept the lower per-IP rate limit. For authenticated reads (higher rate limit), ocync uses whatever AWS identity the workload has, exactly as for ECR private. See [ECR Kubernetes deployment](/registries/ecr#kubernetes-deployment) for the EKS Pod Identity and IRSA setups; both apply unchanged.

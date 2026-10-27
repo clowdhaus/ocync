@@ -19,7 +19,7 @@ order: 7
 
 FIPS mode is a compile-time decision. The `fips` feature flag links the AWS-LC FIPS module. The `non-fips` feature flag uses aws-lc-rs without it.
 
-A FIPS build restricts TLS to FIPS-approved algorithms: AES-GCM cipher suites, key exchange over P-256, P-384 or the X25519MLKEM768 post-quantum hybrid, and extended master secret for TLS 1.2. ChaCha20-Poly1305 and plain X25519 are never offered. The restriction covers every TLS client in the binary: `reqwest`, which Google authentication also uses, and the client the AWS SDK builds itself. A FIPS build checks this at startup and refuses to run if TLS is not FIPS-approved.
+A FIPS build restricts TLS to FIPS-approved algorithms: AES-GCM cipher suites, key exchange over P-256, P-384 or the X25519MLKEM768 post-quantum hybrid, and extended master secret for TLS 1.2. ChaCha20-Poly1305 and plain X25519 are never offered. The restriction covers every TLS client in the binary: `reqwest`, which AWS and Google authentication also use. A FIPS build checks this at startup and refuses to run if TLS is not FIPS-approved.
 
 `rustls` counts X25519MLKEM768 as approved through its ML-KEM part, although its own source notes that ML-KEM in the AWS-LC FIPS module is FIPS-pending and that it follows the interpretation some regimes (such as FedRAMP Rev. 5 SC-13) allow for modules in that state. Treat the hybrid as approved only if your assessor accepts that interpretation.
 

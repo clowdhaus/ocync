@@ -13,7 +13,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use aws_config::BehaviorVersion;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -59,28 +58,15 @@ impl RegistryId {
     }
 }
 
-/// Load an SDK config for the given ECR hostname.
-///
-/// Extracts the region from the hostname. The config also carries the
-/// credentials and the FIPS, dual-stack and endpoint URL settings.
-///
-/// When `profile` is `Some`, credential resolution is scoped to that named
-/// profile; when `None`, the ambient credential chain is used. Profile-not-found
-/// errors surface at the first ECR API call, not here.
-pub(crate) async fn load_sdk_config(
+/// The AWS API client for the ECR registry at `hostname`, in the region the
+/// hostname names, with credentials from `profile` or the default chain.
+pub(crate) fn api_client(
     hostname: &str,
     profile: Option<&str>,
-) -> Result<aws_config::SdkConfig, Error> {
-    let region = ecr_region(hostname).ok_or_else(|| Error::EcrApi {
-        reason: format!("cannot extract AWS region from ECR hostname '{hostname}'"),
-    })?;
-
-    let mut builder = aws_config::defaults(BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.to_owned()));
-    if let Some(p) = profile {
-        builder = builder.profile_name(p);
-    }
-    Ok(builder.load().await)
+) -> Result<crate::aws::Client, crate::aws::ConfigError> {
+    let region = ecr_region(hostname)
+        .ok_or_else(|| crate::aws::ConfigError::NoRegionInHostname(hostname.to_owned()))?;
+    crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr)
 }
 
 /// Maximum number of layer digests per `BatchCheckLayerAvailability` API call.
@@ -437,15 +423,11 @@ impl BatchChecker {
     /// as a different identity than the auth provider, which silently breaks
     /// `BatchCheckLayerAvailability` for registries reachable only via the
     /// named profile.
-    pub async fn from_hostname(hostname: &str, profile: Option<&str>) -> Result<Self, Error> {
-        let sdk_config = load_sdk_config(hostname, profile).await?;
+    pub fn from_hostname(hostname: &str, profile: Option<&str>) -> Result<Self, Error> {
+        let client = api_client(hostname, profile).map_err(|e| Error::EcrApi {
+            reason: e.to_string(),
+        })?;
         let registry_id = RegistryId::from_hostname(hostname);
-        let client =
-            crate::aws::Client::new(&sdk_config, crate::aws::Service::Ecr).map_err(|e| {
-                Error::EcrApi {
-                    reason: e.to_string(),
-                }
-            })?;
         Ok(Self {
             api: Box::new(AwsEcrBatchApi {
                 client,
@@ -1233,30 +1215,15 @@ mod tests {
         assert_eq!(log.calls(), 2);
     }
 
-    #[tokio::test]
-    async fn batch_checker_from_hostname_accepts_named_profile() {
+    #[test]
+    fn batch_checker_from_hostname_accepts_named_profile() {
         // Pins the BatchChecker / EcrAuth symmetry: both must thread the same
         // profile, otherwise sync runs against profile-scoped registries get
         // split-brain auth.
         let checker = BatchChecker::from_hostname(
             "123456789012.dkr.ecr.us-east-1.amazonaws.com",
             Some("nonexistent-profile-for-test"),
-        )
-        .await;
+        );
         assert!(checker.is_ok(), "{:?}", checker.err());
-    }
-
-    #[tokio::test]
-    async fn load_sdk_config_accepts_named_profile() {
-        // SdkConfig has no public profile accessor, so this only verifies the
-        // load path itself does not reject an unknown profile name (resolution
-        // is deferred to the first ECR API call).
-        let cfg = load_sdk_config(
-            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
-            Some("nonexistent-profile-for-test"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(cfg.region().map(|r| r.as_ref()), Some("us-east-1"));
     }
 }

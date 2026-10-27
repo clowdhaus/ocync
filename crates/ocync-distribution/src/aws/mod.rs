@@ -1,40 +1,52 @@
-//! Signed calls to the AWS JSON APIs ocync uses: ECR and ECR Public.
+//! Calls to the AWS APIs ocync uses: ECR and ECR Public, signed, and for
+//! the credential chain STS, the IAM Identity Center portal and SSO OIDC.
 //!
-//! Signing, endpoint resolution, retries, clock-skew correction and error
-//! parsing are owned here. Credentials and the FIPS, dual-stack, endpoint URL
-//! and attempt settings still come from `aws-config`'s `SdkConfig`.
+//! Settings, the shared config and credentials files, signing, endpoint
+//! resolution, retries, clock-skew correction and error parsing are owned
+//! here, with no AWS SDK crate, and the credential chain in
+//! [`credentials`].
 
 mod calendar;
+mod config;
+mod credentials;
 mod endpoint;
+mod host;
+mod profile;
+#[cfg(test)]
+mod replay;
 mod retry;
 mod sigv4;
+mod xml;
+
+use self::config::{Config, ServiceId};
+use self::credentials::{Chain, Credentials};
+use self::host::{Host, Network, Transport};
 
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use aws_config::SdkConfig;
-use aws_config::retry::RetryConfig;
-use aws_credential_types::Credentials;
-use aws_credential_types::provider::error::CredentialsError;
-use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
-use aws_types::service_config::ServiceConfigKey;
 use bytes::Bytes;
-use http::{HeaderMap, StatusCode};
+use http::header::{CONTENT_TYPE, InvalidHeaderValue};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use url::Url;
 
 use self::calendar::parse_imf_fixdate;
-use self::endpoint::{DualStack, Endpoint, Fips, Region};
+use self::endpoint::{Endpoint, Region};
+use self::sigv4::encode_pairs;
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
+use crate::scheme::UnsupportedScheme;
 
 /// The content type of the AWS JSON 1.1 protocol both APIs speak.
 const AWS_JSON_1_1: &str = "application/x-amz-json-1.1";
 
 /// The header naming the operation, as `<target prefix>.<operation>`.
-const X_AMZ_TARGET: &str = "x-amz-target";
+const X_AMZ_TARGET: HeaderName = HeaderName::from_static("x-amz-target");
 
 /// A connection not made within this fails, so an unreachable endpoint
 /// surfaces in seconds. It is the SDK's value.
@@ -45,22 +57,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
 /// the SDK's stalled-stream grace period.
 const STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The SDK's default attempts per call, which size
-/// [`CREDENTIALS_LOAD_TIMEOUT`]. A call's own attempts come from its
-/// `RetryConfig`.
-const DEFAULT_MAX_ATTEMPTS: u32 = 3;
-
-/// The SDK's default first backoff, which sizes
-/// [`CREDENTIALS_LOAD_TIMEOUT`].
-const SDK_INITIAL_BACKOFF_MS: u64 = 1_000;
-
 /// A credential load that takes longer fails. This is the SDK's bound for
-/// its default retry and connect settings: every backoff between
-/// [`DEFAULT_MAX_ATTEMPTS`] attempts, plus each attempt at twice
-/// [`CONNECT_TIMEOUT`].
+/// its default retry and connect settings: every backoff between the
+/// default attempts, plus each attempt at twice [`CONNECT_TIMEOUT`].
 const CREDENTIALS_LOAD_TIMEOUT: Duration = Duration::from_millis(
-    SDK_INITIAL_BACKOFF_MS * ((1 << (DEFAULT_MAX_ATTEMPTS - 1)) - 1)
-        + DEFAULT_MAX_ATTEMPTS as u64 * 2 * CONNECT_TIMEOUT.as_millis() as u64,
+    retry::INITIAL_BACKOFF.as_millis() as u64
+        * ((1 << (retry::DEFAULT_MAX_ATTEMPTS.get() - 1)) - 1)
+        + retry::DEFAULT_MAX_ATTEMPTS.get() as u64 * 2 * CONNECT_TIMEOUT.as_millis() as u64,
 );
 
 /// How long a credential without an expiry is reused, as the SDK's identity
@@ -118,8 +121,18 @@ const CLOCK_SKEW_CODES: &[&str] = &[
     "AccessDeniedException",
 ];
 
-/// The AWS APIs ocync calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// What sets one AWS API apart from another to its calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApiId {
+    /// Names its endpoint URL settings and its retry partition.
+    service_id: ServiceId,
+    /// The name its requests are signed under, such as `ecr`.
+    signing_name: &'static str,
+    error_format: ErrorFormat,
+}
+
+/// The AWS JSON APIs ocync calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Service {
     /// Amazon ECR, for registry tokens and layer checks.
     Ecr,
@@ -128,14 +141,6 @@ pub(crate) enum Service {
 }
 
 impl Service {
-    /// The name the service signs requests under.
-    fn signing_name(self) -> &'static str {
-        match self {
-            Self::Ecr => "ecr",
-            Self::EcrPublic => "ecr-public",
-        }
-    }
-
     /// The `x-amz-target` prefix naming the service's operations.
     fn target_prefix(self) -> &'static str {
         match self {
@@ -144,12 +149,16 @@ impl Service {
         }
     }
 
-    /// The service ID that names its endpoint URL setting, such as
-    /// `AWS_ENDPOINT_URL_ECR_PUBLIC`.
-    fn service_id(self) -> &'static str {
-        match self {
-            Self::Ecr => "ECR",
-            Self::EcrPublic => "ECR PUBLIC",
+    /// How calls to the API are signed, partitioned and read.
+    fn api_id(self) -> ApiId {
+        let (service_id, signing_name) = match self {
+            Self::Ecr => (ServiceId::ECR, "ecr"),
+            Self::EcrPublic => (ServiceId::ECR_PUBLIC, "ecr-public"),
+        };
+        ApiId {
+            service_id,
+            signing_name,
+            error_format: ErrorFormat::Json,
         }
     }
 }
@@ -174,15 +183,23 @@ pub(crate) trait Operation: Serialize {
 /// Why a [`Client`] could not be built from the AWS configuration.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConfigError {
-    /// The configuration names no region.
-    #[error("no AWS region configured")]
-    MissingRegion,
+    /// An ECR hostname that names no region.
+    #[error("cannot extract AWS region from ECR hostname '{0}'")]
+    NoRegionInHostname(String),
     /// The configured region is not a valid host label.
-    #[error("invalid AWS region '{0}': must be a valid host label")]
-    InvalidRegion(String),
-    /// The configuration has no credentials provider.
-    #[error("no AWS credentials provider configured")]
-    MissingCredentialsProvider,
+    #[error(transparent)]
+    InvalidRegion(#[from] endpoint::InvalidRegion),
+    /// `AWS_MAX_ATTEMPTS` or `max_attempts` is not a whole number above 0.
+    #[error("invalid AWS max attempts '{text}': must be a whole number of at least 1")]
+    InvalidMaxAttempts {
+        /// The configured value.
+        text: String,
+        /// Why it did not parse.
+        source: std::num::ParseIntError,
+    },
+    /// `AWS_RETRY_MODE` or `retry_mode` is not `standard` or `adaptive`.
+    #[error("invalid AWS retry mode '{0}': must be standard or adaptive")]
+    InvalidRetryMode(String),
     /// An endpoint URL is configured together with FIPS endpoints.
     #[error("Invalid Configuration: FIPS and custom endpoint are not supported")]
     FipsWithEndpointUrl,
@@ -193,11 +210,8 @@ pub(crate) enum ConfigError {
     #[error("invalid AWS endpoint URL: {0}")]
     InvalidEndpoint(#[source] url::ParseError),
     /// The endpoint is a URL with no host to send to, such as `unix:`.
-    #[error("AWS endpoint URL scheme '{scheme}' is not http or https")]
-    EndpointNotHttp {
-        /// The configured scheme.
-        scheme: String,
-    },
+    #[error("invalid AWS endpoint URL: {0}")]
+    EndpointNotHttp(#[source] UnsupportedScheme),
     /// The HTTP client could not be built.
     #[error("failed to build the AWS HTTP client: {0}")]
     HttpClient(#[source] reqwest::Error),
@@ -222,21 +236,46 @@ enum CodeKind {
 struct ErrorCode {
     text: String,
     kind: CodeKind,
+    /// The operation's model of this code, when it has one.
+    modeled: Option<&'static ModeledError>,
+}
+
+/// Whether the SDK re-sends an error an operation models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeledRetry {
+    /// As a transient fault.
+    Transient,
+    /// Only as the shared code lists say.
+    Shared,
+}
+
+/// An error an operation models, as its SDK generates it.
+#[derive(Debug, PartialEq, Eq)]
+struct ModeledError {
+    /// The code on the wire, such as `InvalidIdentityToken`.
+    code: &'static str,
+    /// The name the SDK reports it under, such as
+    /// `InvalidIdentityTokenException`.
+    name: &'static str,
+    retry: ModeledRetry,
 }
 
 impl ErrorCode {
     /// Read the code from `x-amzn-errortype`, `code` or `__type` text, such as
     /// `aws.protocoltests#FooError:http://internal.amazon.com/coral/`, as the
-    /// SDK does. Text that names no code is `None`.
-    fn parse(raw: &str) -> Option<Self> {
+    /// SDK does, and classify it as the shared lists and the operation's
+    /// `modeled` errors say. Text that names no code is `None`.
+    fn parse(raw: &str, modeled: &'static [ModeledError]) -> Option<Self> {
         let code = raw.split_once(':').map_or(raw, |(code, _)| code);
         let code = code.split_once('#').map_or(code, |(_, code)| code);
         if code.is_empty() {
             return None;
         }
+        let modeled = modeled.iter().find(|m| m.code == code);
+        let modeled_transient = modeled.is_some_and(|m| m.retry == ModeledRetry::Transient);
         let kind = if THROTTLING_CODES.contains(&code) {
             CodeKind::Throttling
-        } else if TRANSIENT_CODES.contains(&code) {
+        } else if TRANSIENT_CODES.contains(&code) || modeled_transient {
             CodeKind::Transient
         } else if CLOCK_SKEW_CODES.contains(&code) {
             CodeKind::ClockSkew
@@ -246,6 +285,7 @@ impl ErrorCode {
         Some(Self {
             text: code.to_owned(),
             kind,
+            modeled,
         })
     }
 }
@@ -264,15 +304,22 @@ impl ServiceError {
     /// The code comes from `x-amzn-errortype`, else the body's `code`, else
     /// its `__type`. Only string values count, and a body that is not JSON
     /// still leaves the status, which is what retry classification needs.
-    fn parse(status: StatusCode, header_code: Option<ErrorCode>, body: &[u8]) -> Self {
+    fn parse(
+        status: StatusCode,
+        header_code: Option<&str>,
+        body: &[u8],
+        modeled: &'static [ModeledError],
+    ) -> Self {
         let body: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(body).unwrap_or_default();
         let text = |key: &str| body.get(key).and_then(serde_json::Value::as_str);
-        let code = header_code.or_else(|| {
-            text("code")
-                .or_else(|| text("__type"))
-                .and_then(ErrorCode::parse)
-        });
+        let code = header_code
+            .and_then(|raw| ErrorCode::parse(raw, modeled))
+            .or_else(|| {
+                text("code")
+                    .or_else(|| text("__type"))
+                    .and_then(|raw| ErrorCode::parse(raw, modeled))
+            });
         let message = ["message", "Message", "errorMessage"]
             .into_iter()
             .find_map(text)
@@ -281,6 +328,18 @@ impl ServiceError {
             status,
             code,
             message,
+            retry_after: None,
+        }
+    }
+
+    /// The code and message of a query protocol `ErrorResponse`. A body that
+    /// is not one still leaves the status.
+    fn parse_xml(status: StatusCode, body: &[u8], modeled: &'static [ModeledError]) -> Self {
+        let body = std::str::from_utf8(body).unwrap_or_default();
+        Self {
+            status,
+            code: xml::text(body, &["Error", "Code"]).and_then(|c| ErrorCode::parse(&c, modeled)),
+            message: xml::text(body, &["Error", "Message"]),
             retry_after: None,
         }
     }
@@ -363,13 +422,14 @@ impl fmt::Display for ClockSkew {
 /// Why one attempt at a call failed.
 #[derive(Debug, thiserror::Error)]
 enum Failure {
-    /// No credentials could be loaded.
-    #[error("failed to load AWS credentials: {0}")]
-    Credentials(#[source] CredentialsError),
-    /// The request did not complete. Built only through `From`, which drops
-    /// the URL.
+    /// No credentials could be loaded. The credential errors leave their
+    /// causes to `source`, and this text is all a caller keeps, so it names
+    /// every cause, and is not a source itself.
+    #[error("failed to load AWS credentials: {}", credentials::error_chain(.0))]
+    Credentials(credentials::Error),
+    /// The request did not complete.
     #[error("request failed: {0}")]
-    Transport(#[source] reqwest::Error),
+    Transport(#[source] TransportError),
     /// The service answered with an error.
     #[error("{0}")]
     Service(ServiceError),
@@ -385,21 +445,42 @@ enum Failure {
     /// The service's answer could not be read.
     #[error("unreadable response: {0}")]
     Decode(#[source] serde_json::Error),
+    /// A header to send, such as a credential's session token, holds a byte
+    /// a header cannot carry.
+    #[error("request has a header that cannot be sent: {0}")]
+    InvalidHeader(#[source] InvalidHeaderValue),
 }
 
-/// The endpoint URL may carry a key, so a transport error drops it.
-impl From<reqwest::Error> for Failure {
+/// A request that did not complete, its URL dropped: an endpoint URL can
+/// carry a key, and the error's text reaches logs and the report.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(super) struct TransportError(reqwest::Error);
+
+impl From<reqwest::Error> for TransportError {
     fn from(error: reqwest::Error) -> Self {
-        Self::Transport(error.without_url())
+        Self(error.without_url())
     }
 }
 
-impl Failure {
-    /// How the SDK retries this failure, or `None` when it does not. A throttle
-    /// code wins over the status it came with, as in the SDK.
+impl TransportError {
+    /// Whether a re-send may succeed.
+    pub(super) fn is_transient(&self) -> bool {
+        is_transient_transport(&self.0)
+    }
+}
+
+impl From<reqwest::Error> for Failure {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(error.into())
+    }
+}
+
+impl retry::Retryable for Failure {
+    /// A throttle code wins over the status it came with, as in the SDK.
     fn retry_kind(&self) -> Option<retry::Kind> {
         match self {
-            Self::Transport(e) => is_transient_transport(e).then_some(retry::Kind::Transient),
+            Self::Transport(e) => e.is_transient().then_some(retry::Kind::Transient),
             Self::Service(e) => match e.code.as_ref().map(|c| c.kind) {
                 Some(CodeKind::Throttling) => Some(retry::Kind::Throttling),
                 Some(CodeKind::Transient) => Some(retry::Kind::Transient),
@@ -411,15 +492,17 @@ impl Failure {
                 _ => None,
             },
             Self::ClockSkewed { .. } => Some(retry::Kind::Server),
-            Self::Credentials(_) | Self::Decode(_) => None,
+            Self::Credentials(_) | Self::Decode(_) | Self::InvalidHeader(_) => None,
         }
     }
 
-    /// The wait the service asked for before a retry.
     fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Service(error) | Self::ClockSkewed { error, .. } => error.retry_after,
-            Self::Credentials(_) | Self::Transport(_) | Self::Decode(_) => None,
+            Self::Credentials(_)
+            | Self::Transport(_)
+            | Self::Decode(_)
+            | Self::InvalidHeader(_) => None,
         }
     }
 }
@@ -434,11 +517,52 @@ pub(crate) struct CallError {
     source: Failure,
 }
 
-/// A client for one AWS JSON API in one region.
-pub(crate) struct Client {
-    http: reqwest::Client,
-    provider: SharedCredentialsProvider,
-    credentials: CredentialCache<Credentials>,
+/// How an API writes its error answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorFormat {
+    /// The JSON protocols: `x-amzn-errortype`, `code` or `__type`.
+    Json,
+    /// The query protocol: `<Error><Code>` in an `ErrorResponse`.
+    Xml,
+}
+
+/// Whether a request carries a signature.
+enum Signing {
+    /// Signed with this key.
+    Signed(Credentials),
+    /// Sent unsigned, as an operation that proves identity some other way
+    /// is.
+    Unsigned,
+}
+
+/// A request to an [`Api`]'s endpoint.
+struct ApiRequest<'a> {
+    /// The operation's name, for logs and errors.
+    operation: &'static str,
+    method: http::Method,
+    /// The operation's path, joined to the endpoint's.
+    path: &'static str,
+    /// Headers to send, signed when the request is.
+    headers: &'a [(HeaderName, &'a str)],
+    body: Bytes,
+    /// The errors the operation models.
+    modeled_errors: &'static [ModeledError],
+}
+
+/// The settings an [`Api`] is built from, beside its [`ApiId`].
+struct ApiParts {
+    region: Region,
+    endpoint: Endpoint,
+    retry: retry::Strategy,
+    partition: Arc<retry::Partition>,
+    skew_correction: SkewCorrection,
+    stall_timeout: Duration,
+}
+
+/// One AWS API in one region: where its requests go, and the retry, clock
+/// skew and error handling every call to it shares.
+struct Api {
+    http: Transport,
     /// The last [`ClockSkew`] measured, which every signature corrects for.
     /// Stays 0 when `skew_correction` is off.
     skew: AtomicI64,
@@ -448,88 +572,16 @@ pub(crate) struct Client {
     /// The retry quota and rate limiter shared with every client for the
     /// same service and region.
     partition: Arc<retry::Partition>,
-    service: Service,
     region: Region,
     endpoint: Endpoint,
+    id: ApiId,
 }
 
-impl fmt::Debug for Client {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Client")
-            .field("service", &self.service)
-            .field("endpoint", &self.endpoint)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Everything a [`Client`] is built from.
-struct Parts {
-    provider: SharedCredentialsProvider,
-    service: Service,
-    region: Region,
-    endpoint: Endpoint,
-    retry: retry::Strategy,
-    partition: Arc<retry::Partition>,
-    skew_correction: SkewCorrection,
-    stall_timeout: Duration,
-}
-
-impl Client {
-    /// A client for `service` in the region and with the credentials,
-    /// endpoint settings, endpoint URL override and attempt count `config`
-    /// carries.
-    pub(crate) fn new(config: &SdkConfig, service: Service) -> Result<Self, ConfigError> {
-        let region = Region::parse(config.region().ok_or(ConfigError::MissingRegion)?.as_ref())?;
-        let provider = config
-            .credentials_provider()
-            .ok_or(ConfigError::MissingCredentialsProvider)?;
-        let endpoint_url = config
-            .service_config()
-            .and_then(|c| {
-                let key = ServiceConfigKey::builder()
-                    .service_id(service.service_id())
-                    .env("AWS_ENDPOINT_URL")
-                    .profile("endpoint_url")
-                    .build()
-                    .expect("every key part is set");
-                c.load_config(key)
-            })
-            .or_else(|| config.endpoint_url().map(str::to_owned))
-            .map(|url| Endpoint::parse(&url))
-            .transpose()?;
-        let fips = match config.use_fips() {
-            Some(true) => Fips::On,
-            _ => Fips::Off,
-        };
-        let dual_stack = match config.use_dual_stack() {
-            Some(true) => DualStack::On,
-            _ => DualStack::Off,
-        };
-        let endpoint = endpoint::resolve(service, &region, fips, dual_stack, endpoint_url)?;
-        let skew_correction = match config.disable_clock_skew_correction() {
-            Some(true) => SkewCorrection::Off,
-            _ => SkewCorrection::On,
-        };
-        let retry = config.retry_config().map_or_else(
-            || retry::Strategy::new(&RetryConfig::standard()),
-            retry::Strategy::new,
-        );
-        Self::from_parts(Parts {
-            provider,
-            service,
-            partition: retry::partition(service, &region),
-            region,
-            endpoint,
-            retry,
-            skew_correction,
-            stall_timeout: STALL_TIMEOUT,
-        })
-    }
-
-    fn from_parts(parts: Parts) -> Result<Self, ConfigError> {
-        let Parts {
-            provider,
-            service,
+impl Api {
+    /// The API `id` with the settings `parts` hold, sending through
+    /// `network` with the client settings of every AWS API call.
+    fn new(network: &Network, id: ApiId, parts: ApiParts) -> Result<Self, reqwest::Error> {
+        let ApiParts {
             region,
             endpoint,
             retry,
@@ -537,80 +589,122 @@ impl Client {
             skew_correction,
             stall_timeout,
         } = parts;
-        crate::install_crypto_provider();
-        // Signed requests never follow a redirect: the signature names the
-        // host it was made for.
-        let http = crate::client::no_redirect_builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(stall_timeout)
-            .build()
-            .map_err(ConfigError::HttpClient)?;
         Ok(Self {
-            http,
-            provider,
-            credentials: CredentialCache::new(),
-            skew: AtomicI64::new(0),
+            http: network.transport(api_client(stall_timeout))?,
+            skew: AtomicI64::default(),
             skew_correction,
             retry,
             partition,
-            service,
             region,
             endpoint,
+            id,
         })
     }
 
-    /// Call `O` with `input`, re-sending throttles, transient faults and
+    /// Send `request`, re-sending throttles, transient faults and
     /// clock-skewed signatures as the SDK's retry policy allows (see
-    /// [`retry`]), and decode its output.
-    pub(crate) async fn call<O: Operation>(&self, input: &O) -> Result<O::Output, CallError> {
-        let body = Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize"));
-        let target = format!("{}.{}", self.service.target_prefix(), O::NAME);
-        let (target, body) = (&target, &body);
+    /// [`retry`]), and return the successful answer's body. `signing` is
+    /// asked before each attempt whether to sign, and with which key.
+    async fn call<F, Fut>(&self, request: &ApiRequest<'_>, signing: F) -> Result<Bytes, Failure>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Signing, Failure>>,
+    {
+        self.call_with(request, &[], signing).await
+    }
+
+    /// Send `request` unsigned with `query`, as an operation that proves
+    /// identity some other way is. Only an unsigned call takes a query, as
+    /// the signer signs none.
+    async fn call_unsigned(
+        &self,
+        request: &ApiRequest<'_>,
+        query: &[(&str, &str)],
+    ) -> Result<Bytes, Failure> {
+        self.call_with(request, query, || async { Ok(Signing::Unsigned) })
+            .await
+    }
+
+    async fn call_with<F, Fut>(
+        &self,
+        request: &ApiRequest<'_>,
+        query: &[(&str, &str)],
+        signing: F,
+    ) -> Result<Bytes, Failure>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Signing, Failure>>,
+    {
+        let url = self.url(request.path, query);
+        let signed_headers: Vec<(&str, &str)> = request
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .chain([("host", self.endpoint.host())])
+            .collect();
         let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
-        retrying(O::NAME, &mut policy, |attempt| async move {
+        let (url, signing, signed_headers) = (&url, &signing, &signed_headers);
+        retrying(request.operation, &mut policy, |attempt| async move {
             self.partition.send_token(&self.retry, attempt).await;
-            self.send(target, body.clone()).await
+            let signing = signing().await?;
+            self.send(request, url, signed_headers, &signing).await
         })
         .await
-        .map_err(|source| CallError {
-            service: self.service,
-            operation: O::NAME,
-            source,
-        })
     }
 
-    async fn send<T: DeserializeOwned>(&self, target: &str, body: Bytes) -> Result<T, Failure> {
-        let credentials = self.credentials().await?;
-        let headers = [("content-type", AWS_JSON_1_1), (X_AMZ_TARGET, target)];
-        let signed_headers = [headers[0], headers[1], ("host", self.endpoint.host())];
+    /// The URL of the operation at `path` with `query`, each query value
+    /// encoded as the SDK encodes it.
+    fn url(&self, path: &str, query: &[(&str, &str)]) -> Url {
+        let mut url = endpoint::join_path(self.endpoint.url(), path);
+        if !query.is_empty() {
+            url.set_query(Some(&encode_pairs(query.iter().copied())));
+        }
+        url
+    }
+
+    /// Send `request` to `url` once. `signed_headers` are its headers and
+    /// `host`, as a signature covers them.
+    async fn send(
+        &self,
+        request: &ApiRequest<'_>,
+        url: &Url,
+        signed_headers: &[(&str, &str)],
+        signing: &Signing,
+    ) -> Result<Bytes, Failure> {
         let sent = SystemTime::now();
         let applied = ClockSkew(self.skew.load(Ordering::Relaxed));
-        let signed = sigv4::sign(
-            &sigv4::Request {
-                method: &http::Method::POST,
-                path: self.endpoint.url().path(),
-                headers: &signed_headers,
-                body: &body,
-            },
-            sigv4::AccessKey {
-                id: credentials.access_key_id(),
-                secret: credentials.secret_access_key(),
-                session_token: credentials.session_token(),
-            },
-            &sigv4::CredentialScope {
-                region: self.region.as_str(),
-                service: self.service.signing_name(),
-            },
-            applied.apply(sent),
-        );
-        let mut request = self.http.post(self.endpoint.url().clone()).body(body);
-        for (name, value) in headers {
-            request = request.header(name, value);
+        let mut outgoing = reqwest::Request::new(request.method.clone(), url.clone());
+        *outgoing.body_mut() = Some(request.body.clone().into());
+        let headers = outgoing.headers_mut();
+        for (name, value) in request.headers {
+            let value = HeaderValue::from_str(value).map_err(Failure::InvalidHeader)?;
+            headers.insert(name, value);
         }
-        for (name, value) in signed {
-            request = request.header(name, value);
+        if let Signing::Signed(credentials) = signing {
+            let signed = sigv4::sign(
+                &sigv4::Request {
+                    method: &request.method,
+                    path: url.path(),
+                    headers: signed_headers,
+                    body: &request.body,
+                },
+                sigv4::AccessKey {
+                    id: credentials.access_key_id(),
+                    secret: credentials.secret_access_key(),
+                    session_token: credentials.session_token(),
+                },
+                &sigv4::CredentialScope {
+                    region: self.region.as_str(),
+                    service: self.id.signing_name,
+                },
+                applied.apply(sent),
+            );
+            for (name, value) in signed {
+                let value = HeaderValue::try_from(value).map_err(Failure::InvalidHeader)?;
+                headers.insert(HeaderName::from_static(name), value);
+            }
         }
-        let response = request.send().await?;
+        let response = self.http.send(outgoing).await?;
         let measured = match self.skew_correction {
             SkewCorrection::On => ClockSkew::measure(response.headers(), sent, SystemTime::now()),
             SkewCorrection::Off => None,
@@ -619,11 +713,7 @@ impl Client {
             self.skew.store(skew.0, Ordering::Relaxed);
         }
         let status = response.status();
-        let header_code = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|v| v.to_str().ok())
-            .and_then(ErrorCode::parse);
+        let header_code = response.headers().get("x-amzn-errortype").cloned();
         let retry_after = response
             .headers()
             .get(X_AMZ_RETRY_AFTER)
@@ -631,16 +721,26 @@ impl Client {
             .map(Duration::from_millis);
         let bytes = response.bytes().await?;
         if status.is_success() {
-            return serde_json::from_slice(&bytes).map_err(Failure::Decode);
+            return Ok(bytes);
         }
+        let modeled = request.modeled_errors;
         let error = ServiceError {
             retry_after,
-            ..ServiceError::parse(status, header_code, &bytes)
+            ..match self.id.error_format {
+                ErrorFormat::Json => ServiceError::parse(
+                    status,
+                    header_code.as_ref().and_then(|v| v.to_str().ok()),
+                    &bytes,
+                    modeled,
+                ),
+                ErrorFormat::Xml => ServiceError::parse_xml(status, &bytes, modeled),
+            }
         };
-        let signature_rejected = error
-            .code
-            .as_ref()
-            .is_some_and(|c| c.kind == CodeKind::ClockSkew);
+        let signature_rejected = matches!(signing, Signing::Signed(_))
+            && error
+                .code
+                .as_ref()
+                .is_some_and(|c| c.kind == CodeKind::ClockSkew);
         // The SDK compares the whole skew. Once a signature is already on
         // AWS's clock, a rejection is real (a denied role or a bad key), so
         // only the skew this signature left uncorrected counts.
@@ -654,18 +754,148 @@ impl Client {
             _ => Failure::Service(error),
         })
     }
+}
+
+/// Where a client's credentials come from.
+enum Provider {
+    /// The default credential chain.
+    Chain(Box<Chain>),
+    /// A test's own loader, to count or stall loads.
+    #[cfg(test)]
+    Test(tests::Loader),
+}
+
+impl Provider {
+    async fn load(&self) -> Result<Credentials, credentials::Error> {
+        match self {
+            Self::Chain(chain) => chain.load().await,
+            #[cfg(test)]
+            Self::Test(loader) => loader().await,
+        }
+    }
+}
+
+/// A client for one AWS JSON API in one region.
+pub(crate) struct Client {
+    api: Api,
+    provider: Provider,
+    credentials: CredentialCache<Credentials>,
+    service: Service,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("service", &self.service)
+            .field("endpoint", &self.api.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Everything a [`Client`] is built from.
+struct Parts {
+    provider: Provider,
+    service: Service,
+    network: Network,
+    api: ApiParts,
+}
+
+impl Client {
+    /// A client for `service` in `region`, configured from the process
+    /// environment and the shared AWS files, `profile` naming the profile
+    /// to use in place of `AWS_PROFILE`.
+    pub(crate) fn from_env(
+        region: &str,
+        profile: Option<&str>,
+        service: Service,
+    ) -> Result<Self, ConfigError> {
+        Self::new(&Host::current(), region, profile, service)
+    }
+
+    /// A client for `service` in `region`, with the endpoint, retry,
+    /// clock-skew and credential settings `host` holds for `profile`.
+    fn new(
+        host: &Host,
+        region: &str,
+        profile: Option<&str>,
+        service: Service,
+    ) -> Result<Self, ConfigError> {
+        let config = Config::load(host, profile);
+        let region = Region::parse(region)?;
+        let endpoint = endpoint::resolve(
+            service,
+            &region,
+            config.fips(),
+            config.dual_stack(),
+            config.endpoint_url(service.api_id().service_id)?,
+        )?;
+        let retry = config.retry()?;
+        let api = ApiParts {
+            partition: retry::partition(service.api_id().service_id, &region),
+            endpoint,
+            retry: retry::Strategy::new(&retry),
+            skew_correction: config.skew_correction(),
+            stall_timeout: STALL_TIMEOUT,
+            region,
+        };
+        let chain =
+            Chain::new(host, &api.region, config, &retry).map_err(ConfigError::HttpClient)?;
+        Self::from_parts(Parts {
+            provider: Provider::Chain(Box::new(chain)),
+            service,
+            network: host.network.clone(),
+            api,
+        })
+    }
+
+    fn from_parts(parts: Parts) -> Result<Self, ConfigError> {
+        let Parts {
+            provider,
+            service,
+            network,
+            api,
+        } = parts;
+        Ok(Self {
+            api: Api::new(&network, service.api_id(), api).map_err(ConfigError::HttpClient)?,
+            provider,
+            credentials: CredentialCache::new(),
+            service,
+        })
+    }
+
+    /// Call `O` with `input`, retried as [`Api::call`] does, and decode its
+    /// output.
+    pub(crate) async fn call<O: Operation>(&self, input: &O) -> Result<O::Output, CallError> {
+        let target = format!("{}.{}", self.service.target_prefix(), O::NAME);
+        let request = ApiRequest {
+            operation: O::NAME,
+            method: http::Method::POST,
+            path: "/",
+            headers: &[(CONTENT_TYPE, AWS_JSON_1_1), (X_AMZ_TARGET, &target)],
+            body: Bytes::from(serde_json::to_vec(input).expect("operation inputs serialize")),
+            modeled_errors: &[],
+        };
+        self.api
+            .call(&request, || async {
+                self.credentials().await.map(Signing::Signed)
+            })
+            .await
+            .and_then(|body| serde_json::from_slice(&body).map_err(Failure::Decode))
+            .map_err(|source| CallError {
+                service: self.service,
+                operation: O::NAME,
+                source,
+            })
+    }
 
     /// The cached credential, loaded again shortly before it expires.
     /// Concurrent callers share one load instead of each asking IMDS or STS.
     async fn credentials(&self) -> Result<Credentials, Failure> {
         self.credentials
-            .get_or_refresh("aws-credentials", async {
-                let loaded = tokio::time::timeout(
-                    CREDENTIALS_LOAD_TIMEOUT,
-                    self.provider.provide_credentials(),
-                )
-                .await
-                .map_err(|_| CredentialsError::provider_timed_out(CREDENTIALS_LOAD_TIMEOUT))??;
+            .get_or_refresh(async {
+                let loaded = tokio::time::timeout(CREDENTIALS_LOAD_TIMEOUT, self.provider.load())
+                    .await
+                    .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))??;
                 let ttl = loaded.expiry().map_or(DEFAULT_EXPIRATION, remaining);
                 Ok((loaded, ttl))
             })
@@ -674,14 +904,26 @@ impl Client {
     }
 }
 
+/// The HTTP client settings for AWS API calls. The client never follows a
+/// redirect, since a signature names the host it was made for, and it uses
+/// `HTTPS_PROXY` and `NO_PROXY` as the rest of ocync does.
+fn api_client(stall_timeout: Duration) -> reqwest::ClientBuilder {
+    crate::client::no_redirect_builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(stall_timeout)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
-    use wiremock::matchers::{body_json, header, header_exists, method, path};
+    use wiremock::matchers::{any, body_json, header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use super::retry::Retryable as _;
     use super::*;
 
     /// An operation the tests call, answered with `{"ok": true}`.
@@ -698,47 +940,60 @@ mod tests {
         type Output = ProbeOutput;
     }
 
-    fn static_credentials(session_token: Option<&str>) -> SharedCredentialsProvider {
-        SharedCredentialsProvider::new(Credentials::new(
-            "AKIDEXAMPLE",
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            session_token.map(str::to_owned),
-            None,
-            "test",
-        ))
+    /// A test's own credential loader.
+    pub(super) type Loader = Box<
+        dyn Fn() -> Pin<Box<dyn Future<Output = Result<Credentials, credentials::Error>> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    /// A provider answering with the example key and `session_token`.
+    fn static_credentials(session_token: Option<&str>) -> Provider {
+        let credentials = credentials::tests::key(session_token, None);
+        Provider::Test(Box::new(move || {
+            let credentials = credentials.clone();
+            Box::pin(async move { Ok(credentials) })
+        }))
     }
 
     /// The SDK's settings with `max_attempts` and a 1 ms first backoff, so a
     /// test's retries take milliseconds.
-    fn strategy(max_attempts: u32) -> retry::Strategy {
-        retry::Strategy::new(
-            &RetryConfig::standard()
-                .with_max_attempts(max_attempts)
-                .with_initial_backoff(Duration::from_millis(1)),
-        )
+    fn strategy(max_attempts: NonZeroU32) -> retry::Strategy {
+        retry::Strategy::new(&retry::Settings {
+            max_attempts,
+            initial_backoff: Duration::from_millis(1),
+            ..retry::Settings::default()
+        })
     }
 
-    /// The parts of an ECR client in `us-east-1` at `endpoint`, with static
-    /// credentials, the SDK's default attempts and its own retry quota.
+    /// The parts of an ECR client with static credentials and the
+    /// [`api_parts`] for `endpoint`.
     fn parts(endpoint: &str) -> Parts {
         Parts {
             provider: static_credentials(None),
             service: Service::Ecr,
+            network: Network::Real,
+            api: api_parts(endpoint),
+        }
+    }
+
+    /// The settings of an API in `us-east-1` at `endpoint`, with the SDK's
+    /// default attempts and its own retry quota.
+    fn api_parts(endpoint: &str) -> ApiParts {
+        ApiParts {
             region: Region::parse("us-east-1").unwrap(),
             endpoint: Endpoint::parse(endpoint).unwrap(),
-            retry: strategy(DEFAULT_MAX_ATTEMPTS),
+            retry: strategy(retry::DEFAULT_MAX_ATTEMPTS),
             partition: Arc::default(),
             skew_correction: SkewCorrection::On,
             stall_timeout: STALL_TIMEOUT,
         }
     }
 
-    fn client(server: &MockServer, max_attempts: u32) -> Client {
-        Client::from_parts(Parts {
-            retry: strategy(max_attempts),
-            ..parts(&server.uri())
-        })
-        .unwrap()
+    fn client(server: &MockServer, max_attempts: NonZeroU32) -> Client {
+        let mut parts = parts(&server.uri());
+        parts.api.retry = strategy(max_attempts);
+        Client::from_parts(parts).unwrap()
     }
 
     fn ok() -> ResponseTemplate {
@@ -805,7 +1060,7 @@ mod tests {
                 .expect(sent)
                 .mount(&server)
                 .await;
-            let err = client(&server, max_attempts)
+            let err = client(&server, NonZeroU32::new(max_attempts).unwrap())
                 .call(&Probe {})
                 .await
                 .unwrap_err();
@@ -828,7 +1083,7 @@ mod tests {
             .mount(&server)
             .await;
         assert_eq!(
-            client(&server, DEFAULT_MAX_ATTEMPTS)
+            client(&server, retry::DEFAULT_MAX_ATTEMPTS)
                 .call(&Probe {})
                 .await
                 .unwrap(),
@@ -847,12 +1102,10 @@ mod tests {
             std::future::pending::<()>().await;
             drop(socket);
         });
-        let client = Client::from_parts(Parts {
-            retry: strategy(1),
-            stall_timeout: Duration::from_millis(200),
-            ..parts(&format!("http://{address}"))
-        })
-        .unwrap();
+        let mut parts = parts(&format!("http://{address}"));
+        parts.api.retry = strategy(NonZeroU32::MIN);
+        parts.api.stall_timeout = Duration::from_millis(200);
+        let client = Client::from_parts(parts).unwrap();
         let err = tokio::time::timeout(Duration::from_secs(10), client.call(&Probe {}))
             .await
             .expect("the stall limit ends the call")
@@ -883,7 +1136,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = client(&server, DEFAULT_MAX_ATTEMPTS)
+        let err = client(&server, retry::DEFAULT_MAX_ATTEMPTS)
             .call(&Probe {})
             .await
             .unwrap_err();
@@ -898,14 +1151,28 @@ mod tests {
     /// anything else, or an answer that does not parse, is not retried.
     #[test]
     fn classifies_answers_as_the_sdk_does() {
-        let kind = |status: u16, code: Option<&str>| {
+        let kind_modeled = |status: u16, code: Option<&str>, modeled| {
             Failure::Service(ServiceError::parse(
                 StatusCode::from_u16(status).unwrap(),
-                code.and_then(ErrorCode::parse),
+                code,
                 b"",
+                modeled,
             ))
             .retry_kind()
         };
+        let kind = |status, code| kind_modeled(status, code, &[]);
+        // A code one operation models as transient is final for the rest.
+        let modeled = &[ModeledError {
+            code: "IDPCommunicationError",
+            name: "IdpCommunicationErrorException",
+            retry: ModeledRetry::Transient,
+        }];
+        let idp = Some("IDPCommunicationError");
+        assert_eq!(
+            kind_modeled(400, idp, modeled),
+            Some(retry::Kind::Transient)
+        );
+        assert_eq!(kind(400, idp), None);
         assert_eq!(
             kind(503, Some("ThrottlingException")),
             Some(retry::Kind::Throttling)
@@ -940,7 +1207,7 @@ mod tests {
             .mount(&server)
             .await;
         let started = std::time::Instant::now();
-        client(&server, DEFAULT_MAX_ATTEMPTS)
+        client(&server, retry::DEFAULT_MAX_ATTEMPTS)
             .call(&Probe {})
             .await
             .unwrap();
@@ -952,12 +1219,10 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let client = Client::from_parts(Parts {
-            retry: strategy(10),
-            partition: Arc::new(retry::Partition::with_capacity(5)),
-            ..parts(&server.uri())
-        })
-        .unwrap();
+        let mut parts = parts(&server.uri());
+        parts.api.retry = strategy(NonZeroU32::new(10).unwrap());
+        parts.api.partition = Arc::new(retry::Partition::with_capacity(5));
+        let client = Client::from_parts(parts).unwrap();
         client.call(&Probe {}).await.unwrap_err();
     }
 
@@ -987,8 +1252,8 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let corrected = client(&server, DEFAULT_MAX_ATTEMPTS);
-        corrected.skew.store(600_000, Ordering::Relaxed);
+        let corrected = client(&server, retry::DEFAULT_MAX_ATTEMPTS);
+        corrected.api.skew.store(600_000, Ordering::Relaxed);
         corrected.call(&Probe {}).await.unwrap_err();
 
         for (ahead, cached, skew_correction, sent) in [
@@ -1009,11 +1274,9 @@ mod tests {
                 .expect(sent - 1)
                 .mount(&server)
                 .await;
-            let client = Client::from_parts(Parts {
-                skew_correction,
-                ..parts(&server.uri())
-            })
-            .unwrap();
+            let mut parts = parts(&server.uri());
+            parts.api.skew_correction = skew_correction;
+            let client = Client::from_parts(parts).unwrap();
             let result = client.call(&Probe {}).await;
             assert_eq!(
                 result.is_ok(),
@@ -1033,6 +1296,94 @@ mod tests {
                 assert!((598..=602).contains(&shift), "signed {shift}s later");
             }
         }
+    }
+
+    /// An unsigned call that draws a signature error is final, however far
+    /// apart the clocks are: there is no signature to make again. Breaks if
+    /// a skewed answer re-sends an unsigned request.
+    #[tokio::test]
+    async fn does_not_resend_an_unsigned_call_for_skew() {
+        let server = MockServer::start().await;
+        let ahead = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(600));
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("date", ahead.as_str())
+                    .set_body_json(serde_json::json!({"__type": "InvalidSignatureException"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = Api::new(
+            &Network::Real,
+            Service::Ecr.api_id(),
+            api_parts(&server.uri()),
+        )
+        .unwrap();
+        let request = ApiRequest {
+            operation: "Probe",
+            method: http::Method::POST,
+            path: "/",
+            headers: &[],
+            body: Bytes::new(),
+            modeled_errors: &[],
+        };
+        let err = api
+            .call(&request, || async { Ok(Signing::Unsigned) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Failure::Service(_)), "{err}");
+    }
+
+    /// The operation's path joins a configured endpoint's path with one
+    /// slash, as the SDK joins them, and an unsigned call's query has every
+    /// byte outside the unreserved set encoded. Breaks if the endpoint's
+    /// path is dropped, a slash doubles, or a query value is sent as is.
+    #[tokio::test]
+    async fn joins_the_operation_path_to_the_endpoint_path() {
+        let server = MockServer::start().await;
+        Mock::given(any()).respond_with(ok()).mount(&server).await;
+        let api = Api::new(
+            &Network::Real,
+            Service::Ecr.api_id(),
+            api_parts(&format!("{}/prefix/", server.uri())),
+        )
+        .unwrap();
+        let request = |method, path| ApiRequest {
+            operation: "Probe",
+            method,
+            path,
+            headers: &[],
+            body: Bytes::new(),
+            modeled_errors: &[],
+        };
+        let query = [("role_name", "a b+c/d"), ("account_id", "1")];
+        api.call_unsigned(
+            &request(http::Method::GET, "/federation/credentials"),
+            &query,
+        )
+        .await
+        .unwrap();
+        api.call(&request(http::Method::POST, "/"), || async {
+            Ok(Signing::Signed(credentials::tests::key(None, None)))
+        })
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let sent: Vec<_> = requests
+            .iter()
+            .map(|r| (r.url.path(), r.url.query()))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (
+                    "/prefix/federation/credentials",
+                    Some("role_name=a%20b%2Bc%2Fd&account_id=1")
+                ),
+                ("/prefix/", None),
+            ]
+        );
     }
 
     /// The skew is the server's `Date` against the midpoint of the round
@@ -1088,11 +1439,7 @@ mod tests {
     #[test]
     fn reads_the_error_code_as_the_sdk_does() {
         let parse = |header: Option<&str>, body: &str| {
-            let e = ServiceError::parse(
-                StatusCode::BAD_REQUEST,
-                header.and_then(ErrorCode::parse),
-                body.as_bytes(),
-            );
+            let e = ServiceError::parse(StatusCode::BAD_REQUEST, header, body.as_bytes(), &[]);
             (e.code.map(|c| (c.text, c.kind)), e.message)
         };
         let code = |text: &str, kind| Some((text.to_owned(), kind));
@@ -1147,25 +1494,15 @@ mod tests {
     /// layer checks does not reload it from IMDS or STS on every call.
     #[tokio::test]
     async fn reuses_a_credential_until_it_nears_expiry() {
-        #[derive(Debug)]
-        struct Counting(Arc<AtomicUsize>, Duration);
-        impl ProvideCredentials for Counting {
-            fn provide_credentials<'a>(
-                &'a self,
-            ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
-            where
-                Self: 'a,
-            {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                aws_credential_types::provider::future::ProvideCredentials::ready(Ok(
-                    Credentials::new("id", "secret", None, Some(SystemTime::now() + self.1), "t"),
-                ))
-            }
-        }
         for (lifetime, loads) in [(Duration::from_secs(3600), 1), (Duration::from_secs(5), 2)] {
             let count = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&count);
             let client = Client::from_parts(Parts {
-                provider: SharedCredentialsProvider::new(Counting(count.clone(), lifetime)),
+                provider: Provider::Test(Box::new(move || {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    let expiry = SystemTime::now() + lifetime;
+                    Box::pin(async move { Ok(credentials::tests::key(None, Some(expiry))) })
+                })),
                 ..parts("https://example.com")
             })
             .unwrap();
@@ -1180,22 +1517,8 @@ mod tests {
     /// holding it forever.
     #[tokio::test(start_paused = true)]
     async fn gives_up_on_a_credential_source_that_hangs() {
-        #[derive(Debug)]
-        struct Hangs;
-        impl ProvideCredentials for Hangs {
-            fn provide_credentials<'a>(
-                &'a self,
-            ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
-            where
-                Self: 'a,
-            {
-                aws_credential_types::provider::future::ProvideCredentials::new(
-                    std::future::pending(),
-                )
-            }
-        }
         let client = Client::from_parts(Parts {
-            provider: SharedCredentialsProvider::new(Hangs),
+            provider: Provider::Test(Box::new(|| Box::pin(std::future::pending()))),
             ..parts("https://example.com")
         })
         .unwrap();
@@ -1203,56 +1526,65 @@ mod tests {
         let err = client.call(&Probe {}).await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ECR GetAuthorizationToken failed: failed to load AWS credentials: credentials provider timed out after 21 seconds"
+            "ECR GetAuthorizationToken failed: failed to load AWS credentials: credentials provider timed out after 21.6 seconds"
         );
         assert_eq!(started.elapsed(), CREDENTIALS_LOAD_TIMEOUT);
     }
+
     /// A configured region that is not a host label fails when the client is
     /// built, before it can reach an endpoint host name.
     #[test]
     fn refuses_a_region_that_is_not_a_host_label() {
-        let config = |region: &'static str| {
-            SdkConfig::builder()
-                .region(aws_config::Region::new(region))
-                .credentials_provider(static_credentials(None))
-                .build()
-        };
-        Client::new(&config("us-west-2"), Service::Ecr).unwrap();
-        let err = Client::new(&config("evil.example/x"), Service::Ecr).unwrap_err();
+        let host = config::tests::host(&[], "");
+        let client = |region| Client::new(&host, region, None, Service::Ecr);
+        client("us-west-2").unwrap();
+        let err = client("evil.example/x").unwrap_err();
         assert!(matches!(err, ConfigError::InvalidRegion(_)), "{err}");
     }
 
-    /// `disable_clock_skew_correction` in the SDK's configuration turns
-    /// correction off; unset or false leaves it on.
+    /// The settings reach the client: the skew switch, FIPS on the
+    /// endpoint and the attempt count. Breaks if `new` drops one.
     #[test]
-    fn reads_the_skew_correction_switch() {
-        let config = |disable: Option<bool>| {
-            let mut builder = SdkConfig::builder()
-                .region(aws_config::Region::new("us-west-2"))
-                .credentials_provider(static_credentials(None));
-            builder.set_disable_clock_skew_correction(disable);
-            builder.build()
-        };
-        for (disable, expected) in [
-            (None, SkewCorrection::On),
-            (Some(false), SkewCorrection::On),
-            (Some(true), SkewCorrection::Off),
-        ] {
-            let client = Client::new(&config(disable), Service::Ecr).unwrap();
-            assert_eq!(client.skew_correction, expected, "{disable:?}");
-        }
+    fn new_applies_the_settings() {
+        let host = config::tests::host(
+            &[
+                ("AWS_DISABLE_CLOCK_SKEW_CORRECTION", "true"),
+                ("AWS_USE_FIPS_ENDPOINT", "true"),
+                ("AWS_MAX_ATTEMPTS", "1"),
+            ],
+            "",
+        );
+        let new = |host| Client::new(host, "us-west-2", None, Service::Ecr);
+        let client = new(&host).unwrap();
+        assert_eq!(client.api.skew_correction, SkewCorrection::Off);
+        assert_eq!(
+            client.api.endpoint.host(),
+            "api.ecr-fips.us-west-2.amazonaws.com"
+        );
+        assert_eq!(client.api.retry.max_attempts(), 1);
+        let bad = config::tests::host(&[("AWS_RETRY_MODE", "legacy")], "");
+        let err = new(&bad).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidRetryMode(_)), "{err}");
     }
 
-    /// The defaults that size the credential load timeout are the SDK's
-    /// standard retry defaults.
+    /// A named profile replaces `AWS_PROFILE` for the client's settings.
+    /// Breaks if `new` reads the selected profile instead of the named one.
     #[test]
-    fn sizes_the_credential_timeout_from_the_sdk_defaults() {
-        let standard = RetryConfig::standard();
-        assert_eq!(DEFAULT_MAX_ATTEMPTS, standard.max_attempts());
-        assert_eq!(
-            Duration::from_millis(SDK_INITIAL_BACKOFF_MS),
-            standard.initial_backoff()
+    fn new_reads_the_named_profile() {
+        let host = config::tests::host(
+            &[("AWS_PROFILE", "default")],
+            "[default]\nuse_fips_endpoint = true\n[profile other]\nuse_fips_endpoint = false\n",
         );
+        let host_name = |profile| {
+            Client::new(&host, "us-west-2", profile, Service::Ecr)
+                .unwrap()
+                .api
+                .endpoint
+                .host()
+                .to_owned()
+        };
+        assert_eq!(host_name(None), "api.ecr-fips.us-west-2.amazonaws.com");
+        assert_eq!(host_name(Some("other")), "api.ecr.us-west-2.amazonaws.com");
     }
 
     /// A transport failure does not carry the endpoint URL, whose path may
@@ -1262,11 +1594,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let client = Client::from_parts(Parts {
-            retry: strategy(1),
-            ..parts(&format!("http://{address}/secret-key"))
-        })
-        .unwrap();
+        let mut parts = parts(&format!("http://{address}/secret-key"));
+        parts.api.retry = strategy(NonZeroU32::MIN);
+        let client = Client::from_parts(parts).unwrap();
         let err = client.call(&Probe {}).await.unwrap_err();
         let mut chain = format!("{err:?}");
         let mut source: Option<&dyn std::error::Error> = Some(&err);
@@ -1276,5 +1606,25 @@ mod tests {
         }
         assert!(chain.contains("error sending request"), "{chain}");
         assert!(!chain.contains("secret-key"), "{chain}");
+    }
+
+    /// A session token a header cannot carry fails the call before anything
+    /// is sent, and is not retried. Breaks if the request goes out without
+    /// the token or the failure is re-sent.
+    #[tokio::test]
+    async fn refuses_a_header_that_cannot_be_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ok())
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = Client::from_parts(Parts {
+            provider: static_credentials(Some("token\nwith a newline")),
+            ..parts(&server.uri())
+        })
+        .unwrap();
+        let err = client.call(&Probe {}).await.unwrap_err();
+        assert!(matches!(err.source, Failure::InvalidHeader(_)), "{err}");
     }
 }

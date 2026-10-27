@@ -116,7 +116,7 @@ registries:
 
 | Value | Description |
 |---|---|
-| `ecr` | AWS ECR private. HTTP Basic using an SDK-issued token; ambient AWS credentials |
+| `ecr` | AWS ECR private. HTTP Basic using a `GetAuthorizationToken` token; ambient AWS credentials |
 | `gar` | Google Artifact Registry (`*-docker.pkg.dev`); Application Default Credentials |
 | `gcr` | Legacy Google Container Registry (`*.gcr.io`); same provider as `gar` |
 | `acr` | Azure Container Registry; AAD credential chain via proprietary OAuth2 exchange |

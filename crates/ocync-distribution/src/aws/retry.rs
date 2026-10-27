@@ -1,5 +1,5 @@
 //! The AWS SDK's standard and adaptive retry behavior, ported from
-//! `aws-smithy-runtime` 1.16.1 and read from the same `aws-config` settings:
+//! `aws-smithy-runtime` 1.16.1 and configured by the same settings:
 //! `AWS_MAX_ATTEMPTS`, `AWS_RETRY_MODE` and `AWS_NEW_RETRIES_2026`.
 //!
 //! A retry spends from a quota shared by every call to one service in one
@@ -7,22 +7,20 @@
 //! fewer retries from the whole process rather than from each call.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aws_config::retry::{RetryConfig, RetryMode};
-use aws_smithy_types::retry::RetrySpec;
-
+use super::ConfigError;
+use super::config::ServiceId;
 use super::endpoint::Region;
-use super::{Failure, Service};
 use crate::retry::Policy;
 
 /// The quota a partition starts with and never exceeds.
 const QUOTA_CAPACITY: u32 = 500;
 
-/// What a success returns to the quota when its client holds no retry
-/// permit.
+/// What a success returns to the quota when its call holds no retry permit.
 const PERMIT_REGENERATION_AMOUNT: u32 = 1;
 
 /// What a non-transient retry spends before retry behavior 2.1.
@@ -35,6 +33,19 @@ const THROTTLING_RETRY_COST: u32 = 5;
 const DEFAULT_RETRY_COST: u32 = 14;
 /// What a transient retry spends under retry behavior 2.1.
 const DEFAULT_RETRY_TIMEOUT_COST: u32 = 14;
+
+/// The attempts a call makes by default, the first included.
+pub(super) const DEFAULT_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).expect("3 is not 0");
+
+/// The first backoff, before jitter, and before retry behavior 2.1 the
+/// first backoff of every kind.
+pub(super) const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest backoff.
+const MAX_BACKOFF: Duration = Duration::from_secs(20);
+
+/// The first backoff of a non-throttling retry under retry behavior 2.1.
+const V2_1_NON_THROTTLING_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Under retry behavior 2.1, a server-sent `x-amz-retry-after` may lengthen
 /// the computed backoff by at most this.
@@ -49,7 +60,9 @@ pub(super) enum Kind {
     /// A connection, timeout or I/O failure, a timeout error code, or HTTP
     /// 500, 502, 503 or 504.
     Transient,
-    /// A signature rejected for clock skew.
+    /// A failure the SDK classifies as a server error: a signature rejected
+    /// for clock skew, an instance metadata 5xx or 401, or a container
+    /// endpoint success whose body does not read.
     Server,
 }
 
@@ -73,7 +86,7 @@ impl Answer {
 
 /// The SDK's retry behavior version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Version {
+pub(super) enum Version {
     /// The default.
     V2_0,
     /// Selected by `AWS_NEW_RETRIES_2026=true`.
@@ -95,9 +108,27 @@ impl Version {
 
 /// Whether sends are paced by the adaptive rate limiter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(super) enum Mode {
+    /// Not paced.
     Standard,
+    /// Paced by the adaptive rate limiter.
     Adaptive,
+}
+
+impl std::str::FromStr for Mode {
+    type Err = ConfigError;
+
+    /// `standard` or `adaptive`, any case, surrounding space ignored.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mode = text.trim();
+        if mode.eq_ignore_ascii_case("standard") {
+            Ok(Self::Standard)
+        } else if mode.eq_ignore_ascii_case("adaptive") {
+            Ok(Self::Adaptive)
+        } else {
+            Err(ConfigError::InvalidRetryMode(text.to_owned()))
+        }
+    }
 }
 
 /// How an adaptive client paces its retries.
@@ -107,6 +138,34 @@ enum Pacing {
     Backoff,
     /// Under 2.1: each retry takes a send token after its backoff.
     SendToken,
+}
+
+/// The settings a [`Strategy`] is made from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Settings {
+    /// The attempts a call makes, the first included.
+    pub(super) max_attempts: NonZeroU32,
+    /// Whether sends are paced.
+    pub(super) mode: Mode,
+    /// The retry behavior version.
+    pub(super) version: Version,
+    /// The first backoff before jitter.
+    pub(super) initial_backoff: Duration,
+    /// The longest backoff.
+    pub(super) max_backoff: Duration,
+}
+
+/// The SDK's standard retry defaults.
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            mode: Mode::Standard,
+            version: Version::V2_0,
+            initial_backoff: INITIAL_BACKOFF,
+            max_backoff: MAX_BACKOFF,
+        }
+    }
 }
 
 /// The retry strategy of one client, as the SDK's standard strategy is.
@@ -120,51 +179,29 @@ pub(super) struct Strategy {
     mode: Mode,
     /// The jitter factor in `[0, 1)` each backoff is scaled by.
     jitter: fn() -> f64,
-    /// What the latest retry of any call on this client spent, returned to
-    /// the quota by the next success of any call. A newer retry replaces it
-    /// and leaves the older cost spent.
-    permit: Mutex<Option<u32>>,
 }
 
 impl Strategy {
-    /// The strategy `config` carries, as the SDK reads it.
-    pub(super) fn new(config: &RetryConfig) -> Self {
-        let spec = config.retry_spec();
-        let jitter: fn() -> f64 = if config.use_static_exponential_base() {
-            || 1.0
-        } else {
-            fastrand::f64
-        };
+    /// The strategy `settings` set, jittered as the SDK's is.
+    pub(super) fn new(settings: &Settings) -> Self {
         Self {
-            jitter,
-            max_attempts: config.max_attempts(),
-            initial_backoff: config.initial_backoff(),
-            non_throttling_initial_backoff: spec.map_or(
-                config.initial_backoff(),
-                RetrySpec::non_throttling_initial_backoff,
-            ),
-            max_backoff: config.max_backoff(),
-            version: if spec.is_some_and(|s| s.is_at_least(RetrySpec::V2_1)) {
-                Version::V2_1
-            } else {
-                Version::V2_0
+            jitter: fastrand::f64,
+            max_attempts: settings.max_attempts.get(),
+            initial_backoff: settings.initial_backoff,
+            non_throttling_initial_backoff: match settings.version {
+                Version::V2_0 => settings.initial_backoff,
+                Version::V2_1 => V2_1_NON_THROTTLING_INITIAL_BACKOFF,
             },
-            mode: match config.mode() {
-                RetryMode::Adaptive => Mode::Adaptive,
-                _ => Mode::Standard,
-            },
-            permit: Mutex::default(),
+            max_backoff: settings.max_backoff,
+            version: settings.version,
+            mode: settings.mode,
         }
     }
 
-    /// Hold `cost` as the client's retry permit.
-    fn hold(&self, cost: u32) {
-        *self.permit.lock().expect("no panic while held") = Some(cost);
-    }
-
-    /// Give up the client's retry permit, if it holds one.
-    fn release(&self) -> Option<u32> {
-        self.permit.lock().expect("no panic while held").take()
+    /// The attempts a call makes, the first included.
+    #[cfg(test)]
+    pub(super) fn max_attempts(&self) -> u32 {
+        self.max_attempts
     }
 
     /// How retries are paced, or `None` for a standard client.
@@ -195,7 +232,7 @@ impl Default for Partition {
 }
 
 /// Partitions by service and region.
-type Partitions = HashMap<(Service, Region), Arc<Partition>>;
+type Partitions = HashMap<(ServiceId, Region), Arc<Partition>>;
 
 /// Every partition in the process. Synchronized, not `Rc<RefCell<_>>`,
 /// because the AWS client is a `Send + Sync` leaf like `RegistryClient`:
@@ -204,7 +241,7 @@ type Partitions = HashMap<(Service, Region), Arc<Partition>>;
 static PARTITIONS: LazyLock<Mutex<Partitions>> = LazyLock::new(Mutex::default);
 
 /// The partition of `service` in `region`, shared by every client for it.
-pub(super) fn partition(service: Service, region: &Region) -> Arc<Partition> {
+pub(super) fn partition(service: ServiceId, region: &Region) -> Arc<Partition> {
     let mut partitions = PARTITIONS.lock().expect("no panic while held");
     Arc::clone(partitions.entry((service, region.clone())).or_default())
 }
@@ -287,6 +324,12 @@ fn now() -> f64 {
 pub(super) struct CallPolicy<'a> {
     strategy: &'a Strategy,
     partition: &'a Partition,
+    /// What this call's latest retry spent, returned to the quota if the
+    /// call succeeds. A newer retry replaces it and leaves the older cost
+    /// spent. The SDK keeps one permit per client, so concurrent calls
+    /// overwrite each other's and the overwritten costs never return; kept
+    /// per call, each success returns exactly what its own retry spent.
+    permit: Option<u32>,
 }
 
 impl<'a> CallPolicy<'a> {
@@ -295,6 +338,7 @@ impl<'a> CallPolicy<'a> {
         Self {
             strategy,
             partition,
+            permit: None,
         }
     }
 
@@ -328,8 +372,19 @@ impl<'a> CallPolicy<'a> {
     }
 }
 
-impl Policy<Failure> for CallPolicy<'_> {
-    fn retry(&mut self, attempt: u32, error: &Failure) -> Option<Duration> {
+/// A failure the SDK's retry policy classifies.
+pub(super) trait Retryable {
+    /// How the SDK retries this failure, or `None` when it does not.
+    fn retry_kind(&self) -> Option<Kind>;
+
+    /// The wait the service asked for before a retry.
+    fn retry_after(&self) -> Option<Duration> {
+        None
+    }
+}
+
+impl<E: Retryable> Policy<E> for CallPolicy<'_> {
+    fn retry(&mut self, attempt: u32, error: &E) -> Option<Duration> {
         let kind = error.retry_kind();
         self.partition.observe(self.strategy.mode, Answer::of(kind));
         let kind = kind?;
@@ -343,17 +398,16 @@ impl Policy<Failure> for CallPolicy<'_> {
             tracing::debug!(attempts, ?kind, "AWS retry quota exhausted; not retrying");
             return None;
         }
-        self.strategy.hold(cost);
+        self.permit = Some(cost);
         Some(backoff)
     }
 
+    /// The call succeeded: the limiter grows back, and the quota gets back
+    /// the call's permit, or 1 when it holds none.
     fn succeeded(&mut self) {
         self.partition.observe(self.strategy.mode, Answer::Other);
-        self.partition.refund(
-            self.strategy
-                .release()
-                .unwrap_or(PERMIT_REGENERATION_AMOUNT),
-        );
+        self.partition
+            .refund(self.permit.take().unwrap_or(PERMIT_REGENERATION_AMOUNT));
     }
 }
 
@@ -525,7 +579,7 @@ impl Limiter {
 mod tests {
     use http::StatusCode;
 
-    use super::super::{ClockSkew, CodeKind, ErrorCode, ServiceError};
+    use super::super::{ClockSkew, CodeKind, ErrorCode, Failure, ServiceError};
     use super::*;
 
     /// A failure the SDK classifies as `kind`, with the server's
@@ -536,6 +590,7 @@ mod tests {
             code: code.map(|(text, kind)| ErrorCode {
                 text: text.to_owned(),
                 kind,
+                modeled: None,
             }),
             message: None,
             retry_after,
@@ -563,20 +618,40 @@ mod tests {
     }
 
     /// The SDK's tests run with the jitter factor fixed at 1.
-    fn standard() -> RetryConfig {
-        RetryConfig::standard().with_use_static_exponential_base(true)
+    fn fixed(settings: &Settings) -> Strategy {
+        Strategy {
+            jitter: || 1.0,
+            ..Strategy::new(settings)
+        }
     }
 
-    fn v2_1() -> RetryConfig {
-        standard().with_retry_spec(RetrySpec::v2_1())
+    fn attempts(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).expect("a test's attempt count is not 0")
     }
 
-    fn adaptive() -> RetryConfig {
-        RetryConfig::adaptive().with_use_static_exponential_base(true)
+    fn standard() -> Settings {
+        Settings::default()
     }
 
-    fn v2_1_adaptive() -> RetryConfig {
-        adaptive().with_retry_spec(RetrySpec::v2_1())
+    fn v2_1() -> Settings {
+        Settings {
+            version: Version::V2_1,
+            ..standard()
+        }
+    }
+
+    fn adaptive() -> Settings {
+        Settings {
+            mode: Mode::Adaptive,
+            ..standard()
+        }
+    }
+
+    fn v2_1_adaptive() -> Settings {
+        Settings {
+            version: Version::V2_1,
+            ..adaptive()
+        }
     }
 
     fn secs(s: u64) -> Option<Duration> {
@@ -612,11 +687,11 @@ mod tests {
     #[test]
     fn backs_off_exponentially_to_the_max() {
         for (max_backoff, delays) in [(20, [1, 2, 4, 8]), (3, [1, 2, 3, 3])] {
-            let strategy = Strategy::new(
-                &standard()
-                    .with_max_attempts(5)
-                    .with_max_backoff(Duration::from_secs(max_backoff)),
-            );
+            let strategy = fixed(&Settings {
+                max_attempts: attempts(5),
+                max_backoff: Duration::from_secs(max_backoff),
+                ..standard()
+            });
             let partition = Partition::default();
             let mut failures: Vec<_> = (0..4u32)
                 .map(|i| {
@@ -637,7 +712,10 @@ mod tests {
     /// retry's cost.
     #[test]
     fn spends_and_returns_the_quota() {
-        let strategy = Strategy::new(&standard().with_max_attempts(5));
+        let strategy = fixed(&Settings {
+            max_attempts: attempts(5),
+            ..standard()
+        });
         let partition = Partition::with_capacity(5);
         run(
             &strategy,
@@ -657,7 +735,7 @@ mod tests {
                 (failure(Kind::Transient, secs(1)), secs(1), 80),
             ],
         );
-        call.succeeded();
+        Policy::<Failure>::succeeded(&mut call);
         assert_eq!(left(&partition), 90);
     }
 
@@ -665,7 +743,10 @@ mod tests {
     /// one, up to the capacity and no further.
     #[test]
     fn a_first_try_success_refills_the_quota() {
-        let strategy = Strategy::new(&standard().with_max_attempts(u32::MAX));
+        let strategy = fixed(&Settings {
+            max_attempts: NonZeroU32::MAX,
+            ..standard()
+        });
         let partition = Partition::with_capacity(20);
         run(
             &strategy,
@@ -675,21 +756,26 @@ mod tests {
                 (failure(Kind::Transient, None), secs(2), 0),
             ],
         );
-        let other_client = Strategy::new(&standard());
-        policy(&other_client, &partition).succeeded();
+        let other_client = fixed(&standard());
+        Policy::<Failure>::succeeded(&mut policy(&other_client, &partition));
         assert_eq!(left(&partition), 1);
         for _ in 0..20 {
-            policy(&other_client, &partition).succeeded();
+            Policy::<Failure>::succeeded(&mut policy(&other_client, &partition));
         }
         assert_eq!(left(&partition), 20);
     }
 
-    /// The SDK holds one retry permit per client, not per call: a call that
-    /// ran out of attempts leaves its permit for the client's next success,
-    /// and a newer retry on another call leaves the replaced cost spent.
+    /// Each call holds its own retry permit. A call that runs out of
+    /// attempts leaves its cost spent, and another call's success does not
+    /// return it; two calls retrying at once each return their own cost.
+    /// Breaks if the permit is shared per client, as the SDK's is, where the
+    /// newer retry overwrites the older call's permit.
     #[test]
-    fn holds_one_retry_permit_per_client() {
-        let strategy = Strategy::new(&standard().with_max_attempts(2));
+    fn holds_one_retry_permit_per_call() {
+        let strategy = fixed(&Settings {
+            max_attempts: attempts(2),
+            ..standard()
+        });
         let partition = Partition::default();
         run(
             &strategy,
@@ -699,31 +785,27 @@ mod tests {
                 (failure(Kind::Transient, None), None, 490),
             ],
         );
-        policy(&strategy, &partition).succeeded();
-        assert_eq!(left(&partition), 500, "the next success returns the permit");
+        Policy::<Failure>::succeeded(&mut policy(&strategy, &partition));
+        assert_eq!(
+            left(&partition),
+            491,
+            "a call holding no permit regenerates one, not the failed call's"
+        );
 
         let mut older = run(
             &strategy,
             &partition,
-            &[(failure(Kind::Transient, None), secs(1), 490)],
+            &[(failure(Kind::Transient, None), secs(1), 481)],
         );
-        run(
+        let mut newer = run(
             &strategy,
             &partition,
-            &[(failure(Kind::Server, None), secs(1), 485)],
+            &[(failure(Kind::Server, None), secs(1), 476)],
         );
-        older.succeeded();
-        assert_eq!(
-            left(&partition),
-            490,
-            "the older call's 10 stays spent; the newer permit's 5 returns"
-        );
-        policy(&strategy, &partition).succeeded();
-        assert_eq!(
-            left(&partition),
-            491,
-            "with no permit held, a success regenerates one"
-        );
+        Policy::<Failure>::succeeded(&mut older);
+        assert_eq!(left(&partition), 486, "the older call returns its 10");
+        Policy::<Failure>::succeeded(&mut newer);
+        assert_eq!(left(&partition), 491, "the newer call returns its 5");
     }
 
     /// `retry_eventually_succeeds`, `fail_due_to_max_attempts_reached`,
@@ -731,7 +813,7 @@ mod tests {
     /// 2.1 starts a non-throttle at 50 ms and spends 14 for it.
     #[test]
     fn retry_behavior_2_1_backs_off_and_spends_less_for_a_throttle() {
-        let strategy = Strategy::new(&v2_1());
+        let strategy = fixed(&v2_1());
         let partition = Partition::default();
         let mut call = run(
             &strategy,
@@ -741,7 +823,7 @@ mod tests {
                 (failure(Kind::Server, None), millis(100), 472),
             ],
         );
-        call.succeeded();
+        Policy::<Failure>::succeeded(&mut call);
         assert_eq!(left(&partition), 486);
 
         let partition = Partition::default();
@@ -755,11 +837,11 @@ mod tests {
             ],
         );
 
-        let strategy = Strategy::new(
-            &v2_1()
-                .with_max_attempts(5)
-                .with_max_backoff(Duration::from_millis(200)),
-        );
+        let strategy = fixed(&Settings {
+            max_attempts: attempts(5),
+            max_backoff: Duration::from_millis(200),
+            ..v2_1()
+        });
         let partition = Partition::default();
         run(
             &strategy,
@@ -773,14 +855,14 @@ mod tests {
             ],
         );
 
-        let strategy = Strategy::new(&v2_1());
+        let strategy = fixed(&v2_1());
         let partition = Partition::default();
         let mut call = run(
             &strategy,
             &partition,
             &[(failure(Kind::Throttling, None), secs(1), 495)],
         );
-        call.succeeded();
+        Policy::<Failure>::succeeded(&mut call);
         assert_eq!(left(&partition), 500);
 
         let partition = Partition::with_capacity(20);
@@ -798,13 +880,13 @@ mod tests {
     /// 2.1 keeps it between the computed backoff and 5 seconds past it.
     #[test]
     fn honors_retry_after() {
-        for (config, after, delay) in [
+        for (settings, after, delay) in [
             (standard(), secs(30), secs(20)),
             (v2_1(), secs(3), secs(3)),
             (v2_1(), millis(10), millis(50)),
             (v2_1(), secs(10), millis(5050)),
         ] {
-            let strategy = Strategy::new(&config);
+            let strategy = fixed(&settings);
             let partition = Partition::default();
             let mut call = policy(&strategy, &partition);
             assert_eq!(
@@ -815,24 +897,25 @@ mod tests {
         }
     }
 
-    /// A 2.0 spec set explicitly starts a non-throttle at 1 second, as the
-    /// default does; 2.1 is read from the spec `aws-config` sets for
-    /// `AWS_NEW_RETRIES_2026=true`.
+    /// Retry behavior 2.0 starts a non-throttle at the 1 second initial
+    /// backoff; 2.1 starts it at 50 ms and keeps 1 second for throttles.
+    /// The values are `RetryConfig::standard()` and `RetrySpec` in
+    /// `aws-smithy-types` 1.9.0.
     #[test]
-    fn reads_the_retry_spec() {
-        let v2_0 = Strategy::new(&standard().with_retry_spec(RetrySpec::v2_0()));
+    fn reads_the_retry_version() {
+        let v2_0 = fixed(&standard());
         assert_eq!(v2_0.version, Version::V2_0);
         assert_eq!(v2_0.non_throttling_initial_backoff, Duration::from_secs(1));
-        let v2_1 = Strategy::new(&v2_1());
+        let v2_1 = fixed(&v2_1());
         assert_eq!(v2_1.version, Version::V2_1);
         assert_eq!(
             v2_1.non_throttling_initial_backoff,
             Duration::from_millis(50)
         );
         assert_eq!(v2_1.initial_backoff, Duration::from_secs(1));
-        let adaptive = Strategy::new(&adaptive());
+        let adaptive = fixed(&adaptive());
         assert_eq!(adaptive.mode, Mode::Adaptive);
-        assert_eq!(Strategy::new(&standard()).mode, Mode::Standard);
+        assert_eq!(fixed(&standard()).mode, Mode::Standard);
     }
 
     /// The `calculate_exponential_backoff` cases.
@@ -866,18 +949,18 @@ mod tests {
     #[test]
     fn shares_a_partition_per_service_and_region() {
         let region = |text| Region::parse(text).unwrap();
-        let a = partition(Service::Ecr, &region("eu-west-3"));
+        let a = partition(ServiceId::ECR, &region("eu-west-3"));
         assert!(Arc::ptr_eq(
             &a,
-            &partition(Service::Ecr, &region("eu-west-3"))
+            &partition(ServiceId::ECR, &region("eu-west-3"))
         ));
         assert!(!Arc::ptr_eq(
             &a,
-            &partition(Service::Ecr, &region("eu-west-2"))
+            &partition(ServiceId::ECR, &region("eu-west-2"))
         ));
         assert!(!Arc::ptr_eq(
             &a,
-            &partition(Service::EcrPublic, &region("eu-west-3"))
+            &partition(ServiceId::ECR_PUBLIC, &region("eu-west-3"))
         ));
     }
 
@@ -910,7 +993,7 @@ mod tests {
     async fn takes_a_send_token_as_the_sdk_does() {
         let adaptive = adaptive();
         let adaptive_2_1 = v2_1_adaptive();
-        for (config, attempt, takes) in [
+        for (settings, attempt, takes) in [
             (&adaptive, 0, true),
             (&adaptive, 1, false),
             (&adaptive_2_1, 0, true),
@@ -918,12 +1001,12 @@ mod tests {
             (&standard(), 0, false),
         ] {
             let partition = limited(5.0, 0.0);
-            partition.send_token(&Strategy::new(config), attempt).await;
+            partition.send_token(&fixed(settings), attempt).await;
             let expected = if takes { 4.0 } else { 5.0 };
             assert_eq!(
                 capacity(&partition),
                 expected,
-                "{config:?} attempt {attempt}"
+                "{settings:?} attempt {attempt}"
             );
         }
     }
@@ -933,8 +1016,8 @@ mod tests {
     /// the send token.
     #[test]
     fn only_a_pre_2_1_backoff_waits_on_the_limiter() {
-        let adaptive = Strategy::new(&adaptive());
-        let adaptive_2_1 = Strategy::new(&v2_1_adaptive());
+        let adaptive = fixed(&adaptive());
+        let adaptive_2_1 = fixed(&v2_1_adaptive());
         for (strategy, waits) in [(&adaptive, true), (&adaptive_2_1, false)] {
             let partition = limited(0.0, 1.0);
             let backoff = policy(strategy, &partition).backoff(1, Kind::Throttling, None);
@@ -955,7 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn takes_the_token_after_waiting_for_it() {
         let partition = limited(0.0, 10.0);
-        partition.send_token(&Strategy::new(&adaptive()), 0).await;
+        partition.send_token(&fixed(&adaptive()), 0).await;
         let left = capacity(&partition);
         assert!((0.0..0.5).contains(&left), "{left}");
     }

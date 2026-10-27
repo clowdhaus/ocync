@@ -21,6 +21,7 @@ use super::{Credentials, Scope, Token};
 use crate::client::no_redirect_http_client;
 use crate::error::Error;
 use crate::retry::send_retrying;
+use crate::scheme::Scheme;
 
 /// Cached `WWW-Authenticate` challenge for a registry.
 ///
@@ -226,10 +227,10 @@ fn validate_realm_url(realm: &reqwest::Url, registry_base: &reqwest::Url) -> Res
     }
 
     // Scheme check: https always allowed; http only when registry is also http.
-    match realm.scheme() {
-        "https" => {}
-        "http" => {
-            if registry_base.scheme() != "http" {
+    match Scheme::try_from(realm) {
+        Ok(Scheme::Https) => {}
+        Ok(Scheme::Http) => {
+            if !matches!(Scheme::try_from(registry_base), Ok(Scheme::Http)) {
                 return Err(realm_err(
                     registry_str,
                     format!(
@@ -239,13 +240,10 @@ fn validate_realm_url(realm: &reqwest::Url, registry_base: &reqwest::Url) -> Res
                 ));
             }
         }
-        _ => {
+        Err(unsupported) => {
             return Err(realm_err(
                 registry_str,
-                format!(
-                    "realm URL '{realm}' uses unsupported scheme '{scheme}'",
-                    scheme = realm.scheme()
-                ),
+                format!("realm URL '{realm}' uses {unsupported}"),
             ));
         }
     }
@@ -602,8 +600,8 @@ struct TokenResponse {
 impl fmt::Debug for TokenResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenResponse")
-            .field("token", &"[REDACTED]")
-            .field("access_token", &"[REDACTED]")
+            .field("token", &crate::REDACTED)
+            .field("access_token", &crate::REDACTED)
             .field("expires_in", &self.expires_in)
             .finish()
     }

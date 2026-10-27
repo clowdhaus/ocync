@@ -22,7 +22,7 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::CredentialCache;
-use crate::error::Error;
+use crate::error::{Error, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
@@ -133,23 +133,6 @@ trait AzureTokenSource: Send + Sync + fmt::Debug {
     fn reset(&self) {}
 }
 
-/// Prevents credential leakage through error messages. Upstream
-/// `azure_identity` dumps full response bodies -- we exceed upstream
-/// by truncating. Matches `token_exchange.rs` discipline of
-/// status-code-only errors.
-fn truncate_body(body: &str) -> &str {
-    if body.len() <= 200 {
-        return body;
-    }
-    // Find the last char boundary at or before byte 200 to avoid
-    // panicking on multi-byte UTF-8 sequences.
-    let mut end = 200;
-    while !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    &body[..end]
-}
-
 /// ACR refresh token response from `/oauth2/exchange`.
 #[derive(Deserialize)]
 struct RefreshTokenResponse {
@@ -201,7 +184,10 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
         let body = response.text().await.unwrap_or_default();
         return Err(Error::AuthFailed {
             registry: service.to_owned(),
-            reason: format!("ACR {endpoint} returned {status}: {}", truncate_body(&body)),
+            reason: format!(
+                "ACR {endpoint} returned {status}: {}",
+                truncate_quoted(&body)
+            ),
         });
     }
 
@@ -330,7 +316,7 @@ impl AzureCredentialChain {
             let body = resp.text().await.unwrap_or_default();
             return Err(CredentialError::Failed(format!(
                 "{source} auth failed: {}",
-                truncate_body(&body)
+                truncate_quoted(&body)
             )));
         }
 
@@ -416,7 +402,7 @@ impl AzureCredentialChain {
             let body = resp.text().await.unwrap_or_default();
             return Err(CredentialError::Failed(format!(
                 "managed identity not configured: {}",
-                truncate_body(&body)
+                truncate_quoted(&body)
             )));
         }
         if !status.is_success() {
@@ -455,7 +441,7 @@ impl AzureCredentialChain {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(CredentialError::Failed(format!(
                 "az CLI failed: {}",
-                truncate_body(&stderr)
+                truncate_quoted(&stderr)
             )));
         }
 
@@ -607,7 +593,7 @@ impl AcrAuth {
 
     async fn ensure_refresh_token(&self) -> Result<String, Error> {
         self.refresh_cache
-            .get_or_refresh("acr-refresh-token", async {
+            .get_or_refresh(async {
                 tracing::debug!(service = %self.service, "ACR refresh token expired, re-acquiring");
                 let aad_access_token = self.api.get_token().await?;
                 let refresh_token = exchange_refresh_token(
@@ -756,22 +742,6 @@ mod tests {
         let (authority, resource) = azure_endpoints("myregistry.azurecr.us");
         assert_eq!(authority, "login.microsoftonline.us");
         assert_eq!(resource, "https://containerregistry.azure.us");
-    }
-
-    #[test]
-    fn truncate_body_short() {
-        assert_eq!(truncate_body("short"), "short");
-    }
-
-    #[test]
-    fn truncate_body_at_multibyte_boundary() {
-        // 198 ASCII chars + a 3-byte UTF-8 char (euro sign) = 201 bytes.
-        // Naive &body[..200] would slice mid-char and panic.
-        let body = format!("{}x{}", "a".repeat(197), '\u{20AC}');
-        assert_eq!(body.len(), 201);
-        let truncated = truncate_body(&body);
-        assert!(truncated.len() <= 200);
-        assert!(truncated.is_char_boundary(truncated.len()));
     }
 
     /// Mock Azure token source that returns pre-configured access token strings.

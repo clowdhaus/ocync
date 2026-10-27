@@ -29,7 +29,7 @@ pub struct StaticTokenAuth {
 impl fmt::Debug for StaticTokenAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StaticTokenAuth")
-            .field("token", &"[REDACTED]")
+            .field("token", &crate::REDACTED)
             .field("registry", &self.registry)
             .field("invalidated", &self.invalidated.load(Ordering::Relaxed))
             .finish()

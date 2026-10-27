@@ -250,9 +250,9 @@ pub(crate) struct RegistryConfig {
 
     /// Named AWS profile for ECR credential resolution.
     ///
-    /// When set, ECR auth for this registry uses
-    /// `aws_config::ConfigLoader::profile_name(p)` instead of the ambient
-    /// credential chain. Only valid with explicit `auth_type: ecr`.
+    /// When set, ECR auth for this registry resolves credentials and
+    /// settings from this profile instead of the one `AWS_PROFILE` selects.
+    /// Only valid with explicit `auth_type: ecr`.
     ///
     /// Use this when the registry requires credentials distinct from the
     /// ambient identity (for example, a third-party ECR accessed with static

@@ -28,7 +28,9 @@ pub use detect::{ProviderKind, detect_provider_kind};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use crate::error::Error;
 
@@ -41,10 +43,9 @@ pub(crate) fn registry_origin(registry: &url::Url) -> String {
 
 /// Tokens are proactively refreshed when their remaining lifetime drops
 /// below this window. Must be shorter than the shortest token TTL we
-/// encounter (Docker Hub returns 300s). The prior value of 15 minutes
-/// caused every Docker Hub token to be "stale" immediately, bypassing
-/// the cache entirely.
-const EARLY_REFRESH_WINDOW: Duration = Duration::from_secs(30);
+/// encounter (Docker Hub returns 300s): a window at least that long marks
+/// every such token stale on arrival, bypassing the cache entirely.
+pub(crate) const EARLY_REFRESH_WINDOW: Duration = Duration::from_secs(30);
 
 /// OAuth2-style scope for registry token requests.
 ///
@@ -134,7 +135,7 @@ pub struct Token {
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Token")
-            .field("value", &"[REDACTED]")
+            .field("value", &crate::REDACTED)
             .field("expires_at", &self.expires_at)
             .finish()
     }
@@ -150,11 +151,12 @@ impl Token {
         }
     }
 
-    /// Create a Bearer token with a known time-to-live.
+    /// Create a Bearer token with a known time-to-live. A lifetime past
+    /// what the clock can hold never expires.
     pub fn with_ttl(value: impl Into<String>, ttl: Duration) -> Self {
         Self {
             value: value.into(),
-            expires_at: Some(Instant::now() + ttl),
+            expires_at: Instant::now().checked_add(ttl),
             scheme: AuthScheme::Bearer,
         }
     }
@@ -186,7 +188,7 @@ impl Token {
 
     /// Whether this token has already expired.
     pub fn is_expired(&self) -> bool {
-        self.expires_at.is_some_and(|exp| Instant::now() >= exp)
+        !is_fresh(self.expires_at, Duration::ZERO)
     }
 
     /// Returns `true` if the token is still usable (not expired and not within
@@ -196,17 +198,21 @@ impl Token {
     }
 
     /// Whether this token should be proactively refreshed (remaining lifetime
-    /// is below [`EARLY_REFRESH_WINDOW`]).
+    /// is at most [`EARLY_REFRESH_WINDOW`]).
     pub fn should_refresh(&self) -> bool {
-        match self.expires_at {
-            Some(exp) => {
-                let now = Instant::now();
-                exp.checked_duration_since(now)
-                    .is_none_or(|remaining| remaining < EARLY_REFRESH_WINDOW)
-            }
-            None => false,
-        }
+        !is_fresh(self.expires_at, EARLY_REFRESH_WINDOW)
     }
+}
+
+/// Whether a value expiring at `expires_at`, or never when `None`, has
+/// more than `window` of its lifetime left, as the SDK's expiring cache
+/// judges it. Time is tokio's, so a test with paused time moves it.
+pub(crate) fn is_fresh(expires_at: Option<Instant>, window: Duration) -> bool {
+    expires_at.is_none_or(|expires_at| {
+        expires_at
+            .checked_duration_since(Instant::now())
+            .is_some_and(|left| left > window)
+    })
 }
 
 /// Build a sorted, space-joined cache key from a set of scopes.
@@ -237,7 +243,7 @@ impl fmt::Debug for Credentials {
             Self::Basic { username, .. } => f
                 .debug_struct("Credentials::Basic")
                 .field("username", username)
-                .field("password", &"[REDACTED]")
+                .field("password", &crate::REDACTED)
                 .finish(),
         }
     }
@@ -310,6 +316,15 @@ mod tests {
     #[test]
     fn token_with_long_ttl_not_expired() {
         let token = Token::with_ttl("abc123", Duration::from_secs(3600));
+        assert!(!token.is_expired());
+        assert!(!token.should_refresh());
+    }
+
+    /// A lifetime past what the clock can hold never expires. Breaks if the
+    /// lifetime is added to the clock unchecked, which panics.
+    #[test]
+    fn token_with_a_lifetime_past_the_clock_never_expires() {
+        let token = Token::with_ttl("abc123", Duration::MAX);
         assert!(!token.is_expired());
         assert!(!token.should_refresh());
     }

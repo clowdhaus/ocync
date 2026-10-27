@@ -53,9 +53,9 @@ struct AuthEntry {
 impl fmt::Debug for AuthEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthEntry")
-            .field("auth", &"[REDACTED]")
+            .field("auth", &crate::REDACTED)
             .field("username", &self.username)
-            .field("password", &"[REDACTED]")
+            .field("password", &crate::REDACTED)
             .finish()
     }
 }
