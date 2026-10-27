@@ -154,7 +154,7 @@ fn credential_api(
 
 /// `error` and each of its sources, joined as upstream prints them, so a
 /// reason kept as text still names its cause.
-fn error_chain(error: &dyn std::error::Error) -> String {
+pub(super) fn error_chain(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(e) = source {
@@ -436,6 +436,24 @@ pub(super) mod tests {
         assert_eq!(
             error_chain(&err),
             "failed to load credentials from web identity: \
+             failed to read the web identity token file /missing.jwt: \
+             No such file or directory (os error 2)"
+        );
+    }
+
+    /// A failed load reaches the caller with its cause, as the caller keeps
+    /// only the text. Breaks if the text stops at the source that failed.
+    #[tokio::test]
+    async fn a_failed_load_names_its_cause() {
+        let vars = [
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/missing.jwt"),
+            ("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test-role"),
+        ];
+        let err = chain(&vars, "").load().await.unwrap_err();
+        assert_eq!(
+            super::super::Failure::Credentials(err).to_string(),
+            "failed to load AWS credentials: \
+             failed to load credentials from web identity: \
              failed to read the web identity token file /missing.jwt: \
              No such file or directory (os error 2)"
         );

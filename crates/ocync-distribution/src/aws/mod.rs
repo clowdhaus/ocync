@@ -422,8 +422,10 @@ impl fmt::Display for ClockSkew {
 /// Why one attempt at a call failed.
 #[derive(Debug, thiserror::Error)]
 enum Failure {
-    /// No credentials could be loaded.
-    #[error("failed to load AWS credentials: {0}")]
+    /// No credentials could be loaded. The credential errors leave their
+    /// causes to `source`, and this text is all a caller keeps, so it names
+    /// every cause.
+    #[error("failed to load AWS credentials: {}", credentials::error_chain(.0))]
     Credentials(#[source] credentials::Error),
     /// The request did not complete. Built only through `From`, which drops
     /// the URL.
