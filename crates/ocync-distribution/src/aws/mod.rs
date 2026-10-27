@@ -427,10 +427,9 @@ enum Failure {
     /// every cause, and is not a source itself.
     #[error("failed to load AWS credentials: {}", credentials::error_chain(.0))]
     Credentials(credentials::Error),
-    /// The request did not complete. Built only through `From`, which drops
-    /// the URL.
+    /// The request did not complete.
     #[error("request failed: {0}")]
-    Transport(#[source] reqwest::Error),
+    Transport(#[source] TransportError),
     /// The service answered with an error.
     #[error("{0}")]
     Service(ServiceError),
@@ -452,10 +451,28 @@ enum Failure {
     InvalidHeader(#[source] InvalidHeaderValue),
 }
 
-/// The endpoint URL may carry a key, so a transport error drops it.
+/// A request that did not complete, its URL dropped: an endpoint URL can
+/// carry a key, and the error's text reaches logs and the report.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(super) struct TransportError(reqwest::Error);
+
+impl From<reqwest::Error> for TransportError {
+    fn from(error: reqwest::Error) -> Self {
+        Self(error.without_url())
+    }
+}
+
+impl TransportError {
+    /// Whether a re-send may succeed.
+    pub(super) fn is_transient(&self) -> bool {
+        is_transient_transport(&self.0)
+    }
+}
+
 impl From<reqwest::Error> for Failure {
     fn from(error: reqwest::Error) -> Self {
-        Self::Transport(error.without_url())
+        Self::Transport(error.into())
     }
 }
 
@@ -463,7 +480,7 @@ impl retry::Retryable for Failure {
     /// A throttle code wins over the status it came with, as in the SDK.
     fn retry_kind(&self) -> Option<retry::Kind> {
         match self {
-            Self::Transport(e) => is_transient_transport(e).then_some(retry::Kind::Transient),
+            Self::Transport(e) => e.is_transient().then_some(retry::Kind::Transient),
             Self::Service(e) => match e.code.as_ref().map(|c| c.kind) {
                 Some(CodeKind::Throttling) => Some(retry::Kind::Throttling),
                 Some(CodeKind::Transient) => Some(retry::Kind::Transient),

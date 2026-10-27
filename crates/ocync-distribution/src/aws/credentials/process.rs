@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use super::super::calendar;
 use super::{Credentials, json};
-use crate::error::truncate_body;
+use crate::error::truncate_quoted;
 
 /// The only document version upstream reads.
 const VERSION: i32 = 1;
@@ -96,11 +96,10 @@ pub(super) async fn load(command: Command<'_>) -> Result<Credentials, Error> {
         .await
         .map_err(Error::Spawn)?;
     if !output.status.success() {
-        let stderr =
-            std::str::from_utf8(&output.stderr).unwrap_or("could not decode stderr as UTF-8");
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::Exited {
             status: output.status,
-            stderr: truncate_body(stderr).to_owned(),
+            stderr: truncate_quoted(&stderr).to_owned(),
         });
     }
     let stdout = std::str::from_utf8(&output.stdout).map_err(Error::NotUtf8)?;
@@ -264,13 +263,17 @@ mod tests {
     }
 
     /// A failing command's stderr is cut to its start, as it can hold a
-    /// token and the error reaches the report. Breaks if all of it is kept.
+    /// token and the error reaches the report, and a byte that is not UTF-8
+    /// past the cut costs nothing. Breaks if all of it is kept, or the text
+    /// is replaced for that byte.
     #[cfg(unix)]
     #[tokio::test]
     async fn keeps_only_the_start_of_a_failing_commands_stderr() {
-        let error = load(Command("printf 'a%.0s' $(seq 300) >&2; exit 1"))
-            .await
-            .unwrap_err();
+        let error = load(Command(
+            "printf 'a%.0s' $(seq 300) >&2; printf '\\377' >&2; exit 1",
+        ))
+        .await
+        .unwrap_err();
         let Error::Exited { stderr, .. } = error else {
             panic!("{error}");
         };

@@ -32,9 +32,12 @@ const REFRESH_BUFFER: Duration = Duration::from_secs(5 * 60);
 /// The least time between two refreshes of one token.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The longest a refresh may take, well under the chain's 21.6 second bound,
-/// so a refresh that hangs still leaves time to use the cached token.
+/// The longest a refresh may take, well under the chain's credential
+/// timeout, so a refresh that hangs still leaves time to use the cached
+/// token.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const _: () =
+    assert!(REFRESH_TIMEOUT.as_millis() < super::super::CREDENTIALS_LOAD_TIMEOUT.as_millis() / 2);
 
 /// The path of SSO OIDC's `CreateToken`.
 const CREATE_TOKEN_PATH: &str = "/token";
@@ -145,9 +148,9 @@ enum RefreshError {
     /// seconds.
     #[error("SSO OIDC CreateToken answer could not be read")]
     Answer(#[source] serde_json::Error),
-    /// The refresh did not finish in time.
-    #[error("SSO OIDC CreateToken timed out after {} seconds", .0.as_secs())]
-    TimedOut(Duration),
+    /// The refresh did not finish within [`REFRESH_TIMEOUT`].
+    #[error("SSO OIDC CreateToken timed out after {} seconds", REFRESH_TIMEOUT.as_secs_f64())]
+    TimedOut,
 }
 
 /// When this process last tried to refresh a token, if it has.
@@ -249,7 +252,7 @@ pub(super) async fn load(
         refresh(host, config, retry, region, registration),
     )
     .await
-    .unwrap_or(Err(RefreshError::TimedOut(REFRESH_TIMEOUT)));
+    .unwrap_or(Err(RefreshError::TimedOut));
     match refreshed {
         Ok(refreshed) => {
             let token = AccessToken(refreshed.access_token.clone());
@@ -869,6 +872,28 @@ mod tests {
             "cachedtoken"
         );
         assert_eq!(started.elapsed(), REFRESH_TIMEOUT);
+    }
+
+    /// A load cut off mid-refresh still counts the attempt, so a load right
+    /// after uses the cached token rather than refreshing again. Breaks if
+    /// the attempt is counted only once the refresh returns.
+    #[tokio::test(start_paused = true)]
+    async fn counts_a_refresh_its_load_was_cut_off_in() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(created("newtoken", None).set_delay(Duration::from_secs(3600)))
+            .mount(&server)
+            .await;
+        let home = Home::new("cut", &refreshable("2021-12-25T13:33:00Z"));
+        let host = home.host(&server, "2021-12-25T13:30:00Z");
+        let cut = tokio::time::timeout(Duration::from_secs(1), load_on(&host, SESSION)).await;
+        assert!(cut.is_err(), "the refresh answered");
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            load_on(&host, SESSION).await.unwrap().as_str(),
+            "cachedtoken"
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO, "refreshed again");
     }
 
     /// Loads of one token at once refresh it once, and the load that waited

@@ -22,7 +22,7 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::CredentialCache;
-use crate::error::{Error, truncate_body};
+use crate::error::{Error, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
@@ -184,7 +184,10 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
         let body = response.text().await.unwrap_or_default();
         return Err(Error::AuthFailed {
             registry: service.to_owned(),
-            reason: format!("ACR {endpoint} returned {status}: {}", truncate_body(&body)),
+            reason: format!(
+                "ACR {endpoint} returned {status}: {}",
+                truncate_quoted(&body)
+            ),
         });
     }
 
@@ -313,7 +316,7 @@ impl AzureCredentialChain {
             let body = resp.text().await.unwrap_or_default();
             return Err(CredentialError::Failed(format!(
                 "{source} auth failed: {}",
-                truncate_body(&body)
+                truncate_quoted(&body)
             )));
         }
 
@@ -399,7 +402,7 @@ impl AzureCredentialChain {
             let body = resp.text().await.unwrap_or_default();
             return Err(CredentialError::Failed(format!(
                 "managed identity not configured: {}",
-                truncate_body(&body)
+                truncate_quoted(&body)
             )));
         }
         if !status.is_success() {
@@ -438,7 +441,7 @@ impl AzureCredentialChain {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(CredentialError::Failed(format!(
                 "az CLI failed: {}",
-                truncate_body(&stderr)
+                truncate_quoted(&stderr)
             )));
         }
 

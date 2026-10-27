@@ -19,13 +19,14 @@ use http::{HeaderValue, Method, StatusCode, Uri};
 use url::Url;
 
 use super::super::TRANSIENT_STATUSES;
+use super::super::TransportError;
 use super::super::host::{
     Dns, Env, Fs, Host, Network, Timeouts, Transport, credential_endpoint_client,
 };
 use super::super::retry::{self, Kind, Retryable};
 use super::json::{self, Code, Document};
 use super::{Credentials, Error as ChainError};
-use crate::retry::{is_transient_transport, retrying};
+use crate::retry::retrying;
 use crate::scheme::{Scheme, UnsupportedScheme};
 
 /// The path and query of the ECS agent's endpoint, which wins over
@@ -132,10 +133,9 @@ pub(in crate::aws) enum Error {
     /// The client pinned to a host's checked addresses could not be built.
     #[error("could not build the HTTP client for the container endpoint")]
     Client(#[source] reqwest::Error),
-    /// The request did not complete. Built only through `From`, which drops
-    /// the URL: it can carry a key.
+    /// The request did not complete.
     #[error("could not communicate with the container endpoint")]
-    Transport(#[source] reqwest::Error),
+    Transport(#[source] TransportError),
     /// A failing status.
     #[error("Non-success status from HTTP credential provider: {0:?}")]
     Status(StatusCode),
@@ -152,19 +152,18 @@ pub(in crate::aws) enum Error {
     },
 }
 
-/// The SDK retries a transport failure, a 500, 502, 503 or 504, and a
-/// success whose body does not read.
-/// The endpoint URL can carry a key, so a transport error drops it.
 impl From<reqwest::Error> for Error {
     fn from(error: reqwest::Error) -> Self {
-        Self::Transport(error.without_url())
+        Self::Transport(error.into())
     }
 }
 
+/// The SDK retries a transport failure, a 500, 502, 503 or 504, and a
+/// success whose body does not read.
 impl Retryable for Error {
     fn retry_kind(&self) -> Option<Kind> {
         match self {
-            Self::Transport(e) => is_transient_transport(e).then_some(Kind::Transient),
+            Self::Transport(e) => e.is_transient().then_some(Kind::Transient),
             Self::Status(status) => TRANSIENT_STATUSES
                 .contains(status)
                 .then_some(Kind::Transient),
@@ -854,7 +853,7 @@ mod tests {
         let transport = Network::Real.transport(reqwest::Client::builder()).unwrap();
         let failure = transport.send(request(&url, None)).await.unwrap_err();
         assert_eq!(
-            Error::Transport(failure).retry_kind(),
+            Error::Transport(failure.into()).retry_kind(),
             Some(Kind::Transient)
         );
     }

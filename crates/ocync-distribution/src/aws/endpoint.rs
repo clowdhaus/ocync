@@ -341,11 +341,12 @@ pub(super) fn resolve_credential_api(
     })
 }
 
-/// `path` joined to `endpoint`'s own path with one slash, as the SDK joins
-/// an operation's path to every endpoint, the instance metadata one
-/// included.
+/// `path` joined to `endpoint`'s own path with one slash, and the
+/// endpoint's query dropped, as the SDK joins an operation's path to every
+/// endpoint, the instance metadata one included.
 pub(super) fn join_path(endpoint: &Url, path: &str) -> Url {
     let mut url = endpoint.clone();
+    url.set_query(None);
     let base = endpoint.path();
     url.set_path(&format!(
         "{}/{}",
@@ -358,6 +359,24 @@ pub(super) fn join_path(endpoint: &Url, path: &str) -> Url {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One slash joins the paths whatever each side ends or starts with,
+    /// and an endpoint's query is dropped, as in the SDK's `merge_paths`.
+    /// Breaks if a slash is lost or doubled, or the query is sent.
+    #[test]
+    fn joins_paths_as_the_sdk_does() {
+        for (endpoint, path, joined) in [
+            ("https://h", "/op", "https://h/op"),
+            ("https://h/", "op", "https://h/op"),
+            ("https://h/base", "/op", "https://h/base/op"),
+            ("https://h/base/", "/op", "https://h/base/op"),
+            ("https://h/base//", "/op", "https://h/base//op"),
+            ("https://h/base?k=v", "/op", "https://h/base/op"),
+        ] {
+            let url = join_path(&Url::parse(endpoint).unwrap(), path);
+            assert_eq!(url.as_str(), joined, "{endpoint} + {path}");
+        }
+    }
 
     /// The endpoint rule tests generated into `aws-sdk-ecr` 1.135.0 and
     /// `aws-sdk-ecrpublic` 1.120.0, less the "Missing Region" cases, which

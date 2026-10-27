@@ -19,6 +19,7 @@ use http::header::InvalidHeaderValue;
 use http::{HeaderValue, Method, StatusCode};
 use url::Url;
 
+use super::super::TransportError;
 use super::super::config::{Config, ImdsEndpointError};
 use super::super::endpoint::join_path;
 use super::super::host::{Clock, Env, Host, Timeouts, Transport, credential_endpoint_client};
@@ -81,7 +82,7 @@ pub(in crate::aws) enum RequestError {
     #[error("error response from IMDS (code: {})", .0.as_u16())]
     Status(StatusCode),
     /// An attempt or the whole request took too long.
-    #[error("IMDS did not answer within {0:?}")]
+    #[error("IMDS did not answer within {} seconds", .0.as_secs_f64())]
     TimedOut(Duration),
 }
 
@@ -123,10 +124,9 @@ pub(in crate::aws) enum TokenError {
     /// The lifetime does not read.
     #[error("the returned TTL was invalid")]
     InvalidTtl(#[source] TtlError),
-    /// The request did not complete, such as off EC2. Built only through
-    /// `From`, which drops the URL.
+    /// The request did not complete, such as off EC2.
     #[error("could not communicate with IMDS")]
-    Transport(#[source] reqwest::Error),
+    Transport(#[source] TransportError),
     /// The answer failed the request.
     #[error(transparent)]
     Request(#[from] RequestError),
@@ -150,10 +150,9 @@ pub(in crate::aws) enum Error {
     /// No session token.
     #[error("failed to load IMDS session token")]
     Token(#[source] TokenError),
-    /// The request did not complete. Built only through `From`, which drops
-    /// the URL.
+    /// The request did not complete.
     #[error("an IO error occurred communicating with IMDS")]
-    Transport(#[source] reqwest::Error),
+    Transport(#[source] TransportError),
     /// The answer failed the request.
     #[error(transparent)]
     Request(#[from] RequestError),
@@ -231,17 +230,15 @@ enum Access {
     Ready { endpoint: Url, transport: Transport },
 }
 
-/// The endpoint URL is configurable, so a transport error drops it.
 impl From<reqwest::Error> for TokenError {
     fn from(error: reqwest::Error) -> Self {
-        Self::Transport(error.without_url())
+        Self::Transport(error.into())
     }
 }
 
-/// The endpoint URL is configurable, so a transport error drops it.
 impl From<reqwest::Error> for Error {
     fn from(error: reqwest::Error) -> Self {
-        Self::Transport(error.without_url())
+        Self::Transport(error.into())
     }
 }
 
@@ -302,18 +299,19 @@ impl Provider {
                 transport,
             } => (endpoint, transport),
         };
-        let loaded = self.fetch(endpoint, transport).await;
-        let mut last = self.last.lock().expect("no panic while held");
-        match (loaded, last.as_mut()) {
-            (Err(error), Some(last)) => {
-                tracing::warn!(error = %error_chain(&error), "IMDS refresh failed; using the last credentials loaded");
-                // Kept extended, so the next failure reuses this expiry
-                // instead of drawing new jitter.
-                last.expiry = last.expiry.map(|expiry| self.extend(expiry));
-                Ok(last.clone())
-            }
-            (loaded, _) => loaded,
-        }
+        let error = match self.fetch(endpoint, transport).await {
+            Ok(credentials) => return Ok(credentials),
+            Err(error) => error,
+        };
+        let Some(mut stale) = self.last.lock().expect("no panic while held").clone() else {
+            return Err(error);
+        };
+        tracing::warn!(error = %error_chain(&error), "IMDS refresh failed; using the last credentials loaded");
+        stale.expiry = stale.expiry.map(|expiry| self.extend(expiry));
+        // Stored extended, so the next failure reuses this expiry instead of
+        // drawing new jitter.
+        *self.last.lock().expect("no panic while held") = Some(stale.clone());
+        Ok(stale)
     }
 
     async fn fetch(
@@ -668,6 +666,7 @@ mod tests {
             reason.starts_with("could not communicate with IMDS: "),
             "{reason}"
         );
+        assert!(!reason.contains("127.0.0.1"), "{reason}");
         assert_eq!(connections.get(), 1);
         assert!(
             (TIMEOUTS.read..ATTEMPT_TIMEOUT).contains(&elapsed),
@@ -747,6 +746,8 @@ mod tests {
             (EXTENSION..=EXTENSION + Duration::from_secs(EXTENSION_JITTER_SECS)).contains(&after),
             "{after:?}"
         );
+        let stored = source.last.lock().unwrap().as_ref().unwrap().expiry;
+        assert_eq!(stored, Some(expiry));
     }
 
     /// A token is reused until [`TOKEN_REFRESH_BUFFER`] before its expiry

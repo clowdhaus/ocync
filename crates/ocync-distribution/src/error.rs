@@ -208,7 +208,7 @@ const MAX_QUOTED_BYTES: usize = 200;
 /// The start of `body`, at most [`MAX_QUOTED_BYTES`] and cut on a character
 /// boundary. A response body or a helper's stderr can carry a token, and an
 /// error's text reaches logs and the `--json` report.
-pub(crate) fn truncate_body(body: &str) -> &str {
+pub(crate) fn truncate_quoted(body: &str) -> &str {
     if body.len() <= MAX_QUOTED_BYTES {
         return body;
     }
@@ -224,17 +224,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truncate_body_short() {
-        assert_eq!(truncate_body("short"), "short");
+    fn truncate_quoted_short() {
+        assert_eq!(truncate_quoted("short"), "short");
     }
 
     #[test]
-    fn truncate_body_at_multibyte_boundary() {
+    fn truncate_quoted_at_multibyte_boundary() {
         // 198 ASCII chars + a 3-byte UTF-8 char (euro sign) = 201 bytes.
         // Naive &body[..200] would slice mid-char and panic.
         let body = format!("{}x{}", "a".repeat(197), '\u{20AC}');
         assert_eq!(body.len(), 201);
-        let truncated = truncate_body(&body);
+        let truncated = truncate_quoted(&body);
         assert!(truncated.len() <= MAX_QUOTED_BYTES);
         assert!(truncated.is_char_boundary(truncated.len()));
     }
