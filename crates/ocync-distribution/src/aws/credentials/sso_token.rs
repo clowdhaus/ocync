@@ -145,7 +145,10 @@ enum RefreshError {
 struct LastRefresh(Option<SystemTime>);
 
 /// The refresh state of each cached session token, by cache file. Shared by
-/// every chain in a process, so one token is refreshed once.
+/// every chain in a process, so one token is refreshed once. Synchronized,
+/// not `Rc<RefCell<_>>`, because the AWS client is a `Send + Sync` leaf. The
+/// outer lock is never held across an `.await`; a token's own lock is held
+/// across its refresh, so loads of it take turns.
 #[derive(Debug, Clone, Default)]
 pub(in crate::aws) struct Sessions(
     Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<LastRefresh>>>>>,

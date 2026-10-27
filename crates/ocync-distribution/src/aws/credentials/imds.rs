@@ -236,6 +236,8 @@ pub(super) struct Provider {
     partition: retry::Partition,
     token: CredentialCache<HeaderValue>,
     /// The last credentials loaded, served when a refresh fails.
+    /// Synchronized, not `Rc<RefCell<_>>`, because the AWS client holding
+    /// this source is a `Send + Sync` leaf. Never held across an `.await`.
     last: Mutex<Option<Credentials>>,
 }
 
@@ -284,10 +286,13 @@ impl Provider {
             } => (endpoint, transport),
         };
         let loaded = self.fetch(endpoint, transport).await;
-        let last = self.last.lock().expect("no panic while held");
-        match (loaded, last.as_ref()) {
+        let mut last = self.last.lock().expect("no panic while held");
+        match (loaded, last.as_mut()) {
             (Err(error), Some(last)) => {
                 tracing::warn!(%error, "IMDS refresh failed; using the last credentials loaded");
+                // Kept extended, so the next failure reuses this expiry
+                // instead of drawing new jitter.
+                last.expiry = last.expiry.map(|expiry| self.extend(expiry));
                 Ok(last.clone())
             }
             (loaded, _) => loaded,
@@ -707,6 +712,34 @@ mod tests {
         replay.assert_done();
         assert_eq!(second.access_key_id(), first.access_key_id());
         assert_eq!(second.expiry(), first.expiry());
+    }
+
+    /// A refresh that fails after the last credentials expired serves them
+    /// valid for 10 to 15 more minutes. Breaks if the passed expiry is
+    /// served, which sends every call back to IMDS while it is down.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_refresh_extends_expired_last_credentials() {
+        let now = UNIX_EPOCH + EXPIRY + Duration::from_secs(3600);
+        let failure = get(3, "", StatusCode::BAD_REQUEST, b"");
+        let replay = traffic([granted(0)].into_iter().chain(reads(1)).chain([failure]));
+        let host = host(
+            HashMap::new(),
+            HashMap::new(),
+            Clock::Fixed(now),
+            Network::Replay(Arc::clone(&replay)),
+        );
+        let source = imds(&host);
+        source.load().await.unwrap();
+        if let Some(last) = source.last.lock().unwrap().as_mut() {
+            last.expiry = Some(UNIX_EPOCH + EXPIRY);
+        }
+        let expiry = source.load().await.unwrap().expiry().unwrap();
+        replay.assert_done();
+        let after = expiry.duration_since(now).unwrap();
+        assert!(
+            (EXTENSION..=EXTENSION + Duration::from_secs(EXTENSION_JITTER_SECS)).contains(&after),
+            "{after:?}"
+        );
     }
 
     /// A token is reused until [`TOKEN_REFRESH_BUFFER`] before its expiry
