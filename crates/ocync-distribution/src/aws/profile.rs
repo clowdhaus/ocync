@@ -230,15 +230,17 @@ fn merge(
             tracing::warn!("AWS config section [default] ignored for [profile default]");
             continue;
         }
-        let target = match name.prefix {
-            None | Some(PROFILE_PREFIX) => sections.profiles.entry(name.suffix.to_owned()),
-            Some(SSO_SESSION_PREFIX) => sections.sso_sessions.entry(name.suffix.to_owned()),
-            Some(SERVICES_PREFIX) => {
+        let target = match name.kind {
+            SectionKind::Bare | SectionKind::Profile => {
+                sections.profiles.entry(name.suffix.to_owned())
+            }
+            SectionKind::SsoSession => sections.sso_sessions.entry(name.suffix.to_owned()),
+            SectionKind::Services => {
                 let services = sections.services.entry(name.suffix.to_owned()).or_default();
                 merge_services(services, name.suffix, properties);
                 continue;
             }
-            Some(prefix) => {
+            SectionKind::Other(prefix) => {
                 tracing::debug!(prefix, section = name.suffix, "AWS config section not read");
                 continue;
             }
@@ -287,40 +289,76 @@ fn is_identifier(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || "_-/.%@:+".contains(c))
 }
 
-/// A section header split into its optional prefix and its name.
+/// What a section header's prefix makes the section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectionKind<'a> {
+    /// No prefix: `[default]`, or any credentials file section.
+    Bare,
+    /// `[profile name]`.
+    Profile,
+    /// `[sso-session name]`.
+    SsoSession,
+    /// `[services name]`.
+    Services,
+    /// A prefix that is not read.
+    Other(&'a str),
+}
+
+impl<'a> SectionKind<'a> {
+    fn parse(prefix: Option<&'a str>) -> Self {
+        match prefix {
+            None => Self::Bare,
+            Some(PROFILE_PREFIX) => Self::Profile,
+            Some(SSO_SESSION_PREFIX) => Self::SsoSession,
+            Some(SERVICES_PREFIX) => Self::Services,
+            Some(other) => Self::Other(other),
+        }
+    }
+
+    /// The prefix as written, if any.
+    fn prefix(self) -> Option<&'a str> {
+        match self {
+            Self::Bare => None,
+            Self::Profile => Some(PROFILE_PREFIX),
+            Self::SsoSession => Some(SSO_SESSION_PREFIX),
+            Self::Services => Some(SERVICES_PREFIX),
+            Self::Other(prefix) => Some(prefix),
+        }
+    }
+}
+
+/// A section header split into its kind and its name.
 struct SectionName<'a> {
-    prefix: Option<&'a str>,
+    kind: SectionKind<'a>,
     suffix: &'a str,
 }
 
 impl<'a> SectionName<'a> {
     fn parse(header: &'a str) -> Self {
         let header = header.trim_matches(WHITESPACE);
-        match header.split_once(WHITESPACE) {
-            Some((prefix, suffix)) => Self {
-                prefix: Some(prefix.trim()),
-                suffix: suffix.trim(),
-            },
-            None => Self {
-                prefix: None,
-                suffix: header.trim(),
-            },
+        let (prefix, suffix) = match header.split_once(WHITESPACE) {
+            Some((prefix, suffix)) => (Some(prefix.trim()), suffix.trim()),
+            None => (None, header.trim()),
+        };
+        Self {
+            kind: SectionKind::parse(prefix),
+            suffix,
         }
     }
 
     fn is_unprefixed_default(&self) -> bool {
-        self.prefix.is_none() && self.suffix == DEFAULT_PROFILE
+        self.kind == SectionKind::Bare && self.suffix == DEFAULT_PROFILE
     }
 
     fn is_prefixed_default(&self) -> bool {
-        self.prefix == Some(PROFILE_PREFIX) && self.suffix == DEFAULT_PROFILE
+        self.kind == SectionKind::Profile && self.suffix == DEFAULT_PROFILE
     }
 
     /// The config file needs a prefix on every section but `[default]`; the
     /// credentials file allows no prefix at all.
     fn valid_for(self, kind: FileKind) -> Result<Self, String> {
-        let Self { prefix, suffix } = self;
-        match (kind, prefix) {
+        let suffix = self.suffix;
+        match (kind, self.kind.prefix()) {
             (FileKind::Config, Some(prefix)) if !is_identifier(suffix) => Err(format!(
                 "[{prefix} {suffix}]: `{suffix}` is not a valid name"
             )),

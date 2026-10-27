@@ -216,7 +216,7 @@ fn normalize_path(path: &str) -> String {
 /// What [`percent_encode`] leaves as it is, beside the RFC 3986 unreserved
 /// set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Keep {
+enum Keep {
     /// Nothing else: a query or form value.
     Unreserved,
     /// The `/` separators of a path.
@@ -225,7 +225,7 @@ pub(super) enum Keep {
 
 /// Percent-encode every byte outside the RFC 3986 unreserved set but what
 /// `keep` names, as AWS encodes paths and query and form values.
-pub(super) fn percent_encode(value: &str, keep: Keep) -> String {
+fn percent_encode(value: &str, keep: Keep) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric()

@@ -35,6 +35,9 @@ pub mod spec;
 /// Tag listing with pagination.
 pub mod tags;
 
+/// What a secret prints as in a `Debug` rendering.
+pub(crate) const REDACTED: &str = "[REDACTED]";
+
 /// Install `aws-lc-rs` as the process-wide rustls crypto provider.
 ///
 /// Must be called before any TLS connection is established. Safe to call

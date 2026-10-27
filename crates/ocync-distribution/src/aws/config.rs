@@ -287,7 +287,7 @@ impl Config {
 
 /// `true` or `false`, any case, for the setting named `name`. Anything else
 /// is ignored with a warning, as the SDK does.
-fn parse_flag(name: &str, value: &str) -> Option<bool> {
+fn parse_flag(name: &'static str, value: &str) -> Option<bool> {
     if value.eq_ignore_ascii_case("true") {
         Some(true)
     } else if value.eq_ignore_ascii_case("false") {

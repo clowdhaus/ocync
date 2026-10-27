@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::str::Utf8Error;
 
 use super::super::host::{Fs, Host};
-use super::{Credentials, Error as ChainError, REDACTED, sts};
+use super::{Credentials, Error as ChainError, sts};
+use crate::REDACTED;
 
 /// The variable naming the token file.
 const TOKEN_FILE: &str = "AWS_WEB_IDENTITY_TOKEN_FILE";

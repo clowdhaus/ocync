@@ -119,7 +119,7 @@ Both the CSI driver and the cloud-specific provider plugin (AWS, Azure, GCP, or 
 
 ## Workload Identity
 
-For cloud registries (ECR, ECR Public, GAR, ACR), the cleanest path is **no Secret at all** -- bind the workload to a cloud IAM identity and let the SDK resolve credentials on each pod. The chart's `workloadIdentity` block sets the right ServiceAccount annotation (and pod label, for Azure) for your provider:
+For cloud registries (ECR, ECR Public, GAR, ACR), the cleanest path is **no Secret at all** -- bind the workload to a cloud IAM identity and let ocync resolve credentials on each pod. The chart's `workloadIdentity` block sets the right ServiceAccount annotation (and pod label, for Azure) for your provider:
 
 ```yaml
 # values.yaml -- AWS IRSA

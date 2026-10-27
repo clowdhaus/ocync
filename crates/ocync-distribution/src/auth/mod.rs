@@ -43,9 +43,8 @@ pub(crate) fn registry_origin(registry: &url::Url) -> String {
 
 /// Tokens are proactively refreshed when their remaining lifetime drops
 /// below this window. Must be shorter than the shortest token TTL we
-/// encounter (Docker Hub returns 300s). The prior value of 15 minutes
-/// caused every Docker Hub token to be "stale" immediately, bypassing
-/// the cache entirely.
+/// encounter (Docker Hub returns 300s): a window at least that long marks
+/// every such token stale on arrival, bypassing the cache entirely.
 pub(crate) const EARLY_REFRESH_WINDOW: Duration = Duration::from_secs(30);
 
 /// OAuth2-style scope for registry token requests.
@@ -136,7 +135,7 @@ pub struct Token {
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Token")
-            .field("value", &"[REDACTED]")
+            .field("value", &crate::REDACTED)
             .field("expires_at", &self.expires_at)
             .finish()
     }
@@ -244,7 +243,7 @@ impl fmt::Debug for Credentials {
             Self::Basic { username, .. } => f
                 .debug_struct("Credentials::Basic")
                 .field("username", username)
-                .field("password", &"[REDACTED]")
+                .field("password", &crate::REDACTED)
                 .finish(),
         }
     }

@@ -1281,8 +1281,7 @@ fn client_for(
 /// configuration is needed - if we know it's ECR, we use the batch API.
 ///
 /// Targets only: the map is read in exactly one place, keyed by target alias,
-/// so a checker for a source-only registry is an AWS round trip per cycle that
-/// nothing can consume.
+/// so a checker for a source-only registry would never be used.
 fn build_batch_checkers(
     config: &Config,
     clients: &ClientMap,
@@ -1292,8 +1291,7 @@ fn build_batch_checkers(
     let mut checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
     // Targets only, and only where the client built: the map is read by
-    // target alias, and a registry that already failed would just repeat the
-    // round trip for a checker nothing can use.
+    // target alias, and a registry that already failed has no use for one.
     let usable: Vec<(&String, &RegistryConfig)> = config
         .registries
         .iter()
@@ -1307,7 +1305,7 @@ fn build_batch_checkers(
         let _item = tracker.track(name);
         let hostname = bare_hostname(&reg.url);
         // Explicit non-Ecr auth_type is a hard opt-out: don't try to build an
-        // AWS-SDK-backed batch checker for a registry the user has declared
+        // ECR batch checker for a registry the user has declared
         // is not ECR, even if the hostname pattern matches. Only fall
         // through to hostname auto-detection when no `auth_type` is set.
         let is_ecr = match reg.auth_type.as_ref() {

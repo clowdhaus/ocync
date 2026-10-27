@@ -18,6 +18,13 @@ use super::{Credentials, credential_api};
 /// The header that carries the login token: the call is not signed.
 const BEARER_TOKEN: HeaderName = HeaderName::from_static("x-amz-sso_bearer_token");
 
+/// The path of `GetRoleCredentials`.
+const ROLE_CREDENTIALS_PATH: &str = "/federation/credentials";
+
+/// The query names of `GetRoleCredentials`.
+const ROLE_NAME: &str = "role_name";
+const ACCOUNT_ID: &str = "account_id";
+
 /// An IAM Identity Center role a profile names.
 #[derive(Debug)]
 pub(super) struct Role<'a> {
@@ -76,15 +83,12 @@ pub(super) async fn load(
     let request = ApiRequest {
         operation: "GetRoleCredentials",
         method: http::Method::GET,
-        path: "/federation/credentials",
+        path: ROLE_CREDENTIALS_PATH,
         headers: &[(BEARER_TOKEN, token.as_str())],
         body: Bytes::new(),
         modeled_errors: &[],
     };
-    let query = [
-        ("role_name", role.role_name),
-        ("account_id", role.account_id),
-    ];
+    let query = [(ROLE_NAME, role.role_name), (ACCOUNT_ID, role.account_id)];
     let answer = api
         .call_unsigned(&request, &query)
         .await
