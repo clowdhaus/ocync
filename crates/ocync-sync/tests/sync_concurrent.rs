@@ -1929,229 +1929,85 @@ async fn sync_prewarmed_committed_repo_skips_watch_wait() {
     assert_eq!(report.images[0].blob_stats.transferred, 1);
 }
 
-/// Follower-leader mount deadlock: bounded deadline breaks the prior-run cycle.
+/// A wait for another image's manifest commit is bounded by the mount-source
+/// wait deadline.
 ///
-/// This exercises the deadlock where a follower (tgt-b) is waiting for a leader
-/// (tgt-a) to commit before mounting 7 warm-cache blobs, while the leader is
-/// blocked on a shared blob claimed by the follower. Without a deadline, this
-/// is a cyclic wait: follower waits for tgt-a commit, leader waits for follower's
-/// shared-blob upload, which can't proceed because follower's watch-waits block it.
-///
-/// Setup:
-/// - Leader (tgt-a): 1 config + 1 unique layer + 1 shared layer = 3 blobs.
-/// - Follower (tgt-b): 1 config + 7 warm layers + 1 shared layer = 9 blobs.
-///   The 7 warm layers "previously uploaded by the leader" exist at tgt-a in
-///   the cache but tgt-a is not yet committed.
-///
-/// Resolution via bounded deadline:
-/// 1. Follower claims shared blob first (leader blobs delayed 50ms).
-/// 2. Follower pushes shared blob (no committed source -> falls through to push).
-/// 3. Leader claims shared blob, waits for a committed mount source.
-/// 4. The bounded deadline (2s) trips for the leader on the shared blob.
-/// 5. Leader falls through to push, completes all blobs, commits.
-/// 6. tgt-a commit fires the watch; follower mounts its 7 warm blobs.
-///
-/// The semaphore-boundary fix still matters here: watch-waits run OUTSIDE the
-/// semaphore so the follower's shared-blob future can always get a permit.
+/// Two images at different repos share one layer, and both manifest PUTs are
+/// slow. Whichever image uploads the layer leaves it at its repo uncommitted
+/// for the length of its manifest PUT, so the other image waits on that
+/// repo's commit watch. The deadline expires before the commit, and the
+/// waiting image pushes the layer instead of mounting it. Without the bound,
+/// it would wait out the slow PUT and then mount.
 #[tokio::test(flavor = "current_thread")]
-async fn sync_follower_mount_wait_no_deadlock() {
+async fn sync_mount_wait_on_an_uncommitted_repo_is_bounded() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    // Shared layer between leader and follower.
-    let shared_data = b"shared-mount-deadlock-layer";
+    let shared = b"bounded-wait-shared-layer";
+    let parts_a = ManifestBuilder::new(b"bounded-wait-config-a")
+        .layer(shared)
+        .build();
+    let parts_b = ManifestBuilder::new(b"bounded-wait-config-b")
+        .layer(shared)
+        .build();
+    parts_a.mount_source(&source_server, "src-a", "v1").await;
+    parts_b.mount_source(&source_server, "src-b", "v1").await;
 
-    // 7 layers that "already exist at tgt-a" (warm cache).
-    // These have distinct data so they get distinct digests.
-    let warm_layers: Vec<Vec<u8>> = (0..7)
-        .map(|i| format!("warm-cache-layer-{i}-mount-deadlock").into_bytes())
+    for (repo, parts) in [("tgt-a", &parts_a), ("tgt-b", &parts_b)] {
+        mount_manifest_head_not_found(&target_server, repo, "v1").await;
+        mount_blob_not_found(&target_server, repo, &parts.config_desc.digest).await;
+        mount_blob_not_found(&target_server, repo, &parts.layer_descs[0].digest).await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/{repo}/blobs/uploads/")))
+            .and(query_param(
+                "mount",
+                parts.layer_descs[0].digest.to_string(),
+            ))
+            .respond_with(ResponseTemplate::new(201))
+            .with_priority(1)
+            .expect(0)
+            .mount(&target_server)
+            .await;
+        mount_blob_push(&target_server, repo).await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/{repo}/manifests/v1")))
+            .respond_with(ResponseTemplate::new(201).set_delay(std::time::Duration::from_secs(3)))
+            .mount(&target_server)
+            .await;
+    }
+
+    let mappings = [("src-a", "tgt-a"), ("src-b", "tgt-b")]
+        .into_iter()
+        .map(|(src, tgt)| {
+            resolved_mapping(
+                mock_client(&source_server),
+                src,
+                tgt,
+                vec![target_entry("target", mock_client(&target_server))],
+                vec![TagPair::same("v1")],
+            )
+        })
         .collect();
 
-    // Leader image: 1 config + 1 unique layer + 1 shared layer.
-    let parts_leader = ManifestBuilder::new(b"config-mount-deadlock-leader")
-        .layer(b"unique-leader-layer-mount-deadlock")
-        .layer(shared_data)
-        .build();
-
-    // Follower image: 1 config + 7 warm layers + shared layer = 9 blobs total.
-    let mut builder_follower = ManifestBuilder::new(b"config-mount-deadlock-follower");
-    for layer in &warm_layers {
-        builder_follower = builder_follower.layer(layer);
-    }
-    builder_follower = builder_follower.layer(shared_data);
-    let parts_follower = builder_follower.build();
-
-    // Source: leader blobs delayed 50ms so follower claims shared blob first.
-    mount_source_manifest(
-        &source_server,
-        "src-leader",
-        "v1",
-        &serde_json::to_vec(&ImageManifest {
-            schema_version: 2,
-            media_type: None,
-            config: parts_leader.config_desc.clone(),
-            layers: parts_leader.layer_descs.clone(),
-            subject: None,
-            artifact_type: None,
-            annotations: None,
-        })
-        .unwrap(),
-    )
-    .await;
-    // Leader config blob: delayed so follower runs first.
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/src-leader/blobs/{}",
-            parts_leader.config_desc.digest
-        )))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"config-mount-deadlock-leader".to_vec())
-                .insert_header(
-                    "content-length",
-                    b"config-mount-deadlock-leader".len().to_string(),
-                )
-                .set_delay(std::time::Duration::from_millis(50)),
-        )
-        .mount(&source_server)
-        .await;
-    // Leader unique layer: delayed.
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/src-leader/blobs/{}",
-            parts_leader.layer_descs[0].digest
-        )))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(b"unique-leader-layer-mount-deadlock".to_vec())
-                .insert_header(
-                    "content-length",
-                    b"unique-leader-layer-mount-deadlock".len().to_string(),
-                )
-                .set_delay(std::time::Duration::from_millis(50)),
-        )
-        .mount(&source_server)
-        .await;
-    // Leader shared layer: delayed.
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/src-leader/blobs/{}",
-            parts_leader.layer_descs[1].digest
-        )))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(shared_data.to_vec())
-                .insert_header("content-length", shared_data.len().to_string())
-                .set_delay(std::time::Duration::from_millis(50)),
-        )
-        .mount(&source_server)
-        .await;
-
-    // Source: follower blobs served instantly (follower claims before leader).
-    parts_follower
-        .mount_source(&source_server, "src-follower", "v1")
-        .await;
-
-    // Target: both repos accept uploads and mounts.
-    for repo in &["tgt-a", "tgt-b"] {
-        mount_manifest_head_not_found(&target_server, repo, "v1").await;
-        // All blob HEADs return 404.
-        mount_blob_not_found(&target_server, repo, &parts_leader.config_desc.digest).await;
-        mount_blob_not_found(&target_server, repo, &parts_follower.config_desc.digest).await;
-        for desc in &parts_leader.layer_descs {
-            mount_blob_not_found(&target_server, repo, &desc.digest).await;
-        }
-        for desc in &parts_follower.layer_descs {
-            mount_blob_not_found(&target_server, repo, &desc.digest).await;
-        }
-        mount_blob_push(&target_server, repo).await;
-        mount_manifest_push(&target_server, repo, "v1").await;
-
-        // Mount mocks for all blobs (priority 1 over upload POST).
-        for desc in parts_leader.layer_descs.iter() {
-            Mock::given(method("POST"))
-                .and(path(format!("/v2/{repo}/blobs/uploads/")))
-                .and(query_param("mount", desc.digest.to_string()))
-                .respond_with(ResponseTemplate::new(201))
-                .with_priority(1)
-                .mount(&target_server)
-                .await;
-        }
-        for desc in parts_follower.layer_descs.iter() {
-            Mock::given(method("POST"))
-                .and(path(format!("/v2/{repo}/blobs/uploads/")))
-                .and(query_param("mount", desc.digest.to_string()))
-                .respond_with(ResponseTemplate::new(201))
-                .with_priority(1)
-                .mount(&target_server)
-                .await;
-        }
-    }
-
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let mapping_leader = resolved_mapping(
-        Arc::clone(&source_client),
-        "src-leader",
-        "tgt-a",
-        vec![target_entry("target", Arc::clone(&target_client))],
-        vec![TagPair::same("v1")],
-    );
-    let mapping_follower = resolved_mapping(
-        source_client,
-        "src-follower",
-        "tgt-b",
-        vec![target_entry("target", target_client)],
-        vec![TagPair::same("v1")],
-    );
-
-    // Warm cache: the 7 "old" blobs are already at tgt-a (the leader's repo)
-    // with status Completed. This makes the follower's mount-source lookup
-    // return tgt-a for each of them, triggering the commit wait.
-    let target_name = "target";
-    let cache = empty_cache();
-    {
-        let tgt_a_repo = RepositoryName::new("tgt-a").unwrap();
-        let mut c = cache.borrow_mut();
-        for desc in &parts_follower.layer_descs[..7] {
-            c.set_blob_completed(target_name, desc.digest.clone(), tgt_a_repo.clone());
-        }
-        // Do NOT mark tgt-a as committed -- this forces the watch wait.
-    }
-
-    // Short mount-source wait deadline so the leader's deadline trips quickly
-    // on the shared blob (no committed source) instead of waiting 60s.
-    // The follower still mounts its 7 warm blobs from the committed leader.
     let engine = SyncEngine::new(fast_retry(), 10)
-        .with_mount_source_wait_deadline(std::time::Duration::from_secs(2));
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        .with_mount_source_wait_deadline(std::time::Duration::from_millis(500));
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
         engine.run(
-            vec![mapping_leader, mapping_follower],
-            cache,
+            mappings,
+            empty_cache(),
             BlobStage::disabled(),
             &NullProgress,
-            Some(&ShutdownSignal::new()),
+            None,
         ),
     )
-    .await;
+    .await
+    .expect("commit wait was not bounded");
 
-    let report =
-        result.expect("engine deadlocked: cyclic watch-wait not broken by bounded deadline");
-    assert_eq!(report.images.len(), 2);
-    assert!(
-        report
-            .images
-            .iter()
-            .all(|r| matches!(r.status, ImageStatus::Synced)),
-        "both images should sync via deadline fallback (no deadlock): {:#?}",
-        report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
-    );
     assert_eq!(report.stats.images_synced, 2);
-    // Core invariant: no deadlock. Both images must complete.
-    // Whether warm blobs are mounted vs pushed depends on timing; the
-    // bounded-deadline guarantees correctness (both sync), not mount rate.
+    assert_eq!(report.stats.blobs_mounted, 0);
+    // Each image pushes its config and the shared layer.
+    assert_eq!(report.stats.blobs_transferred, 4);
 }
 
 /// Two images share a blob and run concurrently; the blob already exists at

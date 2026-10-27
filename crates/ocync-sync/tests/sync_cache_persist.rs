@@ -104,11 +104,12 @@ fn round_trip_mount_source_survives() {
     // committed_repos is runtime-only (not persisted). Mark committed
     // to verify the blob repos data survived the round-trip.
     loaded.mark_repo_committed("reg.io", &repo("repo/a"));
-    // committed_mount_sources returns an iterator of repos that are present
-    // and committed; repo/a should appear as a mount source for repo/b.
+    // A loaded `Verified` entry needs a commit to be offered until
+    // `start_run` turns it into `Remembered`; repo/a should appear as a mount
+    // source for repo/b.
     assert_eq!(
         loaded
-            .committed_mount_sources("reg.io", &digest_a(), &repo("repo/b"))
+            .mount_sources("reg.io", &digest_a(), &repo("repo/b"))
             .next()
             .cloned(),
         Some(repo("repo/a"))

@@ -291,8 +291,9 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
         .await;
     mount_manifest_push(&target_server, "repo-b", "v1").await;
 
-    // Pre-warm the cache: blobs already exist at repo-a on the target,
-    // and repo-a has a committed manifest (so it's a valid mount source).
+    // Pre-warm the cache: blobs already exist at repo-a on the target, and
+    // repo-a was committed earlier in this process, so it is offered ahead of
+    // repos known only from an earlier run.
     let cache = empty_cache();
     {
         let mut c = cache.borrow_mut();
@@ -326,6 +327,123 @@ async fn sync_warm_cache_triggers_cross_repo_mount() {
     assert_eq!(report.images[0].blob_stats.transferred, 0);
     assert_eq!(report.images[0].blob_stats.skipped, 0);
     assert_eq!(report.stats.blobs_mounted, 2);
+    assert_eq!(report.stats.blobs_transferred, 0);
+}
+
+/// A blob that an earlier run left at repo-a is mounted from repo-a at once,
+/// though this run pushes nothing to repo-a, so its commit watch never fires.
+#[tokio::test]
+async fn sync_mounts_from_an_earlier_runs_repo_without_waiting() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"earlier-config")
+        .layer(b"earlier-layer")
+        .build();
+
+    mount_source_manifest(&source_server, "repo-b", "v1", &parts.bytes).await;
+
+    mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-b/blobs/uploads/"))
+        .and(query_param("from", "repo-a"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(2)
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo-b", "v1").await;
+
+    // Known at repo-a from an earlier run only: the run turns these into
+    // remembered entries, and repo-a is never marked committed.
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        let repo_a = RepositoryName::new("repo-a").unwrap();
+        c.set_blob_completed("target", parts.config_desc.digest.clone(), repo_a.clone());
+        c.set_blob_completed("target", parts.layer_descs[0].digest.clone(), repo_a);
+    }
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo-b",
+        vec![TagPair::same("v1")],
+    );
+
+    // Waiting for repo-a's commit would hold each blob for the 60-second
+    // deadline and then push it.
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_sync_with_cache(vec![mapping], cache),
+    )
+    .await
+    .expect("mount waited for a commit that never comes");
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(report.stats.blobs_mounted, 2);
+    assert_eq!(report.stats.blobs_transferred, 0);
+}
+
+/// A refused mount still checks whether the target repo holds the blob, so a
+/// blob already there is not pushed again on a registry with no batch check.
+#[tokio::test]
+async fn sync_refused_mount_still_checks_the_target_repo() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"refused-config")
+        .layer(b"refused-layer")
+        .build();
+
+    mount_source_manifest(&source_server, "repo-b", "v1", &parts.bytes).await;
+
+    mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo-b/blobs/uploads/"))
+        .and(query_param("from", "repo-a"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .append_header("Location", "/v2/repo-b/blobs/uploads/refused-uuid"),
+        )
+        .expect(2)
+        .mount(&target_server)
+        .await;
+    for desc in [&parts.config_desc, &parts.layer_descs[0]] {
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/repo-b/blobs/{}", desc.digest)))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("content-length", desc.size.to_string()),
+            )
+            .expect(1)
+            .mount(&target_server)
+            .await;
+    }
+    Mock::given(method("PUT"))
+        .and(path_regex("^/v2/repo-b/blobs/uploads/.+"))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo-b", "v1").await;
+
+    let cache = empty_cache();
+    {
+        let mut c = cache.borrow_mut();
+        let repo_a = RepositoryName::new("repo-a").unwrap();
+        c.set_blob_completed("target", parts.config_desc.digest.clone(), repo_a.clone());
+        c.set_blob_completed("target", parts.layer_descs[0].digest.clone(), repo_a);
+    }
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo-b",
+        vec![TagPair::same("v1")],
+    );
+    let report = run_sync_with_cache(vec![mapping], cache).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(report.stats.blobs_skipped, 2);
     assert_eq!(report.stats.blobs_transferred, 0);
 }
 
