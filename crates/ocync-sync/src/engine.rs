@@ -2551,7 +2551,7 @@ async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> Sta
 
 /// Cross-repo mount-source resolver with bounded deadline.
 ///
-/// Loops until either (a) a committed mount source emerges, (b) all candidate
+/// Loops until either (a) a mount source emerges, (b) all candidate
 /// repos resolve without committing, or (c) the deadline expires. Returns
 /// the mount source to attempt, or `None` if the caller should fall back to
 /// push.
@@ -2656,8 +2656,6 @@ async fn transfer_claimed_blob(
     mount_source: Option<RepositoryName>,
     staging: StagingClaim<'_>,
 ) -> BlobResult {
-    let mut mount_attempted = false;
-
     if let Some(from_repo) = mount_source {
         debug!(%digest, %from_repo, target = %io.sink.target_name, "attempting mount");
         match io
@@ -2679,12 +2677,11 @@ async fn transfer_claimed_blob(
                 // claim prevents concurrent waiters from re-claiming and
                 // starting duplicate pushes.
                 io.sink.mark_repo_stale(digest, &from_repo);
-                mount_attempted = true;
             }
         }
     }
 
-    if !batch_checked.contains(digest) && !mount_attempted {
+    if !batch_checked.contains(digest) {
         let head_result = io.target_client.blob_exists(io.target_repo, digest).await;
         match head_result {
             Ok(Some(_)) => {

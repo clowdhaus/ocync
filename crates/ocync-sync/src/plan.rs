@@ -48,13 +48,10 @@ impl RepoBlobState {
         matches!(self, Self::Failed(_))
     }
 
-    /// Whether this state means "still active or resolvable in this run".
-    /// Used by `unresolved_watches_for` to filter dead-end candidates.
+    /// Whether this state was recorded this run and is not a dead end.
+    /// Used by `unresolved_watches_for` to filter candidates to wait on.
     pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            Self::Verified | Self::Uploading | Self::Completed | Self::Remembered
-        )
+        matches!(self, Self::Verified | Self::Uploading | Self::Completed)
     }
 }
 
@@ -243,11 +240,12 @@ impl BlobDedupMap {
         &'a self,
         target: &str,
         digest: &Digest,
-    ) -> Box<dyn Iterator<Item = (&'a RepositoryName, &'a RepoBlobState)> + 'a> {
-        match self.inner.get(target).and_then(|m| m.get(digest)) {
-            Some(info) => Box::new(info.repos.iter()),
-            None => Box::new(std::iter::empty()),
-        }
+    ) -> impl Iterator<Item = (&'a RepositoryName, &'a RepoBlobState)> + 'a {
+        self.inner
+            .get(target)
+            .and_then(|m| m.get(digest))
+            .into_iter()
+            .flat_map(|info| info.repos.iter())
     }
 
     /// Drop `repo`'s state for the blob if it is only [`RepoBlobState::Remembered`],

@@ -126,7 +126,8 @@ pub struct TransferStateCache {
     dedup: BlobDedupMap,
     snapshots: SourceSnapshotMap,
     /// Runtime-only: tracks which (target, repo) pairs have had their manifests
-    /// committed. Only repos here are eligible mount sources. Kept across runs
+    /// committed. Repos here are mount sources ahead of repos known only from
+    /// an earlier run. Kept across runs
     /// in one process: a repo committed in an earlier run still holds its
     /// manifest at the target, and a stale entry self-heals through
     /// `mark_blob_repo_stale` when a mount from it fails.
@@ -198,9 +199,10 @@ impl TransferStateCache {
 
     /// Iterator over mount sources for a blob, excluding `current_repo`.
     ///
-    /// Yields first the repos holding the blob whose manifest this run
-    /// committed at `target`, then the repos holding it only according to an
-    /// earlier run. An earlier run's repo is offered without waiting, because
+    /// Yields first the repos holding the blob whose manifest is committed at
+    /// `target` in this process, then the uncommitted repos holding it only
+    /// according to an earlier run. An earlier run's repo is offered without
+    /// waiting, because
     /// its commit watch fires only if this run pushes an image to it: its
     /// manifest most likely already references the blob, and a mount the
     /// registry refuses marks it stale and falls back to a push. Iteration
@@ -211,26 +213,28 @@ impl TransferStateCache {
         digest: &'a Digest,
         current_repo: &'a RepositoryName,
     ) -> impl Iterator<Item = &'a RepositoryName> + 'a {
-        let committed = self.committed_repos.get(target);
-        let is_committed = move |r: &RepositoryName| committed.is_some_and(|set| set.contains(r));
+        let committed_set = self.committed_repos.get(target);
+        let is_committed =
+            move |r: &RepositoryName| committed_set.is_some_and(|set| set.contains(r));
         let others = move || {
             self.dedup
                 .repos_iter(target, digest)
                 .filter(move |(r, _)| *r != current_repo)
         };
-        let this_run = others().filter(move |(r, state)| state.is_present() && is_committed(r));
-        let earlier_run = others().filter(move |(r, state)| {
-            matches!(state, RepoBlobState::Remembered) && !is_committed(r)
-        });
-        this_run.chain(earlier_run).map(|(r, _)| r)
+        let committed = others().filter(move |(r, state)| state.is_present() && is_committed(r));
+        let remembered_uncommitted = others()
+            .filter(move |(r, state)| **state == RepoBlobState::Remembered && !is_committed(r));
+        committed.chain(remembered_uncommitted).map(|(r, _)| r)
     }
 
     /// `Watch::Receivers` for repos that:
-    ///   1. Have the blob with an active state (present or Uploading, NOT Failed)
+    ///   1. Have the blob recorded this run (`Verified`, `Completed` or
+    ///      `Uploading`, NOT `Failed`)
     ///   2. Have not yet had their manifest-commit watch fire
     ///
     /// Used by the resolver to subscribe only to repos still able to become a
-    /// committed mount source.
+    /// mount source once committed. A repo known only from an earlier run is
+    /// never waited on: [`Self::mount_sources`] offers it at once.
     pub fn unresolved_watches_for(
         &mut self,
         target: &str,
@@ -578,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_sources_excludes_uncommitted_repos() {
+    fn mount_sources_excludes_this_runs_uncommitted_repos() {
         let mut cache = TransferStateCache::new();
         cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
 
@@ -586,7 +590,10 @@ mod tests {
             .mount_sources("reg.io", &digest(), &repo("repo/b"))
             .cloned()
             .collect();
-        assert!(sources.is_empty(), "uncommitted repo must be excluded");
+        assert!(
+            sources.is_empty(),
+            "a repo recorded this run must commit before it is offered"
+        );
     }
 
     #[test]
@@ -662,6 +669,20 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(sources, vec![repo("repo/b"), repo("repo/a")]);
+    }
+
+    #[test]
+    fn mount_sources_yields_a_remembered_committed_repo_once() {
+        let mut cache = TransferStateCache::new();
+        cache.set_blob_completed("reg.io", digest(), repo("repo/a"));
+        cache.mark_repo_committed("reg.io", &repo("repo/a"));
+        cache.start_run();
+
+        let sources: Vec<_> = cache
+            .mount_sources("reg.io", &digest(), &repo("repo/b"))
+            .cloned()
+            .collect();
+        assert_eq!(sources, vec![repo("repo/a")]);
     }
 
     #[test]
