@@ -57,15 +57,10 @@ impl RetryConfig {
 
 /// Determine whether a request should be retried based on HTTP status code.
 ///
-/// Retries on 408 (Request Timeout), 429 (Too Many Requests), and all 5xx
-/// server errors. This matches the behavior of crane and regsync.
+/// Retries the statuses `ocync_distribution::retry::is_transient_status`
+/// names.
 pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) -> bool {
-    if current_attempt >= max_retries {
-        return false;
-    }
-    status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
+    current_attempt < max_retries && ocync_distribution::retry::is_transient_status(status)
 }
 
 /// ECR (and possibly other registries) can return 404 with the OCI error

@@ -9,7 +9,7 @@ mod container;
 mod environment;
 #[cfg(test)]
 mod fixtures;
-mod imds;
+pub(crate) mod imds;
 mod json;
 mod process;
 mod profile;
@@ -18,8 +18,6 @@ mod sso_token;
 mod sts;
 mod web_identity;
 
-#[cfg(test)]
-pub(super) use imds::TOKEN_HEADER;
 pub(super) use sso_token::Sessions;
 
 use std::fmt;
@@ -148,24 +146,6 @@ fn credential_api(
         stall_timeout: STALL_TIMEOUT,
     };
     Api::new(&host.network, id, parts).map_err(ConfigError::HttpClient)
-}
-
-/// `error` and each of its sources, joined as upstream prints them, so a
-/// reason kept as text still names its cause. A cause the text already ends
-/// with is not repeated: some errors print their cause and also return it as
-/// their source.
-pub(super) fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(e) = source {
-        let cause = e.to_string();
-        if !text.ends_with(&cause) {
-            text.push_str(": ");
-            text.push_str(&cause);
-        }
-        source = e.source();
-    }
-    text
 }
 
 /// Each source and why it was not configured, as `source: reason; ...`.
@@ -324,6 +304,7 @@ impl fmt::Debug for Chain {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::error::error_chain;
 
     /// The SDK documentation's example key, with `session_token` and
     /// `expiry`.

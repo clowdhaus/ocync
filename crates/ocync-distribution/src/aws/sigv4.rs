@@ -2,9 +2,8 @@
 //!
 //! Signs in the `Authorization` header, with the session token signed as
 //! `x-amz-security-token`, URI path normalization on, the path encoded
-//! twice, and no query: the endpoint never carries one. That is the form
-//! every service ocync calls expects; S3 alone differs, and ocync does not
-//! call it.
+//! twice, and the query canonicalized. That is the form every service ocync
+//! signs for expects; S3 alone differs, and ocync does not call it.
 
 use std::fmt::{self, Write as _};
 use std::time::SystemTime;
@@ -21,6 +20,9 @@ const X_AMZ_DATE: &str = "x-amz-date";
 
 /// The header carrying a temporary credential's session token.
 const X_AMZ_SECURITY_TOKEN: &str = "x-amz-security-token";
+
+/// The header the signature itself is sent in.
+const AUTHORIZATION: &str = "authorization";
 
 /// The AWS key to sign with, borrowed from the credential that holds it.
 #[derive(Clone, Copy)]
@@ -47,6 +49,8 @@ pub(super) struct Request<'a> {
     pub(super) method: &'a http::Method,
     /// The path as sent, already percent-encoded once.
     pub(super) path: &'a str,
+    /// The query as sent, without the `?`, already percent-encoded once.
+    pub(super) query: &'a str,
     /// The headers to sign, including `host`. The signer adds
     /// [`X_AMZ_DATE`], [`X_AMZ_SECURITY_TOKEN`] and `authorization` itself.
     pub(super) headers: &'a [(&'a str, &'a str)],
@@ -88,7 +92,7 @@ pub(super) fn sign(
     key: AccessKey<'_>,
     scope: &CredentialScope<'_>,
     time: SystemTime,
-) -> Vec<(&'static str, String)> {
+) -> Signed {
     let date = AmzDate::new(time);
     let (canonical, signed_headers) = canonical_request(request, &date, key.session_token);
     let string_to_sign = string_to_sign(&canonical, &date, scope);
@@ -98,12 +102,43 @@ pub(super) fn sign(
         key.id,
         credential_scope(&date, scope),
     );
-    let mut headers = vec![(X_AMZ_DATE, date.0)];
-    if let Some(token) = key.session_token {
-        headers.push((X_AMZ_SECURITY_TOKEN, token.to_owned()));
+    Signed {
+        amz_date: date.0,
+        security_token: key.session_token.map(str::to_owned),
+        authorization,
     }
-    headers.push(("authorization", authorization));
-    headers
+}
+
+/// The headers a signature adds to its request. No `Debug`, as it holds a
+/// session token and a signature.
+pub(super) struct Signed {
+    amz_date: String,
+    security_token: Option<String>,
+    authorization: String,
+}
+
+impl Signed {
+    /// The `x-amz-date` header and, with a session token, the
+    /// `x-amz-security-token` header.
+    pub(super) fn date_and_token(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            (X_AMZ_DATE, Some(self.amz_date.as_str())),
+            (X_AMZ_SECURITY_TOKEN, self.security_token.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value?)))
+    }
+
+    /// The `authorization` header's value.
+    pub(super) fn authorization(&self) -> &str {
+        &self.authorization
+    }
+
+    /// Every header to send.
+    pub(super) fn headers(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.date_and_token()
+            .chain([(AUTHORIZATION, self.authorization())])
+    }
 }
 
 /// The canonical request and its signed header list.
@@ -138,14 +173,38 @@ fn canonical_request(
     }
     let signed_headers = names.join(";");
 
-    // The empty line is the canonical query.
     let canonical = format!(
-        "{}\n{}\n\n{canonical_headers}\n{signed_headers}\n{}",
+        "{}\n{}\n{}\n{canonical_headers}\n{signed_headers}\n{}",
         request.method,
         percent_encode(&normalize_path(request.path), Keep::PathSeparators),
+        canonical_query(request.query),
         hex::encode(digest::digest(&digest::SHA256, request.body)),
     );
     (canonical, signed_headers)
+}
+
+/// `query` with each name and value decoded and encoded again as AWS
+/// encodes query values, sorted by name and then value.
+fn canonical_query(query: &str) -> String {
+    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(name, value)| {
+            (
+                percent_encode(&name, Keep::Unreserved),
+                percent_encode(&value, Keep::Unreserved),
+            )
+        })
+        .collect();
+    pairs.sort_unstable();
+    let mut canonical = String::with_capacity(query.len());
+    for (name, value) in &pairs {
+        if !canonical.is_empty() {
+            canonical.push('&');
+        }
+        canonical.push_str(name);
+        canonical.push('=');
+        canonical.push_str(value);
+    }
+    canonical
 }
 
 fn string_to_sign(canonical: &str, date: &AmzDate, scope: &CredentialScope<'_>) -> String {
@@ -267,9 +326,8 @@ mod tests {
     /// 1.6.3, in `sigv4-test-suite/`, that apply to header signing with
     /// normalized, double-encoded paths. Left out: the unnormalized cases
     /// (S3 only), `sign_body` and `omit_session_token` cases (options ocync
-    /// never sets), the query cases (an endpoint never carries one), and
-    /// `get-space-normalized` and `get-utf8`, which expect a single-encoded
-    /// path and which `aws-sigv4` also skips.
+    /// never sets), and `get-space-normalized` and `get-utf8`, which expect
+    /// a single-encoded path and which `aws-sigv4` also skips.
     const VECTORS: &[&str] = &[
         "get-header-key-duplicate",
         "get-header-value-multiline",
@@ -283,12 +341,20 @@ mod tests {
         "get-slashes-normalized",
         "get-unreserved",
         "get-vanilla",
+        "get-vanilla-empty-query-key",
+        "get-vanilla-query",
+        "get-vanilla-query-order-encoded",
+        "get-vanilla-query-order-key-case",
+        "get-vanilla-query-unreserved",
+        "get-vanilla-utf8-query",
         "get-vanilla-with-session-token",
         "post-header-key-case",
         "post-header-key-sort",
         "post-header-value-case",
         "post-sts-header-before",
         "post-vanilla",
+        "post-vanilla-empty-query-value",
+        "post-vanilla-query",
     ];
 
     fn read(test: &str, file: &str) -> String {
@@ -305,6 +371,7 @@ mod tests {
     struct Raw {
         method: http::Method,
         path: String,
+        query: String,
         headers: Vec<(String, String)>,
         body: String,
     }
@@ -325,7 +392,6 @@ mod tests {
                 }
             })
             .collect();
-        assert!(!target.contains('?'), "{target}: the signer signs no query");
         let mut headers: Vec<(String, String)> = Vec::new();
         for line in lines {
             if line.starts_with(char::is_whitespace) {
@@ -340,9 +406,11 @@ mod tests {
                 }
             }
         }
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
         Raw {
             method: method.parse().unwrap(),
-            path: target,
+            path: path.to_owned(),
+            query: query.to_owned(),
             headers,
             body: body.to_string(),
         }
@@ -372,6 +440,7 @@ mod tests {
         let request = Request {
             method: &raw.method,
             path: &raw.path,
+            query: &raw.query,
             headers: &headers,
             body: raw.body.as_bytes(),
         };
@@ -445,6 +514,7 @@ mod tests {
         let request = Request {
             method: &http::Method::GET,
             path: "/",
+            query: "",
             headers: &[("Host", "example.amazonaws.com")],
             body: b"",
         };
@@ -452,26 +522,25 @@ mod tests {
             region: "us-east-1",
             service: "service",
         };
-        let headers = sign(
+        let signed = sign(
             &request,
             key,
             &scope,
             UNIX_EPOCH + Duration::from_secs(SUITE_TIME),
         );
         assert_eq!(
-            headers,
+            signed.headers().collect::<Vec<_>>(),
             [
-                (X_AMZ_DATE, "20150830T123600Z".to_string()),
+                (X_AMZ_DATE, "20150830T123600Z"),
                 (
                     X_AMZ_SECURITY_TOKEN,
-                    "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267".to_string()
+                    "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267"
                 ),
                 (
                     "authorization",
                     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
                      SignedHeaders=host;x-amz-date;x-amz-security-token, \
                      Signature=07ec1639c89043aa0e3e2de82b96708f198cceab042d4a97044c66dd9f74e7f8"
-                        .to_string()
                 ),
             ]
         );

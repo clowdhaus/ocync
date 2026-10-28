@@ -18,7 +18,7 @@ const MAX_LABEL_LEN: usize = 63;
 /// It is spliced into endpoint host names and signatures, so it must be a
 /// valid host label, dots allowed, as the SDK's endpoint rules require.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct Region(String);
+pub(crate) struct Region(String);
 
 /// A region that is not a valid host label.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -27,7 +27,7 @@ pub(crate) struct InvalidRegion(String);
 
 impl Region {
     /// Read `text` as a region.
-    pub(super) fn parse(text: &str) -> Result<Self, InvalidRegion> {
+    pub(crate) fn parse(text: &str) -> Result<Self, InvalidRegion> {
         let valid_label = |label: &str| {
             (1..=MAX_LABEL_LEN).contains(&label.len())
                 && !label.starts_with('-')
@@ -43,7 +43,7 @@ impl Region {
     }
 
     /// The region as text.
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -183,14 +183,7 @@ impl Endpoint {
         let _ = url.set_password(None);
         let path = format!("{}/", url.path().trim_end_matches('/'));
         url.set_path(&path);
-        let host = url
-            .host_str()
-            .expect("an http or https URL has a host")
-            .to_owned();
-        let host = match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host,
-        };
+        let host = super::host_header(&url).to_owned();
         Ok(Self { url, host })
     }
 

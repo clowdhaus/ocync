@@ -6,6 +6,7 @@
 #[cfg(test)]
 use std::collections::HashMap;
 use std::env::VarError;
+use std::ffi::OsString;
 use std::io::{self, Write as _};
 use std::net::IpAddr;
 use std::path::Path;
@@ -22,10 +23,10 @@ use super::replay::Replay;
 /// Everything the settings and credentials are read from, and the SSO
 /// token refreshes the chains on it share.
 #[derive(Debug, Clone)]
-pub(super) struct Host {
-    pub(super) env: Env,
-    pub(super) fs: Fs,
-    pub(super) platform: Platform,
+pub(crate) struct Host {
+    pub(crate) env: Env,
+    pub(crate) fs: Fs,
+    pub(crate) platform: Platform,
     pub(super) clock: Clock,
     pub(super) network: Network,
     pub(super) dns: Dns,
@@ -34,7 +35,7 @@ pub(super) struct Host {
 
 impl Host {
     /// This process on the platform it runs on.
-    pub(super) fn current() -> Self {
+    pub(crate) fn current() -> Self {
         Self {
             env: Env::Process,
             fs: Fs::Real,
@@ -52,7 +53,7 @@ impl Host {
     /// A Unix host on the system clock with no variables, files or names,
     /// whose network fails the test on any request, sharing SSO token
     /// refreshes with no other host. Tests override only what they set.
-    pub(super) fn fixed() -> Self {
+    pub(crate) fn fixed() -> Self {
         Self {
             env: Env::Fixed(HashMap::new()),
             fs: Fs::Fixed(HashMap::new()),
@@ -94,7 +95,7 @@ impl Dns {
 
 /// Where the time comes from.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum Clock {
+pub(crate) enum Clock {
     /// The system clock.
     System,
     /// A fixed instant.
@@ -104,7 +105,7 @@ pub(super) enum Clock {
 
 impl Clock {
     /// The time now.
-    pub(super) fn now(self) -> SystemTime {
+    pub(crate) fn now(self) -> SystemTime {
         match self {
             Self::System => SystemTime::now(),
             #[cfg(test)]
@@ -142,15 +143,15 @@ impl Network {
 
 /// How long a connection and each read may take.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Timeouts {
-    pub(super) connect: Duration,
-    pub(super) read: Duration,
+pub(crate) struct Timeouts {
+    pub(crate) connect: Duration,
+    pub(crate) read: Duration,
 }
 
 /// The client settings for a credential endpoint the token is meant for
 /// alone, the instance metadata service or the container endpoint: no
 /// proxy, so a token never reaches an `HTTP_PROXY` host, and no redirect.
-pub(super) fn credential_endpoint_client(timeouts: Timeouts) -> reqwest::ClientBuilder {
+pub(crate) fn credential_endpoint_client(timeouts: Timeouts) -> reqwest::ClientBuilder {
     crate::client::no_redirect_builder()
         .no_proxy()
         .connect_timeout(timeouts.connect)
@@ -183,18 +184,21 @@ impl Transport {
 
 /// Where environment variables come from.
 #[derive(Debug, Clone)]
-pub(super) enum Env {
+pub(crate) enum Env {
     /// The running process's environment.
     Process,
     /// A fixed set.
     #[cfg(test)]
     Fixed(HashMap<String, String>),
+    /// A fixed set whose values need not be UTF-8.
+    #[cfg(test)]
+    FixedOs(HashMap<String, OsString>),
 }
 
 impl Env {
     /// The value of `key`, or `None` when unset. A value that is not UTF-8
     /// is also `None`, with a warning, as the SDK treats it as unset.
-    pub(super) fn get(&self, key: &str) -> Option<String> {
+    pub(crate) fn get(&self, key: &str) -> Option<String> {
         match self {
             Self::Process => match std::env::var(key) {
                 Ok(value) => Some(value),
@@ -206,13 +210,27 @@ impl Env {
             },
             #[cfg(test)]
             Self::Fixed(vars) => vars.get(key).cloned(),
+            #[cfg(test)]
+            Self::FixedOs(vars) => vars.get(key)?.clone().into_string().ok(),
+        }
+    }
+
+    /// The value of `key` as the platform holds it, UTF-8 or not, or `None`
+    /// when unset. For a variable naming a path.
+    pub(crate) fn get_os(&self, key: &str) -> Option<OsString> {
+        match self {
+            Self::Process => std::env::var_os(key),
+            #[cfg(test)]
+            Self::Fixed(vars) => vars.get(key).map(OsString::from),
+            #[cfg(test)]
+            Self::FixedOs(vars) => vars.get(key).cloned(),
         }
     }
 }
 
 /// Where files come from.
 #[derive(Debug, Clone)]
-pub(super) enum Fs {
+pub(crate) enum Fs {
     /// The real file system.
     Real,
     /// A fixed set of files. A path not in the map is not found, as the
@@ -258,7 +276,7 @@ impl Fs {
     }
     /// The whole contents of `path`. The files read here are a few
     /// kilobytes on local disk, so a blocking read is used.
-    pub(super) fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+    pub(crate) fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         match self {
             Self::Real => std::fs::read(path),
             #[cfg(test)]
@@ -286,7 +304,7 @@ fn write_new_private(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 /// The platform rules for finding the home directory and joining paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Platform {
+pub(crate) enum Platform {
     /// Linux, macOS and other Unix-like systems.
     Unix,
     /// Windows.

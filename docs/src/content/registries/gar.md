@@ -8,10 +8,12 @@ order: 3
 
 ocync auto-detects GAR (`*-docker.pkg.dev`) and legacy GCR hostnames (`gcr.io`, `us.gcr.io`, `eu.gcr.io`, `asia.gcr.io`) and uses Google Application Default Credentials (ADC):
 
-- `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service account key file
+- `GOOGLE_APPLICATION_CREDENTIALS` pointing at a credentials file: a service account key, an authorized user, a Workload Identity Federation (`external_account`) configuration or an impersonated service account
 - `gcloud auth application-default login` (developer machines)
 - GKE Workload Identity (cluster-side identity binding)
 - Compute Engine / Cloud Run / GCE metadata server (instance default service account)
+
+Workload Identity Federation takes its subject token from a file (such as a projected Kubernetes service account token), a URL, or AWS. On EKS, the AWS source signs with the pod's AWS credentials (IRSA or Pod Identity), so `ocync` reaches Artifact Registry with no service account key. The executable source is not supported. See the [security design](/design/security#owned-google-authentication) for how this matches Google's own library.
 
 See the [GCP ADC docs](https://cloud.google.com/docs/authentication/application-default-credentials) for the full precedence chain.
 
@@ -19,9 +21,9 @@ Notable behaviors:
 
 - The OAuth2 access token is sent as the password half of HTTP Basic credentials (username `oauth2accesstoken`) to drive a standard OCI `/v2/token` Bearer exchange. This matches what `gcloud auth configure-docker` writes into the docker config.
 - Monolithic uploads: GAR does not support OCI chunked uploads. ocync buffers the full blob in memory and performs a single PUT, so RSS scales with blob size during pushes; a 2 GB layer spikes memory accordingly.
-- Cross-repo blob mounts have not been observed to be fulfilled by GAR. ocync attempts the mount POST anyway (cheap, ~100 ms) and falls through to upload on 202.
+- Cross-repo blob mounts between two images in the same Artifact Registry repository are fulfilled: on 2026-10-28 a sync into `<repo>/main/static` mounted all 4 blobs an earlier sync had pushed to `<repo>/branch/static` in the same repository, transferring 0 bytes. Mounts between different repositories have not been tested. ocync attempts the mount POST anyway (cheap, ~100 ms) and falls through to upload on 202.
 - GAR enforces a single per-project quota across all operation types; ocync uses one AIMD window per project rather than per-action.
-- SDK credential TTL is a conservative 10 minutes (`google-cloud-auth` does not expose `expires_in`), so watch-mode refresh is decoupled from actual token lifetime. ADC refreshes are sub-millisecond.
+- The access token is kept for its real lifetime, from the token endpoint's `expires_in` or impersonation's `expireTime`, and fetched again 30 seconds before it expires.
 
 ## CLI example
 

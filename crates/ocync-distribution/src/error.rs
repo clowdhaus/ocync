@@ -64,6 +64,44 @@ pub enum Error {
         reason: String,
     },
 
+    /// Google's credentials yielded no token for the registry.
+    #[error("no Google token for registry '{registry}': {reason}")]
+    GoogleCredentials {
+        /// The registry the token was for.
+        registry: String,
+        /// Why no token was had, with its causes.
+        reason: String,
+        /// Whether asking again may succeed.
+        transience: Transience,
+    },
+
+    /// A registry's token endpoint answered with an error status. 401
+    /// Unauthorized refuses the credentials sent; other statuses refuse the
+    /// scope asked for or fail on the endpoint's side. Not a registry answer,
+    /// so [`Self::status_code`] leaves it out.
+    #[error("authentication failed for registry '{registry}': token endpoint returned {status}")]
+    TokenEndpoint {
+        /// The registry whose token endpoint answered.
+        registry: String,
+        /// The status it answered.
+        status: http::StatusCode,
+    },
+
+    /// A registry's `/v2/` ping, sent to find its token endpoint, answered
+    /// with a status other than the 401 challenge. Already retried where
+    /// transient, so [`Self::status_code`] leaves it out as it does
+    /// [`Self::TokenEndpoint`].
+    #[error(
+        "authentication failed for registry '{registry}': registry ping returned {status} \
+         (expected 401 challenge)"
+    )]
+    RegistryPing {
+        /// The registry pinged.
+        registry: String,
+        /// The status it answered.
+        status: http::StatusCode,
+    },
+
     /// An external credential helper process failed.
     #[error("credential helper '{helper}' failed: {reason}")]
     CredentialHelperFailed {
@@ -165,6 +203,15 @@ pub enum Error {
     },
 }
 
+/// Whether a failure may pass if the same request is sent again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transience {
+    /// It may pass, as a server error, a throttle or a timeout can.
+    Transient,
+    /// It fails again, as refused credentials do.
+    Final,
+}
+
 impl Error {
     /// An [`Error::AuthFailed`] for `registry`, with `reason` as its text.
     pub(crate) fn auth_failed(registry: &str, reason: impl std::fmt::Display) -> Self {
@@ -189,11 +236,21 @@ impl Error {
 
     /// Whether this error represents an authentication or authorization failure.
     ///
-    /// Returns `true` for [`AuthFailed`](Self::AuthFailed) errors and registry
-    /// responses with HTTP 401 Unauthorized or 403 Forbidden status codes.
+    /// Returns `true` for [`AuthFailed`](Self::AuthFailed) errors, a token
+    /// endpoint's 4xx other than 408 Request Timeout and 429 Too Many
+    /// Requests, Google credentials
+    /// that fail for good, and registry responses with HTTP 401 Unauthorized
+    /// or 403 Forbidden status codes.
     pub fn is_auth_error(&self) -> bool {
         match self {
-            Self::AuthFailed { .. } => true,
+            Self::AuthFailed { .. }
+            | Self::GoogleCredentials {
+                transience: Transience::Final,
+                ..
+            } => true,
+            Self::TokenEndpoint { status, .. } | Self::RegistryPing { status, .. } => {
+                status.is_client_error() && !crate::retry::is_transient_status(*status)
+            }
             Self::RegistryError { status, .. } => {
                 *status == http::StatusCode::UNAUTHORIZED || *status == http::StatusCode::FORBIDDEN
             }
@@ -202,8 +259,26 @@ impl Error {
     }
 }
 
+/// `error` and each of its sources, joined as upstream prints them, so a
+/// reason kept as text still names its cause. A cause the text already ends
+/// with is not repeated: some errors print their cause and also return it as
+/// their source.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(e) = source {
+        let cause = e.to_string();
+        if !text.ends_with(&cause) {
+            text.push_str(": ");
+            text.push_str(&cause);
+        }
+        source = e.source();
+    }
+    text
+}
+
 /// The most of an external body or stream kept in an error, in bytes.
-const MAX_QUOTED_BYTES: usize = 200;
+pub(crate) const MAX_QUOTED_BYTES: usize = 200;
 
 /// The start of `body`, at most [`MAX_QUOTED_BYTES`] and cut on a character
 /// boundary. A response body or a helper's stderr can carry a token, and an
@@ -392,6 +467,26 @@ mod tests {
             reason: "bad creds".into(),
         };
         assert!(err.is_auth_error());
+    }
+
+    /// A token endpoint that refuses is an auth error, and one that times
+    /// out, is throttled or is failing is not. Breaks if a 408, 429 or 503
+    /// exits as refused credentials.
+    #[test]
+    fn is_auth_error_token_endpoint() {
+        for (status, auth_error) in [
+            (http::StatusCode::UNAUTHORIZED, true),
+            (http::StatusCode::NOT_FOUND, true),
+            (http::StatusCode::REQUEST_TIMEOUT, false),
+            (http::StatusCode::TOO_MANY_REQUESTS, false),
+            (http::StatusCode::SERVICE_UNAVAILABLE, false),
+        ] {
+            let err = Error::TokenEndpoint {
+                registry: "example.com".into(),
+                status,
+            };
+            assert_eq!(err.is_auth_error(), auth_error, "{status}");
+        }
     }
 
     #[test]

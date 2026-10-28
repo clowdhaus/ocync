@@ -4,8 +4,9 @@
 //! retries the ones it drives. The prepare phase has no such layer above it:
 //! it runs before the engine exists, so a transient failure there fails a
 //! whole mapping or image. The operations that run there retry themselves,
-//! through [`retrying`], and share one schedule and one predicate so they
-//! cannot drift apart. The AWS API calls run the same loop under the AWS
+//! through [`retrying`], and share one schedule so they cannot drift apart.
+//! Each passes the predicate for its own errors, built on
+//! [`is_transient_transport`]. The AWS API calls run the same loop under the AWS
 //! SDK's retry policy instead (see `crate::aws`).
 
 use std::cell::Cell;
@@ -51,6 +52,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// rather than repeating the predicate, because two copies drift.
 pub fn is_transient_transport(error: &reqwest::Error) -> bool {
     error.is_request() || error.is_body() || error.is_decode()
+}
+
+/// Whether a server that answered `status` may answer differently if asked
+/// again: 408, 429 or any 5xx. The single definition for the workspace, as
+/// crane and regsync retry the same set.
+pub fn is_transient_status(status: http::StatusCode) -> bool {
+    status.is_server_error()
+        || status == http::StatusCode::REQUEST_TIMEOUT
+        || status == http::StatusCode::TOO_MANY_REQUESTS
 }
 
 /// Whether an error is worth re-sending: a throttle, or a transport failure.
@@ -102,11 +112,22 @@ pub(crate) struct Budgeted<'a>(pub(crate) &'a Cell<u32>);
 
 impl Policy<Error> for Budgeted<'_> {
     fn retry(&mut self, attempt: u32, error: &Error) -> Option<Duration> {
-        if !is_transient(error) || attempt >= MAX_TRANSIENT_RETRIES || self.0.get() == 0 {
+        if self.0.get() == 0 {
             return None;
         }
+        let delay = Bounded(is_transient).retry(attempt, error)?;
         self.0.set(self.0.get() - 1);
-        Some(backoff(attempt))
+        Some(delay)
+    }
+}
+
+/// A failure the predicate calls transient is sent again on the jittered
+/// schedule, at most [`MAX_TRANSIENT_RETRIES`] times per call.
+pub(crate) struct Bounded<F>(pub(crate) F);
+
+impl<E, F: Fn(&E) -> bool> Policy<E> for Bounded<F> {
+    fn retry(&mut self, attempt: u32, error: &E) -> Option<Duration> {
+        ((self.0)(error) && attempt < MAX_TRANSIENT_RETRIES).then(|| backoff(attempt))
     }
 }
 
@@ -117,7 +138,7 @@ impl Policy<Error> for Budgeted<'_> {
 /// and token exchanges, which are.
 pub(crate) async fn retrying<T, E, P, F, Fut>(what: &str, policy: &mut P, op: F) -> Result<T, E>
 where
-    E: std::fmt::Display,
+    E: std::error::Error,
     P: Policy<E>,
     F: Fn(u32) -> Fut,
     Fut: Future<Output = Result<T, E>>,
@@ -137,7 +158,7 @@ where
                     what,
                     attempt,
                     delay_ms = delay.as_millis(),
-                    error = %e,
+                    error = %crate::error::error_chain(&e),
                     "transient failure; backing off and retrying"
                 );
                 tokio::time::sleep(delay).await;
@@ -151,8 +172,9 @@ where
 ///
 /// Returns the **final response**, including a throttled one, rather than
 /// turning a 429 into an error. That distinction is load-bearing for the auth
-/// paths: their callers collapse any non-success into `Error::AuthFailed`,
-/// which carries no `status_code()`, and the engine's `with_retry` therefore
+/// paths: their callers collapse any non-success into
+/// `Error::RegistryPing`, `Error::TokenEndpoint` or `Error::AuthFailed`,
+/// none of which carries a `status_code()`, and the engine's `with_retry` therefore
 /// cannot classify it as retryable. Surfacing a 429 as a typed error instead
 /// would hand the engine a retryable auth failure and multiply this retry by
 /// the engine's own, aiming 4x the requests at a registry that is already
@@ -323,6 +345,24 @@ mod tests {
             "one initial attempt plus every retry, numbered from 0"
         );
         assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    /// A retry's log names the failure's causes, not only its top line.
+    /// Breaks if why a retry was needed is lost from the log.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_retry_logs_the_cause_of_the_failure() {
+        let (_, logs) = crate::test_logs::capture_logs(retrying(
+            "a lookup",
+            &mut Bounded(|_: &crate::google::Error| true),
+            |_| async {
+                Err::<(), _>(crate::google::Error::Url {
+                    field: "token_url",
+                    source: url::ParseError::EmptyHost,
+                })
+            },
+        ))
+        .await;
+        assert!(logs.contains("empty host"), "{logs}");
     }
 
     #[tokio::test]

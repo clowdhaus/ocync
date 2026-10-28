@@ -24,7 +24,8 @@ use super::super::endpoint::{CredentialApi, Region};
 use super::super::host::Host;
 use super::super::profile::expand_home;
 use super::super::{ApiRequest, ConfigError, Failure, calendar, retry};
-use super::{credential_api, error_chain, json};
+use super::{credential_api, json};
+use crate::error::error_chain;
 
 /// How long before its expiry a token is refreshed.
 const REFRESH_BUFFER: Duration = Duration::from_secs(5 * 60);
@@ -423,9 +424,9 @@ mod tests {
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::super::fixtures::capture_logs;
     use super::*;
     use crate::aws::host::{Clock, Env, Fs, Network};
+    use crate::test_logs::capture_logs;
 
     /// The session every test loads, as upstream's tests name it.
     const SESSION: Login<'static> = Login::Session {

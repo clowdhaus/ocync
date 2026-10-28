@@ -5,7 +5,7 @@
 
 use std::num::NonZeroU32;
 
-use super::endpoint::{DualStack, Endpoint, Fips};
+use super::endpoint::{DualStack, Endpoint, Fips, InvalidRegion, Region};
 use super::host::{Env, Host};
 use super::profile::{self, Location, ParseError, Properties, Sections};
 use super::{ConfigError, SkewCorrection, retry};
@@ -20,6 +20,12 @@ struct Setting {
     env: &'static str,
     profile: &'static str,
 }
+
+/// The variables naming the region, in the SDK's order.
+const REGION_VARIABLES: [&str; 2] = ["AWS_REGION", "AWS_DEFAULT_REGION"];
+
+/// The profile property naming the region.
+const REGION_PROPERTY: &str = "region";
 
 const USE_FIPS: Setting = Setting {
     env: "AWS_USE_FIPS_ENDPOINT",
@@ -169,6 +175,18 @@ impl Config {
             env: host.env.clone(),
             sections,
         }
+    }
+
+    /// The region `AWS_REGION`, `AWS_DEFAULT_REGION` or the selected
+    /// profile's `region` names, in the SDK's order.
+    pub(super) fn region(&self) -> Result<Option<Region>, InvalidRegion> {
+        if let Some(region) = REGION_VARIABLES.iter().find_map(|name| self.env.get(name)) {
+            return Region::parse(&region).map(Some);
+        }
+        self.profile()
+            .and_then(|profile| profile.get(REGION_PROPERTY))
+            .map(|region| Region::parse(region))
+            .transpose()
     }
 
     /// The selected profile's name.
@@ -331,6 +349,51 @@ pub(super) mod tests {
     /// The config of [`host`] with no named profile.
     fn config(vars: &[(&str, &str)], config_file: &str) -> Config {
         Config::load(&host(vars, config_file), None)
+    }
+
+    /// `AWS_REGION` before `AWS_DEFAULT_REGION`, then the selected
+    /// profile's `region`; none set is `None`, and a value that is not a
+    /// region is an error. Breaks if the order flips, the profile is not
+    /// read, or a bad region is taken.
+    #[test]
+    fn region_precedence() {
+        let profile = "[default]\nregion = eu-west-1\n";
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, Option<&'a str>);
+        let cases: &[Case<'_>] = &[
+            (
+                &[
+                    ("AWS_REGION", "us-west-2"),
+                    ("AWS_DEFAULT_REGION", "us-east-1"),
+                ],
+                profile,
+                Some("us-west-2"),
+            ),
+            (
+                &[("AWS_DEFAULT_REGION", "us-east-1")],
+                profile,
+                Some("us-east-1"),
+            ),
+            (&[], profile, Some("eu-west-1")),
+            (&[], "", None),
+        ];
+        for (vars, file, expected) in cases {
+            let found = config(vars, file).region().unwrap();
+            assert_eq!(
+                found.as_ref().map(Region::as_str),
+                *expected,
+                "{vars:?} {file:?}"
+            );
+        }
+        assert!(
+            config(&[("AWS_REGION", "not a region")], "")
+                .region()
+                .is_err()
+        );
+        assert!(
+            config(&[], "[default]\nregion = not a region\n")
+                .region()
+                .is_err()
+        );
     }
 
     const SERVICES_FILE: &str = "[default]\nendpoint_url = http://profile-global\nservices = local\n\

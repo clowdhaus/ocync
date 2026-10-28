@@ -17,18 +17,14 @@
 use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard};
 
-use ocync_distribution::{AwsCredentialProviders, RegistryClient};
+use ocync_distribution::RegistryClient;
 
 use crate::cli::config::{AuthType, BasicCredentials, RegistryConfig};
-use crate::cli::{CliError, Registry, build_registry_client};
+use crate::cli::{CliError, Registry, RunCredentials, build_registry_client};
 
-/// Build the client for `cfg`, with AWS credentials of its own.
+/// Build the client for `cfg`, with credentials of its own.
 async fn build(cfg: &RegistryConfig) -> Result<RegistryClient, CliError> {
-    build_registry_client(
-        Registry::Configured(cfg),
-        &AwsCredentialProviders::default(),
-    )
-    .await
+    build_registry_client(Registry::Configured(cfg), &RunCredentials::default()).await
 }
 
 /// Process-wide guard for tests that mutate `DOCKER_CONFIG`. Held for the

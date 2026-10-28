@@ -18,16 +18,20 @@ mod retry;
 mod sigv4;
 mod xml;
 
+pub(crate) use self::calendar::parse_rfc3339_with_offset;
 use self::config::{Config, ServiceId};
+pub(crate) use self::credentials::imds;
 use self::credentials::{Chain, Credentials};
-use self::host::{Host, Network, Transport};
+pub(crate) use self::host::Host;
+pub(crate) use self::host::{Clock, Env, Fs, Platform, Timeouts, credential_endpoint_client};
+use self::host::{Network, Transport};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -38,7 +42,8 @@ use serde::de::DeserializeOwned;
 use url::Url;
 
 use self::calendar::parse_imf_fixdate;
-use self::endpoint::{Endpoint, Region};
+use self::endpoint::Endpoint;
+pub(crate) use self::endpoint::{InvalidRegion, Region};
 use self::sigv4::encode_pairs;
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
@@ -190,7 +195,7 @@ pub(crate) enum ConfigError {
     NoRegionInHostname(String),
     /// The configured region is not a valid host label.
     #[error(transparent)]
-    InvalidRegion(#[from] endpoint::InvalidRegion),
+    InvalidRegion(#[from] InvalidRegion),
     /// `AWS_MAX_ATTEMPTS` or `max_attempts` is not a whole number above 0.
     #[error("invalid AWS max attempts '{text}': must be a whole number of at least 1")]
     InvalidMaxAttempts {
@@ -428,7 +433,7 @@ enum Failure {
     /// causes to `source`, and this text is all a caller keeps, so it names
     /// every cause, and is not a source itself.
     /// Shared, because clients waiting on one failed load all report it.
-    #[error("failed to load AWS credentials: {}", credentials::error_chain(&**.0))]
+    #[error("failed to load AWS credentials: {}", crate::error::error_chain(&**.0))]
     Credentials(Arc<credentials::Error>),
     /// The request did not complete.
     #[error("request failed: {0}")]
@@ -617,8 +622,7 @@ impl Api {
     }
 
     /// Send `request` unsigned with `query`, as an operation that proves
-    /// identity some other way is. Only an unsigned call takes a query, as
-    /// the signer signs none.
+    /// identity some other way is.
     async fn call_unsigned(
         &self,
         request: &ApiRequest<'_>,
@@ -688,6 +692,7 @@ impl Api {
                 &sigv4::Request {
                     method: &request.method,
                     path: url.path(),
+                    query: url.query().unwrap_or_default(),
                     headers: signed_headers,
                     body: &request.body,
                 },
@@ -702,7 +707,7 @@ impl Api {
                 },
                 applied.apply(sent),
             );
-            for (name, value) in signed {
+            for (name, value) in signed.headers() {
                 let value = HeaderValue::try_from(value).map_err(Failure::InvalidHeader)?;
                 headers.insert(HeaderName::from_static(name), value);
             }
@@ -784,10 +789,7 @@ impl Provider {
 /// providers holding it must be `Send + Sync`.
 struct SharedCredentials {
     provider: Provider,
-    cache: CredentialCache<Credentials>,
-    /// When the last load failed, and why. The lock is never held across an
-    /// `.await`.
-    failed: Mutex<Option<(tokio::time::Instant, Arc<credentials::Error>)>>,
+    cache: CredentialCache<Credentials, Arc<credentials::Error>>,
 }
 
 impl SharedCredentials {
@@ -795,7 +797,6 @@ impl SharedCredentials {
         Self {
             provider,
             cache: CredentialCache::new(),
-            failed: Mutex::new(None),
         }
     }
 
@@ -805,24 +806,13 @@ impl SharedCredentials {
     /// rather than running the chain again, so a hung source costs one bound,
     /// not one per waiting client.
     async fn load(&self) -> Result<Credentials, Failure> {
-        let asked = tokio::time::Instant::now();
         self.cache
-            .get_or_refresh(async {
-                if let Some((at, error)) = &*self.failed.lock().expect("no panic while held")
-                    && *at > asked
-                {
-                    return Err(Arc::clone(error));
-                }
+            .get_or_refresh_sharing_failure(async {
                 let loaded = tokio::time::timeout(CREDENTIALS_LOAD_TIMEOUT, self.provider.load())
                     .await
                     .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))
                     .and_then(|loaded| loaded)
-                    .map_err(|error| {
-                        let error = Arc::new(error);
-                        *self.failed.lock().expect("no panic while held") =
-                            Some((tokio::time::Instant::now(), Arc::clone(&error)));
-                        error
-                    })?;
+                    .map_err(Arc::new)?;
                 let ttl = loaded.expiry().map_or(DEFAULT_EXPIRATION, remaining);
                 Ok((loaded, ttl))
             })
@@ -886,6 +876,194 @@ impl AwsCredentialProviders {
         users.sort_unstable();
         users
     }
+}
+
+/// The signing name of STS.
+const STS_SIGNING_NAME: &str = "sts";
+
+/// Signs the STS `GetCallerIdentity` request a Google external account sends
+/// as its subject token, with the default profile's credentials for one
+/// region from the run's shared AWS credentials.
+pub(crate) struct CallerIdentitySigner {
+    credentials: Arc<SharedCredentials>,
+    region: Region,
+}
+
+impl fmt::Debug for CallerIdentitySigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallerIdentitySigner")
+            .field("region", &self.region)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a request was not signed: no credentials were loaded.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct SigningError(Failure);
+
+/// The AWS settings a [`CallerIdentitySigner`] is built from: the
+/// environment and shared files of one host, read once.
+pub(crate) struct CallerIdentityConfig<'h> {
+    host: &'h Host,
+    config: Config,
+}
+
+impl<'h> CallerIdentityConfig<'h> {
+    /// The settings of `host`.
+    pub(crate) fn load(host: &'h Host) -> Self {
+        Self {
+            host,
+            config: Config::load(host, None),
+        }
+    }
+
+    /// The region `AWS_REGION`, `AWS_DEFAULT_REGION` or the selected
+    /// profile's `region` names, or `None` when none does.
+    pub(crate) fn region(&self) -> Result<Option<Region>, InvalidRegion> {
+        self.config.region()
+    }
+
+    /// A signer for `region`, taking the credentials from
+    /// `aws_credentials`.
+    pub(crate) fn signer(
+        self,
+        region: Region,
+        aws_credentials: &AwsCredentialProviders,
+    ) -> Result<CallerIdentitySigner, ConfigError> {
+        let retry = self.config.retry()?;
+        let credentials =
+            shared_credentials(self.host, self.config, &region, &retry, aws_credentials)?;
+        Ok(CallerIdentitySigner {
+            credentials,
+            region,
+        })
+    }
+}
+
+impl CallerIdentitySigner {
+    /// The method of the request signed.
+    pub(crate) const METHOD: http::Method = http::Method::POST;
+
+    /// The region the request is signed for.
+    pub(crate) fn region(&self) -> &Region {
+        &self.region
+    }
+
+    /// Sign a [`Self::METHOD`] request to `url` with `headers` and an empty
+    /// body, at `time`, the `host` header signed as [`host_header`].
+    pub(crate) async fn sign(
+        &self,
+        url: &Url,
+        headers: &[(&str, &str)],
+        time: SystemTime,
+    ) -> Result<CallerIdentityHeaders, SigningError> {
+        let credentials = self.credentials.load().await.map_err(SigningError)?;
+        let headers: Vec<(&str, &str)> = [("host", host_header(url))]
+            .into_iter()
+            .chain(headers.iter().copied())
+            .collect();
+        let signed = sigv4::sign(
+            &sigv4::Request {
+                method: &Self::METHOD,
+                path: url.path(),
+                query: url.query().unwrap_or_default(),
+                headers: &headers,
+                body: &[],
+            },
+            sigv4::AccessKey {
+                id: credentials.access_key_id(),
+                secret: credentials.secret_access_key(),
+                session_token: credentials.session_token(),
+            },
+            &sigv4::CredentialScope {
+                region: self.region.as_str(),
+                service: STS_SIGNING_NAME,
+            },
+            time,
+        );
+        let owned = |(name, value): (&str, &str)| (name.to_owned(), value.to_owned());
+        let mut sorted: Vec<(String, String)> = headers
+            .into_iter()
+            .map(owned)
+            .chain(signed.date_and_token().map(owned))
+            .collect();
+        sorted.sort_unstable();
+        Ok(CallerIdentityHeaders {
+            signed: sorted,
+            authorization: signed.authorization().to_owned(),
+        })
+    }
+}
+
+/// The headers of a signed caller identity request.
+pub(crate) struct CallerIdentityHeaders {
+    /// Every signed header, `host` among them, sorted by name.
+    signed: Vec<(String, String)>,
+    /// The `authorization` header's value, which covers `signed`.
+    authorization: String,
+}
+
+impl CallerIdentityHeaders {
+    /// Every signed header sorted by name, then `authorization` under
+    /// `authorization_name`.
+    pub(crate) fn headers<'a>(
+        &'a self,
+        authorization_name: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.signed
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .chain([(authorization_name, self.authorization.as_str())])
+    }
+}
+
+/// Prints header names only, as the values hold a session token and a
+/// signature.
+impl fmt::Debug for CallerIdentityHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.headers("authorization").map(|(name, _)| name))
+            .finish()
+    }
+}
+
+/// The `host` header a request to `url` carries: its host, and its port
+/// when it is not the scheme's.
+fn host_header(url: &Url) -> &str {
+    &url[url::Position::BeforeHost..url::Position::AfterPort]
+}
+
+#[cfg(test)]
+impl CallerIdentitySigner {
+    /// A signer in `region` with the example key and `session_token`.
+    pub(crate) fn example(region: &str, session_token: Option<&str>) -> Self {
+        Self {
+            credentials: Arc::new(SharedCredentials::new(tests::static_credentials(
+                session_token,
+            ))),
+            region: Region::parse(region).unwrap(),
+        }
+    }
+}
+
+/// The credentials for `config`'s profile in `region`, from
+/// `aws_credentials`, with a chain built for them if there are none yet.
+fn shared_credentials(
+    host: &Host,
+    config: Config,
+    region: &Region,
+    retry: &retry::Settings,
+    aws_credentials: &AwsCredentialProviders,
+) -> Result<Arc<SharedCredentials>, ConfigError> {
+    let key = ProviderKey {
+        profile: config.profile_name().to_owned(),
+        region: region.clone(),
+    };
+    aws_credentials.get_or_try_insert(key, || {
+        let chain = Chain::new(host, region, config, retry).map_err(ConfigError::HttpClient)?;
+        Ok::<_, ConfigError>(SharedCredentials::new(Provider::Chain(Box::new(chain))))
+    })
 }
 
 /// A client for one AWS JSON API in one region.
@@ -954,15 +1132,7 @@ impl Client {
             stall_timeout: STALL_TIMEOUT,
             region,
         };
-        let key = ProviderKey {
-            profile: config.profile_name().to_owned(),
-            region: api.region.clone(),
-        };
-        let credentials = aws_credentials.get_or_try_insert(key, || {
-            let chain =
-                Chain::new(host, &api.region, config, &retry).map_err(ConfigError::HttpClient)?;
-            Ok::<_, ConfigError>(SharedCredentials::new(Provider::Chain(Box::new(chain))))
-        })?;
+        let credentials = shared_credentials(host, config, &api.region, &retry, aws_credentials)?;
         Self::from_parts(Parts {
             credentials,
             service,
@@ -1055,7 +1225,7 @@ mod tests {
     >;
 
     /// A provider answering with the example key and `session_token`.
-    fn static_credentials(session_token: Option<&str>) -> Provider {
+    pub(super) fn static_credentials(session_token: Option<&str>) -> Provider {
         let credentials = credentials::tests::key(session_token, None);
         Provider::Test(Box::new(move || {
             let credentials = credentials.clone();
@@ -1112,6 +1282,28 @@ mod tests {
             "__type": "ThrottlingException",
             "message": "Rate exceeded"
         }))
+    }
+
+    /// The signed `host` keeps a port the URL names, and drops the
+    /// scheme's own. Breaks if a custom STS port is signed without it.
+    #[test]
+    fn signs_the_host_with_its_port() {
+        for (url, host) in [
+            (
+                "https://sts.internal.example:8443/",
+                "sts.internal.example:8443",
+            ),
+            (
+                "https://sts.us-east-1.amazonaws.com:443/",
+                "sts.us-east-1.amazonaws.com",
+            ),
+            (
+                "https://sts.us-east-1.amazonaws.com/",
+                "sts.us-east-1.amazonaws.com",
+            ),
+        ] {
+            assert_eq!(host_header(&Url::parse(url).unwrap()), host);
+        }
     }
 
     /// The request carries the AWS JSON protocol headers and a signature

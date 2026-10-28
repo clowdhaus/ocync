@@ -25,11 +25,10 @@ base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 bytes.workspace = true
 fastrand.workspace = true
 futures-util = { version = "0.3", default-features = false }
-google-cloud-auth.workspace = true
 http.workspace = true
 hex.workspace = true
 regex-lite = { version = "0.1", default-features = false, features = ["std", "string"] }
-reqwest = { workspace = true, features = ["http2", "rustls-no-provider", "stream", "json"] }
+reqwest = { workspace = true, features = ["http2", "rustls-no-provider", "stream", "json", "form", "query"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde.workspace = true
 serde_json.workspace = true

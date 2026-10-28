@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use futures_util::StreamExt;
-use ocync_distribution::AwsCredentialProviders;
 use ocync_distribution::ecr::BatchBlobChecker;
 use ocync_distribution::spec::ManifestKind;
 use ocync_distribution::{Digest, RepositoryName};
@@ -28,7 +27,7 @@ use crate::cli::commands::synchronize::{
 };
 use crate::cli::config::{Config, load_config};
 use crate::cli::output::format_bytes;
-use crate::cli::{CliError, ExitCode};
+use crate::cli::{CliError, ExitCode, RunCredentials};
 
 /// Arguments for the `analyze` subcommand.
 #[derive(Debug, clap::Args)]
@@ -106,12 +105,12 @@ pub(crate) async fn run(
     // stretch it exists for stays silent.
     let tracker = PrepareTracker::default();
     let analysis = with_prepare_progress(&tracker, "analysis", async {
-        let aws_credentials = AwsCredentialProviders::default();
+        let credentials = RunCredentials::default();
         let clients = build_clients(
             &config,
             &referenced_registries(&config),
             &tracker,
-            &aws_credentials,
+            &credentials,
         )
         .await;
         collect_analysis(

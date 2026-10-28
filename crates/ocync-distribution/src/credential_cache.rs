@@ -1,10 +1,13 @@
 //! A credential cached until it nears expiry, shared by the cloud auth
 //! providers and the AWS API client.
 
+use std::convert::Infallible;
 use std::future::Future;
+use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockWriteGuard};
 use tokio::time::Instant;
 
 use crate::auth::{EARLY_REFRESH_WINDOW, is_fresh};
@@ -23,10 +26,25 @@ pub(crate) fn remaining(until: SystemTime) -> Duration {
 /// refreshes. Used by the ECR, ECR Public, Azure and Google auth providers,
 /// the AWS API client and the instance metadata session token. Time is
 /// tokio's, so a test with paused time moves it.
-pub(crate) struct CredentialCache<T> {
-    cached: RwLock<Option<CacheEntry<T>>>,
+///
+/// `E` is the error [`Self::get_or_refresh_sharing_failure`] hands to the callers
+/// that waited on a refresh that failed. A cache that never shares one
+/// leaves it [`Infallible`].
+pub(crate) struct CredentialCache<T, E = Infallible> {
+    cached: RwLock<Slot<T, E>>,
     /// A value with less than this left is refreshed.
     refresh_window: Duration,
+    /// How many refreshes have failed, so a caller can tell a failure that
+    /// came after it asked from one that came before, without a clock.
+    failures: AtomicU64,
+}
+
+/// What a [`CredentialCache`] holds.
+struct Slot<T, E> {
+    entry: Option<CacheEntry<T>>,
+    /// The last refresh that failed, and its count in
+    /// [`CredentialCache::failures`].
+    failed: Option<(u64, E)>,
 }
 
 struct CacheEntry<T> {
@@ -51,7 +69,7 @@ impl<T> CacheEntry<T> {
     }
 }
 
-impl<T: Clone + Send + Sync> CredentialCache<T> {
+impl<T: Clone + Send + Sync, E> CredentialCache<T, E> {
     /// Create an empty cache that refreshes [`EARLY_REFRESH_WINDOW`] before
     /// expiry.
     pub(crate) fn new() -> Self {
@@ -61,8 +79,12 @@ impl<T: Clone + Send + Sync> CredentialCache<T> {
     /// Create an empty cache that refreshes `window` before expiry.
     pub(crate) fn with_refresh_window(window: Duration) -> Self {
         Self {
-            cached: RwLock::new(None),
+            cached: RwLock::new(Slot {
+                entry: None,
+                failed: None,
+            }),
             refresh_window: window,
+            failures: AtomicU64::new(0),
         }
     }
 
@@ -71,48 +93,101 @@ impl<T: Clone + Send + Sync> CredentialCache<T> {
     ///
     /// The refresh future is created at the call site but only polled on
     /// cache miss, so the API call is never issued when the cache is warm.
-    pub(crate) async fn get_or_refresh<E>(
+    pub(crate) async fn get_or_refresh<F>(
+        &self,
+        refresh: impl Future<Output = Result<(T, Duration), F>>,
+    ) -> Result<T, F> {
+        let mut slot = match self.fresh_or_lock().await {
+            ControlFlow::Break(value) => return Ok(value),
+            ControlFlow::Continue(slot) => slot,
+        };
+        let (value, ttl) = refresh.await?;
+        slot.entry = Some(CacheEntry::new(value.clone(), ttl));
+        Ok(value)
+    }
+
+    /// As [`Self::get_or_refresh`], but a caller that was waiting on a
+    /// refresh that failed gets its error instead of refreshing again. A
+    /// failing source then costs one refresh per wave of callers, not one
+    /// per caller. Whether a caller gets a stored error depends only on when
+    /// it asked, not on the order callers reach the lock: one that asked
+    /// before a failure gets that failure's error, and one that asked after
+    /// it refreshes.
+    pub(crate) async fn get_or_refresh_sharing_failure(
         &self,
         refresh: impl Future<Output = Result<(T, Duration), E>>,
-    ) -> Result<T, E> {
-        // Fast path: read-lock check allows concurrent readers.
+    ) -> Result<T, E>
+    where
+        E: Clone,
+    {
+        let asked = self.failures.load(Ordering::Acquire);
+        let mut slot = match self.fresh_or_lock().await {
+            ControlFlow::Break(value) => return Ok(value),
+            ControlFlow::Continue(slot) => slot,
+        };
+        if let Some((failure, error)) = &slot.failed
+            && *failure > asked
         {
-            let cached = self.cached.read().await;
-            if let Some(ref entry) = *cached {
-                if entry.is_fresh(self.refresh_window) {
-                    return Ok(entry.value.clone());
-                }
+            return Err(error.clone());
+        }
+        match refresh.await {
+            Ok((value, ttl)) => {
+                slot.entry = Some(CacheEntry::new(value.clone(), ttl));
+                Ok(value)
+            }
+            Err(error) => {
+                let failure = self.failures.fetch_add(1, Ordering::AcqRel) + 1;
+                slot.failed = Some((failure, error.clone()));
+                Err(error)
             }
         }
+    }
 
-        // Slow path: write-lock for refresh.
-        let mut cached = self.cached.write().await;
-
-        // Double-check after acquiring write lock -- another task may have
-        // already refreshed while we waited.
-        if let Some(ref entry) = *cached {
-            if entry.is_fresh(self.refresh_window) {
-                return Ok(entry.value.clone());
-            }
+    /// The cached value if fresh, found under a read lock that concurrent
+    /// callers share, or else the write lock to refresh under. The value is
+    /// looked for again under the write lock, as another caller may have
+    /// refreshed it while this one waited.
+    async fn fresh_or_lock(&self) -> ControlFlow<T, RwLockWriteGuard<'_, Slot<T, E>>> {
+        if let Some(value) = self.fresh_in(&*self.cached.read().await) {
+            return ControlFlow::Break(value);
         }
+        let slot = self.cached.write().await;
+        match self.fresh_in(&slot) {
+            Some(value) => ControlFlow::Break(value),
+            None => ControlFlow::Continue(slot),
+        }
+    }
 
-        let (value, ttl) = refresh.await?;
-
-        *cached = Some(CacheEntry::new(value.clone(), ttl));
-
-        Ok(value)
+    /// The value `slot` holds, if fresh.
+    fn fresh_in(&self, slot: &Slot<T, E>) -> Option<T> {
+        slot.entry
+            .as_ref()
+            .filter(|entry| entry.is_fresh(self.refresh_window))
+            .map(|entry| entry.value.clone())
     }
 
     /// Clear the cached value, forcing the next `get_or_refresh` to call
     /// the refresh function.
     pub(crate) async fn clear(&self) {
-        *self.cached.write().await = None;
+        self.cached.write().await.entry = None;
+    }
+
+    /// Clear the cached value if `matches` says it is the one to drop.
+    pub(crate) async fn clear_if(&self, matches: impl FnOnce(&T) -> bool) {
+        let mut slot = self.cached.write().await;
+        if slot
+            .entry
+            .as_ref()
+            .is_some_and(|entry| matches(&entry.value))
+        {
+            slot.entry = None;
+        }
     }
 
     /// Replace the cached value (test helper).
     #[cfg(test)]
     pub(crate) async fn set(&self, value: T, ttl: Duration) {
-        *self.cached.write().await = Some(CacheEntry::new(value, ttl));
+        self.cached.write().await.entry = Some(CacheEntry::new(value, ttl));
     }
 }
 
@@ -130,9 +205,10 @@ mod tests {
     /// the window is not honored or a long lifetime overflows the clock.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn refreshes_within_the_window() {
-        let cache = CredentialCache::with_refresh_window(Duration::from_secs(120));
+        let cache: CredentialCache<_> =
+            CredentialCache::with_refresh_window(Duration::from_secs(120));
         let load = |value: u32, ttl: u64| async move {
-            Ok::<_, std::convert::Infallible>((value, Duration::from_secs(ttl)))
+            Ok::<_, Infallible>((value, Duration::from_secs(ttl)))
         };
         assert_eq!(cache.get_or_refresh(load(1, 1000)).await, Ok(1));
         tokio::time::advance(Duration::from_secs(879)).await;
@@ -141,5 +217,33 @@ mod tests {
         assert_eq!(cache.get_or_refresh(load(3, u64::MAX)).await, Ok(3));
         tokio::time::advance(Duration::from_secs(1 << 40)).await;
         assert_eq!(cache.get_or_refresh(load(4, 1000)).await, Ok(3));
+    }
+
+    /// Callers waiting on a refresh that fails get its error, and one that
+    /// asks afterwards refreshes again. Breaks if each waiter repeats the
+    /// failed refresh, or a failure is kept for later callers.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn waiters_share_a_failed_refresh() {
+        use std::cell::Cell;
+
+        let cache: CredentialCache<u32, &str> = CredentialCache::new();
+        let refreshes = Cell::new(0);
+        let failing = || async {
+            refreshes.set(refreshes.get() + 1);
+            tokio::task::yield_now().await;
+            Err("down")
+        };
+
+        let (first, second) = tokio::join!(
+            cache.get_or_refresh_sharing_failure(failing()),
+            cache.get_or_refresh_sharing_failure(failing()),
+        );
+
+        assert_eq!((first, second), (Err("down"), Err("down")));
+        assert_eq!(refreshes.get(), 1);
+        let later = cache
+            .get_or_refresh_sharing_failure(async { Ok((7, Duration::from_secs(1000))) })
+            .await;
+        assert_eq!(later, Ok(7));
     }
 }

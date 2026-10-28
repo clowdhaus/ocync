@@ -18,10 +18,14 @@ pub mod digest;
 pub mod ecr;
 /// Error types for OCI distribution operations.
 pub mod error;
+/// Google Cloud Application Default Credentials.
+mod google;
 /// JSON decoding shared by the registry and AWS clients.
 mod json;
 /// Manifest operations (pull, push, head, referrers).
 pub mod manifest;
+/// Address rules for requests that carry a secret.
+mod net;
 /// OCI image reference parser.
 pub mod reference;
 /// Bounded retry for transient failures in the prepare phase.
@@ -34,6 +38,8 @@ pub mod sha256;
 pub mod spec;
 /// Tag listing with pagination.
 pub mod tags;
+#[cfg(test)]
+mod test_logs;
 
 /// What a secret prints as in a `Debug` rendering.
 pub(crate) const REDACTED: &str = "[REDACTED]";

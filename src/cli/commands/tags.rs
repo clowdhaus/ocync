@@ -1,12 +1,11 @@
 //! The `tags` subcommand - lists and filters tags from a repository.
 
-use ocync_distribution::AwsCredentialProviders;
 use ocync_distribution::RepositoryName;
 use ocync_sync::filter::FilterConfig;
 
 use crate::TagsArgs;
 use crate::cli::config::load_config;
-use crate::cli::{CliError, ExitCode, Registry, build_registry_client};
+use crate::cli::{CliError, ExitCode, Registry, RunCredentials, build_registry_client};
 
 pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     let registry = args.repository.registry();
@@ -19,7 +18,7 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     };
     let client = build_registry_client(
         Registry::resolve(&registries, registry),
-        &AwsCredentialProviders::default(),
+        &RunCredentials::default(),
     )
     .await?;
 
