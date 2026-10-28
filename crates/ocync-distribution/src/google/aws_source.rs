@@ -265,6 +265,55 @@ mod tests {
         assert_eq!(region_from_env(&default).as_deref(), Some("us-east-1"));
     }
 
+    /// Upstream `test_resolve_region_imds` and `test_resolve_imdsv2_token`:
+    /// with no region variable, an IMDSv2 token is asked for with its TTL
+    /// and sent with the zone request, and the zone's region is used.
+    /// Breaks if the token is not asked for or not sent, or the zone's
+    /// letter is kept.
+    #[tokio::test]
+    async fn reads_the_region_from_instance_metadata() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/latest/api/token"))
+            .and(header(IMDSV2_TTL.0, IMDSV2_TTL.1))
+            .respond_with(ResponseTemplate::new(200).set_body_string("imds-token"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/zone"))
+            .and(header(IMDSV2_TOKEN, "imds-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("us-gov-west-1a"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let host = super::super::tests::host(crate::aws::Platform::Unix, &[], &[]);
+        let clients = super::super::Clients::new().unwrap();
+        let aws_credentials = crate::aws::AwsCredentialProviders::default();
+        let setup = Setup {
+            host: &host,
+            clients: &clients,
+            aws_credentials: &aws_credentials,
+        };
+
+        let region = region_from_metadata(
+            &setup,
+            Some(&format!("{}/zone", server.uri())),
+            Some(&format!("{}/latest/api/token", server.uri())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(region, "us-gov-west-1");
+        assert!(matches!(
+            region_from_metadata(&setup, None, None).await,
+            Err(Error::NoAwsRegion)
+        ));
+    }
+
     /// Upstream `test_subject_token_env_success`, with the whole token
     /// checked: the URL with its query, the method, the headers sorted with
     /// `Authorization` last, the empty body, and a signature that covers the

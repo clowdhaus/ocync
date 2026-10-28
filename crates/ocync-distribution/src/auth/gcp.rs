@@ -451,6 +451,68 @@ mod tests {
         assert_eq!(password(&auth).await, "ya29.only");
     }
 
+    /// A transient failure from Google is sent again before the provider
+    /// gives up, as the prepare phase has no other retry; a refusal is not.
+    /// Breaks if a 503 fails the load or a 401 is sent twice.
+    #[tokio::test]
+    async fn retries_a_transient_google_failure() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        use crate::aws::{Env, Fs, Platform};
+
+        for (first, calls, succeeds) in [(503, 2, true), (401, 1, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(first))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "ya29.user", "token_type": "Bearer", "expires_in": 3600
+                })))
+                .expect(calls - 1)
+                .mount(&server)
+                .await;
+            let file = serde_json::json!({
+                "type": "authorized_user",
+                "client_id": "client",
+                "client_secret": "secret",
+                "refresh_token": "refresh",
+                "token_uri": format!("{}/token", server.uri()),
+            });
+            let host = google::Host {
+                env: Env::Fixed(HashMap::from([(
+                    "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+                    "/adc.json".to_owned(),
+                )])),
+                fs: Fs::Fixed(HashMap::from([(
+                    PathBuf::from("/adc.json"),
+                    file.to_string().into_bytes(),
+                )])),
+                platform: Platform::Unix,
+            };
+            let clients = google::Clients::new().unwrap();
+            let credentials =
+                google::Credentials::load(&host, &clients, &AwsCredentialProviders::default())
+                    .await
+                    .unwrap();
+            let source = AdcTokenSource {
+                credentials,
+                clients,
+                hostname: "us-docker.pkg.dev".into(),
+            };
+
+            let token = source.access_token().await;
+
+            assert_eq!(token.is_ok(), succeeds, "{first}: {token:?}");
+        }
+    }
+
     #[tokio::test]
     async fn invalidation_clears_all_caches() {
         let server = MockServer::start().await;
