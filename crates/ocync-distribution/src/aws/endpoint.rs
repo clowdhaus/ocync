@@ -183,14 +183,7 @@ impl Endpoint {
         let _ = url.set_password(None);
         let path = format!("{}/", url.path().trim_end_matches('/'));
         url.set_path(&path);
-        let host = url
-            .host_str()
-            .expect("an http or https URL has a host")
-            .to_owned();
-        let host = match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host,
-        };
+        let host = super::host_header(&url).to_owned();
         Ok(Self { url, host })
     }
 

@@ -7,9 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use super::super::tests::host;
+use super::super::tests::{Fixture, host};
 use super::*;
-use crate::aws::{AwsCredentialProviders, Host, Platform};
+use crate::aws::{Host, Platform};
 use crate::google::REGISTRY_SCOPE;
 
 /// The subject token file the tests read.
@@ -39,15 +39,8 @@ fn token_host(token: &str) -> Host {
     )
 }
 
-async fn build(json: Value, scopes: Scopes, host: &Host) -> Result<Account, Error> {
-    let clients = Clients::new().unwrap();
-    let aws_credentials = AwsCredentialProviders::default();
-    let setup = Setup {
-        host,
-        clients: &clients,
-        aws_credentials: &aws_credentials,
-    };
-    Account::from_json(json, scopes, &setup).await
+async fn build(json: Value, scopes: Scopes, host: Host) -> Result<Account, Error> {
+    Account::from_json(json, scopes, &Fixture::new(host).setup()).await
 }
 
 async fn token(account: &Account) -> Result<AccessToken, Error> {
@@ -91,7 +84,7 @@ async fn exchanges_the_subject_token_at_sts() {
     let account = build(
         account_file(&server),
         Scopes::Registry,
-        &token_host("k8s-jwt\n"),
+        token_host("k8s-jwt\n"),
     )
     .await
     .unwrap();
@@ -158,7 +151,7 @@ async fn impersonates_after_the_exchange() {
     )
     .into();
 
-    let account = build(file, Scopes::Registry, &token_host("jwt"))
+    let account = build(file, Scopes::Registry, token_host("jwt"))
         .await
         .unwrap();
     let token = token(&account).await.unwrap();
@@ -198,7 +191,7 @@ async fn retries_only_the_failed_call() {
     let mut file = account_file(&server);
     file["service_account_impersonation_url"] = format!("{}{iam}", server.uri()).into();
 
-    let account = build(file, Scopes::Registry, &token_host("jwt"))
+    let account = build(file, Scopes::Registry, token_host("jwt"))
         .await
         .unwrap();
 
@@ -230,7 +223,7 @@ async fn reports_a_failed_exchange() {
     let mut file = account_file(&server);
     file["service_account_impersonation_url"] =
         format!("{}/iam/serviceAccounts/sa", server.uri()).into();
-    let account = build(file, Scopes::Registry, &token_host("jwt"))
+    let account = build(file, Scopes::Registry, token_host("jwt"))
         .await
         .unwrap();
     let error = token(&account).await.unwrap_err();
@@ -256,7 +249,7 @@ async fn reports_a_failed_exchange() {
     let mut file = account_file(&server);
     file["service_account_impersonation_url"] =
         format!("{}/iam/serviceAccounts/sa", server.uri()).into();
-    let account = build(file, Scopes::Registry, &token_host("jwt"))
+    let account = build(file, Scopes::Registry, token_host("jwt"))
         .await
         .unwrap();
     let error = token(&account).await.unwrap_err();
@@ -292,7 +285,7 @@ async fn authenticates_the_client() {
     file["client_id"] = "client".into();
     file["client_secret"] = "secret?>ab".into();
 
-    let account = build(file, Scopes::Registry, &token_host("jwt"))
+    let account = build(file, Scopes::Registry, token_host("jwt"))
         .await
         .unwrap();
     token(&account).await.unwrap();
@@ -318,7 +311,7 @@ async fn sends_the_workforce_project() {
         "//iam.googleapis.com/locations/global/workforcePools/pool/providers/idp".into();
     file["workforce_pool_user_project"] = "project".into();
 
-    let account = build(file, Scopes::Registry, &token_host("jwt"))
+    let account = build(file, Scopes::Registry, token_host("jwt"))
         .await
         .unwrap();
     token(&account).await.unwrap();
@@ -338,7 +331,7 @@ async fn refuses_a_workforce_project_outside_a_workforce_pool() {
     let server = MockServer::start().await;
     let mut file = account_file(&server);
     file["workforce_pool_user_project"] = "project".into();
-    let error = build(file, Scopes::Registry, &token_host("jwt"))
+    let error = build(file, Scopes::Registry, token_host("jwt"))
         .await
         .unwrap_err();
     assert!(
@@ -399,7 +392,7 @@ async fn refuses_an_executable_source() {
     let server = MockServer::start().await;
     let mut file = account_file(&server);
     file["credential_source"] = serde_json::json!({"executable": {"command": "/bin/token"}});
-    let error = build(file, Scopes::Registry, &token_host("jwt"))
+    let error = build(file, Scopes::Registry, token_host("jwt"))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("executable"), "{error}");

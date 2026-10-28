@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::super::tests::host;
+use super::super::tests::{Fixture, host};
 use super::*;
-use crate::aws::{AwsCredentialProviders, Platform};
+use crate::aws::Platform;
 use crate::google::REGISTRY_SCOPE;
 
 /// The IAM path the tests impersonate at.
@@ -37,15 +37,8 @@ fn impersonated_file(server: &MockServer) -> Value {
 }
 
 async fn build(json: Value, scopes: Scopes) -> Result<Account, Error> {
-    let host = host(Platform::Unix, &[], &[]);
-    let clients = Clients::new().unwrap();
-    let aws_credentials = AwsCredentialProviders::default();
-    let setup = Setup {
-        host: &host,
-        clients: &clients,
-        aws_credentials: &aws_credentials,
-    };
-    Account::from_json(json, scopes, &setup).await
+    let fixture = Fixture::new(host(Platform::Unix, &[], &[]));
+    Account::from_json(json, scopes, &fixture.setup()).await
 }
 
 async fn mount_source(server: &MockServer) {

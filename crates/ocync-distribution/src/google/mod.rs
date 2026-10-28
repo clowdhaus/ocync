@@ -283,6 +283,15 @@ pub(crate) enum Error {
     /// An executable subject token source, which ocync does not run.
     #[error("unsupported subject token source `executable`")]
     ExecutableSource,
+    /// The metadata server's host variable is not a bare `host[:port]`.
+    #[error(
+        "{} must be host[:port], with no path, query or user info",
+        metadata::HOST_VARIABLE
+    )]
+    MetadataHost(#[source] Option<url::ParseError>),
+    /// The token an impersonation is made with cannot be sent as a header.
+    #[error("the source credential's access token cannot be sent as a header")]
+    SourceToken(#[source] http::header::InvalidHeaderValue),
     /// An authorized user's `quota_project_id` cannot be sent as a header.
     #[error("invalid `quota_project_id`")]
     QuotaProject(#[source] http::header::InvalidHeaderValue),
@@ -351,6 +360,14 @@ impl Error {
         }
     }
 
+    /// A request of `call` that did not complete, its URL dropped.
+    fn transport(call: Call, source: reqwest::Error) -> Self {
+        Self::Transport {
+            call,
+            source: source.without_url(),
+        }
+    }
+
     /// An error for an answer whose status is not a success, its body read
     /// no further than is quoted.
     async fn status(call: Call, mut response: reqwest::Response) -> Self {
@@ -376,24 +393,25 @@ impl Error {
 /// it. The prepare phase reaches these calls before the engine's retry
 /// exists, which is why they retry themselves.
 async fn send(call: Call, request: reqwest::RequestBuilder) -> Result<Vec<u8>, Error> {
-    // A builder that holds an error does not clone: sent once, it returns
-    // that error.
-    if request.try_clone().is_none() {
-        return send_once(call, request).await;
-    }
+    let (client, request) = request.build_split();
+    let request = request.map_err(|source| Error::transport(call, source))?;
     retrying(call.as_str(), &mut Bounded(Error::is_transient), |_| {
-        send_once(call, request.try_clone().expect("cloned above"))
+        let request = request
+            .try_clone()
+            .expect("every request here has a buffered body");
+        send_once(call, &client, request)
     })
     .await
 }
 
 /// One try of [`send`].
-async fn send_once(call: Call, request: reqwest::RequestBuilder) -> Result<Vec<u8>, Error> {
-    let transport = |source: reqwest::Error| Error::Transport {
-        call,
-        source: source.without_url(),
-    };
-    let mut response = request.send().await.map_err(transport)?;
+async fn send_once(
+    call: Call,
+    client: &reqwest::Client,
+    request: reqwest::Request,
+) -> Result<Vec<u8>, Error> {
+    let transport = |source| Error::transport(call, source);
+    let mut response = client.execute(request).await.map_err(transport)?;
     if !response.status().is_success() {
         return Err(Error::status(call, response).await);
     }
@@ -466,16 +484,29 @@ impl ScopeList {
 }
 
 /// What an IAM `generateAccessToken` call carries from the token it is
-/// made with: the token, and the project billed when the source names one.
+/// made with: the token as an `authorization` header that never prints,
+/// and the project billed when the source names one.
+#[derive(Debug)]
 struct SourceAuth {
-    bearer: Secret,
+    authorization: HeaderValue,
     quota_project: Option<HeaderValue>,
 }
 
 impl SourceAuth {
+    /// The authorization of `token`, billing `quota_project` when set.
+    fn new(token: &str, quota_project: Option<HeaderValue>) -> Result<Self, Error> {
+        let mut authorization =
+            HeaderValue::try_from(format!("Bearer {token}")).map_err(Error::SourceToken)?;
+        authorization.set_sensitive(true);
+        Ok(Self {
+            authorization,
+            quota_project,
+        })
+    }
+
     /// `request` carrying this authorization.
     fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = request.bearer_auth(self.bearer.expose());
+        let request = request.header(http::header::AUTHORIZATION, &self.authorization);
         match &self.quota_project {
             Some(project) => request.header(user_account::QUOTA_PROJECT_HEADER, project),
             None => request,
@@ -572,10 +603,7 @@ impl Credentials {
             Self::AuthorizedUser(user) => user.quota_project().cloned(),
             _ => None,
         };
-        Ok(SourceAuth {
-            bearer: token.token,
-            quota_project,
-        })
+        SourceAuth::new(token.token.expose(), quota_project)
     }
 }
 

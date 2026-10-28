@@ -12,7 +12,7 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::credentials::TOKEN_HEADER;
+use super::credentials::imds::TOKEN_HEADER;
 
 /// The request headers compared, as upstream compares them.
 const COMPARED_HEADERS: &[&str] = &["content-type", TOKEN_HEADER];

@@ -8,15 +8,15 @@ use serde::de::IgnoredAny;
 
 use url::Url;
 
-use super::{AccessToken, Call, Clients, Error, Scopes, expiring, parse_url, send_json};
+use super::{AccessToken, Call, Clients, Error, Scopes, expiring, send_json};
 use crate::aws::{Clock, Env, Timeouts};
 
 /// The variable naming the metadata server's `host[:port]`, without a
 /// scheme.
-const HOST_VARIABLE: &str = "GCE_METADATA_HOST";
+pub(super) const HOST_VARIABLE: &str = "GCE_METADATA_HOST";
 
-/// The metadata server when [`HOST_VARIABLE`] is unset.
-const DEFAULT_ROOT: &str = "http://metadata.google.internal";
+/// The metadata server's host when [`HOST_VARIABLE`] is unset.
+pub(super) const DEFAULT_HOST: &str = "metadata.google.internal";
 
 /// The path of the default service account's token.
 const TOKEN_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
@@ -50,16 +50,25 @@ struct TokenResponse {
 }
 
 impl Server {
-    /// The server [`HOST_VARIABLE`] names, else the default, asking for
-    /// `scopes`. A host that does not form a URL is an error.
+    /// The server at the `host[:port]` [`HOST_VARIABLE`] names, else the
+    /// default, asking for `scopes`. A value that is not a bare
+    /// `host[:port]`, such as one with a path or user info, is an error.
     pub(super) fn new(env: &Env, scopes: Scopes) -> Result<Self, Error> {
-        let root = env
-            .get(HOST_VARIABLE)
-            .map_or_else(|| DEFAULT_ROOT.to_owned(), |host| format!("http://{host}"));
-        let mut token_url = parse_url(
-            HOST_VARIABLE,
-            &format!("{}{TOKEN_PATH}", root.trim_end_matches('/')),
-        )?;
+        let host = env.get(HOST_VARIABLE);
+        let mut token_url = Url::parse(&format!(
+            "http://{}",
+            host.as_deref().unwrap_or(DEFAULT_HOST)
+        ))
+        .map_err(|e| Error::MetadataHost(Some(e)))?;
+        if token_url.path() != "/"
+            || token_url.query().is_some()
+            || token_url.fragment().is_some()
+            || !token_url.username().is_empty()
+            || token_url.password().is_some()
+        {
+            return Err(Error::MetadataHost(None));
+        }
+        token_url.set_path(TOKEN_PATH);
         if let Some(scopes) = scopes.registry_or_endpoint_default() {
             token_url
                 .query_pairs_mut()
@@ -110,8 +119,10 @@ mod tests {
 
     /// Upstream `test_resolve_endpoint_default` and `_env_var`: the default
     /// server, and the variable's host with `http://` before it. A host that
-    /// forms no URL is an error, not a panic at the first request. Breaks if
-    /// the variable is ignored, given a scheme of its own, or not parsed.
+    /// forms no URL, or a value with a path, query, fragment or user info,
+    /// is an error, not a request elsewhere. Upstream accepts the latter.
+    /// Breaks if the variable is ignored, given a scheme of its own, or not
+    /// parsed.
     #[test]
     fn resolves_the_server() {
         let default = Server::new(&Env::Fixed(HashMap::new()), Scopes::Default).unwrap();
@@ -125,16 +136,19 @@ mod tests {
             format!("http://10.0.0.1:8080{TOKEN_PATH}")
         );
         let error = Server::new(&host_env("bad host"), Scopes::Default).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                Error::Url {
-                    field: HOST_VARIABLE,
-                    ..
-                }
-            ),
-            "{error}"
-        );
+        assert!(matches!(error, Error::MetadataHost(Some(_))), "{error}");
+        for not_a_host in [
+            "10.0.0.1:8080/x",
+            "user:pw@10.0.0.1",
+            "10.0.0.1?q",
+            "10.0.0.1#f",
+        ] {
+            let error = Server::new(&host_env(not_a_host), Scopes::Default).unwrap_err();
+            assert!(
+                matches!(error, Error::MetadataHost(None)),
+                "{not_a_host}: {error}"
+            );
+        }
     }
 
     /// Upstream `token_provider_full` and `headers_success_with_quota_project`:

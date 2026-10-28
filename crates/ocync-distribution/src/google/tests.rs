@@ -26,6 +26,32 @@ pub(crate) fn host(platform: Platform, vars: &[(&str, &str)], files: &[(&str, Ve
     host
 }
 
+/// What a test's [`Setup`] borrows.
+pub(super) struct Fixture {
+    host: Host,
+    clients: Clients,
+    aws_credentials: AwsCredentialProviders,
+}
+
+impl Fixture {
+    /// Clients and empty AWS credentials for `host`.
+    pub(super) fn new(host: Host) -> Self {
+        Self {
+            host,
+            clients: Clients::new().unwrap(),
+            aws_credentials: AwsCredentialProviders::default(),
+        }
+    }
+
+    pub(super) fn setup(&self) -> Setup<'_> {
+        Setup {
+            host: &self.host,
+            clients: &self.clients,
+            aws_credentials: &self.aws_credentials,
+        }
+    }
+}
+
 async fn load(host: &Host) -> Result<Credentials, Error> {
     Credentials::load(
         host,
@@ -229,12 +255,24 @@ async fn cut_short(call: Call) -> Error {
     let clients = Clients::new().unwrap();
 
     // One try: the server answers once, and the retry is not under test.
-    let error = send_once(call, clients.api.get(format!("http://{address}/")))
-        .await
-        .unwrap_err();
+    let request = clients
+        .api
+        .get(format!("http://{address}/"))
+        .build()
+        .unwrap();
+    let error = send_once(call, &clients.api, request).await.unwrap_err();
 
     server.join().unwrap();
     error
+}
+
+/// A source token no header can carry is an error before any request is
+/// built. Breaks if it reaches the request builder, where it would surface
+/// as a network failure.
+#[test]
+fn refuses_a_source_token_no_header_can_carry() {
+    let error = SourceAuth::new("ya29.bad\ntoken", None).unwrap_err();
+    assert!(matches!(error, Error::SourceToken(_)), "{error}");
 }
 
 /// A lifetime past what the clock can hold is refused. Breaks if it

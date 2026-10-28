@@ -135,9 +135,14 @@ impl Signed {
     }
 
     /// Every header to send.
-    pub(super) fn headers(&self) -> impl Iterator<Item = (&'static str, &str)> {
-        self.date_and_token()
-            .chain([(AUTHORIZATION, self.authorization.as_str())])
+    pub(super) fn into_headers(self) -> impl Iterator<Item = (&'static str, String)> {
+        [
+            (X_AMZ_DATE, Some(self.amz_date)),
+            (X_AMZ_SECURITY_TOKEN, self.security_token),
+            (AUTHORIZATION, Some(self.authorization)),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value?)))
     }
 }
 
@@ -528,8 +533,12 @@ mod tests {
             &scope,
             UNIX_EPOCH + Duration::from_secs(SUITE_TIME),
         );
+        let headers: Vec<_> = signed.into_headers().collect();
         assert_eq!(
-            signed.headers().collect::<Vec<_>>(),
+            headers
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect::<Vec<_>>(),
             [
                 (X_AMZ_DATE, "20150830T123600Z"),
                 (

@@ -20,11 +20,8 @@ mod xml;
 
 pub(crate) use self::calendar::parse_rfc3339_with_offset;
 use self::config::{Config, ServiceId};
+pub(crate) use self::credentials::imds;
 use self::credentials::{Chain, Credentials};
-pub(crate) use self::credentials::{
-    TOKEN_HEADER as IMDS_TOKEN_HEADER, TOKEN_TTL as IMDS_TOKEN_TTL,
-    TOKEN_TTL_HEADER as IMDS_TOKEN_TTL_HEADER, imds_disabled,
-};
 pub(crate) use self::host::Host;
 pub(crate) use self::host::{Clock, Env, Fs, Platform, Timeouts, credential_endpoint_client};
 use self::host::{Network, Transport};
@@ -710,8 +707,8 @@ impl Api {
                 },
                 applied.apply(sent),
             );
-            for (name, value) in signed.headers() {
-                let value = HeaderValue::from_str(value).map_err(Failure::InvalidHeader)?;
+            for (name, value) in signed.into_headers() {
+                let value = HeaderValue::try_from(value).map_err(Failure::InvalidHeader)?;
                 headers.insert(HeaderName::from_static(name), value);
             }
         }
@@ -921,31 +918,37 @@ impl fmt::Debug for CallerIdentitySigner {
 pub(crate) struct SigningError(Failure);
 
 /// The AWS settings a [`CallerIdentitySigner`] is built from: the
-/// environment and shared files, read once.
-pub(crate) struct CallerIdentityConfig(Config);
+/// environment and shared files of one host, read once.
+pub(crate) struct CallerIdentityConfig<'h> {
+    host: &'h Host,
+    config: Config,
+}
 
-impl CallerIdentityConfig {
+impl<'h> CallerIdentityConfig<'h> {
     /// The settings of `host`.
-    pub(crate) fn load(host: &Host) -> Self {
-        Self(Config::load(host, None))
+    pub(crate) fn load(host: &'h Host) -> Self {
+        Self {
+            host,
+            config: Config::load(host, None),
+        }
     }
 
     /// The region `AWS_REGION`, `AWS_DEFAULT_REGION` or the selected
     /// profile's `region` names, or `None` when none does.
     pub(crate) fn region(&self) -> Result<Option<Region>, InvalidRegion> {
-        self.0.region()
+        self.config.region()
     }
 
     /// A signer for `region`, taking the credentials from
     /// `aws_credentials`.
     pub(crate) fn signer(
         self,
-        host: &Host,
         region: Region,
         aws_credentials: &AwsCredentialProviders,
     ) -> Result<CallerIdentitySigner, ConfigError> {
-        let retry = self.0.retry()?;
-        let credentials = shared_credentials(host, self.0, &region, &retry, aws_credentials)?;
+        let retry = self.config.retry()?;
+        let credentials =
+            shared_credentials(self.host, self.config, &region, &retry, aws_credentials)?;
         Ok(CallerIdentitySigner {
             credentials,
             region,

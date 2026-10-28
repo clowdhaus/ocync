@@ -446,9 +446,16 @@ async fn request_token(
         .map(Duration::from_secs)
         .map_err(TokenError::InvalidTtl)?;
     let body = response.bytes().await.map_err(TokenError::from)?;
-    let mut token = HeaderValue::from_bytes(&body).map_err(TokenError::InvalidToken)?;
-    token.set_sensitive(true);
+    let token = session_token(&body).map_err(TokenError::InvalidToken)?;
     Ok((token, ttl))
+}
+
+/// The session token the token endpoint answered with `body`, as a header
+/// value that never prints.
+pub(crate) fn session_token(body: &[u8]) -> Result<HeaderValue, InvalidHeaderValue> {
+    let mut token = HeaderValue::from_bytes(body)?;
+    token.set_sensitive(true);
+    Ok(token)
 }
 
 /// Whether `AWS_EC2_METADATA_DISABLED` is `true`, any case.

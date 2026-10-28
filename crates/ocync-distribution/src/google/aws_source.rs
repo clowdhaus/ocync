@@ -12,13 +12,14 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use http::HeaderValue;
+use super::{Call, Error, Secret, Setup, parse_url, send, send_text};
+use crate::aws::{CallerIdentityConfig, CallerIdentitySigner, Region, host_header, imds};
 
-use super::{Call, Error, Secret, Setup, parse_url, send_text};
-use crate::aws::{
-    CallerIdentityConfig, CallerIdentitySigner, IMDS_TOKEN_HEADER, IMDS_TOKEN_TTL,
-    IMDS_TOKEN_TTL_HEADER, Region, host_header, imds_disabled,
-};
+/// The field naming the URL the availability zone is asked of.
+const REGION_URL_FIELD: &str = "region_url";
+
+/// The field naming the URL an `IMDSv2` session token is asked of.
+const IMDSV2_TOKEN_URL_FIELD: &str = "imdsv2_session_token_url";
 
 /// The STS URL when the file names none. `{region}` is replaced.
 const DEFAULT_VERIFICATION_URL: &str =
@@ -81,7 +82,7 @@ impl Source {
             None => region_from_metadata(setup, file).await?,
         };
         let signer = config
-            .signer(setup.host, region, setup.aws_credentials)
+            .signer(region, setup.aws_credentials)
             .map_err(Error::AwsConfig)?;
         Self::with_signer(
             signer,
@@ -145,31 +146,29 @@ async fn region_from_metadata(setup: &Setup<'_>, file: &SourceFile) -> Result<Re
     let Some(region_url) = &file.region_url else {
         return Err(Error::NoAwsRegion);
     };
-    if imds_disabled(&setup.host.env) {
+    if imds::disabled(&setup.host.env) {
         return Err(Error::AwsMetadataDisabled);
     }
-    let region_url = parse_url("region_url", region_url)?;
+    let region_url = parse_url(REGION_URL_FIELD, region_url)?;
     let token_url = file
         .imdsv2_session_token_url
         .as_deref()
-        .map(|url| parse_url("imdsv2_session_token_url", url))
+        .map(|url| parse_url(IMDSV2_TOKEN_URL_FIELD, url))
         .transpose()?;
     let client = &setup.clients.metadata;
     let token = match token_url {
         Some(url) => {
             let request = client
                 .put(url)
-                .header(IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL.as_secs());
-            let token = send_text(Call::AwsRegion, request).await?;
-            let mut token = HeaderValue::try_from(token).map_err(Error::AwsMetadataToken)?;
-            token.set_sensitive(true);
-            Some(token)
+                .header(imds::TOKEN_TTL_HEADER, imds::TOKEN_TTL.as_secs());
+            let token = send(Call::AwsRegion, request).await?;
+            Some(imds::session_token(&token).map_err(Error::AwsMetadataToken)?)
         }
         None => None,
     };
     let mut request = client.get(region_url);
     if let Some(token) = token {
-        request = request.header(IMDS_TOKEN_HEADER, token);
+        request = request.header(imds::TOKEN_HEADER, token);
     }
     let zone = send_text(Call::AwsRegion, request).await?;
     let region = region_from_zone(&zone).ok_or(Error::NoAwsRegion)?;
@@ -218,7 +217,9 @@ fn sts_url(template: Option<&str>, region: &Region) -> Result<Url, Error> {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
+    use super::super::tests::{Fixture, host};
     use super::*;
+    use crate::aws::Platform;
 
     fn region(text: &str) -> Region {
         Region::parse(text).unwrap()
@@ -270,71 +271,6 @@ mod tests {
         assert!(matches!(no_host, Err(Error::StsUrlHost)));
     }
 
-    /// Upstream `test_resolve_region_env`: `AWS_REGION` before
-    /// `AWS_DEFAULT_REGION`, then, past upstream, the selected profile's
-    /// `region`, so a profile's credentials sign in their own region.
-    /// Breaks if the order flips or the profile is not read.
-    #[test]
-    fn reads_the_configured_region() {
-        let config = b"[default]\nregion = eu-west-1\n".to_vec();
-        for (vars, expected) in [
-            (
-                &[
-                    ("AWS_REGION", "us-west-2"),
-                    ("AWS_DEFAULT_REGION", "us-east-1"),
-                ][..],
-                Some("us-west-2"),
-            ),
-            (
-                &[("AWS_DEFAULT_REGION", "us-east-1")][..],
-                Some("us-east-1"),
-            ),
-            (&[][..], Some("eu-west-1")),
-        ] {
-            let mut vars = vars.to_vec();
-            vars.push(("HOME", "/h"));
-            let host = super::super::tests::host(
-                crate::aws::Platform::Unix,
-                &vars,
-                &[("/h/.aws/config", config.clone())],
-            );
-            let found = CallerIdentityConfig::load(&host).region().unwrap();
-            assert_eq!(found, expected.map(region), "{vars:?}");
-        }
-        let bare = super::super::tests::host(crate::aws::Platform::Unix, &[], &[]);
-        assert!(
-            CallerIdentityConfig::load(&bare)
-                .region()
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// What a test's [`Setup`] borrows.
-    struct Fixture {
-        host: crate::aws::Host,
-        clients: super::super::Clients,
-        aws_credentials: crate::aws::AwsCredentialProviders,
-    }
-
-    impl Fixture {
-        fn new(vars: &[(&str, &str)], files: &[(&str, Vec<u8>)]) -> Self {
-            Self {
-                host: super::super::tests::host(crate::aws::Platform::Unix, vars, files),
-                clients: super::super::Clients::new().unwrap(),
-                aws_credentials: crate::aws::AwsCredentialProviders::default(),
-            }
-        }
-
-        fn setup(&self) -> Setup<'_> {
-            Setup {
-                host: &self.host,
-                clients: &self.clients,
-                aws_credentials: &self.aws_credentials,
-            }
-        }
-    }
-
     fn file(region_url: Option<String>, imdsv2_url: Option<String>) -> SourceFile {
         SourceFile {
             _environment_id: IgnoredAny,
@@ -357,19 +293,19 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/latest/api/token"))
-            .and(header(IMDS_TOKEN_TTL_HEADER, "21600"))
+            .and(header(imds::TOKEN_TTL_HEADER, "21600"))
             .respond_with(ResponseTemplate::new(200).set_body_string("imds-token"))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/zone"))
-            .and(header(IMDS_TOKEN_HEADER, "imds-token"))
+            .and(header(imds::TOKEN_HEADER, "imds-token"))
             .respond_with(ResponseTemplate::new(200).set_body_string("us-gov-west-1a"))
             .expect(1)
             .mount(&server)
             .await;
-        let fixture = Fixture::new(&[], &[]);
+        let fixture = Fixture::new(host(Platform::Unix, &[], &[]));
 
         let found = region_from_metadata(
             &fixture.setup(),
@@ -407,7 +343,7 @@ mod tests {
                 .expect(calls - 1)
                 .mount(&server)
                 .await;
-            let fixture = Fixture::new(&[], &[]);
+            let fixture = Fixture::new(host(Platform::Unix, &[], &[]));
 
             let found = region_from_metadata(
                 &fixture.setup(),
@@ -421,18 +357,34 @@ mod tests {
 
     /// A region lookup that cannot succeed fails at once: with no
     /// `region_url`, with one that is not a URL, with
-    /// `AWS_EC2_METADATA_DISABLED` set, or with no metadata service to
-    /// connect to. Breaks if a bad URL panics, the variable is ignored, or
-    /// a refused connection is sent again, which stalls a workstation with
-    /// AWS profile credentials for seconds per registry.
+    /// `AWS_EC2_METADATA_DISABLED` set, with no metadata service to connect
+    /// to, with a session token no header can carry, or with a zone that
+    /// names no region. Breaks if a bad value panics or is sent on, the
+    /// variable is ignored, or a refused connection is sent again, which
+    /// stalls a workstation with AWS profile credentials for seconds per
+    /// registry.
     #[tokio::test]
     async fn fails_a_region_lookup_at_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("bad\ntoken"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/zone"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not a zone"))
+            .mount(&server)
+            .await;
         let no_url: fn(&Error) -> bool = |e| matches!(e, Error::NoAwsRegion);
         let bad_url: fn(&Error) -> bool = |e| {
             matches!(
                 e,
                 Error::Url {
-                    field: "region_url",
+                    field: REGION_URL_FIELD,
                     ..
                 }
             )
@@ -440,25 +392,37 @@ mod tests {
         let disabled: fn(&Error) -> bool = |e| matches!(e, Error::AwsMetadataDisabled);
         let refused: fn(&Error) -> bool =
             |e| matches!(e, Error::Transport { .. }) && !e.is_transient();
-        let unreachable = "http://127.0.0.1:1/zone";
-        for (vars, region_url, expected) in [
-            (&[][..], None, no_url),
-            (&[][..], Some("169.254.169.254/zone"), bad_url),
+        let bad_token: fn(&Error) -> bool = |e| matches!(e, Error::AwsMetadataToken(_));
+        let bad_zone: fn(&Error) -> bool = |e| matches!(e, Error::AwsRegion(_));
+        let unreachable = Some("http://127.0.0.1:1/zone".to_owned());
+        let zone = Some(format!("{}/zone", server.uri()));
+        let token = Some(format!("{}/token", server.uri()));
+        for (vars, region_url, token_url, expected) in [
+            (&[][..], None, None, no_url),
+            (
+                &[][..],
+                Some("169.254.169.254/zone".to_owned()),
+                None,
+                bad_url,
+            ),
             (
                 &[("AWS_EC2_METADATA_DISABLED", "true")][..],
-                Some(unreachable),
+                unreachable.clone(),
+                None,
                 disabled,
             ),
-            (&[][..], Some(unreachable), refused),
+            (&[][..], unreachable, None, refused),
+            (&[][..], zone.clone(), token, bad_token),
+            (&[][..], zone, None, bad_zone),
         ] {
-            let fixture = Fixture::new(vars, &[]);
+            let fixture = Fixture::new(host(Platform::Unix, vars, &[]));
+            let file = file(region_url, token_url);
 
-            let error =
-                region_from_metadata(&fixture.setup(), &file(region_url.map(str::to_owned), None))
-                    .await
-                    .unwrap_err();
+            let error = region_from_metadata(&fixture.setup(), &file)
+                .await
+                .unwrap_err();
 
-            assert!(expected(&error), "{region_url:?}: {error}");
+            assert!(expected(&error), "{file:?}: {error}");
         }
     }
 
@@ -466,14 +430,15 @@ mod tests {
     /// if the signer reads the process environment or the real AWS files.
     #[tokio::test]
     async fn signs_with_the_host_it_is_given() {
-        let fixture = Fixture::new(
+        let fixture = Fixture::new(host(
+            Platform::Unix,
             &[("HOME", "/home/u"), ("AWS_REGION", "eu-west-3")],
             &[(
                 "/home/u/.aws/credentials",
                 b"[default]\naws_access_key_id = AKIDINJECTED\naws_secret_access_key = secret\n"
                     .to_vec(),
             )],
-        );
+        ));
 
         let source = Source::new(&fixture.setup(), &file(None, None), "audience")
             .await

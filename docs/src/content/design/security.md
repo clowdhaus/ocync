@@ -71,9 +71,9 @@ Scanners that read the embedded list directly still see the dropped crates until
 
 The rules every change to `auth/gcp.rs` and `google/` keeps. Each rule names the cost it bounds, as requests to Google count against the run's rate limits.
 
-| Event | What happens | Requests to Google |
+| Event | What happens | Requests sent |
 |---|---|---|
-| First Artifact Registry or Container Registry host set up in a run | The credentials load once. Hosts set up at once wait on the same load. | At most the AWS region lookup |
+| First Artifact Registry or Container Registry host set up in a run | The credentials load once. Hosts set up at once wait on the same load. | None to Google. At most the AWS region lookup, to the instance metadata service |
 | A later host in the run | Shares the load and the Google token | None |
 | The load fails | Kept for the run: every request of the load has already retried a transient failure | None more |
 | A Google token is needed | The kept one, until 30 seconds before its `expires_in` or `expireTime`. One with no expiry is kept until an exchange refuses it, as upstream never refreshes one | One token chain per lifetime |
@@ -90,10 +90,11 @@ Deliberate differences from upstream:
 - AWS subject token: signed with the owned AWS signer and credentials from `ocync`'s AWS chain for that region, so IRSA, EKS Pod Identity, profiles and every other AWS source work. Upstream reads only the `AWS_*` key variables and the instance metadata role URL the file names, which `ocync` does not read. The region comes from `AWS_REGION`, `AWS_DEFAULT_REGION`, the selected AWS profile's `region` (which upstream does not read), then the file's `region_url`, which is not asked when `AWS_EC2_METADATA_DISABLED` is set, as the AWS chain does not ask the instance metadata service then either. It is resolved when the registry is set up.
 - The metadata server and the `region_url` lookup use no proxy, so a token never reaches a proxy host, and are bounded: 1 second to connect, 10 seconds per read. Upstream honors the system proxy and sets no timeout. A URL subject token source at a link-local or loopback address, the EC2 instance metadata service's IPv6 address, `localhost` or `metadata.google.internal`, such as Azure's instance metadata service or a sidecar, uses no proxy either. The other Google calls, including any other URL source, honor `HTTPS_PROXY` and `NO_PROXY`, as upstream, with 5 seconds to connect and 20 seconds per read.
 - No call follows a redirect, so a body carrying a secret is never sent on to another host.
+- `GCE_METADATA_HOST` must be a bare `host[:port]`. Upstream appends the token path to whatever it holds, so a path, query or user info in it sends the request somewhere else.
 - Retries follow the [token lifecycle](#token-lifecycle). Upstream tries most calls once and retries only the IAM call.
 - An impersonated token whose `expireTime` has already passed is an error. Upstream panics.
 - STS client authentication sends `id:secret` in standard padded base64, as RFC 7617 and Google's Go and Python libraries do. Upstream sends URL-safe base64 without padding.
-- A service account's key, an authorized user's `token_uri`, the file's `token_url` and impersonation URL, and a URL source's URL and headers are parsed when the credentials are loaded, so a bad one fails when the registry is set up rather than at the first token.
+- A service account's key, an authorized user's `token_uri` and `quota_project_id`, the file's `token_url` and impersonation URL, a URL source's URL and headers, an AWS source's `region_url` and `imdsv2_session_token_url`, and `GCE_METADATA_HOST` are parsed when the credentials are loaded, so a bad one fails when the registry is set up rather than at the first token.
 - An answer that is not UTF-8 is an error. Upstream replaces the invalid bytes of a URL subject token.
 - An `expires_in` past what the clock can hold is an error, rather than a token that never expires.
 - An error shows no request URL, as its query can hold a token.

@@ -351,6 +351,51 @@ pub(super) mod tests {
         Config::load(&host(vars, config_file), None)
     }
 
+    /// `AWS_REGION` before `AWS_DEFAULT_REGION`, then the selected
+    /// profile's `region`; none set is `None`, and a value that is not a
+    /// region is an error. Breaks if the order flips, the profile is not
+    /// read, or a bad region is taken.
+    #[test]
+    fn region_precedence() {
+        let profile = "[default]\nregion = eu-west-1\n";
+        type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, Option<&'a str>);
+        let cases: &[Case<'_>] = &[
+            (
+                &[
+                    ("AWS_REGION", "us-west-2"),
+                    ("AWS_DEFAULT_REGION", "us-east-1"),
+                ],
+                profile,
+                Some("us-west-2"),
+            ),
+            (
+                &[("AWS_DEFAULT_REGION", "us-east-1")],
+                profile,
+                Some("us-east-1"),
+            ),
+            (&[], profile, Some("eu-west-1")),
+            (&[], "", None),
+        ];
+        for (vars, file, expected) in cases {
+            let found = config(vars, file).region().unwrap();
+            assert_eq!(
+                found.as_ref().map(Region::as_str),
+                *expected,
+                "{vars:?} {file:?}"
+            );
+        }
+        assert!(
+            config(&[("AWS_REGION", "not a region")], "")
+                .region()
+                .is_err()
+        );
+        assert!(
+            config(&[], "[default]\nregion = not a region\n")
+                .region()
+                .is_err()
+        );
+    }
+
     const SERVICES_FILE: &str = "[default]\nendpoint_url = http://profile-global\nservices = local\n\
         [services local]\necr =\n  endpoint_url = http://profile-ecr\n\
         ecr_public =\n  endpoint_url = http://wrong-spelling\n\

@@ -162,7 +162,7 @@ const EC2_METADATA_IPV6: std::net::Ipv6Addr =
     std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
 
 /// Host names that only ever name this host or its metadata service.
-const LOCAL_DOMAINS: [&str; 2] = ["localhost", "metadata.google.internal"];
+const LOCAL_DOMAINS: [&str; 2] = ["localhost", super::metadata::DEFAULT_HOST];
 
 /// The client that fetches a URL source: the metadata client, with no
 /// proxy, for this host or a metadata service, such as Azure's at a
@@ -397,10 +397,7 @@ impl Account {
         };
         let call = Generate {
             url,
-            auth: SourceAuth {
-                bearer: Secret(response.access_token),
-                quota_project: None,
-            },
+            auth: SourceAuth::new(&response.access_token, None)?,
             delegates: None,
             scopes: &self.scopes,
         };
