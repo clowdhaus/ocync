@@ -202,6 +202,24 @@ impl Error {
     }
 }
 
+/// `error` and each of its sources, joined as upstream prints them, so a
+/// reason kept as text still names its cause. A cause the text already ends
+/// with is not repeated: some errors print their cause and also return it as
+/// their source.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(e) = source {
+        let cause = e.to_string();
+        if !text.ends_with(&cause) {
+            text.push_str(": ");
+            text.push_str(&cause);
+        }
+        source = e.source();
+    }
+    text
+}
+
 /// The most of an external body or stream kept in an error, in bytes.
 const MAX_QUOTED_BYTES: usize = 200;
 

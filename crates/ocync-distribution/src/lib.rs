@@ -18,6 +18,8 @@ pub mod digest;
 pub mod ecr;
 /// Error types for OCI distribution operations.
 pub mod error;
+/// Google Cloud Application Default Credentials.
+mod google;
 /// JSON decoding shared by the registry and AWS clients.
 mod json;
 /// Manifest operations (pull, push, head, referrers).

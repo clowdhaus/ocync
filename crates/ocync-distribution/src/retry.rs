@@ -72,7 +72,7 @@ pub(crate) fn is_transient(error: &Error) -> bool {
 /// unjittered schedule would send all 16 retries back in lockstep and produce
 /// the next burst. The factor is drawn from `[0.75, 1.25)`, matching
 /// `ocync_sync::retry`.
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     let base = INITIAL_BACKOFF
         .saturating_mul(1u32 << attempt.min(16))
         .min(MAX_BACKOFF);

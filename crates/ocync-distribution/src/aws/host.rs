@@ -94,7 +94,7 @@ impl Dns {
 
 /// Where the time comes from.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum Clock {
+pub(crate) enum Clock {
     /// The system clock.
     System,
     /// A fixed instant.
@@ -104,7 +104,7 @@ pub(super) enum Clock {
 
 impl Clock {
     /// The time now.
-    pub(super) fn now(self) -> SystemTime {
+    pub(crate) fn now(self) -> SystemTime {
         match self {
             Self::System => SystemTime::now(),
             #[cfg(test)]
@@ -142,15 +142,15 @@ impl Network {
 
 /// How long a connection and each read may take.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Timeouts {
-    pub(super) connect: Duration,
-    pub(super) read: Duration,
+pub(crate) struct Timeouts {
+    pub(crate) connect: Duration,
+    pub(crate) read: Duration,
 }
 
 /// The client settings for a credential endpoint the token is meant for
 /// alone, the instance metadata service or the container endpoint: no
 /// proxy, so a token never reaches an `HTTP_PROXY` host, and no redirect.
-pub(super) fn credential_endpoint_client(timeouts: Timeouts) -> reqwest::ClientBuilder {
+pub(crate) fn credential_endpoint_client(timeouts: Timeouts) -> reqwest::ClientBuilder {
     crate::client::no_redirect_builder()
         .no_proxy()
         .connect_timeout(timeouts.connect)
@@ -183,7 +183,7 @@ impl Transport {
 
 /// Where environment variables come from.
 #[derive(Debug, Clone)]
-pub(super) enum Env {
+pub(crate) enum Env {
     /// The running process's environment.
     Process,
     /// A fixed set.
@@ -194,7 +194,7 @@ pub(super) enum Env {
 impl Env {
     /// The value of `key`, or `None` when unset. A value that is not UTF-8
     /// is also `None`, with a warning, as the SDK treats it as unset.
-    pub(super) fn get(&self, key: &str) -> Option<String> {
+    pub(crate) fn get(&self, key: &str) -> Option<String> {
         match self {
             Self::Process => match std::env::var(key) {
                 Ok(value) => Some(value),
@@ -212,7 +212,7 @@ impl Env {
 
 /// Where files come from.
 #[derive(Debug, Clone)]
-pub(super) enum Fs {
+pub(crate) enum Fs {
     /// The real file system.
     Real,
     /// A fixed set of files. A path not in the map is not found, as the
@@ -258,7 +258,7 @@ impl Fs {
     }
     /// The whole contents of `path`. The files read here are a few
     /// kilobytes on local disk, so a blocking read is used.
-    pub(super) fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+    pub(crate) fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         match self {
             Self::Real => std::fs::read(path),
             #[cfg(test)]
@@ -286,7 +286,7 @@ fn write_new_private(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 /// The platform rules for finding the home directory and joining paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Platform {
+pub(crate) enum Platform {
     /// Linux, macOS and other Unix-like systems.
     Unix,
     /// Windows.
@@ -295,7 +295,7 @@ pub(super) enum Platform {
 
 impl Platform {
     /// The platform this binary runs on.
-    pub(super) fn current() -> Self {
+    pub(crate) fn current() -> Self {
         if cfg!(windows) {
             Self::Windows
         } else {

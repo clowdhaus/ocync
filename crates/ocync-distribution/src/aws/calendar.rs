@@ -173,7 +173,7 @@ pub(super) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
 /// date that does not exist, a leap second or a local time before 1970 is
 /// `None`. A month-end leap second, which `time` reads as the nanosecond
 /// before the next second, is refused like any other.
-pub(super) fn parse_rfc3339_with_offset(text: &str) -> Option<SystemTime> {
+pub(crate) fn parse_rfc3339_with_offset(text: &str) -> Option<SystemTime> {
     let (date, time, offset) = date_time(text, Separator::AnyByte)?;
     let local = instant(date, time)?;
     if offset.eq_ignore_ascii_case("z") {

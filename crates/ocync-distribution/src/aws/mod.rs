@@ -18,8 +18,10 @@ mod retry;
 mod sigv4;
 mod xml;
 
+pub(crate) use self::calendar::parse_rfc3339_with_offset;
 use self::config::{Config, ServiceId};
 use self::credentials::{Chain, Credentials};
+pub(crate) use self::host::{Clock, Env, Fs, Platform, Timeouts, credential_endpoint_client};
 use self::host::{Host, Network, Transport};
 
 use std::cell::RefCell;
@@ -889,6 +891,117 @@ impl AwsCredentialProviders {
     }
 }
 
+/// The signing name of STS.
+const STS_SIGNING_NAME: &str = "sts";
+
+/// Signs the STS `GetCallerIdentity` request a Google external account sends
+/// as its subject token, with the default profile's credentials for one
+/// region from the run's shared AWS credentials.
+pub(crate) struct CallerIdentitySigner {
+    credentials: Arc<SharedCredentials>,
+    region: Region,
+}
+
+impl fmt::Debug for CallerIdentitySigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallerIdentitySigner")
+            .field("region", &self.region)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a request was not signed: no credentials were loaded.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct SigningError(Failure);
+
+impl CallerIdentitySigner {
+    /// A signer for `region`, configured from the process environment and
+    /// the shared AWS files, taking the credentials from `aws_credentials`.
+    pub(crate) fn new(
+        region: &str,
+        aws_credentials: &AwsCredentialProviders,
+    ) -> Result<Self, ConfigError> {
+        let host = Host::current();
+        let config = Config::load(&host, None);
+        let region = Region::parse(region)?;
+        let retry = config.retry()?;
+        let credentials = shared_credentials(&host, config, &region, &retry, aws_credentials)?;
+        Ok(Self {
+            credentials,
+            region,
+        })
+    }
+
+    /// The region the request is signed for.
+    pub(crate) fn region(&self) -> &str {
+        self.region.as_str()
+    }
+
+    /// Sign a `method` request to `url` with `headers`, which include
+    /// `host`, and an empty body, at `time`. Returns the headers to add.
+    pub(crate) async fn sign(
+        &self,
+        method: &http::Method,
+        url: &Url,
+        headers: &[(&str, &str)],
+        time: SystemTime,
+    ) -> Result<Vec<(&'static str, String)>, SigningError> {
+        let credentials = self.credentials.load().await.map_err(SigningError)?;
+        Ok(sigv4::sign(
+            &sigv4::Request {
+                method,
+                path: url.path(),
+                query: url.query().unwrap_or_default(),
+                headers,
+                body: &[],
+            },
+            sigv4::AccessKey {
+                id: credentials.access_key_id(),
+                secret: credentials.secret_access_key(),
+                session_token: credentials.session_token(),
+            },
+            &sigv4::CredentialScope {
+                region: self.region.as_str(),
+                service: STS_SIGNING_NAME,
+            },
+            time,
+        ))
+    }
+}
+
+#[cfg(test)]
+impl CallerIdentitySigner {
+    /// A signer in `region` with the example key and `session_token`.
+    pub(crate) fn example(region: &str, session_token: Option<&str>) -> Self {
+        Self {
+            credentials: Arc::new(SharedCredentials::new(tests::static_credentials(
+                session_token,
+            ))),
+            region: Region::parse(region).unwrap(),
+        }
+    }
+}
+
+/// The credentials for `config`'s profile in `region`, from
+/// `aws_credentials`, with a chain built for them if there are none yet.
+fn shared_credentials(
+    host: &Host,
+    config: Config,
+    region: &Region,
+    retry: &retry::Settings,
+    aws_credentials: &AwsCredentialProviders,
+) -> Result<Arc<SharedCredentials>, ConfigError> {
+    let key = ProviderKey {
+        profile: config.profile_name().to_owned(),
+        region: region.clone(),
+    };
+    aws_credentials.get_or_try_insert(key, || {
+        let chain = Chain::new(host, region, config, retry).map_err(ConfigError::HttpClient)?;
+        Ok::<_, ConfigError>(SharedCredentials::new(Provider::Chain(Box::new(chain))))
+    })
+}
+
 /// A client for one AWS JSON API in one region.
 pub(crate) struct Client {
     api: Api,
@@ -955,15 +1068,7 @@ impl Client {
             stall_timeout: STALL_TIMEOUT,
             region,
         };
-        let key = ProviderKey {
-            profile: config.profile_name().to_owned(),
-            region: api.region.clone(),
-        };
-        let credentials = aws_credentials.get_or_try_insert(key, || {
-            let chain =
-                Chain::new(host, &api.region, config, &retry).map_err(ConfigError::HttpClient)?;
-            Ok::<_, ConfigError>(SharedCredentials::new(Provider::Chain(Box::new(chain))))
-        })?;
+        let credentials = shared_credentials(host, config, &api.region, &retry, aws_credentials)?;
         Self::from_parts(Parts {
             credentials,
             service,
@@ -1056,7 +1161,7 @@ mod tests {
     >;
 
     /// A provider answering with the example key and `session_token`.
-    fn static_credentials(session_token: Option<&str>) -> Provider {
+    pub(super) fn static_credentials(session_token: Option<&str>) -> Provider {
         let credentials = credentials::tests::key(session_token, None);
         Provider::Test(Box::new(move || {
             let credentials = credentials.clone();

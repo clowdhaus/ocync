@@ -150,23 +150,7 @@ fn credential_api(
     Api::new(&host.network, id, parts).map_err(ConfigError::HttpClient)
 }
 
-/// `error` and each of its sources, joined as upstream prints them, so a
-/// reason kept as text still names its cause. A cause the text already ends
-/// with is not repeated: some errors print their cause and also return it as
-/// their source.
-pub(super) fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(e) = source {
-        let cause = e.to_string();
-        if !text.ends_with(&cause) {
-            text.push_str(": ");
-            text.push_str(&cause);
-        }
-        source = e.source();
-    }
-    text
-}
+pub(super) use crate::error::error_chain;
 
 /// Each source and why it was not configured, as `source: reason; ...`.
 fn skipped(reasons: &[(Source, String)]) -> String {

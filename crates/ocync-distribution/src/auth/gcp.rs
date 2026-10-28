@@ -1,7 +1,7 @@
 //! Google Artifact Registry / Container Registry authentication provider.
 //!
-//! Uses `google-cloud-auth` to obtain `OAuth2` access tokens via Application
-//! Default Credentials (ADC), then performs standard OCI Bearer token
+//! Obtains `OAuth2` access tokens from Application Default Credentials,
+//! resolved in [`crate::google`], then performs standard OCI Bearer token
 //! exchange using `oauth2accesstoken` as the username. This is the Rust
 //! equivalent of:
 //!
@@ -22,8 +22,11 @@ use std::time::Duration;
 use super::token_cache::TokenCache;
 use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
-use crate::credential_cache::CredentialCache;
-use crate::error::Error;
+use crate::aws::{AwsCredentialProviders, Clock};
+use crate::credential_cache::{CredentialCache, remaining};
+use crate::error::{Error, error_chain};
+use crate::google::{self, AccessToken};
+use crate::retry::{MAX_TRANSIENT_RETRIES, Policy, backoff, retrying};
 
 /// Username for GCP `OAuth2` token exchange.
 ///
@@ -31,53 +34,50 @@ use crate::error::Error;
 /// auth, with the `OAuth2` access token as the password.
 const GCP_USERNAME: &str = "oauth2accesstoken";
 
-/// Default GCP `OAuth2` token lifetime (10 minutes).
-///
-/// `google-cloud-auth` does not expose the actual `expires_in` from the
-/// metadata server or token endpoint response. Standard GCP tokens last
-/// 1 hour, but Workload Identity Federation can issue tokens as short as
-/// 15 minutes. A 10-minute default ensures we proactively re-fetch
-/// before WIF tokens expire, avoiding unnecessary 401 -> invalidate ->
-/// re-fetch cycles in watch mode. The cost is ~6 local ADC refreshes
-/// per hour instead of 1 -- cheap since the metadata server and file
-/// reads are sub-millisecond.
-const GCP_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(600);
-
 /// Abstraction over GCP token acquisition for testability.
 ///
-/// The real implementation wraps `google-cloud-auth`. Tests inject a mock
-/// that returns canned tokens without hitting GCP.
+/// The real implementation resolves Application Default Credentials. Tests
+/// inject a mock that returns canned tokens without hitting GCP.
 pub(crate) trait GcpTokenSource: Send + Sync + fmt::Debug {
-    /// Obtain a raw `OAuth2` access token string.
-    fn access_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>>;
+    /// Obtain an `OAuth2` access token and its expiry.
+    fn access_token(&self)
+    -> Pin<Box<dyn Future<Output = Result<AccessToken, Error>> + Send + '_>>;
 }
 
-/// Default [`GcpTokenSource`] backed by `google-cloud-auth` ADC.
-struct GoogleCloudTokenSource {
-    credentials: google_cloud_auth::credentials::AccessTokenCredentials,
+/// Default [`GcpTokenSource`]: the host's Application Default Credentials.
+#[derive(Debug)]
+struct AdcTokenSource {
+    credentials: google::Credentials,
+    clients: google::Clients,
     /// Registry hostname for error context.
     hostname: String,
 }
 
-impl fmt::Debug for GoogleCloudTokenSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GoogleCloudTokenSource")
-            .finish_non_exhaustive()
+/// A transient failure is sent again on the crate's schedule, as the
+/// prepare phase reaches this before the engine's retry exists.
+struct Transient;
+
+impl Policy<google::Error> for Transient {
+    fn retry(&mut self, attempt: u32, error: &google::Error) -> Option<Duration> {
+        (error.is_transient() && attempt < MAX_TRANSIENT_RETRIES).then(|| backoff(attempt))
     }
 }
 
-impl GcpTokenSource for GoogleCloudTokenSource {
-    fn access_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>> {
+impl GcpTokenSource for AdcTokenSource {
+    fn access_token(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<AccessToken, Error>> + Send + '_>> {
         Box::pin(async move {
-            let token = self
-                .credentials
-                .access_token()
-                .await
-                .map_err(|e| Error::AuthFailed {
-                    registry: self.hostname.clone(),
-                    reason: format!("GCP access token request failed: {e}"),
-                })?;
-            Ok(token.token)
+            retrying("GCP access token", &mut Transient, |_| {
+                self.credentials.access_token(&self.clients, Clock::System)
+            })
+            .await
+            .map_err(|e| {
+                Error::auth_failed(
+                    &self.hostname,
+                    format!("GCP access token request failed: {}", error_chain(&e)),
+                )
+            })
         })
     }
 }
@@ -124,21 +124,30 @@ impl GcpAuth {
     /// Credentials are fetched lazily on the first `get_token` call and
     /// refreshed automatically when approaching expiry.
     /// `registry` is the base URL the registry's client uses.
-    pub async fn new(registry: &url::Url, http: reqwest::Client) -> Result<Self, Error> {
+    pub async fn new(
+        registry: &url::Url,
+        http: reqwest::Client,
+        aws_credentials: &AwsCredentialProviders,
+    ) -> Result<Self, Error> {
         let hostname = registry.host_str().unwrap_or_default().to_owned();
-        let credentials = google_cloud_auth::credentials::Builder::default()
-            .with_scopes(["https://www.googleapis.com/auth/devstorage.read_write"])
-            .build_access_token_credentials()
-            .map_err(|e| Error::AuthFailed {
-                registry: hostname.clone(),
-                reason: format!("GCP credential setup failed: {e}"),
-            })?;
+        let setup_failed = |e: google::Error| {
+            Error::auth_failed(
+                &hostname,
+                format!("GCP credential setup failed: {}", error_chain(&e)),
+            )
+        };
+        let clients = google::Clients::new().map_err(setup_failed)?;
+        let credentials =
+            google::Credentials::load(&google::Host::current(), &clients, aws_credentials)
+                .await
+                .map_err(setup_failed)?;
 
         Ok(Self {
             base_url: registry_origin(registry),
             http,
-            api: Box::new(GoogleCloudTokenSource {
+            api: Box::new(AdcTokenSource {
                 credentials,
+                clients,
                 hostname,
             }),
             credential_cache: CredentialCache::new(),
@@ -173,15 +182,15 @@ impl GcpAuth {
                     tracing::warn!(error = %e, "GCP access token request failed");
                     e
                 })?;
+                // A token with no expiry is kept until a registry refuses
+                // it, as upstream never refreshes one.
+                let ttl = access_token.expiry.map_or(Duration::MAX, remaining);
                 let credentials = Credentials::Basic {
                     username: GCP_USERNAME.to_owned(),
-                    password: access_token,
+                    password: access_token.token.expose().to_owned(),
                 };
-                tracing::debug!(
-                    ttl_secs = GCP_DEFAULT_TOKEN_TTL.as_secs(),
-                    "GCP OAuth2 credentials refreshed"
-                );
-                Ok((credentials, GCP_DEFAULT_TOKEN_TTL))
+                tracing::debug!(ttl_secs = ttl.as_secs(), "GCP OAuth2 credentials refreshed");
+                Ok((credentials, ttl))
             })
             .await
     }
@@ -247,41 +256,59 @@ mod tests {
 
     use super::*;
 
-    /// Mock GCP token source that returns pre-configured access tokens.
+    /// How long the mock's tokens last unless a test says otherwise.
+    const HOUR: Option<Duration> = Some(Duration::from_secs(3600));
+
+    /// Mock GCP token source that returns pre-configured access tokens,
+    /// each lasting its own time from when it is handed out.
     #[derive(Debug)]
     struct MockGcpTokenSource {
-        tokens: Mutex<VecDeque<String>>,
+        tokens: Mutex<VecDeque<(String, Option<Duration>)>>,
     }
 
     impl MockGcpTokenSource {
         fn succeeding(token: &str) -> Self {
-            Self {
-                tokens: Mutex::new(VecDeque::from(
-                    std::iter::repeat_n(token.to_owned(), 10).collect::<Vec<_>>(),
-                )),
-            }
+            Self::with_tokens(vec![(token, HOUR); 10])
         }
 
-        fn with_tokens(tokens: Vec<String>) -> Self {
+        fn with_tokens(tokens: Vec<(&str, Option<Duration>)>) -> Self {
             Self {
-                tokens: Mutex::new(VecDeque::from(tokens)),
+                tokens: Mutex::new(
+                    tokens
+                        .into_iter()
+                        .map(|(token, lasts)| (token.to_owned(), lasts))
+                        .collect(),
+                ),
             }
         }
     }
 
     impl GcpTokenSource for MockGcpTokenSource {
-        fn access_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>> {
+        fn access_token(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<AccessToken, Error>> + Send + '_>> {
             Box::pin(async move {
-                self.tokens
-                    .lock()
-                    .await
-                    .pop_front()
-                    .ok_or_else(|| Error::AuthFailed {
-                        registry: "mock-gcp".into(),
-                        reason: "mock: no more tokens".into(),
-                    })
+                let (token, lasts) =
+                    self.tokens
+                        .lock()
+                        .await
+                        .pop_front()
+                        .ok_or_else(|| Error::AuthFailed {
+                            registry: "mock-gcp".into(),
+                            reason: "mock: no more tokens".into(),
+                        })?;
+                Ok(AccessToken {
+                    token: token.into(),
+                    expiry: lasts.map(|lasts| std::time::SystemTime::now() + lasts),
+                })
             })
         }
+    }
+
+    /// The password of the credentials `auth` holds now.
+    async fn password(auth: &GcpAuth) -> String {
+        let Credentials::Basic { password, .. } = auth.ensure_credentials().await.unwrap();
+        password
     }
 
     fn mount_v2_and_token(server: &MockServer, token_value: &str) -> Vec<Mock> {
@@ -386,7 +413,7 @@ mod tests {
         let auth = GcpAuth::with_api(
             server.uri(),
             crate::test_http_client(),
-            MockGcpTokenSource::with_tokens(vec!["ya29.once".to_owned()]),
+            MockGcpTokenSource::with_tokens(vec![("ya29.once", HOUR)]),
         );
         let t1 = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
         let t2 = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
@@ -394,43 +421,34 @@ mod tests {
         assert_eq!(t2.value(), "cached");
     }
 
+    /// A token that expires within the refresh window is fetched again on
+    /// the next use, where the old fixed 10 minute lifetime kept it. Breaks
+    /// if the token's own expiry is not what the cache keeps it for.
     #[tokio::test]
-    async fn sdk_credentials_refresh_on_expiry() {
-        let server = MockServer::start().await;
-        for mock in mount_v2_and_token(&server, "refreshed") {
-            mock.mount(&server).await;
-        }
-
+    async fn a_short_lived_token_is_fetched_again() {
         let auth = GcpAuth::with_api(
-            server.uri(),
+            "https://us-docker.pkg.dev",
             crate::test_http_client(),
             MockGcpTokenSource::with_tokens(vec![
-                "ya29.first".to_owned(),
-                "ya29.second".to_owned(),
+                ("ya29.first", Some(Duration::from_secs(20))),
+                ("ya29.second", HOUR),
             ]),
         );
+        assert_eq!(password(&auth).await, "ya29.first");
+        assert_eq!(password(&auth).await, "ya29.second");
+    }
 
-        // First call fetches "ya29.first" with GCP_DEFAULT_TOKEN_TTL.
-        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-
-        // Overwrite the SDK cache with a near-zero TTL (10s < 30s
-        // EARLY_REFRESH_WINDOW). This exercises the TTL-driven refresh
-        // path in CredentialCache, simulating what happens when the
-        // underlying access token expires before our cache TTL.
-        let stale = Credentials::Basic {
-            username: GCP_USERNAME.to_owned(),
-            password: "ya29.first".to_owned(),
-        };
-        auth.credential_cache
-            .set(stale, Duration::from_secs(10))
-            .await;
-
-        // Clear the Bearer token cache so get_token() re-enters
-        // ensure_credentials(). SDK creds are near-expiry, so
-        // CredentialCache triggers a refresh -> "ya29.second".
-        auth.tokens.clear().await;
-
-        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+    /// A token with no expiry is kept, as upstream never refreshes one.
+    /// Breaks if it is fetched again on each use.
+    #[tokio::test]
+    async fn a_token_without_expiry_is_kept() {
+        let auth = GcpAuth::with_api(
+            "https://us-docker.pkg.dev",
+            crate::test_http_client(),
+            MockGcpTokenSource::with_tokens(vec![("ya29.only", None)]),
+        );
+        assert_eq!(password(&auth).await, "ya29.only");
+        assert_eq!(password(&auth).await, "ya29.only");
     }
 
     #[tokio::test]
