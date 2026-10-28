@@ -169,7 +169,7 @@ impl AuthorizationToken {
 /// expiry. The actual token lifetime is read from the API response, falling
 /// back to 12 hours if not provided.
 ///
-/// Supports all AWS credential aws_credentials via the default credential chain:
+/// Supports all AWS credential sources via the default credential chain:
 /// environment variables, shared config/credential files, IMDS/ECS
 /// container credentials, IRSA (IAM Roles for Service Accounts), and
 /// EKS Pod Identity.
