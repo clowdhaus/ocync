@@ -34,8 +34,9 @@
 //! - `OCYNC_PROFILE_WORKERS`       `max_concurrent_transfers` (default: 50;
 //!   note the engine default is 10 -- the harness deliberately oversubscribes
 //!   to stress h2 stream budgeting).
-//! - `OCYNC_PROFILE_HTTP1=1`       refuse to negotiate HTTP/2 via ALPN.
-//!   Used to isolate HTTP/2 multiplexing stalls from the rest of the path.
+//! - `OCYNC_PROFILE_HTTP1=1`       refuse to negotiate HTTP/2 via ALPN for
+//!   metadata and uploads (blob downloads always use HTTP/1.1). Used to
+//!   isolate HTTP/2 multiplexing stalls from the rest of the path.
 //! - `OCYNC_PROFILE_H2_ADAPTIVE=0` disable HTTP/2 adaptive-window sizing
 //!   for A/B testing the pre-fix behavior.
 //! - `OCYNC_PROFILE_STREAM_CAP`    override per-`RegistryClient`
@@ -92,7 +93,12 @@ async fn run_profile(src: Arc<RegistryClient>, dst: Arc<RegistryClient>, label: 
         "[profile] {label}: populating source: {n_images} images x {n_layers} layers x {layer_bytes} B"
     );
     let pop_start = Instant::now();
-    let repos = populate_source(&src, n_images, n_layers, layer_bytes).await;
+    let corpus = Corpus {
+        images: n_images,
+        layers: n_layers,
+        layer_bytes,
+    };
+    let repos = populate_source(&src, &corpus).await;
     eprintln!("[profile] {label}: populate took {:?}", pop_start.elapsed());
 
     let mappings = repos
@@ -142,8 +148,8 @@ async fn run_profile(src: Arc<RegistryClient>, dst: Arc<RegistryClient>, label: 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "spins up Docker containers; run via samply, not in CI"]
 async fn profile_small_images() {
-    let (_src_ctr, src_url) = start_registry_http().await;
-    let (_dst_ctr, dst_url) = start_registry_http().await;
+    let (_src_ctr, src_url) = start_registry().await;
+    let (_dst_ctr, dst_url) = start_registry().await;
     let src = make_client(src_url, false);
     let dst = make_client(dst_url, false);
     run_profile(src, dst, "http").await;

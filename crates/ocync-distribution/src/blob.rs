@@ -1,14 +1,9 @@
 //! Blob operations - existence checks, pull, push, mount, and upload management.
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
-use pin_project_lite::pin_project;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LOCATION};
-use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, warn};
 
 use crate::aimd::RegistryAction;
@@ -19,39 +14,6 @@ use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
 use crate::spec::RepositoryName;
-
-pin_project! {
-    /// Stream wrapper that holds a streaming-blob semaphore permit for the
-    /// lifetime of the inner stream. Used by [`RegistryClient::blob_pull`] to
-    /// release the permit when the caller has fully consumed the response
-    /// body, not when `blob_pull` itself returns.
-    ///
-    /// `pin_project_lite` lets the projection work for any `S: Stream`,
-    /// including streams that are not `Unpin` (a future change in
-    /// reqwest's stream impl would otherwise silently bypass this
-    /// wrapper).
-    struct PermitStream<S> {
-        #[pin]
-        inner: S,
-        _permit: OwnedSemaphorePermit,
-    }
-}
-
-impl<S: Stream> Stream for PermitStream<S> {
-    type Item = S::Item;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().inner.poll_next(cx)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        // Forward the inner stream's hint so consumers that pre-allocate
-        // (e.g. `reqwest::Body::wrap_stream` setting Content-Length, or
-        // any `collect::<Vec<_>>()`) see the same information as the raw
-        // `bytes_stream()`.
-        self.inner.size_hint()
-    }
-}
 
 /// Content type for raw blob data in OCI upload requests.
 const OCTET_STREAM: &str = "application/octet-stream";
@@ -178,31 +140,21 @@ impl RegistryClient {
     /// Pull a blob as a streaming response.
     ///
     /// Issues a GET request to `/v2/{repository}/blobs/{digest}` and returns
-    /// a byte stream for the response body. The streaming-blob semaphore
-    /// is acquired before the GET and held by the returned stream until it
-    /// is fully consumed, bounding concurrent long-lived h2 streams. The GET
-    /// and any redirect it follows go over HTTP/1.1; see
-    /// [`RegistryClient::blob_http`].
+    /// a byte stream for the response body. The GET and any redirect it
+    /// follows go over HTTP/1.1, so a body left unread holds back only its
+    /// own connection. It takes no streaming-blob permit, which budgets
+    /// HTTP/2 streams for uploads: a copy holding one while its upload waits
+    /// for another from the same client would deadlock.
     pub async fn blob_pull(
         &self,
         repository: &RepositoryName,
         digest: &Digest,
     ) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>> + 'static, Error> {
-        let permit = self.acquire_streaming_blob_permit().await;
         let path = blob_path(digest);
         let resp = self
-            .get_on(
-                &self.blob_http,
-                repository,
-                &path,
-                None,
-                RegistryAction::BlobRead,
-            )
+            .get(repository, &path, None, RegistryAction::BlobRead)
             .await?;
-        Ok(PermitStream {
-            inner: resp.bytes_stream(),
-            _permit: permit,
-        })
+        Ok(resp.bytes_stream())
     }
 
     /// Attempt a cross-repository blob mount.

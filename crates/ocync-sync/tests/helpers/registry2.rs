@@ -1,75 +1,50 @@
 //! Real `registry:2` containers for tests that need a real registry's wire
 //! behavior, such as HTTP/2 flow control, and a corpus to fill them with.
 
+#![allow(dead_code, unused_imports, unreachable_pub)]
+
 use bytes::Bytes;
 use futures_util::stream;
 use ocync_distribution::sha256::Sha256;
 use ocync_distribution::spec::{MediaType, RepositoryName};
 use ocync_distribution::{Digest, RegistryClient};
-use rcgen::{CertificateParams, DnType, KeyPair};
-use testcontainers::core::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ContainerRequest, GenericImage, ImageExt};
-use url::Url;
 
 use super::builders::ManifestBuilder;
 
-/// A `registry:2` container listening on port 5000.
-fn registry() -> ContainerRequest<GenericImage> {
-    GenericImage::new("registry", "2")
-        .with_exposed_port(5000.into())
-        .with_wait_for(WaitFor::message_on_stderr("listening on"))
-        // Without an init process to reap it, the registry can be left a
-        // zombie Docker cannot kill, and the container is never removed.
-        .with_host_config_modifier(|config| config.init = Some(true))
+/// The container starters `ocync-distribution`'s own `registry:2` tests use.
+#[path = "../../../ocync-distribution/tests/common/mod.rs"]
+mod common;
+
+pub use common::{start_registry, start_registry_tls};
+
+/// What [`populate_source`] pushes: `images` images, each a config and
+/// `layers` distinct layers of `layer_bytes`.
+#[derive(Debug, Clone, Copy)]
+pub struct Corpus {
+    pub images: usize,
+    pub layers: usize,
+    pub layer_bytes: usize,
 }
 
-/// Starts `request` and returns the container with its `scheme` base URL.
-async fn start(
-    request: ContainerRequest<GenericImage>,
-    scheme: &str,
-) -> (ContainerAsync<GenericImage>, Url) {
-    let container = request
-        .start()
-        .await
-        .expect("registry:2 container failed to start");
-    let port = container
-        .get_host_port_ipv4(5000)
-        .await
-        .expect("get_host_port_ipv4 failed");
-    let url = Url::parse(&format!("{scheme}://127.0.0.1:{port}")).unwrap();
-    (container, url)
-}
+impl Corpus {
+    /// The config blob of image `image`.
+    pub fn config(&self, image: usize) -> Vec<u8> {
+        format!("{{\"image\":{image}}}").into_bytes()
+    }
 
-/// A `registry:2` serving plain HTTP/1.1.
-pub async fn start_registry_http() -> (ContainerAsync<GenericImage>, Url) {
-    start(registry(), "http").await
-}
+    /// Layer `layer` of image `image`: zeros, varied per (image, layer) so
+    /// digests are unique.
+    pub fn layer(&self, image: usize, layer: usize) -> Vec<u8> {
+        let mut data = vec![0u8; self.layer_bytes];
+        data[0] = (image & 0xff) as u8;
+        data[1] = (layer & 0xff) as u8;
+        data
+    }
 
-/// Self-signed cert covering `localhost` + `127.0.0.1`, valid for the
-/// run of the test. Generated per test invocation so there's no
-/// on-disk artifact to manage.
-fn self_signed_localhost() -> (Vec<u8>, Vec<u8>) {
-    let key = KeyPair::generate().expect("rcgen KeyPair::generate");
-    let mut params = CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
-        .expect("rcgen CertificateParams::new");
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "ocync-perf-profile");
-    let cert = params.self_signed(&key).expect("rcgen self_signed");
-    (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
-}
-
-/// A `registry:2` serving TLS with a self-signed certificate, so a client
-/// negotiates HTTP/2 with it.
-pub async fn start_registry_tls() -> (ContainerAsync<GenericImage>, Url) {
-    let (cert_pem, key_pem) = self_signed_localhost();
-    let request = registry()
-        .with_env_var("REGISTRY_HTTP_TLS_CERTIFICATE", "/certs/tls.crt")
-        .with_env_var("REGISTRY_HTTP_TLS_KEY", "/certs/tls.key")
-        .with_copy_to("/certs/tls.crt", cert_pem)
-        .with_copy_to("/certs/tls.key", key_pem);
-    start(request, "https").await
+    /// The bytes of all of an image's blobs.
+    pub fn image_bytes(&self, image: usize) -> u64 {
+        (self.config(image).len() + self.layers * self.layer_bytes) as u64
+    }
 }
 
 async fn push_blob_stream(client: &RegistryClient, repo: &RepositoryName, data: Vec<u8>) {
@@ -83,35 +58,20 @@ async fn push_blob_stream(client: &RegistryClient, repo: &RepositoryName, data: 
         .expect("blob_push_stream");
 }
 
-/// The content of layer `l` of image `i` in [`populate_source`]: zeros,
-/// varied per (image, layer) so digests are unique.
-pub fn layer(i: usize, l: usize, layer_bytes: usize) -> Vec<u8> {
-    let mut layer = vec![0u8; layer_bytes];
-    layer[0] = (i & 0xff) as u8;
-    layer[1] = (l & 0xff) as u8;
-    layer
-}
-
-/// Pushes `n_images` images, each a config and `n_layers` distinct layers
-/// of `layer_bytes`, tagged `v1` in repositories `perf/img-NNNN`.
-pub async fn populate_source(
-    client: &RegistryClient,
-    n_images: usize,
-    n_layers: usize,
-    layer_bytes: usize,
-) -> Vec<RepositoryName> {
-    let mut repos = Vec::with_capacity(n_images);
-    for i in 0..n_images {
-        let repo = RepositoryName::new(format!("perf/img-{i:04}")).unwrap();
-        let config_data = format!("{{\"image\":{i}}}").into_bytes();
-        // Stream the corpus into the source registry the same way the
-        // engine does during sync; otherwise the harness's setup-time SHA
-        // dominates the profile and the actual streaming path is invisible.
+/// Pushes `corpus` to `client`, each image tagged `v1` in repository
+/// `test/img-NNNN`, and returns the repositories.
+pub async fn populate_source(client: &RegistryClient, corpus: &Corpus) -> Vec<RepositoryName> {
+    let mut repos = Vec::with_capacity(corpus.images);
+    for i in 0..corpus.images {
+        let repo = RepositoryName::new(format!("test/img-{i:04}")).unwrap();
+        let config_data = corpus.config(i);
+        // Streamed the way the engine pushes during a sync, so setup
+        // exercises the same upload path.
         push_blob_stream(client, &repo, config_data.clone()).await;
 
         let mut builder = ManifestBuilder::new(&config_data);
-        for l in 0..n_layers {
-            let layer = layer(i, l, layer_bytes);
+        for l in 0..corpus.layers {
+            let layer = corpus.layer(i, l);
             push_blob_stream(client, &repo, layer.clone()).await;
             builder = builder.layer(&layer);
         }

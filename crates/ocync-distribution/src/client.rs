@@ -36,12 +36,12 @@ pub(crate) fn no_redirect_builder() -> reqwest::ClientBuilder {
         .redirect(reqwest::redirect::Policy::none())
 }
 
-/// Default cap on concurrent long-lived blob streams per registry.
+/// Default cap on concurrent blob uploads per registry.
 ///
 /// reqwest/hyper opens one HTTP/2 connection per origin and multiplexes
-/// streams over it. Each blob upload (POST + streaming PUT) or pull
-/// (streaming GET) holds an h2 stream open for the duration of the
-/// transfer. Major container registries advertise
+/// streams over it. Each blob upload (POST + streaming PUT) holds an h2
+/// stream open for the duration of the transfer. Blob downloads go over
+/// HTTP/1.1 and are not counted. Major container registries advertise
 /// `SETTINGS_MAX_CONCURRENT_STREAMS` in the range 100-128
 /// (registry-1.docker.io: 128, ghcr.io: 100, cgr.dev: 100,
 /// us-docker.pkg.dev: 100, public.ecr.aws: 128, quay.io: 128,
@@ -158,10 +158,10 @@ impl RegistryClientBuilder {
         self
     }
 
-    /// Set the cap on concurrent long-lived blob streams (push / pull).
+    /// Set the cap on concurrent blob uploads.
     ///
-    /// Each blob upload PUT and blob pull GET holds an HTTP/2 stream open
-    /// for the duration of the transfer. Reqwest/hyper uses one h2
+    /// Each blob upload PUT holds an HTTP/2 stream open for the duration of
+    /// the transfer. Reqwest/hyper uses one h2
     /// connection per origin, so this cap must stay under the server's
     /// advertised `SETTINGS_MAX_CONCURRENT_STREAMS` (typically 100-128 on
     /// major registries) minus headroom for metadata operations
@@ -232,10 +232,11 @@ impl RegistryClientBuilder {
         self
     }
 
-    /// Refuse to negotiate HTTP/2 via ALPN. Test-only escape hatch for the
-    /// perf profile harness, used to isolate HTTP/2-multiplexing stalls
-    /// from the rest of the streaming path. Hidden from public docs;
-    /// never use in production code.
+    /// Refuse to negotiate HTTP/2 via ALPN for every request but blob
+    /// downloads, which always use HTTP/1.1. Test-only escape hatch for the
+    /// perf profile harness, used to isolate HTTP/2-multiplexing stalls on
+    /// metadata and uploads. Hidden from public docs; never use in
+    /// production code.
     #[doc(hidden)]
     pub fn force_http1(mut self, force: bool) -> Self {
         self.force_http1 = force;
@@ -281,15 +282,11 @@ impl RegistryClientBuilder {
         if self.force_http1 {
             http_builder = http_builder.http1_only();
         }
-        // Enable HTTP/2 adaptive flow-control window sizing. Hyper's
-        // default starts each stream at a 64KB receive window and grows
-        // it only after `WINDOW_UPDATE` frames; at high stream
-        // concurrency (e.g. `max_concurrent_transfers` of 50 streaming
-        // large blobs) this starves throughput and against some
-        // registries surfaces as a stall. Adaptive window sizes the
-        // window dynamically based on observed throughput. Off by
-        // default in reqwest; we want it on by default for the registry
-        // client.
+        // Enable HTTP/2 adaptive flow-control window sizing for the
+        // responses this client receives (everything but blob downloads).
+        // Hyper's fixed defaults are 2 MiB per stream and 5 MiB per
+        // connection; adaptive sizing starts both at 65,535 bytes and grows
+        // them with measured throughput. Off by default in reqwest.
         //
         // Test hook: `http2_adaptive_window(false)` disables for A/B.
         if self.h2_adaptive_window {
@@ -325,16 +322,16 @@ pub struct RegistryClient {
     pub(crate) http: reqwest::Client,
     /// HTTP/1.1 only, for blob downloads. Over HTTP/2 a response body
     /// holds a share of its connection's receive window until it is read,
-    /// and that window starts at 65,535 bytes, so bodies opened ahead of
-    /// uploads still waiting on a limit can fill it and starve the bodies
-    /// being read. Over HTTP/1.1 each body holds back only its own
-    /// connection.
+    /// and with adaptive window sizing that window starts at 65,535 bytes,
+    /// so bodies opened ahead of uploads still waiting on a limit can fill
+    /// it and starve the bodies being read. Over HTTP/1.1 each body holds
+    /// back only its own connection.
     pub(crate) blob_http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
-    /// Cap on concurrent long-lived blob streams (push / pull). Acquired
-    /// at the start of [`Self::blob_push_stream`] and [`Self::blob_pull`]
-    /// to keep the per-connection HTTP/2 stream usage below the server's
+    /// Cap on concurrent blob uploads. Acquired by
+    /// [`Self::blob_push_stream`] to keep the per-connection HTTP/2 stream
+    /// usage below the server's
     /// advertised `SETTINGS_MAX_CONCURRENT_STREAMS`. See the constant
     /// `DEFAULT_STREAMING_BLOB_CONCURRENCY` for the rationale and probed
     /// numbers per registry.
@@ -544,18 +541,7 @@ impl RegistryClient {
         accept: Option<&str>,
         op: RegistryAction,
     ) -> Result<reqwest::Response, Error> {
-        self.get_on(&self.http, repository, path, accept, op).await
-    }
-
-    /// [`get`](Self::get), sent through `http`.
-    pub(crate) async fn get_on(
-        &self,
-        http: &reqwest::Client,
-        repository: &RepositoryName,
-        path: &str,
-        accept: Option<&str>,
-        op: RegistryAction,
-    ) -> Result<reqwest::Response, Error> {
+        let http = self.http_for(op);
         let url = build_url(&self.base_url, repository, path)?;
         let scopes = [Scope::pull(repository.as_str())];
 
@@ -571,6 +557,15 @@ impl RegistryClient {
             .await?;
 
         classify_response(resp, &self.base_url, repository).await
+    }
+
+    /// The HTTP client for `op`: [`Self::blob_http`] for blob downloads,
+    /// the HTTP/2 client for everything else.
+    fn http_for(&self, op: RegistryAction) -> &reqwest::Client {
+        match op {
+            RegistryAction::BlobRead => &self.blob_http,
+            _ => &self.http,
+        }
     }
 
     /// Perform an authenticated HEAD request.

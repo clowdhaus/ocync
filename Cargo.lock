@@ -2357,7 +2357,6 @@ dependencies = [
  "hex",
  "http",
  "httpdate",
- "pin-project-lite",
  "rcgen",
  "regex-lite",
  "reqwest",
