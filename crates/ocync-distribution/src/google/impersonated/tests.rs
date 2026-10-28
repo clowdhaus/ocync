@@ -1,7 +1,7 @@
 //! Tests of the impersonated service account, ported from upstream's
 //! `impersonated.rs`.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

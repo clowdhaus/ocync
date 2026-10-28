@@ -4,6 +4,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::{RwLock, RwLockWriteGuard};
@@ -33,13 +34,17 @@ pub(crate) struct CredentialCache<T, E = Infallible> {
     cached: RwLock<Slot<T, E>>,
     /// A value with less than this left is refreshed.
     refresh_window: Duration,
+    /// How many refreshes have failed, so a caller can tell a failure that
+    /// came after it asked from one that came before, without a clock.
+    failures: AtomicU64,
 }
 
 /// What a [`CredentialCache`] holds.
 struct Slot<T, E> {
     entry: Option<CacheEntry<T>>,
-    /// The last refresh that failed, and when.
-    failed: Option<(Instant, E)>,
+    /// The last refresh that failed, and its count in
+    /// [`CredentialCache::failures`].
+    failed: Option<(u64, E)>,
 }
 
 struct CacheEntry<T> {
@@ -79,6 +84,7 @@ impl<T: Clone + Send + Sync, E> CredentialCache<T, E> {
                 failed: None,
             }),
             refresh_window: window,
+            failures: AtomicU64::new(0),
         }
     }
 
@@ -114,13 +120,13 @@ impl<T: Clone + Send + Sync, E> CredentialCache<T, E> {
     where
         E: Clone,
     {
-        let asked = Instant::now();
+        let asked = self.failures.load(Ordering::Acquire);
         let mut slot = match self.fresh_or_lock().await {
             ControlFlow::Break(value) => return Ok(value),
             ControlFlow::Continue(slot) => slot,
         };
-        if let Some((at, error)) = &slot.failed
-            && *at > asked
+        if let Some((failure, error)) = &slot.failed
+            && *failure > asked
         {
             return Err(error.clone());
         }
@@ -130,7 +136,8 @@ impl<T: Clone + Send + Sync, E> CredentialCache<T, E> {
                 Ok(value)
             }
             Err(error) => {
-                slot.failed = Some((Instant::now(), error.clone()));
+                let failure = self.failures.fetch_add(1, Ordering::AcqRel) + 1;
+                slot.failed = Some((failure, error.clone()));
                 Err(error)
             }
         }
@@ -223,7 +230,7 @@ mod tests {
         let refreshes = Cell::new(0);
         let failing = || async {
             refreshes.set(refreshes.get() + 1);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
             Err("down")
         };
 
@@ -234,7 +241,6 @@ mod tests {
 
         assert_eq!((first, second), (Err("down"), Err("down")));
         assert_eq!(refreshes.get(), 1);
-        tokio::time::advance(Duration::from_secs(1)).await;
         let later = cache
             .get_or_refresh_sharing_failure(async { Ok((7, Duration::from_secs(1000))) })
             .await;

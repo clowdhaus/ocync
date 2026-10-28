@@ -323,12 +323,15 @@ pub(crate) enum Error {
     /// An executable subject token source, which ocync does not run.
     #[error("unsupported subject token source `executable`")]
     ExecutableSource,
-    /// The metadata server's host variable is not a bare `host[:port]`.
+    /// The metadata server's host variable does not parse as a host.
+    #[error("{} is not a valid host[:port]", metadata::HOST_VARIABLE)]
+    MetadataHostInvalid(#[source] url::ParseError),
+    /// The metadata server's host variable has more than `host[:port]`.
     #[error(
         "{} must be host[:port], with no path, query or user info",
         metadata::HOST_VARIABLE
     )]
-    MetadataHost(#[source] Option<url::ParseError>),
+    MetadataHostNotBare,
     /// The token an impersonation is made with cannot be sent as a header.
     #[error("the source credential's access token cannot be sent as a header")]
     SourceToken(#[source] http::header::InvalidHeaderValue),
@@ -349,8 +352,9 @@ pub(crate) enum Error {
         #[source]
         source: url::ParseError,
     },
-    /// The AWS region for an AWS subject token was not found.
-    #[error("could not resolve AWS region")]
+    /// No AWS region is configured, and the file names no `region_url` to
+    /// ask.
+    #[error("no AWS region configured and no `region_url` to look it up")]
     NoAwsRegion,
     /// No AWS region is configured, and `AWS_EC2_METADATA_DISABLED` keeps
     /// it from being asked of the instance metadata service.
@@ -388,19 +392,18 @@ impl Error {
     /// Whether the call may succeed if sent again, as upstream classifies
     /// it: a 5xx, 408 or 429 answer, or a transport failure the crate
     /// retries. An answer that is not the JSON expected is final. A GCE or
-    /// EC2 metadata service that does not connect is final too: a host with
-    /// none never gets one. A GCE metadata server that connects and then
-    /// times out or resets, as GKE's can while it mints a token, may be sent
-    /// again. The EC2 one answers a region lookup at once when it answers at
-    /// all, so its timeout is final.
+    /// GKE metadata server that does not connect or answer is sent again, as
+    /// GKE's takes a few seconds to start serving a new pod. The EC2
+    /// instance metadata service a region lookup asks is up whenever its
+    /// host is, so one that does not connect or answer in time never will.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
             Self::Status { status, .. } => crate::retry::is_transient_status(*status),
             Self::Transport { call, source } => {
                 let final_failure = match call {
-                    Call::Metadata => source.is_connect(),
                     Call::AwsRegion => source.is_connect() || source.is_timeout(),
-                    Call::UserToken
+                    Call::Metadata
+                    | Call::UserToken
                     | Call::StsExchange
                     | Call::Impersonation
                     | Call::SubjectUrl(_) => false,

@@ -707,7 +707,7 @@ impl Api {
                 },
                 applied.apply(sent),
             );
-            for (name, value) in signed.into_headers() {
+            for (name, value) in signed.headers() {
                 let value = HeaderValue::try_from(value).map_err(Failure::InvalidHeader)?;
                 headers.insert(HeaderName::from_static(name), value);
             }

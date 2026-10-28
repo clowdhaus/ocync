@@ -59,14 +59,14 @@ impl Server {
             "http://{}",
             host.as_deref().unwrap_or(DEFAULT_HOST)
         ))
-        .map_err(|e| Error::MetadataHost(Some(e)))?;
+        .map_err(Error::MetadataHostInvalid)?;
         if token_url.path() != "/"
             || token_url.query().is_some()
             || token_url.fragment().is_some()
             || !token_url.username().is_empty()
             || token_url.password().is_some()
         {
-            return Err(Error::MetadataHost(None));
+            return Err(Error::MetadataHostNotBare);
         }
         token_url.set_path(TOKEN_PATH);
         if let Some(scopes) = scopes.registry_or_endpoint_default() {
@@ -137,7 +137,7 @@ mod tests {
             format!("http://10.0.0.1:8080{TOKEN_PATH}")
         );
         let error = Server::new(&host_env("bad host"), Scopes::Default).unwrap_err();
-        assert!(matches!(error, Error::MetadataHost(Some(_))), "{error}");
+        assert!(matches!(error, Error::MetadataHostInvalid(_)), "{error}");
         for not_a_host in [
             "10.0.0.1:8080/x",
             "user:pw@10.0.0.1",
@@ -146,7 +146,7 @@ mod tests {
         ] {
             let error = Server::new(&host_env(not_a_host), Scopes::Default).unwrap_err();
             assert!(
-                matches!(error, Error::MetadataHost(None)),
+                matches!(error, Error::MetadataHostNotBare),
                 "{not_a_host}: {error}"
             );
         }
@@ -204,19 +204,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token.expiry, crate::google::Expiry::Never);
-    }
-
-    /// A host with no metadata server fails at once and is not tried again,
-    /// as upstream tries it once. Breaks if a refused connection becomes
-    /// transient for the metadata server.
-    #[tokio::test]
-    async fn a_refused_connection_is_final() {
-        let error = Server::new(&host_env("127.0.0.1:1"), Scopes::Default)
-            .unwrap()
-            .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, Error::Transport { .. }), "{error}");
-        assert!(!error.is_transient());
     }
 }

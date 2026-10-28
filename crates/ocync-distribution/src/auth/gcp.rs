@@ -17,8 +17,8 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::OnceCell;
@@ -56,7 +56,7 @@ trait GcpTokenSource: Send + Sync + fmt::Debug {
 /// doomed requests. Create one per run: the next run, such as the next
 /// watch cycle, reads the credentials again.
 #[derive(Default)]
-pub struct SharedGoogleToken(OnceCell<Result<Arc<CachedGoogleToken>, Rc<google::Error>>>);
+pub struct SharedGoogleToken(OnceCell<Result<Arc<CachedGoogleToken>, Arc<google::Error>>>);
 
 impl fmt::Debug for SharedGoogleToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -70,13 +70,13 @@ impl SharedGoogleToken {
         &self,
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
-    ) -> Result<Arc<CachedGoogleToken>, Rc<google::Error>> {
+    ) -> Result<Arc<CachedGoogleToken>, Arc<google::Error>> {
         self.0
             .get_or_init(|| async {
                 AdcTokenSource::load(host, aws_credentials)
                     .await
                     .map(|source| Arc::new(CachedGoogleToken::new(source)))
-                    .map_err(Rc::new)
+                    .map_err(Arc::new)
             })
             .await
             .clone()
@@ -113,14 +113,15 @@ impl CachedGoogleToken {
             .get_or_refresh_sharing_failure(async {
                 tracing::debug!("GCP OAuth2 token expired or missing, refreshing");
                 let token = self.source.access_token().await.map_err(Arc::new)?;
-                match token.expiry {
-                    Expiry::At(expiry) => tracing::debug!(
-                        ttl_secs = remaining(expiry).as_secs(),
-                        "GCP OAuth2 token refreshed"
-                    ),
-                    Expiry::Never => tracing::debug!("GCP OAuth2 token refreshed, with no expiry"),
-                }
-                let ttl = lifetime(&token);
+                // A token with no expiry is kept until a token exchange
+                // refuses it, as upstream never refreshes one: the cache
+                // holds a lifetime past what the clock can hold as never
+                // expiring.
+                let ttl = match token.expiry {
+                    Expiry::At(expiry) => remaining(expiry),
+                    Expiry::Never => Duration::MAX,
+                };
+                tracing::debug!(expiry = ?token.expiry, "GCP OAuth2 token refreshed");
                 Ok((token, ttl))
             })
             .await
@@ -161,16 +162,6 @@ fn credentials_failed(registry: &str, stage: Stage, error: &google::Error) -> Er
         } else {
             Transience::Final
         },
-    }
-}
-
-/// How long `token` is kept. A token with no expiry is kept until a token
-/// exchange refuses it, as upstream never refreshes one: the cache holds a
-/// lifetime past what the clock can hold as never expiring.
-fn lifetime(token: &AccessToken) -> Duration {
-    match token.expiry {
-        Expiry::At(expiry) => remaining(expiry),
-        Expiry::Never => Duration::MAX,
     }
 }
 
@@ -231,6 +222,10 @@ pub struct GcpAuth {
     tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
     challenge_cache: token_exchange::ChallengeCache,
+    /// Whether the registry refused a Google token fetched fresh for it, so
+    /// another refusal says the identity, not the token, is refused and
+    /// fetching again would spend a token chain per scope for nothing.
+    fresh_token_refused: AtomicBool,
 }
 
 impl fmt::Debug for GcpAuth {
@@ -274,32 +269,28 @@ impl GcpAuth {
         aws_credentials: &AwsCredentialProviders,
         shared_token: &SharedGoogleToken,
     ) -> Result<Self, Error> {
-        let hostname = registry.host_str().unwrap_or_default().to_owned();
         let cached_token = shared_token
             .cached_token(host, aws_credentials)
             .await
-            .map_err(|e| credentials_failed(&hostname, Stage::Setup, &e))?;
-        Ok(Self::with_token(
-            registry_origin(registry),
-            hostname,
-            http,
-            cached_token,
-        ))
+            .map_err(|e| {
+                credentials_failed(registry.host_str().unwrap_or_default(), Stage::Setup, &e)
+            })?;
+        Ok(Self::with_token(registry, http, cached_token))
     }
 
     fn with_token(
-        base_url: String,
-        hostname: String,
+        registry: &url::Url,
         http: reqwest::Client,
         cached_token: Arc<CachedGoogleToken>,
     ) -> Self {
         Self {
-            base_url,
-            hostname,
+            base_url: registry_origin(registry),
+            hostname: registry.host_str().unwrap_or_default().to_owned(),
             http,
             cached_token,
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
+            fresh_token_refused: AtomicBool::new(false),
         }
     }
 
@@ -311,8 +302,7 @@ impl GcpAuth {
         api: impl GcpTokenSource + 'static,
     ) -> Self {
         Self::with_token(
-            base_url.into(),
-            "mock-gcp".to_owned(),
+            &base_url.into().parse().expect("a registry URL"),
             http,
             Arc::new(CachedGoogleToken::new(api)),
         )
@@ -374,10 +364,18 @@ impl AuthProvider for GcpAuth {
                         Err(Error::TokenEndpoint {
                             status: http::StatusCode::UNAUTHORIZED,
                             ..
-                        }) => {
+                        }) if !self.fresh_token_refused.load(Ordering::Relaxed) => {
                             self.cached_token.refuse(&google_token).await;
                             let fresh = self.google_token().await?;
-                            self.exchange(&scopes, &fresh).await
+                            let exchanged = self.exchange(&scopes, &fresh).await;
+                            if let Err(Error::TokenEndpoint {
+                                status: http::StatusCode::UNAUTHORIZED,
+                                ..
+                            }) = exchanged
+                            {
+                                self.fresh_token_refused.store(true, Ordering::Relaxed);
+                            }
+                            exchanged
                         }
                         exchanged => exchanged,
                     };
@@ -622,6 +620,38 @@ mod tests {
 
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         assert_eq!(password(&auth).await, "ya29.fresh");
+    }
+
+    /// A registry that refuses a fresh Google token too costs one more
+    /// Google token for the host, not one per scope. Breaks if every scope
+    /// refused with 401 fetches its own Google token.
+    #[tokio::test]
+    async fn a_refused_identity_fetches_one_more_google_token() {
+        let server = MockServer::start().await;
+        mount_v2_and_token(&server, "registry")
+            .remove(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(4)
+            .mount(&server)
+            .await;
+        let auth = GcpAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            MockGcpTokenSource::with_tokens(vec![
+                ("ya29.first", None),
+                ("ya29.second", None),
+                ("ya29.third", None),
+            ]),
+        );
+
+        for repo in ["a", "b", "c"] {
+            auth.get_token(&[Scope::pull(repo)]).await.unwrap_err();
+        }
+        assert_eq!(password(&auth).await, "ya29.second");
     }
 
     /// An exchange that refuses the scope (403), as for a repository the

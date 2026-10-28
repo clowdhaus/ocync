@@ -303,15 +303,15 @@ fn classifies_answers() {
     assert!(!undecodable.is_transient());
 }
 
-/// A request that does not connect is final for a metadata service, which
-/// a host either has or never will, and is sent again for a URL source on
-/// this host, such as a token sidecar still starting. Breaks if the sidecar
-/// fails the run at once, or a missing metadata service is retried.
+/// A request that does not connect is final for the EC2 instance metadata
+/// service, which a host either has or never will, and is sent again for a
+/// GKE metadata server or a token sidecar still starting. Breaks if either
+/// fails the run at once, or a missing EC2 service is retried.
 #[tokio::test]
-async fn a_refused_connection_is_final_only_for_a_metadata_service() {
+async fn a_refused_connection_is_final_only_for_the_ec2_metadata_service() {
     let clients = Clients::new().unwrap();
     for (call, transient) in [
-        (Call::Metadata, false),
+        (Call::Metadata, true),
         (Call::AwsRegion, false),
         (Call::SubjectUrl(Route::Direct), true),
     ] {
@@ -330,7 +330,7 @@ async fn a_refused_connection_is_final_only_for_a_metadata_service() {
 #[tokio::test]
 async fn a_transport_error_shows_no_url() {
     let clients = Clients::new().unwrap();
-    let error = send(&clients, Call::Metadata, |client| {
+    let error = send(&clients, Call::AwsRegion, |client| {
         client.get("http://127.0.0.1:1/token?token=s3cret")
     })
     .await

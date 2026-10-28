@@ -87,6 +87,21 @@ pub enum Error {
         status: http::StatusCode,
     },
 
+    /// A registry's `/v2/` ping, sent to find its token endpoint, answered
+    /// with a status other than the 401 challenge. Already retried where
+    /// transient, so [`Self::status_code`] leaves it out as it does
+    /// [`Self::TokenEndpoint`].
+    #[error(
+        "authentication failed for registry '{registry}': registry ping returned {status} \
+         (expected 401 challenge)"
+    )]
+    RegistryPing {
+        /// The registry pinged.
+        registry: String,
+        /// The status it answered.
+        status: http::StatusCode,
+    },
+
     /// An external credential helper process failed.
     #[error("credential helper '{helper}' failed: {reason}")]
     CredentialHelperFailed {
@@ -233,7 +248,7 @@ impl Error {
                 transience: Transience::Final,
                 ..
             } => true,
-            Self::TokenEndpoint { status, .. } => {
+            Self::TokenEndpoint { status, .. } | Self::RegistryPing { status, .. } => {
                 status.is_client_error() && !crate::retry::is_transient_status(*status)
             }
             Self::RegistryError { status, .. } => {

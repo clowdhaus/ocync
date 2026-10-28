@@ -167,8 +167,7 @@ async fn region_from_metadata(setup: &Setup<'_>, file: &SourceFile) -> Result<Re
         }
     })
     .await?;
-    let region = region_from_zone(&zone).ok_or(Error::NoAwsRegion)?;
-    Region::parse(region).map_err(Error::AwsRegion)
+    Region::parse(region_from_zone(&zone)).map_err(Error::AwsRegion)
 }
 
 /// The region of zone `zone`: the name up to its first part that is a
@@ -176,23 +175,20 @@ async fn region_from_metadata(setup: &Setup<'_>, file: &SourceFile) -> Result<Re
 /// are the Local Zone `us-east-1-bos-1a` and the Wavelength Zone
 /// `us-east-1-wl1-bos-wlz-1`, which upstream reads as regions that do not
 /// exist. A name with no such part is taken as the region itself.
-fn region_from_zone(zone: &str) -> Option<&str> {
+fn region_from_zone(zone: &str) -> &str {
     let zone = zone.trim();
-    if zone.is_empty() {
-        return None;
-    }
     let mut start = 0;
     for part in zone.split('-') {
         if part.starts_with(|c: char| c.is_ascii_digit()) {
             let number = part.trim_end_matches(|c: char| c.is_ascii_alphabetic());
             if number.bytes().all(|b| b.is_ascii_digit()) {
-                return Some(&zone[..start + number.len()]);
+                return &zone[..start + number.len()];
             }
             break;
         }
         start += part.len() + 1;
     }
-    Some(zone)
+    zone
 }
 
 /// The STS URL template, `{region}` replaced once the region is known.
@@ -243,17 +239,16 @@ mod tests {
     #[test]
     fn reads_the_region_of_a_zone() {
         for (zone, region) in [
-            ("us-east-1a", Some("us-east-1")),
-            ("us-east-1", Some("us-east-1")),
-            ("us-gov-west-1a", Some("us-gov-west-1")),
-            ("  us-east-1a  ", Some("us-east-1")),
-            ("", None),
-            ("   ", None),
-            ("a", Some("a")),
-            ("us-east-1\u{e9}", Some("us-east-1\u{e9}")),
-            ("us-west-2-lax-1a", Some("us-west-2")),
-            ("us-east-1-wl1-bos-wlz-1", Some("us-east-1")),
-            ("ap-northeast-1-tpe-1a", Some("ap-northeast-1")),
+            ("us-east-1a", "us-east-1"),
+            ("us-east-1", "us-east-1"),
+            ("us-gov-west-1a", "us-gov-west-1"),
+            ("  us-east-1a  ", "us-east-1"),
+            ("   ", ""),
+            ("a", "a"),
+            ("us-east-1\u{e9}", "us-east-1\u{e9}"),
+            ("us-west-2-lax-1a", "us-west-2"),
+            ("us-east-1-wl1-bos-wlz-1", "us-east-1"),
+            ("ap-northeast-1-tpe-1a", "ap-northeast-1"),
         ] {
             assert_eq!(region_from_zone(zone), region, "{zone:?}");
         }

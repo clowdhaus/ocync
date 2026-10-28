@@ -1,8 +1,6 @@
 //! A service account impersonated through IAM `generateAccessToken`, with a
 //! token of source credentials or of an external account's STS exchange.
 
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
@@ -13,8 +11,9 @@ use super::{
 };
 use crate::aws::{Clock, parse_rfc3339_with_offset};
 
-/// How long an impersonated token is asked to last, as upstream.
-const LIFETIME: Duration = Duration::from_secs(3600);
+/// How long an impersonated token is asked to last, as upstream, in the
+/// API's duration format.
+const LIFETIME: &str = "3600s";
 
 /// What precedes the service account in an impersonation URL.
 const SERVICE_ACCOUNTS: &str = "/serviceAccounts/";
@@ -63,7 +62,7 @@ struct GenerateRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     delegates: Option<&'a [String]>,
     scope: &'a ScopeList,
-    lifetime: String,
+    lifetime: &'static str,
 }
 
 /// The `generateAccessToken` answer.
@@ -124,7 +123,7 @@ impl Generate<'_> {
             let request = client.post(self.url.clone()).json(&GenerateRequest {
                 delegates: self.delegates,
                 scope: self.scopes,
-                lifetime: format!("{}s", LIFETIME.as_secs_f64()),
+                lifetime: LIFETIME,
             });
             self.auth.apply(request)
         })

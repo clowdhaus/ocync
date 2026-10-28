@@ -373,9 +373,9 @@ pub(crate) async fn exchange(
         if resp.status() != StatusCode::UNAUTHORIZED {
             let status = resp.status();
             tracing::warn!(base_url, %status, "registry ping returned unexpected status");
-            return Err(Error::AuthFailed {
+            return Err(Error::RegistryPing {
                 registry: base_url.to_owned(),
-                reason: format!("registry ping returned {status} (expected 401 challenge)"),
+                status,
             });
         }
 
@@ -1074,6 +1074,7 @@ mod tests {
             msg.contains("403") && msg.contains("expected 401 challenge"),
             "unexpected error message: {msg}"
         );
+        assert!(err.is_auth_error(), "{msg}");
         // Must NOT mention WWW-Authenticate.
         assert!(
             !msg.contains("WWW-Authenticate"),
@@ -1081,6 +1082,8 @@ mod tests {
         );
     }
 
+    /// A registry ping that fails with an outage is not reported as
+    /// refused credentials. Breaks if a 5xx ping exits with the auth code.
     #[tokio::test]
     async fn exchange_500_returns_clear_error() {
         let mock = wiremock::MockServer::start().await;
@@ -1100,6 +1103,12 @@ mod tests {
         assert!(
             msg.contains("500") && msg.contains("expected 401 challenge"),
             "unexpected error message: {msg}"
+        );
+        assert!(!err.is_auth_error(), "{msg}");
+        assert_eq!(
+            err.status_code(),
+            None,
+            "the engine must not retry it again"
         );
     }
 
