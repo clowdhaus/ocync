@@ -797,45 +797,48 @@ mod tests {
         assert!(err.to_string().contains("WWW-Authenticate"));
     }
 
-    /// A throttled token endpoint must be re-sent, not fail the mapping.
+    /// A throttled or failing token endpoint is re-sent, not surfaced.
     ///
     /// 95 mappings against one registry need 95 scoped tokens, so this
-    /// endpoint is high-volume exactly when a run is widest. Surfacing its
-    /// 429 loses a mapping the registry never refused.
+    /// endpoint is high-volume exactly when a run is widest. Surfacing a
+    /// 429 or 503 loses a mapping the registry never refused. Breaks if
+    /// either status fails the exchange on its first answer.
     #[tokio::test]
-    async fn exchange_retries_a_throttled_token_endpoint() {
-        let mock = wiremock::MockServer::start().await;
+    async fn exchange_retries_a_transient_token_endpoint_status() {
+        for status in [429, 503] {
+            let mock = wiremock::MockServer::start().await;
 
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v2/"))
-            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{}/token""#, mock.uri()),
-            ))
-            .mount(&mock)
-            .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v2/"))
+                .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                    "WWW-Authenticate",
+                    format!(r#"Bearer realm="{}/token""#, mock.uri()),
+                ))
+                .mount(&mock)
+                .await;
 
-        // Throttled once, then answered.
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/token"))
-            .respond_with(wiremock::ResponseTemplate::new(429))
-            .up_to_n_times(1)
-            .mount(&mock)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/token"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "issued"})),
-            )
-            .mount(&mock)
-            .await;
+            // Failing once, then answered.
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/token"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .up_to_n_times(1)
+                .mount(&mock)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/token"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"token": "issued"})),
+                )
+                .mount(&mock)
+                .await;
 
-        let http = crate::test_http_client();
-        let (token, _) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
-            .await
-            .expect("a throttled token endpoint must be retried, not surfaced");
-        assert_eq!(token.value(), "issued");
+            let http = crate::test_http_client();
+            let (token, _) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{status} must be retried, not surfaced: {e}"));
+            assert_eq!(token.value(), "issued", "{status}");
+        }
     }
 
     /// Retries are bounded: an endpoint that only throttles still returns.
@@ -868,42 +871,40 @@ mod tests {
         );
     }
 
+    /// A token endpoint's refusal is sent once and surfaced. Breaks if a
+    /// 401 or 403 is retried like an outage.
     #[tokio::test]
     async fn exchange_endpoint_error() {
-        let mock = wiremock::MockServer::start().await;
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let mock = wiremock::MockServer::start().await;
 
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v2/"))
-            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{}/token""#, mock.uri()),
-            ))
-            .expect(1)
-            .mount(&mock)
-            .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v2/"))
+                .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                    "WWW-Authenticate",
+                    format!(r#"Bearer realm="{}/token""#, mock.uri()),
+                ))
+                .expect(1)
+                .mount(&mock)
+                .await;
 
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/token"))
-            .respond_with(wiremock::ResponseTemplate::new(403))
-            .expect(1)
-            .mount(&mock)
-            .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/token"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&mock)
+                .await;
 
-        let http = crate::test_http_client();
-        let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::TokenEndpoint {
-                    status: StatusCode::FORBIDDEN,
-                    ..
-                }
-            ),
-            "expected a 403 from the token endpoint, got: {err:?}"
-        );
-        assert_eq!(err.status_code(), None, "not a registry answer");
+            let http = crate::test_http_client();
+            let err = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::TokenEndpoint { status: s, .. } if s == status),
+                "expected a {status} from the token endpoint, got: {err:?}"
+            );
+            assert_eq!(err.status_code(), None, "not a registry answer");
+        }
     }
 
     #[tokio::test]
@@ -1082,8 +1083,9 @@ mod tests {
         );
     }
 
-    /// A registry ping that fails with an outage is not reported as
-    /// refused credentials. Breaks if a 5xx ping exits with the auth code.
+    /// A registry ping that fails with an outage is retried, then not
+    /// reported as refused credentials. Breaks if a 5xx ping is sent once or
+    /// exits with the auth code.
     #[tokio::test]
     async fn exchange_500_returns_clear_error() {
         let mock = wiremock::MockServer::start().await;
@@ -1091,7 +1093,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v2/"))
             .respond_with(wiremock::ResponseTemplate::new(500))
-            .expect(1)
+            .expect(u64::from(crate::retry::MAX_TRANSIENT_RETRIES) + 1)
             .mount(&mock)
             .await;
 
