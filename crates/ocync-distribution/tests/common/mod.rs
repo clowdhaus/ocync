@@ -21,9 +21,11 @@ pub fn test_digest(data: &[u8]) -> Digest {
 /// matches the key with any value.
 pub const LABEL_KEY: &str = "dev.ocync.test";
 
-/// The label value on the registry containers. Descriptive only: the
-/// orphan sweep matches [`LABEL_KEY`] with any value.
-const REGISTRY_LABEL_VALUE: &str = "registry";
+/// The name of the registry image the tests run.
+pub const REGISTRY_NAME: &str = "registry";
+
+/// The tag of the registry image the tests run.
+pub const REGISTRY_TAG: &str = "2";
 
 /// The `key=value` label filter for containers labeled `value`.
 pub fn label(value: &str) -> String {
@@ -109,12 +111,34 @@ pub async fn labeled(
         .await
 }
 
+/// Whether a container in `state`, created at `created` seconds past the
+/// epoch, counts as left behind at `now` under `ages`. A creation time
+/// that cannot be read never counts as old.
+pub fn is_orphan(
+    state: Option<bollard::models::ContainerSummaryStateEnum>,
+    created: i64,
+    ages: OrphanAge,
+    now: SystemTime,
+) -> bool {
+    use bollard::models::ContainerSummaryStateEnum as State;
+
+    let threshold = match state {
+        Some(State::CREATED | State::EXITED | State::DEAD) => ages.stopped,
+        _ => ages.any_state,
+    };
+    u64::try_from(created)
+        .ok()
+        .and_then(|created| UNIX_EPOCH.checked_add(Duration::from_secs(created)))
+        .and_then(|created| created.checked_add(threshold))
+        .is_some_and(|due| due <= now)
+}
+
 /// Remove the containers matching the label `filter` (`key` or
 /// `key=value`) that `ages` counts as left behind at `now`. Ages are
-/// measured against Docker's creation times, so `now` is on the daemon's
-/// clock, which a local daemon shares with this host.
+/// measured against Docker's creation times, so they assume the daemon's
+/// clock agrees with `now`'s, as a native daemon's does; a VM daemon whose
+/// clock drifts past the stopped age can lose a container still starting.
 pub async fn sweep(filter: &str, ages: OrphanAge, now: SystemTime) -> Result<Swept, SweepError> {
-    use bollard::models::ContainerSummaryStateEnum as State;
     use bollard::query_parameters::RemoveContainerOptions;
 
     let docker = testcontainers::core::client::docker_client_instance()
@@ -126,16 +150,7 @@ pub async fn sweep(filter: &str, ages: OrphanAge, now: SystemTime) -> Result<Swe
         let (Some(id), Some(created)) = (container.id, container.created) else {
             continue;
         };
-        let threshold = match container.state {
-            Some(State::CREATED | State::EXITED | State::DEAD) => ages.stopped,
-            _ => ages.any_state,
-        };
-        // A creation time that cannot be read never counts as old.
-        let Ok(created) = u64::try_from(created) else {
-            continue;
-        };
-        let created = UNIX_EPOCH + Duration::from_secs(created);
-        if created.checked_add(threshold).is_none_or(|due| due > now) {
+        if !is_orphan(container.state, created, ages, now) {
             continue;
         }
         let options = RemoveContainerOptions {
@@ -144,7 +159,7 @@ pub async fn sweep(filter: &str, ages: OrphanAge, now: SystemTime) -> Result<Swe
         };
         match docker.remove_container(&id, Some(options)).await {
             Ok(()) => swept.removed += 1,
-            // Another run removed it first.
+            // Already gone, or already being removed by another run.
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404 | 409,
                 ..
@@ -198,10 +213,10 @@ async fn sweep_orphans() {
 }
 
 /// A `registry:2` container listening on port 5000.
-fn registry() -> testcontainers::ContainerRequest<testcontainers::GenericImage> {
+pub fn registry() -> testcontainers::ContainerRequest<testcontainers::GenericImage> {
     use testcontainers::{GenericImage, ImageExt};
 
-    GenericImage::new("registry", "2")
+    GenericImage::new(REGISTRY_NAME, REGISTRY_TAG)
         .with_exposed_port(5000.into())
         .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
             "listening on",
@@ -209,7 +224,30 @@ fn registry() -> testcontainers::ContainerRequest<testcontainers::GenericImage> 
         // Without an init process to reap it, the registry can be left a
         // zombie Docker cannot kill, and the container is never removed.
         .with_host_config_modifier(|config| config.init = Some(true))
-        .with_label(LABEL_KEY, REGISTRY_LABEL_VALUE)
+}
+
+/// Start `request` labeled [`LABEL_KEY`]`=value`. A label value of its
+/// own lets a start that fails remove what it left at once, instead of
+/// waiting for a later run's sweep.
+pub async fn start_labeled(
+    request: testcontainers::ContainerRequest<testcontainers::GenericImage>,
+    value: &str,
+) -> testcontainers::core::error::Result<testcontainers::ContainerAsync<testcontainers::GenericImage>>
+{
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+
+    let started = request.with_label(LABEL_KEY, value).start().await;
+    if started.is_err() {
+        // Every container with this label is this start's, so a `now` past
+        // the longest run counts each as left behind.
+        let any = OrphanAge {
+            stopped: Duration::ZERO,
+            any_state: Duration::ZERO,
+        };
+        let _ = sweep(&label(value), any, SystemTime::now() + LONGEST_RUN).await;
+    }
+    started
 }
 
 /// Start `request` and return the container with its `scheme` base URL.
@@ -220,11 +258,17 @@ async fn start(
     testcontainers::ContainerAsync<testcontainers::GenericImage>,
     Url,
 ) {
-    use testcontainers::runners::AsyncRunner;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static STARTS: AtomicUsize = AtomicUsize::new(0);
 
     sweep_orphans().await;
-    let container = request
-        .start()
+    let value = format!(
+        "registry-{}-{}",
+        std::process::id(),
+        STARTS.fetch_add(1, Ordering::Relaxed)
+    );
+    let container = start_labeled(request, &value)
         .await
         .expect("failed to start registry container");
     let port = container
