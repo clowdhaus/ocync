@@ -72,7 +72,7 @@ pub(crate) fn is_transient(error: &Error) -> bool {
 /// unjittered schedule would send all 16 retries back in lockstep and produce
 /// the next burst. The factor is drawn from `[0.75, 1.25)`, matching
 /// `ocync_sync::retry`.
-pub(crate) fn backoff(attempt: u32) -> Duration {
+fn backoff(attempt: u32) -> Duration {
     let base = INITIAL_BACKOFF
         .saturating_mul(1u32 << attempt.min(16))
         .min(MAX_BACKOFF);
@@ -107,6 +107,16 @@ impl Policy<Error> for Budgeted<'_> {
         }
         self.0.set(self.0.get() - 1);
         Some(backoff(attempt))
+    }
+}
+
+/// A failure the predicate calls transient is sent again on the jittered
+/// schedule, at most [`MAX_TRANSIENT_RETRIES`] times per call.
+pub(crate) struct Bounded<F>(pub(crate) F);
+
+impl<E, F: Fn(&E) -> bool> Policy<E> for Bounded<F> {
+    fn retry(&mut self, attempt: u32, error: &E) -> Option<Duration> {
+        ((self.0)(error) && attempt < MAX_TRANSIENT_RETRIES).then(|| backoff(attempt))
     }
 }
 

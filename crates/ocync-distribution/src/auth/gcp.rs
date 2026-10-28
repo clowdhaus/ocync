@@ -26,7 +26,7 @@ use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{Error, error_chain};
 use crate::google::{self, AccessToken};
-use crate::retry::{MAX_TRANSIENT_RETRIES, Policy, backoff, retrying};
+use crate::retry::{Bounded, retrying};
 
 /// Username for GCP `OAuth2` token exchange.
 ///
@@ -53,24 +53,18 @@ struct AdcTokenSource {
     hostname: String,
 }
 
-/// A transient failure is sent again on the crate's schedule, as the
-/// prepare phase reaches this before the engine's retry exists.
-struct Transient;
-
-impl Policy<google::Error> for Transient {
-    fn retry(&mut self, attempt: u32, error: &google::Error) -> Option<Duration> {
-        (error.is_transient() && attempt < MAX_TRANSIENT_RETRIES).then(|| backoff(attempt))
-    }
-}
-
 impl GcpTokenSource for AdcTokenSource {
     fn access_token(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<AccessToken, Error>> + Send + '_>> {
         Box::pin(async move {
-            retrying("GCP access token", &mut Transient, |_| {
-                self.credentials.access_token(&self.clients, Clock::System)
-            })
+            // The prepare phase reaches this before the engine's retry
+            // exists, so a transient failure is sent again here.
+            retrying(
+                "GCP access token",
+                &mut Bounded(google::Error::is_transient),
+                |_| self.credentials.access_token(&self.clients, Clock::System),
+            )
             .await
             .map_err(|e| {
                 Error::auth_failed(
@@ -138,7 +132,7 @@ impl GcpAuth {
         };
         let clients = google::Clients::new().map_err(setup_failed)?;
         let credentials =
-            google::Credentials::load(&google::Host::current(), &clients, aws_credentials)
+            google::Credentials::load(&crate::aws::Host::current(), &clients, aws_credentials)
                 .await
                 .map_err(setup_failed)?;
 
@@ -182,14 +176,27 @@ impl GcpAuth {
                     tracing::warn!(error = %e, "GCP access token request failed");
                     e
                 })?;
-                // A token with no expiry is kept until a registry refuses
-                // it, as upstream never refreshes one.
-                let ttl = access_token.expiry.map_or(Duration::MAX, remaining);
                 let credentials = Credentials::Basic {
                     username: GCP_USERNAME.to_owned(),
                     password: access_token.token.expose().to_owned(),
                 };
-                tracing::debug!(ttl_secs = ttl.as_secs(), "GCP OAuth2 credentials refreshed");
+                // A token with no expiry is kept until a registry refuses
+                // it, as upstream never refreshes one. The cache holds a
+                // lifetime past what the clock can hold as never expiring.
+                let ttl = match access_token.expiry {
+                    Some(expiry) => {
+                        let ttl = remaining(expiry);
+                        tracing::debug!(
+                            ttl_secs = ttl.as_secs(),
+                            "GCP OAuth2 credentials refreshed"
+                        );
+                        ttl
+                    }
+                    None => {
+                        tracing::debug!("GCP OAuth2 credentials refreshed, with no expiry");
+                        Duration::MAX
+                    }
+                };
                 Ok((credentials, ttl))
             })
             .await
@@ -422,8 +429,7 @@ mod tests {
     }
 
     /// A token that expires within the refresh window is fetched again on
-    /// the next use, where the old fixed 10 minute lifetime kept it. Breaks
-    /// if the token's own expiry is not what the cache keeps it for.
+    /// the next use. Breaks if the cache keeps a token past its own expiry.
     #[tokio::test]
     async fn a_short_lived_token_is_fetched_again() {
         let auth = GcpAuth::with_api(
@@ -456,10 +462,7 @@ mod tests {
     /// Breaks if a 503 fails the load or a 401 is sent twice.
     #[tokio::test]
     async fn retries_a_transient_google_failure() {
-        use std::collections::HashMap;
-        use std::path::PathBuf;
-
-        use crate::aws::{Env, Fs, Platform};
+        use crate::aws::Platform;
 
         for (first, calls, succeeds) in [(503, 2, true), (401, 1, false)] {
             let server = MockServer::start().await;
@@ -485,17 +488,11 @@ mod tests {
                 "refresh_token": "refresh",
                 "token_uri": format!("{}/token", server.uri()),
             });
-            let host = google::Host {
-                env: Env::Fixed(HashMap::from([(
-                    "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
-                    "/adc.json".to_owned(),
-                )])),
-                fs: Fs::Fixed(HashMap::from([(
-                    PathBuf::from("/adc.json"),
-                    file.to_string().into_bytes(),
-                )])),
-                platform: Platform::Unix,
-            };
+            let host = google::tests::host(
+                Platform::Unix,
+                &[("GOOGLE_APPLICATION_CREDENTIALS", "/adc.json")],
+                &[("/adc.json", file.to_string().into_bytes())],
+            );
             let clients = google::Clients::new().unwrap();
             let credentials =
                 google::Credentials::load(&host, &clients, &AwsCredentialProviders::default())

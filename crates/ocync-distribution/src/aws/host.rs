@@ -22,10 +22,10 @@ use super::replay::Replay;
 /// Everything the settings and credentials are read from, and the SSO
 /// token refreshes the chains on it share.
 #[derive(Debug, Clone)]
-pub(super) struct Host {
-    pub(super) env: Env,
-    pub(super) fs: Fs,
-    pub(super) platform: Platform,
+pub(crate) struct Host {
+    pub(crate) env: Env,
+    pub(crate) fs: Fs,
+    pub(crate) platform: Platform,
     pub(super) clock: Clock,
     pub(super) network: Network,
     pub(super) dns: Dns,
@@ -34,7 +34,7 @@ pub(super) struct Host {
 
 impl Host {
     /// This process on the platform it runs on.
-    pub(super) fn current() -> Self {
+    pub(crate) fn current() -> Self {
         Self {
             env: Env::Process,
             fs: Fs::Real,
@@ -52,7 +52,7 @@ impl Host {
     /// A Unix host on the system clock with no variables, files or names,
     /// whose network fails the test on any request, sharing SSO token
     /// refreshes with no other host. Tests override only what they set.
-    pub(super) fn fixed() -> Self {
+    pub(crate) fn fixed() -> Self {
         Self {
             env: Env::Fixed(HashMap::new()),
             fs: Fs::Fixed(HashMap::new()),

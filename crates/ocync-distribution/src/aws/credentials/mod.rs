@@ -18,8 +18,7 @@ mod sso_token;
 mod sts;
 mod web_identity;
 
-#[cfg(test)]
-pub(super) use imds::TOKEN_HEADER;
+pub(crate) use imds::{TOKEN_HEADER, TOKEN_TTL, TOKEN_TTL_HEADER};
 pub(super) use sso_token::Sessions;
 
 use std::fmt;
@@ -149,8 +148,6 @@ fn credential_api(
     };
     Api::new(&host.network, id, parts).map_err(ConfigError::HttpClient)
 }
-
-pub(super) use crate::error::error_chain;
 
 /// Each source and why it was not configured, as `source: reason; ...`.
 fn skipped(reasons: &[(Source, String)]) -> String {
@@ -308,6 +305,7 @@ impl fmt::Debug for Chain {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::error::error_chain;
 
     /// The SDK documentation's example key, with `session_token` and
     /// `expiry`.

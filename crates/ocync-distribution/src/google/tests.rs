@@ -6,23 +6,24 @@ use std::path::PathBuf;
 
 use super::service_account::tests::{key_file, pkcs8_pem};
 use super::*;
+use crate::aws::Fs;
 
-/// A host with `vars` and `files`.
-pub(super) fn host(platform: Platform, vars: &[(&str, &str)], files: &[(&str, Vec<u8>)]) -> Host {
-    Host {
-        env: Env::Fixed(
-            vars.iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect(),
-        ),
-        fs: Fs::Fixed(
-            files
-                .iter()
-                .map(|(path, contents)| (PathBuf::from(path), contents.clone()))
-                .collect::<HashMap<_, _>>(),
-        ),
-        platform,
-    }
+/// A fixed host on `platform` with `vars` and `files`.
+pub(crate) fn host(platform: Platform, vars: &[(&str, &str)], files: &[(&str, Vec<u8>)]) -> Host {
+    let mut host = Host::fixed();
+    host.platform = platform;
+    host.env = Env::Fixed(
+        vars.iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+    );
+    host.fs = Fs::Fixed(
+        files
+            .iter()
+            .map(|(path, contents)| (PathBuf::from(path), contents.clone()))
+            .collect::<HashMap<_, _>>(),
+    );
+    host
 }
 
 async fn load(host: &Host) -> Result<Credentials, Error> {
@@ -77,7 +78,7 @@ fn finds_the_well_known_path() {
 async fn reads_the_file_the_variable_names() {
     let host = host(
         Platform::Unix,
-        &[(CREDENTIALS_FILE, "/keys/sa.json"), ("HOME", "/home/u")],
+        &[(CREDENTIALS_VARIABLE, "/keys/sa.json"), ("HOME", "/home/u")],
         &[
             ("/keys/sa.json", service_account_bytes()),
             (
@@ -101,7 +102,7 @@ async fn reads_the_file_the_variable_names() {
 async fn a_missing_named_file_is_an_error() {
     let host = host(
         Platform::Unix,
-        &[(CREDENTIALS_FILE, "/keys/none.json")],
+        &[(CREDENTIALS_VARIABLE, "/keys/none.json")],
         &[],
     );
     let error = load(&host).await.unwrap_err();
@@ -163,7 +164,7 @@ async fn refuses_files_it_cannot_use() {
     ] {
         let host = host(
             Platform::Unix,
-            &[(CREDENTIALS_FILE, "/keys/adc.json")],
+            &[(CREDENTIALS_VARIABLE, "/keys/adc.json")],
             &[("/keys/adc.json", contents.as_bytes().to_vec())],
         );
         let error = load(&host).await.unwrap_err();
@@ -176,4 +177,47 @@ async fn refuses_files_it_cannot_use() {
 fn a_secret_never_prints() {
     let secret = Secret::from("ya29.secret".to_owned());
     assert_eq!(format!("{secret:?}"), REDACTED);
+}
+
+/// An answer cut short while its body is read may be sent again. Breaks if
+/// a body read failure is final, which a reset after the headers would
+/// make of a throttled Google endpoint.
+#[tokio::test]
+async fn a_body_cut_short_is_transient() {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.read(&mut [0; 1024]).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{")
+            .unwrap();
+    });
+    let clients = Clients::new().unwrap();
+
+    let error = send_json::<Value>(
+        Call::UserToken,
+        clients.api.get(format!("http://{address}/")),
+    )
+    .await
+    .unwrap_err();
+
+    server.join().unwrap();
+    assert!(matches!(error, Error::Transport { .. }), "{error}");
+    assert!(error.is_transient(), "{error}");
+}
+
+/// A lifetime past what the clock can hold is refused. Breaks if it
+/// silently becomes a token with no expiry.
+#[test]
+fn refuses_a_lifetime_the_clock_cannot_hold() {
+    let now = SystemTime::UNIX_EPOCH;
+    assert!(matches!(
+        expiring("t".to_owned(), now, Some(u64::MAX)),
+        Err(Error::ExpiresIn(u64::MAX))
+    ));
+    let token = expiring("t".to_owned(), now, Some(60)).unwrap();
+    assert_eq!(token.expiry, Some(now + Duration::from_secs(60)));
 }

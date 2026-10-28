@@ -72,12 +72,14 @@ The upstream tests of the behavior `ocync` keeps are ported against the owned co
 
 Deliberate differences from upstream:
 
-- AWS subject token: signed with the owned AWS signer and credentials from `ocync`'s AWS chain for that region, so IRSA, EKS Pod Identity, profiles and every other AWS source work. Upstream reads only the `AWS_*` key variables and the instance metadata role URL the file names, which `ocync` does not read. The region still comes from `AWS_REGION`, `AWS_DEFAULT_REGION`, then the file's `region_url`, and is resolved when the registry is set up.
+- AWS subject token: signed with the owned AWS signer and credentials from `ocync`'s AWS chain for that region, so IRSA, EKS Pod Identity, profiles and every other AWS source work. Upstream reads only the `AWS_*` key variables and the instance metadata role URL the file names, which `ocync` does not read. The region still comes from `AWS_REGION`, `AWS_DEFAULT_REGION`, then the file's `region_url`, and is resolved when the registry is set up, the `region_url` lookup sent again on a transient failure as a token load is.
 - The metadata server and the `region_url` lookup use no proxy, so a token never reaches a proxy host, and are bounded: 1 second to connect, 10 seconds per read. Upstream honors the system proxy and sets no timeout. The other Google calls, including a URL subject token source, honor `HTTPS_PROXY` and `NO_PROXY`, as upstream, with 5 seconds to connect and 20 seconds per read.
 - No call follows a redirect, so a body carrying a secret is never sent on to another host.
-- A transient failure of a token load (an HTTP 5xx, 408 or 429, or a request that did not connect or complete) is sent again on the crate's jittered schedule, up to 4 times, because the prepare phase reaches it before the engine's retry exists. Upstream tries most calls once and retries only the IAM call. A metadata server that does not answer is not retried: a host without one never gets one.
+- A transient failure of a token load (an HTTP 5xx, 408 or 429, or a request that did not connect or complete, or whose answer was cut short) is sent again on the crate's jittered schedule, up to 4 times, because the prepare phase reaches it before the engine's retry exists. Upstream tries most calls once and retries only the IAM call. A metadata server that does not answer is not retried: a host without one never gets one.
 - An impersonated token whose `expireTime` has already passed is an error. Upstream panics.
-- A service account's key is parsed when the credentials are loaded, so a bad key fails when the registry is set up rather than at the first token.
+- A service account's key, the file's `token_url` and impersonation URL, and a URL source's URL and headers are parsed when the credentials are loaded, so a bad one fails when the registry is set up rather than at the first token.
+- An answer that is not UTF-8 is an error. Upstream replaces the invalid bytes of a URL subject token.
+- An `expires_in` past what the clock can hold is an error, rather than a token that never expires.
 - An error keeps at most the first 200 bytes of an answer's body, and a missing subject token field is not shown with the document it was looked for in, as either can hold a token.
 - The `x-goog-api-client` telemetry header is not sent.
 

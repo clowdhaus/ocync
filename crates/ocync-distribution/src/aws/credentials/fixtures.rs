@@ -19,7 +19,8 @@ use super::super::endpoint::Region;
 use super::super::host::{Clock, Env, Fs, Host, Network};
 use super::super::profile::{self, Location};
 use super::super::replay::Replay;
-use super::{Chain, Credentials, Source, error_chain};
+use super::{Chain, Credentials, Source};
+use crate::error::error_chain;
 
 /// Where the cases are.
 pub(super) const DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/aws/credential-test-data");

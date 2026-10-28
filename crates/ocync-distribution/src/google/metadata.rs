@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
-use super::{AccessToken, Call, Clients, Error, REGISTRY_SCOPE, Scopes, expiring, send_json};
+use super::{AccessToken, Call, Clients, Error, Scopes, expiring, send_json};
 use crate::aws::{Clock, Env, Timeouts};
 
 /// The variable naming the metadata server's `host[:port]`, without a
@@ -57,10 +57,9 @@ impl Metadata {
             .map_or_else(|| DEFAULT_ROOT.to_owned(), |host| format!("http://{host}"));
         Self {
             root: root.trim_end_matches('/').to_owned(),
-            scopes: match scopes {
-                Scopes::Registry => Some(REGISTRY_SCOPE.to_owned()),
-                Scopes::Default => None,
-            },
+            scopes: scopes
+                .registry_or_endpoint_default()
+                .map(|scopes| scopes.joined(",")),
         }
     }
 
@@ -78,11 +77,7 @@ impl Metadata {
             request = request.query(&[("scopes", scopes)]);
         }
         let response: TokenResponse = send_json(Call::Metadata, request).await?;
-        Ok(expiring(
-            response.access_token,
-            clock.now(),
-            response.expires_in,
-        ))
+        expiring(response.access_token, clock.now(), response.expires_in)
     }
 }
 
@@ -95,6 +90,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::google::REGISTRY_SCOPE;
 
     const NOW: Duration = Duration::from_secs(1_700_000_000);
 

@@ -478,9 +478,9 @@ mod tests {
     use serde_json::json;
 
     use super::super::super::replay::{Recorded, Replay, record};
-    use super::super::error_chain;
     use super::super::fixtures::{DATA, capture_logs};
     use super::*;
+    use crate::error::error_chain;
 
     /// The relative URI the tests set.
     const RELATIVE: &str = "/v2/credentials/task";

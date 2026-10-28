@@ -9,8 +9,8 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::super::tests::host;
 use super::*;
-use crate::aws::{AwsCredentialProviders, Platform};
-use crate::google::Host;
+use crate::aws::{AwsCredentialProviders, Host, Platform};
+use crate::google::REGISTRY_SCOPE;
 
 /// The subject token file the tests read.
 const TOKEN_FILE: &str = "/var/run/token";
@@ -418,8 +418,8 @@ async fn reads_url_subject_tokens() {
     let clients = Clients::new().unwrap();
     let read = |format: Format| {
         let source = Source::Url {
-            url: format!("{}/token", server.uri()),
-            headers: vec![("metadata".into(), "true".into())],
+            url: Url::parse(&format!("{}/token", server.uri())).unwrap(),
+            headers: header_map(HashMap::from([("metadata".into(), "true".into())])).unwrap(),
             format,
         };
         let clients = clients.clone();
@@ -449,4 +449,17 @@ async fn reads_url_subject_tokens() {
         .await,
         Err(Error::SubjectField(_))
     ));
+}
+
+/// A URL source's headers are parsed at load. Breaks if a header that
+/// cannot be sent is accepted.
+#[test]
+fn refuses_a_bad_url_source_header() {
+    for (name, value) in [("bad name", "v"), ("ok", "bad\nvalue")] {
+        let error = header_map(HashMap::from([(name.to_owned(), value.to_owned())])).unwrap_err();
+        assert!(
+            matches!(&error, Error::SubjectHeader(found) if found == name),
+            "{error}"
+        );
+    }
 }

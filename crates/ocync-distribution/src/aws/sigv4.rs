@@ -89,7 +89,7 @@ pub(super) fn sign(
     key: AccessKey<'_>,
     scope: &CredentialScope<'_>,
     time: SystemTime,
-) -> Vec<(&'static str, String)> {
+) -> Signed {
     let date = AmzDate::new(time);
     let (canonical, signed_headers) = canonical_request(request, &date, key.session_token);
     let string_to_sign = string_to_sign(&canonical, &date, scope);
@@ -99,12 +99,44 @@ pub(super) fn sign(
         key.id,
         credential_scope(&date, scope),
     );
-    let mut headers = vec![(X_AMZ_DATE, date.0)];
-    if let Some(token) = key.session_token {
-        headers.push((X_AMZ_SECURITY_TOKEN, token.to_owned()));
+    Signed {
+        amz_date: date.0,
+        security_token: key.session_token.map(str::to_owned),
+        authorization,
     }
-    headers.push(("authorization", authorization));
-    headers
+}
+
+/// The headers a signature adds to its request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Signed {
+    amz_date: String,
+    security_token: Option<String>,
+    /// The `authorization` header's value.
+    pub(crate) authorization: String,
+}
+
+impl Signed {
+    /// The `x-amz-date` header and, with a session token, the
+    /// `x-amz-security-token` header.
+    pub(crate) fn date_and_token(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            (X_AMZ_DATE, Some(self.amz_date.as_str())),
+            (X_AMZ_SECURITY_TOKEN, self.security_token.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value?)))
+    }
+
+    /// Every header to send.
+    pub(super) fn into_headers(self) -> impl Iterator<Item = (&'static str, String)> {
+        [
+            (X_AMZ_DATE, Some(self.amz_date)),
+            (X_AMZ_SECURITY_TOKEN, self.security_token),
+            ("authorization", Some(self.authorization)),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value?)))
+    }
 }
 
 /// The canonical request and its signed header list.
@@ -139,7 +171,6 @@ fn canonical_request(
     }
     let signed_headers = names.join(";");
 
-    // The empty line is the canonical query.
     let canonical = format!(
         "{}\n{}\n{}\n{canonical_headers}\n{signed_headers}\n{}",
         request.method,
@@ -162,11 +193,16 @@ fn canonical_query(query: &str) -> String {
         })
         .collect();
     pairs.sort_unstable();
-    pairs
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("&")
+    let mut canonical = String::with_capacity(query.len());
+    for (name, value) in &pairs {
+        if !canonical.is_empty() {
+            canonical.push('&');
+        }
+        canonical.push_str(name);
+        canonical.push('=');
+        canonical.push_str(value);
+    }
+    canonical
 }
 
 fn string_to_sign(canonical: &str, date: &AmzDate, scope: &CredentialScope<'_>) -> String {
@@ -484,14 +520,14 @@ mod tests {
             region: "us-east-1",
             service: "service",
         };
-        let headers = sign(
+        let signed = sign(
             &request,
             key,
             &scope,
             UNIX_EPOCH + Duration::from_secs(SUITE_TIME),
         );
         assert_eq!(
-            headers,
+            signed.into_headers().collect::<Vec<_>>(),
             [
                 (X_AMZ_DATE, "20150830T123600Z".to_string()),
                 (

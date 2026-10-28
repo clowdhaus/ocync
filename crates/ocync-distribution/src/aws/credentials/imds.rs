@@ -25,8 +25,9 @@ use super::super::endpoint::join_path;
 use super::super::host::{Clock, Env, Host, Timeouts, Transport, credential_endpoint_client};
 use super::super::retry::{self, Kind, Retryable};
 use super::json::{self, Code, Document};
-use super::{Credentials, Error as ChainError, error_chain};
+use super::{Credentials, Error as ChainError};
 use crate::credential_cache::CredentialCache;
+use crate::error::error_chain;
 use crate::retry::retrying;
 
 /// The variable that turns the source off when `true`, any case.
@@ -39,14 +40,14 @@ const TOKEN_PATH: &str = "/latest/api/token";
 const CREDENTIALS_PATH: &str = "/latest/meta-data/iam/security-credentials/";
 
 /// The header naming the token lifetime asked for, and granted.
-const TOKEN_TTL_HEADER: &str = "x-aws-ec2-metadata-token-ttl-seconds";
+pub(crate) const TOKEN_TTL_HEADER: &str = "x-aws-ec2-metadata-token-ttl-seconds";
 
 /// The header carrying the session token.
-pub(in crate::aws) const TOKEN_HEADER: &str = "x-aws-ec2-metadata-token";
+pub(crate) const TOKEN_HEADER: &str = "x-aws-ec2-metadata-token";
 
 /// The token lifetime asked for: six hours, the SDK's. A longer lifetime
 /// granted is cached as this one.
-const TOKEN_TTL: Duration = Duration::from_secs(21_600);
+pub(crate) const TOKEN_TTL: Duration = Duration::from_secs(21_600);
 
 /// A token this close to expiry is replaced.
 const TOKEN_REFRESH_BUFFER: Duration = Duration::from_secs(120);

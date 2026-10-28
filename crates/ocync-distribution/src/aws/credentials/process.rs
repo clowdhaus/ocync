@@ -156,9 +156,9 @@ fn parse(output: &str) -> Result<Credentials, Invalid> {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use super::super::error_chain;
     use super::super::fixtures::capture_logs;
     use super::*;
+    use crate::error::error_chain;
 
     /// The command prints only its program, so arguments that carry a
     /// secret stay out of logs and errors. Breaks if an argument prints.

@@ -151,9 +151,9 @@ mod tests {
     use super::super::super::endpoint::Region;
     use super::super::super::host::{Clock, Env, Network};
     use super::super::super::retry;
-    use super::super::error_chain;
     use super::super::fixtures::capture_logs;
     use super::*;
+    use crate::error::error_chain;
 
     const TOKEN: &str = "header.payload.signature\n";
     const ROLE: &str = "arn:aws:iam::123456789012:role/test-role";

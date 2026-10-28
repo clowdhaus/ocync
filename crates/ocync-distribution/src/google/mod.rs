@@ -14,6 +14,7 @@ mod metadata;
 mod service_account;
 mod user_account;
 
+use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -24,7 +25,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use crate::REDACTED;
-use crate::aws::{AwsCredentialProviders, Clock, Env, Fs, Platform};
+use crate::aws::{AwsCredentialProviders, Clock, Env, Host, Platform};
 use crate::error::truncate_quoted;
 
 /// The scope every registry token is asked for: push and pull on Artifact
@@ -36,7 +37,7 @@ const REGISTRY_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_wr
 const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 /// The variable naming the credentials file.
-const CREDENTIALS_FILE: &str = "GOOGLE_APPLICATION_CREDENTIALS";
+const CREDENTIALS_VARIABLE: &str = "GOOGLE_APPLICATION_CREDENTIALS";
 
 /// gcloud's well-known credentials file, under `HOME` on Unix and `APPDATA`
 /// on Windows (AIP-4113).
@@ -51,25 +52,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A Google API call that receives nothing for this long, after it is sent
 /// or between reads, fails.
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// The process environment and files the credentials come from.
-#[derive(Debug, Clone)]
-pub(crate) struct Host {
-    pub(crate) env: Env,
-    pub(crate) fs: Fs,
-    pub(crate) platform: Platform,
-}
-
-impl Host {
-    /// This process on the platform it runs on.
-    pub(crate) fn current() -> Self {
-        Self {
-            env: Env::Process,
-            fs: Fs::Real,
-            platform: Platform::current(),
-        }
-    }
-}
 
 /// The HTTP clients the credentials are fetched with.
 #[derive(Debug, Clone)]
@@ -138,12 +120,18 @@ pub(crate) struct AccessToken {
 }
 
 /// The token in an answer that says it lasts `expires_in` seconds from
-/// `now`, or that does not say.
-fn expiring(token: String, now: SystemTime, expires_in: Option<u64>) -> AccessToken {
-    AccessToken {
+/// `now`, or that does not say. A lifetime the clock cannot hold is refused.
+fn expiring(token: String, now: SystemTime, expires_in: Option<u64>) -> Result<AccessToken, Error> {
+    let expiry = expires_in
+        .map(|secs| {
+            now.checked_add(Duration::from_secs(secs))
+                .ok_or(Error::ExpiresIn(secs))
+        })
+        .transpose()?;
+    Ok(AccessToken {
         token: Secret(token),
-        expiry: expires_in.and_then(|secs| now.checked_add(Duration::from_secs(secs))),
-    }
+        expiry,
+    })
 }
 
 /// The Google endpoint a request went to, named as upstream names it in
@@ -227,13 +215,16 @@ pub(crate) enum Error {
     /// A service account's token was not signed.
     #[error("failed to sign the service account token")]
     Sign(#[source] aws_lc_rs::error::Unspecified),
+    /// A token's `expires_in` is past what the clock can hold.
+    #[error("invalid expires_in {0}: past what the clock can hold")]
+    ExpiresIn(u64),
     /// The clock reads before the Unix epoch, which a JWT cannot carry.
     #[error("the system clock is before 1970")]
     ClockBeforeEpoch,
     /// An HTTP client did not build.
     #[error("failed to build the HTTP client")]
     Client(#[source] reqwest::Error),
-    /// A request did not complete.
+    /// A request, or the read of its answer, did not complete.
     #[error("{call}")]
     Transport {
         call: Call,
@@ -248,14 +239,21 @@ pub(crate) enum Error {
         status: http::StatusCode,
         body: String,
     },
-    /// An endpoint's answer did not decode.
+    /// An endpoint's answer is not the JSON expected.
     #[error("{call}: unreadable response")]
     Decode {
         call: Call,
         #[source]
-        source: reqwest::Error,
+        source: serde_json::Error,
     },
-    /// A subject token is not UTF-8.
+    /// An endpoint's answer is not UTF-8.
+    #[error("{call}: the answer is not UTF-8")]
+    NotUtf8 {
+        call: Call,
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+    /// A subject token file is not UTF-8.
     #[error("the subject token is not UTF-8")]
     SubjectNotUtf8(#[source] std::string::FromUtf8Error),
     /// A JSON subject token document does not parse.
@@ -270,9 +268,19 @@ pub(crate) enum Error {
     /// An impersonated token expired before it arrived. Upstream panics.
     #[error("the impersonated access token expired at {0} before it was received")]
     AlreadyExpired(String),
-    /// A subject token source ocync does not support.
-    #[error("unsupported subject token source `{0}`")]
-    UnsupportedSource(&'static str),
+    /// An executable subject token source, which ocync does not run.
+    #[error("unsupported subject token source `executable`")]
+    ExecutableSource,
+    /// A URL subject token source names a header that is not valid.
+    #[error("invalid subject token URL header `{0}`")]
+    SubjectHeader(String),
+    /// A URL in the credentials file does not parse.
+    #[error("invalid `{field}`")]
+    Url {
+        field: &'static str,
+        #[source]
+        source: url::ParseError,
+    },
     /// The AWS region for an AWS subject token was not found.
     #[error("could not resolve AWS region")]
     NoAwsRegion,
@@ -292,8 +300,9 @@ pub(crate) enum Error {
 
 impl Error {
     /// Whether the call may succeed if sent again, as upstream classifies
-    /// it: a 5xx, 408 or 429 answer, or a request that did not connect or
-    /// complete. The metadata server is the exception: a host with no
+    /// it: a 5xx, 408 or 429 answer, or a transport failure the crate
+    /// retries. An answer that is not the JSON expected is final. The
+    /// metadata server is the exception: a host with no
     /// metadata server never gets one, and upstream tries it once.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
@@ -303,7 +312,7 @@ impl Error {
                     || *status == http::StatusCode::TOO_MANY_REQUESTS
             }
             Self::Transport { call, source } => {
-                *call != Call::Metadata && (source.is_connect() || source.is_request())
+                *call != Call::Metadata && crate::retry::is_transient_transport(source)
             }
             _ => false,
         }
@@ -321,22 +330,30 @@ impl Error {
     }
 }
 
+/// Send `request` for `call` and read its successful answer.
+async fn send(call: Call, request: reqwest::RequestBuilder) -> Result<bytes::Bytes, Error> {
+    let transport = |source| Error::Transport { call, source };
+    let response = request.send().await.map_err(transport)?;
+    if !response.status().is_success() {
+        return Err(Error::status(call, response).await);
+    }
+    response.bytes().await.map_err(transport)
+}
+
 /// Send `request` for `call` and decode its JSON answer.
 async fn send_json<T: serde::de::DeserializeOwned>(
     call: Call,
     request: reqwest::RequestBuilder,
 ) -> Result<T, Error> {
-    let response = request
-        .send()
-        .await
-        .map_err(|source| Error::Transport { call, source })?;
-    if !response.status().is_success() {
-        return Err(Error::status(call, response).await);
-    }
-    response
-        .json()
-        .await
-        .map_err(|source| Error::Decode { call, source })
+    let body = send(call, request).await?;
+    serde_json::from_slice(&body).map_err(|source| Error::Decode { call, source })
+}
+
+/// Send `request` for `call` and read its answer as text, which must be
+/// UTF-8.
+async fn send_text(call: Call, request: reqwest::RequestBuilder) -> Result<String, Error> {
+    let body = send(call, request).await?;
+    String::from_utf8(body.into()).map_err(|source| Error::NotUtf8 { call, source })
 }
 
 /// The scopes a credential asks for.
@@ -347,6 +364,55 @@ enum Scopes {
     /// The scopes the file sets, else the type's default. The source of an
     /// impersonated service account asks for these, as upstream.
     Default,
+}
+
+impl Scopes {
+    /// The registry scope, else the file's `listed` scopes, else `default`.
+    fn resolve(self, listed: Option<Vec<String>>, default: &'static str) -> ScopeList {
+        ScopeList(match (self, listed) {
+            (Self::Registry, _) => vec![Cow::Borrowed(REGISTRY_SCOPE)],
+            (Self::Default, Some(listed)) => listed.into_iter().map(Cow::Owned).collect(),
+            (Self::Default, None) => vec![Cow::Borrowed(default)],
+        })
+    }
+
+    /// The registry scope, or `None` to leave the scopes to the endpoint.
+    fn registry_or_endpoint_default(self) -> Option<ScopeList> {
+        match self {
+            Self::Registry => Some(ScopeList(vec![Cow::Borrowed(REGISTRY_SCOPE)])),
+            Self::Default => None,
+        }
+    }
+}
+
+/// The scopes a token is asked for.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+struct ScopeList(Vec<Cow<'static, str>>);
+
+impl ScopeList {
+    /// The scopes, separated by `separator`.
+    fn joined(&self, separator: &str) -> String {
+        self.0.join(separator)
+    }
+}
+
+/// What an IAM `generateAccessToken` call carries from the token it is
+/// made with: the token, and the project billed when the source names one.
+struct SourceAuth {
+    bearer: Secret,
+    quota_project: Option<String>,
+}
+
+impl SourceAuth {
+    /// `request` carrying this authorization.
+    fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request.bearer_auth(self.bearer.expose());
+        match &self.quota_project {
+            Some(project) => request.header(user_account::QUOTA_PROJECT_HEADER, project),
+            None => request,
+        }
+    }
 }
 
 /// Credentials that obtain access tokens.
@@ -433,22 +499,19 @@ impl Credentials {
         })
     }
 
-    /// The headers the IAM call of an impersonated service account carries
-    /// from these source credentials: the token, and the quota project of
-    /// an authorized user, as upstream forwards its source's headers.
-    async fn source_headers(
-        &self,
-        clients: &Clients,
-        clock: Clock,
-    ) -> Result<Vec<(&'static str, String)>, Error> {
+    /// What the IAM call of an impersonated service account carries from
+    /// these source credentials: a new token, and the quota project of an
+    /// authorized user, as upstream forwards its source's headers.
+    async fn source_auth(&self, clients: &Clients, clock: Clock) -> Result<SourceAuth, Error> {
         let token = self.access_token(clients, clock).await?;
-        let mut headers = vec![("authorization", format!("Bearer {}", token.token.expose()))];
-        if let Self::AuthorizedUser(user) = self
-            && let Some(project) = user.quota_project_id()
-        {
-            headers.push((user_account::QUOTA_PROJECT_HEADER, project.to_owned()));
-        }
-        Ok(headers)
+        let quota_project = match self {
+            Self::AuthorizedUser(user) => user.quota_project_id().map(str::to_owned),
+            _ => None,
+        };
+        Ok(SourceAuth {
+            bearer: token.token,
+            quota_project,
+        })
     }
 }
 
@@ -489,7 +552,7 @@ struct Setup<'a> {
 /// server: the file `GOOGLE_APPLICATION_CREDENTIALS` names, which must
 /// exist, else gcloud's well-known file if it does.
 fn find_file(host: &Host) -> Result<Option<Vec<u8>>, Error> {
-    if let Some(path) = host.env.get(CREDENTIALS_FILE) {
+    if let Some(path) = host.env.get(CREDENTIALS_VARIABLE) {
         let path = PathBuf::from(path);
         return match host.fs.read(&path) {
             Ok(contents) => Ok(Some(contents)),
@@ -520,4 +583,4 @@ fn well_known_path(env: &Env, platform: Platform) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

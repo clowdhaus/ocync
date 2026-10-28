@@ -9,6 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::super::tests::host;
 use super::*;
 use crate::aws::{AwsCredentialProviders, Platform};
+use crate::google::REGISTRY_SCOPE;
 
 /// The IAM path the tests impersonate at.
 const IAM_PATH: &str =
@@ -137,10 +138,13 @@ async fn sends_delegates_and_chooses_scopes() {
     token(&account).await.unwrap();
 
     let from_file = build(file.clone(), Scopes::Default).await.unwrap();
-    assert_eq!(from_file.scopes, ["https://www.googleapis.com/auth/other"]);
+    assert_eq!(
+        from_file.scopes.joined(" "),
+        "https://www.googleapis.com/auth/other"
+    );
     file.as_object_mut().unwrap().remove("scopes");
     let default = build(file, Scopes::Default).await.unwrap();
-    assert_eq!(default.scopes, [DEFAULT_SCOPE]);
+    assert_eq!(default.scopes.joined(" "), DEFAULT_SCOPE);
 }
 
 /// Upstream `test_generate_access_token_403`, `test_missing_expiry`,
@@ -217,17 +221,18 @@ async fn refuses_bad_files() {
 #[test]
 fn parses_the_impersonation_url() {
     let one = "https://iam/v1/projects/-/serviceAccounts/sa@p:generateAccessToken";
-    assert_eq!(
-        ImpersonationUrl::parse(one.to_owned()).unwrap(),
-        ImpersonationUrl(one.to_owned())
-    );
+    assert_eq!(parse_impersonation_url(one).unwrap().as_str(), one);
     for bad in [
         "https://iam/v1/projects/-/sa@p",
         "https://iam/serviceAccounts/a/serviceAccounts/b",
     ] {
         assert!(matches!(
-            ImpersonationUrl::parse(bad.to_owned()),
+            parse_impersonation_url(bad),
             Err(Error::ImpersonationUrl)
         ));
     }
+    assert!(matches!(
+        parse_impersonation_url("not a url/serviceAccounts/sa"),
+        Err(Error::Url { .. })
+    ));
 }

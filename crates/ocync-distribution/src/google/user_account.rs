@@ -5,9 +5,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{
-    AccessToken, Call, Clients, Error, REGISTRY_SCOPE, Scopes, Secret, expiring, send_json,
-};
+use super::{AccessToken, Call, Clients, Error, Scopes, Secret, expiring, send_json};
 use crate::aws::Clock;
 
 /// The token endpoint when the file names none.
@@ -80,10 +78,9 @@ impl AuthorizedUser {
             refresh_token: file.refresh_token,
             token_uri: file.token_uri.unwrap_or_else(|| TOKEN_URI.to_owned()),
             quota_project_id: file.quota_project_id,
-            scopes: match scopes {
-                Scopes::Registry => Some(REGISTRY_SCOPE.to_owned()),
-                Scopes::Default => None,
-            },
+            scopes: scopes
+                .registry_or_endpoint_default()
+                .map(|scopes| scopes.joined(" ")),
         })
     }
 
@@ -106,11 +103,7 @@ impl AuthorizedUser {
             scopes: self.scopes.as_deref(),
         });
         let response: RefreshResponse = send_json(Call::UserToken, request).await?;
-        Ok(expiring(
-            response.access_token,
-            clock.now(),
-            response.expires_in,
-        ))
+        expiring(response.access_token, clock.now(), response.expires_in)
     }
 }
 
@@ -122,6 +115,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::google::REGISTRY_SCOPE;
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_700_000_000)

@@ -24,7 +24,8 @@ use super::super::endpoint::{CredentialApi, Region};
 use super::super::host::Host;
 use super::super::profile::expand_home;
 use super::super::{ApiRequest, ConfigError, Failure, calendar, retry};
-use super::{credential_api, error_chain, json};
+use super::{credential_api, json};
+use crate::error::error_chain;
 
 /// How long before its expiry a token is refreshed.
 const REFRESH_BUFFER: Duration = Duration::from_secs(5 * 60);

@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use super::{
-    AccessToken, Call, Clients, CredentialType, Credentials, DEFAULT_SCOPE, Error, REGISTRY_SCOPE,
-    Scopes, Secret, Setup, send_json,
+    AccessToken, Call, Clients, CredentialType, Credentials, DEFAULT_SCOPE, Error, ScopeList,
+    Scopes, Secret, Setup, SourceAuth, send_json,
 };
 use crate::aws::{Clock, parse_rfc3339_with_offset};
 
@@ -27,28 +28,38 @@ struct ImpersonatedFile {
     scopes: Option<Vec<String>>,
 }
 
-/// An impersonation URL that names one service account, as upstream
-/// requires of an impersonated service account file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ImpersonationUrl(String);
-
-impl ImpersonationUrl {
-    /// `url`, if [`SERVICE_ACCOUNTS`] occurs in it exactly once.
-    fn parse(url: String) -> Result<Self, Error> {
-        match url.matches(SERVICE_ACCOUNTS).count() {
-            1 => Ok(Self(url)),
-            _ => Err(Error::ImpersonationUrl),
-        }
+/// The impersonation URL of an impersonated service account file, which
+/// must name one service account, as upstream requires.
+fn parse_impersonation_url(url: &str) -> Result<Url, Error> {
+    if url.matches(SERVICE_ACCOUNTS).count() != 1 {
+        return Err(Error::ImpersonationUrl);
     }
+    parse_url(IMPERSONATION_URL_FIELD, url)
+}
+
+/// The field naming the impersonation URL.
+pub(super) const IMPERSONATION_URL_FIELD: &str = "service_account_impersonation_url";
+
+/// `url`, the value of `field`.
+pub(super) fn parse_url(field: &'static str, url: &str) -> Result<Url, Error> {
+    Url::parse(url).map_err(|source| Error::Url { field, source })
 }
 
 /// A service account impersonated with source credentials.
 #[derive(Debug)]
 pub(crate) struct Impersonated {
     source: Box<Credentials>,
-    url: ImpersonationUrl,
+    url: Url,
     delegates: Option<Vec<String>>,
-    scopes: Vec<String>,
+    scopes: ScopeList,
+}
+
+/// A `generateAccessToken` call.
+pub(super) struct Generate<'a> {
+    pub(super) url: &'a Url,
+    pub(super) auth: SourceAuth,
+    pub(super) delegates: Option<&'a [String]>,
+    pub(super) scopes: &'a ScopeList,
 }
 
 /// The `generateAccessToken` request, in upstream's fields.
@@ -56,7 +67,7 @@ pub(crate) struct Impersonated {
 struct GenerateRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     delegates: Option<&'a [String]>,
-    scope: &'a [String],
+    scope: &'a ScopeList,
     lifetime: String,
 }
 
@@ -79,7 +90,7 @@ impl Impersonated {
         setup: &Setup<'_>,
     ) -> Result<Self, Error> {
         let file: ImpersonatedFile = serde_json::from_value(json).map_err(Error::Parse)?;
-        let url = ImpersonationUrl::parse(file.service_account_impersonation_url)?;
+        let url = parse_impersonation_url(&file.service_account_impersonation_url)?;
         let kind = match CredentialType::of(&file.source_credentials)? {
             CredentialType::Impersonated => return Err(Error::NestedImpersonation),
             kind => kind,
@@ -90,12 +101,7 @@ impl Impersonated {
             source: Box::new(source),
             url,
             delegates: file.delegates,
-            scopes: match scopes {
-                Scopes::Registry => vec![REGISTRY_SCOPE.to_owned()],
-                Scopes::Default => file
-                    .scopes
-                    .unwrap_or_else(|| vec![DEFAULT_SCOPE.to_owned()]),
-            },
+            scopes: scopes.resolve(file.scopes, DEFAULT_SCOPE),
         })
     }
 
@@ -105,47 +111,37 @@ impl Impersonated {
         clients: &Clients,
         clock: Clock,
     ) -> Result<AccessToken, Error> {
-        let headers = self.source.source_headers(clients, clock).await?;
-        generate_access_token(
-            clients,
-            clock,
-            &self.url.0,
-            &headers,
-            self.delegates.as_deref(),
-            &self.scopes,
-        )
-        .await
+        let auth = self.source.source_auth(clients, clock).await?;
+        let call = Generate {
+            url: &self.url,
+            auth,
+            delegates: self.delegates.as_deref(),
+            scopes: &self.scopes,
+        };
+        call.send(clients, clock).await
     }
 }
 
-/// Call `generateAccessToken` at `url` with `headers` from the source, for
-/// a token with `scopes` lasting [`LIFETIME`].
-pub(super) async fn generate_access_token(
-    clients: &Clients,
-    clock: Clock,
-    url: &str,
-    headers: &[(&'static str, String)],
-    delegates: Option<&[String]>,
-    scopes: &[String],
-) -> Result<AccessToken, Error> {
-    let mut request = clients.api.post(url).json(&GenerateRequest {
-        delegates,
-        scope: scopes,
-        lifetime: format!("{}s", LIFETIME.as_secs_f64()),
-    });
-    for (name, value) in headers {
-        request = request.header(*name, value);
+impl Generate<'_> {
+    /// A token with the call's scopes, lasting [`LIFETIME`].
+    pub(super) async fn send(self, clients: &Clients, clock: Clock) -> Result<AccessToken, Error> {
+        let request = clients.api.post(self.url.clone()).json(&GenerateRequest {
+            delegates: self.delegates,
+            scope: self.scopes,
+            lifetime: format!("{}s", LIFETIME.as_secs_f64()),
+        });
+        let request = self.auth.apply(request);
+        let response: GenerateResponse = send_json(Call::Impersonation, request).await?;
+        let expiry = parse_rfc3339_with_offset(&response.expire_time)
+            .ok_or_else(|| Error::ExpireTime(response.expire_time.clone()))?;
+        if expiry <= clock.now() {
+            return Err(Error::AlreadyExpired(response.expire_time));
+        }
+        Ok(AccessToken {
+            token: Secret(response.access_token),
+            expiry: Some(expiry),
+        })
     }
-    let response: GenerateResponse = send_json(Call::Impersonation, request).await?;
-    let expiry = parse_rfc3339_with_offset(&response.expire_time)
-        .ok_or_else(|| Error::ExpireTime(response.expire_time.clone()))?;
-    if expiry <= clock.now() {
-        return Err(Error::AlreadyExpired(response.expire_time));
-    }
-    Ok(AccessToken {
-        token: Secret(response.access_token),
-        expiry: Some(expiry),
-    })
 }
 
 #[cfg(test)]

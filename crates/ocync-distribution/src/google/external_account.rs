@@ -7,14 +7,17 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use serde_json::Value;
+use url::Url;
 
 use super::aws_source::{AwsSource, AwsSourceFile};
+use super::impersonated::{Generate, IMPERSONATION_URL_FIELD, parse_url};
 use super::{
-    AccessToken, Call, Clients, DEFAULT_SCOPE, Error, REGISTRY_SCOPE, Scopes, Secret, Setup,
-    expiring, impersonated, send_json,
+    AccessToken, Call, Clients, DEFAULT_SCOPE, Error, ScopeList, Scopes, Secret, Setup, SourceAuth,
+    expiring, send_json, send_text,
 };
 use crate::aws::{Clock, Fs};
 
@@ -130,8 +133,8 @@ enum Source {
     },
     /// A URL, fetched with `headers` on every exchange.
     Url {
-        url: String,
-        headers: Vec<(String, String)>,
+        url: Url,
+        headers: HeaderMap,
         format: Format,
     },
     /// A signed AWS `GetCallerIdentity` request.
@@ -154,45 +157,66 @@ impl Source {
                 headers,
                 format,
             } => {
-                let mut request = clients.api.get(url).timeout(SUBJECT_URL_TIMEOUT);
-                for (name, value) in headers {
-                    request = request.header(name, value);
-                }
-                let call = Call::SubjectUrl;
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|source| Error::Transport { call, source })?;
-                if !response.status().is_success() {
-                    return Err(Error::status(call, response).await);
-                }
-                let text = response
-                    .text()
-                    .await
-                    .map_err(|source| Error::Decode { call, source })?;
-                format.read(text)
+                let request = clients
+                    .api
+                    .get(url.clone())
+                    .headers(headers.clone())
+                    .timeout(SUBJECT_URL_TIMEOUT);
+                format.read(send_text(Call::SubjectUrl, request).await?)
             }
             Self::Aws(aws) => aws.subject_token(clock.now()).await,
         }
     }
 }
 
+/// The field naming the STS endpoint.
+const TOKEN_URL_FIELD: &str = "token_url";
+
+/// The field naming a URL source.
+const SUBJECT_URL_FIELD: &str = "credential_source.url";
+
+/// A URL source's `headers`, parsed once so a bad one fails at load.
+fn header_map(headers: HashMap<String, String>) -> Result<HeaderMap, Error> {
+    headers
+        .into_iter()
+        .map(|(name, value)| {
+            let parsed = HeaderName::try_from(name.as_str())
+                .ok()
+                .zip(HeaderValue::try_from(value).ok());
+            parsed.ok_or(Error::SubjectHeader(name))
+        })
+        .collect()
+}
+
 /// How long a URL source may take, as upstream's client timeout.
 const SUBJECT_URL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How the STS exchange is authenticated, as upstream decides it.
+#[derive(Debug)]
+enum StsAuth {
+    /// The file sets a client ID and secret: HTTP Basic.
+    Client { id: String, secret: Secret },
+    /// The file sets neither but names a workforce pool user project: the
+    /// `options` form field, `{"userProject": ...}`.
+    UserProject { options: String },
+    /// Nothing is sent: one of the client ID and secret, or neither and no
+    /// project.
+    Unauthenticated,
+}
 
 /// An external account.
 #[derive(Debug)]
 pub(crate) struct ExternalAccount {
     audience: String,
     subject_token_type: String,
-    token_url: String,
-    impersonation_url: Option<String>,
-    /// The client ID and secret, sent only when both are set.
-    client: Option<(String, Secret)>,
-    /// The STS `options`, `{"userProject": ...}`, sent only with no client
-    /// ID and no secret, as upstream.
-    options: Option<String>,
-    scopes: Vec<String>,
+    token_url: Url,
+    impersonation_url: Option<Url>,
+    auth: StsAuth,
+    /// The scopes of the token returned.
+    scopes: ScopeList,
+    /// The STS `scope`: the IAM scope when the STS token is exchanged
+    /// again, else [`Self::scopes`].
+    sts_scope: String,
     source: Source,
 }
 
@@ -222,51 +246,52 @@ impl ExternalAccount {
         }
         let source = match file.credential_source {
             SourceFile::Aws(aws) => Source::Aws(AwsSource::new(setup, &aws, &file.audience).await?),
-            SourceFile::Executable { .. } => return Err(Error::UnsupportedSource("executable")),
+            SourceFile::Executable { .. } => return Err(Error::ExecutableSource),
             SourceFile::Url {
                 url,
                 headers,
                 format,
-            } => {
-                let mut headers: Vec<_> = headers.unwrap_or_default().into_iter().collect();
-                headers.sort();
-                Source::Url {
-                    url,
-                    headers,
-                    format: format.into(),
-                }
-            }
+            } => Source::Url {
+                url: parse_url(SUBJECT_URL_FIELD, &url)?,
+                headers: header_map(headers.unwrap_or_default())?,
+                format: format.into(),
+            },
             SourceFile::File { file, format } => Source::File {
                 path: PathBuf::from(file),
                 format: format.into(),
                 fs: setup.host.fs.clone(),
             },
         };
-        let options = match (&file.client_id, &file.client_secret) {
-            (None, None) => file
-                .workforce_pool_user_project
-                .map(|project| serde_json::json!({ "userProject": project }).to_string()),
-            _ => None,
+        let auth = match (file.client_id, file.client_secret) {
+            (Some(id), Some(secret)) => StsAuth::Client { id, secret },
+            (None, None) => match file.workforce_pool_user_project {
+                Some(project) => StsAuth::UserProject {
+                    options: serde_json::json!({ "userProject": project }).to_string(),
+                },
+                None => StsAuth::Unauthenticated,
+            },
+            _ => StsAuth::Unauthenticated,
         };
-        let client = match (file.client_id, file.client_secret) {
-            (Some(id), Some(secret)) => Some((id, secret)),
-            _ => None,
-        };
-        let scopes = match scopes {
-            Scopes::Registry => vec![REGISTRY_SCOPE.to_owned()],
-            Scopes::Default => file
-                .scopes
-                .filter(|scopes| !scopes.is_empty())
-                .unwrap_or_else(|| vec![DEFAULT_SCOPE.to_owned()]),
+        let scopes = scopes.resolve(
+            file.scopes.filter(|scopes| !scopes.is_empty()),
+            DEFAULT_SCOPE,
+        );
+        let impersonation_url = file
+            .service_account_impersonation_url
+            .map(|url| parse_url(IMPERSONATION_URL_FIELD, &url))
+            .transpose()?;
+        let sts_scope = match impersonation_url {
+            Some(_) => IAM_SCOPE.to_owned(),
+            None => scopes.joined(" "),
         };
         Ok(Self {
             audience: file.audience,
             subject_token_type: file.subject_token_type,
-            token_url: file.token_url,
-            impersonation_url: file.service_account_impersonation_url,
-            client,
-            options,
+            token_url: parse_url(TOKEN_URL_FIELD, &file.token_url)?,
+            impersonation_url,
+            auth,
             scopes,
+            sts_scope,
             source,
         })
     }
@@ -279,37 +304,37 @@ impl ExternalAccount {
         clock: Clock,
     ) -> Result<AccessToken, Error> {
         let subject_token = self.source.subject_token(clients, clock).await?;
-        let scope = match self.impersonation_url {
-            Some(_) => IAM_SCOPE.to_owned(),
-            None => self.scopes.join(" "),
-        };
         let mut form = vec![
             ("grant_type", GRANT_TYPE),
             ("requested_token_type", ACCESS_TOKEN_TYPE),
             ("subject_token", subject_token.expose()),
             ("subject_token_type", &self.subject_token_type),
-            ("scope", &scope),
+            ("scope", &self.sts_scope),
             ("audience", &self.audience),
         ];
-        if let Some(options) = &self.options {
+        if let StsAuth::UserProject { options } = &self.auth {
             form.push(("options", options));
         }
-        let mut request = clients.api.post(&self.token_url).form(&form);
-        if let Some((id, secret)) = &self.client {
+        let mut request = clients.api.post(self.token_url.clone()).form(&form);
+        if let StsAuth::Client { id, secret } = &self.auth {
             let basic = URL_SAFE_NO_PAD.encode(format!("{id}:{}", secret.expose()));
             request = request.header("authorization", format!("Basic {basic}"));
         }
         let now = clock.now();
         let response: StsResponse = send_json(Call::StsExchange, request).await?;
         let Some(url) = &self.impersonation_url else {
-            return Ok(expiring(
-                response.access_token,
-                now,
-                Some(response.expires_in),
-            ));
+            return expiring(response.access_token, now, Some(response.expires_in));
         };
-        let headers = [("authorization", format!("Bearer {}", response.access_token))];
-        impersonated::generate_access_token(clients, clock, url, &headers, None, &self.scopes).await
+        let call = Generate {
+            url,
+            auth: SourceAuth {
+                bearer: Secret(response.access_token),
+                quota_project: None,
+            },
+            delegates: None,
+            scopes: &self.scopes,
+        };
+        call.send(clients, clock).await
     }
 }
 

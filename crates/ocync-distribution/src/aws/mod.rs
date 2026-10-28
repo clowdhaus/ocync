@@ -21,8 +21,10 @@ mod xml;
 pub(crate) use self::calendar::parse_rfc3339_with_offset;
 use self::config::{Config, ServiceId};
 use self::credentials::{Chain, Credentials};
+pub(crate) use self::credentials::{TOKEN_HEADER, TOKEN_TTL, TOKEN_TTL_HEADER};
+pub(crate) use self::host::Host;
 pub(crate) use self::host::{Clock, Env, Fs, Platform, Timeouts, credential_endpoint_client};
-use self::host::{Host, Network, Transport};
+use self::host::{Network, Transport};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -40,7 +42,8 @@ use serde::de::DeserializeOwned;
 use url::Url;
 
 use self::calendar::parse_imf_fixdate;
-use self::endpoint::{Endpoint, Region};
+use self::endpoint::Endpoint;
+pub(crate) use self::endpoint::{InvalidRegion, Region};
 use self::sigv4::encode_pairs;
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::retry::{is_transient_transport, retrying};
@@ -192,7 +195,7 @@ pub(crate) enum ConfigError {
     NoRegionInHostname(String),
     /// The configured region is not a valid host label.
     #[error(transparent)]
-    InvalidRegion(#[from] endpoint::InvalidRegion),
+    InvalidRegion(#[from] InvalidRegion),
     /// `AWS_MAX_ATTEMPTS` or `max_attempts` is not a whole number above 0.
     #[error("invalid AWS max attempts '{text}': must be a whole number of at least 1")]
     InvalidMaxAttempts {
@@ -430,7 +433,7 @@ enum Failure {
     /// causes to `source`, and this text is all a caller keeps, so it names
     /// every cause, and is not a source itself.
     /// Shared, because clients waiting on one failed load all report it.
-    #[error("failed to load AWS credentials: {}", credentials::error_chain(&**.0))]
+    #[error("failed to load AWS credentials: {}", crate::error::error_chain(&**.0))]
     Credentials(Arc<credentials::Error>),
     /// The request did not complete.
     #[error("request failed: {0}")]
@@ -619,8 +622,7 @@ impl Api {
     }
 
     /// Send `request` unsigned with `query`, as an operation that proves
-    /// identity some other way is. Only an unsigned call takes a query, as
-    /// the signer signs none.
+    /// identity some other way is.
     async fn call_unsigned(
         &self,
         request: &ApiRequest<'_>,
@@ -705,7 +707,7 @@ impl Api {
                 },
                 applied.apply(sent),
             );
-            for (name, value) in signed {
+            for (name, value) in signed.into_headers() {
                 let value = HeaderValue::try_from(value).map_err(Failure::InvalidHeader)?;
                 headers.insert(HeaderName::from_static(name), value);
             }
@@ -916,17 +918,16 @@ impl fmt::Debug for CallerIdentitySigner {
 pub(crate) struct SigningError(Failure);
 
 impl CallerIdentitySigner {
-    /// A signer for `region`, configured from the process environment and
-    /// the shared AWS files, taking the credentials from `aws_credentials`.
+    /// A signer for `region`, configured from `host`'s environment and
+    /// shared AWS files, taking the credentials from `aws_credentials`.
     pub(crate) fn new(
-        region: &str,
+        host: &Host,
+        region: Region,
         aws_credentials: &AwsCredentialProviders,
     ) -> Result<Self, ConfigError> {
-        let host = Host::current();
-        let config = Config::load(&host, None);
-        let region = Region::parse(region)?;
+        let config = Config::load(host, None);
         let retry = config.retry()?;
-        let credentials = shared_credentials(&host, config, &region, &retry, aws_credentials)?;
+        let credentials = shared_credentials(host, config, &region, &retry, aws_credentials)?;
         Ok(Self {
             credentials,
             region,
@@ -934,8 +935,8 @@ impl CallerIdentitySigner {
     }
 
     /// The region the request is signed for.
-    pub(crate) fn region(&self) -> &str {
-        self.region.as_str()
+    pub(crate) fn region(&self) -> &Region {
+        &self.region
     }
 
     /// Sign a `method` request to `url` with `headers`, which include
@@ -946,7 +947,7 @@ impl CallerIdentitySigner {
         url: &Url,
         headers: &[(&str, &str)],
         time: SystemTime,
-    ) -> Result<Vec<(&'static str, String)>, SigningError> {
+    ) -> Result<sigv4::Signed, SigningError> {
         let credentials = self.credentials.load().await.map_err(SigningError)?;
         Ok(sigv4::sign(
             &sigv4::Request {

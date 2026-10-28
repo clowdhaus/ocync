@@ -12,7 +12,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{AccessToken, DEFAULT_SCOPE, Error, REGISTRY_SCOPE, Scopes, Secret};
+use super::{AccessToken, DEFAULT_SCOPE, Error, Scopes, Secret};
 
 /// How far `iat` is set before now and `exp` after the lifetime, so a
 /// clock a little ahead of Google's is not refused.
@@ -97,11 +97,7 @@ impl ServiceAccount {
             key: parse_pkcs8_pem(file.private_key.expose()).map_err(Error::PrivateKey)?,
             client_email: file.client_email,
             private_key_id: file.private_key_id,
-            scope: match scopes {
-                Scopes::Registry => REGISTRY_SCOPE,
-                Scopes::Default => DEFAULT_SCOPE,
-            }
-            .to_owned(),
+            scope: scopes.resolve(None, DEFAULT_SCOPE).joined(" "),
         })
     }
 
