@@ -134,7 +134,7 @@ pub(crate) struct Config {
 pub(crate) struct GlobalConfig {
     /// Maximum concurrent image syncs (default: 10).
     ///
-    /// Default derived as `streaming_blob_concurrency / BLOB_CONCURRENCY = 64
+    /// Default derived as `blob_upload_concurrency / BLOB_CONCURRENCY = 64
     /// / 6`, sized so the per-target HTTP/2 stream budget is not exhausted
     /// (typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is 100-128
     /// across major container registries).
@@ -163,7 +163,7 @@ fn default_max_concurrent_transfers() -> usize {
     // Mirror the engine's DEFAULT_MAX_CONCURRENT_TRANSFERS. The previous
     // value of 50 multiplied by BLOB_CONCURRENCY=6 (= 300 streams) blew
     // past the per-connection HTTP/2 stream budget on every major
-    // registry; see DEFAULT_STREAMING_BLOB_CONCURRENCY in
+    // registry; see DEFAULT_BLOB_UPLOAD_CONCURRENCY in
     // ocync-distribution for the derivation. Keep these two in lockstep.
     ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS
 }

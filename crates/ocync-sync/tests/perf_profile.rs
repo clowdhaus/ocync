@@ -40,7 +40,7 @@
 //! - `OCYNC_PROFILE_H2_ADAPTIVE=0` disable HTTP/2 adaptive-window sizing
 //!   for A/B testing the pre-fix behavior.
 //! - `OCYNC_PROFILE_STREAM_CAP`    override per-`RegistryClient`
-//!   `streaming_blob_concurrency` (default: 64). Lower to verify the
+//!   `blob_upload_concurrency` (default: 64). Lower to verify the
 //!   per-target stream cap binds.
 
 mod helpers;
@@ -78,7 +78,7 @@ fn make_client(url: Url, accept_invalid_certs: bool) -> Arc<RegistryClient> {
         .ok()
         .and_then(|v| v.parse().ok())
     {
-        builder = builder.streaming_blob_concurrency(cap);
+        builder = builder.blob_upload_concurrency(cap);
     }
     Arc::new(builder.build().expect("RegistryClient"))
 }

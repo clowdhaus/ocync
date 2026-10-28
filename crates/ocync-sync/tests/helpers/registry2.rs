@@ -5,24 +5,28 @@
 
 use bytes::Bytes;
 use futures_util::stream;
-use ocync_distribution::sha256::Sha256;
 use ocync_distribution::spec::{MediaType, RepositoryName};
 use ocync_distribution::{Digest, RegistryClient};
 
 use super::builders::ManifestBuilder;
+use super::fixtures::blob_digest;
 
 /// The container starters `ocync-distribution`'s own `registry:2` tests use.
 #[path = "../../../ocync-distribution/tests/common/mod.rs"]
 mod common;
 
+/// `registry:2` over plain HTTP, and over TLS with a self-signed certificate.
 pub use common::{start_registry, start_registry_tls};
 
 /// What [`populate_source`] pushes: `images` images, each a config and
 /// `layers` distinct layers of `layer_bytes`.
 #[derive(Debug, Clone, Copy)]
 pub struct Corpus {
+    /// Number of images, each in its own repository.
     pub images: usize,
+    /// Distinct layers per image.
     pub layers: usize,
+    /// Size of each layer in bytes.
     pub layer_bytes: usize,
 }
 
@@ -48,7 +52,7 @@ impl Corpus {
 }
 
 async fn push_blob_stream(client: &RegistryClient, repo: &RepositoryName, data: Vec<u8>) {
-    let digest = Digest::from_sha256(Sha256::digest(&data));
+    let digest = blob_digest(&data);
     let size = data.len() as u64;
     let body = Bytes::from(data);
     let s = stream::once(async move { Ok::<_, ocync_distribution::Error>(body) });
@@ -65,15 +69,14 @@ pub async fn populate_source(client: &RegistryClient, corpus: &Corpus) -> Vec<Re
     for i in 0..corpus.images {
         let repo = RepositoryName::new(format!("test/img-{i:04}")).unwrap();
         let config_data = corpus.config(i);
+        let mut builder = ManifestBuilder::new(&config_data);
         // Streamed the way the engine pushes during a sync, so setup
         // exercises the same upload path.
-        push_blob_stream(client, &repo, config_data.clone()).await;
-
-        let mut builder = ManifestBuilder::new(&config_data);
+        push_blob_stream(client, &repo, config_data).await;
         for l in 0..corpus.layers {
             let layer = corpus.layer(i, l);
-            push_blob_stream(client, &repo, layer.clone()).await;
             builder = builder.layer(&layer);
+            push_blob_stream(client, &repo, layer).await;
         }
         let parts = builder.build();
         client

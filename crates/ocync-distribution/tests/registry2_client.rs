@@ -16,6 +16,9 @@ mod common;
 
 use std::time::Duration;
 
+use http::Version;
+use ocync_distribution::aimd::RegistryAction;
+
 use bytes::Bytes;
 use futures_util::{TryStreamExt, stream};
 use ocync_distribution::client::RegistryClientBuilder;
@@ -263,9 +266,10 @@ async fn blob_pull_roundtrip() {
 }
 
 /// A blob body being read arrives in full while bodies opened before it are
-/// left unread. Each blob is far larger than the 65,535 byte window an
-/// adaptive HTTP/2 connection starts with. Breaks if blob downloads share
-/// an HTTP/2 connection, whose receive window the unread bodies fill.
+/// left unread, with the client's adaptive HTTP/2 windows. Each blob is far
+/// larger than the 65,535 byte window an adaptive HTTP/2 connection starts
+/// with. Breaks if blob downloads share an HTTP/2 connection, whose receive
+/// window the unread bodies fill.
 #[tokio::test]
 async fn an_unread_blob_body_does_not_hold_back_another() {
     let (_container, url) = start_registry_tls().await;
@@ -280,6 +284,26 @@ async fn an_unread_blob_body_does_not_hold_back_another() {
         data[0] = blob;
         digests.push(client.blob_push(&repo, &data).await.unwrap());
     }
+    let path = format!("blobs/{}", digests[0]);
+    let head = client
+        .head(&repo, &path, None, RegistryAction::BlobHead)
+        .await
+        .unwrap();
+    assert_eq!(
+        head.version(),
+        Version::HTTP_2,
+        "other requests stay on HTTP/2"
+    );
+    let get = client
+        .get(&repo, &path, None, RegistryAction::BlobRead)
+        .await
+        .unwrap();
+    assert_eq!(
+        get.version(),
+        Version::HTTP_11,
+        "blob downloads use HTTP/1.1"
+    );
+    drop(get);
 
     let mut unread = Vec::new();
     for digest in &digests[..3] {

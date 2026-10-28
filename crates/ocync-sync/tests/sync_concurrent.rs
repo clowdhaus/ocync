@@ -2639,7 +2639,7 @@ async fn sync_within_one_registry_does_not_wait_on_its_own_download() {
     img.mount_target(&server, "dst", "v1").await;
     let client = Arc::new(
         ocync_distribution::RegistryClientBuilder::new(server.uri().parse().unwrap())
-            .streaming_blob_concurrency(1)
+            .blob_upload_concurrency(1)
             .build()
             .unwrap(),
     );
