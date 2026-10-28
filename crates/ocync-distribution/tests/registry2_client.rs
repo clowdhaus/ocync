@@ -16,11 +16,10 @@ mod common;
 
 use std::time::Duration;
 
-use http::Version;
-use ocync_distribution::aimd::RegistryAction;
-
 use bytes::Bytes;
 use futures_util::{TryStreamExt, stream};
+use http::Version;
+use ocync_distribution::aimd::RegistryAction;
 use ocync_distribution::client::RegistryClientBuilder;
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
 use ocync_distribution::{Digest, Error};

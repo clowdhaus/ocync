@@ -56,9 +56,10 @@ const DEFAULT_BLOB_UPLOAD_CONCURRENCY: usize = 64;
 
 /// Default cap on concurrent blob downloads per registry. Each is its own
 /// HTTP/1.1 connection while its body is open, so the cap bounds the
-/// connections and TLS handshakes one sync opens to a source, at the 64 the
-/// upload cap allows streams.
-const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: usize = 64;
+/// connections and TLS handshakes one sync opens to a source. Every upload
+/// reads one download, so a lower cap would hold uploads below their own
+/// cap, and a higher one would only open more bodies waiting on uploads.
+const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: usize = DEFAULT_BLOB_UPLOAD_CONCURRENCY;
 
 /// Default per-target byte budget for in-flight buffered blob bodies.
 ///
@@ -186,8 +187,9 @@ impl RegistryClientBuilder {
     /// Set the cap on concurrent blob downloads, each its own HTTP/1.1
     /// connection while its body is open.
     ///
-    /// Default: [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`] (64).
-    pub fn blob_download_concurrency(mut self, n: usize) -> Self {
+    /// Default: [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
+    #[cfg(test)]
+    pub(crate) fn blob_download_concurrency(mut self, n: usize) -> Self {
         self.blob_download_concurrency = n.max(1);
         self
     }
@@ -312,7 +314,7 @@ impl RegistryClientBuilder {
             http_builder = http_builder.http2_adaptive_window(true);
         }
         let http = http_builder.build()?;
-        let download_http = base_builder().http1_only().build()?;
+        let blob_download_http = base_builder().http1_only().build()?;
 
         let aimd = AimdController::new(
             self.url.host_str().unwrap_or("unknown"),
@@ -321,7 +323,7 @@ impl RegistryClientBuilder {
         Ok(RegistryClient {
             base_url: self.url,
             http,
-            download_http,
+            blob_download_http,
             auth: self.auth,
             aimd,
             blob_upload_sem: Arc::new(Semaphore::new(self.blob_upload_concurrency)),
@@ -346,7 +348,7 @@ pub struct RegistryClient {
     /// so bodies opened ahead of uploads still waiting on a limit can fill
     /// it and starve the bodies being read. Over HTTP/1.1 each body holds
     /// back only its own connection.
-    pub(crate) download_http: reqwest::Client,
+    pub(crate) blob_download_http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
     /// Cap on concurrent blob uploads. Acquired by
@@ -384,6 +386,15 @@ pub struct RegistryClient {
     rate_limit_remaining: AtomicU64,
 }
 
+/// Acquire a permit from one of the client's blob caps.
+async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
+    // The client never closes its semaphores.
+    Arc::clone(sem)
+        .acquire_owned()
+        .await
+        .expect("blob semaphore closed")
+}
+
 impl RegistryClient {
     /// Acquire a permit gating concurrent blob uploads.
     ///
@@ -392,34 +403,25 @@ impl RegistryClient {
     /// dropped. See [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] for the
     /// rationale.
     pub(crate) async fn acquire_blob_upload_permit(&self) -> OwnedSemaphorePermit {
-        // Sema is never closed for the lifetime of the client; unwrap is
-        // sound.
-        Arc::clone(&self.blob_upload_sem)
-            .acquire_owned()
-            .await
-            .expect("blob upload semaphore closed")
+        acquire_permit(&self.blob_upload_sem).await
     }
 
     /// Acquire a permit gating concurrent blob downloads. See
     /// [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
     pub(crate) async fn acquire_blob_download_permit(&self) -> OwnedSemaphorePermit {
-        // Never closed for the lifetime of the client.
-        Arc::clone(&self.blob_download_sem)
-            .acquire_owned()
-            .await
-            .expect("blob download semaphore closed")
+        acquire_permit(&self.blob_download_sem).await
     }
 
     /// Acquire both the per-target count permit and the byte-budget
     /// permit for a fallback (buffered) blob upload, in the right order.
     ///
-    /// Returns `(bytes_permit, stream_permit)`. Both are held by the
+    /// Returns `(bytes_permit, upload_permit)`. Both are held by the
     /// caller for the duration of the buffered upload; Rust tuples drop
     /// fields in declaration order, so `bytes_permit` is released
     /// FIRST on scope exit. Releasing the contested byte budget ahead
     /// of the count cap is the right order: a fallback that completes
     /// freeing 6 MB lets queued buffered uploads admit immediately,
-    /// while the stream-count cap (default 64) is rarely the bottleneck
+    /// while the upload cap (default 64) is rarely the bottleneck
     /// at typical workloads. See the per-cap docs on
     /// [`Self::acquire_blob_upload_permit`] and
     /// [`Self::acquire_buffered_bytes_permit`] for the semantics of
@@ -428,9 +430,9 @@ impl RegistryClient {
         &self,
         known_size: Option<u64>,
     ) -> (OwnedSemaphorePermit, OwnedSemaphorePermit) {
-        let stream_permit = self.acquire_blob_upload_permit().await;
+        let upload_permit = self.acquire_blob_upload_permit().await;
         let bytes_permit = self.acquire_buffered_bytes_permit(known_size).await;
-        (bytes_permit, stream_permit)
+        (bytes_permit, upload_permit)
     }
 
     /// Acquire a byte-budget permit for a fallback (buffered) blob upload.
@@ -594,11 +596,11 @@ impl RegistryClient {
         classify_response(resp, &self.base_url, repository).await
     }
 
-    /// The HTTP client for `op`: [`Self::download_http`] for blob downloads,
+    /// The HTTP client for `op`: [`Self::blob_download_http`] for blob downloads,
     /// [`Self::http`], the default client, for everything else.
     fn http_for(&self, op: RegistryAction) -> &reqwest::Client {
         match op {
-            RegistryAction::BlobRead => &self.download_http,
+            RegistryAction::BlobRead => &self.blob_download_http,
             RegistryAction::ManifestHead
             | RegistryAction::ManifestRead
             | RegistryAction::ManifestWrite

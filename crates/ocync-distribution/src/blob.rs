@@ -333,7 +333,7 @@ impl RegistryClient {
 
         // Bound concurrent long-lived h2 streams. The streaming PUT body
         // is the long-lived part; the POST above completes quickly.
-        let _stream_permit = self.acquire_blob_upload_permit().await;
+        let _upload_permit = self.acquire_blob_upload_permit().await;
 
         // Streaming PUT - send the blob body through a single HTTP request.
         // Uses Transfer-Encoding: chunked (no Content-Length), so the body
@@ -406,11 +406,11 @@ impl RegistryClient {
         );
         // Two complementary caps for buffered fallback uploads:
         //   1. `blob_upload_sem` bounds the *count* of in-flight
-        //      buffered uploads (also doubles as h2-stream cap).
+        //      buffered uploads, the same cap as streamed uploads.
         //   2. `buffered_blob_bytes_sem` bounds total *bytes* held
         //      across in-flight buffered uploads.
         // The helper acquires both in the right order; the returned
-        // tuple drops bytes_permit before stream_permit on scope exit.
+        // tuple drops bytes_permit before upload_permit on scope exit.
         let _permits = self.acquire_buffered_upload_permits(known_size).await;
         let body = buffer_stream(stream, known_size).await?;
         let actual_digest = self.blob_push(repository, &body).await?;
@@ -832,6 +832,11 @@ mod tests {
         assert!(
             blocked.is_err(),
             "second download must wait while the first body is open"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "second download must not be sent while the first body is open"
         );
 
         drop(first);

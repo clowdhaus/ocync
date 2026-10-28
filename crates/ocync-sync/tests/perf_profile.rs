@@ -39,9 +39,9 @@
 //!   isolate HTTP/2 multiplexing stalls from the rest of the path.
 //! - `OCYNC_PROFILE_H2_ADAPTIVE=0` disable HTTP/2 adaptive-window sizing
 //!   for A/B testing the pre-fix behavior.
-//! - `OCYNC_PROFILE_STREAM_CAP`    override per-`RegistryClient`
+//! - `OCYNC_PROFILE_UPLOAD_CAP`    override per-`RegistryClient`
 //!   `blob_upload_concurrency` (default: 64). Lower to verify the
-//!   per-target stream cap binds.
+//!   per-target upload cap binds.
 
 mod helpers;
 
@@ -74,7 +74,7 @@ fn make_client(url: Url, accept_invalid_certs: bool) -> Arc<RegistryClient> {
     if std::env::var("OCYNC_PROFILE_H2_ADAPTIVE").ok().as_deref() == Some("0") {
         builder = builder.http2_adaptive_window(false);
     }
-    if let Some(cap) = std::env::var("OCYNC_PROFILE_STREAM_CAP")
+    if let Some(cap) = std::env::var("OCYNC_PROFILE_UPLOAD_CAP")
         .ok()
         .and_then(|v| v.parse().ok())
     {

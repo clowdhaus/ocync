@@ -5,8 +5,8 @@
 
 use bytes::Bytes;
 use futures_util::stream;
+use ocync_distribution::RegistryClient;
 use ocync_distribution::spec::{MediaType, RepositoryName};
-use ocync_distribution::{Digest, RegistryClient};
 
 use super::builders::ManifestBuilder;
 use super::fixtures::blob_digest;

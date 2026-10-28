@@ -745,7 +745,7 @@ pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 10;
 ///
 /// Matches skopeo's default (6). Across images, each `RegistryClient` caps
 /// uploads (`blob_upload_sem`) and downloads (`blob_download_sem`)
-/// independently, 64 each by default.
+/// independently.
 const BLOB_CONCURRENCY: usize = 6;
 
 /// Default shutdown drain deadline in seconds.
