@@ -334,8 +334,12 @@ pub(crate) enum Error {
     #[error("invalid `quota_project_id`")]
     QuotaProject(#[source] http::header::InvalidHeaderValue),
     /// A URL subject token source names a header that is not valid.
-    #[error("invalid subject token URL header `{0}`")]
-    SubjectHeader(String),
+    #[error("invalid subject token URL header `{name}`")]
+    SubjectHeader {
+        name: String,
+        #[source]
+        source: http::Error,
+    },
     /// A URL in the credentials file does not parse.
     #[error("invalid `{field}`")]
     Url {
@@ -359,12 +363,9 @@ pub(crate) enum Error {
     /// header cannot carry.
     #[error("invalid AWS instance metadata session token")]
     AwsMetadataToken(#[source] http::header::InvalidHeaderValue),
-    /// The AWS STS URL does not parse.
-    #[error("invalid AWS STS URL")]
-    StsUrl(#[source] url::ParseError),
-    /// The AWS STS URL names no host.
-    #[error("invalid AWS STS URL: missing host")]
-    StsUrlHost,
+    /// A URL in the credentials file names no host.
+    #[error("invalid `{0}`: missing host")]
+    UrlHost(&'static str),
     /// The AWS settings for an AWS subject token are invalid.
     #[error("invalid AWS configuration for the AWS subject token")]
     AwsConfig(#[source] crate::aws::ConfigError),

@@ -30,8 +30,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -789,10 +789,7 @@ impl Provider {
 /// providers holding it must be `Send + Sync`.
 struct SharedCredentials {
     provider: Provider,
-    cache: CredentialCache<Credentials>,
-    /// When the last load failed, and why. The lock is never held across an
-    /// `.await`.
-    failed: Mutex<Option<(tokio::time::Instant, Arc<credentials::Error>)>>,
+    cache: CredentialCache<Credentials, Arc<credentials::Error>>,
 }
 
 impl SharedCredentials {
@@ -800,7 +797,6 @@ impl SharedCredentials {
         Self {
             provider,
             cache: CredentialCache::new(),
-            failed: Mutex::new(None),
         }
     }
 
@@ -810,24 +806,13 @@ impl SharedCredentials {
     /// rather than running the chain again, so a hung source costs one bound,
     /// not one per waiting client.
     async fn load(&self) -> Result<Credentials, Failure> {
-        let asked = tokio::time::Instant::now();
         self.cache
-            .get_or_refresh(async {
-                if let Some((at, error)) = &*self.failed.lock().expect("no panic while held")
-                    && *at > asked
-                {
-                    return Err(Arc::clone(error));
-                }
+            .get_or_refresh_shared(async {
                 let loaded = tokio::time::timeout(CREDENTIALS_LOAD_TIMEOUT, self.provider.load())
                     .await
                     .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))
                     .and_then(|loaded| loaded)
-                    .map_err(|error| {
-                        let error = Arc::new(error);
-                        *self.failed.lock().expect("no panic while held") =
-                            Some((tokio::time::Instant::now(), Arc::clone(&error)));
-                        error
-                    })?;
+                    .map_err(Arc::new)?;
                 let ttl = loaded.expiry().map_or(DEFAULT_EXPIRATION, remaining);
                 Ok((loaded, ttl))
             })

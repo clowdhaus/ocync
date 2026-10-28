@@ -548,7 +548,7 @@ fn refuses_a_bad_url_source_header() {
     for (name, value) in [("bad name", "v"), ("ok", "bad\nvalue")] {
         let error = header_map(HashMap::from([(name.to_owned(), value.to_owned())])).unwrap_err();
         assert!(
-            matches!(&error, Error::SubjectHeader(found) if found == name),
+            matches!(&error, Error::SubjectHeader { name: found, .. } if found == name),
             "{error}"
         );
     }

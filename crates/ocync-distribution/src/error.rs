@@ -64,11 +64,24 @@ pub enum Error {
         reason: String,
     },
 
-    /// A registry's token endpoint refused the credentials sent to it with
-    /// 401 Unauthorized, as opposed to refusing the scope asked for.
+    /// Google's credentials yielded no token for the registry.
+    #[error("authentication failed for registry '{registry}': {reason}")]
+    GoogleCredentials {
+        /// The registry the token was for.
+        registry: String,
+        /// Why no token was had, with its causes.
+        reason: String,
+        /// Whether asking again may succeed.
+        transience: Transience,
+    },
+
+    /// A registry's token endpoint answered with an error status. 401
+    /// Unauthorized refuses the credentials sent; other statuses refuse the
+    /// scope asked for or fail on the endpoint's side. Not a registry answer,
+    /// so [`Self::status_code`] leaves it out.
     #[error("authentication failed for registry '{registry}': token endpoint returned {status}")]
-    TokenRefused {
-        /// The registry whose token endpoint refused the credentials.
+    TokenEndpoint {
+        /// The registry whose token endpoint answered.
         registry: String,
         /// The status it answered.
         status: http::StatusCode,
@@ -175,6 +188,15 @@ pub enum Error {
     },
 }
 
+/// Whether a failure may pass if the same request is sent again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transience {
+    /// It may pass, as a server error, a throttle or a timeout can.
+    Transient,
+    /// It fails again, as refused credentials do.
+    Final,
+}
+
 impl Error {
     /// An [`Error::AuthFailed`] for `registry`, with `reason` as its text.
     pub(crate) fn auth_failed(registry: &str, reason: impl std::fmt::Display) -> Self {
@@ -199,11 +221,18 @@ impl Error {
 
     /// Whether this error represents an authentication or authorization failure.
     ///
-    /// Returns `true` for [`AuthFailed`](Self::AuthFailed) errors and registry
-    /// responses with HTTP 401 Unauthorized or 403 Forbidden status codes.
+    /// Returns `true` for [`AuthFailed`](Self::AuthFailed) and
+    /// [`TokenEndpoint`](Self::TokenEndpoint) errors, Google credentials that
+    /// fail for good, and registry responses with HTTP 401 Unauthorized or
+    /// 403 Forbidden status codes.
     pub fn is_auth_error(&self) -> bool {
         match self {
-            Self::AuthFailed { .. } | Self::TokenRefused { .. } => true,
+            Self::AuthFailed { .. }
+            | Self::TokenEndpoint { .. }
+            | Self::GoogleCredentials {
+                transience: Transience::Final,
+                ..
+            } => true,
             Self::RegistryError { status, .. } => {
                 *status == http::StatusCode::UNAUTHORIZED || *status == http::StatusCode::FORBIDDEN
             }
@@ -423,8 +452,8 @@ mod tests {
     }
 
     #[test]
-    fn is_auth_error_token_refused() {
-        let err = Error::TokenRefused {
+    fn is_auth_error_token_endpoint() {
+        let err = Error::TokenEndpoint {
             registry: "example.com".into(),
             status: http::StatusCode::UNAUTHORIZED,
         };

@@ -459,19 +459,12 @@ pub(crate) async fn exchange(
         });
     }
 
-    if resp.status() == StatusCode::UNAUTHORIZED {
-        tracing::warn!(base_url, "token endpoint refused the credentials");
-        return Err(Error::TokenRefused {
-            registry: base_url.to_owned(),
-            status: StatusCode::UNAUTHORIZED,
-        });
-    }
-    if resp.status().is_client_error() || resp.status().is_server_error() {
-        let status = resp.status();
+    let status = resp.status();
+    if status.is_client_error() || status.is_server_error() {
         tracing::warn!(base_url, %status, "token endpoint returned error");
-        return Err(Error::AuthFailed {
+        return Err(Error::TokenEndpoint {
             registry: base_url.to_owned(),
-            reason: format!("token endpoint returned {status}"),
+            status,
         });
     }
     let token_resp = resp.json::<TokenResponse>().await?;
@@ -930,11 +923,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Error::AuthFailed { .. }),
-            "expected AuthFailed, got: {err:?}"
+            matches!(
+                err,
+                Error::TokenEndpoint {
+                    status: StatusCode::FORBIDDEN,
+                    ..
+                }
+            ),
+            "expected a 403 from the token endpoint, got: {err:?}"
         );
-        let msg = err.to_string();
-        assert!(msg.contains("403"), "expected 403 in error: {msg}");
+        assert_eq!(err.status_code(), None, "not a registry answer");
     }
 
     #[tokio::test]

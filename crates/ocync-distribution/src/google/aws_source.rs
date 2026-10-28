@@ -21,6 +21,9 @@ const REGION_URL_FIELD: &str = "region_url";
 /// The field naming the URL an `IMDSv2` session token is asked of.
 const IMDSV2_TOKEN_URL_FIELD: &str = "imdsv2_session_token_url";
 
+/// The field naming the STS URL the subject token is signed for.
+const VERIFICATION_URL_FIELD: &str = "regional_cred_verification_url";
+
 /// The STS URL when the file names none. `{region}` is replaced.
 const DEFAULT_VERIFICATION_URL: &str =
     "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15";
@@ -98,7 +101,7 @@ impl Source {
     ) -> Result<Self, Error> {
         let url = sts_url(verification_url, signer.region())?;
         if !url.has_host() {
-            return Err(Error::StsUrlHost);
+            return Err(Error::UrlHost(VERIFICATION_URL_FIELD));
         }
         Ok(Self {
             url,
@@ -215,7 +218,10 @@ fn sts_url(template: Option<&str>, region: &Region) -> Result<Url, Error> {
     } else {
         format!("https://{url}")
     };
-    Url::parse(&url).map_err(Error::StsUrl)
+    Url::parse(&url).map_err(|source| Error::Url {
+        field: VERIFICATION_URL_FIELD,
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -273,7 +279,10 @@ mod tests {
             Some("httpx:/sts"),
             "audience",
         );
-        assert!(matches!(no_host, Err(Error::StsUrlHost)));
+        assert!(matches!(
+            no_host,
+            Err(Error::UrlHost(VERIFICATION_URL_FIELD))
+        ));
     }
 
     fn file(region_url: Option<String>, imdsv2_url: Option<String>) -> SourceFile {

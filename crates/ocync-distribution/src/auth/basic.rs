@@ -279,7 +279,9 @@ mod tests {
             test_credentials(),
         );
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
-        assert!(matches!(err, Error::AuthFailed { .. }));
+        assert!(
+            matches!(err, Error::TokenEndpoint { status, .. } if status == http::StatusCode::FORBIDDEN)
+        );
     }
 
     #[tokio::test]
@@ -539,7 +541,9 @@ mod tests {
                 .await
                 .expect("task did not panic")
                 .expect_err("concurrent waiters must each surface the auth error");
-            assert!(matches!(err, Error::AuthFailed { .. }));
+            assert!(
+                matches!(err, Error::TokenEndpoint { status, .. } if status == http::StatusCode::FORBIDDEN)
+            );
         }
     }
 

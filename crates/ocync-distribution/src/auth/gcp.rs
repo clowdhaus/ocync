@@ -28,7 +28,7 @@ use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
-use crate::error::{Error, error_chain};
+use crate::error::{Error, Transience, error_chain};
 use crate::google::{self, AccessToken, Expiry};
 
 /// Username for GCP `OAuth2` token exchange.
@@ -87,7 +87,7 @@ impl DefaultCredentials {
 /// to expire or a registry's token exchange refuses it with 401.
 struct SharedToken {
     source: Box<dyn GcpTokenSource>,
-    token: CredentialCache<AccessToken>,
+    token: CredentialCache<AccessToken, Arc<google::Error>>,
 }
 
 impl fmt::Debug for SharedToken {
@@ -106,12 +106,13 @@ impl SharedToken {
         }
     }
 
-    /// The kept token, or a new one.
-    async fn get(&self) -> Result<AccessToken, google::Error> {
+    /// The kept token, or a new one. Providers waiting on a fetch that
+    /// failed get its error rather than each asking again.
+    async fn get(&self) -> Result<AccessToken, Arc<google::Error>> {
         self.token
-            .get_or_refresh(async {
+            .get_or_refresh_shared(async {
                 tracing::debug!("GCP OAuth2 token expired or missing, refreshing");
-                let token = self.source.access_token().await?;
+                let token = self.source.access_token().await.map_err(Arc::new)?;
                 match token.expiry {
                     Expiry::At(expiry) => tracing::debug!(
                         ttl_secs = remaining(expiry).as_secs(),
@@ -129,6 +130,19 @@ impl SharedToken {
     /// does not discard a token another has fetched since.
     async fn refuse(&self, refused: &google::Secret) {
         self.token.clear_if(|kept| kept.token == *refused).await;
+    }
+}
+
+/// The error for `registry` when Google's credentials failed at `stage`.
+fn credentials_failed(registry: &str, stage: &str, error: &google::Error) -> Error {
+    Error::GoogleCredentials {
+        registry: registry.to_owned(),
+        reason: format!("{stage}: {}", error_chain(error)),
+        transience: if error.is_transient() {
+            Transience::Transient
+        } else {
+            Transience::Final
+        },
     }
 }
 
@@ -246,12 +260,7 @@ impl GcpAuth {
         let google_token = gcp_credentials
             .token(host, aws_credentials)
             .await
-            .map_err(|e| {
-                Error::auth_failed(
-                    &hostname,
-                    format!("GCP credential setup failed: {}", error_chain(&*e)),
-                )
-            })?;
+            .map_err(|e| credentials_failed(&hostname, "GCP credential setup failed", &e))?;
         Ok(Self::with_token(
             registry_origin(registry),
             hostname,
@@ -316,10 +325,7 @@ impl GcpAuth {
     async fn google_token(&self) -> Result<google::Secret, Error> {
         let token = self.google_token.get().await.map_err(|e| {
             tracing::warn!(error = %e, "GCP access token request failed");
-            Error::auth_failed(
-                &self.hostname,
-                format!("GCP access token request failed: {}", error_chain(&e)),
-            )
+            credentials_failed(&self.hostname, "GCP access token request failed", &e)
         })?;
         Ok(token.token)
     }
@@ -346,7 +352,10 @@ impl AuthProvider for GcpAuth {
                         // revoked or Google's clock has passed it: one more
                         // try with a fresh one. Any other failure, such as a
                         // scope the identity cannot reach, keeps it.
-                        Err(Error::TokenRefused { .. }) => {
+                        Err(Error::TokenEndpoint {
+                            status: http::StatusCode::UNAUTHORIZED,
+                            ..
+                        }) => {
                             self.google_token.refuse(&google_token).await;
                             let fresh = self.google_token().await?;
                             self.exchange(&scopes, &fresh).await
@@ -387,6 +396,25 @@ mod tests {
     use wiremock::{Mock, ResponseTemplate};
 
     use super::*;
+
+    /// A Google failure that may pass is not an auth error, and one that
+    /// fails again is. Breaks if every Google failure exits as refused
+    /// credentials, or a refusal stops counting as one.
+    #[test]
+    fn only_a_final_google_failure_is_an_auth_error() {
+        for (status, auth_error) in [
+            (http::StatusCode::SERVICE_UNAVAILABLE, false),
+            (http::StatusCode::UNAUTHORIZED, true),
+        ] {
+            let failure = google::Error::Status {
+                call: google::Call::Metadata,
+                status,
+                body: String::new(),
+            };
+            let error = credentials_failed("gcr.io", "GCP access token request failed", &failure);
+            assert_eq!(error.is_auth_error(), auth_error, "{status}");
+        }
+    }
 
     /// How long the mock's tokens last unless a test says otherwise.
     const HOUR: Option<Duration> = Some(Duration::from_secs(3600));

@@ -52,8 +52,8 @@ pub(crate) enum KeyError {
     #[error("the PEM body is not base64")]
     Base64(#[source] base64::DecodeError),
     /// The key is not an RSA key `aws-lc-rs` accepts.
-    #[error("the key was rejected: {0}")]
-    Rejected(aws_lc_rs::error::KeyRejected),
+    #[error("the key was rejected")]
+    Rejected(#[source] aws_lc_rs::error::KeyRejected),
 }
 
 /// A service account and the key it signs with.

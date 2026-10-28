@@ -265,9 +265,10 @@ fn header_map(headers: HashMap<String, String>) -> Result<HeaderMap, Error> {
         .into_iter()
         .map(|(name, value)| {
             let parsed = HeaderName::try_from(name.as_str())
-                .ok()
-                .zip(HeaderValue::try_from(value).ok());
-            let (name, mut value) = parsed.ok_or(Error::SubjectHeader(name))?;
+                .map_err(http::Error::from)
+                .and_then(|parsed| Ok((parsed, HeaderValue::try_from(value)?)));
+            let (name, mut value) =
+                parsed.map_err(|source| Error::SubjectHeader { name, source })?;
             value.set_sensitive(true);
             Ok((name, value))
         })

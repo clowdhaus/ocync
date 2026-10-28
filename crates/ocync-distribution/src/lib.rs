@@ -121,7 +121,7 @@ pub use blob::MountResult;
 pub use client::{RegistryClient, RegistryClientBuilder};
 pub use digest::Digest;
 pub use ecr::{BatchBlobChecker, BlobExistence};
-pub use error::Error;
+pub use error::{Error, Transience};
 pub use manifest::{ManifestHead, ManifestPull};
 pub use reference::Reference;
 pub use spec::{
