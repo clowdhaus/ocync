@@ -158,15 +158,27 @@ impl Format {
     }
 }
 
+/// The EC2 instance metadata service's IPv6 address, which is unique-local
+/// rather than link-local.
+const EC2_METADATA_IPV6: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
+
+/// Host names that only ever name this host or its metadata service.
+const LOCAL_DOMAINS: [&str; 2] = ["localhost", "metadata.google.internal"];
+
 /// The client that fetches a URL source: the metadata client, with no
-/// proxy, for a link-local or loopback address such as Azure's instance
-/// metadata service, so its token never reaches a proxy host; else the API
-/// client, through the proxy.
+/// proxy, for this host or a metadata service, such as Azure's at a
+/// link-local address, so its token never reaches a proxy host; else the
+/// API client, through the proxy.
 fn url_client<'a>(clients: &'a Clients, url: &Url) -> &'a reqwest::Client {
     let local = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_link_local() || ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_unicast_link_local() || ip.is_loopback(),
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_unicast_link_local() || ip.is_loopback() || ip == EC2_METADATA_IPV6
+        }
+        Some(url::Host::Domain(domain)) => LOCAL_DOMAINS
+            .iter()
+            .any(|local| domain.trim_end_matches('.').eq_ignore_ascii_case(local)),
         None => false,
     };
     if local {

@@ -38,9 +38,6 @@ use crate::retry::{Bounded, retrying};
 /// auth, with the `OAuth2` access token as the password.
 const GCP_USERNAME: &str = "oauth2accesstoken";
 
-/// Why a token source gave no token.
-type SourceError = Box<dyn std::error::Error + Send + Sync>;
-
 /// Abstraction over GCP token acquisition for testability.
 ///
 /// The real implementation resolves Application Default Credentials. Tests
@@ -49,7 +46,7 @@ pub(crate) trait GcpTokenSource: Send + Sync + fmt::Debug {
     /// Obtain an `OAuth2` access token and its expiry.
     fn access_token(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<AccessToken, SourceError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<AccessToken, google::Error>> + Send + '_>>;
 }
 
 /// The Google credentials one run's GAR and GCR providers share, so the
@@ -88,7 +85,7 @@ impl GcpCredentials {
 }
 
 /// A token source and the token it last returned, kept until it is about
-/// to expire.
+/// to expire or a registry's token exchange refuses it.
 struct SharedToken {
     source: Box<dyn GcpTokenSource>,
     token: CredentialCache<AccessToken>,
@@ -111,7 +108,7 @@ impl SharedToken {
     }
 
     /// The kept token, or a new one.
-    async fn get(&self) -> Result<AccessToken, SourceError> {
+    async fn get(&self) -> Result<AccessToken, google::Error> {
         self.token
             .get_or_refresh(async {
                 tracing::debug!("GCP OAuth2 token expired or missing, refreshing");
@@ -128,11 +125,17 @@ impl SharedToken {
             })
             .await
     }
+
+    /// Drop the kept token if it is `refused`, so one registry's refusal
+    /// does not discard a token another has fetched since.
+    async fn refuse(&self, refused: &google::Secret) {
+        self.token.clear_if(|kept| kept.token == *refused).await;
+    }
 }
 
-/// How long `token` is kept. A token with no expiry is kept for the run, as
-/// upstream never refreshes one: the cache holds a lifetime past what the
-/// clock can hold as never expiring.
+/// How long `token` is kept. A token with no expiry is kept until a token
+/// exchange refuses it, as upstream never refreshes one: the cache holds a
+/// lifetime past what the clock can hold as never expiring.
 fn lifetime(token: &AccessToken) -> Duration {
     token.expiry.map_or(Duration::MAX, remaining)
 }
@@ -162,7 +165,7 @@ impl AdcTokenSource {
 impl GcpTokenSource for AdcTokenSource {
     fn access_token(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<AccessToken, SourceError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<AccessToken, google::Error>> + Send + '_>> {
         Box::pin(async move {
             // The prepare phase reaches this before the engine's retry
             // exists, so a transient failure is sent again here.
@@ -172,7 +175,6 @@ impl GcpTokenSource for AdcTokenSource {
                 |_| self.credentials.access_token(&self.clients, Clock::System),
             )
             .await
-            .map_err(SourceError::from)
         })
     }
 }
@@ -295,19 +297,16 @@ impl GcpAuth {
         )
     }
 
-    /// The Basic credentials of the current Google token.
-    async fn ensure_credentials(&self) -> Result<Credentials, Error> {
+    /// The current Google token.
+    async fn google_token(&self) -> Result<google::Secret, Error> {
         let token = self.google_token.get().await.map_err(|e| {
             tracing::warn!(error = %e, "GCP access token request failed");
             Error::auth_failed(
                 &self.hostname,
-                format!("GCP access token request failed: {}", error_chain(&*e)),
+                format!("GCP access token request failed: {}", error_chain(&e)),
             )
         })?;
-        Ok(Credentials::Basic {
-            username: GCP_USERNAME.to_owned(),
-            password: token.token.expose().to_owned(),
-        })
+        Ok(token.token)
     }
 }
 
@@ -325,22 +324,32 @@ impl AuthProvider for GcpAuth {
             let key = scopes_cache_key(&scopes);
             self.tokens
                 .get_or_fetch(key.clone(), || async {
-                    // Ensure GCP credentials are fresh before token exchange.
-                    let credentials = self.ensure_credentials().await?;
+                    let google_token = self.google_token().await?;
+                    let credentials = Credentials::Basic {
+                        username: GCP_USERNAME.to_owned(),
+                        password: google_token.expose().to_owned(),
+                    };
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
                     let cached_challenge = self.challenge_cache.get().await;
-                    let (token, challenge) = token_exchange::exchange(
+                    let exchanged = token_exchange::exchange(
                         &self.http,
                         &self.base_url,
                         &scopes,
                         Some(&credentials),
                         cached_challenge.as_ref(),
                     )
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                        e
-                    })?;
+                    .await;
+                    let (token, challenge) = match exchanged {
+                        Ok(exchanged) => exchanged,
+                        Err(e) => {
+                            tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                            // The exchange is the one request the Google
+                            // token authenticates, so a refusal may be of it,
+                            // as when it was revoked or the clocks disagree.
+                            self.google_token.refuse(&google_token).await;
+                            return Err(e);
+                        }
+                    };
                     self.challenge_cache.set(challenge).await;
                     Ok(token)
                 })
@@ -353,9 +362,9 @@ impl AuthProvider for GcpAuth {
             let entries = self.tokens.len().await;
             tracing::debug!(base_url = %self.base_url, entries, "invalidating GCP token cache");
             self.tokens.clear().await;
-            // The Google token stays: a refusal is of the registry's token,
-            // and the kept Google token exchanges for a new one without a
-            // request to Google.
+            // The Google token stays: a refusal here is of the registry's
+            // token, and the kept Google token exchanges for a new one
+            // without a request to Google. A refused exchange drops it.
             self.challenge_cache.clear().await;
         })
     }
@@ -402,14 +411,18 @@ mod tests {
     impl GcpTokenSource for MockGcpTokenSource {
         fn access_token(
             &self,
-        ) -> Pin<Box<dyn Future<Output = Result<AccessToken, SourceError>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<AccessToken, google::Error>> + Send + '_>> {
             Box::pin(async move {
-                let (token, lasts) = self
-                    .tokens
-                    .lock()
-                    .await
-                    .pop_front()
-                    .ok_or("mock: no more tokens")?;
+                let (token, lasts) =
+                    self.tokens
+                        .lock()
+                        .await
+                        .pop_front()
+                        .ok_or_else(|| google::Error::Status {
+                            call: google::Call::Metadata,
+                            status: http::StatusCode::UNAUTHORIZED,
+                            body: "mock: no more tokens".to_owned(),
+                        })?;
                 Ok(AccessToken {
                     token: token.into(),
                     expiry: lasts.map(|lasts| std::time::SystemTime::now() + lasts),
@@ -420,8 +433,7 @@ mod tests {
 
     /// The password of the credentials `auth` holds now.
     async fn password(auth: &GcpAuth) -> String {
-        let Credentials::Basic { password, .. } = auth.ensure_credentials().await.unwrap();
-        password
+        auth.google_token().await.unwrap().expose().to_owned()
     }
 
     fn mount_v2_and_token(server: &MockServer, token_value: &str) -> Vec<Mock> {
@@ -452,20 +464,73 @@ mod tests {
         assert_eq!(auth.name(), "gcp");
     }
 
+    /// The exchange sends the Google token as the `oauth2accesstoken`
+    /// user's Basic password. Breaks if the user name or password changes.
     #[tokio::test]
-    async fn credentials_use_oauth2accesstoken_username() {
+    async fn exchanges_as_oauth2accesstoken() {
+        let server = MockServer::start().await;
+        mount_v2_and_token(&server, "registry")
+            .remove(0)
+            .mount(&server)
+            .await;
+        // base64 of `oauth2accesstoken:ya29.test-token`.
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(header(
+                "authorization",
+                "Basic b2F1dGgyYWNjZXNzdG9rZW46eWEyOS50ZXN0LXRva2Vu",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "registry", "expires_in": 300})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let auth = GcpAuth::with_api(
-            "https://us-docker.pkg.dev",
+            server.uri(),
             crate::test_http_client(),
             MockGcpTokenSource::succeeding("ya29.test-token"),
         );
-        let creds = auth.ensure_credentials().await.unwrap();
-        match creds {
-            Credentials::Basic { username, password } => {
-                assert_eq!(username, GCP_USERNAME);
-                assert_eq!(password, "ya29.test-token");
-            }
-        }
+
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+    }
+
+    /// A refused token exchange drops the Google token, so the next try
+    /// fetches another, as one revoked or past Google's clock would never
+    /// exchange again. Breaks if the refused token is used again.
+    #[tokio::test]
+    async fn a_refused_exchange_drops_the_google_token() {
+        let server = MockServer::start().await;
+        mount_v2_and_token(&server, "registry")
+            .remove(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "registry", "expires_in": 300})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth = GcpAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            MockGcpTokenSource::with_tokens(vec![("ya29.revoked", None), ("ya29.fresh", None)]),
+        );
+
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
+        assert_eq!(password(&auth).await, "ya29.fresh");
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }
 
     #[tokio::test]
@@ -585,7 +650,7 @@ mod tests {
             )
             .await;
 
-            let credentials = auth.ensure_credentials().await;
+            let credentials = auth.google_token().await;
 
             assert_eq!(credentials.is_ok(), succeeds, "{first}: {credentials:?}");
         }

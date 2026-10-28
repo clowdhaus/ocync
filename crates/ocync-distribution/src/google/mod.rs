@@ -27,7 +27,7 @@ use url::Url;
 
 use crate::REDACTED;
 use crate::aws::{AwsCredentialProviders, Clock, Env, Host, Platform};
-use crate::error::truncate_quoted;
+use crate::error::{MAX_QUOTED_BYTES, truncate_quoted};
 
 /// The scope every registry token is asked for: push and pull on Artifact
 /// Registry and Container Registry.
@@ -299,15 +299,18 @@ pub(crate) enum Error {
     /// The AWS subject token was not signed.
     #[error("failed to sign the AWS subject token")]
     AwsSigning(#[source] crate::aws::SigningError),
+    /// An answer was longer than any token response.
+    #[error("{call}, answer over {MAX_BODY} bytes")]
+    BodyTooLarge { call: Call },
 }
 
 impl Error {
     /// Whether the call may succeed if sent again, as upstream classifies
     /// it: a 5xx, 408 or 429 answer, or a transport failure the crate
-    /// retries. An answer that is not the JSON expected is final. A
-    /// metadata server that does not connect is final too: a host with no
-    /// metadata server never gets one. One that connects and then times
-    /// out or resets, as GKE's can while it mints a token, may be sent again.
+    /// retries. An answer that is not the JSON expected is final. A GCE or
+    /// EC2 metadata service that does not connect is final too: a host with
+    /// none never gets one. One that connects and then times out or resets,
+    /// as GKE's can while it mints a token, may be sent again.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
             Self::Status { status, .. } => {
@@ -316,21 +319,28 @@ impl Error {
                     || *status == http::StatusCode::TOO_MANY_REQUESTS
             }
             Self::Transport { call, source } => {
-                !(*call == Call::Metadata && source.is_connect())
+                !(matches!(call, Call::Metadata | Call::AwsRegion) && source.is_connect())
                     && crate::retry::is_transient_transport(source)
             }
             _ => false,
         }
     }
 
-    /// An error for an answer whose status is not a success.
-    async fn status(call: Call, response: reqwest::Response) -> Self {
+    /// An error for an answer whose status is not a success, its body read
+    /// no further than is quoted.
+    async fn status(call: Call, mut response: reqwest::Response) -> Self {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let mut body = Vec::new();
+        while body.len() <= MAX_QUOTED_BYTES {
+            match response.chunk().await {
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                Ok(None) | Err(_) => break,
+            }
+        }
         Self::Status {
             call,
             status,
-            body: truncate_quoted(&body).to_owned(),
+            body: truncate_quoted(&String::from_utf8_lossy(&body)).to_owned(),
         }
     }
 }
@@ -341,11 +351,18 @@ async fn send(call: Call, request: reqwest::RequestBuilder) -> Result<bytes::Byt
         call,
         source: source.without_url(),
     };
-    let response = request.send().await.map_err(transport)?;
+    let mut response = request.send().await.map_err(transport)?;
     if !response.status().is_success() {
         return Err(Error::status(call, response).await);
     }
-    response.bytes().await.map_err(transport)
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport)? {
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(Error::BodyTooLarge { call });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.into())
 }
 
 /// Send `request` for `call` and decode its JSON answer.
@@ -547,6 +564,11 @@ impl CredentialType {
         }
     }
 }
+
+/// The most of an answer read: well past any token, JWT or zone a Google
+/// or metadata endpoint returns, and short of a body that would exhaust
+/// memory.
+const MAX_BODY: usize = 1024 * 1024;
 
 /// `url`, the value of `field`.
 fn parse_url(field: &'static str, url: &str) -> Result<Url, Error> {

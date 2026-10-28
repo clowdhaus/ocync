@@ -506,6 +506,8 @@ fn fetches_a_local_url_source_without_the_proxy() {
         ("http://[fe80::1]/token", true),
         ("http://127.0.0.1:8080/token", true),
         ("http://localhost:8080/token", true),
+        ("http://[fd00:ec2::254]/latest/api/token", true),
+        ("http://metadata.google.internal/token", true),
         ("https://sts.example.com/token", false),
         ("http://169.254.169.254.example.com/token", false),
     ] {

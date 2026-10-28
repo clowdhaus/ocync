@@ -14,12 +14,10 @@ use url::Url;
 
 use super::{Call, Error, Secret, Setup, send_text};
 use crate::aws::{
-    CallerIdentitySigner, Env, InvalidRegion, Region, TOKEN_HEADER, TOKEN_TTL, TOKEN_TTL_HEADER,
+    CallerIdentitySigner, InvalidRegion, Region, TOKEN_HEADER, TOKEN_TTL, TOKEN_TTL_HEADER,
+    configured_region,
 };
 use crate::retry::{Bounded, retrying};
-
-/// The variables naming the region, in upstream's order.
-const REGION_VARIABLES: [&str; 2] = ["AWS_REGION", "AWS_DEFAULT_REGION"];
 
 /// The STS URL when the file names none. `{region}` is replaced.
 const DEFAULT_VERIFICATION_URL: &str =
@@ -78,7 +76,7 @@ impl Source {
         file: &SourceFile,
         audience: &str,
     ) -> Result<Self, Error> {
-        let region = match region_from_env(&setup.host.env) {
+        let region = match configured_region(setup.host) {
             Some(region) => region,
             None => region_from_metadata(setup, file).await?,
         }
@@ -99,7 +97,7 @@ impl Source {
     ) -> Result<Self, Error> {
         let url = sts_url(verification_url, signer.region())?;
         Ok(Self {
-            host: url.host_str().ok_or(Error::StsUrlHost)?.to_owned(),
+            host: signed_host(&url)?,
             url,
             signer,
             audience: audience.to_owned(),
@@ -139,12 +137,14 @@ impl Source {
     }
 }
 
-/// The region the environment names, if it names one.
-fn region_from_env(env: &Env) -> Option<Result<Region, InvalidRegion>> {
-    REGION_VARIABLES
-        .iter()
-        .find_map(|name| env.get(name))
-        .map(|region| Region::parse(&region))
+/// The `host` header `url` is signed with: its host, and its port when it
+/// is not the scheme's, as the request carries it.
+fn signed_host(url: &Url) -> Result<String, Error> {
+    let host = url.host_str().ok_or(Error::StsUrlHost)?;
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
 }
 
 /// The region of the availability zone `file`'s `region_url` answers, with
@@ -222,7 +222,6 @@ fn sts_url(template: Option<&str>, region: &Region) -> Result<Url, Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
@@ -274,26 +273,38 @@ mod tests {
     }
 
     /// Upstream `test_resolve_region_env`: `AWS_REGION` before
-    /// `AWS_DEFAULT_REGION`. Breaks if the order flips.
+    /// `AWS_DEFAULT_REGION`, then, past upstream, the selected profile's
+    /// `region`, so a profile's credentials sign in their own region.
+    /// Breaks if the order flips or the profile is not read.
     #[test]
-    fn reads_the_region_from_the_environment() {
-        let both = Env::Fixed(HashMap::from([
-            ("AWS_REGION".to_owned(), "us-west-2".to_owned()),
-            ("AWS_DEFAULT_REGION".to_owned(), "us-east-1".to_owned()),
-        ]));
-        assert_eq!(
-            region_from_env(&both).unwrap().unwrap(),
-            region("us-west-2")
-        );
-        let default = Env::Fixed(HashMap::from([(
-            "AWS_DEFAULT_REGION".to_owned(),
-            "us-east-1".to_owned(),
-        )]));
-        assert_eq!(
-            region_from_env(&default).unwrap().unwrap(),
-            region("us-east-1")
-        );
-        assert!(region_from_env(&Env::Fixed(HashMap::new())).is_none());
+    fn reads_the_configured_region() {
+        let config = b"[default]\nregion = eu-west-1\n".to_vec();
+        for (vars, expected) in [
+            (
+                &[
+                    ("AWS_REGION", "us-west-2"),
+                    ("AWS_DEFAULT_REGION", "us-east-1"),
+                ][..],
+                Some("us-west-2"),
+            ),
+            (
+                &[("AWS_DEFAULT_REGION", "us-east-1")][..],
+                Some("us-east-1"),
+            ),
+            (&[][..], Some("eu-west-1")),
+        ] {
+            let mut vars = vars.to_vec();
+            vars.push(("HOME", "/h"));
+            let host = super::super::tests::host(
+                crate::aws::Platform::Unix,
+                &vars,
+                &[("/h/.aws/config", config.clone())],
+            );
+            let found = configured_region(&host).map(Result::unwrap);
+            assert_eq!(found, expected.map(region), "{vars:?}");
+        }
+        let bare = super::super::tests::host(crate::aws::Platform::Unix, &[], &[]);
+        assert!(configured_region(&bare).is_none());
     }
 
     /// Upstream `test_resolve_region_imds` and `test_resolve_imdsv2_token`:
@@ -396,6 +407,54 @@ mod tests {
 
             assert_eq!(found.is_ok(), succeeds, "{first}: {found:?}");
         }
+    }
+
+    /// The signed `host` keeps a port the URL names, and drops the
+    /// scheme's own. Breaks if a custom STS port is signed without it.
+    #[test]
+    fn signs_the_host_with_its_port() {
+        for (url, host) in [
+            (
+                "https://sts.internal.example:8443/",
+                "sts.internal.example:8443",
+            ),
+            (
+                "https://sts.us-east-1.amazonaws.com:443/",
+                "sts.us-east-1.amazonaws.com",
+            ),
+            (
+                "https://sts.us-east-1.amazonaws.com/",
+                "sts.us-east-1.amazonaws.com",
+            ),
+        ] {
+            assert_eq!(signed_host(&Url::parse(url).unwrap()).unwrap(), host);
+        }
+    }
+
+    /// A host with no instance metadata service fails the region lookup
+    /// at once. Breaks if a refused connection is sent again, which stalls
+    /// a workstation with AWS profile credentials for seconds per registry.
+    #[tokio::test]
+    async fn a_refused_region_lookup_is_final() {
+        let host = super::super::tests::host(crate::aws::Platform::Unix, &[], &[]);
+        let clients = super::super::Clients::new().unwrap();
+        let aws_credentials = crate::aws::AwsCredentialProviders::default();
+        let setup = Setup {
+            host: &host,
+            clients: &clients,
+            aws_credentials: &aws_credentials,
+        };
+        let file = SourceFile {
+            _environment_id: IgnoredAny,
+            region_url: Some("http://127.0.0.1:1/zone".to_owned()),
+            regional_cred_verification_url: None,
+            imdsv2_session_token_url: None,
+        };
+
+        let error = region_from_metadata(&setup, &file).await.unwrap_err();
+
+        assert!(matches!(error, Error::Transport { .. }), "{error}");
+        assert!(!error.is_transient());
     }
 
     /// The region, profile and keys all come from the injected host. Breaks

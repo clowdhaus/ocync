@@ -21,6 +21,12 @@ struct Setting {
     profile: &'static str,
 }
 
+/// The variables naming the region, in the SDK's order.
+const REGION_VARIABLES: [&str; 2] = ["AWS_REGION", "AWS_DEFAULT_REGION"];
+
+/// The profile property naming the region.
+const REGION_PROPERTY: &str = "region";
+
 const USE_FIPS: Setting = Setting {
     env: "AWS_USE_FIPS_ENDPOINT",
     profile: "use_fips_endpoint",
@@ -169,6 +175,15 @@ impl Config {
             env: host.env.clone(),
             sections,
         }
+    }
+
+    /// The region `AWS_REGION`, `AWS_DEFAULT_REGION` or the selected
+    /// profile's `region` names, in the SDK's order.
+    pub(super) fn region(&self) -> Option<String> {
+        REGION_VARIABLES
+            .iter()
+            .find_map(|name| self.env.get(name))
+            .or_else(|| self.profile()?.get(REGION_PROPERTY).cloned())
     }
 
     /// The selected profile's name.

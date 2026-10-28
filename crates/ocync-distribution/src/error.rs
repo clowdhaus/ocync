@@ -221,7 +221,7 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
 }
 
 /// The most of an external body or stream kept in an error, in bytes.
-const MAX_QUOTED_BYTES: usize = 200;
+pub(crate) const MAX_QUOTED_BYTES: usize = 200;
 
 /// The start of `body`, at most [`MAX_QUOTED_BYTES`] and cut on a character
 /// boundary. A response body or a helper's stderr can carry a token, and an

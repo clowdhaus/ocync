@@ -266,3 +266,23 @@ async fn a_transport_error_shows_no_url() {
     );
     assert!(!format!("{error:?}").contains("s3cret"), "{error:?}");
 }
+
+/// An answer longer than any token is refused rather than read whole.
+/// Breaks if the body is read past the cap.
+#[tokio::test]
+async fn refuses_an_answer_past_the_cap() {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_BODY + 1]))
+        .mount(&server)
+        .await;
+    let clients = Clients::new().unwrap();
+
+    let error = send(Call::SubjectUrl, clients.api.get(server.uri()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::BodyTooLarge { .. }), "{error}");
+}

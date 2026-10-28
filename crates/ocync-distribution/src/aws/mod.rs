@@ -1127,6 +1127,14 @@ fn api_client(stall_timeout: Duration) -> reqwest::ClientBuilder {
         .read_timeout(stall_timeout)
 }
 
+/// The region `host`'s AWS configuration names: `AWS_REGION`,
+/// `AWS_DEFAULT_REGION`, then the selected profile's `region`.
+pub(crate) fn configured_region(host: &Host) -> Option<Result<Region, InvalidRegion>> {
+    Config::load(host, None)
+        .region()
+        .map(|region| Region::parse(&region))
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
