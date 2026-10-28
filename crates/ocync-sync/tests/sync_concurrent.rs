@@ -2626,3 +2626,35 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
     let _report = result.expect("engine must drain cleanly on cancel during resolver wait");
     // Image status may be Cancelled or Synced depending on scheduling; either is correct.
 }
+
+/// A copy between two repositories of one registry, with one client as
+/// source and target, finishes when that client allows one upload at a
+/// time. Breaks if a blob download takes an upload permit, which it would
+/// hold while its own upload waits for the permit.
+#[tokio::test]
+async fn sync_within_one_registry_does_not_wait_on_its_own_download() {
+    let server = MockServer::start().await;
+    let img = ManifestBuilder::new(b"cfg").layer(b"layer").build();
+    img.mount_source(&server, "src", "v1").await;
+    img.mount_target(&server, "dst", "v1").await;
+    let client = Arc::new(
+        ocync_distribution::RegistryClientBuilder::new(server.uri().parse().unwrap())
+            .blob_upload_concurrency(1)
+            .build()
+            .unwrap(),
+    );
+    let mapping = resolved_mapping(
+        Arc::clone(&client),
+        "src",
+        "dst",
+        vec![target_entry("same", client)],
+        vec![TagPair::same("v1")],
+    );
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(10), run_sync(vec![mapping]))
+        .await
+        .expect("the copy waited on its own download");
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(report.stats.blobs_transferred, 2);
+}

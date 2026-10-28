@@ -28,7 +28,6 @@ futures-util = { version = "0.3", default-features = false }
 google-cloud-auth.workspace = true
 http.workspace = true
 hex.workspace = true
-pin-project-lite.workspace = true
 regex-lite = { version = "0.1", default-features = false, features = ["std", "string"] }
 reqwest = { workspace = true, features = ["http2", "rustls-no-provider", "stream", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
@@ -41,7 +40,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 httpdate = { version = "1", default-features = false }
-rcgen = { workspace = true, features = ["aws_lc_rs"] }
+rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
 testcontainers = { version = "0.28", default-features = false }
 tokio = { workspace = true, features = ["sync", "time", "test-util", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }

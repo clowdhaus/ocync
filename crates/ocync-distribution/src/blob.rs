@@ -1,14 +1,9 @@
 //! Blob operations - existence checks, pull, push, mount, and upload management.
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
-use pin_project_lite::pin_project;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LOCATION};
-use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, warn};
 
 use crate::aimd::RegistryAction;
@@ -19,39 +14,6 @@ use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
 use crate::spec::RepositoryName;
-
-pin_project! {
-    /// Stream wrapper that holds a streaming-blob semaphore permit for the
-    /// lifetime of the inner stream. Used by [`RegistryClient::blob_pull`] to
-    /// release the permit when the caller has fully consumed the response
-    /// body, not when `blob_pull` itself returns.
-    ///
-    /// `pin_project_lite` lets the projection work for any `S: Stream`,
-    /// including streams that are not `Unpin` (a future change in
-    /// reqwest's stream impl would otherwise silently bypass this
-    /// wrapper).
-    struct PermitStream<S> {
-        #[pin]
-        inner: S,
-        _permit: OwnedSemaphorePermit,
-    }
-}
-
-impl<S: Stream> Stream for PermitStream<S> {
-    type Item = S::Item;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().inner.poll_next(cx)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        // Forward the inner stream's hint so consumers that pre-allocate
-        // (e.g. `reqwest::Body::wrap_stream` setting Content-Length, or
-        // any `collect::<Vec<_>>()`) see the same information as the raw
-        // `bytes_stream()`.
-        self.inner.size_hint()
-    }
-}
 
 /// Content type for raw blob data in OCI upload requests.
 const OCTET_STREAM: &str = "application/octet-stream";
@@ -127,7 +89,7 @@ async fn buffer_stream(
 ) -> Result<Vec<u8>, Error> {
     // Cap the pre-allocation. capacity_hint comes from the manifest's
     // declared blob size, which is attacker-controllable; an unbounded
-    // `with_capacity` plus the per-target streaming-blob concurrency
+    // `with_capacity` plus the per-target blob upload concurrency
     // budget multiplies into arbitrary memory pressure.
     let cap = capacity_hint
         .map(|s| (s as usize).min(MAX_BUFFER_PREALLOC))
@@ -178,23 +140,26 @@ impl RegistryClient {
     /// Pull a blob as a streaming response.
     ///
     /// Issues a GET request to `/v2/{repository}/blobs/{digest}` and returns
-    /// a byte stream for the response body. The streaming-blob semaphore
-    /// is acquired before the GET and held by the returned stream until it
-    /// is fully consumed, bounding concurrent long-lived h2 streams.
+    /// a byte stream for the response body. The GET and any redirect it
+    /// follows go over HTTP/1.1, so a body left unread holds back only its
+    /// own connection. A download permit is held by the returned stream
+    /// until it is dropped, bounding open download connections; it is never
+    /// an upload permit, which a copy's upload waits for while its download
+    /// is open.
     pub async fn blob_pull(
         &self,
         repository: &RepositoryName,
         digest: &Digest,
     ) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>> + 'static, Error> {
-        let permit = self.acquire_streaming_blob_permit().await;
+        let permit = self.acquire_blob_download_permit().await;
         let path = blob_path(digest);
         let resp = self
             .get(repository, &path, None, RegistryAction::BlobRead)
             .await?;
-        Ok(PermitStream {
-            inner: resp.bytes_stream(),
-            _permit: permit,
-        })
+        Ok(resp.bytes_stream().map(move |chunk| {
+            let _held = &permit;
+            chunk
+        }))
     }
 
     /// Attempt a cross-repository blob mount.
@@ -368,7 +333,7 @@ impl RegistryClient {
 
         // Bound concurrent long-lived h2 streams. The streaming PUT body
         // is the long-lived part; the POST above completes quickly.
-        let _stream_permit = self.acquire_streaming_blob_permit().await;
+        let _upload_permit = self.acquire_blob_upload_permit().await;
 
         // Streaming PUT - send the blob body through a single HTTP request.
         // Uses Transfer-Encoding: chunked (no Content-Length), so the body
@@ -440,12 +405,12 @@ impl RegistryClient {
             "GAR does not support chunked uploads; buffering entire blob in memory"
         );
         // Two complementary caps for buffered fallback uploads:
-        //   1. `streaming_blob_sem` bounds the *count* of in-flight
-        //      buffered uploads (also doubles as h2-stream cap).
+        //   1. `blob_upload_sem` bounds the *count* of in-flight
+        //      buffered uploads, the same cap as streamed uploads.
         //   2. `buffered_blob_bytes_sem` bounds total *bytes* held
         //      across in-flight buffered uploads.
         // The helper acquires both in the right order; the returned
-        // tuple drops bytes_permit before stream_permit on scope exit.
+        // tuple drops bytes_permit before upload_permit on scope exit.
         let _permits = self.acquire_buffered_upload_permits(known_size).await;
         let body = buffer_stream(stream, known_size).await?;
         let actual_digest = self.blob_push(repository, &body).await?;
@@ -717,6 +682,10 @@ async fn classify_mount_response(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use futures_util::TryStreamExt;
+
     use super::*;
 
     #[test]
@@ -832,6 +801,51 @@ mod tests {
 
     fn test_digest(data: &[u8]) -> Digest {
         Digest::from_sha256(Sha256::digest(data))
+    }
+
+    /// A blob download waits for the download cap while another body is
+    /// open, and proceeds once that body is dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_pull_waits_for_the_download_cap_until_a_body_is_dropped() {
+        let server = wiremock::MockServer::start().await;
+        let data = b"layer".to_vec();
+        let digest = test_digest(&data);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/v2/repo/{}",
+                blob_path(&digest)
+            )))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(data.clone()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = crate::client::RegistryClientBuilder::new(server.uri().parse().unwrap())
+            .blob_download_concurrency(1)
+            .build()
+            .unwrap();
+        let repo = RepositoryName::new("repo").unwrap();
+
+        let first = client.blob_pull(&repo, &digest).await.unwrap();
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(200), client.blob_pull(&repo, &digest))
+                .await;
+        assert!(
+            blocked.is_err(),
+            "second download must wait while the first body is open"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "second download must not be sent while the first body is open"
+        );
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(5), client.blob_pull(&repo, &digest))
+            .await
+            .expect("second download must start once the first body is dropped")
+            .unwrap();
+        let body: Vec<Bytes> = second.try_collect().await.unwrap();
+        assert_eq!(body.concat(), data);
     }
 
     fn data_stream(

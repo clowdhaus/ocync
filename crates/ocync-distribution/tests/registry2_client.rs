@@ -14,12 +14,17 @@
 #[allow(unreachable_pub)]
 mod common;
 
+use std::time::Duration;
+
 use bytes::Bytes;
-use futures_util::stream;
+use futures_util::{TryStreamExt, stream};
+use http::Version;
+use ocync_distribution::aimd::RegistryAction;
+use ocync_distribution::client::RegistryClientBuilder;
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
 use ocync_distribution::{Digest, Error};
 
-use common::{local_client, start_registry, test_digest};
+use common::{local_client, start_registry, start_registry_tls, test_digest};
 
 /// Build a minimal valid OCI image manifest.
 fn build_manifest(
@@ -257,4 +262,59 @@ async fn blob_pull_roundtrip() {
         body.extend_from_slice(&chunk.expect("stream chunk error"));
     }
     assert_eq!(body, data);
+}
+
+/// A blob body being read arrives in full while bodies opened before it are
+/// left unread, with the client's adaptive HTTP/2 windows. Each blob is far
+/// larger than the 65,535 byte window an adaptive HTTP/2 connection starts
+/// with. Breaks if blob downloads share an HTTP/2 connection, whose receive
+/// window the unread bodies fill.
+#[tokio::test]
+async fn an_unread_blob_body_does_not_hold_back_another() {
+    let (_container, url) = start_registry_tls().await;
+    let client = RegistryClientBuilder::new(url)
+        .allow_invalid_certs(true)
+        .build()
+        .unwrap();
+    let repo = RepositoryName::new("test/unread").unwrap();
+    let mut digests = Vec::new();
+    for blob in 0..4u8 {
+        let mut data = vec![0u8; 1 << 20];
+        data[0] = blob;
+        digests.push(client.blob_push(&repo, &data).await.unwrap());
+    }
+    let path = format!("blobs/{}", digests[0]);
+    let head = client
+        .head(&repo, &path, None, RegistryAction::BlobHead)
+        .await
+        .unwrap();
+    assert_eq!(
+        head.version(),
+        Version::HTTP_2,
+        "other requests stay on HTTP/2"
+    );
+    let get = client
+        .get(&repo, &path, None, RegistryAction::BlobRead)
+        .await
+        .unwrap();
+    assert_eq!(
+        get.version(),
+        Version::HTTP_11,
+        "blob downloads use HTTP/1.1"
+    );
+    drop(get);
+
+    let mut unread = Vec::new();
+    for digest in &digests[..3] {
+        unread.push(client.blob_pull(&repo, digest).await.unwrap());
+    }
+    let read = client.blob_pull(&repo, &digests[3]).await.unwrap();
+    let bytes = read.try_fold(0, |n, chunk| async move { Ok(n + chunk.len()) });
+    let bytes = tokio::time::timeout(Duration::from_secs(30), bytes)
+        .await
+        .expect("the body being read stalled")
+        .unwrap();
+
+    assert_eq!(bytes, 1 << 20);
+    drop(unread);
 }

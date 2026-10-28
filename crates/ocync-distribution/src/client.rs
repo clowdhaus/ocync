@@ -36,30 +36,37 @@ pub(crate) fn no_redirect_builder() -> reqwest::ClientBuilder {
         .redirect(reqwest::redirect::Policy::none())
 }
 
-/// Default cap on concurrent long-lived blob streams per registry.
+/// Default cap on concurrent blob uploads per registry.
 ///
 /// reqwest/hyper opens one HTTP/2 connection per origin and multiplexes
-/// streams over it. Each blob upload (POST + streaming PUT) or pull
-/// (streaming GET) holds an h2 stream open for the duration of the
-/// transfer. Major container registries advertise
+/// streams over it. Each blob upload (POST + streaming PUT) holds an h2
+/// stream open for the duration of the transfer. Blob downloads go over
+/// HTTP/1.1 and are not counted. Major container registries advertise
 /// `SETTINGS_MAX_CONCURRENT_STREAMS` in the range 100-128
 /// (registry-1.docker.io: 128, ghcr.io: 100, cgr.dev: 100,
 /// us-docker.pkg.dev: 100, public.ecr.aws: 128, quay.io: 128,
 /// mcr.microsoft.com: 100, probed 2026-06-01).
 ///
-/// Capping concurrent streaming blobs at 64 leaves 36-64 stream slots
-/// for short-lived metadata operations (manifest HEAD/GET, blob mount POST,
-/// auth refresh) on every registry we've probed. Without this cap, default
-/// `max_concurrent_transfers * BLOB_CONCURRENCY` of 50 * 6 = 300 streams
-/// overshoots the budget by 3x and the connection stalls indefinitely.
-const DEFAULT_STREAMING_BLOB_CONCURRENCY: usize = 64;
+/// Capping concurrent blob uploads at 64 leaves 36-64 stream slots for
+/// short-lived metadata operations (manifest HEAD/GET, blob mount POST,
+/// auth refresh) on every registry we've probed. Without this cap, a
+/// `max_concurrent_transfers * BLOB_CONCURRENCY` above the budget
+/// overshoots it and the connection stalls indefinitely.
+const DEFAULT_BLOB_UPLOAD_CONCURRENCY: usize = 64;
+
+/// Default cap on concurrent blob downloads per registry. Each is its own
+/// HTTP/1.1 connection while its body is open, so the cap bounds the
+/// connections and TLS handshakes one sync opens to a source. Every upload
+/// reads one download, so a lower cap would hold uploads below their own
+/// cap, and a higher one would only open more bodies waiting on uploads.
+const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: usize = DEFAULT_BLOB_UPLOAD_CONCURRENCY;
 
 /// Default per-target byte budget for in-flight buffered blob bodies.
 ///
 /// The fallback upload paths (GHCR single-PATCH, GAR monolithic PUT, ACR
 /// chunked PATCH) all buffer the entire blob in memory because the target
 /// registry cannot accept a streaming body. With
-/// [`DEFAULT_STREAMING_BLOB_CONCURRENCY`] = 64 and no byte cap, 64
+/// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] = 64 and no byte cap, 64
 /// concurrent 1 GB layers (common for CUDA/ML images) would hold ~64 GB
 /// resident -- enough to OOM most hosts.
 ///
@@ -86,9 +93,12 @@ pub struct RegistryClientBuilder {
     url: Url,
     auth: Option<Box<dyn AuthProvider>>,
     max_concurrent: usize,
-    /// Cap on concurrent long-lived blob streams (push PUTs, pull GETs).
-    /// Defaults to [`DEFAULT_STREAMING_BLOB_CONCURRENCY`].
-    streaming_blob_concurrency: usize,
+    /// Cap on concurrent blob uploads. Defaults to
+    /// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`].
+    blob_upload_concurrency: usize,
+    /// Cap on concurrent blob downloads. Defaults to
+    /// [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
+    blob_download_concurrency: usize,
     /// Byte budget for in-flight buffered blob bodies on fallback upload
     /// paths (GHCR / GAR / ACR). Defaults to [`DEFAULT_BUFFERED_BLOB_BYTES`].
     buffered_blob_bytes: usize,
@@ -131,7 +141,8 @@ impl RegistryClientBuilder {
             url,
             auth: None,
             max_concurrent: DEFAULT_MAX_CONCURRENT_REQUESTS,
-            streaming_blob_concurrency: DEFAULT_STREAMING_BLOB_CONCURRENCY,
+            blob_upload_concurrency: DEFAULT_BLOB_UPLOAD_CONCURRENCY,
+            blob_download_concurrency: DEFAULT_BLOB_DOWNLOAD_CONCURRENCY,
             buffered_blob_bytes: DEFAULT_BUFFERED_BLOB_BYTES,
             dns_overrides: Vec::new(),
             accept_invalid_certs: false,
@@ -158,18 +169,28 @@ impl RegistryClientBuilder {
         self
     }
 
-    /// Set the cap on concurrent long-lived blob streams (push / pull).
+    /// Set the cap on concurrent blob uploads.
     ///
-    /// Each blob upload PUT and blob pull GET holds an HTTP/2 stream open
-    /// for the duration of the transfer. Reqwest/hyper uses one h2
+    /// Each blob upload PUT holds an HTTP/2 stream open for the duration of
+    /// the transfer. Reqwest/hyper uses one h2
     /// connection per origin, so this cap must stay under the server's
     /// advertised `SETTINGS_MAX_CONCURRENT_STREAMS` (typically 100-128 on
     /// major registries) minus headroom for metadata operations
     /// (manifest HEAD/GET, blob mount, auth refresh).
     ///
-    /// Default: [`DEFAULT_STREAMING_BLOB_CONCURRENCY`] (64).
-    pub fn streaming_blob_concurrency(mut self, n: usize) -> Self {
-        self.streaming_blob_concurrency = n.max(1);
+    /// Default: [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] (64).
+    pub fn blob_upload_concurrency(mut self, n: usize) -> Self {
+        self.blob_upload_concurrency = n.max(1);
+        self
+    }
+
+    /// Set the cap on concurrent blob downloads, each its own HTTP/1.1
+    /// connection while its body is open.
+    ///
+    /// Default: [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
+    #[cfg(test)]
+    pub(crate) fn blob_download_concurrency(mut self, n: usize) -> Self {
+        self.blob_download_concurrency = n.max(1);
         self
     }
 
@@ -232,10 +253,11 @@ impl RegistryClientBuilder {
         self
     }
 
-    /// Refuse to negotiate HTTP/2 via ALPN. Test-only escape hatch for the
-    /// perf profile harness, used to isolate HTTP/2-multiplexing stalls
-    /// from the rest of the streaming path. Hidden from public docs;
-    /// never use in production code.
+    /// Refuse to negotiate HTTP/2 via ALPN for every request but blob
+    /// downloads, which always use HTTP/1.1. Test-only escape hatch for the
+    /// perf profile harness, used to isolate HTTP/2-multiplexing stalls on
+    /// metadata and uploads. Hidden from public docs; never use in
+    /// production code.
     #[doc(hidden)]
     pub fn force_http1(mut self, force: bool) -> Self {
         self.force_http1 = force;
@@ -267,31 +289,32 @@ impl RegistryClientBuilder {
     /// Build the registry client.
     pub fn build(self) -> Result<RegistryClient, Error> {
         crate::install_crypto_provider();
-        let mut http_builder = reqwest::Client::builder().user_agent(USER_AGENT_VALUE);
-        for (host, addr) in &self.dns_overrides {
-            http_builder = http_builder.resolve(host, *addr);
-        }
-        if self.accept_invalid_certs {
-            http_builder = http_builder.danger_accept_invalid_certs(true);
-        }
+        let base_builder = || {
+            let mut builder = reqwest::Client::builder().user_agent(USER_AGENT_VALUE);
+            for (host, addr) in &self.dns_overrides {
+                builder = builder.resolve(host, *addr);
+            }
+            if self.accept_invalid_certs {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+            builder
+        };
+        let mut http_builder = base_builder();
         if self.force_http1 {
             http_builder = http_builder.http1_only();
         }
-        // Enable HTTP/2 adaptive flow-control window sizing. Hyper's
-        // default starts each stream at a 64KB receive window and grows
-        // it only after `WINDOW_UPDATE` frames; at high stream
-        // concurrency (e.g. `max_concurrent_transfers` of 50 streaming
-        // large blobs) this starves throughput and against some
-        // registries surfaces as a stall. Adaptive window sizes the
-        // window dynamically based on observed throughput. Off by
-        // default in reqwest; we want it on by default for the registry
-        // client.
+        // Enable HTTP/2 adaptive flow-control window sizing for the
+        // responses this client receives (everything but blob downloads).
+        // Hyper's fixed defaults are 2 MiB per stream and 5 MiB per
+        // connection; adaptive sizing starts both at 65,535 bytes and grows
+        // them with measured throughput. Off by default in reqwest.
         //
         // Test hook: `http2_adaptive_window(false)` disables for A/B.
         if self.h2_adaptive_window {
             http_builder = http_builder.http2_adaptive_window(true);
         }
         let http = http_builder.build()?;
+        let blob_download_http = base_builder().http1_only().build()?;
 
         let aimd = AimdController::new(
             self.url.host_str().unwrap_or("unknown"),
@@ -300,9 +323,11 @@ impl RegistryClientBuilder {
         Ok(RegistryClient {
             base_url: self.url,
             http,
+            blob_download_http,
             auth: self.auth,
             aimd,
-            streaming_blob_sem: Arc::new(Semaphore::new(self.streaming_blob_concurrency)),
+            blob_upload_sem: Arc::new(Semaphore::new(self.blob_upload_concurrency)),
+            blob_download_sem: Arc::new(Semaphore::new(self.blob_download_concurrency)),
             buffered_blob_bytes_sem: Arc::new(Semaphore::new(self.buffered_blob_bytes)),
             buffered_blob_bytes_budget: self.buffered_blob_bytes,
             rate_limit_remaining: AtomicU64::new(RATE_LIMIT_UNKNOWN),
@@ -317,15 +342,27 @@ impl RegistryClientBuilder {
 pub struct RegistryClient {
     pub(crate) base_url: Url,
     pub(crate) http: reqwest::Client,
+    /// HTTP/1.1 only, for blob downloads. Over HTTP/2 a response body
+    /// holds a share of its connection's receive window until it is read,
+    /// and with adaptive window sizing that window starts at 65,535 bytes,
+    /// so bodies opened ahead of uploads still waiting on a limit can fill
+    /// it and starve the bodies being read. Over HTTP/1.1 each body holds
+    /// back only its own connection.
+    pub(crate) blob_download_http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
-    /// Cap on concurrent long-lived blob streams (push / pull). Acquired
-    /// at the start of [`Self::blob_push_stream`] and [`Self::blob_pull`]
-    /// to keep the per-connection HTTP/2 stream usage below the server's
+    /// Cap on concurrent blob uploads. Acquired by
+    /// [`Self::blob_push_stream`] to keep the per-connection HTTP/2 stream
+    /// usage below the server's
     /// advertised `SETTINGS_MAX_CONCURRENT_STREAMS`. See the constant
-    /// `DEFAULT_STREAMING_BLOB_CONCURRENCY` for the rationale and probed
+    /// `DEFAULT_BLOB_UPLOAD_CONCURRENCY` for the rationale and probed
     /// numbers per registry.
-    pub(crate) streaming_blob_sem: Arc<Semaphore>,
+    pub(crate) blob_upload_sem: Arc<Semaphore>,
+    /// Cap on concurrent blob downloads, held by [`Self::blob_pull`]'s
+    /// stream until it is dropped. Never shared with uploads: a copy holds
+    /// one while its upload waits for an upload permit, which would
+    /// deadlock if both came from one semaphore.
+    pub(crate) blob_download_sem: Arc<Semaphore>,
     /// Byte-budget semaphore for in-flight buffered blob bodies. One
     /// permit == one byte. Acquired by the GHCR / GAR / ACR fallback
     /// upload paths (which buffer the entire blob) before
@@ -349,43 +386,53 @@ pub struct RegistryClient {
     rate_limit_remaining: AtomicU64,
 }
 
+/// Acquire a permit from one of the client's blob caps.
+async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
+    // The client never closes its semaphores.
+    Arc::clone(sem)
+        .acquire_owned()
+        .await
+        .expect("blob semaphore closed")
+}
+
 impl RegistryClient {
-    /// Acquire a permit gating concurrent long-lived blob streams.
+    /// Acquire a permit gating concurrent blob uploads.
     ///
-    /// Held by blob push / pull paths for the duration of the streaming
-    /// HTTP/2 body. Released automatically when the returned permit is
-    /// dropped. See [`DEFAULT_STREAMING_BLOB_CONCURRENCY`] for the
+    /// Held by blob upload paths for the duration of the streaming HTTP/2
+    /// PUT body. Released automatically when the returned permit is
+    /// dropped. See [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] for the
     /// rationale.
-    pub(crate) async fn acquire_streaming_blob_permit(&self) -> OwnedSemaphorePermit {
-        // Sema is never closed for the lifetime of the client; unwrap is
-        // sound.
-        Arc::clone(&self.streaming_blob_sem)
-            .acquire_owned()
-            .await
-            .expect("streaming blob semaphore closed")
+    pub(crate) async fn acquire_blob_upload_permit(&self) -> OwnedSemaphorePermit {
+        acquire_permit(&self.blob_upload_sem).await
+    }
+
+    /// Acquire a permit gating concurrent blob downloads. See
+    /// [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
+    pub(crate) async fn acquire_blob_download_permit(&self) -> OwnedSemaphorePermit {
+        acquire_permit(&self.blob_download_sem).await
     }
 
     /// Acquire both the per-target count permit and the byte-budget
     /// permit for a fallback (buffered) blob upload, in the right order.
     ///
-    /// Returns `(bytes_permit, stream_permit)`. Both are held by the
+    /// Returns `(bytes_permit, upload_permit)`. Both are held by the
     /// caller for the duration of the buffered upload; Rust tuples drop
     /// fields in declaration order, so `bytes_permit` is released
     /// FIRST on scope exit. Releasing the contested byte budget ahead
     /// of the count cap is the right order: a fallback that completes
     /// freeing 6 MB lets queued buffered uploads admit immediately,
-    /// while the stream-count cap (default 64) is rarely the bottleneck
+    /// while the upload cap (default 64) is rarely the bottleneck
     /// at typical workloads. See the per-cap docs on
-    /// [`Self::acquire_streaming_blob_permit`] and
+    /// [`Self::acquire_blob_upload_permit`] and
     /// [`Self::acquire_buffered_bytes_permit`] for the semantics of
     /// each.
     pub(crate) async fn acquire_buffered_upload_permits(
         &self,
         known_size: Option<u64>,
     ) -> (OwnedSemaphorePermit, OwnedSemaphorePermit) {
-        let stream_permit = self.acquire_streaming_blob_permit().await;
+        let upload_permit = self.acquire_blob_upload_permit().await;
         let bytes_permit = self.acquire_buffered_bytes_permit(known_size).await;
-        (bytes_permit, stream_permit)
+        (bytes_permit, upload_permit)
     }
 
     /// Acquire a byte-budget permit for a fallback (buffered) blob upload.
@@ -408,7 +455,7 @@ impl RegistryClient {
     ///   conservatively budget the same up-front allocation the buffer
     ///   itself reserves; actual buffered bytes may exceed this if the
     ///   blob is larger than the reserve, but the count cap
-    ///   (`streaming_blob_sem`) still bounds total in-flight count.
+    ///   (`blob_upload_sem`) still bounds total in-flight count.
     pub(crate) async fn acquire_buffered_bytes_permit(
         &self,
         expected: Option<u64>,
@@ -531,6 +578,7 @@ impl RegistryClient {
         accept: Option<&str>,
         op: RegistryAction,
     ) -> Result<reqwest::Response, Error> {
+        let http = self.http_for(op);
         let url = build_url(&self.base_url, repository, path)?;
         let scopes = [Scope::pull(repository.as_str())];
 
@@ -541,11 +589,27 @@ impl RegistryClient {
                         headers.insert(ACCEPT, val);
                     }
                 }
-                self.http.get(url.clone()).headers(headers)
+                http.get(url.clone()).headers(headers)
             })
             .await?;
 
         classify_response(resp, &self.base_url, repository).await
+    }
+
+    /// The HTTP client for `op`: [`Self::blob_download_http`] for blob downloads,
+    /// [`Self::http`], the default client, for everything else.
+    fn http_for(&self, op: RegistryAction) -> &reqwest::Client {
+        match op {
+            RegistryAction::BlobRead => &self.blob_download_http,
+            RegistryAction::ManifestHead
+            | RegistryAction::ManifestRead
+            | RegistryAction::ManifestWrite
+            | RegistryAction::BlobHead
+            | RegistryAction::BlobUploadInit
+            | RegistryAction::BlobUploadChunk
+            | RegistryAction::BlobUploadComplete
+            | RegistryAction::TagList => &self.http,
+        }
     }
 
     /// Perform an authenticated HEAD request.
