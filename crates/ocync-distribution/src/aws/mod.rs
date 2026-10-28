@@ -688,6 +688,7 @@ impl Api {
                 &sigv4::Request {
                     method: &request.method,
                     path: url.path(),
+                    query: url.query().unwrap_or_default(),
                     headers: signed_headers,
                     body: &request.body,
                 },

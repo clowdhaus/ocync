@@ -2,9 +2,8 @@
 //!
 //! Signs in the `Authorization` header, with the session token signed as
 //! `x-amz-security-token`, URI path normalization on, the path encoded
-//! twice, and no query: the endpoint never carries one. That is the form
-//! every service ocync calls expects; S3 alone differs, and ocync does not
-//! call it.
+//! twice, and the query canonicalized. That is the form every service ocync
+//! signs for expects; S3 alone differs, and ocync does not call it.
 
 use std::fmt::{self, Write as _};
 use std::time::SystemTime;
@@ -47,6 +46,8 @@ pub(super) struct Request<'a> {
     pub(super) method: &'a http::Method,
     /// The path as sent, already percent-encoded once.
     pub(super) path: &'a str,
+    /// The query as sent, without the `?`, already percent-encoded once.
+    pub(super) query: &'a str,
     /// The headers to sign, including `host`. The signer adds
     /// [`X_AMZ_DATE`], [`X_AMZ_SECURITY_TOKEN`] and `authorization` itself.
     pub(super) headers: &'a [(&'a str, &'a str)],
@@ -140,12 +141,32 @@ fn canonical_request(
 
     // The empty line is the canonical query.
     let canonical = format!(
-        "{}\n{}\n\n{canonical_headers}\n{signed_headers}\n{}",
+        "{}\n{}\n{}\n{canonical_headers}\n{signed_headers}\n{}",
         request.method,
         percent_encode(&normalize_path(request.path), Keep::PathSeparators),
+        canonical_query(request.query),
         hex::encode(digest::digest(&digest::SHA256, request.body)),
     );
     (canonical, signed_headers)
+}
+
+/// `query` with each name and value decoded and encoded again as AWS
+/// encodes query values, sorted by name and then value.
+fn canonical_query(query: &str) -> String {
+    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(name, value)| {
+            (
+                percent_encode(&name, Keep::Unreserved),
+                percent_encode(&value, Keep::Unreserved),
+            )
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn string_to_sign(canonical: &str, date: &AmzDate, scope: &CredentialScope<'_>) -> String {
@@ -267,9 +288,8 @@ mod tests {
     /// 1.6.3, in `sigv4-test-suite/`, that apply to header signing with
     /// normalized, double-encoded paths. Left out: the unnormalized cases
     /// (S3 only), `sign_body` and `omit_session_token` cases (options ocync
-    /// never sets), the query cases (an endpoint never carries one), and
-    /// `get-space-normalized` and `get-utf8`, which expect a single-encoded
-    /// path and which `aws-sigv4` also skips.
+    /// never sets), and `get-space-normalized` and `get-utf8`, which expect
+    /// a single-encoded path and which `aws-sigv4` also skips.
     const VECTORS: &[&str] = &[
         "get-header-key-duplicate",
         "get-header-value-multiline",
@@ -283,12 +303,20 @@ mod tests {
         "get-slashes-normalized",
         "get-unreserved",
         "get-vanilla",
+        "get-vanilla-empty-query-key",
+        "get-vanilla-query",
+        "get-vanilla-query-order-encoded",
+        "get-vanilla-query-order-key-case",
+        "get-vanilla-query-unreserved",
+        "get-vanilla-utf8-query",
         "get-vanilla-with-session-token",
         "post-header-key-case",
         "post-header-key-sort",
         "post-header-value-case",
         "post-sts-header-before",
         "post-vanilla",
+        "post-vanilla-empty-query-value",
+        "post-vanilla-query",
     ];
 
     fn read(test: &str, file: &str) -> String {
@@ -305,6 +333,7 @@ mod tests {
     struct Raw {
         method: http::Method,
         path: String,
+        query: String,
         headers: Vec<(String, String)>,
         body: String,
     }
@@ -325,7 +354,6 @@ mod tests {
                 }
             })
             .collect();
-        assert!(!target.contains('?'), "{target}: the signer signs no query");
         let mut headers: Vec<(String, String)> = Vec::new();
         for line in lines {
             if line.starts_with(char::is_whitespace) {
@@ -340,9 +368,11 @@ mod tests {
                 }
             }
         }
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
         Raw {
             method: method.parse().unwrap(),
-            path: target,
+            path: path.to_owned(),
+            query: query.to_owned(),
             headers,
             body: body.to_string(),
         }
@@ -372,6 +402,7 @@ mod tests {
         let request = Request {
             method: &raw.method,
             path: &raw.path,
+            query: &raw.query,
             headers: &headers,
             body: raw.body.as_bytes(),
         };
@@ -445,6 +476,7 @@ mod tests {
         let request = Request {
             method: &http::Method::GET,
             path: "/",
+            query: "",
             headers: &[("Host", "example.amazonaws.com")],
             body: b"",
         };
