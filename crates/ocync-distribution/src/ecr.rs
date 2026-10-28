@@ -390,7 +390,7 @@ impl EcrBatchApi for AwsEcrBatchApi {
                 repository_name: repo,
             };
             let output = self.client.call(&input).await.map_err(|e| Error::EcrApi {
-                reason: format!("{e} for '{repo}'"),
+                reason: format!("checking '{repo}': {e}"),
             })?;
             Ok(output.into())
         })

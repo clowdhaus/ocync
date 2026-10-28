@@ -22,7 +22,7 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::CredentialCache;
-use crate::error::{Error, truncate_quoted};
+use crate::error::{Error, error_chain, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
@@ -172,9 +172,12 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
                 registry: service.to_owned(),
                 // Unwrapped so the reason reads as it always has: `Error::Http`
                 // Displays as "HTTP request failed: ..." and would double the
-                // prefix this line already writes.
+                // prefix this line already writes. The chain names the cause,
+                // such as a refused connection.
                 reason: match &e {
-                    Error::Http(inner) => format!("ACR {endpoint} request failed: {inner}"),
+                    Error::Http(inner) => {
+                        format!("ACR {endpoint} request failed: {}", error_chain(inner))
+                    }
                     other => format!("ACR {endpoint} request failed: {other}"),
                 },
             })?;
@@ -307,10 +310,12 @@ impl AzureCredentialChain {
         form: &[(&str, &str)],
         source: &str,
     ) -> Result<String, CredentialError> {
-        let resp =
-            http.post(url).form(form).send().await.map_err(|e| {
-                CredentialError::Failed(format!("{source} token request failed: {e}"))
-            })?;
+        let resp = http.post(url).form(form).send().await.map_err(|e| {
+            CredentialError::Failed(format!(
+                "{source} token request failed: {}",
+                error_chain(&e)
+            ))
+        })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();

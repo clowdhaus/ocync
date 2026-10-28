@@ -1990,9 +1990,9 @@ mod tests {
         assert!(Arc::ptr_eq(&auth.credentials, &public.credentials));
     }
 
-    /// A transport failure's text names its cause and does not carry the
-    /// endpoint URL, whose path may hold a key. Breaks if the refused
-    /// connection is dropped from the text callers keep.
+    /// A transport failure's text names its deepest cause and does not
+    /// carry the endpoint URL's path, which may hold a key. Breaks if the
+    /// refused connection is dropped from the text callers keep.
     #[tokio::test]
     async fn transport_errors_name_their_cause_without_the_endpoint_url() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2003,7 +2003,15 @@ mod tests {
         let client = Client::from_parts(parts).unwrap();
         let err = client.call(&Probe {}).await.unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("tcp connect error"), "{text}");
+        // The operating system's own words for the refusal, from a plain
+        // connection to the same closed port.
+        let refused = std::net::TcpStream::connect(address)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.ends_with(&refused),
+            "{text} does not end with {refused}"
+        );
         assert!(!format!("{text}{err:?}").contains("secret-key"), "{err:?}");
     }
 
