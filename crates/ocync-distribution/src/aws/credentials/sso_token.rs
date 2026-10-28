@@ -424,9 +424,9 @@ mod tests {
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::super::fixtures::capture_logs;
     use super::*;
     use crate::aws::host::{Clock, Env, Fs, Network};
+    use crate::test_logs::capture_logs;
 
     /// The session every test loads, as upstream's tests name it.
     const SESSION: Login<'static> = Login::Session {

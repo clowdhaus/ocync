@@ -36,6 +36,8 @@ pub mod sha256;
 pub mod spec;
 /// Tag listing with pagination.
 pub mod tags;
+#[cfg(test)]
+mod test_logs;
 
 /// What a secret prints as in a `Debug` rendering.
 pub(crate) const REDACTED: &str = "[REDACTED]";

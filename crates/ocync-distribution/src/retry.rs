@@ -128,7 +128,7 @@ impl<E, F: Fn(&E) -> bool> Policy<E> for Bounded<F> {
 /// and token exchanges, which are.
 pub(crate) async fn retrying<T, E, P, F, Fut>(what: &str, policy: &mut P, op: F) -> Result<T, E>
 where
-    E: std::fmt::Display,
+    E: std::error::Error,
     P: Policy<E>,
     F: Fn(u32) -> Fut,
     Fut: Future<Output = Result<T, E>>,
@@ -148,7 +148,7 @@ where
                     what,
                     attempt,
                     delay_ms = delay.as_millis(),
-                    error = %e,
+                    error = %crate::error::error_chain(&e),
                     "transient failure; backing off and retrying"
                 );
                 tokio::time::sleep(delay).await;
@@ -335,6 +335,24 @@ mod tests {
             "one initial attempt plus every retry, numbered from 0"
         );
         assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    /// A retry's log names the failure's causes, not only its top line.
+    /// Breaks if why a retry was needed is lost from the log.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_retry_logs_the_cause_of_the_failure() {
+        let (_, logs) = crate::test_logs::capture_logs(retrying(
+            "a lookup",
+            &mut Bounded(|_: &crate::google::Error| true),
+            |_| async {
+                Err::<(), _>(crate::google::Error::Url {
+                    field: "token_url",
+                    source: url::ParseError::EmptyHost,
+                })
+            },
+        ))
+        .await;
+        assert!(logs.contains("empty host"), "{logs}");
     }
 
     #[tokio::test]
