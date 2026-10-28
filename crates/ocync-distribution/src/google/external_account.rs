@@ -65,7 +65,7 @@ impl<'de> Deserialize<'de> for SourceFile {
         let source = if names("environment_id") {
             serde_json::from_value(value).map(Self::Aws)
         } else if names("executable") {
-            serde_json::from_value::<ExecutableSource>(value).map(|_| Self::Executable)
+            Ok(Self::Executable)
         } else if names("url") {
             serde_json::from_value(value).map(Self::Url)
         } else if names("file") {
@@ -77,13 +77,6 @@ impl<'de> Deserialize<'de> for SourceFile {
         };
         source.map_err(D::Error::custom)
     }
-}
-
-/// An executable source: its `executable.command` is all that selects it.
-#[derive(Deserialize)]
-struct ExecutableSource {
-    #[serde(rename = "executable")]
-    _executable: ExecutableFile,
 }
 
 /// A URL source.
@@ -99,13 +92,6 @@ struct UrlFile {
 struct FileFile {
     file: String,
     format: Option<FormatFile>,
-}
-
-/// An executable source's settings: the command is all that selects it.
-#[derive(Deserialize)]
-struct ExecutableFile {
-    #[serde(rename = "command")]
-    _command: IgnoredAny,
 }
 
 /// How a subject token is written, as the file says it.
@@ -164,9 +150,9 @@ impl Format {
         match self {
             Self::Text => Ok(Secret(text)),
             Self::Json { field } => {
-                let json: Value = serde_json::from_str(&text).map_err(Error::SubjectJson)?;
-                match json.get(field) {
-                    Some(Value::String(token)) => Ok(Secret(token.clone())),
+                let mut json: Value = serde_json::from_str(&text).map_err(Error::SubjectJson)?;
+                match json.get_mut(field).map(Value::take) {
+                    Some(Value::String(token)) => Ok(Secret(token)),
                     _ => Err(Error::SubjectField(field.clone())),
                 }
             }
@@ -313,7 +299,7 @@ impl Exchange {
 
 /// An external account.
 #[derive(Debug)]
-pub(crate) struct Account {
+pub(super) struct Account {
     audience: String,
     subject_token_type: String,
     token_url: Url,

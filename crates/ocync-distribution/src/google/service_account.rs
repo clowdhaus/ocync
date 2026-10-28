@@ -57,7 +57,7 @@ pub(crate) enum KeyError {
 }
 
 /// A service account and the key it signs with.
-pub(crate) struct Account {
+pub(super) struct Account {
     client_email: String,
     private_key_id: String,
     key: RsaKeyPair,

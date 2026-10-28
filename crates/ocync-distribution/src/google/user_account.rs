@@ -38,7 +38,7 @@ struct UserFile {
 
 /// An authorized user's refresh token and where to exchange it.
 #[derive(Debug)]
-pub(crate) struct AuthorizedUser {
+pub(super) struct AuthorizedUser {
     client_id: String,
     client_secret: Secret,
     refresh_token: Secret,

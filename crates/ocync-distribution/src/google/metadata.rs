@@ -34,7 +34,7 @@ pub(super) const TIMEOUTS: Timeouts = Timeouts {
 
 /// The metadata server's token endpoint.
 #[derive(Debug)]
-pub(crate) struct Server {
+pub(super) struct Server {
     /// The token URL, with the comma-joined scopes as its query unless the
     /// server's default is wanted.
     token_url: Url,

@@ -565,7 +565,11 @@ impl SourceAuth {
 
 /// Credentials that obtain access tokens.
 #[derive(Debug)]
-pub(crate) enum Credentials {
+pub(crate) struct Credentials(Kind);
+
+/// The kinds of [`Credentials`].
+#[derive(Debug)]
+enum Kind {
     ServiceAccount(service_account::Account),
     AuthorizedUser(user_account::AuthorizedUser),
     ExternalAccount(Box<external_account::Account>),
@@ -588,7 +592,8 @@ impl Credentials {
             aws_credentials,
         };
         match find_file(host)? {
-            None => metadata::Server::new(&host.env, Scopes::Registry).map(Self::Metadata),
+            None => metadata::Server::new(&host.env, Scopes::Registry)
+                .map(|server| Self(Kind::Metadata(server))),
             Some(contents) => {
                 let json: Value = serde_json::from_slice(&contents).map_err(Error::Parse)?;
                 let kind = CredentialType::of(&json)?;
@@ -605,24 +610,25 @@ impl Credentials {
         setup: &'a Setup<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<Self, Error>> + 'a>> {
         Box::pin(async move {
-            match kind {
+            let kind = match kind {
                 CredentialType::ServiceAccount => {
-                    service_account::Account::from_json(json, scopes).map(Self::ServiceAccount)
+                    service_account::Account::from_json(json, scopes).map(Kind::ServiceAccount)
                 }
                 CredentialType::AuthorizedUser => {
-                    user_account::AuthorizedUser::from_json(json, scopes).map(Self::AuthorizedUser)
+                    user_account::AuthorizedUser::from_json(json, scopes).map(Kind::AuthorizedUser)
                 }
                 CredentialType::ExternalAccount => {
                     external_account::Account::from_json(json, scopes, setup)
                         .await
-                        .map(|account| Self::ExternalAccount(Box::new(account)))
+                        .map(|account| Kind::ExternalAccount(Box::new(account)))
                 }
                 CredentialType::Impersonated => {
                     impersonated::Account::from_json(json, scopes, setup)
                         .await
-                        .map(Self::Impersonated)
+                        .map(Kind::Impersonated)
                 }
-            }
+            };
+            kind.map(Self)
         })
     }
 
@@ -633,12 +639,12 @@ impl Credentials {
         clock: Clock,
     ) -> Pin<Box<dyn Future<Output = Result<AccessToken, Error>> + Send + 'a>> {
         Box::pin(async move {
-            match self {
-                Self::ServiceAccount(account) => account.access_token(clock.now()),
-                Self::AuthorizedUser(user) => user.access_token(clients, clock).await,
-                Self::ExternalAccount(account) => account.access_token(clients, clock).await,
-                Self::Impersonated(account) => account.access_token(clients, clock).await,
-                Self::Metadata(server) => server.access_token(clients, clock).await,
+            match &self.0 {
+                Kind::ServiceAccount(account) => account.access_token(clock.now()),
+                Kind::AuthorizedUser(user) => user.access_token(clients, clock).await,
+                Kind::ExternalAccount(account) => account.access_token(clients, clock).await,
+                Kind::Impersonated(account) => account.access_token(clients, clock).await,
+                Kind::Metadata(server) => server.access_token(clients, clock).await,
             }
         })
     }
@@ -648,8 +654,8 @@ impl Credentials {
     /// authorized user, as upstream forwards its source's headers.
     async fn source_auth(&self, clients: &Clients, clock: Clock) -> Result<SourceAuth, Error> {
         let token = self.access_token(clients, clock).await?;
-        let quota_project = match self {
-            Self::AuthorizedUser(user) => user.quota_project().cloned(),
+        let quota_project = match &self.0 {
+            Kind::AuthorizedUser(user) => user.quota_project().cloned(),
             _ => None,
         };
         SourceAuth::new(token.token.expose(), quota_project)

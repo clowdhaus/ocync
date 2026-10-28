@@ -56,26 +56,26 @@ pub(crate) trait GcpTokenSource: Send + Sync + fmt::Debug {
 /// doomed requests. Create one per run: the next run, such as the next
 /// watch cycle, reads the credentials again.
 #[derive(Default)]
-pub struct DefaultCredentials(OnceCell<Result<Arc<SharedToken>, Rc<google::Error>>>);
+pub struct SharedGoogleToken(OnceCell<Result<Arc<GoogleToken>, Rc<google::Error>>>);
 
-impl fmt::Debug for DefaultCredentials {
+impl fmt::Debug for SharedGoogleToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DefaultCredentials").finish_non_exhaustive()
+        f.debug_struct("SharedGoogleToken").finish_non_exhaustive()
     }
 }
 
-impl DefaultCredentials {
+impl SharedGoogleToken {
     /// The token of `host`'s credentials, loaded on first use.
     async fn token(
         &self,
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
-    ) -> Result<Arc<SharedToken>, Rc<google::Error>> {
+    ) -> Result<Arc<GoogleToken>, Rc<google::Error>> {
         self.0
             .get_or_init(|| async {
                 AdcTokenSource::load(host, aws_credentials)
                     .await
-                    .map(|source| Arc::new(SharedToken::new(source)))
+                    .map(|source| Arc::new(GoogleToken::new(source)))
                     .map_err(Rc::new)
             })
             .await
@@ -85,20 +85,20 @@ impl DefaultCredentials {
 
 /// A token source and the token it last returned, kept until it is about
 /// to expire or a registry's token exchange refuses it with 401.
-struct SharedToken {
+struct GoogleToken {
     source: Box<dyn GcpTokenSource>,
     token: CredentialCache<AccessToken, Arc<google::Error>>,
 }
 
-impl fmt::Debug for SharedToken {
+impl fmt::Debug for GoogleToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SharedToken")
+        f.debug_struct("GoogleToken")
             .field("source", &self.source)
             .finish_non_exhaustive()
     }
 }
 
-impl SharedToken {
+impl GoogleToken {
     fn new(source: impl GcpTokenSource + 'static) -> Self {
         Self {
             source: Box::new(source),
@@ -226,7 +226,7 @@ pub struct GcpAuth {
     /// HTTP client for OCI token exchange.
     http: reqwest::Client,
     /// The Google token, shared by the run's GAR and GCR providers.
-    google_token: Arc<SharedToken>,
+    google_token: Arc<GoogleToken>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
@@ -254,7 +254,7 @@ impl GcpAuth {
         registry: &url::Url,
         http: reqwest::Client,
         aws_credentials: &AwsCredentialProviders,
-        gcp_credentials: &DefaultCredentials,
+        gcp_credentials: &SharedGoogleToken,
     ) -> Result<Self, Error> {
         Self::on_host(
             registry,
@@ -272,7 +272,7 @@ impl GcpAuth {
         http: reqwest::Client,
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
-        gcp_credentials: &DefaultCredentials,
+        gcp_credentials: &SharedGoogleToken,
     ) -> Result<Self, Error> {
         let hostname = registry.host_str().unwrap_or_default().to_owned();
         let google_token = gcp_credentials
@@ -291,7 +291,7 @@ impl GcpAuth {
         base_url: String,
         hostname: String,
         http: reqwest::Client,
-        google_token: Arc<SharedToken>,
+        google_token: Arc<GoogleToken>,
     ) -> Self {
         Self {
             base_url,
@@ -314,7 +314,7 @@ impl GcpAuth {
             base_url.into(),
             "mock-gcp".to_owned(),
             http,
-            Arc::new(SharedToken::new(api)),
+            Arc::new(GoogleToken::new(api)),
         )
     }
 
@@ -461,7 +461,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn waiting_registries_share_a_failed_token_fetch() {
         let fetches = Arc::new(AtomicUsize::new(0));
-        let shared = SharedToken::new(SlowlyFailing(Arc::clone(&fetches)));
+        let shared = GoogleToken::new(SlowlyFailing(Arc::clone(&fetches)));
 
         let (first, second) = tokio::join!(shared.get(), shared.get());
 
@@ -687,7 +687,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_user_token(&server, 1).await;
         let host = user_host(&server);
-        let shared = DefaultCredentials::default();
+        let shared = SharedGoogleToken::default();
         let us = adc_auth("https://us-docker.pkg.dev", &host, &shared).await;
         let europe = adc_auth("https://europe-docker.pkg.dev", &host, &shared).await;
 
@@ -712,7 +712,7 @@ mod tests {
             .mount(&server)
             .await;
         let host = aws_source_host(&server);
-        let shared = DefaultCredentials::default();
+        let shared = SharedGoogleToken::default();
         let aws_credentials = AwsCredentialProviders::default();
 
         for registry in ["https://us-docker.pkg.dev", "https://europe-docker.pkg.dev"] {
@@ -741,7 +741,7 @@ mod tests {
             .mount(&server)
             .await;
         let host = aws_source_host(&server);
-        let shared = DefaultCredentials::default();
+        let shared = SharedGoogleToken::default();
         let aws_credentials = AwsCredentialProviders::default();
         let load = |registry: &str| {
             let registry: url::Url = registry.parse().unwrap();
@@ -821,7 +821,7 @@ mod tests {
     async fn adc_auth(
         registry: &str,
         host: &crate::aws::Host,
-        shared: &DefaultCredentials,
+        shared: &SharedGoogleToken,
     ) -> GcpAuth {
         GcpAuth::on_host(
             &registry.parse().unwrap(),

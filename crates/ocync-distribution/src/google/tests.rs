@@ -138,8 +138,8 @@ async fn finds_the_credentials_in_order() {
         Vec<(&'a str, Vec<u8>)>,
         Check,
     );
-    let service_account: Check = |r| matches!(r, Ok(Credentials::ServiceAccount(_)));
-    let metadata: Check = |r| matches!(r, Ok(Credentials::Metadata(_)));
+    let service_account: Check = |r| matches!(r, Ok(Credentials(Kind::ServiceAccount(_))));
+    let metadata: Check = |r| matches!(r, Ok(Credentials(Kind::Metadata(_))));
     let missing: Check = |r| match r {
         Err(e @ Error::MissingFile(_)) => e.to_string().contains(CREDENTIALS_VARIABLE),
         _ => false,

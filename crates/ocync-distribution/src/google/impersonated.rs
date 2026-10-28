@@ -42,7 +42,7 @@ pub(super) const IMPERSONATION_URL_FIELD: &str = "service_account_impersonation_
 
 /// A service account impersonated with source credentials.
 #[derive(Debug)]
-pub(crate) struct Account {
+pub(super) struct Account {
     source: Box<Credentials>,
     url: Url,
     delegates: Option<Vec<String>>,

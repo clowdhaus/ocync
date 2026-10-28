@@ -18,7 +18,7 @@ use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::auth::docker::{DockerConfig, DockerConfigAuth};
 use ocync_distribution::auth::ecr::EcrAuth;
 use ocync_distribution::auth::ecr_public::EcrPublicAuth;
-use ocync_distribution::auth::gcp::{DefaultCredentials, GcpAuth};
+use ocync_distribution::auth::gcp::{GcpAuth, SharedGoogleToken};
 use ocync_distribution::auth::static_token::StaticTokenAuth;
 use ocync_distribution::{AwsCredentialProviders, RegistryClient};
 
@@ -224,7 +224,7 @@ impl<'a> Registry<'a> {
 #[derive(Debug, Default)]
 pub(crate) struct RunCredentials {
     pub(crate) aws: AwsCredentialProviders,
-    pub(crate) gcp: DefaultCredentials,
+    pub(crate) gcp: SharedGoogleToken,
 }
 
 /// Build a [`RegistryClient`] for `registry`, using the appropriate auth
