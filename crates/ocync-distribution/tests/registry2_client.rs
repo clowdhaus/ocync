@@ -14,7 +14,8 @@
 #[allow(unreachable_pub)]
 mod common;
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures_util::{TryStreamExt, stream};
@@ -23,6 +24,7 @@ use ocync_distribution::aimd::RegistryAction;
 use ocync_distribution::client::RegistryClientBuilder;
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
 use ocync_distribution::{Digest, Error};
+use testcontainers::bollard;
 
 use common::{local_client, start_registry, start_registry_tls, test_digest};
 
@@ -87,100 +89,128 @@ async fn registry_runs_under_init() {
     assert_eq!(String::from_utf8_lossy(&pid1).trim(), "docker-init");
 }
 
-/// Run the Docker CLI with `args` and return its trimmed stdout.
-fn docker(args: &[&str]) -> String {
-    let output = std::process::Command::new("docker")
-        .args(args)
-        .output()
-        .expect("docker runs");
-    assert!(output.status.success(), "docker {args:?}: {output:?}");
-    String::from_utf8(output.stdout)
-        .expect("docker prints UTF-8")
-        .trim()
-        .to_owned()
-}
-
-/// The full IDs of the containers carrying `label`, sorted, or `None` if
-/// Docker could not be asked.
-fn labeled(label: &str) -> Option<Vec<String>> {
-    let output = std::process::Command::new("docker")
-        .args(["ps", "--all", "--quiet", "--no-trunc", "--filter"])
-        .arg(format!("label={label}"))
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    let mut ids: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .map(str::to_owned)
+/// The sorted IDs of the containers matching the label `filter`.
+async fn labeled_ids(docker: &bollard::Docker, filter: &str) -> Vec<String> {
+    let mut ids: Vec<String> = common::labeled(docker, filter)
+        .await
+        .expect("Docker lists containers")
+        .into_iter()
+        .filter_map(|container| container.id)
         .collect();
     ids.sort();
-    Some(ids)
+    ids
 }
 
-/// Removes every container with its label when dropped, so a failing test
-/// leaves none behind.
-struct RemoveLabeledOnDrop(String);
+/// Create a `registry:2` container labeled [`common::LABEL_KEY`]`=value`
+/// that sleeps for ten minutes once started, and return its ID. A failed
+/// test leaves it to stop on its own, so a later sweep removes it as a
+/// stopped container rather than a day later as a running one.
+async fn labeled_container(docker: &bollard::Docker, value: &str) -> String {
+    use bollard::models::{ContainerCreateBody, HostConfig};
+    use bollard::query_parameters::CreateContainerOptions;
 
-impl Drop for RemoveLabeledOnDrop {
-    /// Never panics, as a panic while a failing test unwinds aborts the
-    /// whole test binary.
-    fn drop(&mut self) {
-        if let Some(ids) = labeled(&self.0).filter(|ids| !ids.is_empty()) {
-            let _ = std::process::Command::new("docker")
-                .args(["rm", "--force"])
-                .args(ids)
-                .output();
-        }
-    }
+    docker
+        .create_container(
+            None::<CreateContainerOptions>,
+            ContainerCreateBody {
+                image: Some("registry:2".to_owned()),
+                entrypoint: Some(vec!["sleep".to_owned(), "600".to_owned()]),
+                labels: Some(HashMap::from([(
+                    common::LABEL_KEY.to_owned(),
+                    value.to_owned(),
+                )])),
+                host_config: Some(HostConfig {
+                    init: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Docker creates the container")
+        .id
 }
 
 /// A sweep removes a stopped container only past its stopped age, and a
 /// running one only past its any-state age. Breaks if a container another
-/// run is still starting is removed, one left behind is kept, or a
-/// container with another label is touched. Its labels are its own, so it
-/// never removes another test's container.
+/// run is still starting is removed, one left behind is kept, a container
+/// with another label is touched, or a daemon clock a little ahead of this
+/// host's keeps a container. Its labels are its own, so it never removes
+/// another test's container; a failure leaves them to a later run's sweep.
 #[tokio::test]
 async fn sweep_removes_only_containers_past_their_age() {
+    use bollard::query_parameters::{CreateImageOptions, StartContainerOptions};
+
+    let docker = testcontainers::core::client::docker_client_instance()
+        .await
+        .expect("a Docker client");
+    docker
+        .create_image(
+            Some(CreateImageOptions {
+                from_image: Some("registry".to_owned()),
+                tag: Some("2".to_owned()),
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("Docker pulls registry:2");
     let value = format!(
         "sweep-check-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
+        SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
     );
-    let label = common::label(&value);
-    let other = common::label(&format!("{value}-other"));
-    let _cleanup = (
-        RemoveLabeledOnDrop(label.clone()),
-        RemoveLabeledOnDrop(other.clone()),
-    );
-    let created = docker(&["create", "--label", &label, "registry:2"]);
-    let running = docker(&["run", "--detach", "--init", "--label", &label, "registry:2"]);
-    let unrelated = docker(&["create", "--label", &other, "registry:2"]);
-    let listed = |label: &str| labeled(label).expect("docker lists containers");
+    let other_value = format!("{value}-other");
+    let created = labeled_container(&docker, &value).await;
+    let running = labeled_container(&docker, &value).await;
+    docker
+        .start_container(&running, None::<StartContainerOptions>)
+        .await
+        .expect("Docker starts the container");
+    let unrelated = labeled_container(&docker, &other_value).await;
+    let (label, other) = (common::label(&value), common::label(&other_value));
+    // A daemon clock up to a minute ahead of this host still counts these
+    // containers as created by now.
+    let now = SystemTime::now() + Duration::from_secs(60);
 
     for (stopped, any_state, removed, left) in [
         (
-            common::LONGEST_TEST,
-            common::LONGEST_TEST,
+            common::LONGEST_RUN,
+            common::LONGEST_RUN,
             0,
             vec![&created, &running],
         ),
-        (Duration::ZERO, common::LONGEST_TEST, 1, vec![&running]),
+        (Duration::ZERO, common::LONGEST_RUN, 1, vec![&running]),
         (Duration::ZERO, Duration::ZERO, 1, vec![]),
     ] {
         let ages = common::OrphanAge { stopped, any_state };
+        let swept = common::sweep(&label, ages, now).await.unwrap();
         assert_eq!(
-            common::sweep(&label, ages).await.unwrap(),
-            removed,
+            (swept.removed, swept.failed.len()),
+            (removed, 0),
             "{ages:?}"
         );
         let mut left: Vec<String> = left.into_iter().cloned().collect();
         left.sort();
-        assert_eq!(listed(&label), left, "{ages:?}");
+        assert_eq!(labeled_ids(&docker, &label).await, left, "{ages:?}");
     }
-    assert_eq!(listed(&other), [unrelated], "another label is never swept");
+    assert_eq!(
+        labeled_ids(&docker, &other).await,
+        std::slice::from_ref(&unrelated),
+        "another label is never swept"
+    );
+    docker
+        .remove_container(
+            &unrelated,
+            None::<bollard::query_parameters::RemoveContainerOptions>,
+        )
+        .await
+        .expect("Docker removes the container");
 }
 
 /// Starting a registry runs the orphan sweep, and the registry is found by
@@ -190,7 +220,10 @@ async fn sweep_removes_only_containers_past_their_age() {
 async fn starting_a_registry_sweeps_and_labels_it() {
     let (container, _url) = start_registry().await;
     assert!(common::swept(), "start runs the orphan sweep");
-    let ids = labeled(common::LABEL_KEY).expect("docker lists containers");
+    let docker = testcontainers::core::client::docker_client_instance()
+        .await
+        .expect("a Docker client");
+    let ids = labeled_ids(&docker, common::LABEL_KEY).await;
     assert!(ids.iter().any(|id| id == container.id()), "{ids:?}");
 }
 

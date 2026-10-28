@@ -3,7 +3,7 @@
 #![allow(dead_code, reason = "each test binary uses only some of these helpers")]
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ocync_distribution::client::RegistryClientBuilder;
 use ocync_distribution::{Digest, RegistryClient};
@@ -30,10 +30,12 @@ pub fn label(value: &str) -> String {
     format!("{LABEL_KEY}={value}")
 }
 
-/// testcontainers' fixed timeout on each Docker request.
+/// testcontainers 0.28's fixed timeout on each Docker request. Not
+/// exported, so an upgrade rechecks it.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// testcontainers' timeout on starting a created container.
+/// testcontainers 0.28's timeout on starting a created container. Not
+/// exported, so an upgrade rechecks it.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The longest a test container can sit between Docker's creation time and
@@ -43,8 +45,9 @@ const LONGEST_START: Duration = CLIENT_TIMEOUT
     .saturating_mul(3)
     .saturating_add(START_TIMEOUT);
 
-/// Longer than any test runs.
-pub const LONGEST_TEST: Duration = Duration::from_secs(60 * 60);
+/// Longer than any test run, a profiling run included, so a sweep never
+/// removes a registry another run is still using.
+pub const LONGEST_RUN: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How old a labeled container must be to count as left behind.
 #[derive(Debug, Clone, Copy)]
@@ -53,16 +56,16 @@ pub struct OrphanAge {
     /// create or start that times out under load is still finished by
     /// Docker later, with no handle left in the test to remove it.
     pub stopped: Duration,
-    /// For any container, running or not: one whose start finished after
+    /// For a container in any other state: one whose start finished after
     /// the test gave up on it is left running.
     pub any_state: Duration,
 }
 
 /// What a test run sweeps: stopped containers well past the longest start,
-/// and any past the longest test.
+/// and any past the longest run.
 const ORPHANS: OrphanAge = OrphanAge {
     stopped: LONGEST_START.saturating_mul(2),
-    any_state: LONGEST_TEST,
+    any_state: LONGEST_RUN,
 };
 
 /// Why a sweep failed.
@@ -71,69 +74,85 @@ pub enum SweepError {
     /// No Docker client, found as testcontainers finds the daemon.
     #[error("connecting to Docker: {0}")]
     Connect(#[source] testcontainers::core::client::ClientError),
-    /// Docker refused a list or a removal.
-    #[error("Docker: {0}")]
-    Docker(#[source] bollard::errors::Error),
+    /// Docker refused to list the containers.
+    #[error("listing containers: {0}")]
+    List(#[source] bollard::errors::Error),
+}
+
+/// What a sweep removed, and the removals Docker refused.
+#[derive(Debug, Default)]
+pub struct Swept {
+    /// How many containers were removed.
+    pub removed: usize,
+    /// Each container Docker would not remove, such as one stuck as a
+    /// zombie, with why. The others are still removed.
+    pub failed: Vec<(String, bollard::errors::Error)>,
+}
+
+/// The containers matching the label `filter` (`key` or `key=value`), in
+/// any state.
+pub async fn labeled(
+    docker: &bollard::Docker,
+    filter: &str,
+) -> Result<Vec<bollard::models::ContainerSummary>, bollard::errors::Error> {
+    use bollard::query_parameters::ListContainersOptions;
+
+    docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "label".to_owned(),
+                vec![filter.to_owned()],
+            )])),
+            ..Default::default()
+        }))
+        .await
 }
 
 /// Remove the containers matching the label `filter` (`key` or
-/// `key=value`) that `ages` counts as left behind, returning how many were
-/// removed. Ages are measured on this host's clock against Docker's
-/// creation times, so they assume the daemon's clock agrees, as a local
-/// daemon's does.
-pub async fn sweep(filter: &str, ages: OrphanAge) -> Result<usize, SweepError> {
-    use bollard::query_parameters::{ListContainersOptions, RemoveContainerOptions};
+/// `key=value`) that `ages` counts as left behind at `now`. Ages are
+/// measured against Docker's creation times, so `now` is on the daemon's
+/// clock, which a local daemon shares with this host.
+pub async fn sweep(filter: &str, ages: OrphanAge, now: SystemTime) -> Result<Swept, SweepError> {
+    use bollard::models::ContainerSummaryStateEnum as State;
+    use bollard::query_parameters::RemoveContainerOptions;
 
     let docker = testcontainers::core::client::docker_client_instance()
         .await
         .map_err(SweepError::Connect)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock is past 1970");
-    let created_before = |age: Duration| (now.saturating_sub(age).as_secs()) as i64;
-    let mut removed = 0;
-    for (statuses, age) in [
-        (&["created", "exited", "dead"][..], ages.stopped),
-        (&[][..], ages.any_state),
-    ] {
-        let mut filters = HashMap::from([("label".to_owned(), vec![filter.to_owned()])]);
-        if !statuses.is_empty() {
-            filters.insert(
-                "status".to_owned(),
-                statuses.iter().map(|&status| status.to_owned()).collect(),
-            );
+    let containers = labeled(&docker, filter).await.map_err(SweepError::List)?;
+    let mut swept = Swept::default();
+    for container in containers {
+        let (Some(id), Some(created)) = (container.id, container.created) else {
+            continue;
+        };
+        let threshold = match container.state {
+            Some(State::CREATED | State::EXITED | State::DEAD) => ages.stopped,
+            _ => ages.any_state,
+        };
+        // A creation time that cannot be read never counts as old.
+        let Ok(created) = u64::try_from(created) else {
+            continue;
+        };
+        let created = UNIX_EPOCH + Duration::from_secs(created);
+        if created.checked_add(threshold).is_none_or(|due| due > now) {
+            continue;
         }
-        let containers = docker
-            .list_containers(Some(ListContainersOptions {
-                all: true,
-                filters: Some(filters),
-                ..Default::default()
-            }))
-            .await
-            .map_err(SweepError::Docker)?;
-        for container in containers {
-            let (Some(id), Some(created)) = (container.id, container.created) else {
-                continue;
-            };
-            if created > created_before(age) {
-                continue;
-            }
-            let options = RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            };
-            match docker.remove_container(&id, Some(options)).await {
-                Ok(()) => removed += 1,
-                // Another run removed it first.
-                Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404 | 409,
-                    ..
-                }) => {}
-                Err(e) => return Err(SweepError::Docker(e)),
-            }
+        let options = RemoveContainerOptions {
+            force: true,
+            ..Default::default()
+        };
+        match docker.remove_container(&id, Some(options)).await {
+            Ok(()) => swept.removed += 1,
+            // Another run removed it first.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404 | 409,
+                ..
+            }) => {}
+            Err(e) => swept.failed.push((id, e)),
         }
     }
-    Ok(removed)
+    Ok(swept)
 }
 
 /// Set once a process has run its orphan sweep.
@@ -153,17 +172,27 @@ async fn sweep_orphans() {
 
     SWEPT
         .get_or_init(|| async {
-            let _ = match sweep(LABEL_KEY, ORPHANS).await {
-                Ok(0) => Ok(()),
-                Ok(removed) => writeln!(
-                    std::io::stderr(),
-                    "removed {removed} leftover test containers"
-                ),
-                Err(e) => writeln!(
-                    std::io::stderr(),
-                    "warning: sweeping leftover test containers failed: {e}"
-                ),
-            };
+            let mut stderr = std::io::stderr();
+            match sweep(LABEL_KEY, ORPHANS, SystemTime::now()).await {
+                Ok(swept) => {
+                    if swept.removed > 0 {
+                        let _ =
+                            writeln!(stderr, "removed {} leftover test containers", swept.removed);
+                    }
+                    for (id, e) in swept.failed {
+                        let _ = writeln!(
+                            stderr,
+                            "warning: leftover test container {id} not removed: {e}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        stderr,
+                        "warning: sweeping leftover test containers failed: {e}"
+                    );
+                }
+            }
         })
         .await;
 }
