@@ -36,7 +36,7 @@ fn impersonated_file(server: &MockServer) -> Value {
     })
 }
 
-async fn build(json: Value, scopes: Scopes) -> Result<Impersonated, Error> {
+async fn build(json: Value, scopes: Scopes) -> Result<Account, Error> {
     let host = host(Platform::Unix, &[], &[]);
     let clients = Clients::new().unwrap();
     let aws_credentials = AwsCredentialProviders::default();
@@ -45,7 +45,7 @@ async fn build(json: Value, scopes: Scopes) -> Result<Impersonated, Error> {
         clients: &clients,
         aws_credentials: &aws_credentials,
     };
-    Impersonated::from_json(json, scopes, &setup).await
+    Account::from_json(json, scopes, &setup).await
 }
 
 async fn mount_source(server: &MockServer) {
@@ -72,7 +72,7 @@ fn iam_answer(expire_time: &str) -> ResponseTemplate {
     }))
 }
 
-async fn token(account: &Impersonated) -> Result<AccessToken, Error> {
+async fn token(account: &Account) -> Result<AccessToken, Error> {
     account
         .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
         .await

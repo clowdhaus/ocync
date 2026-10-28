@@ -8,6 +8,9 @@ use serde_json::Value;
 use super::{AccessToken, Call, Clients, Error, Scopes, Secret, expiring, send_json};
 use crate::aws::Clock;
 
+/// The refresh grant, RFC 6749 section 6.
+const GRANT_TYPE: &str = "refresh_token";
+
 /// The token endpoint when the file names none.
 const TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 
@@ -96,7 +99,7 @@ impl AuthorizedUser {
         clock: Clock,
     ) -> Result<AccessToken, Error> {
         let request = clients.api.post(&self.token_uri).json(&RefreshRequest {
-            grant_type: "refresh_token",
+            grant_type: GRANT_TYPE,
             client_id: &self.client_id,
             client_secret: self.client_secret.expose(),
             refresh_token: self.refresh_token.expose(),

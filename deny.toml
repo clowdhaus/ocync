@@ -30,6 +30,12 @@ deny = [
   { crate = "openssl", wrappers = [] },
   { crate = "openssl-sys", wrappers = [] },
   { crate = "ring", wrappers = [] },
+  # Pure-Rust hashes and a ChaCha20 generator sit outside the FIPS module.
+  # Only the testcontainers dev dependency may pull the generator.
+  { crate = "sha2", wrappers = [] },
+  { crate = "hmac", wrappers = [] },
+  { crate = "chacha20", wrappers = ["rand"] },
+  { crate = "rand", wrappers = ["bollard", "ferroid"] },
 ]
 # Transitive duplicates from AWS SDK + testcontainers ecosystem version splits.
 # These are unavoidable until upstream unifies major versions.

@@ -47,7 +47,7 @@ pub(super) fn parse_url(field: &'static str, url: &str) -> Result<Url, Error> {
 
 /// A service account impersonated with source credentials.
 #[derive(Debug)]
-pub(crate) struct Impersonated {
+pub(crate) struct Account {
     source: Box<Credentials>,
     url: Url,
     delegates: Option<Vec<String>>,
@@ -80,7 +80,7 @@ struct GenerateResponse {
     expire_time: String,
 }
 
-impl Impersonated {
+impl Account {
     /// The account `json` describes, asking for `scopes`. The source is
     /// built with its own defaults, as upstream, and may be any supported
     /// type but this one.

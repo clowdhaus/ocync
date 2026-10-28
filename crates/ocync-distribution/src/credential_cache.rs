@@ -109,6 +109,14 @@ impl<T: Clone + Send + Sync> CredentialCache<T> {
         *self.cached.write().await = None;
     }
 
+    /// Clear the cached value if `matches` says it is the one to drop.
+    pub(crate) async fn clear_if(&self, matches: impl FnOnce(&T) -> bool) {
+        let mut cached = self.cached.write().await;
+        if cached.as_ref().is_some_and(|entry| matches(&entry.value)) {
+            *cached = None;
+        }
+    }
+
     /// Replace the cached value (test helper).
     #[cfg(test)]
     pub(crate) async fn set(&self, value: T, ttl: Duration) {

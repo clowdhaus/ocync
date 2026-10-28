@@ -35,7 +35,7 @@ const METHOD: http::Method = http::Method::POST;
 /// `environment_id` selects it and is not read further, as upstream; the
 /// role URL `url` is not read, as the AWS chain supplies the credentials.
 #[derive(Debug, Deserialize)]
-pub(super) struct AwsSourceFile {
+pub(super) struct SourceFile {
     #[serde(rename = "environment_id")]
     _environment_id: IgnoredAny,
     region_url: Option<String>,
@@ -45,7 +45,7 @@ pub(super) struct AwsSourceFile {
 
 /// The AWS subject token source.
 #[derive(Debug)]
-pub(super) struct AwsSource {
+pub(super) struct Source {
     signer: CallerIdentitySigner,
     url: Url,
     /// The host of `url`, signed as `host`.
@@ -68,14 +68,14 @@ struct Header<'a> {
     value: &'a str,
 }
 
-impl AwsSource {
+impl Source {
     /// The source `file` describes, for `audience`: the region from the
     /// environment or `region_url`, the STS URL from
     /// `regional_cred_verification_url` or the default, and that region's
     /// credentials from the run's AWS chain.
     pub(super) async fn new(
         setup: &Setup<'_>,
-        file: &AwsSourceFile,
+        file: &SourceFile,
         audience: &str,
     ) -> Result<Self, Error> {
         let region = match region_from_env(&setup.host.env) {
@@ -153,7 +153,7 @@ fn region_from_env(env: &Env) -> Option<Result<Region, InvalidRegion>> {
 /// is set up.
 async fn region_from_metadata(
     setup: &Setup<'_>,
-    file: &AwsSourceFile,
+    file: &SourceFile,
 ) -> Result<Result<Region, InvalidRegion>, Error> {
     let Some(region_url) = &file.region_url else {
         return Err(Error::NoAwsRegion);
@@ -169,7 +169,7 @@ async fn region_from_metadata(
 /// One try of [`region_from_metadata`].
 async fn zone_region(
     setup: &Setup<'_>,
-    file: &AwsSourceFile,
+    file: &SourceFile,
     region_url: &str,
 ) -> Result<Result<Region, InvalidRegion>, Error> {
     let client = &setup.clients.metadata;
@@ -265,7 +265,7 @@ mod tests {
             "https://sts.eu-west-1.amazonaws.com/"
         );
         assert!(sts_url(Some("http://"), &region("us-east-1")).is_err());
-        let no_host = AwsSource::with_signer(
+        let no_host = Source::with_signer(
             CallerIdentitySigner::example("us-east-1", None),
             Some("httpx:/sts"),
             "audience",
@@ -330,7 +330,7 @@ mod tests {
             aws_credentials: &aws_credentials,
         };
 
-        let file = |region_url: Option<String>, imdsv2_url: Option<String>| AwsSourceFile {
+        let file = |region_url: Option<String>, imdsv2_url: Option<String>| SourceFile {
             _environment_id: IgnoredAny,
             region_url,
             regional_cred_verification_url: None,
@@ -385,7 +385,7 @@ mod tests {
                 clients: &clients,
                 aws_credentials: &aws_credentials,
             };
-            let file = AwsSourceFile {
+            let file = SourceFile {
                 _environment_id: IgnoredAny,
                 region_url: Some(format!("{}/zone", server.uri())),
                 regional_cred_verification_url: None,
@@ -418,14 +418,14 @@ mod tests {
             clients: &clients,
             aws_credentials: &aws_credentials,
         };
-        let file = AwsSourceFile {
+        let file = SourceFile {
             _environment_id: IgnoredAny,
             region_url: None,
             regional_cred_verification_url: None,
             imdsv2_session_token_url: None,
         };
 
-        let source = AwsSource::new(&setup, &file, "audience").await.unwrap();
+        let source = Source::new(&setup, &file, "audience").await.unwrap();
         let token = source.subject_token(UNIX_EPOCH).await.unwrap();
 
         let json: String = url::form_urlencoded::parse(token.expose().as_bytes())
@@ -445,7 +445,7 @@ mod tests {
     /// encoding changes.
     #[tokio::test]
     async fn signs_the_caller_identity_request() {
-        let source = AwsSource::with_signer(
+        let source = Source::with_signer(
             CallerIdentitySigner::example("us-east-1", Some("session-token")),
             None,
             "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",

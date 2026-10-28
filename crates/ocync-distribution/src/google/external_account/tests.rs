@@ -39,7 +39,7 @@ fn token_host(token: &str) -> Host {
     )
 }
 
-async fn build(json: Value, scopes: Scopes, host: &Host) -> Result<ExternalAccount, Error> {
+async fn build(json: Value, scopes: Scopes, host: &Host) -> Result<Account, Error> {
     let clients = Clients::new().unwrap();
     let aws_credentials = AwsCredentialProviders::default();
     let setup = Setup {
@@ -47,10 +47,10 @@ async fn build(json: Value, scopes: Scopes, host: &Host) -> Result<ExternalAccou
         clients: &clients,
         aws_credentials: &aws_credentials,
     };
-    ExternalAccount::from_json(json, scopes, &setup).await
+    Account::from_json(json, scopes, &setup).await
 }
 
-async fn token(account: &ExternalAccount) -> Result<AccessToken, Error> {
+async fn token(account: &Account) -> Result<AccessToken, Error> {
     account
         .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
         .await
@@ -462,4 +462,17 @@ fn refuses_a_bad_url_source_header() {
             "{error}"
         );
     }
+}
+
+/// A URL source's header values never print. Breaks if a token in one
+/// reaches a `Debug` print of the credentials.
+#[test]
+fn url_source_headers_never_print() {
+    let headers = header_map(HashMap::from([(
+        "authorization".to_owned(),
+        "bearer gha-token".to_owned(),
+    )]))
+    .unwrap();
+    let printed = format!("{headers:?}");
+    assert!(!printed.contains("gha-token"), "{printed}");
 }

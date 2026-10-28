@@ -301,9 +301,10 @@ pub(crate) enum Error {
 impl Error {
     /// Whether the call may succeed if sent again, as upstream classifies
     /// it: a 5xx, 408 or 429 answer, or a transport failure the crate
-    /// retries. An answer that is not the JSON expected is final. The
-    /// metadata server is the exception: a host with no
-    /// metadata server never gets one, and upstream tries it once.
+    /// retries. An answer that is not the JSON expected is final. A
+    /// metadata server that does not connect is final too: a host with no
+    /// metadata server never gets one. One that connects and then times
+    /// out or resets, as GKE's can while it mints a token, may be sent again.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
             Self::Status { status, .. } => {
@@ -312,7 +313,8 @@ impl Error {
                     || *status == http::StatusCode::TOO_MANY_REQUESTS
             }
             Self::Transport { call, source } => {
-                *call != Call::Metadata && crate::retry::is_transient_transport(source)
+                !(*call == Call::Metadata && source.is_connect())
+                    && crate::retry::is_transient_transport(source)
             }
             _ => false,
         }
@@ -418,11 +420,11 @@ impl SourceAuth {
 /// Credentials that obtain access tokens.
 #[derive(Debug)]
 pub(crate) enum Credentials {
-    ServiceAccount(service_account::ServiceAccount),
+    ServiceAccount(service_account::Account),
     AuthorizedUser(user_account::AuthorizedUser),
-    ExternalAccount(Box<external_account::ExternalAccount>),
-    Impersonated(impersonated::Impersonated),
-    Metadata(metadata::Metadata),
+    ExternalAccount(Box<external_account::Account>),
+    Impersonated(impersonated::Account),
+    Metadata(metadata::Server),
 }
 
 impl Credentials {
@@ -440,7 +442,7 @@ impl Credentials {
             aws_credentials,
         };
         match find_file(host)? {
-            None => Ok(Self::Metadata(metadata::Metadata::new(
+            None => Ok(Self::Metadata(metadata::Server::new(
                 &host.env,
                 Scopes::Registry,
             ))),
@@ -462,19 +464,18 @@ impl Credentials {
         Box::pin(async move {
             match kind {
                 CredentialType::ServiceAccount => {
-                    service_account::ServiceAccount::from_json(json, scopes)
-                        .map(Self::ServiceAccount)
+                    service_account::Account::from_json(json, scopes).map(Self::ServiceAccount)
                 }
                 CredentialType::AuthorizedUser => {
                     user_account::AuthorizedUser::from_json(json, scopes).map(Self::AuthorizedUser)
                 }
                 CredentialType::ExternalAccount => {
-                    external_account::ExternalAccount::from_json(json, scopes, setup)
+                    external_account::Account::from_json(json, scopes, setup)
                         .await
                         .map(|account| Self::ExternalAccount(Box::new(account)))
                 }
                 CredentialType::Impersonated => {
-                    impersonated::Impersonated::from_json(json, scopes, setup)
+                    impersonated::Account::from_json(json, scopes, setup)
                         .await
                         .map(Self::Impersonated)
                 }

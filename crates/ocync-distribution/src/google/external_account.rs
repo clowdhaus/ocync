@@ -13,7 +13,7 @@ use serde::de::IgnoredAny;
 use serde_json::Value;
 use url::Url;
 
-use super::aws_source::{AwsSource, AwsSourceFile};
+use super::aws_source;
 use super::impersonated::{Generate, IMPERSONATION_URL_FIELD, parse_url};
 use super::{
     AccessToken, Call, Clients, DEFAULT_SCOPE, Error, ScopeList, Scopes, Secret, Setup, SourceAuth,
@@ -54,7 +54,7 @@ struct AccountFile {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum SourceFile {
-    Aws(AwsSourceFile),
+    Aws(aws_source::SourceFile),
     Executable {
         #[serde(rename = "executable")]
         _executable: ExecutableFile,
@@ -138,7 +138,7 @@ enum Source {
         format: Format,
     },
     /// A signed AWS `GetCallerIdentity` request.
-    Aws(AwsSource),
+    Aws(aws_source::Source),
 }
 
 impl Source {
@@ -175,7 +175,9 @@ const TOKEN_URL_FIELD: &str = "token_url";
 /// The field naming a URL source.
 const SUBJECT_URL_FIELD: &str = "credential_source.url";
 
-/// A URL source's `headers`, parsed once so a bad one fails at load.
+/// A URL source's `headers`, parsed once so a bad one fails at load. The
+/// values are marked sensitive, so they never print: one can carry a token,
+/// as GitHub Actions' `Authorization` header does.
 fn header_map(headers: HashMap<String, String>) -> Result<HeaderMap, Error> {
     headers
         .into_iter()
@@ -183,7 +185,9 @@ fn header_map(headers: HashMap<String, String>) -> Result<HeaderMap, Error> {
             let parsed = HeaderName::try_from(name.as_str())
                 .ok()
                 .zip(HeaderValue::try_from(value).ok());
-            parsed.ok_or(Error::SubjectHeader(name))
+            let (name, mut value) = parsed.ok_or(Error::SubjectHeader(name))?;
+            value.set_sensitive(true);
+            Ok((name, value))
         })
         .collect()
 }
@@ -206,7 +210,7 @@ enum StsAuth {
 
 /// An external account.
 #[derive(Debug)]
-pub(crate) struct ExternalAccount {
+pub(crate) struct Account {
     audience: String,
     subject_token_type: String,
     token_url: Url,
@@ -231,7 +235,7 @@ struct StsResponse {
     expires_in: u64,
 }
 
-impl ExternalAccount {
+impl Account {
     /// The account `json` describes, asking for `scopes`. An AWS source
     /// resolves its region and takes its AWS credentials here.
     pub(super) async fn from_json(
@@ -245,7 +249,9 @@ impl ExternalAccount {
             return Err(Error::WorkforceProject);
         }
         let source = match file.credential_source {
-            SourceFile::Aws(aws) => Source::Aws(AwsSource::new(setup, &aws, &file.audience).await?),
+            SourceFile::Aws(aws) => {
+                Source::Aws(aws_source::Source::new(setup, &aws, &file.audience).await?)
+            }
             SourceFile::Executable { .. } => return Err(Error::ExecutableSource),
             SourceFile::Url {
                 url,

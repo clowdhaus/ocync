@@ -21,6 +21,12 @@ const CLOCK_SKEW_FUDGE: Duration = Duration::from_secs(10);
 /// How long a token is valid, as upstream's `DEFAULT_TOKEN_TIMEOUT`.
 const LIFETIME: Duration = Duration::from_secs(3600);
 
+/// The JWT signing algorithm, RSASSA-PKCS1-v1_5 with SHA-256 (RFC 7518).
+const ALGORITHM: &str = "RS256";
+
+/// The JWT `typ` header (RFC 7519).
+const TOKEN_TYPE: &str = "JWT";
+
 /// The PEM armor of a PKCS#8 private key.
 const PKCS8_ARMOR: (&str, &str) = ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----");
 
@@ -51,7 +57,7 @@ pub(crate) enum KeyError {
 }
 
 /// A service account and the key it signs with.
-pub(crate) struct ServiceAccount {
+pub(crate) struct Account {
     client_email: String,
     private_key_id: String,
     key: RsaKeyPair,
@@ -59,7 +65,7 @@ pub(crate) struct ServiceAccount {
     scope: String,
 }
 
-impl fmt::Debug for ServiceAccount {
+impl fmt::Debug for Account {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServiceAccount")
             .field("client_email", &self.client_email)
@@ -88,7 +94,7 @@ struct Claims<'a> {
     sub: &'a str,
 }
 
-impl ServiceAccount {
+impl Account {
     /// The service account `json` describes, asking for `scopes`. The key
     /// is parsed here, so a bad key fails when the credentials are loaded.
     pub(super) fn from_json(json: Value, scopes: Scopes) -> Result<Self, Error> {
@@ -109,8 +115,8 @@ impl ServiceAccount {
             .ok_or(Error::ClockBeforeEpoch)?;
         let expiry = now + CLOCK_SKEW_FUDGE + LIFETIME;
         let header = Header {
-            alg: "RS256",
-            typ: "JWT",
+            alg: ALGORITHM,
+            typ: TOKEN_TYPE,
             kid: &self.private_key_id,
         };
         let claims = Claims {
@@ -215,7 +221,7 @@ pub(super) mod tests {
     /// signature is not RS256 over the first two parts.
     #[test]
     fn signs_the_jwt_upstream_writes() {
-        let account = ServiceAccount::from_json(key_file(&pkcs8_pem()), Scopes::Registry).unwrap();
+        let account = Account::from_json(key_file(&pkcs8_pem()), Scopes::Registry).unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
         let token = account.access_token(now).unwrap();
@@ -250,7 +256,7 @@ pub(super) mod tests {
     /// the registry scope leaks into a source credential.
     #[test]
     fn a_source_asks_for_the_default_scope() {
-        let account = ServiceAccount::from_json(key_file(&pkcs8_pem()), Scopes::Default).unwrap();
+        let account = Account::from_json(key_file(&pkcs8_pem()), Scopes::Default).unwrap();
         assert_eq!(account.scope, DEFAULT_SCOPE);
     }
 
@@ -264,7 +270,7 @@ pub(super) mod tests {
             pkcs1,
             "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
         ] {
-            let error = ServiceAccount::from_json(key_file(pem), Scopes::Registry).unwrap_err();
+            let error = Account::from_json(key_file(pem), Scopes::Registry).unwrap_err();
             assert!(matches!(error, Error::PrivateKey(_)), "{error}");
         }
     }
@@ -276,7 +282,7 @@ pub(super) mod tests {
     fn refuses_a_file_missing_a_field() {
         let mut file = key_file(&pkcs8_pem());
         file.as_object_mut().unwrap().remove("project_id");
-        let error = ServiceAccount::from_json(file, Scopes::Registry).unwrap_err();
+        let error = Account::from_json(file, Scopes::Registry).unwrap_err();
         let error = crate::error::error_chain(&error);
         assert!(error.contains("project_id"), "{error}");
     }

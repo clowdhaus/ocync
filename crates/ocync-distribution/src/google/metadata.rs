@@ -32,7 +32,7 @@ pub(super) const TIMEOUTS: Timeouts = Timeouts {
 
 /// The metadata server's token endpoint.
 #[derive(Debug)]
-pub(crate) struct Metadata {
+pub(crate) struct Server {
     /// The server, `http://` and the host, with no trailing slash.
     root: String,
     /// The comma-joined scopes, or `None` for the server's default.
@@ -48,7 +48,7 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
-impl Metadata {
+impl Server {
     /// The server [`HOST_VARIABLE`] names, else the default, asking for
     /// `scopes`.
     pub(super) fn new(env: &Env, scopes: Scopes) -> Self {
@@ -108,14 +108,14 @@ mod tests {
     /// the variable is ignored or given a scheme of its own.
     #[test]
     fn resolves_the_server() {
-        let default = Metadata::new(&Env::Fixed(HashMap::new()), Scopes::Default);
+        let default = Server::new(&Env::Fixed(HashMap::new()), Scopes::Default);
         assert_eq!(default.root, "http://metadata.google.internal");
         let env = Env::Fixed(HashMap::from([(
             HOST_VARIABLE.to_owned(),
             "10.0.0.1:8080/".to_owned(),
         )]));
         assert_eq!(
-            Metadata::new(&env, Scopes::Default).root,
+            Server::new(&env, Scopes::Default).root,
             "http://10.0.0.1:8080"
         );
     }
@@ -138,7 +138,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let token = Metadata::new(&server_env(&server), Scopes::Registry)
+        let token = Server::new(&server_env(&server), Scopes::Registry)
             .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
             .await
             .unwrap();
@@ -162,7 +162,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let token = Metadata::new(&server_env(&server), Scopes::Default)
+        let token = Server::new(&server_env(&server), Scopes::Default)
             .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
             .await
             .unwrap();
@@ -185,7 +185,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(status).set_body_string(body))
                 .mount(&server)
                 .await;
-            let error = Metadata::new(&server_env(&server), Scopes::Default)
+            let error = Server::new(&server_env(&server), Scopes::Default)
                 .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
                 .await
                 .unwrap_err();
@@ -202,7 +202,7 @@ mod tests {
             HOST_VARIABLE.to_owned(),
             "127.0.0.1:1".to_owned(),
         )]));
-        let error = Metadata::new(&env, Scopes::Default)
+        let error = Server::new(&env, Scopes::Default)
             .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
             .await
             .unwrap_err();

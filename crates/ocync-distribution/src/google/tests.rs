@@ -179,11 +179,22 @@ fn a_secret_never_prints() {
     assert_eq!(format!("{secret:?}"), REDACTED);
 }
 
-/// An answer cut short while its body is read may be sent again. Breaks if
-/// a body read failure is final, which a reset after the headers would
-/// make of a throttled Google endpoint.
+/// An answer cut short while its body is read may be sent again, from the
+/// metadata server too. Breaks if a body read failure is final, which a
+/// reset after the headers would make of a throttled Google endpoint or a
+/// GKE metadata server minting a token.
 #[tokio::test]
 async fn a_body_cut_short_is_transient() {
+    for call in [Call::UserToken, Call::Metadata] {
+        let error = cut_short(call).await;
+        assert!(matches!(error, Error::Transport { .. }), "{error}");
+        assert!(error.is_transient(), "{call}: {error}");
+    }
+}
+
+/// The error of `call` to a server that closes the connection partway
+/// through its answer's body.
+async fn cut_short(call: Call) -> Error {
     use std::io::{Read as _, Write as _};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -197,16 +208,12 @@ async fn a_body_cut_short_is_transient() {
     });
     let clients = Clients::new().unwrap();
 
-    let error = send_json::<Value>(
-        Call::UserToken,
-        clients.api.get(format!("http://{address}/")),
-    )
-    .await
-    .unwrap_err();
+    let error = send_json::<Value>(call, clients.api.get(format!("http://{address}/")))
+        .await
+        .unwrap_err();
 
     server.join().unwrap();
-    assert!(matches!(error, Error::Transport { .. }), "{error}");
-    assert!(error.is_transient(), "{error}");
+    error
 }
 
 /// A lifetime past what the clock can hold is refused. Breaks if it
