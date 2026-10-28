@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use ocync_distribution::AwsCredentialProviders;
 use ocync_distribution::RepositoryName;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
@@ -47,8 +48,9 @@ pub(crate) async fn run(
     let destination = Registry::resolve(&registries, args.destination.registry());
     let dst_reg_config = destination.config();
     let source = Registry::resolve(&registries, args.source.registry());
-    let source_client = Arc::new(build_registry_client(source).await?);
-    let target_client = Arc::new(build_registry_client(destination).await?);
+    let aws_credentials = AwsCredentialProviders::default();
+    let source_client = Arc::new(build_registry_client(source, &aws_credentials).await?);
+    let target_client = Arc::new(build_registry_client(destination, &aws_credentials).await?);
 
     let source_authority = source_client
         .registry_authority()
@@ -71,7 +73,7 @@ pub(crate) async fn run(
     };
     let batch_checker: Option<Rc<dyn BatchBlobChecker>> = if dst_is_ecr {
         let profile = dst_reg_config.and_then(|r| r.aws_profile.as_deref());
-        let checker = BatchChecker::from_hostname(dst_hostname, profile)
+        let checker = BatchChecker::from_hostname(dst_hostname, profile, &aws_credentials)
             .map_err(|e| CliError::Input(format!("ECR batch checker for '{dst_hostname}': {e}")))?;
         Some(Rc::new(checker))
     } else {
