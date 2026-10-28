@@ -28,6 +28,7 @@ use url::Url;
 use crate::REDACTED;
 use crate::aws::{AwsCredentialProviders, Clock, Env, Host, Platform};
 use crate::error::{MAX_QUOTED_BYTES, truncate_quoted};
+use crate::retry::{Bounded, retrying};
 
 /// The scope every registry token is asked for: push and pull on Artifact
 /// Registry and Container Registry.
@@ -345,8 +346,23 @@ impl Error {
     }
 }
 
-/// Send `request` for `call` and read its successful answer.
-async fn send(call: Call, request: reqwest::RequestBuilder) -> Result<bytes::Bytes, Error> {
+/// Send `request` for `call` and read its successful answer. A transient
+/// failure sends this request again on the crate's schedule, and only this
+/// one, so a failure at the end of a chain repeats none of the calls before
+/// it. The prepare phase reaches these calls before the engine's retry
+/// exists, which is why they retry themselves.
+async fn send(call: Call, request: reqwest::RequestBuilder) -> Result<Vec<u8>, Error> {
+    retrying(&call.to_string(), &mut Bounded(Error::is_transient), |_| {
+        let request = request
+            .try_clone()
+            .expect("a Google request's body is buffered, so it clones");
+        send_once(call, request)
+    })
+    .await
+}
+
+/// One try of [`send`].
+async fn send_once(call: Call, request: reqwest::RequestBuilder) -> Result<Vec<u8>, Error> {
     let transport = |source: reqwest::Error| Error::Transport {
         call,
         source: source.without_url(),
@@ -362,7 +378,7 @@ async fn send(call: Call, request: reqwest::RequestBuilder) -> Result<bytes::Byt
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body.into())
+    Ok(body)
 }
 
 /// Send `request` for `call` and decode its JSON answer.
@@ -378,7 +394,7 @@ async fn send_json<T: serde::de::DeserializeOwned>(
 /// UTF-8.
 async fn send_text(call: Call, request: reqwest::RequestBuilder) -> Result<String, Error> {
     let body = send(call, request).await?;
-    String::from_utf8(body.into()).map_err(|source| Error::NotUtf8 { call, source })
+    String::from_utf8(body).map_err(|source| Error::NotUtf8 { call, source })
 }
 
 /// The scopes a credential asks for.
@@ -394,10 +410,11 @@ enum Scopes {
 impl Scopes {
     /// The registry scope, else the file's `listed` scopes, else `default`.
     fn resolve(self, listed: Option<Vec<String>>, default: &'static str) -> ScopeList {
-        ScopeList(match (self, listed) {
-            (Self::Registry, _) => vec![Cow::Borrowed(REGISTRY_SCOPE)],
-            (Self::Default, Some(listed)) => listed.into_iter().map(Cow::Owned).collect(),
-            (Self::Default, None) => vec![Cow::Borrowed(default)],
+        self.registry_or_endpoint_default().unwrap_or_else(|| {
+            ScopeList(match listed {
+                Some(listed) => listed.into_iter().map(Cow::Owned).collect(),
+                None => vec![Cow::Borrowed(default)],
+            })
         })
     }
 

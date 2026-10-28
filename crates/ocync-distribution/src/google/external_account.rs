@@ -5,8 +5,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -389,8 +387,8 @@ impl Account {
         }
         let mut request = clients.api.post(self.token_url.clone()).form(&form);
         if let StsAuth::Client { id, secret } = &self.auth {
-            let basic = STANDARD.encode(format!("{id}:{}", secret.expose()));
-            request = request.header("authorization", format!("Basic {basic}"));
+            // Standard padded base64, with the header marked sensitive.
+            request = request.basic_auth(id, Some(secret.expose()));
         }
         let now = clock.now();
         let response: StsResponse = send_json(Call::StsExchange, request).await?;

@@ -459,6 +459,13 @@ pub(crate) async fn exchange(
         });
     }
 
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        tracing::warn!(base_url, "token endpoint refused the credentials");
+        return Err(Error::TokenRefused {
+            registry: base_url.to_owned(),
+            status: StatusCode::UNAUTHORIZED,
+        });
+    }
     if resp.status().is_client_error() || resp.status().is_server_error() {
         let status = resp.status();
         tracing::warn!(base_url, %status, "token endpoint returned error");

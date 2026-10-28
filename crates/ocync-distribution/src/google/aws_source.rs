@@ -17,7 +17,6 @@ use crate::aws::{
     CallerIdentitySigner, InvalidRegion, Region, TOKEN_HEADER, TOKEN_TTL, TOKEN_TTL_HEADER,
     configured_region,
 };
-use crate::retry::{Bounded, retrying};
 
 /// The STS URL when the file names none. `{region}` is replaced.
 const DEFAULT_VERIFICATION_URL: &str =
@@ -149,8 +148,6 @@ fn signed_host(url: &Url) -> Result<String, Error> {
 
 /// The region of the availability zone `file`'s `region_url` answers, with
 /// an `IMDSv2` token from its `imdsv2_session_token_url` when it names one.
-/// A transient failure is sent again, as this runs once, when the registry
-/// is set up.
 async fn region_from_metadata(
     setup: &Setup<'_>,
     file: &SourceFile,
@@ -158,20 +155,6 @@ async fn region_from_metadata(
     let Some(region_url) = &file.region_url else {
         return Err(Error::NoAwsRegion);
     };
-    retrying(
-        "AWS region lookup",
-        &mut Bounded(Error::is_transient),
-        |_| zone_region(setup, file, region_url),
-    )
-    .await
-}
-
-/// One try of [`region_from_metadata`].
-async fn zone_region(
-    setup: &Setup<'_>,
-    file: &SourceFile,
-    region_url: &str,
-) -> Result<Result<Region, InvalidRegion>, Error> {
     let client = &setup.clients.metadata;
     let token = match &file.imdsv2_session_token_url {
         Some(url) => {
@@ -191,17 +174,26 @@ async fn zone_region(
         .ok_or(Error::NoAwsRegion)
 }
 
-/// The region of zone `zone`: `us-east-1d` is in `us-east-1`. A name that
-/// does not end in a letter after a digit is taken as the region itself.
+/// The region of zone `zone`: the name up to its first part that is a
+/// number, without the zone's letter. `us-east-1d` is in `us-east-1`, as
+/// are the Local Zone `us-east-1-bos-1a` and the Wavelength Zone
+/// `us-east-1-wl1-bos-wlz-1`, which upstream reads as regions that do not
+/// exist. A name with no such part is taken as the region itself.
 fn region_from_zone(zone: &str) -> Option<&str> {
     let zone = zone.trim();
-    if !zone.chars().last()?.is_ascii_alphabetic() {
-        return Some(zone);
+    if zone.is_empty() {
+        return None;
     }
-    // The last character is ASCII, one byte, so this cuts on a boundary.
-    let region = &zone[..zone.len() - 1];
-    if region.ends_with(|c: char| c.is_ascii_digit()) {
-        return Some(region);
+    let mut start = 0;
+    for part in zone.split('-') {
+        if part.starts_with(|c: char| c.is_ascii_digit()) {
+            let number = part.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+            if number.bytes().all(|b| b.is_ascii_digit()) {
+                return Some(&zone[..start + number.len()]);
+            }
+            break;
+        }
+        start += part.len() + 1;
     }
     Some(zone)
 }
@@ -230,8 +222,9 @@ mod tests {
         Region::parse(text).unwrap()
     }
 
-    /// Upstream `test_parse_region_from_zone`. Breaks if a zone keeps its
-    /// letter or a region loses its digit.
+    /// Upstream `test_parse_region_from_zone`, and Local and Wavelength
+    /// Zones. Breaks if a zone keeps its letter, a region loses its digit,
+    /// or a Local Zone's own name is kept.
     #[test]
     fn reads_the_region_of_a_zone() {
         for (zone, region) in [
@@ -243,6 +236,9 @@ mod tests {
             ("   ", None),
             ("a", Some("a")),
             ("us-east-1\u{e9}", Some("us-east-1\u{e9}")),
+            ("us-west-2-lax-1a", Some("us-west-2")),
+            ("us-east-1-wl1-bos-wlz-1", Some("us-east-1")),
+            ("ap-northeast-1-tpe-1a", Some("ap-northeast-1")),
         ] {
             assert_eq!(region_from_zone(zone), region, "{zone:?}");
         }

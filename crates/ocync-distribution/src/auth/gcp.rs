@@ -30,7 +30,6 @@ use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{Error, error_chain};
 use crate::google::{self, AccessToken};
-use crate::retry::{Bounded, retrying};
 
 /// Username for GCP `OAuth2` token exchange.
 ///
@@ -57,15 +56,15 @@ pub(crate) trait GcpTokenSource: Send + Sync + fmt::Debug {
 /// doomed requests. Create one per run: the next run, such as the next
 /// watch cycle, reads the credentials again.
 #[derive(Default)]
-pub struct GcpCredentials(OnceCell<Result<Arc<SharedToken>, Rc<google::Error>>>);
+pub struct DefaultCredentials(OnceCell<Result<Arc<SharedToken>, Rc<google::Error>>>);
 
-impl fmt::Debug for GcpCredentials {
+impl fmt::Debug for DefaultCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GcpCredentials").finish_non_exhaustive()
+        f.debug_struct("DefaultCredentials").finish_non_exhaustive()
     }
 }
 
-impl GcpCredentials {
+impl DefaultCredentials {
     /// The token of `host`'s credentials, loaded on first use.
     async fn token(
         &self,
@@ -85,7 +84,7 @@ impl GcpCredentials {
 }
 
 /// A token source and the token it last returned, kept until it is about
-/// to expire or a registry's token exchange refuses it.
+/// to expire or a registry's token exchange refuses it with 401.
 struct SharedToken {
     source: Box<dyn GcpTokenSource>,
     token: CredentialCache<AccessToken>,
@@ -166,16 +165,8 @@ impl GcpTokenSource for AdcTokenSource {
     fn access_token(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<AccessToken, google::Error>> + Send + '_>> {
-        Box::pin(async move {
-            // The prepare phase reaches this before the engine's retry
-            // exists, so a transient failure is sent again here.
-            retrying(
-                "GCP access token",
-                &mut Bounded(google::Error::is_transient),
-                |_| self.credentials.access_token(&self.clients, Clock::System),
-            )
-            .await
-        })
+        // Each request of the chain retries a transient failure itself.
+        Box::pin(self.credentials.access_token(&self.clients, Clock::System))
     }
 }
 
@@ -228,7 +219,7 @@ impl GcpAuth {
         registry: &url::Url,
         http: reqwest::Client,
         aws_credentials: &AwsCredentialProviders,
-        gcp_credentials: &GcpCredentials,
+        gcp_credentials: &DefaultCredentials,
     ) -> Result<Self, Error> {
         Self::on_host(
             registry,
@@ -246,7 +237,7 @@ impl GcpAuth {
         http: reqwest::Client,
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
-        gcp_credentials: &GcpCredentials,
+        gcp_credentials: &DefaultCredentials,
     ) -> Result<Self, Error> {
         let hostname = registry.host_str().unwrap_or_default().to_owned();
         let google_token = gcp_credentials
@@ -297,6 +288,27 @@ impl GcpAuth {
         )
     }
 
+    /// The registry token for `scopes`, exchanged with `google_token`.
+    async fn exchange(
+        &self,
+        scopes: &[Scope],
+        google_token: &google::Secret,
+    ) -> Result<(Token, Option<token_exchange::WwwAuthenticate>), Error> {
+        let credentials = Credentials::Basic {
+            username: GCP_USERNAME.to_owned(),
+            password: google_token.expose().to_owned(),
+        };
+        let cached_challenge = self.challenge_cache.get().await;
+        token_exchange::exchange(
+            &self.http,
+            &self.base_url,
+            scopes,
+            Some(&credentials),
+            cached_challenge.as_ref(),
+        )
+        .await
+    }
+
     /// The current Google token.
     async fn google_token(&self) -> Result<google::Secret, Error> {
         let token = self.google_token.get().await.map_err(|e| {
@@ -324,32 +336,23 @@ impl AuthProvider for GcpAuth {
             let key = scopes_cache_key(&scopes);
             self.tokens
                 .get_or_fetch(key.clone(), || async {
-                    let google_token = self.google_token().await?;
-                    let credentials = Credentials::Basic {
-                        username: GCP_USERNAME.to_owned(),
-                        password: google_token.expose().to_owned(),
-                    };
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-                    let cached_challenge = self.challenge_cache.get().await;
-                    let exchanged = token_exchange::exchange(
-                        &self.http,
-                        &self.base_url,
-                        &scopes,
-                        Some(&credentials),
-                        cached_challenge.as_ref(),
-                    )
-                    .await;
-                    let (token, challenge) = match exchanged {
-                        Ok(exchanged) => exchanged,
-                        Err(e) => {
-                            tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                            // The exchange is the one request the Google
-                            // token authenticates, so a refusal may be of it,
-                            // as when it was revoked or the clocks disagree.
+                    let google_token = self.google_token().await?;
+                    let exchanged = match self.exchange(&scopes, &google_token).await {
+                        // The Google token itself was refused, as when it was
+                        // revoked or Google's clock has passed it: one more
+                        // try with a fresh one. Any other failure, such as a
+                        // scope the identity cannot reach, keeps it.
+                        Err(Error::TokenRefused { .. }) => {
                             self.google_token.refuse(&google_token).await;
-                            return Err(e);
+                            let fresh = self.google_token().await?;
+                            self.exchange(&scopes, &fresh).await
                         }
+                        exchanged => exchanged,
                     };
+                    let (token, challenge) = exchanged.inspect_err(|e| {
+                        tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                    })?;
                     self.challenge_cache.set(challenge).await;
                     Ok(token)
                 })
@@ -364,7 +367,8 @@ impl AuthProvider for GcpAuth {
             self.tokens.clear().await;
             // The Google token stays: a refusal here is of the registry's
             // token, and the kept Google token exchanges for a new one
-            // without a request to Google. A refused exchange drops it.
+            // without a request to Google. An exchange that refuses the
+            // Google token drops it.
             self.challenge_cache.clear().await;
         })
     }
@@ -496,9 +500,10 @@ mod tests {
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }
 
-    /// A refused token exchange drops the Google token, so the next try
-    /// fetches another, as one revoked or past Google's clock would never
-    /// exchange again. Breaks if the refused token is used again.
+    /// An exchange that refuses the Google token with 401 drops it and tries
+    /// once more with a fresh one, as one revoked or past Google's clock
+    /// would never exchange again. Breaks if the refused token is used
+    /// again or the exchange is not tried again.
     #[tokio::test]
     async fn a_refused_exchange_drops_the_google_token() {
         let server = MockServer::start().await;
@@ -528,9 +533,34 @@ mod tests {
             MockGcpTokenSource::with_tokens(vec![("ya29.revoked", None), ("ya29.fresh", None)]),
         );
 
-        auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
-        assert_eq!(password(&auth).await, "ya29.fresh");
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(password(&auth).await, "ya29.fresh");
+    }
+
+    /// An exchange that refuses the scope (403), as for a repository the
+    /// identity cannot reach, keeps the Google token. Breaks if any failed
+    /// exchange fetches another Google token.
+    #[tokio::test]
+    async fn a_refused_scope_keeps_the_google_token() {
+        let server = MockServer::start().await;
+        mount_v2_and_token(&server, "registry")
+            .remove(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth = GcpAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            MockGcpTokenSource::with_tokens(vec![("ya29.kept", None)]),
+        );
+
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
+        assert_eq!(password(&auth).await, "ya29.kept");
     }
 
     #[tokio::test]
@@ -646,7 +676,7 @@ mod tests {
             let auth = adc_auth(
                 "https://us-docker.pkg.dev",
                 &user_host(&server),
-                &GcpCredentials::default(),
+                &DefaultCredentials::default(),
             )
             .await;
 
@@ -665,7 +695,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_user_token(&server, 1).await;
         let host = user_host(&server);
-        let shared = GcpCredentials::default();
+        let shared = DefaultCredentials::default();
         let us = adc_auth("https://us-docker.pkg.dev", &host, &shared).await;
         let europe = adc_auth("https://europe-docker.pkg.dev", &host, &shared).await;
 
@@ -690,7 +720,7 @@ mod tests {
             .mount(&server)
             .await;
         let host = aws_source_host(&server);
-        let shared = GcpCredentials::default();
+        let shared = DefaultCredentials::default();
         let aws_credentials = AwsCredentialProviders::default();
 
         for registry in ["https://us-docker.pkg.dev", "https://europe-docker.pkg.dev"] {
@@ -719,7 +749,7 @@ mod tests {
             .mount(&server)
             .await;
         let host = aws_source_host(&server);
-        let shared = GcpCredentials::default();
+        let shared = DefaultCredentials::default();
         let aws_credentials = AwsCredentialProviders::default();
         let load = |registry: &str| {
             let registry: url::Url = registry.parse().unwrap();
@@ -796,7 +826,11 @@ mod tests {
 
     /// A provider for `registry` with `host`'s credentials, shared through
     /// `shared`.
-    async fn adc_auth(registry: &str, host: &crate::aws::Host, shared: &GcpCredentials) -> GcpAuth {
+    async fn adc_auth(
+        registry: &str,
+        host: &crate::aws::Host,
+        shared: &DefaultCredentials,
+    ) -> GcpAuth {
         GcpAuth::on_host(
             &registry.parse().unwrap(),
             crate::test_http_client(),

@@ -64,6 +64,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// A registry's token endpoint refused the credentials sent to it with
+    /// 401 Unauthorized, as opposed to refusing the scope asked for.
+    #[error("authentication failed for registry '{registry}': token endpoint returned {status}")]
+    TokenRefused {
+        /// The registry whose token endpoint refused the credentials.
+        registry: String,
+        /// The status it answered.
+        status: http::StatusCode,
+    },
+
     /// An external credential helper process failed.
     #[error("credential helper '{helper}' failed: {reason}")]
     CredentialHelperFailed {
@@ -193,7 +203,7 @@ impl Error {
     /// responses with HTTP 401 Unauthorized or 403 Forbidden status codes.
     pub fn is_auth_error(&self) -> bool {
         match self {
-            Self::AuthFailed { .. } => true,
+            Self::AuthFailed { .. } | Self::TokenRefused { .. } => true,
             Self::RegistryError { status, .. } => {
                 *status == http::StatusCode::UNAUTHORIZED || *status == http::StatusCode::FORBIDDEN
             }
@@ -408,6 +418,15 @@ mod tests {
         let err = Error::AuthFailed {
             registry: "example.com".into(),
             reason: "bad creds".into(),
+        };
+        assert!(err.is_auth_error());
+    }
+
+    #[test]
+    fn is_auth_error_token_refused() {
+        let err = Error::TokenRefused {
+            registry: "example.com".into(),
+            status: http::StatusCode::UNAUTHORIZED,
         };
         assert!(err.is_auth_error());
     }

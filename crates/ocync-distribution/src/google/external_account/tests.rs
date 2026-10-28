@@ -167,6 +167,47 @@ async fn impersonates_after_the_exchange() {
     assert_eq!(token.expiry, Some(now() + Duration::from_secs(1_200)));
 }
 
+/// A transient IAM failure sends the IAM call again, and only it: the STS
+/// exchange before it is not repeated. Breaks if a retry restarts the
+/// chain.
+#[tokio::test]
+async fn retries_only_the_failed_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/sts"))
+        .respond_with(sts_answer("ya29.sts"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let iam = "/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken";
+    Mock::given(method("POST"))
+        .and(path(iam))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(iam))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "accessToken": "ya29.impersonated", "expireTime": "2023-11-14T22:33:20Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut file = account_file(&server);
+    file["service_account_impersonation_url"] = format!("{}{iam}", server.uri()).into();
+
+    let account = build(file, Scopes::Registry, &token_host("jwt"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        token(&account).await.unwrap().token.expose(),
+        "ya29.impersonated"
+    );
+}
+
 /// Upstream `test_impersonation_flow_sts_call_fails` and `_iam_call_fails`
 /// and `exchange_token_err`: a failed STS call stops before IAM, and a
 /// failed IAM call is reported. Breaks if IAM is called after a failed

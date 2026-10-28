@@ -228,7 +228,8 @@ async fn cut_short(call: Call) -> Error {
     });
     let clients = Clients::new().unwrap();
 
-    let error = send_json::<Value>(call, clients.api.get(format!("http://{address}/")))
+    // One try: the server answers once, and the retry is not under test.
+    let error = send_once(call, clients.api.get(format!("http://{address}/")))
         .await
         .unwrap_err();
 
