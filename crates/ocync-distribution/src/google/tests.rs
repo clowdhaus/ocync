@@ -255,12 +255,9 @@ async fn cut_short(call: Call) -> Error {
     let clients = Clients::new().unwrap();
 
     // One try: the server answers once, and the retry is not under test.
-    let request = clients
-        .api
-        .get(format!("http://{address}/"))
-        .build()
-        .unwrap();
-    let error = send_once(call, &clients.api, request).await.unwrap_err();
+    let client = clients.client(call);
+    let request = client.get(format!("http://{address}/")).build().unwrap();
+    let error = send_once(call, client, request).await.unwrap_err();
 
     server.join().unwrap();
     error
@@ -285,7 +282,29 @@ fn refuses_a_lifetime_the_clock_cannot_hold() {
         Err(Error::ExpiresIn(u64::MAX))
     ));
     let token = expiring("t".to_owned(), now, Some(60)).unwrap();
-    assert_eq!(token.expiry, Some(now + Duration::from_secs(60)));
+    assert_eq!(token.expiry, Expiry::At(now + Duration::from_secs(60)));
+}
+
+/// A request that does not connect is final for a metadata service, which
+/// a host either has or never will, and is sent again for a URL source on
+/// this host, such as a token sidecar still starting. Breaks if the sidecar
+/// fails the run at once, or a missing metadata service is retried.
+#[tokio::test]
+async fn a_refused_connection_is_final_only_for_a_metadata_service() {
+    let clients = Clients::new().unwrap();
+    for (call, transient) in [
+        (Call::Metadata, false),
+        (Call::AwsRegion, false),
+        (Call::SubjectUrl(Route::Direct), true),
+    ] {
+        let client = clients.client(call);
+        let request = client.get("http://127.0.0.1:1/token").build().unwrap();
+
+        let error = send_once(call, client, request).await.unwrap_err();
+
+        assert!(matches!(error, Error::Transport { .. }), "{error}");
+        assert_eq!(error.is_transient(), transient, "{call:?}");
+    }
 }
 
 /// A failed request's error shows no URL, as its query can hold a token.
@@ -293,11 +312,11 @@ fn refuses_a_lifetime_the_clock_cannot_hold() {
 #[tokio::test]
 async fn a_transport_error_shows_no_url() {
     let clients = Clients::new().unwrap();
-    let request = clients
-        .metadata
-        .get("http://127.0.0.1:1/token?token=s3cret");
-
-    let error = send(Call::SubjectUrl, request).await.unwrap_err();
+    let error = send(&clients, Call::Metadata, |client| {
+        client.get("http://127.0.0.1:1/token?token=s3cret")
+    })
+    .await
+    .unwrap_err();
 
     assert!(
         !crate::error::error_chain(&error).contains("s3cret"),
@@ -319,9 +338,11 @@ async fn refuses_an_answer_past_the_cap() {
         .await;
     let clients = Clients::new().unwrap();
 
-    let error = send(Call::SubjectUrl, clients.api.get(server.uri()))
-        .await
-        .unwrap_err();
+    let error = send(&clients, Call::SubjectUrl(Route::Proxied), |client| {
+        client.get(server.uri())
+    })
+    .await
+    .unwrap_err();
 
     assert!(matches!(error, Error::BodyTooLarge { .. }), "{error}");
 }

@@ -155,22 +155,27 @@ async fn region_from_metadata(setup: &Setup<'_>, file: &SourceFile) -> Result<Re
         .as_deref()
         .map(|url| parse_url(IMDSV2_TOKEN_URL_FIELD, url))
         .transpose()?;
-    let client = &setup.clients.metadata;
+    let clients = setup.clients;
     let token = match token_url {
         Some(url) => {
-            let request = client
-                .put(url)
-                .header(imds::TOKEN_TTL_HEADER, imds::TOKEN_TTL.as_secs());
-            let token = send(Call::AwsRegion, request).await?;
+            let token = send(clients, Call::AwsRegion, |client| {
+                client
+                    .put(url)
+                    .header(imds::TOKEN_TTL_HEADER, imds::TOKEN_TTL.as_secs())
+            })
+            .await?;
             Some(imds::session_token(&token).map_err(Error::AwsMetadataToken)?)
         }
         None => None,
     };
-    let mut request = client.get(region_url);
-    if let Some(token) = token {
-        request = request.header(imds::TOKEN_HEADER, token);
-    }
-    let zone = send_text(Call::AwsRegion, request).await?;
+    let zone = send_text(clients, Call::AwsRegion, |client| {
+        let request = client.get(region_url);
+        match token {
+            Some(token) => request.header(imds::TOKEN_HEADER, token),
+            None => request,
+        }
+    })
+    .await?;
     let region = region_from_zone(&zone).ok_or(Error::NoAwsRegion)?;
     Region::parse(region).map_err(Error::AwsRegion)
 }

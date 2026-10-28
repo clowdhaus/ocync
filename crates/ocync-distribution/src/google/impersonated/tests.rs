@@ -101,7 +101,7 @@ async fn impersonates_with_the_source_token() {
     let token = token(&account).await.unwrap();
 
     assert_eq!(token.token.expose(), "ya29.impersonated");
-    assert_eq!(token.expiry, Some(now() + Duration::from_secs(1200)));
+    assert_eq!(token.expiry, Expiry::At(now() + Duration::from_secs(1200)));
 }
 
 /// Upstream `test_with_delegates`, `test_scopes_from_json` and

@@ -15,8 +15,8 @@ use super::aws_source;
 use super::impersonated::{Generate, IMPERSONATION_URL_FIELD};
 use super::parse_url;
 use super::{
-    AccessToken, Call, Clients, DEFAULT_SCOPE, Error, ScopeList, Scopes, Secret, Setup, SourceAuth,
-    expiring, send_json, send_text,
+    AccessToken, Call, Clients, DEFAULT_SCOPE, Error, Route, ScopeList, Scopes, Secret, Setup,
+    SourceAuth, expiring, send_json, send_text,
 };
 use crate::aws::{Clock, Fs};
 
@@ -29,10 +29,6 @@ const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
 /// The token type asked of STS.
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
-
-/// The `format.type` that reads the token from a JSON field. Any other
-/// type reads the whole text, as upstream.
-const JSON_FORMAT: &str = "json";
 
 /// An external account file, as upstream reads it.
 #[derive(Deserialize)]
@@ -112,12 +108,22 @@ struct ExecutableFile {
     _command: IgnoredAny,
 }
 
-/// How a subject token is written.
+/// How a subject token is written, as the file says it.
 #[derive(Deserialize)]
 struct FormatFile {
     #[serde(rename = "type")]
-    kind: String,
+    kind: FormatKind,
     subject_token_field_name: Option<String>,
+}
+
+/// A format's `type`: `json` reads a field, and any other type reads the
+/// whole text, as upstream.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FormatKind {
+    Json,
+    #[serde(other)]
+    Text,
 }
 
 /// How a subject token is written.
@@ -129,13 +135,25 @@ enum Format {
     Json { field: String },
 }
 
-impl From<Option<FormatFile>> for Format {
-    fn from(format: Option<FormatFile>) -> Self {
+impl TryFrom<Option<FormatFile>> for Format {
+    type Error = Error;
+
+    /// A `json` format must name its field. Upstream reads an empty name,
+    /// which no token document has, and fails at every exchange.
+    fn try_from(format: Option<FormatFile>) -> Result<Self, Error> {
         match format {
-            Some(format) if format.kind == JSON_FORMAT => Self::Json {
-                field: format.subject_token_field_name.unwrap_or_default(),
-            },
-            _ => Self::Text,
+            Some(FormatFile {
+                kind: FormatKind::Json,
+                subject_token_field_name,
+            }) => subject_token_field_name
+                .filter(|field| !field.is_empty())
+                .map(|field| Self::Json { field })
+                .ok_or(Error::NoSubjectField),
+            Some(FormatFile {
+                kind: FormatKind::Text,
+                ..
+            })
+            | None => Ok(Self::Text),
         }
     }
 }
@@ -164,11 +182,10 @@ const EC2_METADATA_IPV6: std::net::Ipv6Addr =
 /// Host names that only ever name this host or its metadata service.
 const LOCAL_DOMAINS: [&str; 2] = ["localhost", super::metadata::DEFAULT_HOST];
 
-/// The client that fetches a URL source: the metadata client, with no
-/// proxy, for this host or a metadata service, such as Azure's at a
-/// link-local address, so its token never reaches a proxy host; else the
-/// API client, through the proxy.
-fn url_client<'a>(clients: &'a Clients, url: &Url) -> &'a reqwest::Client {
+/// The route to a URL source: direct for this host or a metadata service,
+/// such as Azure's at a link-local address, so its token never reaches a
+/// proxy host; else through the proxy.
+fn route(url: &Url) -> Route {
     let local = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_link_local() || ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => {
@@ -179,11 +196,7 @@ fn url_client<'a>(clients: &'a Clients, url: &Url) -> &'a reqwest::Client {
             .any(|local| domain.trim_end_matches('.').eq_ignore_ascii_case(local)),
         None => false,
     };
-    if local {
-        &clients.metadata
-    } else {
-        &clients.api
-    }
+    if local { Route::Direct } else { Route::Proxied }
 }
 
 /// Where the subject token comes from.
@@ -199,6 +212,7 @@ enum Source {
     /// A URL, fetched with `headers` on every exchange.
     Url {
         url: Url,
+        route: Route,
         headers: HeaderMap,
         format: Format,
     },
@@ -219,14 +233,18 @@ impl Source {
             }
             Self::Url {
                 url,
+                route,
                 headers,
                 format,
             } => {
-                let request = url_client(clients, url)
-                    .get(url.clone())
-                    .headers(headers.clone())
-                    .timeout(SUBJECT_URL_TIMEOUT);
-                format.read(send_text(Call::SubjectUrl, request).await?)
+                let text = send_text(clients, Call::SubjectUrl(*route), |client| {
+                    client
+                        .get(url.clone())
+                        .headers(headers.clone())
+                        .timeout(SUBJECT_URL_TIMEOUT)
+                })
+                .await?;
+                format.read(text)
             }
             Self::Aws(aws) => aws.subject_token(clock.now()).await,
         }
@@ -272,19 +290,34 @@ enum StsAuth {
     Unauthenticated,
 }
 
+/// What the STS token becomes.
+#[derive(Debug)]
+enum Exchange {
+    /// The token itself, asked of STS with `scope`, space-separated.
+    Sts { scope: String },
+    /// Exchanged at IAM `url` for a service account's token with `scopes`,
+    /// so STS is asked for [`IAM_SCOPE`] alone.
+    Impersonate { url: Url, scopes: ScopeList },
+}
+
+impl Exchange {
+    /// The `scope` asked of STS.
+    fn sts_scope(&self) -> &str {
+        match self {
+            Self::Sts { scope } => scope,
+            Self::Impersonate { .. } => IAM_SCOPE,
+        }
+    }
+}
+
 /// An external account.
 #[derive(Debug)]
 pub(crate) struct Account {
     audience: String,
     subject_token_type: String,
     token_url: Url,
-    impersonation_url: Option<Url>,
     auth: StsAuth,
-    /// The scopes of the token returned.
-    scopes: ScopeList,
-    /// The STS `scope`: the IAM scope when the STS token is exchanged
-    /// again, else [`Self::scopes`].
-    sts_scope: String,
+    exchange: Exchange,
     source: Source,
 }
 
@@ -308,8 +341,7 @@ impl Account {
         setup: &Setup<'_>,
     ) -> Result<Self, Error> {
         let file: AccountFile = serde_json::from_value(json).map_err(Error::Parse)?;
-        if file.workforce_pool_user_project.is_some() && !is_workforce_pool_audience(&file.audience)
-        {
+        if file.workforce_pool_user_project.is_some() && Pool::of(&file.audience) == Pool::Other {
             return Err(Error::WorkforceProject);
         }
         let source = match file.credential_source {
@@ -321,14 +353,18 @@ impl Account {
                 url,
                 headers,
                 format,
-            }) => Source::Url {
-                url: parse_url(SUBJECT_URL_FIELD, &url)?,
-                headers: header_map(headers.unwrap_or_default())?,
-                format: format.into(),
-            },
+            }) => {
+                let url = parse_url(SUBJECT_URL_FIELD, &url)?;
+                Source::Url {
+                    route: route(&url),
+                    url,
+                    headers: header_map(headers.unwrap_or_default())?,
+                    format: format.try_into()?,
+                }
+            }
             SourceFile::File(FileFile { file, format }) => Source::File {
                 path: PathBuf::from(file),
-                format: format.into(),
+                format: format.try_into()?,
                 fs: setup.host.fs.clone(),
             },
         };
@@ -346,22 +382,21 @@ impl Account {
             file.scopes.filter(|scopes| !scopes.is_empty()),
             DEFAULT_SCOPE,
         );
-        let impersonation_url = file
-            .service_account_impersonation_url
-            .map(|url| parse_url(IMPERSONATION_URL_FIELD, &url))
-            .transpose()?;
-        let sts_scope = match impersonation_url {
-            Some(_) => IAM_SCOPE.to_owned(),
-            None => scopes.joined(" "),
+        let exchange = match file.service_account_impersonation_url {
+            Some(url) => Exchange::Impersonate {
+                url: parse_url(IMPERSONATION_URL_FIELD, &url)?,
+                scopes,
+            },
+            None => Exchange::Sts {
+                scope: scopes.joined(" "),
+            },
         };
         Ok(Self {
             audience: file.audience,
             subject_token_type: file.subject_token_type,
             token_url: parse_url(TOKEN_URL_FIELD, &file.token_url)?,
-            impersonation_url,
             auth,
-            scopes,
-            sts_scope,
+            exchange,
             source,
         })
     }
@@ -379,41 +414,54 @@ impl Account {
             ("requested_token_type", ACCESS_TOKEN_TYPE),
             ("subject_token", subject_token.expose()),
             ("subject_token_type", &self.subject_token_type),
-            ("scope", &self.sts_scope),
+            ("scope", self.exchange.sts_scope()),
             ("audience", &self.audience),
         ];
         if let StsAuth::UserProject { options } = &self.auth {
             form.push(("options", options));
         }
-        let mut request = clients.api.post(self.token_url.clone()).form(&form);
-        if let StsAuth::Client { id, secret } = &self.auth {
-            // Standard padded base64, with the header marked sensitive.
-            request = request.basic_auth(id, Some(secret.expose()));
-        }
         let now = clock.now();
-        let response: StsResponse = send_json(Call::StsExchange, request).await?;
-        let Some(url) = &self.impersonation_url else {
+        let response: StsResponse = send_json(clients, Call::StsExchange, |client| {
+            let request = client.post(self.token_url.clone()).form(&form);
+            match &self.auth {
+                // Standard padded base64, with the header marked sensitive.
+                StsAuth::Client { id, secret } => request.basic_auth(id, Some(secret.expose())),
+                StsAuth::UserProject { .. } | StsAuth::Unauthenticated => request,
+            }
+        })
+        .await?;
+        let Exchange::Impersonate { url, scopes } = &self.exchange else {
             return expiring(response.access_token, now, Some(response.expires_in));
         };
         let call = Generate {
             url,
             auth: SourceAuth::new(&response.access_token, None)?,
             delegates: None,
-            scopes: &self.scopes,
+            scopes,
         };
         call.send(clients, clock).await
     }
 }
 
-/// Whether `audience` names a workforce pool provider:
-/// `//iam.googleapis.com/locations/<location>/workforcePools/<pool>/providers/<provider>`.
-fn is_workforce_pool_audience(audience: &str) -> bool {
-    let path = audience
-        .strip_prefix("//iam.googleapis.com/")
-        .unwrap_or(audience);
-    let mut parts = path.split('/');
-    matches!(
-        (
+/// The kind of identity pool an audience names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pool {
+    /// A workforce pool provider, for people:
+    /// `//iam.googleapis.com/locations/<location>/workforcePools/<pool>/providers/<provider>`.
+    Workforce,
+    /// Not a workforce pool provider: a workload pool, or an audience of
+    /// no known form.
+    Other,
+}
+
+impl Pool {
+    /// The pool `audience` names.
+    fn of(audience: &str) -> Self {
+        let path = audience
+            .strip_prefix("//iam.googleapis.com/")
+            .unwrap_or(audience);
+        let mut parts = path.split('/');
+        match (
             parts.next(),
             parts.next(),
             parts.next(),
@@ -421,17 +469,19 @@ fn is_workforce_pool_audience(audience: &str) -> bool {
             parts.next(),
             parts.next(),
             parts.next(),
-        ),
-        (
-            Some("locations"),
-            Some(_),
-            Some("workforcePools"),
-            Some(pool),
-            Some("providers"),
-            Some(provider),
-            None,
-        ) if !pool.is_empty() && !provider.is_empty()
-    )
+        ) {
+            (
+                Some("locations"),
+                Some(_),
+                Some("workforcePools"),
+                Some(pool),
+                Some("providers"),
+                Some(provider),
+                None,
+            ) if !pool.is_empty() && !provider.is_empty() => Self::Workforce,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[cfg(test)]

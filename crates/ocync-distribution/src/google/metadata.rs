@@ -83,11 +83,12 @@ impl Server {
         clients: &Clients,
         clock: Clock,
     ) -> Result<AccessToken, Error> {
-        let request = clients
-            .metadata
-            .get(self.token_url.clone())
-            .header(FLAVOR.0, FLAVOR.1);
-        let response: TokenResponse = send_json(Call::Metadata, request).await?;
+        let response: TokenResponse = send_json(clients, Call::Metadata, |client| {
+            client
+                .get(self.token_url.clone())
+                .header(FLAVOR.0, FLAVOR.1)
+        })
+        .await?;
         expiring(response.access_token, clock.now(), response.expires_in)
     }
 }
@@ -175,7 +176,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token.token.expose(), "ya29.mds");
-        assert_eq!(token.expiry, Some(now() + Duration::from_secs(3599)));
+        assert_eq!(
+            token.expiry,
+            crate::google::Expiry::At(now() + Duration::from_secs(3599))
+        );
     }
 
     /// Upstream `token_provider_full_no_scopes`: no scopes query when none is
@@ -199,7 +203,7 @@ mod tests {
             .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
             .await
             .unwrap();
-        assert_eq!(token.expiry, None);
+        assert_eq!(token.expiry, crate::google::Expiry::Never);
     }
 
     /// Upstream `credentials_headers_retryable_error`, `_nonretryable_error`

@@ -56,16 +56,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// or between reads, fails.
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The HTTP clients the credentials are fetched with.
+/// How a request reaches its host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// Straight to this host or a metadata service, never through a proxy,
+    /// so a token never reaches a proxy host.
+    Direct,
+    /// Through `HTTPS_PROXY` and `NO_PROXY`, like registry traffic.
+    Proxied,
+}
+
+/// The HTTP clients the credentials are fetched with, one per [`Route`].
 #[derive(Debug, Clone)]
 pub(crate) struct Clients {
-    /// Google's token, STS and IAM endpoints and a remote federation URL
-    /// source, through `HTTPS_PROXY` like registry traffic.
-    api: reqwest::Client,
-    /// The GCE metadata server, the EC2 instance metadata service and a
-    /// local federation URL source: no proxy, so a token never reaches a
-    /// proxy host.
-    metadata: reqwest::Client,
+    direct: reqwest::Client,
+    proxied: reqwest::Client,
 }
 
 impl Clients {
@@ -73,15 +78,24 @@ impl Clients {
     /// carrying a secret is never sent on to another host.
     pub(crate) fn new() -> Result<Self, Error> {
         crate::install_crypto_provider();
-        let api = crate::client::no_redirect_builder()
+        let proxied = crate::client::no_redirect_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(Error::Client)?;
-        let metadata = crate::aws::credential_endpoint_client(metadata::TIMEOUTS)
+        let direct = crate::aws::credential_endpoint_client(metadata::TIMEOUTS)
             .build()
             .map_err(Error::Client)?;
-        Ok(Self { api, metadata })
+        Ok(Self { direct, proxied })
+    }
+
+    /// The client for `call`, on its route. Only [`send`] picks one, so a
+    /// request and the call its retries are judged by always agree.
+    fn client(&self, call: Call) -> &reqwest::Client {
+        match call.route() {
+            Route::Direct => &self.direct,
+            Route::Proxied => &self.proxied,
+        }
     }
 }
 
@@ -115,23 +129,33 @@ impl<'de> serde::Deserialize<'de> for Secret {
     }
 }
 
-/// An `OAuth2` access token and when it expires. A token with no expiry is
-/// used for the run, as upstream never refreshes one.
+/// When a token stops working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Expiry {
+    /// At this time.
+    At(SystemTime),
+    /// Not as far as its source says: an answer with no lifetime. Such a
+    /// token is used for the run, as upstream never refreshes one.
+    Never,
+}
+
+/// An `OAuth2` access token and when it expires.
 #[derive(Debug, Clone)]
 pub(crate) struct AccessToken {
     pub(crate) token: Secret,
-    pub(crate) expiry: Option<SystemTime>,
+    pub(crate) expiry: Expiry,
 }
 
 /// The token in an answer that says it lasts `expires_in` seconds from
 /// `now`, or that does not say. A lifetime the clock cannot hold is refused.
 fn expiring(token: String, now: SystemTime, expires_in: Option<u64>) -> Result<AccessToken, Error> {
-    let expiry = expires_in
-        .map(|secs| {
-            now.checked_add(Duration::from_secs(secs))
-                .ok_or(Error::ExpiresIn(secs))
-        })
-        .transpose()?;
+    let expiry = match expires_in {
+        Some(secs) => now
+            .checked_add(Duration::from_secs(secs))
+            .map(Expiry::At)
+            .ok_or(Error::ExpiresIn(secs))?,
+        None => Expiry::Never,
+    };
     Ok(AccessToken {
         token: Secret(token),
         expiry,
@@ -150,8 +174,9 @@ pub(crate) enum Call {
     Impersonation,
     /// The GCE metadata server.
     Metadata,
-    /// An external account's URL subject token source.
-    SubjectUrl,
+    /// An external account's URL subject token source, on the route its
+    /// host takes.
+    SubjectUrl(Route),
     /// The EC2 instance metadata service, for an AWS source's region.
     AwsRegion,
 }
@@ -164,8 +189,18 @@ impl Call {
             Self::StsExchange => "failed to exchange token",
             Self::Impersonation => "failed to generate access token",
             Self::Metadata => "failed to fetch access token",
-            Self::SubjectUrl => "failed to request subject token",
+            Self::SubjectUrl(_) => "failed to request subject token",
             Self::AwsRegion => "could not resolve AWS region",
+        }
+    }
+
+    /// How the call reaches its host: the metadata services directly,
+    /// Google's endpoints through the proxy.
+    fn route(self) -> Route {
+        match self {
+            Self::Metadata | Self::AwsRegion => Route::Direct,
+            Self::SubjectUrl(route) => route,
+            Self::UserToken | Self::StsExchange | Self::Impersonation => Route::Proxied,
         }
     }
 }
@@ -271,6 +306,9 @@ pub(crate) enum Error {
     /// A JSON subject token document does not parse.
     #[error("the subject token document is not JSON")]
     SubjectJson(#[source] serde_json::Error),
+    /// A `json` subject token format names no field to read.
+    #[error("credential_source.format of type json names no subject_token_field_name")]
+    NoSubjectField,
     /// A subject token was not found where the credentials say.
     #[error("failed to read subject token field `{0}` as string")]
     SubjectField(String),
@@ -387,13 +425,17 @@ impl Error {
     }
 }
 
-/// Send `request` for `call` and read its successful answer. A transient
-/// failure sends this request again on the crate's schedule, and only this
-/// one, so a failure at the end of a chain repeats none of the calls before
+/// Send the request `build` makes for `call`, on the client its route
+/// takes, and read its successful answer. A transient failure sends this
+/// request again on the crate's schedule, and only this one, so a failure at the end of a chain repeats none of the calls before
 /// it. The prepare phase reaches these calls before the engine's retry
 /// exists, which is why they retry themselves.
-async fn send(call: Call, request: reqwest::RequestBuilder) -> Result<Vec<u8>, Error> {
-    let (client, request) = request.build_split();
+async fn send(
+    clients: &Clients,
+    call: Call,
+    build: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
+) -> Result<Vec<u8>, Error> {
+    let (client, request) = build(clients.client(call)).build_split();
     let request = request.map_err(|source| Error::transport(call, source))?;
     retrying(call.as_str(), &mut Bounded(Error::is_transient), |_| {
         let request = request
@@ -425,19 +467,25 @@ async fn send_once(
     Ok(body)
 }
 
-/// Send `request` for `call` and decode its JSON answer.
+/// [`send`] the request `build` makes for `call`, and decode its JSON
+/// answer.
 async fn send_json<T: serde::de::DeserializeOwned>(
+    clients: &Clients,
     call: Call,
-    request: reqwest::RequestBuilder,
+    build: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
 ) -> Result<T, Error> {
-    let body = send(call, request).await?;
+    let body = send(clients, call, build).await?;
     serde_json::from_slice(&body).map_err(|source| Error::Decode { call, source })
 }
 
-/// Send `request` for `call` and read its answer as text, which must be
-/// UTF-8.
-async fn send_text(call: Call, request: reqwest::RequestBuilder) -> Result<String, Error> {
-    let body = send(call, request).await?;
+/// [`send`] the request `build` makes for `call`, and read its answer as
+/// text, which must be UTF-8.
+async fn send_text(
+    clients: &Clients,
+    call: Call,
+    build: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
+) -> Result<String, Error> {
+    let body = send(clients, call, build).await?;
     String::from_utf8(body).map_err(|source| Error::NotUtf8 { call, source })
 }
 

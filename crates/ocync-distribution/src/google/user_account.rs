@@ -111,17 +111,16 @@ impl AuthorizedUser {
         clients: &Clients,
         clock: Clock,
     ) -> Result<AccessToken, Error> {
-        let request = clients
-            .api
-            .post(self.token_uri.clone())
-            .json(&RefreshRequest {
+        let response: RefreshResponse = send_json(clients, Call::UserToken, |client| {
+            client.post(self.token_uri.clone()).json(&RefreshRequest {
                 grant_type: GRANT_TYPE,
                 client_id: &self.client_id,
                 client_secret: self.client_secret.expose(),
                 refresh_token: self.refresh_token.expose(),
                 scopes: self.scopes.as_deref(),
-            });
-        let response: RefreshResponse = send_json(Call::UserToken, request).await?;
+            })
+        })
+        .await?;
         expiring(response.access_token, clock.now(), response.expires_in)
     }
 }
@@ -185,7 +184,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token.token.expose(), "ya29.user");
-        assert_eq!(token.expiry, Some(now() + Duration::from_secs(3599)));
+        assert_eq!(
+            token.expiry,
+            crate::google::Expiry::At(now() + Duration::from_secs(3599))
+        );
     }
 
     /// Upstream `authorized_user_full_from_json_success` and `_partial`: no

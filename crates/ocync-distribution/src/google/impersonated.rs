@@ -8,8 +8,8 @@ use serde_json::Value;
 use url::Url;
 
 use super::{
-    AccessToken, Call, Clients, CredentialType, Credentials, DEFAULT_SCOPE, Error, ScopeList,
-    Scopes, Secret, Setup, SourceAuth, send_json,
+    AccessToken, Call, Clients, CredentialType, Credentials, DEFAULT_SCOPE, Error, Expiry,
+    ScopeList, Scopes, Secret, Setup, SourceAuth, send_json,
 };
 use crate::aws::{Clock, parse_rfc3339_with_offset};
 
@@ -120,13 +120,15 @@ impl Account {
 impl Generate<'_> {
     /// A token with the call's scopes, lasting [`LIFETIME`].
     pub(super) async fn send(self, clients: &Clients, clock: Clock) -> Result<AccessToken, Error> {
-        let request = clients.api.post(self.url.clone()).json(&GenerateRequest {
-            delegates: self.delegates,
-            scope: self.scopes,
-            lifetime: format!("{}s", LIFETIME.as_secs_f64()),
-        });
-        let request = self.auth.apply(request);
-        let response: GenerateResponse = send_json(Call::Impersonation, request).await?;
+        let response: GenerateResponse = send_json(clients, Call::Impersonation, |client| {
+            let request = client.post(self.url.clone()).json(&GenerateRequest {
+                delegates: self.delegates,
+                scope: self.scopes,
+                lifetime: format!("{}s", LIFETIME.as_secs_f64()),
+            });
+            self.auth.apply(request)
+        })
+        .await?;
         let expiry = parse_rfc3339_with_offset(&response.expire_time)
             .ok_or_else(|| Error::ExpireTime(response.expire_time.clone()))?;
         if expiry <= clock.now() {
@@ -134,7 +136,7 @@ impl Generate<'_> {
         }
         Ok(AccessToken {
             token: Secret(response.access_token),
-            expiry: Some(expiry),
+            expiry: Expiry::At(expiry),
         })
     }
 }

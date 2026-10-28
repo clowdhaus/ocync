@@ -12,7 +12,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{AccessToken, DEFAULT_SCOPE, Error, Scopes, Secret};
+use super::{AccessToken, DEFAULT_SCOPE, Error, Expiry, Scopes, Secret};
 
 /// How far `iat` is set before now and `exp` after the lifetime, so a
 /// clock a little ahead of Google's is not refused.
@@ -139,7 +139,7 @@ impl Account {
             .map_err(Error::Sign)?;
         Ok(AccessToken {
             token: Secret(format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature))),
-            expiry: Some(expiry),
+            expiry: Expiry::At(expiry),
         })
     }
 }
@@ -226,7 +226,7 @@ pub(super) mod tests {
 
         let token = account.access_token(now).unwrap();
 
-        assert_eq!(token.expiry, Some(now + Duration::from_secs(3610)));
+        assert_eq!(token.expiry, Expiry::At(now + Duration::from_secs(3610)));
         let jwt = token.token.expose();
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);

@@ -29,7 +29,7 @@ use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cac
 use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{Error, error_chain};
-use crate::google::{self, AccessToken};
+use crate::google::{self, AccessToken, Expiry};
 
 /// Username for GCP `OAuth2` token exchange.
 ///
@@ -113,11 +113,11 @@ impl SharedToken {
                 tracing::debug!("GCP OAuth2 token expired or missing, refreshing");
                 let token = self.source.access_token().await?;
                 match token.expiry {
-                    Some(expiry) => tracing::debug!(
+                    Expiry::At(expiry) => tracing::debug!(
                         ttl_secs = remaining(expiry).as_secs(),
                         "GCP OAuth2 token refreshed"
                     ),
-                    None => tracing::debug!("GCP OAuth2 token refreshed, with no expiry"),
+                    Expiry::Never => tracing::debug!("GCP OAuth2 token refreshed, with no expiry"),
                 }
                 let ttl = lifetime(&token);
                 Ok((token, ttl))
@@ -136,7 +136,10 @@ impl SharedToken {
 /// exchange refuses it, as upstream never refreshes one: the cache holds a
 /// lifetime past what the clock can hold as never expiring.
 fn lifetime(token: &AccessToken) -> Duration {
-    token.expiry.map_or(Duration::MAX, remaining)
+    match token.expiry {
+        Expiry::At(expiry) => remaining(expiry),
+        Expiry::Never => Duration::MAX,
+    }
 }
 
 /// Default [`GcpTokenSource`]: the run's Application Default Credentials.
@@ -429,7 +432,9 @@ mod tests {
                         })?;
                 Ok(AccessToken {
                     token: token.into(),
-                    expiry: lasts.map(|lasts| std::time::SystemTime::now() + lasts),
+                    expiry: lasts.map_or(Expiry::Never, |lasts| {
+                        Expiry::At(std::time::SystemTime::now() + lasts)
+                    }),
                 })
             })
         }

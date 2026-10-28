@@ -91,7 +91,10 @@ async fn exchanges_the_subject_token_at_sts() {
     let token = token(&account).await.unwrap();
 
     assert_eq!(token.token.expose(), "ya29.sts");
-    assert_eq!(token.expiry, Some(now() + Duration::from_secs(3600)));
+    assert_eq!(
+        token.expiry,
+        crate::google::Expiry::At(now() + Duration::from_secs(3600))
+    );
     let requests = server.received_requests().await.unwrap();
     assert_eq!(
         form(&requests[0]),
@@ -157,7 +160,10 @@ async fn impersonates_after_the_exchange() {
     let token = token(&account).await.unwrap();
 
     assert_eq!(token.token.expose(), "ya29.impersonated");
-    assert_eq!(token.expiry, Some(now() + Duration::from_secs(1_200)));
+    assert_eq!(
+        token.expiry,
+        crate::google::Expiry::At(now() + Duration::from_secs(1_200))
+    );
 }
 
 /// A transient IAM failure sends the IAM call again, and only it: the STS
@@ -340,6 +346,40 @@ async fn refuses_a_workforce_project_outside_a_workforce_pool() {
     );
 }
 
+/// A `json` format reads the field it names, and must name one; any other
+/// type, or none, reads the whole text, as upstream. Breaks if a `json`
+/// format with no field loads, which upstream lets fail at every exchange,
+/// or an unknown type is refused.
+#[test]
+fn parses_the_subject_token_format() {
+    let format = |json: Value| {
+        let file: Option<FormatFile> = serde_json::from_value(json).unwrap();
+        Format::try_from(file)
+    };
+    assert_eq!(
+        format(serde_json::json!({"type": "json", "subject_token_field_name": "token"})).unwrap(),
+        Format::Json {
+            field: "token".into()
+        }
+    );
+    for text in [
+        serde_json::json!({"type": "text"}),
+        serde_json::json!({"type": "xml"}),
+        Value::Null,
+    ] {
+        assert_eq!(format(text.clone()).unwrap(), Format::Text, "{text}");
+    }
+    for no_field in [
+        serde_json::json!({"type": "json"}),
+        serde_json::json!({"type": "json", "subject_token_field_name": ""}),
+    ] {
+        assert!(
+            matches!(format(no_field.clone()), Err(Error::NoSubjectField)),
+            "{no_field}"
+        );
+    }
+}
+
 /// Upstream `test_aws_parsing` and the untagged source order: a source with
 /// `environment_id` is AWS even beside `url`, `executable` comes before
 /// `url`, and `url` before `file`. Breaks if the order changes.
@@ -468,6 +508,7 @@ async fn reads_url_subject_tokens() {
     let read = |format: Format| {
         let source = Source::Url {
             url: Url::parse(&format!("{}/token", server.uri())).unwrap(),
+            route: Route::Direct,
             headers: header_map(HashMap::from([("metadata".into(), "true".into())])).unwrap(),
             format,
         };
@@ -531,21 +572,28 @@ fn url_source_headers_never_print() {
 /// service is fetched through the proxy.
 #[test]
 fn fetches_a_local_url_source_without_the_proxy() {
-    let clients = Clients::new().unwrap();
-    for (url, metadata) in [
+    for (url, expected) in [
         (
             "http://169.254.169.254/metadata/identity/oauth2/token",
-            true,
+            Route::Direct,
         ),
-        ("http://[fe80::1]/token", true),
-        ("http://127.0.0.1:8080/token", true),
-        ("http://localhost:8080/token", true),
-        ("http://[fd00:ec2::254]/latest/api/token", true),
-        ("http://metadata.google.internal/token", true),
-        ("https://sts.example.com/token", false),
-        ("http://169.254.169.254.example.com/token", false),
+        ("http://[fe80::1]/token", Route::Direct),
+        ("http://127.0.0.1:8080/token", Route::Direct),
+        ("http://localhost:8080/token", Route::Direct),
+        ("http://[fd00:ec2::254]/latest/api/token", Route::Direct),
+        ("http://metadata.google.internal/token", Route::Direct),
+        ("https://sts.example.com/token", Route::Proxied),
+        ("http://169.254.169.254.example.com/token", Route::Proxied),
     ] {
-        let client = url_client(&clients, &Url::parse(url).unwrap());
-        assert_eq!(std::ptr::eq(client, &clients.metadata), metadata, "{url}");
+        assert_eq!(route(&Url::parse(url).unwrap()), expected, "{url}");
     }
+    let clients = Clients::new().unwrap();
+    assert!(std::ptr::eq(
+        clients.client(Call::SubjectUrl(Route::Direct)),
+        &clients.direct
+    ));
+    assert!(std::ptr::eq(
+        clients.client(Call::SubjectUrl(Route::Proxied)),
+        &clients.proxied
+    ));
 }
