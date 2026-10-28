@@ -87,6 +87,113 @@ async fn registry_runs_under_init() {
     assert_eq!(String::from_utf8_lossy(&pid1).trim(), "docker-init");
 }
 
+/// Run the Docker CLI with `args` and return its trimmed stdout.
+fn docker(args: &[&str]) -> String {
+    let output = std::process::Command::new("docker")
+        .args(args)
+        .output()
+        .expect("docker runs");
+    assert!(output.status.success(), "docker {args:?}: {output:?}");
+    String::from_utf8(output.stdout)
+        .expect("docker prints UTF-8")
+        .trim()
+        .to_owned()
+}
+
+/// The full IDs of the containers carrying `label`, sorted, or `None` if
+/// Docker could not be asked.
+fn labeled(label: &str) -> Option<Vec<String>> {
+    let output = std::process::Command::new("docker")
+        .args(["ps", "--all", "--quiet", "--no-trunc", "--filter"])
+        .arg(format!("label={label}"))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let mut ids: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    ids.sort();
+    Some(ids)
+}
+
+/// Removes every container with its label when dropped, so a failing test
+/// leaves none behind.
+struct RemoveLabeledOnDrop(String);
+
+impl Drop for RemoveLabeledOnDrop {
+    /// Never panics, as a panic while a failing test unwinds aborts the
+    /// whole test binary.
+    fn drop(&mut self) {
+        if let Some(ids) = labeled(&self.0).filter(|ids| !ids.is_empty()) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "--force"])
+                .args(ids)
+                .output();
+        }
+    }
+}
+
+/// A sweep removes a stopped container only past its stopped age, and a
+/// running one only past its any-state age. Breaks if a container another
+/// run is still starting is removed, one left behind is kept, or a
+/// container with another label is touched. Its labels are its own, so it
+/// never removes another test's container.
+#[tokio::test]
+async fn sweep_removes_only_containers_past_their_age() {
+    let value = format!(
+        "sweep-check-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let label = common::label(&value);
+    let other = common::label(&format!("{value}-other"));
+    let _cleanup = (
+        RemoveLabeledOnDrop(label.clone()),
+        RemoveLabeledOnDrop(other.clone()),
+    );
+    let created = docker(&["create", "--label", &label, "registry:2"]);
+    let running = docker(&["run", "--detach", "--init", "--label", &label, "registry:2"]);
+    let unrelated = docker(&["create", "--label", &other, "registry:2"]);
+    let listed = |label: &str| labeled(label).expect("docker lists containers");
+
+    for (stopped, any_state, removed, left) in [
+        (
+            common::LONGEST_TEST,
+            common::LONGEST_TEST,
+            0,
+            vec![&created, &running],
+        ),
+        (Duration::ZERO, common::LONGEST_TEST, 1, vec![&running]),
+        (Duration::ZERO, Duration::ZERO, 1, vec![]),
+    ] {
+        let ages = common::OrphanAge { stopped, any_state };
+        assert_eq!(
+            common::sweep(&label, ages).await.unwrap(),
+            removed,
+            "{ages:?}"
+        );
+        let mut left: Vec<String> = left.into_iter().cloned().collect();
+        left.sort();
+        assert_eq!(listed(&label), left, "{ages:?}");
+    }
+    assert_eq!(listed(&other), [unrelated], "another label is never swept");
+}
+
+/// Starting a registry runs the orphan sweep, and the registry is found by
+/// the filter that sweep uses. Breaks if leftovers from a timed-out start
+/// are never swept.
+#[tokio::test]
+async fn starting_a_registry_sweeps_and_labels_it() {
+    let (container, _url) = start_registry().await;
+    assert!(common::swept(), "start runs the orphan sweep");
+    let ids = labeled(common::LABEL_KEY).expect("docker lists containers");
+    assert!(ids.iter().any(|id| id == container.id()), "{ids:?}");
+}
+
 /// Push a small blob via the monolithic (POST+PUT) path and verify it exists.
 #[tokio::test]
 async fn blob_push_monolithic_and_exists() {
