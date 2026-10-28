@@ -22,7 +22,7 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::CredentialCache;
-use crate::error::{Error, truncate_quoted};
+use crate::error::{Error, error_chain, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
@@ -172,9 +172,12 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
                 registry: service.to_owned(),
                 // Unwrapped so the reason reads as it always has: `Error::Http`
                 // Displays as "HTTP request failed: ..." and would double the
-                // prefix this line already writes.
+                // prefix this line already writes. The chain names the cause,
+                // such as a refused connection.
                 reason: match &e {
-                    Error::Http(inner) => format!("ACR {endpoint} request failed: {inner}"),
+                    Error::Http(inner) => {
+                        format!("ACR {endpoint} request failed: {}", error_chain(inner))
+                    }
                     other => format!("ACR {endpoint} request failed: {other}"),
                 },
             })?;
@@ -307,10 +310,12 @@ impl AzureCredentialChain {
         form: &[(&str, &str)],
         source: &str,
     ) -> Result<String, CredentialError> {
-        let resp =
-            http.post(url).form(form).send().await.map_err(|e| {
-                CredentialError::Failed(format!("{source} token request failed: {e}"))
-            })?;
+        let resp = http.post(url).form(form).send().await.map_err(|e| {
+            CredentialError::Failed(format!(
+                "{source} token request failed: {}",
+                error_chain(&e)
+            ))
+        })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -820,6 +825,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(refresh, "acr-refresh-tok");
+    }
+
+    /// A request that cannot connect names the refusal, for the ACR
+    /// exchange and the Entra ID token request alike. Breaks if either
+    /// reason keeps only the top line, "error sending request".
+    #[tokio::test]
+    async fn a_refused_connection_is_named() {
+        crate::install_crypto_provider();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let refused = std::net::TcpStream::connect(address)
+            .unwrap_err()
+            .to_string();
+        let base_url = format!("http://{address}");
+        let http = no_redirect_http_client();
+
+        let err = exchange_refresh_token(&http, &base_url, "myregistry.azurecr.io", "aad-tok")
+            .await
+            .unwrap_err();
+        let Error::AuthFailed { reason, .. } = err else {
+            panic!("{err:?}");
+        };
+        assert!(reason.ends_with(&refused), "{reason}");
+
+        let Err(CredentialError::Failed(reason)) = AzureCredentialChain::post_entra_token(
+            &http,
+            &format!("{base_url}/token"),
+            &[],
+            "client secret",
+        )
+        .await
+        else {
+            panic!("expected a failed token request");
+        };
+        assert!(reason.ends_with(&refused), "{reason}");
     }
 
     #[tokio::test]
