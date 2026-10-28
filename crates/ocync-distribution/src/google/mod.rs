@@ -458,3 +458,6 @@ fn well_known_path(env: &Env, platform: Platform) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod differential;
