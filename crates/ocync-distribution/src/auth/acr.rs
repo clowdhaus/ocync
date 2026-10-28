@@ -827,6 +827,42 @@ mod tests {
         assert_eq!(refresh, "acr-refresh-tok");
     }
 
+    /// A request that cannot connect names the refusal, for the ACR
+    /// exchange and the Entra ID token request alike. Breaks if either
+    /// reason keeps only the top line, "error sending request".
+    #[tokio::test]
+    async fn a_refused_connection_is_named() {
+        crate::install_crypto_provider();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let refused = std::net::TcpStream::connect(address)
+            .unwrap_err()
+            .to_string();
+        let base_url = format!("http://{address}");
+        let http = no_redirect_http_client();
+
+        let err = exchange_refresh_token(&http, &base_url, "myregistry.azurecr.io", "aad-tok")
+            .await
+            .unwrap_err();
+        let Error::AuthFailed { reason, .. } = err else {
+            panic!("{err:?}");
+        };
+        assert!(reason.ends_with(&refused), "{reason}");
+
+        let Err(CredentialError::Failed(reason)) = AzureCredentialChain::post_entra_token(
+            &http,
+            &format!("{base_url}/token"),
+            &[],
+            "client secret",
+        )
+        .await
+        else {
+            panic!("expected a failed token request");
+        };
+        assert!(reason.ends_with(&refused), "{reason}");
+    }
+
     #[tokio::test]
     async fn acr_exchange_propagates_401() {
         crate::install_crypto_provider();
