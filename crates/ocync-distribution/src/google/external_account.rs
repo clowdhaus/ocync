@@ -3,6 +3,7 @@
 //! for a service account's token when the file names one to impersonate.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -160,11 +161,6 @@ impl Format {
     }
 }
 
-/// The EC2 instance metadata service's IPv6 address, which is unique-local
-/// rather than link-local.
-const EC2_METADATA_IPV6: std::net::Ipv6Addr =
-    std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
-
 /// Host names that only ever name this host or its metadata service.
 const LOCAL_DOMAINS: [&str; 2] = ["localhost", super::metadata::DEFAULT_HOST];
 
@@ -172,11 +168,17 @@ const LOCAL_DOMAINS: [&str; 2] = ["localhost", super::metadata::DEFAULT_HOST];
 /// such as Azure's at a link-local address, so its token never reaches a
 /// proxy host; else through the proxy.
 fn route(url: &Url) -> Route {
+    let local_ipv4 = |ip: std::net::Ipv4Addr| ip.is_link_local() || ip.is_loopback();
     let local = match url.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_link_local() || ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => {
-            ip.is_unicast_link_local() || ip.is_loopback() || ip == EC2_METADATA_IPV6
-        }
+        Some(url::Host::Ipv4(ip)) => local_ipv4(ip),
+        Some(url::Host::Ipv6(ip)) => match ip.to_ipv4_mapped() {
+            Some(ip) => local_ipv4(ip),
+            None => {
+                ip.is_unicast_link_local()
+                    || ip.is_loopback()
+                    || ip == crate::net::EC2_METADATA_IPV6
+            }
+        },
         Some(url::Host::Domain(domain)) => LOCAL_DOMAINS
             .iter()
             .any(|local| domain.trim_end_matches('.').eq_ignore_ascii_case(local)),
@@ -186,7 +188,6 @@ fn route(url: &Url) -> Route {
 }
 
 /// Where the subject token comes from.
-#[derive(Debug)]
 enum Source {
     /// A file, such as a projected Kubernetes service account token, read
     /// on every exchange.
@@ -204,6 +205,36 @@ enum Source {
     },
     /// A signed AWS `GetCallerIdentity` request.
     Aws(aws_source::Source),
+}
+
+/// Leaves out a URL source's query, which can carry a secret. Its header
+/// values are marked sensitive and print redacted.
+impl fmt::Debug for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File { path, format, .. } => f
+                .debug_struct("File")
+                .field("path", path)
+                .field("format", format)
+                .finish_non_exhaustive(),
+            Self::Url {
+                url,
+                route,
+                headers,
+                format,
+            } => f
+                .debug_struct("Url")
+                .field(
+                    "url",
+                    &&url[url::Position::BeforeHost..url::Position::AfterPath],
+                )
+                .field("route", route)
+                .field("headers", headers)
+                .field("format", format)
+                .finish(),
+            Self::Aws(source) => f.debug_tuple("Aws").field(source).finish(),
+        }
+    }
 }
 
 impl Source {
@@ -331,6 +362,31 @@ impl Account {
         if file.workforce_pool_user_project.is_some() && Pool::of(&file.audience) == Pool::Other {
             return Err(Error::WorkforceProject);
         }
+        // The local fields first, so a malformed file sends no request.
+        let token_url = parse_url(TOKEN_URL_FIELD, &file.token_url)?;
+        let auth = match (file.client_id, file.client_secret) {
+            (Some(id), Some(secret)) => StsAuth::Client { id, secret },
+            (None, None) => match file.workforce_pool_user_project {
+                Some(project) => StsAuth::UserProject {
+                    options: serde_json::json!({ "userProject": project }).to_string(),
+                },
+                None => StsAuth::Unauthenticated,
+            },
+            _ => StsAuth::Unauthenticated,
+        };
+        let scopes = scopes.resolve(
+            file.scopes.filter(|scopes| !scopes.is_empty()),
+            DEFAULT_SCOPE,
+        );
+        let exchange = match file.service_account_impersonation_url {
+            Some(url) => Exchange::Impersonate {
+                url: parse_url(IMPERSONATION_URL_FIELD, &url)?,
+                scopes,
+            },
+            None => Exchange::Sts {
+                scope: scopes.joined(" "),
+            },
+        };
         let source = match file.credential_source {
             SourceFile::Aws(aws) => {
                 Source::Aws(aws_source::Source::new(setup, &aws, &file.audience).await?)
@@ -355,33 +411,10 @@ impl Account {
                 fs: setup.host.fs.clone(),
             },
         };
-        let auth = match (file.client_id, file.client_secret) {
-            (Some(id), Some(secret)) => StsAuth::Client { id, secret },
-            (None, None) => match file.workforce_pool_user_project {
-                Some(project) => StsAuth::UserProject {
-                    options: serde_json::json!({ "userProject": project }).to_string(),
-                },
-                None => StsAuth::Unauthenticated,
-            },
-            _ => StsAuth::Unauthenticated,
-        };
-        let scopes = scopes.resolve(
-            file.scopes.filter(|scopes| !scopes.is_empty()),
-            DEFAULT_SCOPE,
-        );
-        let exchange = match file.service_account_impersonation_url {
-            Some(url) => Exchange::Impersonate {
-                url: parse_url(IMPERSONATION_URL_FIELD, &url)?,
-                scopes,
-            },
-            None => Exchange::Sts {
-                scope: scopes.joined(" "),
-            },
-        };
         Ok(Self {
             audience: file.audience,
             subject_token_type: file.subject_token_type,
-            token_url: parse_url(TOKEN_URL_FIELD, &file.token_url)?,
+            token_url,
             auth,
             exchange,
             source,

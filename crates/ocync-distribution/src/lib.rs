@@ -24,6 +24,8 @@ mod google;
 mod json;
 /// Manifest operations (pull, push, head, referrers).
 pub mod manifest;
+/// Address rules for requests that carry a secret.
+mod net;
 /// OCI image reference parser.
 pub mod reference;
 /// Bounded retry for transient failures in the prepare phase.
@@ -123,7 +125,7 @@ pub use blob::MountResult;
 pub use client::{RegistryClient, RegistryClientBuilder};
 pub use digest::Digest;
 pub use ecr::{BatchBlobChecker, BlobExistence};
-pub use error::{Error, Transience};
+pub use error::Error;
 pub use manifest::{ManifestHead, ManifestPull};
 pub use reference::Reference;
 pub use spec::{

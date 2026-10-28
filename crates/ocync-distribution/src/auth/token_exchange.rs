@@ -108,28 +108,6 @@ fn validate_ipv4(
     Ok(())
 }
 
-/// Extract an embedded IPv4 address from IPv4-translated (RFC 6145) or
-/// NAT64 well-known prefix (RFC 6052) IPv6 addresses.
-///
-/// `Ipv6Addr::to_ipv4_mapped()` only handles `::ffff:x.y.z.w`. This
-/// function covers the two remaining encodings that embed an IPv4 address
-/// in the last 32 bits.
-fn extract_embedded_ipv4(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
-    let segs = ip.segments();
-    // ::ffff:0:x.y.z.w (IPv4-translated, RFC 6145)
-    let is_translated = segs[..6] == [0, 0, 0, 0, 0xffff, 0];
-    // 64:ff9b::x.y.z.w (NAT64 well-known prefix, RFC 6052)
-    let is_nat64 = segs[..6] == [0x0064, 0xff9b, 0, 0, 0, 0];
-    (is_translated || is_nat64).then(|| {
-        Ipv4Addr::new(
-            (segs[6] >> 8) as u8,
-            segs[6] as u8,
-            (segs[7] >> 8) as u8,
-            segs[7] as u8,
-        )
-    })
-}
-
 /// Validate an IPv6 realm address against the cloud-metadata denylist.
 fn validate_ipv6(
     ip: &Ipv6Addr,
@@ -137,13 +115,8 @@ fn validate_ipv6(
     realm: &reqwest::Url,
     registry_str: &str,
 ) -> Result<(), Error> {
-    // Normalize IPv4-mapped IPv6 (::ffff:x.y.z.w) and delegate to IPv4 checks.
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return validate_ipv4(&mapped, registry_is_loopback, realm, registry_str);
-    }
-
-    // IPv4-translated (RFC 6145) and NAT64 (RFC 6052) also embed IPv4.
-    if let Some(v4) = extract_embedded_ipv4(ip) {
+    // An IPv6 form of an IPv4 address gets the IPv4 checks.
+    if let Some(v4) = crate::net::embedded_ipv4(ip) {
         return validate_ipv4(&v4, registry_is_loopback, realm, registry_str);
     }
 
@@ -155,9 +128,7 @@ fn validate_ipv6(
         ));
     }
 
-    // Link-local IPv6 (fe80::/10).
-    // std does not have is_unicast_link_local() on stable; check manually.
-    if (ip.segments()[0] & 0xffc0) == 0xfe80 {
+    if ip.is_unicast_link_local() {
         return Err(realm_err(
             registry_str,
             format!("realm URL '{realm}' points to link-local address {ip}"),
@@ -165,7 +136,7 @@ fn validate_ipv6(
     }
 
     // AWS IPv6 IMDS (fd00:ec2::254).
-    if *ip == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254) {
+    if *ip == crate::net::EC2_METADATA_IPV6 {
         return Err(realm_err(
             registry_str,
             format!("realm URL '{realm}' points to AWS IPv6 IMDS address {ip}"),
@@ -253,7 +224,7 @@ fn validate_realm_url(realm: &reqwest::Url, registry_base: &reqwest::Url) -> Res
         Some(Host::Ipv4(ip)) => ip.is_loopback(),
         Some(Host::Ipv6(ip)) => ip
             .to_ipv4_mapped()
-            .map_or(ip.is_loopback(), |m| m.is_loopback()),
+            .map_or(ip.is_loopback(), |v4| v4.is_loopback()),
         Some(Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         None => false,
     };
@@ -1294,11 +1265,15 @@ mod tests {
         assert_realm_rejected(validate_realm_url(&realm, &registry), "loopback");
     }
 
+    /// A loopback realm is allowed for a registry on this host, plain or
+    /// IPv4-mapped. Breaks if an IPv4-mapped loopback registry is refused.
     #[test]
     fn validate_realm_allows_loopback_when_registry_is_loopback() {
-        let realm = reqwest::Url::parse("http://127.0.0.1:9999/token").unwrap();
-        let registry = reqwest::Url::parse("http://127.0.0.1:5000").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
+        for host in ["127.0.0.1", "[::ffff:127.0.0.1]"] {
+            let realm = reqwest::Url::parse(&format!("http://{host}:9999/token")).unwrap();
+            let registry = reqwest::Url::parse(&format!("http://{host}:5000")).unwrap();
+            validate_realm_url(&realm, &registry).unwrap_or_else(|e| panic!("{host}: {e}"));
+        }
     }
 
     #[test]

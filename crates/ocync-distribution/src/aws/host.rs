@@ -313,7 +313,7 @@ pub(crate) enum Platform {
 
 impl Platform {
     /// The platform this binary runs on.
-    pub(crate) fn current() -> Self {
+    pub(super) fn current() -> Self {
         if cfg!(windows) {
             Self::Windows
         } else {

@@ -425,6 +425,44 @@ fn a_malformed_aws_source_is_an_error() {
     );
 }
 
+/// A file whose own URLs do not parse fails before its AWS source asks the
+/// instance metadata service for a region. Breaks if a malformed file
+/// spends requests on an answer the file alone decides.
+#[tokio::test]
+async fn a_malformed_file_sends_no_request() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("us-east-1a"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let region_url = format!("{}/zone", server.uri());
+    for (field, token_url, verification_url) in [
+        ("token_url", Some("not a url"), None),
+        ("regional_cred_verification_url", None, Some("http://")),
+    ] {
+        let mut file = account_file(&server);
+        if let Some(token_url) = token_url {
+            file["token_url"] = serde_json::json!(token_url);
+        }
+        file["credential_source"] = serde_json::json!({
+            "environment_id": "aws1",
+            "region_url": region_url,
+            "regional_cred_verification_url": verification_url,
+        });
+        let error = build(file, Scopes::Registry, token_host("jwt"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::Url { field: found, .. } | Error::UrlScheme { field: found, .. } if *found == field
+            ),
+            "{field}: {error}"
+        );
+    }
+}
+
 /// An executable source is refused by name, whatever its settings. Breaks
 /// if it is run, accepted, or a malformed one is read as a parse error.
 #[tokio::test]
@@ -562,17 +600,26 @@ fn refuses_a_bad_url_source_header() {
     }
 }
 
-/// A URL source's header values never print. Breaks if a token in one
-/// reaches a `Debug` print of the credentials.
+/// A URL source's query and header values never print. Breaks if a token
+/// in either reaches a `Debug` print of the credentials.
 #[test]
-fn url_source_headers_never_print() {
-    let headers = header_map(HashMap::from([(
-        "authorization".to_owned(),
-        "bearer gha-token".to_owned(),
-    )]))
-    .unwrap();
-    let printed = format!("{headers:?}");
+fn url_source_secrets_never_print() {
+    let source = Source::Url {
+        url: Url::parse("https://user:pw-secret@token.example.com/token?code=query-secret")
+            .unwrap(),
+        route: Route::Proxied,
+        headers: header_map(HashMap::from([(
+            "authorization".to_owned(),
+            "bearer gha-token".to_owned(),
+        )]))
+        .unwrap(),
+        format: Format::Text,
+    };
+    let printed = format!("{source:?}");
+    assert!(!printed.contains("query-secret"), "{printed}");
+    assert!(!printed.contains("pw-secret"), "{printed}");
     assert!(!printed.contains("gha-token"), "{printed}");
+    assert!(printed.contains("token.example.com"), "{printed}");
 }
 
 /// A URL source at a link-local or loopback address is fetched with no
@@ -587,6 +634,10 @@ fn fetches_a_local_url_source_without_the_proxy() {
         ),
         ("http://[fe80::1]/token", Route::Direct),
         ("http://127.0.0.1:8080/token", Route::Direct),
+        ("http://[::ffff:127.0.0.1]:8080/token", Route::Direct),
+        ("http://[::ffff:169.254.169.254]/token", Route::Direct),
+        ("http://[::ffff:0:a9fe:a9fe]/token", Route::Proxied),
+        ("http://[64:ff9b::a9fe:a9fe]/token", Route::Proxied),
         ("http://localhost:8080/token", Route::Direct),
         ("http://[fd00:ec2::254]/latest/api/token", Route::Direct),
         ("http://metadata.google.internal/token", Route::Direct),

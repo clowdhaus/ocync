@@ -67,7 +67,7 @@ pub(super) struct Account {
 
 impl fmt::Debug for Account {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ServiceAccount")
+        f.debug_struct("Account")
             .field("client_email", &self.client_email)
             .field("private_key_id", &self.private_key_id)
             .finish_non_exhaustive()

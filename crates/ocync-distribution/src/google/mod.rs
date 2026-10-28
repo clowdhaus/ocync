@@ -26,6 +26,8 @@ use http::HeaderValue;
 use serde_json::Value;
 use url::Url;
 
+use crate::scheme::{Scheme, UnsupportedScheme};
+
 use crate::REDACTED;
 use crate::aws::{AwsCredentialProviders, Clock, Env, Host, Platform};
 use crate::error::{MAX_QUOTED_BYTES, truncate_quoted};
@@ -363,9 +365,14 @@ pub(crate) enum Error {
     /// header cannot carry.
     #[error("invalid AWS instance metadata session token")]
     AwsMetadataToken(#[source] http::header::InvalidHeaderValue),
-    /// A URL in the credentials file names no host.
-    #[error("invalid `{field}`: missing host")]
-    UrlHost { field: &'static str },
+    /// A URL in the credentials file is not an http or https URL, so it
+    /// names no host to send to.
+    #[error("invalid `{field}`")]
+    UrlScheme {
+        field: &'static str,
+        #[source]
+        source: UnsupportedScheme,
+    },
     /// The AWS settings for an AWS subject token are invalid.
     #[error("invalid AWS configuration for the AWS subject token")]
     AwsConfig(#[source] crate::aws::ConfigError),
@@ -382,18 +389,23 @@ impl Error {
     /// it: a 5xx, 408 or 429 answer, or a transport failure the crate
     /// retries. An answer that is not the JSON expected is final. A GCE or
     /// EC2 metadata service that does not connect is final too: a host with
-    /// none never gets one. One that connects and then times out or resets,
-    /// as GKE's can while it mints a token, may be sent again.
+    /// none never gets one. A GCE metadata server that connects and then
+    /// times out or resets, as GKE's can while it mints a token, may be sent
+    /// again. The EC2 one answers a region lookup at once when it answers at
+    /// all, so its timeout is final.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
-            Self::Status { status, .. } => {
-                status.is_server_error()
-                    || *status == http::StatusCode::REQUEST_TIMEOUT
-                    || *status == http::StatusCode::TOO_MANY_REQUESTS
-            }
+            Self::Status { status, .. } => crate::retry::is_transient_status(*status),
             Self::Transport { call, source } => {
-                !(matches!(call, Call::Metadata | Call::AwsRegion) && source.is_connect())
-                    && crate::retry::is_transient_transport(source)
+                let final_failure = match call {
+                    Call::Metadata => source.is_connect(),
+                    Call::AwsRegion => source.is_connect() || source.is_timeout(),
+                    Call::UserToken
+                    | Call::StsExchange
+                    | Call::Impersonation
+                    | Call::SubjectUrl(_) => false,
+                };
+                !final_failure && crate::retry::is_transient_transport(source)
             }
             _ => false,
         }
@@ -438,12 +450,16 @@ async fn send(
 ) -> Result<Vec<u8>, Error> {
     let (client, request) = build(clients.client(call)).build_split();
     let request = request.map_err(|source| Error::transport(call, source))?;
-    retrying(call.as_str(), &mut Bounded(Error::is_transient), |_| {
-        let request = request
-            .try_clone()
-            .expect("every request here has a buffered body");
-        send_once(call, &client, request)
-    })
+    retrying(
+        "Google credential request",
+        &mut Bounded(Error::is_transient),
+        |_| {
+            let request = request
+                .try_clone()
+                .expect("every request here has a buffered body");
+            send_once(call, &client, request)
+        },
+    )
     .await
 }
 
@@ -688,9 +704,12 @@ impl CredentialType {
 /// memory.
 const MAX_BODY: usize = 1024 * 1024;
 
-/// `url`, the value of `field`.
+/// `url`, the value of `field`: an http or https URL, which always names
+/// a host.
 fn parse_url(field: &'static str, url: &str) -> Result<Url, Error> {
-    Url::parse(url).map_err(|source| Error::Url { field, source })
+    let url = Url::parse(url).map_err(|source| Error::Url { field, source })?;
+    Scheme::try_from(&url).map_err(|source| Error::UrlScheme { field, source })?;
+    Ok(url)
 }
 
 /// What credentials are built with.

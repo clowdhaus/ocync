@@ -227,6 +227,17 @@ mod tests {
             ),
             "{bad_uri:?}"
         );
+        let not_http = AuthorizedUser::from_json(user_file("mailto:x"), Scopes::Registry);
+        assert!(
+            matches!(
+                not_http,
+                Err(Error::UrlScheme {
+                    field: TOKEN_URI_FIELD,
+                    ..
+                })
+            ),
+            "{not_http:?}"
+        );
         let mut bad_project = user_file(TOKEN_URI);
         bad_project["quota_project_id"] = "line\nbreak".into();
         let bad_project = AuthorizedUser::from_json(bad_project, Scopes::Registry);

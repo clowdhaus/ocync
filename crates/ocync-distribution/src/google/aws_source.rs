@@ -5,7 +5,6 @@
 //! Identity and every other AWS source work. Upstream reads only the
 //! `AWS_*` key variables and the instance metadata role the file names.
 
-use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use serde::de::IgnoredAny;
@@ -13,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::{Call, Error, Secret, Setup, parse_url, send, send_text};
-use crate::aws::{CallerIdentityConfig, CallerIdentitySigner, Region, host_header, imds};
+use crate::aws::{CallerIdentityConfig, CallerIdentitySigner, Region, imds};
 
 /// The field naming the URL the availability zone is asked of.
 const REGION_URL_FIELD: &str = "region_url";
@@ -79,6 +78,7 @@ impl Source {
         file: &SourceFile,
         audience: &str,
     ) -> Result<Self, Error> {
+        let sts_url = StsUrl::parse(file.regional_cred_verification_url.as_deref())?;
         let config = CallerIdentityConfig::load(setup.host);
         let region = match config.region().map_err(Error::AwsRegion)? {
             Some(region) => region,
@@ -87,24 +87,15 @@ impl Source {
         let signer = config
             .signer(region, setup.aws_credentials)
             .map_err(Error::AwsConfig)?;
-        Self::with_signer(
-            signer,
-            file.regional_cred_verification_url.as_deref(),
-            audience,
-        )
+        Self::with_signer(signer, &sts_url, audience)
     }
 
     fn with_signer(
         signer: CallerIdentitySigner,
-        verification_url: Option<&str>,
+        sts_url: &StsUrl,
         audience: &str,
     ) -> Result<Self, Error> {
-        let url = sts_url(verification_url, signer.region())?;
-        if !url.has_host() {
-            return Err(Error::UrlHost {
-                field: VERIFICATION_URL_FIELD,
-            });
-        }
+        let url = sts_url.resolve(signer.region())?;
         Ok(Self {
             url,
             signer,
@@ -120,14 +111,8 @@ impl Source {
             .sign(&self.url, &unsigned, now)
             .await
             .map_err(Error::AwsSigning)?;
-        let headers: BTreeMap<&str, &str> = [("host", host_header(&self.url))]
-            .into_iter()
-            .chain(unsigned)
-            .chain(signed.date_and_token())
-            .collect();
-        let headers = headers
-            .into_iter()
-            .chain([(AUTHORIZATION_KEY, signed.authorization())])
+        let headers = signed
+            .headers(AUTHORIZATION_KEY)
             .map(|(key, value)| Header { key, value })
             .collect();
         let json = serde_json::to_string(&SignedRequest {
@@ -166,6 +151,7 @@ async fn region_from_metadata(setup: &Setup<'_>, file: &SourceFile) -> Result<Re
             let token = send(clients, Call::AwsRegion, |client| {
                 client
                     .put(url)
+                    .timeout(imds::REQUEST_TIMEOUT)
                     .header(imds::TOKEN_TTL_HEADER, imds::TOKEN_TTL.as_secs())
             })
             .await?;
@@ -174,7 +160,7 @@ async fn region_from_metadata(setup: &Setup<'_>, file: &SourceFile) -> Result<Re
         None => None,
     };
     let zone = send_text(clients, Call::AwsRegion, |client| {
-        let request = client.get(region_url);
+        let request = client.get(region_url).timeout(imds::REQUEST_TIMEOUT);
         match token {
             Some(token) => request.header(imds::TOKEN_HEADER, token),
             None => request,
@@ -209,21 +195,34 @@ fn region_from_zone(zone: &str) -> Option<&str> {
     Some(zone)
 }
 
-/// The STS URL from `template`, or the default, in `region`, with
-/// `https://` before it when it has no scheme. It must name a host.
-fn sts_url(template: Option<&str>, region: &Region) -> Result<Url, Error> {
-    let url = template
-        .unwrap_or(DEFAULT_VERIFICATION_URL)
-        .replace("{region}", region.as_str());
-    let url = if url.starts_with("http") {
-        url
-    } else {
-        format!("https://{url}")
-    };
-    Url::parse(&url).map_err(|source| Error::Url {
-        field: VERIFICATION_URL_FIELD,
-        source,
-    })
+/// The STS URL template, `{region}` replaced once the region is known.
+#[derive(Debug)]
+struct StsUrl(String);
+
+impl StsUrl {
+    /// `template`, or the default, with `https://` added to a bare host.
+    /// Checked with a sample region, so a template bad for every region
+    /// fails before the region lookup sends a request. One region can still
+    /// fail to resolve where another does.
+    fn parse(template: Option<&str>) -> Result<Self, Error> {
+        let template = template.unwrap_or(DEFAULT_VERIFICATION_URL);
+        let template = if template.starts_with("http") {
+            template.to_owned()
+        } else {
+            format!("https://{template}")
+        };
+        let parsed = Self(template);
+        parsed.resolve(&Region::parse("us-east-1").expect("a valid region"))?;
+        Ok(parsed)
+    }
+
+    /// The URL for `region`.
+    fn resolve(&self, region: &Region) -> Result<Url, Error> {
+        parse_url(
+            VERIFICATION_URL_FIELD,
+            &self.0.replace("{region}", region.as_str()),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -261,30 +260,30 @@ mod tests {
     }
 
     /// Upstream `test_resolve_sts_url` and `_invalid`. Breaks if the region
-    /// is not substituted, a bare host gets no scheme, or a URL with no host
-    /// is accepted.
+    /// is not substituted, a bare host gets no scheme, or a URL that is not
+    /// http or https is accepted.
     #[test]
     fn resolves_the_sts_url() {
+        let resolve = |template, at| {
+            StsUrl::parse(template)
+                .unwrap()
+                .resolve(&region(at))
+                .unwrap()
+        };
         assert_eq!(
-            sts_url(None, &region("us-west-2")).unwrap().as_str(),
+            resolve(None, "us-west-2").as_str(),
             "https://sts.us-west-2.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15"
         );
         assert_eq!(
-            sts_url(Some("sts.{region}.amazonaws.com"), &region("eu-west-1"))
-                .unwrap()
-                .as_str(),
+            resolve(Some("sts.{region}.amazonaws.com"), "eu-west-1").as_str(),
             "https://sts.eu-west-1.amazonaws.com/"
         );
-        assert!(sts_url(Some("http://"), &region("us-east-1")).is_err());
-        let no_host = Source::with_signer(
-            CallerIdentitySigner::example("us-east-1", None),
-            Some("httpx:/sts"),
-            "audience",
-        );
+        assert!(StsUrl::parse(Some("http://")).is_err());
         assert!(matches!(
-            no_host,
-            Err(Error::UrlHost {
+            StsUrl::parse(Some("httpx:/sts")),
+            Err(Error::UrlScheme {
                 field: VERIFICATION_URL_FIELD,
+                ..
             })
         ));
     }
@@ -319,6 +318,38 @@ mod tests {
         .await;
 
         assert_eq!(found.unwrap().as_str(), "us-east-1");
+    }
+
+    /// An instance metadata service that does not answer within its bound
+    /// is asked once, as one behind a container hop limit never answers.
+    /// Breaks if setup stalls retrying it.
+    #[tokio::test]
+    async fn gives_up_on_a_silent_region_lookup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/zone"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("us-east-1a")
+                    .set_delay(imds::REQUEST_TIMEOUT + Duration::from_secs(1)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let fixture = Fixture::new(host(Platform::Unix, &[], &[]));
+
+        let error = region_from_metadata(
+            &fixture.setup(),
+            &file(Some(format!("{}/zone", server.uri())), None),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Transport { .. }), "{error}");
+        assert!(!error.is_transient());
     }
 
     fn file(region_url: Option<String>, imdsv2_url: Option<String>) -> SourceFile {
@@ -479,7 +510,7 @@ mod tests {
     async fn signs_the_caller_identity_request() {
         let source = Source::with_signer(
             CallerIdentitySigner::example("us-east-1", Some("session-token")),
-            None,
+            &StsUrl::parse(None).unwrap(),
             "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
         )
         .unwrap();

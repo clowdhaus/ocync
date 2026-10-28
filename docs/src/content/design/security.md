@@ -59,7 +59,7 @@ Scanners that read the embedded list directly still see the dropped crates until
 
 ## Owned Google authentication
 
-`ocync` resolves Google Application Default Credentials itself, in `crates/ocync-distribution/src/google/`, as `google-cloud-auth` 1.18.0 does, which hashed and signed with the pure-Rust `sha2` and `hmac` crates and drew randomness from a pure-Rust ChaCha20 generator. Every hash, signature and random number now comes from `aws-lc-rs`. The sources, in upstream's order:
+`ocync` resolves Google Application Default Credentials itself, in `crates/ocync-distribution/src/google/`, as `google-cloud-auth` 1.18.0 does, which hashed and signed with the pure-Rust `sha2` and `hmac` crates and drew randomness from a pure-Rust ChaCha20 generator. Every hash, signature and cryptographic random number now comes from `aws-lc-rs`. The sources, in upstream's order:
 
 - The file `GOOGLE_APPLICATION_CREDENTIALS` names, which must exist, then gcloud's well-known file (`$HOME/.config/gcloud/application_default_credentials.json`, or `%APPDATA%\gcloud\application_default_credentials.json` on Windows), then the GCE and GKE metadata server, at `GCE_METADATA_HOST` when it is set.
 - Service account keys: a self-signed RS256 JWT, signed with an `aws-lc-rs` RSA key and used directly as the access token, as upstream uses it. Only PKCS#8 keys are accepted, as upstream.
@@ -78,8 +78,8 @@ The rules every change to `auth/gcp.rs` and `google/` keeps. Each rule names the
 | The load fails | Kept for the run: every request of the load has already retried a transient failure | None more |
 | A Google token is needed | The kept one, until 30 seconds before its `expires_in` or `expireTime`. One with no expiry is kept until an exchange refuses it, as upstream never refreshes one | One token chain per lifetime |
 | A token fetch fails | Hosts that were waiting on it get its error. A host that asks after it tries again | One token chain per wave of waiting hosts |
-| A request of the chain fails transiently (an HTTP 5xx, 408 or 429, a request that did not connect or complete, or an answer cut short) | That request alone is sent again on the crate's jittered schedule, up to 4 times, as the prepare phase reaches it before the engine's retry exists. A metadata server, or the EC2 instance metadata service a `region_url` names, that does not connect is final, as a host without one never gets one. A URL source on this host is retried, as a token sidecar may still be starting | At most 4 more of that request |
-| A registry answers a request with 401 | The registry's token for the scope is dropped and exchanged again with the kept Google token | None |
+| A request of the chain fails transiently (an HTTP 5xx, 408 or 429, a request that did not connect or complete, or an answer cut short) | That request alone is sent again on the crate's jittered schedule, up to 4 times, as the prepare phase reaches it before the engine's retry exists. A metadata server, or the EC2 instance metadata service a `region_url` names, that does not connect is final, as a host without one never gets one. The EC2 one answers within 2 seconds when it answers at all, so its timeout is final too. A URL source on this host is retried, as a token sidecar may still be starting | At most 4 more of that request |
+| A registry answers a request with 401 | The host's registry tokens for every scope and its cached challenge are dropped, and exchanged again with the kept Google token | None |
 | The token exchange answers 401 | The Google token itself was refused, as when it was revoked or Google's clock has passed it. It is dropped if still the one kept, and the exchange is tried once more with a fresh one | One token chain |
 | The token exchange answers 403 or 404 | A scope the identity cannot reach, or a missing repository, both measured on Artifact Registry. The Google token is kept | None |
 | The next run, such as the next watch cycle | Everything is loaded afresh | One token chain |
@@ -96,7 +96,7 @@ Deliberate differences from upstream:
 - An impersonated token whose `expireTime` has already passed is an error. Upstream panics.
 - A subject token format of type `json` with no `subject_token_field_name` is an error when the credentials load. Upstream reads an empty field name and fails at every exchange.
 - STS client authentication sends `id:secret` in standard padded base64, as RFC 7617 and Google's Go and Python libraries do. Upstream sends URL-safe base64 without padding.
-- A service account's key, an authorized user's `token_uri` and `quota_project_id`, the file's `token_url` and impersonation URL, a URL source's URL and headers, an AWS source's `region_url` and `imdsv2_session_token_url`, and `GCE_METADATA_HOST` are parsed when the credentials are loaded, so a bad one fails when the registry is set up rather than at the first token.
+- A service account's key, an authorized user's `token_uri` and `quota_project_id`, the file's `token_url` and impersonation URL, a URL source's URL and headers, and `GCE_METADATA_HOST` are parsed when the credentials are loaded, so a bad one fails when the registry is set up rather than at the first token. An AWS source's `region_url` and `imdsv2_session_token_url` are parsed when the region is looked up, which is also at setup, and not at all when the region comes from elsewhere. A URL that is not `http` or `https` is refused.
 - An answer that is not UTF-8 is an error. Upstream replaces the invalid bytes of a URL subject token.
 - An `expires_in` past what the clock can hold is an error, rather than a token that never expires.
 - An error shows no request URL, as its query can hold a token.

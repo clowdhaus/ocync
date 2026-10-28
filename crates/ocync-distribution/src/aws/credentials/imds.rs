@@ -63,6 +63,11 @@ const TIMEOUTS: Timeouts = Timeouts {
     read: Duration::from_secs(1),
 };
 
+/// How long one request may take: its connect and read bounds. A service
+/// that does not answer in that time, as behind a container with an
+/// `IMDSv2` hop limit of 1, never will.
+pub(crate) const REQUEST_TIMEOUT: Duration = TIMEOUTS.connect.saturating_add(TIMEOUTS.read);
+
 /// An attempt that takes longer fails.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 

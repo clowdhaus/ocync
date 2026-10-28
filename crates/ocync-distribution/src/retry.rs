@@ -4,8 +4,9 @@
 //! retries the ones it drives. The prepare phase has no such layer above it:
 //! it runs before the engine exists, so a transient failure there fails a
 //! whole mapping or image. The operations that run there retry themselves,
-//! through [`retrying`], and share one schedule and one predicate so they
-//! cannot drift apart. The AWS API calls run the same loop under the AWS
+//! through [`retrying`], and share one schedule so they cannot drift apart.
+//! Each passes the predicate for its own errors, built on
+//! [`is_transient_transport`]. The AWS API calls run the same loop under the AWS
 //! SDK's retry policy instead (see `crate::aws`).
 
 use std::cell::Cell;
@@ -51,6 +52,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// rather than repeating the predicate, because two copies drift.
 pub fn is_transient_transport(error: &reqwest::Error) -> bool {
     error.is_request() || error.is_body() || error.is_decode()
+}
+
+/// Whether a server that answered `status` may answer differently if asked
+/// again: 408, 429 or any 5xx. The single definition for the workspace, as
+/// crane and regsync retry the same set.
+pub fn is_transient_status(status: http::StatusCode) -> bool {
+    status.is_server_error()
+        || status == http::StatusCode::REQUEST_TIMEOUT
+        || status == http::StatusCode::TOO_MANY_REQUESTS
 }
 
 /// Whether an error is worth re-sending: a throttle, or a transport failure.

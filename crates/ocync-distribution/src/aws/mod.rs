@@ -952,19 +952,18 @@ impl CallerIdentitySigner {
 
     /// Sign a [`Self::METHOD`] request to `url` with `headers` and an empty
     /// body, at `time`, the `host` header signed as [`host_header`].
-    /// Returns the headers to add.
     pub(crate) async fn sign(
         &self,
         url: &Url,
         headers: &[(&str, &str)],
         time: SystemTime,
-    ) -> Result<sigv4::Signed, SigningError> {
+    ) -> Result<CallerIdentityHeaders, SigningError> {
         let credentials = self.credentials.load().await.map_err(SigningError)?;
         let headers: Vec<(&str, &str)> = [("host", host_header(url))]
             .into_iter()
             .chain(headers.iter().copied())
             .collect();
-        Ok(sigv4::sign(
+        let signed = sigv4::sign(
             &sigv4::Request {
                 method: &Self::METHOD,
                 path: url.path(),
@@ -982,13 +981,56 @@ impl CallerIdentitySigner {
                 service: STS_SIGNING_NAME,
             },
             time,
-        ))
+        );
+        let owned = |(name, value): (&str, &str)| (name.to_owned(), value.to_owned());
+        let mut sorted: Vec<(String, String)> = headers
+            .into_iter()
+            .map(owned)
+            .chain(signed.date_and_token().map(owned))
+            .collect();
+        sorted.sort_unstable();
+        Ok(CallerIdentityHeaders {
+            signed: sorted,
+            authorization: signed.authorization().to_owned(),
+        })
+    }
+}
+
+/// The headers of a signed caller identity request.
+pub(crate) struct CallerIdentityHeaders {
+    /// Every signed header, `host` among them, sorted by name.
+    signed: Vec<(String, String)>,
+    /// The `authorization` header's value, which covers `signed`.
+    authorization: String,
+}
+
+impl CallerIdentityHeaders {
+    /// Every signed header sorted by name, then `authorization` under
+    /// `authorization_name`.
+    pub(crate) fn headers<'a>(
+        &'a self,
+        authorization_name: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.signed
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .chain([(authorization_name, self.authorization.as_str())])
+    }
+}
+
+/// Prints header names only, as the values hold a session token and a
+/// signature.
+impl fmt::Debug for CallerIdentityHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.headers("authorization").map(|(name, _)| name))
+            .finish()
     }
 }
 
 /// The `host` header a request to `url` carries: its host, and its port
 /// when it is not the scheme's.
-pub(crate) fn host_header(url: &Url) -> &str {
+fn host_header(url: &Url) -> &str {
     &url[url::Position::BeforeHost..url::Position::AfterPort]
 }
 

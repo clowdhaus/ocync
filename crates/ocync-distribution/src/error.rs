@@ -222,7 +222,8 @@ impl Error {
     /// Whether this error represents an authentication or authorization failure.
     ///
     /// Returns `true` for [`AuthFailed`](Self::AuthFailed) errors, a token
-    /// endpoint's 4xx other than 429 Too Many Requests, Google credentials
+    /// endpoint's 4xx other than 408 Request Timeout and 429 Too Many
+    /// Requests, Google credentials
     /// that fail for good, and registry responses with HTTP 401 Unauthorized
     /// or 403 Forbidden status codes.
     pub fn is_auth_error(&self) -> bool {
@@ -233,7 +234,7 @@ impl Error {
                 ..
             } => true,
             Self::TokenEndpoint { status, .. } => {
-                status.is_client_error() && *status != http::StatusCode::TOO_MANY_REQUESTS
+                status.is_client_error() && !crate::retry::is_transient_status(*status)
             }
             Self::RegistryError { status, .. } => {
                 *status == http::StatusCode::UNAUTHORIZED || *status == http::StatusCode::FORBIDDEN
@@ -453,14 +454,15 @@ mod tests {
         assert!(err.is_auth_error());
     }
 
-    /// A token endpoint that refuses is an auth error, and one that is
-    /// throttled or failing is not. Breaks if a 503 or 429 exits as refused
-    /// credentials.
+    /// A token endpoint that refuses is an auth error, and one that times
+    /// out, is throttled or is failing is not. Breaks if a 408, 429 or 503
+    /// exits as refused credentials.
     #[test]
     fn is_auth_error_token_endpoint() {
         for (status, auth_error) in [
             (http::StatusCode::UNAUTHORIZED, true),
             (http::StatusCode::NOT_FOUND, true),
+            (http::StatusCode::REQUEST_TIMEOUT, false),
             (http::StatusCode::TOO_MANY_REQUESTS, false),
             (http::StatusCode::SERVICE_UNAVAILABLE, false),
         ] {

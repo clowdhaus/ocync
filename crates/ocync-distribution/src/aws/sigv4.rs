@@ -120,7 +120,7 @@ pub(crate) struct Signed {
 impl Signed {
     /// The `x-amz-date` header and, with a session token, the
     /// `x-amz-security-token` header.
-    pub(crate) fn date_and_token(&self) -> impl Iterator<Item = (&'static str, &str)> {
+    pub(super) fn date_and_token(&self) -> impl Iterator<Item = (&'static str, &str)> {
         [
             (X_AMZ_DATE, Some(self.amz_date.as_str())),
             (X_AMZ_SECURITY_TOKEN, self.security_token.as_deref()),
@@ -130,7 +130,7 @@ impl Signed {
     }
 
     /// The `authorization` header's value.
-    pub(crate) fn authorization(&self) -> &str {
+    pub(super) fn authorization(&self) -> &str {
         &self.authorization
     }
 

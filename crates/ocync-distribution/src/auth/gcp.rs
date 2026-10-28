@@ -341,10 +341,11 @@ impl GcpAuth {
 
     /// The current Google token.
     async fn google_token(&self) -> Result<google::Secret, Error> {
-        let token = self.cached_token.get().await.map_err(|e| {
-            tracing::warn!(error = %e, "GCP access token request failed");
-            credentials_failed(&self.hostname, Stage::TokenRequest, &e)
-        })?;
+        let token = self
+            .cached_token
+            .get()
+            .await
+            .map_err(|e| credentials_failed(&self.hostname, Stage::TokenRequest, &e))?;
         Ok(token.token)
     }
 }
@@ -769,7 +770,7 @@ mod tests {
     /// A host whose credentials are an external account with an AWS
     /// source, its region looked up at `server`.
     fn aws_source_host(server: &MockServer) -> crate::aws::Host {
-        let file = serde_json::json!({
+        adc_host(&serde_json::json!({
             "type": "external_account",
             "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
             "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
@@ -778,12 +779,7 @@ mod tests {
                 "environment_id": "aws1",
                 "region_url": format!("{}/zone", server.uri()),
             },
-        });
-        google::tests::host(
-            crate::aws::Platform::Unix,
-            &[("GOOGLE_APPLICATION_CREDENTIALS", "/adc.json")],
-            &[("/adc.json", file.to_string().into_bytes())],
-        )
+        }))
     }
 
     /// An authorized user's token endpoint at `server`, answering `calls`
@@ -802,13 +798,17 @@ mod tests {
     /// A host whose credentials are an authorized user refreshing at
     /// `server`.
     fn user_host(server: &MockServer) -> crate::aws::Host {
-        let file = serde_json::json!({
+        adc_host(&serde_json::json!({
             "type": "authorized_user",
             "client_id": "client",
             "client_secret": "secret",
             "refresh_token": "refresh",
             "token_uri": format!("{}/token", server.uri()),
-        });
+        }))
+    }
+
+    /// A host whose `GOOGLE_APPLICATION_CREDENTIALS` file is `file`.
+    fn adc_host(file: &serde_json::Value) -> crate::aws::Host {
         google::tests::host(
             crate::aws::Platform::Unix,
             &[("GOOGLE_APPLICATION_CREDENTIALS", "/adc.json")],
