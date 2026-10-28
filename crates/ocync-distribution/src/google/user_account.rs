@@ -1,6 +1,7 @@
 //! An authorized user, as `gcloud auth application-default login` writes
 //! one: a refresh token exchanged at the `OAuth2` token endpoint.
 
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -56,8 +57,8 @@ struct RefreshRequest<'a> {
 #[derive(Deserialize)]
 struct RefreshResponse {
     access_token: String,
-    #[allow(dead_code, reason = "required, as upstream requires it")]
-    token_type: String,
+    #[serde(rename = "token_type")]
+    _token_type: IgnoredAny,
     expires_in: Option<u64>,
 }
 
@@ -65,16 +66,13 @@ impl AuthorizedUser {
     /// The user `json` describes, asking for `scopes`. A universe other than
     /// `googleapis.com` is refused, as upstream.
     pub(super) fn from_json(json: Value, scopes: Scopes) -> Result<Self, Error> {
-        let file: UserFile = serde_json::from_value(json).map_err(Error::parse)?;
+        let file: UserFile = serde_json::from_value(json).map_err(Error::Parse)?;
         if file
             .universe_domain
             .as_deref()
             .is_some_and(|universe| universe != DEFAULT_UNIVERSE)
         {
-            return Err(Error::Parse(
-                "User Account Credentials are not supported in universes other than googleapis.com"
-                    .into(),
-            ));
+            return Err(Error::UserUniverse);
         }
         Ok(Self {
             client_id: file.client_id,

@@ -393,7 +393,10 @@ async fn reads_file_subject_tokens() {
         read(Some(r#"{"other": "jwt"}"#), json()).await,
         Err(Error::SubjectField(_))
     ));
-    assert!(matches!(read(Some(""), json()).await, Err(Error::Parse(_))));
+    assert!(matches!(
+        read(Some(""), json()).await,
+        Err(Error::SubjectJson(_))
+    ));
     assert!(matches!(
         read(None, Format::Text).await,
         Err(Error::ReadFile { .. })

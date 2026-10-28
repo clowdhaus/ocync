@@ -8,7 +8,8 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use serde::Serialize;
+use serde::de::IgnoredAny;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::{Call, Error, Secret, Setup};
@@ -24,20 +25,34 @@ const DEFAULT_VERIFICATION_URL: &str =
 /// The header naming the federation audience, signed with the request.
 const TARGET_RESOURCE: &str = "x-goog-cloud-target-resource";
 
-/// The IMDSv2 token request's TTL header and value, as upstream.
+/// The `IMDSv2` token request's TTL header and value, as upstream.
 const IMDSV2_TTL: (&str, &str) = ("x-aws-ec2-metadata-token-ttl-seconds", "21600");
 
-/// The header carrying an IMDSv2 token.
+/// The header carrying an `IMDSv2` token.
 const IMDSV2_TOKEN: &str = "x-aws-ec2-metadata-token";
 
 /// The request signed.
 const METHOD: http::Method = http::Method::POST;
+
+/// An AWS subject token source as the credentials file writes it.
+/// `environment_id` selects it and is not read further, as upstream; the
+/// role URL `url` is not read, as the AWS chain supplies the credentials.
+#[derive(Debug, Deserialize)]
+pub(super) struct AwsSourceFile {
+    #[serde(rename = "environment_id")]
+    _environment_id: IgnoredAny,
+    region_url: Option<String>,
+    regional_cred_verification_url: Option<String>,
+    imdsv2_session_token_url: Option<String>,
+}
 
 /// The AWS subject token source.
 #[derive(Debug)]
 pub(crate) struct AwsSource {
     signer: CallerIdentitySigner,
     url: Url,
+    /// The host of `url`, signed as `host`.
+    host: String,
     audience: String,
 }
 
@@ -57,24 +72,22 @@ struct Header<'a> {
 }
 
 impl AwsSource {
-    /// The source for `audience`: the region from the environment or
-    /// `region_url`, the STS URL from `verification_url` or the default,
-    /// and that region's credentials from the run's AWS chain.
+    /// The source `file` describes, for `audience`: the region from the
+    /// environment or `region_url`, the STS URL from
+    /// `regional_cred_verification_url` or the default, and that region's
+    /// credentials from the run's AWS chain.
     pub(super) async fn new(
         setup: &Setup<'_>,
-        region_url: Option<&str>,
-        verification_url: Option<&str>,
-        imdsv2_url: Option<&str>,
+        file: &AwsSourceFile,
         audience: &str,
     ) -> Result<Self, Error> {
         let region = match region_from_env(&setup.host.env) {
             Some(region) => region,
-            None => region_from_metadata(setup, region_url, imdsv2_url).await?,
+            None => region_from_metadata(setup, file).await?,
         };
         Self::with_signer(
-            CallerIdentitySigner::new(&region, setup.aws_credentials)
-                .map_err(|e| Error::AwsSigning(e.to_string()))?,
-            verification_url,
+            CallerIdentitySigner::new(&region, setup.aws_credentials).map_err(Error::AwsConfig)?,
+            file.regional_cred_verification_url.as_deref(),
             audience,
         )
     }
@@ -84,8 +97,10 @@ impl AwsSource {
         verification_url: Option<&str>,
         audience: &str,
     ) -> Result<Self, Error> {
+        let url = sts_url(verification_url, signer.region())?;
         Ok(Self {
-            url: sts_url(verification_url, signer.region())?,
+            host: url.host_str().ok_or(Error::StsUrlHost)?.to_owned(),
+            url,
             signer,
             audience: audience.to_owned(),
         })
@@ -93,16 +108,15 @@ impl AwsSource {
 
     /// The subject token signed at `now`.
     pub(super) async fn subject_token(&self, now: SystemTime) -> Result<Secret, Error> {
-        let host = self
-            .url
-            .host_str()
-            .expect("checked when the URL was resolved");
-        let unsigned = [("host", host), (TARGET_RESOURCE, self.audience.as_str())];
+        let unsigned = [
+            ("host", self.host.as_str()),
+            (TARGET_RESOURCE, self.audience.as_str()),
+        ];
         let signed = self
             .signer
             .sign(&METHOD, &self.url, &unsigned, now)
             .await
-            .map_err(|e| Error::AwsSigning(e.to_string()))?;
+            .map_err(Error::AwsSigning)?;
         let mut headers: BTreeMap<&str, &str> = unsigned.into_iter().collect();
         let mut authorization = None;
         for (name, value) in &signed {
@@ -138,18 +152,14 @@ fn region_from_env(env: &Env) -> Option<String> {
     REGION_VARIABLES.iter().find_map(|name| env.get(name))
 }
 
-/// The region of the availability zone `region_url` answers, with an
-/// IMDSv2 token from `imdsv2_url` when the file names one.
-async fn region_from_metadata(
-    setup: &Setup<'_>,
-    region_url: Option<&str>,
-    imdsv2_url: Option<&str>,
-) -> Result<String, Error> {
-    let Some(region_url) = region_url else {
+/// The region of the availability zone `file`'s `region_url` answers, with
+/// an `IMDSv2` token from its `imdsv2_session_token_url` when it names one.
+async fn region_from_metadata(setup: &Setup<'_>, file: &AwsSourceFile) -> Result<String, Error> {
+    let Some(region_url) = &file.region_url else {
         return Err(Error::NoAwsRegion);
     };
     let client = &setup.clients.metadata;
-    let token = match imdsv2_url {
+    let token = match &file.imdsv2_session_token_url {
         Some(url) => Some(text(client.put(url).header(IMDSV2_TTL.0, IMDSV2_TTL.1)).await?),
         None => None,
     };
@@ -182,8 +192,12 @@ async fn text(request: reqwest::RequestBuilder) -> Result<String, Error> {
 /// does not end in a letter after a digit is taken as the region itself.
 fn region_from_zone(zone: &str) -> Option<&str> {
     let zone = zone.trim();
-    let (last, region) = (zone.chars().last()?, &zone[..zone.len() - 1]);
-    if last.is_ascii_alphabetic() && region.ends_with(|c: char| c.is_ascii_digit()) {
+    if !zone.chars().last()?.is_ascii_alphabetic() {
+        return Some(zone);
+    }
+    // The last character is ASCII, one byte, so this cuts on a boundary.
+    let region = &zone[..zone.len() - 1];
+    if region.ends_with(|c: char| c.is_ascii_digit()) {
         return Some(region);
     }
     Some(zone)
@@ -200,11 +214,7 @@ fn sts_url(template: Option<&str>, region: &str) -> Result<Url, Error> {
     } else {
         format!("https://{url}")
     };
-    let url = Url::parse(&url).map_err(|e| Error::Parse(format!("invalid AWS STS URL: {e}")))?;
-    if url.host_str().is_none() {
-        return Err(Error::Parse("invalid AWS STS URL: missing host".into()));
-    }
-    Ok(url)
+    Url::parse(&url).map_err(Error::StsUrl)
 }
 
 #[cfg(test)]
@@ -226,6 +236,7 @@ mod tests {
             ("", None),
             ("   ", None),
             ("a", Some("a")),
+            ("us-east-1\u{e9}", Some("us-east-1\u{e9}")),
         ] {
             assert_eq!(region_from_zone(zone), region, "{zone:?}");
         }
@@ -247,6 +258,12 @@ mod tests {
             "https://sts.eu-west-1.amazonaws.com/"
         );
         assert!(sts_url(Some("http://"), "us-east-1").is_err());
+        let no_host = AwsSource::with_signer(
+            CallerIdentitySigner::example("us-east-1", None),
+            Some("httpx:/sts"),
+            "audience",
+        );
+        assert!(matches!(no_host, Err(Error::StsUrlHost)));
     }
 
     /// Upstream `test_resolve_region_env`: `AWS_REGION` before
@@ -266,7 +283,7 @@ mod tests {
     }
 
     /// Upstream `test_resolve_region_imds` and `test_resolve_imdsv2_token`:
-    /// with no region variable, an IMDSv2 token is asked for with its TTL
+    /// with no region variable, an `IMDSv2` token is asked for with its TTL
     /// and sent with the zone request, and the zone's region is used.
     /// Breaks if the token is not asked for or not sent, or the zone's
     /// letter is kept.
@@ -299,17 +316,25 @@ mod tests {
             aws_credentials: &aws_credentials,
         };
 
+        let file = |region_url: Option<String>, imdsv2_url: Option<String>| AwsSourceFile {
+            _environment_id: IgnoredAny,
+            region_url,
+            regional_cred_verification_url: None,
+            imdsv2_session_token_url: imdsv2_url,
+        };
         let region = region_from_metadata(
             &setup,
-            Some(&format!("{}/zone", server.uri())),
-            Some(&format!("{}/latest/api/token", server.uri())),
+            &file(
+                Some(format!("{}/zone", server.uri())),
+                Some(format!("{}/latest/api/token", server.uri())),
+            ),
         )
         .await
         .unwrap();
 
         assert_eq!(region, "us-gov-west-1");
         assert!(matches!(
-            region_from_metadata(&setup, None, None).await,
+            region_from_metadata(&setup, &file(None, None)).await,
             Err(Error::NoAwsRegion)
         ));
     }

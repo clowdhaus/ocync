@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 
 use super::{AccessToken, Call, Clients, Error, REGISTRY_SCOPE, Scopes, expiring, send_json};
 use crate::aws::{Clock, Env, Timeouts};
@@ -42,8 +43,8 @@ pub(crate) struct Metadata {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
-    #[allow(dead_code, reason = "required, as upstream requires it")]
-    token_type: String,
+    #[serde(rename = "token_type")]
+    _token_type: IgnoredAny,
     expires_in: Option<u64>,
 }
 

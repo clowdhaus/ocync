@@ -207,18 +207,27 @@ async fn refuses_bad_files() {
         (unsupported, "gdch_service_account"),
         (bad_url, "invalid service account impersonation URL"),
     ] {
-        let error = build(file, Scopes::Registry).await.unwrap_err();
-        assert!(error.to_string().contains(expected), "{expected}: {error}");
+        let error = crate::error::error_chain(&build(file, Scopes::Registry).await.unwrap_err());
+        assert!(error.contains(expected), "{expected}: {error}");
     }
 }
 
-/// The email is what follows `/serviceAccounts/`, less the method. Breaks
-/// if the suffix is kept or two occurrences are accepted.
+/// An impersonation URL names exactly one service account. Breaks if none,
+/// or two, are accepted.
 #[test]
-fn reads_the_client_email() {
+fn parses_the_impersonation_url() {
+    let one = "https://iam/v1/projects/-/serviceAccounts/sa@p:generateAccessToken";
     assert_eq!(
-        client_email("https://iam/v1/projects/-/serviceAccounts/sa@p:generateAccessToken").unwrap(),
-        "sa@p"
+        ImpersonationUrl::parse(one.to_owned()).unwrap(),
+        ImpersonationUrl(one.to_owned())
     );
-    assert!(client_email("https://iam/serviceAccounts/a/serviceAccounts/b").is_err());
+    for bad in [
+        "https://iam/v1/projects/-/sa@p",
+        "https://iam/serviceAccounts/a/serviceAccounts/b",
+    ] {
+        assert!(matches!(
+            ImpersonationUrl::parse(bad.to_owned()),
+            Err(Error::ImpersonationUrl)
+        ));
+    }
 }

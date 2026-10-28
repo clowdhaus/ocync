@@ -116,6 +116,7 @@ impl fmt::Debug for Secret {
     }
 }
 
+#[cfg(test)]
 impl From<String> for Secret {
     fn from(value: String) -> Self {
         Self(value)
@@ -194,14 +195,41 @@ pub(crate) enum Error {
         source: io::Error,
     },
     /// The credentials are not valid JSON, or lack a field their type needs.
-    #[error("failed to parse the credentials: {0}")]
-    Parse(String),
+    #[error("failed to parse the credentials")]
+    Parse(#[source] serde_json::Error),
+    /// The credentials have no `type` field.
+    #[error("no `type` field found.")]
+    NoType,
+    /// The credentials' `type` field is not a string.
+    #[error("`type` field is not a string.")]
+    TypeNotString,
     /// The credentials are of a type ocync does not support.
     #[error("unsupported credential type `{0}`")]
     UnsupportedType(String),
+    /// An impersonated service account's source is itself impersonated.
+    #[error(
+        "source credential of type `impersonated_service_account` is not supported. Use the `delegates` field to specify a delegation chain."
+    )]
+    NestedImpersonation,
+    /// An impersonation URL does not name one service account.
+    #[error("invalid service account impersonation URL")]
+    ImpersonationUrl,
+    /// An authorized user belongs to a universe other than `googleapis.com`.
+    #[error("User Account Credentials are not supported in universes other than googleapis.com")]
+    UserUniverse,
+    /// A workforce pool project is set on an audience that is not a
+    /// workforce pool.
+    #[error("workforce_pool_user_project should not be set for non-workforce pool credentials")]
+    WorkforceProject,
     /// A service account's private key is not a PKCS#8 RSA key.
-    #[error("failed to parse service account private key: {0}")]
-    PrivateKey(String),
+    #[error("failed to parse service account private key")]
+    PrivateKey(#[source] service_account::KeyError),
+    /// A service account's token was not signed.
+    #[error("failed to sign the service account token")]
+    Sign(#[source] aws_lc_rs::error::Unspecified),
+    /// The clock reads before the Unix epoch, which a JWT cannot carry.
+    #[error("the system clock is before 1970")]
+    ClockBeforeEpoch,
     /// An HTTP client did not build.
     #[error("failed to build the HTTP client")]
     Client(#[source] reqwest::Error),
@@ -227,6 +255,12 @@ pub(crate) enum Error {
         #[source]
         source: reqwest::Error,
     },
+    /// A subject token is not UTF-8.
+    #[error("the subject token is not UTF-8")]
+    SubjectNotUtf8(#[source] std::string::FromUtf8Error),
+    /// A JSON subject token document does not parse.
+    #[error("the subject token document is not JSON")]
+    SubjectJson(#[source] serde_json::Error),
     /// A subject token was not found where the credentials say.
     #[error("failed to read subject token field `{0}` as string")]
     SubjectField(String),
@@ -242,9 +276,18 @@ pub(crate) enum Error {
     /// The AWS region for an AWS subject token was not found.
     #[error("could not resolve AWS region")]
     NoAwsRegion,
+    /// The AWS STS URL does not parse.
+    #[error("invalid AWS STS URL")]
+    StsUrl(#[source] url::ParseError),
+    /// The AWS STS URL names no host.
+    #[error("invalid AWS STS URL: missing host")]
+    StsUrlHost,
+    /// The AWS settings for an AWS subject token are invalid.
+    #[error("invalid AWS configuration for the AWS subject token")]
+    AwsConfig(#[source] crate::aws::ConfigError),
     /// The AWS subject token was not signed.
-    #[error("failed to sign the AWS subject token: {0}")]
-    AwsSigning(String),
+    #[error("failed to sign the AWS subject token")]
+    AwsSigning(#[source] crate::aws::SigningError),
 }
 
 impl Error {
@@ -275,10 +318,6 @@ impl Error {
             status,
             body: truncate_quoted(&body).to_owned(),
         }
-    }
-
-    fn parse(error: impl fmt::Display) -> Self {
-        Self::Parse(error.to_string())
     }
 }
 
@@ -315,7 +354,7 @@ enum Scopes {
 pub(crate) enum Credentials {
     ServiceAccount(service_account::ServiceAccount),
     AuthorizedUser(user_account::AuthorizedUser),
-    ExternalAccount(external_account::ExternalAccount),
+    ExternalAccount(Box<external_account::ExternalAccount>),
     Impersonated(impersonated::Impersonated),
     Metadata(metadata::Metadata),
 }
@@ -340,41 +379,39 @@ impl Credentials {
                 Scopes::Registry,
             ))),
             Some(contents) => {
-                let json: Value = serde_json::from_slice(&contents).map_err(Error::parse)?;
-                Self::from_json(json, Scopes::Registry, &setup).await
+                let json: Value = serde_json::from_slice(&contents).map_err(Error::Parse)?;
+                let kind = CredentialType::of(&json)?;
+                Self::from_json(kind, json, Scopes::Registry, &setup).await
             }
         }
     }
 
-    /// The credentials `json` describes, by its `type`.
+    /// The credentials of type `kind` that `json` describes.
     fn from_json<'a>(
+        kind: CredentialType,
         json: Value,
         scopes: Scopes,
         setup: &'a Setup<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<Self, Error>> + 'a>> {
         Box::pin(async move {
-            let kind = match json.get("type") {
-                None => return Err(Error::parse("no `type` field found.")),
-                Some(Value::String(kind)) => kind.clone(),
-                Some(_) => return Err(Error::parse("`type` field is not a string.")),
-            };
-            match kind.as_str() {
-                "service_account" => service_account::ServiceAccount::from_json(json, scopes)
-                    .map(Self::ServiceAccount),
-                "authorized_user" => {
+            match kind {
+                CredentialType::ServiceAccount => {
+                    service_account::ServiceAccount::from_json(json, scopes)
+                        .map(Self::ServiceAccount)
+                }
+                CredentialType::AuthorizedUser => {
                     user_account::AuthorizedUser::from_json(json, scopes).map(Self::AuthorizedUser)
                 }
-                "external_account" => {
+                CredentialType::ExternalAccount => {
                     external_account::ExternalAccount::from_json(json, scopes, setup)
                         .await
-                        .map(Self::ExternalAccount)
+                        .map(|account| Self::ExternalAccount(Box::new(account)))
                 }
-                "impersonated_service_account" => {
+                CredentialType::Impersonated => {
                     impersonated::Impersonated::from_json(json, scopes, setup)
                         .await
                         .map(Self::Impersonated)
                 }
-                _ => Err(Error::UnsupportedType(kind)),
             }
         })
     }
@@ -412,6 +449,32 @@ impl Credentials {
             headers.push((user_account::QUOTA_PROJECT_HEADER, project.to_owned()));
         }
         Ok(headers)
+    }
+}
+
+/// A credentials file's `type`, for the types ocync supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialType {
+    ServiceAccount,
+    AuthorizedUser,
+    ExternalAccount,
+    Impersonated,
+}
+
+impl CredentialType {
+    /// The type `json` names. Any other is unsupported and named.
+    fn of(json: &Value) -> Result<Self, Error> {
+        match json.get("type") {
+            None => Err(Error::NoType),
+            Some(Value::String(kind)) => match kind.as_str() {
+                "service_account" => Ok(Self::ServiceAccount),
+                "authorized_user" => Ok(Self::AuthorizedUser),
+                "external_account" => Ok(Self::ExternalAccount),
+                "impersonated_service_account" => Ok(Self::Impersonated),
+                _ => Err(Error::UnsupportedType(kind.clone())),
+            },
+            Some(_) => Err(Error::TypeNotString),
+        }
     }
 }
 

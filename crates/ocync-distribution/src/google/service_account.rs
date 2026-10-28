@@ -8,6 +8,7 @@ use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,8 +31,23 @@ struct KeyFile {
     client_email: String,
     private_key_id: String,
     private_key: Secret,
-    #[allow(dead_code, reason = "required, as upstream requires it")]
-    project_id: String,
+    #[serde(rename = "project_id")]
+    _project_id: IgnoredAny,
+}
+
+/// Why a service account's private key was refused.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum KeyError {
+    /// The key is not in PKCS#8 `PRIVATE KEY` PEM armor, as a PKCS#1
+    /// `RSA PRIVATE KEY` is not.
+    #[error("expected a PKCS#8 `PRIVATE KEY` PEM")]
+    NotPkcs8Pem,
+    /// The armored body is not base64.
+    #[error("the PEM body is not base64")]
+    Base64(#[source] base64::DecodeError),
+    /// The key is not an RSA key `aws-lc-rs` accepts.
+    #[error("the key was rejected: {0}")]
+    Rejected(aws_lc_rs::error::KeyRejected),
 }
 
 /// A service account and the key it signs with.
@@ -76,9 +92,9 @@ impl ServiceAccount {
     /// The service account `json` describes, asking for `scopes`. The key
     /// is parsed here, so a bad key fails when the credentials are loaded.
     pub(super) fn from_json(json: Value, scopes: Scopes) -> Result<Self, Error> {
-        let file: KeyFile = serde_json::from_value(json).map_err(Error::parse)?;
+        let file: KeyFile = serde_json::from_value(json).map_err(Error::Parse)?;
         Ok(Self {
-            key: parse_pkcs8_pem(file.private_key.expose())?,
+            key: parse_pkcs8_pem(file.private_key.expose()).map_err(Error::PrivateKey)?,
             client_email: file.client_email,
             private_key_id: file.private_key_id,
             scope: match scopes {
@@ -92,9 +108,9 @@ impl ServiceAccount {
     /// A token signed at `now`, valid for [`LIFETIME`] past
     /// [`CLOCK_SKEW_FUDGE`].
     pub(super) fn access_token(&self, now: SystemTime) -> Result<AccessToken, Error> {
-        let issued = now
-            .checked_sub(CLOCK_SKEW_FUDGE)
-            .ok_or_else(|| Error::PrivateKey("the clock is before 1970".into()))?;
+        let iat = unix_seconds(now)?
+            .checked_sub(CLOCK_SKEW_FUDGE.as_secs())
+            .ok_or(Error::ClockBeforeEpoch)?;
         let expiry = now + CLOCK_SKEW_FUDGE + LIFETIME;
         let header = Header {
             alg: "RS256",
@@ -105,8 +121,8 @@ impl ServiceAccount {
             iss: &self.client_email,
             scope: &self.scope,
             aud: None,
-            exp: unix_seconds(expiry),
-            iat: unix_seconds(issued),
+            exp: unix_seconds(expiry)?,
+            iat,
             sub: &self.client_email,
         };
         let signed = format!("{}.{}", encode_json(&header), encode_json(&claims));
@@ -118,7 +134,7 @@ impl ServiceAccount {
                 signed.as_bytes(),
                 &mut signature,
             )
-            .map_err(|e| Error::PrivateKey(e.to_string()))?;
+            .map_err(Error::Sign)?;
         Ok(AccessToken {
             token: Secret(format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature))),
             expiry: Some(expiry),
@@ -132,25 +148,24 @@ fn encode_json(value: &impl Serialize) -> String {
 }
 
 /// Seconds since the epoch, as a JWT time.
-fn unix_seconds(time: SystemTime) -> u64 {
+fn unix_seconds(time: SystemTime) -> Result<u64, Error> {
     time.duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
+        .map(|since| since.as_secs())
+        .map_err(|_| Error::ClockBeforeEpoch)
 }
 
 /// The RSA key in a PKCS#8 PEM. Any other key, such as a PKCS#1
 /// `RSA PRIVATE KEY`, is refused, as upstream refuses it.
-fn parse_pkcs8_pem(pem: &str) -> Result<RsaKeyPair, Error> {
+fn parse_pkcs8_pem(pem: &str) -> Result<RsaKeyPair, KeyError> {
     let (begin, end) = PKCS8_ARMOR;
     let body = pem
         .trim()
         .strip_prefix(begin)
         .and_then(|rest| rest.strip_suffix(end))
-        .ok_or_else(|| Error::PrivateKey("expected a PKCS#8 `PRIVATE KEY` PEM".into()))?;
+        .ok_or(KeyError::NotPkcs8Pem)?;
     let base64: String = body.split_ascii_whitespace().collect();
-    let der = STANDARD
-        .decode(base64)
-        .map_err(|e| Error::PrivateKey(e.to_string()))?;
-    RsaKeyPair::from_pkcs8(&der).map_err(|e| Error::PrivateKey(e.to_string()))
+    let der = STANDARD.decode(base64).map_err(KeyError::Base64)?;
+    RsaKeyPair::from_pkcs8(&der).map_err(KeyError::Rejected)
 }
 
 #[cfg(test)]
@@ -266,6 +281,7 @@ pub(super) mod tests {
         let mut file = key_file(&pkcs8_pem());
         file.as_object_mut().unwrap().remove("project_id");
         let error = ServiceAccount::from_json(file, Scopes::Registry).unwrap_err();
-        assert!(error.to_string().contains("project_id"), "{error}");
+        let error = crate::error::error_chain(&error);
+        assert!(error.contains("project_id"), "{error}");
     }
 }

@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::Value;
 
-use super::aws_source::AwsSource;
+use super::aws_source::{AwsSource, AwsSourceFile};
 use super::{
     AccessToken, Call, Clients, DEFAULT_SCOPE, Error, REGISTRY_SCOPE, Scopes, Secret, Setup,
     expiring, impersonated, send_json,
@@ -50,16 +51,10 @@ struct AccountFile {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum SourceFile {
-    Aws {
-        #[allow(dead_code, reason = "selects the AWS source, as upstream")]
-        environment_id: String,
-        region_url: Option<String>,
-        regional_cred_verification_url: Option<String>,
-        imdsv2_session_token_url: Option<String>,
-    },
+    Aws(AwsSourceFile),
     Executable {
-        #[allow(dead_code, reason = "selects the executable source, as upstream")]
-        executable: ExecutableFile,
+        #[serde(rename = "executable")]
+        _executable: ExecutableFile,
     },
     Url {
         url: String,
@@ -75,8 +70,8 @@ enum SourceFile {
 /// An executable source's settings: the command is all that selects it.
 #[derive(Deserialize)]
 struct ExecutableFile {
-    #[allow(dead_code, reason = "required, as upstream requires it")]
-    command: String,
+    #[serde(rename = "command")]
+    _command: IgnoredAny,
 }
 
 /// How a subject token is written.
@@ -113,7 +108,7 @@ impl Format {
         match self {
             Self::Text => Ok(Secret(text)),
             Self::Json { field } => {
-                let json: Value = serde_json::from_str(&text).map_err(Error::parse)?;
+                let json: Value = serde_json::from_str(&text).map_err(Error::SubjectJson)?;
                 match json.get(field) {
                     Some(Value::String(token)) => Ok(Secret(token.clone())),
                     _ => Err(Error::SubjectField(field.clone())),
@@ -152,7 +147,7 @@ impl Source {
                     path: path.clone(),
                     source,
                 })?;
-                format.read(String::from_utf8(bytes).map_err(Error::parse)?)
+                format.read(String::from_utf8(bytes).map_err(Error::SubjectNotUtf8)?)
             }
             Self::Url {
                 url,
@@ -205,10 +200,10 @@ pub(crate) struct ExternalAccount {
 #[derive(Deserialize)]
 struct StsResponse {
     access_token: String,
-    #[allow(dead_code, reason = "required, as upstream requires it")]
-    issued_token_type: String,
-    #[allow(dead_code, reason = "required, as upstream requires it")]
-    token_type: String,
+    #[serde(rename = "issued_token_type")]
+    _issued_token_type: IgnoredAny,
+    #[serde(rename = "token_type")]
+    _token_type: IgnoredAny,
     expires_in: u64,
 }
 
@@ -220,30 +215,13 @@ impl ExternalAccount {
         scopes: Scopes,
         setup: &Setup<'_>,
     ) -> Result<Self, Error> {
-        let file: AccountFile = serde_json::from_value(json).map_err(Error::parse)?;
+        let file: AccountFile = serde_json::from_value(json).map_err(Error::Parse)?;
         if file.workforce_pool_user_project.is_some() && !is_workforce_pool_audience(&file.audience)
         {
-            return Err(Error::Parse(
-                "workforce_pool_user_project should not be set for non-workforce pool credentials"
-                    .into(),
-            ));
+            return Err(Error::WorkforceProject);
         }
         let source = match file.credential_source {
-            SourceFile::Aws {
-                region_url,
-                regional_cred_verification_url,
-                imdsv2_session_token_url,
-                ..
-            } => Source::Aws(
-                AwsSource::new(
-                    setup,
-                    region_url.as_deref(),
-                    regional_cred_verification_url.as_deref(),
-                    imdsv2_session_token_url.as_deref(),
-                    &file.audience,
-                )
-                .await?,
-            ),
+            SourceFile::Aws(aws) => Source::Aws(AwsSource::new(setup, &aws, &file.audience).await?),
             SourceFile::Executable { .. } => return Err(Error::UnsupportedSource("executable")),
             SourceFile::Url {
                 url,

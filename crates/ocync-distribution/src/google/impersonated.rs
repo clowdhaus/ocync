@@ -7,17 +7,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    AccessToken, Call, Clients, Credentials, DEFAULT_SCOPE, Error, REGISTRY_SCOPE, Scopes, Secret,
-    Setup, send_json,
+    AccessToken, Call, Clients, CredentialType, Credentials, DEFAULT_SCOPE, Error, REGISTRY_SCOPE,
+    Scopes, Secret, Setup, send_json,
 };
 use crate::aws::{Clock, parse_rfc3339_with_offset};
 
 /// How long an impersonated token is asked to last, as upstream.
 const LIFETIME: Duration = Duration::from_secs(3600);
 
-/// The file type a source may not have: delegation chains are written as
-/// `delegates` instead.
-const IMPERSONATED_TYPE: &str = "impersonated_service_account";
+/// What precedes the service account in an impersonation URL.
+const SERVICE_ACCOUNTS: &str = "/serviceAccounts/";
 
 /// An impersonated service account file, as upstream reads it.
 #[derive(Deserialize)]
@@ -28,11 +27,26 @@ struct ImpersonatedFile {
     scopes: Option<Vec<String>>,
 }
 
+/// An impersonation URL that names one service account, as upstream
+/// requires of an impersonated service account file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImpersonationUrl(String);
+
+impl ImpersonationUrl {
+    /// `url`, if [`SERVICE_ACCOUNTS`] occurs in it exactly once.
+    fn parse(url: String) -> Result<Self, Error> {
+        match url.matches(SERVICE_ACCOUNTS).count() {
+            1 => Ok(Self(url)),
+            _ => Err(Error::ImpersonationUrl),
+        }
+    }
+}
+
 /// A service account impersonated with source credentials.
 #[derive(Debug)]
 pub(crate) struct Impersonated {
     source: Box<Credentials>,
-    url: String,
+    url: ImpersonationUrl,
     delegates: Option<Vec<String>>,
     scopes: Vec<String>,
 }
@@ -64,19 +78,17 @@ impl Impersonated {
         scopes: Scopes,
         setup: &Setup<'_>,
     ) -> Result<Self, Error> {
-        let file: ImpersonatedFile = serde_json::from_value(json).map_err(Error::parse)?;
-        client_email(&file.service_account_impersonation_url)?;
-        if file.source_credentials.get("type").and_then(Value::as_str) == Some(IMPERSONATED_TYPE) {
-            return Err(Error::Parse(
-                "source credential of type `impersonated_service_account` is not supported. Use the `delegates` field to specify a delegation chain."
-                    .into(),
-            ));
-        }
+        let file: ImpersonatedFile = serde_json::from_value(json).map_err(Error::Parse)?;
+        let url = ImpersonationUrl::parse(file.service_account_impersonation_url)?;
+        let kind = match CredentialType::of(&file.source_credentials)? {
+            CredentialType::Impersonated => return Err(Error::NestedImpersonation),
+            kind => kind,
+        };
         let source =
-            Credentials::from_json(file.source_credentials, Scopes::Default, setup).await?;
+            Credentials::from_json(kind, file.source_credentials, Scopes::Default, setup).await?;
         Ok(Self {
             source: Box::new(source),
-            url: file.service_account_impersonation_url,
+            url,
             delegates: file.delegates,
             scopes: match scopes {
                 Scopes::Registry => vec![REGISTRY_SCOPE.to_owned()],
@@ -97,25 +109,12 @@ impl Impersonated {
         generate_access_token(
             clients,
             clock,
-            &self.url,
+            &self.url.0,
             &headers,
             self.delegates.as_deref(),
             &self.scopes,
         )
         .await
-    }
-}
-
-/// The service account's email in an impersonation URL: what follows its
-/// one `/serviceAccounts/`, less `:generateAccessToken`. Upstream checks it
-/// when it builds the credentials.
-fn client_email(url: &str) -> Result<&str, Error> {
-    let mut parts = url.split("/serviceAccounts/");
-    match (parts.nth(1), parts.next()) {
-        (Some(email), None) => Ok(email.trim_end_matches(":generateAccessToken")),
-        _ => Err(Error::Parse(
-            "invalid service account impersonation URL".into(),
-        )),
     }
 }
 
