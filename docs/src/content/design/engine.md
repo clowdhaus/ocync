@@ -304,6 +304,8 @@ source registry GET -> [bytes stream] -> target registry PATCH/PUT
 
 Memory usage is bounded by chunk size per active upload stream. No disk writes, no eviction logic. The majority deployment (single ECR target) pays only the adaptive concurrency overhead.
 
+The source GET is sent only once its upload has passed every limit that can hold it (the upload session POST, the streaming permit, the upload concurrency window, and the buffered-byte budget on registries that buffer) and is ready to read the body. Over HTTP/2 an opened response body holds a share of its connection's receive window until it is read, and that window starts at 65,535 bytes. Bodies opened ahead of uploads still waiting on a limit fill it, so the uploads that are running get no more data, and the sync stalls until the source closes the requests, which was minutes against the ECR Public CDN.
+
 ### Multi-target content-addressable staging
 
 When a mapping has multiple targets (e.g., us-ecr + eu-ecr + ap-ecr), the source blob is pulled once and written to a content-addressable disk file at `{cache_dir}/blobs/sha256/{hex_digest}`. All target pushes read from the disk file independently, at their own pace.

@@ -14,6 +14,9 @@
 //! - **`fixtures.rs`** -- Mapping constructors, client helpers, retry config.
 //!   `simple_image_manifest` is for HEAD-check tests using fake digests.
 //!
+//! - **`registry2.rs`** -- Real `registry:2` containers over HTTP or TLS, and
+//!   `populate_source` to fill one with images.
+//!
 //! # When to use what
 //!
 //! | Scenario | Use |
@@ -39,6 +42,7 @@ use ocync_sync::{SyncReport, shutdown::ShutdownSignal};
 pub mod builders;
 pub mod fixtures;
 pub mod mocks;
+pub mod registry2;
 
 // Re-export commonly used items for ergonomic `use helpers::*` imports.
 pub use builders::{
@@ -47,6 +51,7 @@ pub use builders::{
 };
 pub use fixtures::*;
 pub use mocks::*;
+pub use registry2::*;
 
 // ---------------------------------------------------------------------------
 // Engine run helpers

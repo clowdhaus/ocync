@@ -2754,11 +2754,13 @@ async fn transfer_claimed_blob(
         }
         StagingClaim::Disabled => {
             // No staging -- direct pull from source + push to target.
-            with_retry(io.retry, "blob transfer", || async {
-                let stream = io.source_client.blob_pull(io.source_repo, digest).await?;
-                io.target_client
-                    .blob_push_stream(io.target_repo, digest, Some(size), stream)
-                    .await
+            with_retry(io.retry, "blob transfer", || {
+                io.target_client.blob_push_stream_with(
+                    io.target_repo,
+                    digest,
+                    Some(size),
+                    async || io.source_client.blob_pull(io.source_repo, digest).await,
+                )
             })
             .await
             .map(|_| ())

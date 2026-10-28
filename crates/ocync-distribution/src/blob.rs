@@ -304,9 +304,38 @@ impl RegistryClient {
     where
         E: Into<Error> + Send,
     {
+        self.blob_push_stream_with(repository, expected_digest, known_size, async || Ok(stream))
+            .await
+    }
+
+    /// Push a blob as [`blob_push_stream`](Self::blob_push_stream) does,
+    /// with its bytes from `open`, called once the upload has passed every
+    /// limit that can hold it and is ready to read them. An error from
+    /// `open` is returned as it is.
+    ///
+    /// Open a source blob here rather than before the push. Over HTTP/2 an
+    /// opened response body takes a share of its connection's receive
+    /// window until it is read, so bodies opened ahead of uploads waiting
+    /// on a limit can fill the window and starve the uploads that are
+    /// running, until the source closes the stalled requests.
+    pub async fn blob_push_stream_with<S, E>(
+        &self,
+        repository: &RepositoryName,
+        expected_digest: &Digest,
+        known_size: Option<u64>,
+        open: impl AsyncFnOnce() -> Result<S, Error>,
+    ) -> Result<Digest, Error>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+        E: Into<Error> + Send,
+    {
         // Map stream errors to our Error type at the boundary so all
         // internal code works uniformly with `Result<Bytes, Error>`.
-        let stream = stream.map(|r| r.map_err(Into::into));
+        let open = async || {
+            open()
+                .await
+                .map(|stream| stream.map(|r| r.map_err(Into::into)))
+        };
 
         // Registry-specific upload fallbacks, detected via the canonical
         // provider detection (handles case-insensitivity, ports, trailing dots).
@@ -321,7 +350,7 @@ impl RegistryClient {
             // multi-PATCH corruption bug.
             Some(ProviderKind::Ghcr) => {
                 return self
-                    .blob_push_stream_ghcr(repository, expected_digest, known_size, stream)
+                    .blob_push_stream_ghcr(repository, expected_digest, known_size, open)
                     .await;
             }
             // GAR: buffer entire stream and use monolithic push.
@@ -330,7 +359,7 @@ impl RegistryClient {
             // this path.
             Some(ProviderKind::Gar) => {
                 return self
-                    .blob_push_stream_gar(repository, expected_digest, known_size, stream)
+                    .blob_push_stream_gar(repository, expected_digest, known_size, open)
                     .await;
             }
             // ACR: chunked PATCH under ACR's ~20 MB streaming-PUT body
@@ -339,7 +368,7 @@ impl RegistryClient {
             // corruption), then splits into ACR_PATCH_CHUNK_SIZE chunks.
             Some(ProviderKind::Acr) => {
                 return self
-                    .blob_push_stream_acr(repository, expected_digest, known_size, stream)
+                    .blob_push_stream_acr(repository, expected_digest, known_size, open)
                     .await;
             }
             // Default: streaming PUT below. Every other ProviderKind
@@ -381,7 +410,7 @@ impl RegistryClient {
         let permit = self.aimd.acquire(RegistryAction::BlobUploadComplete).await;
         let headers = self.auth_headers(&scopes).await?;
         let digest_str = expected_digest.to_string();
-        let body = reqwest::Body::wrap_stream(stream);
+        let body = reqwest::Body::wrap_stream(open().await?);
         let result = self
             .http
             .put(&upload_url)
@@ -427,13 +456,16 @@ impl RegistryClient {
     /// entire stream is buffered in memory and sent as a monolithic upload.
     /// The digest returned by the monolithic push is verified against the
     /// caller's expected digest to catch data corruption.
-    async fn blob_push_stream_gar(
+    async fn blob_push_stream_gar<S>(
         &self,
         repository: &RepositoryName,
         expected_digest: &Digest,
         known_size: Option<u64>,
-        stream: impl Stream<Item = Result<Bytes, Error>>,
-    ) -> Result<Digest, Error> {
+        open: impl AsyncFnOnce() -> Result<S, Error>,
+    ) -> Result<Digest, Error>
+    where
+        S: Stream<Item = Result<Bytes, Error>>,
+    {
         warn!(
             repository = repository.as_str(),
             host = self.base_url.host_str().unwrap_or("unknown"),
@@ -447,7 +479,7 @@ impl RegistryClient {
         // The helper acquires both in the right order; the returned
         // tuple drops bytes_permit before stream_permit on scope exit.
         let _permits = self.acquire_buffered_upload_permits(known_size).await;
-        let body = buffer_stream(stream, known_size).await?;
+        let body = buffer_stream(open().await?, known_size).await?;
         let actual_digest = self.blob_push(repository, &body).await?;
 
         if &actual_digest != expected_digest {
@@ -466,13 +498,16 @@ impl RegistryClient {
     /// request overwrites all previous chunks, so only the last chunk is
     /// stored. This fallback buffers the entire stream and sends a single
     /// PATCH with no `Content-Range` header, followed by a PUT to finalize.
-    async fn blob_push_stream_ghcr(
+    async fn blob_push_stream_ghcr<S>(
         &self,
         repository: &RepositoryName,
         expected_digest: &Digest,
         known_size: Option<u64>,
-        stream: impl Stream<Item = Result<Bytes, Error>>,
-    ) -> Result<Digest, Error> {
+        open: impl AsyncFnOnce() -> Result<S, Error>,
+    ) -> Result<Digest, Error>
+    where
+        S: Stream<Item = Result<Bytes, Error>>,
+    {
         warn!(
             repository = repository.as_str(),
             "GHCR multi-PATCH chunked upload is broken; buffering blob for single-PATCH upload"
@@ -487,7 +522,7 @@ impl RegistryClient {
             .await?;
 
         // Buffer entire stream and verify digest before uploading.
-        let raw = buffer_stream(stream, known_size).await?;
+        let raw = buffer_stream(open().await?, known_size).await?;
         let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
         if &actual_digest != expected_digest {
             return Err(Error::DigestMismatch {
@@ -549,13 +584,16 @@ impl RegistryClient {
     /// by a PUT to finalize with the digest query param. Each PATCH
     /// response carries a fresh `Location` header that is used as the
     /// upload URL for the next PATCH (or the finalize PUT).
-    async fn blob_push_stream_acr(
+    async fn blob_push_stream_acr<S>(
         &self,
         repository: &RepositoryName,
         expected_digest: &Digest,
         known_size: Option<u64>,
-        stream: impl Stream<Item = Result<Bytes, Error>>,
-    ) -> Result<Digest, Error> {
+        open: impl AsyncFnOnce() -> Result<S, Error>,
+    ) -> Result<Digest, Error>
+    where
+        S: Stream<Item = Result<Bytes, Error>>,
+    {
         warn!(
             repository = repository.as_str(),
             "ACR rejects streaming PUT above ~20 MB; buffering blob for chunked PATCH upload"
@@ -565,7 +603,7 @@ impl RegistryClient {
         // See `blob_push_stream_gar` for the layering rationale.
         let _permits = self.acquire_buffered_upload_permits(known_size).await;
 
-        let raw = buffer_stream(stream, known_size).await?;
+        let raw = buffer_stream(open().await?, known_size).await?;
         let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
         if &actual_digest != expected_digest {
             return Err(Error::DigestMismatch {
@@ -1642,5 +1680,63 @@ mod tests {
             gap >= lower_bound,
             "second POST started after only {gap:?}; expected the byte budget to queue it for at least ~{lower_bound:?} behind the first (patch_delay = {patch_delay:?})"
         );
+    }
+
+    /// Every upload path opens its source only once it holds its streaming
+    /// permit, and then once. Breaks if a path opens the source while the
+    /// permit is held elsewhere, where an HTTP/2 source body would sit
+    /// unread in its connection's window, or never opens it.
+    #[tokio::test]
+    async fn blob_push_stream_with_opens_the_source_once_the_upload_can_read_it() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let upload = |status| {
+            ResponseTemplate::new(status).append_header("Location", "/v2/repo/blobs/uploads/id")
+        };
+        Mock::given(method("POST"))
+            .respond_with(upload(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .respond_with(upload(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+        let data = b"blob content";
+        let digest = test_digest(data);
+        let repo = RepositoryName::new("repo").unwrap();
+
+        for host in [
+            "registry.example.com",
+            "ghcr.io",
+            "us-docker.pkg.dev",
+            "example.azurecr.io",
+        ] {
+            let base_url = url::Url::parse(&format!("http://{host}:{port}")).unwrap();
+            let client = crate::client::RegistryClientBuilder::new(base_url)
+                .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+                .streaming_blob_concurrency(1)
+                .build()
+                .unwrap();
+            let held = client.acquire_streaming_blob_permit().await;
+            let opened = std::cell::Cell::new(0);
+            let push = client.blob_push_stream_with(&repo, &digest, Some(12), async || {
+                opened.set(opened.get() + 1);
+                Ok(data_stream(data, 4))
+            });
+            futures_util::pin_mut!(push);
+            let waiting = tokio::time::timeout(std::time::Duration::from_millis(200), &mut push);
+            assert!(waiting.await.is_err(), "{host}: pushed without the permit");
+            assert_eq!(opened.get(), 0, "{host}: opened while the permit was held");
+            drop(held);
+            assert_eq!(push.await.unwrap(), digest, "{host}");
+            assert_eq!(opened.get(), 1, "{host}");
+        }
     }
 }
