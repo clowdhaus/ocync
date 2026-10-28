@@ -1,5 +1,6 @@
 //! The `auth check` subcommand - credential validation.
 
+use ocync_distribution::AwsCredentialSources;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -32,9 +33,10 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
             }
         };
 
+        let aws = AwsCredentialSources::default();
         for (name, reg) in &config.registries {
             let safe_url = redact_url(&reg.url);
-            match build_registry_client(Registry::Configured(reg)).await {
+            match build_registry_client(Registry::Configured(reg), &aws).await {
                 Ok(client) => match client.ping().await {
                     Ok(()) => {
                         let _ = writeln!(out, "  OK    {name} ({safe_url})");

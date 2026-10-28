@@ -152,11 +152,19 @@ impl EcrPublicAuth {
     ///
     /// Constructs the ECR Public client targeting `us-east-1`.
     /// Credentials are fetched lazily on the first `get_token` call and
-    /// refreshed automatically when approaching expiry.
-    pub fn new(http: reqwest::Client) -> Result<Self, Error> {
-        let client =
-            crate::aws::Client::from_env(ECR_PUBLIC_REGION, None, crate::aws::Service::EcrPublic)
-                .map_err(|e| Error::auth_failed(ECR_PUBLIC_HOST, e))?;
+    /// refreshed automatically when approaching expiry, and shared through
+    /// `sources` with other clients for the default profile in `us-east-1`.
+    pub fn new(
+        http: reqwest::Client,
+        sources: &crate::AwsCredentialSources,
+    ) -> Result<Self, Error> {
+        let client = crate::aws::Client::from_env(
+            ECR_PUBLIC_REGION,
+            None,
+            crate::aws::Service::EcrPublic,
+            sources,
+        )
+        .map_err(|e| Error::auth_failed(ECR_PUBLIC_HOST, e))?;
 
         Ok(Self {
             base_url: format!("https://{ECR_PUBLIC_HOST}"),

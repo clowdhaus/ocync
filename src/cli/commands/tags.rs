@@ -1,5 +1,6 @@
 //! The `tags` subcommand - lists and filters tags from a repository.
 
+use ocync_distribution::AwsCredentialSources;
 use ocync_distribution::RepositoryName;
 use ocync_sync::filter::FilterConfig;
 
@@ -16,7 +17,11 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
         Some(config_path) => load_config(config_path)?.registries.into_values().collect(),
         None => Vec::new(),
     };
-    let client = build_registry_client(Registry::resolve(&registries, registry)).await?;
+    let client = build_registry_client(
+        Registry::resolve(&registries, registry),
+        &AwsCredentialSources::default(),
+    )
+    .await?;
 
     let repo_path = RepositoryName::new(repository)?;
     let all_tags = client.list_tags(&repo_path).await?;

@@ -99,7 +99,7 @@ Scanners that read the embedded list directly still see the dropped crates until
 - The EC2 instance metadata service, IMDSv2 only.
 - FIPS endpoints through `AWS_USE_FIPS_ENDPOINT`, and the GovCloud, China and ISO partitions.
 
-A source that is not configured passes to the next, and any other failure stops the chain, as upstream. STS, IAM Identity Center and SSO OIDC calls honor `HTTPS_PROXY` and `NO_PROXY`. The instance metadata service and the container endpoint never use a proxy, so their tokens reach no proxy host.
+Credentials are loaded once per profile and region in a run and shared by the clients that need them, such as a registry's auth provider and its batch checker. Each run, including each watch cycle, starts afresh, so it reads the shared files again and drops credentials AWS may have revoked. A source that is not configured passes to the next, and any other failure stops the chain, as upstream. STS, IAM Identity Center and SSO OIDC calls honor `HTTPS_PROXY` and `NO_PROXY`. The instance metadata service and the container endpoint never use a proxy, so their tokens reach no proxy host.
 
 Deliberate differences from upstream:
 

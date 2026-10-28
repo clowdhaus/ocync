@@ -919,12 +919,12 @@ mod tests {
         let _ = wrapper.next().await;
         let _ = wrapper.next().await; // None - fires callback
 
-        // The callback spawns an async task; wait for its write, bounded so a
-        // missing write fails instead of hanging.
+        // The callback spawns an async task; wait for its whole line, bounded
+        // so a missing write fails instead of hanging.
         let content = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-                if !content.is_empty() {
+                if content.ends_with('\n') {
                     return content;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;

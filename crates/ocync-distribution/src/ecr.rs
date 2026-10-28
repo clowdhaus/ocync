@@ -59,14 +59,16 @@ impl RegistryId {
 }
 
 /// The AWS API client for the ECR registry at `hostname`, in the region the
-/// hostname names, with credentials from `profile` or the default chain.
+/// hostname names, with credentials from `profile` or the default chain,
+/// shared through `sources`.
 pub(crate) fn api_client(
     hostname: &str,
     profile: Option<&str>,
+    sources: &crate::AwsCredentialSources,
 ) -> Result<crate::aws::Client, crate::aws::ConfigError> {
     let region = ecr_region(hostname)
         .ok_or_else(|| crate::aws::ConfigError::NoRegionInHostname(hostname.to_owned()))?;
-    crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr)
+    crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr, sources)
 }
 
 /// Maximum number of layer digests per `BatchCheckLayerAvailability` API call.
@@ -422,9 +424,14 @@ impl BatchChecker {
     /// [`crate::auth::EcrAuth::new`]; otherwise the batch checker authenticates
     /// as a different identity than the auth provider, which silently breaks
     /// `BatchCheckLayerAvailability` for registries reachable only via the
-    /// named profile.
-    pub fn from_hostname(hostname: &str, profile: Option<&str>) -> Result<Self, Error> {
-        let client = api_client(hostname, profile).map_err(|e| Error::EcrApi {
+    /// named profile. Passing the same `sources` as the auth provider lets
+    /// the two share one credential load.
+    pub fn from_hostname(
+        hostname: &str,
+        profile: Option<&str>,
+        sources: &crate::AwsCredentialSources,
+    ) -> Result<Self, Error> {
+        let client = api_client(hostname, profile, sources).map_err(|e| Error::EcrApi {
             reason: e.to_string(),
         })?;
         let registry_id = RegistryId::from_hostname(hostname);
@@ -1223,7 +1230,27 @@ mod tests {
         let checker = BatchChecker::from_hostname(
             "123456789012.dkr.ecr.us-east-1.amazonaws.com",
             Some("nonexistent-profile-for-test"),
+            &crate::AwsCredentialSources::default(),
         );
         assert!(checker.is_ok(), "{:?}", checker.err());
+    }
+
+    /// The auth provider and the batch checker for one registry, given one
+    /// run's sources, share one set of credentials, and a registry in another
+    /// region gets its own. Breaks if either builds credentials of its own.
+    #[test]
+    fn auth_and_batch_checker_share_credentials() {
+        let sources = crate::AwsCredentialSources::default();
+        let host = "123456789012.dkr.ecr.us-west-2.amazonaws.com";
+        let _auth = crate::auth::ecr::EcrAuth::new(host, None, &sources).unwrap();
+        let _checker = BatchChecker::from_hostname(host, None, &sources).unwrap();
+        assert_eq!(sources.users(), vec![2]);
+        let _other = BatchChecker::from_hostname(
+            "123456789012.dkr.ecr.eu-west-1.amazonaws.com",
+            None,
+            &sources,
+        )
+        .unwrap();
+        assert_eq!(sources.users(), vec![1, 2]);
     }
 }

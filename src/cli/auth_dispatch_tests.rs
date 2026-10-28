@@ -14,6 +14,7 @@
 //! workspace dependency; the project's "prefer hand-written under ~100 lines
 //! over a crate" rule directs us to inline this guard.
 
+use ocync_distribution::AwsCredentialSources;
 use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard};
 
@@ -125,27 +126,30 @@ async fn explicit_ecr_dispatches_to_ecr() {
         "123456789012.dkr.ecr.us-east-1.amazonaws.com",
         Some(AuthType::Ecr),
     );
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("ecr"));
 }
 
 #[tokio::test]
 async fn explicit_basic_with_credentials_dispatches_to_basic() {
     let cfg = config_with_basic("registry.example.com");
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("basic"));
 }
 
 #[tokio::test]
 async fn explicit_static_token_dispatches_to_static_token() {
     let cfg = config_with_token("registry.example.com");
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("static-token"));
 }
 
@@ -167,36 +171,40 @@ async fn auth_type_token_alias_dispatches_to_static_token() {
         head_first: false,
         aws_profile: None,
     };
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("static-token"));
 }
 
 #[tokio::test]
 async fn explicit_gar_dispatches_to_gcp() {
     let cfg = config("us-docker.pkg.dev", Some(AuthType::Gar));
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("gcp"));
 }
 
 #[tokio::test]
 async fn explicit_gcr_dispatches_to_gcp() {
     let cfg = config("gcr.io", Some(AuthType::Gcr));
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("gcp"));
 }
 
 #[tokio::test]
 async fn explicit_acr_dispatches_to_acr() {
     let cfg = config("example.azurecr.io", Some(AuthType::Acr));
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("acr"));
 }
 
@@ -205,9 +213,10 @@ async fn explicit_ghcr_alias_dispatches_to_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("ghcr.io", Some(AuthType::Ghcr));
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     // The Ghcr branch routes to DockerConfigAuth and emits a warn-level
     // deprecation hint at most once per process via `warn_ghcr_deprecation_once`
     // (see `ghcr_deprecation_fires_at_most_once` for the Once-gating
@@ -228,7 +237,7 @@ async fn ghcr_deprecation_fires_at_most_once() {
         let dir = tempdir_with_config();
         let _g = EnvGuard::set_docker_config(dir.path());
         let cfg = config("ghcr.io", Some(AuthType::Ghcr));
-        let _ = build_registry_client(Registry::Configured(&cfg))
+        let _ = build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
             .await
             .expect("build client");
     }
@@ -247,18 +256,20 @@ async fn explicit_docker_config_dispatches_to_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("registry.example.com", Some(AuthType::DockerConfig));
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("docker-config"));
 }
 
 #[tokio::test]
 async fn explicit_anonymous_dispatches_to_anonymous() {
     let cfg = config("registry.example.com", Some(AuthType::Anonymous));
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
 }
 
@@ -269,45 +280,50 @@ async fn explicit_anonymous_dispatches_to_anonymous() {
 #[tokio::test]
 async fn autodetect_ecr_hostname_dispatches_to_ecr() {
     let cfg = config("123456789012.dkr.ecr.us-east-1.amazonaws.com", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("ecr"));
 }
 
 #[tokio::test]
 async fn autodetect_ecr_public_dispatches_to_ecr_public() {
     let cfg = config("public.ecr.aws", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("ecr-public"));
 }
 
 #[tokio::test]
 async fn autodetect_gar_dispatches_to_gcp() {
     let cfg = config("us-docker.pkg.dev", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("gcp"));
 }
 
 #[tokio::test]
 async fn autodetect_gcr_dispatches_to_gcp() {
     let cfg = config("gcr.io", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("gcp"));
 }
 
 #[tokio::test]
 async fn autodetect_acr_dispatches_to_acr() {
     let cfg = config("example.azurecr.io", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("acr"));
 }
 
@@ -316,9 +332,10 @@ async fn autodetect_cgr_dev_with_no_docker_config_falls_back_to_anonymous() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("cgr.dev", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
 }
 
@@ -327,9 +344,10 @@ async fn autodetect_cgr_dev_with_docker_config_uses_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("cgr.dev", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     // Provider name is "docker-config" regardless of whether the config
     // contains a matching entry for cgr.dev. Per-host credential lookup
     // happens inside DockerConfigAuth and does not affect the name.
@@ -341,9 +359,10 @@ async fn autodetect_ghcr_io_with_docker_config_uses_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("ghcr.io", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("docker-config"));
 }
 
@@ -352,9 +371,10 @@ async fn autodetect_unknown_hostname_with_no_docker_config_falls_back_to_anonymo
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("registry.unknown.example", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
 }
 
@@ -367,9 +387,10 @@ async fn autodetect_docker_io_with_docker_config_uses_docker_config() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("docker.io", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("docker-config"));
 }
 
@@ -378,9 +399,10 @@ async fn autodetect_docker_io_with_no_docker_config_falls_back_to_anonymous() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("docker.io", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
 }
 
@@ -396,9 +418,10 @@ async fn docker_io_is_rewritten_to_registry_1_for_endpoint() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("docker.io", None);
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     let authority = client
         .registry_authority()
         .expect("client has a host")
@@ -421,9 +444,10 @@ async fn explicit_anonymous_overrides_autodetect_for_cgr_dev() {
     let dir = tempdir_with_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("cgr.dev", Some(AuthType::Anonymous));
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("anonymous"));
 }
 
@@ -436,9 +460,10 @@ async fn explicit_static_token_overrides_autodetect_for_ghcr_io() {
     // Uses static_token instead of ecr (which would attempt real AWS SDK
     // setup on a non-ECR hostname) to keep the test offline.
     let cfg = config_with_token("ghcr.io");
-    let client = build_registry_client(Registry::Configured(&cfg))
-        .await
-        .expect("build client");
+    let client =
+        build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+            .await
+            .expect("build client");
     assert_eq!(client.auth_name(), Some("static-token"));
 }
 
@@ -451,7 +476,7 @@ async fn explicit_ghcr_with_no_docker_config_errors() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("ghcr.io", Some(AuthType::Ghcr));
-    let err = build_registry_client(Registry::Configured(&cfg))
+    let err = build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
         .await
         .expect_err("expected error");
     assert!(
@@ -465,7 +490,7 @@ async fn explicit_docker_config_with_no_docker_config_errors() {
     let dir = tempdir_without_config();
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("registry.example.com", Some(AuthType::DockerConfig));
-    let err = build_registry_client(Registry::Configured(&cfg))
+    let err = build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
         .await
         .expect_err("expected error");
     assert!(
@@ -526,9 +551,10 @@ async fn configured_http_registry_is_reached_over_http() {
         config_with_basic(&server.uri()),
         config(&server.uri(), Some(AuthType::DockerConfig)),
     ] {
-        let client = build_registry_client(Registry::Configured(&cfg))
-            .await
-            .expect("build client");
+        let client =
+            build_registry_client(Registry::Configured(&cfg), &AwsCredentialSources::default())
+                .await
+                .expect("build client");
         let tags = client
             .list_tags(&"repo".parse().unwrap())
             .await
