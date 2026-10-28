@@ -114,7 +114,7 @@ impl<'de> serde::Deserialize<'de> for Secret {
 }
 
 /// An `OAuth2` access token and when it expires. A token with no expiry is
-/// used until a registry refuses it, as upstream never refreshes one.
+/// used for the run, as upstream never refreshes one.
 #[derive(Debug, Clone)]
 pub(crate) struct AccessToken {
     pub(crate) token: Secret,
@@ -226,7 +226,8 @@ pub(crate) enum Error {
     /// An HTTP client did not build.
     #[error("failed to build the HTTP client")]
     Client(#[source] reqwest::Error),
-    /// A request, or the read of its answer, did not complete.
+    /// A request, or the read of its answer, did not complete. The error
+    /// holds no URL, as a URL's query can hold a token.
     #[error("{call}")]
     Transport {
         call: Call,
@@ -336,7 +337,10 @@ impl Error {
 
 /// Send `request` for `call` and read its successful answer.
 async fn send(call: Call, request: reqwest::RequestBuilder) -> Result<bytes::Bytes, Error> {
-    let transport = |source| Error::Transport { call, source };
+    let transport = |source: reqwest::Error| Error::Transport {
+        call,
+        source: source.without_url(),
+    };
     let response = request.send().await.map_err(transport)?;
     if !response.status().is_success() {
         return Err(Error::status(call, response).await);

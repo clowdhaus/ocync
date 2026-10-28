@@ -323,16 +323,32 @@ fn selects_the_source_in_upstream_order() {
     ));
     assert!(matches!(
         parse(serde_json::json!({"executable": {"command": "x"}, "url": "u"})),
-        SourceFile::Executable { .. }
+        SourceFile::Executable
     ));
     assert!(matches!(
         parse(serde_json::json!({"url": "u", "file": "f"})),
-        SourceFile::Url { .. }
+        SourceFile::Url(_)
     ));
     assert!(matches!(
         parse(serde_json::json!({"file": "f"})),
-        SourceFile::File { .. }
+        SourceFile::File(_)
     ));
+}
+
+/// An AWS source with a malformed field is an error, not the URL source
+/// it also names. Breaks if a later source is tried once AWS is selected.
+#[test]
+fn a_malformed_aws_source_is_an_error() {
+    let source = serde_json::from_value::<SourceFile>(serde_json::json!({
+        "environment_id": "aws1",
+        "region_url": 7,
+        "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials",
+    }));
+    let error = source.err().expect("refused");
+    assert_eq!(
+        error.to_string(),
+        "invalid type: integer `7`, expected a string"
+    );
 }
 
 /// An executable source is refused by name. Breaks if it is run or
@@ -489,6 +505,7 @@ fn fetches_a_local_url_source_without_the_proxy() {
         ),
         ("http://[fe80::1]/token", true),
         ("http://127.0.0.1:8080/token", true),
+        ("http://localhost:8080/token", true),
         ("https://sts.example.com/token", false),
         ("http://169.254.169.254.example.com/token", false),
     ] {

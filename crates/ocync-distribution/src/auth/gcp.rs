@@ -14,13 +14,14 @@
 //! var, `~/.config/gcloud/application_default_credentials.json`, GCE/GKE
 //! metadata server. GKE Workload Identity is transparent.
 
-use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::OnceCell;
 
 use super::token_cache::TokenCache;
 use super::token_exchange;
@@ -53,13 +54,13 @@ pub(crate) trait GcpTokenSource: Send + Sync + fmt::Debug {
 
 /// The Google credentials one run's GAR and GCR providers share, so the
 /// Application Default Credentials are loaded, and their token fetched,
-/// once per run rather than once per registry host. A load that fails for
-/// good, such as a bad file, is kept too, as every host would fail it the
-/// same way; a transient failure is not, so the next host tries again.
-/// Create one per run: the next run, such as the next watch cycle, reads
-/// the credentials again.
+/// once per run rather than once per registry host, and hosts that ask at
+/// once share the one load. A failed load is kept too: a load already sends
+/// a transient failure again, so another host would only repeat the same
+/// doomed requests. Create one per run: the next run, such as the next
+/// watch cycle, reads the credentials again.
 #[derive(Default)]
-pub struct GcpCredentials(RefCell<Option<Result<Arc<SharedToken>, Rc<google::Error>>>>);
+pub struct GcpCredentials(OnceCell<Result<Arc<SharedToken>, Rc<google::Error>>>);
 
 impl fmt::Debug for GcpCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -74,17 +75,15 @@ impl GcpCredentials {
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
     ) -> Result<Arc<SharedToken>, Rc<google::Error>> {
-        if let Some(loaded) = &*self.0.borrow() {
-            return loaded.clone();
-        }
-        let loaded = AdcTokenSource::load(host, aws_credentials)
+        self.0
+            .get_or_init(|| async {
+                AdcTokenSource::load(host, aws_credentials)
+                    .await
+                    .map(|source| Arc::new(SharedToken::new(source)))
+                    .map_err(Rc::new)
+            })
             .await
-            .map(|source| Arc::new(SharedToken::new(source)))
-            .map_err(Rc::new);
-        if !loaded.as_ref().is_err_and(|e| e.is_transient()) {
-            *self.0.borrow_mut() = Some(loaded.clone());
-        }
-        loaded
+            .clone()
     }
 }
 
@@ -355,8 +354,8 @@ impl AuthProvider for GcpAuth {
             tracing::debug!(base_url = %self.base_url, entries, "invalidating GCP token cache");
             self.tokens.clear().await;
             // The Google token stays: a refusal is of the registry's token,
-            // which the kept Google token exchanges for anew without a
-            // request to Google, as upstream's own cache did.
+            // and the kept Google token exchanges for a new one without a
+            // request to Google.
             self.challenge_cache.clear().await;
         })
     }
@@ -613,8 +612,8 @@ mod tests {
         assert_eq!(password(&europe).await, "ya29.user");
     }
 
-    /// A load that fails for good is kept for the run, so a second registry
-    /// fails at once with the same error. Breaks if each registry repeats
+    /// A failed load is kept for the run, so a second registry fails at
+    /// once with the same error. Breaks if each registry repeats
     /// the load, here the region lookup of an AWS subject token source.
     #[tokio::test]
     async fn a_failed_load_is_kept_for_the_run() {
@@ -643,19 +642,11 @@ mod tests {
         }
     }
 
-    /// A load that fails transiently is not kept, so the next registry
-    /// loads again and succeeds. Breaks if every failure is kept.
-    #[tokio::test]
-    async fn a_transient_load_failure_is_tried_again() {
+    /// Registries set up at once share one load. Breaks if each starts its
+    /// own, here two region lookups.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hosts_asking_at_once_share_one_load() {
         let server = MockServer::start().await;
-        let attempts = u64::from(crate::retry::MAX_TRANSIENT_RETRIES) + 1;
-        Mock::given(method("GET"))
-            .and(path("/zone"))
-            .respond_with(ResponseTemplate::new(503))
-            .up_to_n_times(attempts)
-            .expect(attempts)
-            .mount(&server)
-            .await;
         Mock::given(method("GET"))
             .and(path("/zone"))
             .respond_with(ResponseTemplate::new(200).set_body_string("us-east-1a"))
@@ -665,28 +656,27 @@ mod tests {
         let host = aws_source_host(&server);
         let shared = GcpCredentials::default();
         let aws_credentials = AwsCredentialProviders::default();
-        for (registry, status) in [
-            ("https://us-docker.pkg.dev", Some("status 503")),
-            ("https://europe-docker.pkg.dev", None),
-        ] {
-            let loaded = GcpAuth::on_host(
-                &registry.parse().unwrap(),
-                crate::test_http_client(),
-                &host,
-                &aws_credentials,
-                &shared,
-            )
-            .await;
-            match status {
-                Some(status) => {
-                    let error = loaded.unwrap_err();
-                    assert!(error.to_string().contains(status), "{error}");
-                }
-                None => {
-                    loaded.unwrap();
-                }
+        let load = |registry: &str| {
+            let registry: url::Url = registry.parse().unwrap();
+            let (host, aws_credentials, shared) = (&host, &aws_credentials, &shared);
+            async move {
+                GcpAuth::on_host(
+                    &registry,
+                    crate::test_http_client(),
+                    host,
+                    aws_credentials,
+                    shared,
+                )
+                .await
             }
-        }
+        };
+
+        let (us, europe) = tokio::join!(
+            load("https://us-docker.pkg.dev"),
+            load("https://europe-docker.pkg.dev")
+        );
+        us.unwrap();
+        europe.unwrap();
     }
 
     /// A host whose credentials are an external account with an AWS

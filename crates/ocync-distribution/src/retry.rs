@@ -102,11 +102,12 @@ pub(crate) struct Budgeted<'a>(pub(crate) &'a Cell<u32>);
 
 impl Policy<Error> for Budgeted<'_> {
     fn retry(&mut self, attempt: u32, error: &Error) -> Option<Duration> {
-        if !is_transient(error) || attempt >= MAX_TRANSIENT_RETRIES || self.0.get() == 0 {
+        if self.0.get() == 0 {
             return None;
         }
+        let delay = Bounded(is_transient).retry(attempt, error)?;
         self.0.set(self.0.get() - 1);
-        Some(backoff(attempt))
+        Some(delay)
     }
 }
 

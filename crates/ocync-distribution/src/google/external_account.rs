@@ -50,25 +50,61 @@ struct AccountFile {
     workforce_pool_user_project: Option<String>,
 }
 
-/// Where the subject token comes from, tried in upstream's order: a source
-/// with `environment_id` is AWS, then `executable`, `url` and `file`.
-#[derive(Deserialize)]
-#[serde(untagged)]
+/// Where the subject token comes from, selected in upstream's order: a
+/// source with `environment_id` is AWS, then one with `executable`, `url`
+/// or `file`. The selected source must then parse, so an AWS source with a
+/// malformed field is an error rather than read as the URL source it also
+/// names.
 enum SourceFile {
     Aws(aws_source::SourceFile),
-    Executable {
-        #[serde(rename = "executable")]
-        _executable: ExecutableFile,
-    },
-    Url {
-        url: String,
-        headers: Option<HashMap<String, String>>,
-        format: Option<FormatFile>,
-    },
-    File {
-        file: String,
-        format: Option<FormatFile>,
-    },
+    Executable,
+    Url(UrlFile),
+    File(FileFile),
+}
+
+impl<'de> Deserialize<'de> for SourceFile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let value = Value::deserialize(deserializer)?;
+        let names = |key: &str| value.get(key).is_some();
+        let source = if names("environment_id") {
+            serde_json::from_value(value).map(Self::Aws)
+        } else if names("executable") {
+            serde_json::from_value::<ExecutableSource>(value).map(|_| Self::Executable)
+        } else if names("url") {
+            serde_json::from_value(value).map(Self::Url)
+        } else if names("file") {
+            serde_json::from_value(value).map(Self::File)
+        } else {
+            return Err(D::Error::custom(
+                "credential_source names no environment_id, executable, url or file",
+            ));
+        };
+        source.map_err(D::Error::custom)
+    }
+}
+
+/// An executable source: its `executable.command` is all that selects it.
+#[derive(Deserialize)]
+struct ExecutableSource {
+    #[serde(rename = "executable")]
+    _executable: ExecutableFile,
+}
+
+/// A URL source.
+#[derive(Deserialize)]
+struct UrlFile {
+    url: String,
+    headers: Option<HashMap<String, String>>,
+    format: Option<FormatFile>,
+}
+
+/// A file source.
+#[derive(Deserialize)]
+struct FileFile {
+    file: String,
+    format: Option<FormatFile>,
 }
 
 /// An executable source's settings: the command is all that selects it.
@@ -130,7 +166,8 @@ fn url_client<'a>(clients: &'a Clients, url: &Url) -> &'a reqwest::Client {
     let local = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_link_local() || ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_unicast_link_local() || ip.is_loopback(),
-        Some(url::Host::Domain(_)) | None => false,
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
     };
     if local {
         &clients.metadata
@@ -269,17 +306,17 @@ impl Account {
             SourceFile::Aws(aws) => {
                 Source::Aws(aws_source::Source::new(setup, &aws, &file.audience).await?)
             }
-            SourceFile::Executable { .. } => return Err(Error::ExecutableSource),
-            SourceFile::Url {
+            SourceFile::Executable => return Err(Error::ExecutableSource),
+            SourceFile::Url(UrlFile {
                 url,
                 headers,
                 format,
-            } => Source::Url {
+            }) => Source::Url {
                 url: parse_url(SUBJECT_URL_FIELD, &url)?,
                 headers: header_map(headers.unwrap_or_default())?,
                 format: format.into(),
             },
-            SourceFile::File { file, format } => Source::File {
+            SourceFile::File(FileFile { file, format }) => Source::File {
                 path: PathBuf::from(file),
                 format: format.into(),
                 fs: setup.host.fs.clone(),

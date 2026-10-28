@@ -248,3 +248,21 @@ fn refuses_a_lifetime_the_clock_cannot_hold() {
     let token = expiring("t".to_owned(), now, Some(60)).unwrap();
     assert_eq!(token.expiry, Some(now + Duration::from_secs(60)));
 }
+
+/// A failed request's error shows no URL, as its query can hold a token.
+/// Breaks if the URL is kept in the error.
+#[tokio::test]
+async fn a_transport_error_shows_no_url() {
+    let clients = Clients::new().unwrap();
+    let request = clients
+        .metadata
+        .get("http://127.0.0.1:1/token?token=s3cret");
+
+    let error = send(Call::SubjectUrl, request).await.unwrap_err();
+
+    assert!(
+        !crate::error::error_chain(&error).contains("s3cret"),
+        "{error:?}"
+    );
+    assert!(!format!("{error:?}").contains("s3cret"), "{error:?}");
+}
