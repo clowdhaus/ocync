@@ -610,25 +610,20 @@ impl Credentials {
         setup: &'a Setup<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<Self, Error>> + 'a>> {
         Box::pin(async move {
-            let kind = match kind {
+            Ok(Self(match kind {
                 CredentialType::ServiceAccount => {
-                    service_account::Account::from_json(json, scopes).map(Kind::ServiceAccount)
+                    Kind::ServiceAccount(service_account::Account::from_json(json, scopes)?)
                 }
                 CredentialType::AuthorizedUser => {
-                    user_account::AuthorizedUser::from_json(json, scopes).map(Kind::AuthorizedUser)
+                    Kind::AuthorizedUser(user_account::AuthorizedUser::from_json(json, scopes)?)
                 }
-                CredentialType::ExternalAccount => {
-                    external_account::Account::from_json(json, scopes, setup)
-                        .await
-                        .map(|account| Kind::ExternalAccount(Box::new(account)))
-                }
+                CredentialType::ExternalAccount => Kind::ExternalAccount(Box::new(
+                    external_account::Account::from_json(json, scopes, setup).await?,
+                )),
                 CredentialType::Impersonated => {
-                    impersonated::Account::from_json(json, scopes, setup)
-                        .await
-                        .map(Kind::Impersonated)
+                    Kind::Impersonated(impersonated::Account::from_json(json, scopes, setup).await?)
                 }
-            };
-            kind.map(Self)
+            }))
         })
     }
 

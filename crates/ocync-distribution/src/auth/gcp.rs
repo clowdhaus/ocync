@@ -41,7 +41,7 @@ const GCP_USERNAME: &str = "oauth2accesstoken";
 ///
 /// The real implementation resolves Application Default Credentials. Tests
 /// inject a mock that returns canned tokens without hitting GCP.
-pub(crate) trait GcpTokenSource: Send + Sync + fmt::Debug {
+trait GcpTokenSource: Send + Sync + fmt::Debug {
     /// Obtain an `OAuth2` access token and its expiry.
     fn access_token(
         &self,
@@ -56,7 +56,7 @@ pub(crate) trait GcpTokenSource: Send + Sync + fmt::Debug {
 /// doomed requests. Create one per run: the next run, such as the next
 /// watch cycle, reads the credentials again.
 #[derive(Default)]
-pub struct SharedGoogleToken(OnceCell<Result<Arc<GoogleToken>, Rc<google::Error>>>);
+pub struct SharedGoogleToken(OnceCell<Result<Arc<CachedGoogleToken>, Rc<google::Error>>>);
 
 impl fmt::Debug for SharedGoogleToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -65,17 +65,17 @@ impl fmt::Debug for SharedGoogleToken {
 }
 
 impl SharedGoogleToken {
-    /// The token of `host`'s credentials, loaded on first use.
-    async fn token(
+    /// The cached token of `host`'s credentials, loaded on first use.
+    async fn cached_token(
         &self,
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
-    ) -> Result<Arc<GoogleToken>, Rc<google::Error>> {
+    ) -> Result<Arc<CachedGoogleToken>, Rc<google::Error>> {
         self.0
             .get_or_init(|| async {
                 AdcTokenSource::load(host, aws_credentials)
                     .await
-                    .map(|source| Arc::new(GoogleToken::new(source)))
+                    .map(|source| Arc::new(CachedGoogleToken::new(source)))
                     .map_err(Rc::new)
             })
             .await
@@ -85,20 +85,20 @@ impl SharedGoogleToken {
 
 /// A token source and the token it last returned, kept until it is about
 /// to expire or a registry's token exchange refuses it with 401.
-struct GoogleToken {
+struct CachedGoogleToken {
     source: Box<dyn GcpTokenSource>,
     token: CredentialCache<AccessToken, Arc<google::Error>>,
 }
 
-impl fmt::Debug for GoogleToken {
+impl fmt::Debug for CachedGoogleToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GoogleToken")
+        f.debug_struct("CachedGoogleToken")
             .field("source", &self.source)
             .finish_non_exhaustive()
     }
 }
 
-impl GoogleToken {
+impl CachedGoogleToken {
     fn new(source: impl GcpTokenSource + 'static) -> Self {
         Self {
             source: Box::new(source),
@@ -226,7 +226,7 @@ pub struct GcpAuth {
     /// HTTP client for OCI token exchange.
     http: reqwest::Client,
     /// The Google token, shared by the run's GAR and GCR providers.
-    google_token: Arc<GoogleToken>,
+    cached_token: Arc<CachedGoogleToken>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
@@ -254,14 +254,14 @@ impl GcpAuth {
         registry: &url::Url,
         http: reqwest::Client,
         aws_credentials: &AwsCredentialProviders,
-        gcp_credentials: &SharedGoogleToken,
+        shared_token: &SharedGoogleToken,
     ) -> Result<Self, Error> {
         Self::on_host(
             registry,
             http,
             &crate::aws::Host::current(),
             aws_credentials,
-            gcp_credentials,
+            shared_token,
         )
         .await
     }
@@ -272,18 +272,18 @@ impl GcpAuth {
         http: reqwest::Client,
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
-        gcp_credentials: &SharedGoogleToken,
+        shared_token: &SharedGoogleToken,
     ) -> Result<Self, Error> {
         let hostname = registry.host_str().unwrap_or_default().to_owned();
-        let google_token = gcp_credentials
-            .token(host, aws_credentials)
+        let cached_token = shared_token
+            .cached_token(host, aws_credentials)
             .await
             .map_err(|e| credentials_failed(&hostname, Stage::Setup, &e))?;
         Ok(Self::with_token(
             registry_origin(registry),
             hostname,
             http,
-            google_token,
+            cached_token,
         ))
     }
 
@@ -291,13 +291,13 @@ impl GcpAuth {
         base_url: String,
         hostname: String,
         http: reqwest::Client,
-        google_token: Arc<GoogleToken>,
+        cached_token: Arc<CachedGoogleToken>,
     ) -> Self {
         Self {
             base_url,
             hostname,
             http,
-            google_token,
+            cached_token,
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
@@ -314,7 +314,7 @@ impl GcpAuth {
             base_url.into(),
             "mock-gcp".to_owned(),
             http,
-            Arc::new(GoogleToken::new(api)),
+            Arc::new(CachedGoogleToken::new(api)),
         )
     }
 
@@ -341,7 +341,7 @@ impl GcpAuth {
 
     /// The current Google token.
     async fn google_token(&self) -> Result<google::Secret, Error> {
-        let token = self.google_token.get().await.map_err(|e| {
+        let token = self.cached_token.get().await.map_err(|e| {
             tracing::warn!(error = %e, "GCP access token request failed");
             credentials_failed(&self.hostname, Stage::TokenRequest, &e)
         })?;
@@ -374,7 +374,7 @@ impl AuthProvider for GcpAuth {
                             status: http::StatusCode::UNAUTHORIZED,
                             ..
                         }) => {
-                            self.google_token.refuse(&google_token).await;
+                            self.cached_token.refuse(&google_token).await;
                             let fresh = self.google_token().await?;
                             self.exchange(&scopes, &fresh).await
                         }
@@ -461,9 +461,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn waiting_registries_share_a_failed_token_fetch() {
         let fetches = Arc::new(AtomicUsize::new(0));
-        let shared = GoogleToken::new(SlowlyFailing(Arc::clone(&fetches)));
+        let cached = CachedGoogleToken::new(SlowlyFailing(Arc::clone(&fetches)));
 
-        let (first, second) = tokio::join!(shared.get(), shared.get());
+        let (first, second) = tokio::join!(cached.get(), cached.get());
 
         assert!(first.is_err() && second.is_err());
         assert_eq!(fetches.load(Ordering::Relaxed), 1);

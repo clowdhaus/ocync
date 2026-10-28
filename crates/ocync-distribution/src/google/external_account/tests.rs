@@ -425,17 +425,25 @@ fn a_malformed_aws_source_is_an_error() {
     );
 }
 
-/// An executable source is refused by name. Breaks if it is run or
-/// accepted.
+/// An executable source is refused by name, whatever its settings. Breaks
+/// if it is run, accepted, or a malformed one is read as a parse error.
 #[tokio::test]
 async fn refuses_an_executable_source() {
     let server = MockServer::start().await;
-    let mut file = account_file(&server);
-    file["credential_source"] = serde_json::json!({"executable": {"command": "/bin/token"}});
-    let error = build(file, Scopes::Registry, token_host("jwt"))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("executable"), "{error}");
+    for executable in [
+        serde_json::json!({"command": "/bin/token"}),
+        serde_json::json!({}),
+    ] {
+        let mut file = account_file(&server);
+        file["credential_source"] = serde_json::json!({ "executable": executable });
+        let error = build(file, Scopes::Registry, token_host("jwt"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::ExecutableSource),
+            "{executable}: {error}"
+        );
+    }
 }
 
 /// Upstream `get_text_token`, `get_json_token`,

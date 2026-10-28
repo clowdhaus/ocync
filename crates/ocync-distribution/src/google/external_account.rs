@@ -48,7 +48,7 @@ struct AccountFile {
 /// source with `environment_id` is AWS, then one with `executable`, `url`
 /// or `file`. The selected source must then parse, so an AWS source with a
 /// malformed field is an error rather than read as the URL source it also
-/// names.
+/// names. An `executable` source is refused unread.
 enum SourceFile {
     Aws(aws_source::SourceFile),
     Executable,
