@@ -32,7 +32,9 @@ use crate::cli::config::{
     resolve_target_names,
 };
 use crate::cli::output::{format_bytes, format_duration};
-use crate::cli::{CliError, ExitCode, Registry, bare_hostname, build_registry_client};
+use crate::cli::{
+    CliError, ExitCode, Registry, RunCredentials, bare_hostname, build_registry_client,
+};
 
 /// Default cache TTL: 12 hours.
 pub(crate) const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
@@ -638,12 +640,12 @@ pub(crate) async fn run(
     let tracker = PrepareTracker::default();
     let resolution = with_prepare_progress(&tracker, "sync", async {
         let referenced = referenced_registries(&config);
-        // One run's clients share AWS credentials; the next run, such as the
+        // One run's clients share credentials; the next run, such as the
         // next watch cycle, loads them afresh.
-        let aws_credentials = AwsCredentialProviders::default();
-        let clients = build_clients(&config, &referenced, &tracker, &aws_credentials).await;
+        let credentials = RunCredentials::default();
+        let clients = build_clients(&config, &referenced, &tracker, &credentials).await;
         let batch_checkers =
-            build_batch_checkers(&config, &clients, &referenced, &tracker, &aws_credentials);
+            build_batch_checkers(&config, &clients, &referenced, &tracker, &credentials.aws);
         resolve_all(
             &config,
             &clients,
@@ -1146,7 +1148,7 @@ pub(crate) async fn build_clients(
     config: &Config,
     referenced: &Referenced,
     tracker: &PrepareTracker,
-    aws_credentials: &AwsCredentialProviders,
+    credentials: &RunCredentials,
 ) -> ClientMap {
     tracker.begin(PreparePhase::Registries, referenced.len());
     let mut clients = ClientMap::with_capacity(referenced.len());
@@ -1158,7 +1160,7 @@ pub(crate) async fn build_clients(
         // wedged provider is named in the progress line rather than showing up
         // as a stalled count.
         let _item = tracker.track(name);
-        let entry = match build_registry_client(Registry::Configured(reg), aws_credentials).await {
+        let entry = match build_registry_client(Registry::Configured(reg), credentials).await {
             Ok(client) => Ok(Arc::new(client)),
             Err(err) => {
                 tracing::error!(
@@ -3494,7 +3496,7 @@ mappings:
             &config,
             &referenced_registries(&config),
             &PrepareTracker::default(),
-            &AwsCredentialProviders::default(),
+            &RunCredentials::default(),
         )
         .await;
 
@@ -3645,10 +3647,10 @@ mappings:
 
         let tracker = PrepareTracker::default();
         let referenced = referenced_registries(&config);
-        let aws_credentials = AwsCredentialProviders::default();
-        let clients = build_clients(&config, &referenced, &tracker, &aws_credentials).await;
+        let credentials = RunCredentials::default();
+        let clients = build_clients(&config, &referenced, &tracker, &credentials).await;
         let checkers =
-            build_batch_checkers(&config, &clients, &referenced, &tracker, &aws_credentials);
+            build_batch_checkers(&config, &clients, &referenced, &tracker, &credentials.aws);
 
         assert!(checkers.is_empty(), "neither registry is ECR");
         let p = tracker.snapshot();
@@ -3686,13 +3688,13 @@ mappings:
 
         let tracker = PrepareTracker::default();
         let referenced = referenced_registries(&config);
-        let aws_credentials = AwsCredentialProviders::default();
-        let clients = build_clients(&config, &referenced, &tracker, &aws_credentials).await;
+        let credentials = RunCredentials::default();
+        let clients = build_clients(&config, &referenced, &tracker, &credentials).await;
         let checkers =
-            build_batch_checkers(&config, &clients, &referenced, &tracker, &aws_credentials);
+            build_batch_checkers(&config, &clients, &referenced, &tracker, &credentials.aws);
 
         assert!(checkers.contains_key("dst"));
-        assert_eq!(aws_credentials.users(), vec![2]);
+        assert_eq!(credentials.aws.users(), vec![2]);
     }
 
     /// A watch cycle re-reporting the same dead mirror is noise; a different

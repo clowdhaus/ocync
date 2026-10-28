@@ -18,7 +18,7 @@ use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::auth::docker::{DockerConfig, DockerConfigAuth};
 use ocync_distribution::auth::ecr::EcrAuth;
 use ocync_distribution::auth::ecr_public::EcrPublicAuth;
-use ocync_distribution::auth::gcp::GcpAuth;
+use ocync_distribution::auth::gcp::{GcpAuth, GcpCredentials};
 use ocync_distribution::auth::static_token::StaticTokenAuth;
 use ocync_distribution::{AwsCredentialProviders, RegistryClient};
 
@@ -218,13 +218,23 @@ impl<'a> Registry<'a> {
     }
 }
 
+/// The credentials one run's clients share: AWS credentials by profile and
+/// region, and Google's Application Default Credentials. Create one per run:
+/// the next run, such as the next watch cycle, loads them afresh.
+#[derive(Debug, Default)]
+pub(crate) struct RunCredentials {
+    pub(crate) aws: AwsCredentialProviders,
+    pub(crate) gcp: GcpCredentials,
+}
+
 /// Build a [`RegistryClient`] for `registry`, using the appropriate auth
-/// provider based on explicit `auth_type` or hostname auto-detection. ECR
-/// providers take their AWS credentials from `aws_credentials`, which one run shares.
+/// provider based on explicit `auth_type` or hostname auto-detection. Cloud
+/// providers take their credentials from `credentials`, which one run shares.
 pub(crate) async fn build_registry_client(
     registry: Registry<'_>,
-    aws_credentials: &AwsCredentialProviders,
+    credentials: &RunCredentials,
 ) -> Result<RegistryClient, CliError> {
+    let aws_credentials = &credentials.aws;
     // Idempotent: required before any reqwest::Client::new() call below
     // because reqwest is built with rustls-no-provider. The production
     // entry point installs this at `main` startup; this call covers
@@ -288,7 +298,7 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Gar | AuthType::Gcr) => {
-            let auth = GcpAuth::new(&url, http, aws_credentials)
+            let auth = GcpAuth::new(&url, http, aws_credentials, &credentials.gcp)
                 .await
                 .map_err(|e| CliError::Auth(format!("GCP auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
@@ -334,7 +344,7 @@ pub(crate) async fn build_registry_client(
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Gar | ProviderKind::Gcr) => {
-                    let auth = GcpAuth::new(&url, http, aws_credentials)
+                    let auth = GcpAuth::new(&url, http, aws_credentials, &credentials.gcp)
                         .await
                         .map_err(|e| {
                             CliError::Auth(format!("GCP auth setup for '{bare_host}': {e}"))

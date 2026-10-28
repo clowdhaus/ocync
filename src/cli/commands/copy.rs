@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ocync_distribution::AwsCredentialProviders;
 use ocync_distribution::RepositoryName;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
@@ -20,7 +19,9 @@ use ocync_sync::staging::BlobStage;
 
 use crate::CopyArgs;
 use crate::cli::config::{AuthType, load_config};
-use crate::cli::{CliError, ExitCode, Registry, bare_hostname, build_registry_client};
+use crate::cli::{
+    CliError, ExitCode, Registry, RunCredentials, bare_hostname, build_registry_client,
+};
 
 /// Run the copy command: transfer a single image from source to destination.
 ///
@@ -48,9 +49,9 @@ pub(crate) async fn run(
     let destination = Registry::resolve(&registries, args.destination.registry());
     let dst_reg_config = destination.config();
     let source = Registry::resolve(&registries, args.source.registry());
-    let aws_credentials = AwsCredentialProviders::default();
-    let source_client = Arc::new(build_registry_client(source, &aws_credentials).await?);
-    let target_client = Arc::new(build_registry_client(destination, &aws_credentials).await?);
+    let credentials = RunCredentials::default();
+    let source_client = Arc::new(build_registry_client(source, &credentials).await?);
+    let target_client = Arc::new(build_registry_client(destination, &credentials).await?);
 
     let source_authority = source_client
         .registry_authority()
@@ -73,7 +74,7 @@ pub(crate) async fn run(
     };
     let batch_checker: Option<Rc<dyn BatchBlobChecker>> = if dst_is_ecr {
         let profile = dst_reg_config.and_then(|r| r.aws_profile.as_deref());
-        let checker = BatchChecker::from_hostname(dst_hostname, profile, &aws_credentials)
+        let checker = BatchChecker::from_hostname(dst_hostname, profile, &credentials.aws)
             .map_err(|e| CliError::Input(format!("ECR batch checker for '{dst_hostname}': {e}")))?;
         Some(Rc::new(checker))
     } else {

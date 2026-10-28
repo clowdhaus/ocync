@@ -1,12 +1,11 @@
 //! The `auth check` subcommand - credential validation.
 
-use ocync_distribution::AwsCredentialProviders;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::cli::config::load_config;
 use crate::cli::output::redact_url;
-use crate::cli::{CliError, ExitCode, Registry, build_registry_client};
+use crate::cli::{CliError, ExitCode, Registry, RunCredentials, build_registry_client};
 
 /// Run credential checks against all registries in config files.
 pub(crate) async fn run_check(configs: &[PathBuf]) -> Result<ExitCode, CliError> {
@@ -20,7 +19,7 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
     // client construction. Keeping the classification is what lets a wholly
     // denied check exit 4 instead of a generic partial failure.
     let mut worst = Worst::Clean;
-    let aws_credentials = AwsCredentialProviders::default();
+    let credentials = RunCredentials::default();
 
     for path in configs {
         // `-c` is repeatable and the files are independent, so one unreadable
@@ -36,7 +35,7 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
 
         for (name, reg) in &config.registries {
             let safe_url = redact_url(&reg.url);
-            match build_registry_client(Registry::Configured(reg), &aws_credentials).await {
+            match build_registry_client(Registry::Configured(reg), &credentials).await {
                 Ok(client) => match client.ping().await {
                     Ok(()) => {
                         let _ = writeln!(out, "  OK    {name} ({safe_url})");
