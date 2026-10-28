@@ -34,16 +34,11 @@ fn parse_impersonation_url(url: &str) -> Result<Url, Error> {
     if url.matches(SERVICE_ACCOUNTS).count() != 1 {
         return Err(Error::ImpersonationUrl);
     }
-    parse_url(IMPERSONATION_URL_FIELD, url)
+    super::parse_url(IMPERSONATION_URL_FIELD, url)
 }
 
 /// The field naming the impersonation URL.
 pub(super) const IMPERSONATION_URL_FIELD: &str = "service_account_impersonation_url";
-
-/// `url`, the value of `field`.
-pub(super) fn parse_url(field: &'static str, url: &str) -> Result<Url, Error> {
-    Url::parse(url).map_err(|source| Error::Url { field, source })
-}
 
 /// A service account impersonated with source credentials.
 #[derive(Debug)]

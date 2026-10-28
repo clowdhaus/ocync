@@ -63,7 +63,8 @@ impl Server {
         }
     }
 
-    /// The default service account's token, tried once, as upstream.
+    /// The default service account's token, asked for once: the caller
+    /// retries a transient failure.
     pub(super) async fn access_token(
         &self,
         clients: &Clients,

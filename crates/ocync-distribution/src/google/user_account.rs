@@ -4,8 +4,9 @@
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
-use super::{AccessToken, Call, Clients, Error, Scopes, Secret, expiring, send_json};
+use super::{AccessToken, Call, Clients, Error, Scopes, Secret, expiring, parse_url, send_json};
 use crate::aws::Clock;
 
 /// The refresh grant, RFC 6749 section 6.
@@ -13,6 +14,9 @@ const GRANT_TYPE: &str = "refresh_token";
 
 /// The token endpoint when the file names none.
 const TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+
+/// The field naming the token endpoint.
+const TOKEN_URI_FIELD: &str = "token_uri";
 
 /// The only universe an authorized user may belong to, as upstream.
 const DEFAULT_UNIVERSE: &str = "googleapis.com";
@@ -37,7 +41,7 @@ pub(crate) struct AuthorizedUser {
     client_id: String,
     client_secret: Secret,
     refresh_token: Secret,
-    token_uri: String,
+    token_uri: Url,
     quota_project_id: Option<String>,
     /// The space-joined scopes, or `None` for the token's own.
     scopes: Option<String>,
@@ -79,7 +83,10 @@ impl AuthorizedUser {
             client_id: file.client_id,
             client_secret: file.client_secret,
             refresh_token: file.refresh_token,
-            token_uri: file.token_uri.unwrap_or_else(|| TOKEN_URI.to_owned()),
+            token_uri: parse_url(
+                TOKEN_URI_FIELD,
+                file.token_uri.as_deref().unwrap_or(TOKEN_URI),
+            )?,
             quota_project_id: file.quota_project_id,
             scopes: scopes
                 .registry_or_endpoint_default()
@@ -92,19 +99,23 @@ impl AuthorizedUser {
         self.quota_project_id.as_deref()
     }
 
-    /// A token for the refresh token, asked for once, as upstream.
+    /// A token for the refresh token, asked for once: the caller retries a
+    /// transient failure.
     pub(super) async fn access_token(
         &self,
         clients: &Clients,
         clock: Clock,
     ) -> Result<AccessToken, Error> {
-        let request = clients.api.post(&self.token_uri).json(&RefreshRequest {
-            grant_type: GRANT_TYPE,
-            client_id: &self.client_id,
-            client_secret: self.client_secret.expose(),
-            refresh_token: self.refresh_token.expose(),
-            scopes: self.scopes.as_deref(),
-        });
+        let request = clients
+            .api
+            .post(self.token_uri.clone())
+            .json(&RefreshRequest {
+                grant_type: GRANT_TYPE,
+                client_id: &self.client_id,
+                client_secret: self.client_secret.expose(),
+                refresh_token: self.refresh_token.expose(),
+                scopes: self.scopes.as_deref(),
+            });
         let response: RefreshResponse = send_json(Call::UserToken, request).await?;
         expiring(response.access_token, clock.now(), response.expires_in)
     }
@@ -177,25 +188,37 @@ mod tests {
     /// `scopes: null`. Breaks if the default endpoint or the null changes.
     #[test]
     fn defaults_the_endpoint_and_scopes() {
-        let mut file = user_file("unused");
+        let mut file = user_file(TOKEN_URI);
         file.as_object_mut().unwrap().remove("token_uri");
         let user = AuthorizedUser::from_json(file, Scopes::Default).unwrap();
-        assert_eq!(user.token_uri, TOKEN_URI);
+        assert_eq!(user.token_uri.as_str(), TOKEN_URI);
         assert_eq!(user.scopes, None);
     }
 
     /// Upstream `builder_rejects_non_default_universe` and
-    /// `authorized_user_parse_fail`: another universe, and a file missing
-    /// the refresh token, are refused. Breaks if either is accepted.
+    /// `authorized_user_parse_fail`: another universe, a file missing the
+    /// refresh token, and a `token_uri` that is not a URL, are refused when
+    /// the file loads. Breaks if any is accepted.
     #[test]
     fn refuses_bad_files() {
-        let mut other_universe = user_file("unused");
+        let mut other_universe = user_file(TOKEN_URI);
         other_universe["universe_domain"] = "example.com".into();
-        let mut no_token = user_file("unused");
+        let mut no_token = user_file(TOKEN_URI);
         no_token.as_object_mut().unwrap().remove("refresh_token");
         for file in [other_universe, no_token] {
             assert!(AuthorizedUser::from_json(file, Scopes::Registry).is_err());
         }
+        let bad_uri = AuthorizedUser::from_json(user_file("not a url"), Scopes::Registry);
+        assert!(
+            matches!(
+                bad_uri,
+                Err(Error::Url {
+                    field: TOKEN_URI_FIELD,
+                    ..
+                })
+            ),
+            "{bad_uri:?}"
+        );
     }
 
     /// Upstream `credential_provider_retryable_error`,

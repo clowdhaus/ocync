@@ -34,8 +34,13 @@ provider "google" {
   region  = local.region
 }
 
+variable "project_id" {
+  description = "Google Cloud project to create the bench target in, set in terraform.tfvars or TF_VAR_project_id"
+  type        = string
+}
+
 locals {
-  project_id = "ocync-513014"
+  project_id = var.project_id
   # Columbus, Ohio: beside the AWS bench instance in us-east-2.
   region = "us-east5"
   name   = "ocync-bench"

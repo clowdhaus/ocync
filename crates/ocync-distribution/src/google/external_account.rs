@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::STANDARD;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -14,7 +14,8 @@ use serde_json::Value;
 use url::Url;
 
 use super::aws_source;
-use super::impersonated::{Generate, IMPERSONATION_URL_FIELD, parse_url};
+use super::impersonated::{Generate, IMPERSONATION_URL_FIELD};
+use super::parse_url;
 use super::{
     AccessToken, Call, Clients, DEFAULT_SCOPE, Error, ScopeList, Scopes, Secret, Setup, SourceAuth,
     expiring, send_json, send_text,
@@ -121,6 +122,23 @@ impl Format {
     }
 }
 
+/// The client that fetches a URL source: the metadata client, with no
+/// proxy, for a link-local or loopback address such as Azure's instance
+/// metadata service, so its token never reaches a proxy host; else the API
+/// client, through the proxy.
+fn url_client<'a>(clients: &'a Clients, url: &Url) -> &'a reqwest::Client {
+    let local = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_link_local() || ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_unicast_link_local() || ip.is_loopback(),
+        Some(url::Host::Domain(_)) | None => false,
+    };
+    if local {
+        &clients.metadata
+    } else {
+        &clients.api
+    }
+}
+
 /// Where the subject token comes from.
 #[derive(Debug)]
 enum Source {
@@ -157,8 +175,7 @@ impl Source {
                 headers,
                 format,
             } => {
-                let request = clients
-                    .api
+                let request = url_client(clients, url)
                     .get(url.clone())
                     .headers(headers.clone())
                     .timeout(SUBJECT_URL_TIMEOUT);
@@ -323,7 +340,7 @@ impl Account {
         }
         let mut request = clients.api.post(self.token_url.clone()).form(&form);
         if let StsAuth::Client { id, secret } = &self.auth {
-            let basic = URL_SAFE_NO_PAD.encode(format!("{id}:{}", secret.expose()));
+            let basic = STANDARD.encode(format!("{id}:{}", secret.expose()));
             request = request.header("authorization", format!("Basic {basic}"));
         }
         let now = clock.now();

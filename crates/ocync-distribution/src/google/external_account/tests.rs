@@ -230,17 +230,16 @@ async fn reports_a_failed_exchange() {
 /// Upstream `exchange_token` with client authentication and
 /// `sts_handler_ignores_workforce_pool_user_project_with_client_auth`:
 /// with both a client ID and secret, Basic auth of `id:secret` in
-/// URL-safe base64 without padding, and no `options`. Breaks if the
-/// encoding changes or `options` is sent beside client auth.
+/// standard padded base64, as RFC 7617 and Google's Go and Python
+/// libraries send it, and no `options`. Upstream sends URL-safe base64
+/// without padding. Breaks if the encoding changes or `options` is sent
+/// beside client auth.
 #[tokio::test]
 async fn authenticates_the_client() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/sts"))
-        .and(header(
-            "authorization",
-            format!("Basic {}", URL_SAFE_NO_PAD.encode("client:secret?>")).as_str(),
-        ))
+        .and(header("authorization", "Basic Y2xpZW50OnNlY3JldD8+YWI="))
         .respond_with(sts_answer("ya29.sts"))
         .expect(1)
         .mount(&server)
@@ -250,7 +249,7 @@ async fn authenticates_the_client() {
         "//iam.googleapis.com/locations/global/workforcePools/pool/providers/idp".into();
     file["workforce_pool_user_project"] = "project".into();
     file["client_id"] = "client".into();
-    file["client_secret"] = "secret?>".into();
+    file["client_secret"] = "secret?>ab".into();
 
     let account = build(file, Scopes::Registry, &token_host("jwt"))
         .await
@@ -475,4 +474,25 @@ fn url_source_headers_never_print() {
     .unwrap();
     let printed = format!("{headers:?}");
     assert!(!printed.contains("gha-token"), "{printed}");
+}
+
+/// A URL source at a link-local or loopback address is fetched with no
+/// proxy, and any other through it. Breaks if Azure's instance metadata
+/// service is fetched through the proxy.
+#[test]
+fn fetches_a_local_url_source_without_the_proxy() {
+    let clients = Clients::new().unwrap();
+    for (url, metadata) in [
+        (
+            "http://169.254.169.254/metadata/identity/oauth2/token",
+            true,
+        ),
+        ("http://[fe80::1]/token", true),
+        ("http://127.0.0.1:8080/token", true),
+        ("https://sts.example.com/token", false),
+        ("http://169.254.169.254.example.com/token", false),
+    ] {
+        let client = url_client(&clients, &Url::parse(url).unwrap());
+        assert_eq!(std::ptr::eq(client, &clients.metadata), metadata, "{url}");
+    }
 }

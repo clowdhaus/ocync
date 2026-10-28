@@ -71,6 +71,26 @@ fn finds_the_well_known_path() {
     assert_eq!(well_known_path(&windows, Platform::Unix), None);
 }
 
+/// A path that is not UTF-8 is still the file read, as upstream reads the
+/// variable. Breaks if such a value is treated as unset, which falls back
+/// to the well-known file and another identity.
+#[cfg(unix)]
+#[test]
+fn reads_a_path_that_is_not_utf8() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = OsStr::from_bytes(b"/adc-\xff.json");
+    let mut host = host(Platform::Unix, &[], &[]);
+    host.env = Env::FixedOs(HashMap::from([(
+        CREDENTIALS_VARIABLE.to_owned(),
+        path.to_owned(),
+    )]));
+    host.fs = Fs::Fixed(HashMap::from([(PathBuf::from(path), b"{}".to_vec())]));
+
+    assert_eq!(find_file(&host).unwrap(), Some(b"{}".to_vec()));
+}
+
 /// Upstream `adc_path_from_env` and `load_adc_success`: the file the
 /// variable names, before the well-known file. Breaks if the variable is
 /// read after the well-known file.

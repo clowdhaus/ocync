@@ -19,7 +19,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::token_cache::TokenCache;
@@ -53,9 +53,11 @@ pub(crate) trait GcpTokenSource: Send + Sync + fmt::Debug {
 
 /// The Google credentials one run's GAR and GCR providers share, so the
 /// Application Default Credentials are loaded, and their token fetched,
-/// once per run rather than once per registry host. A failed load is kept
-/// too, as every host would fail it the same way. Create one per run: the
-/// next run, such as the next watch cycle, reads the credentials again.
+/// once per run rather than once per registry host. A load that fails for
+/// good, such as a bad file, is kept too, as every host would fail it the
+/// same way; a transient failure is not, so the next host tries again.
+/// Create one per run: the next run, such as the next watch cycle, reads
+/// the credentials again.
 #[derive(Default)]
 pub struct GcpCredentials(RefCell<Option<Result<Arc<SharedToken>, Rc<google::Error>>>>);
 
@@ -79,13 +81,15 @@ impl GcpCredentials {
             .await
             .map(|source| Arc::new(SharedToken::new(source)))
             .map_err(Rc::new);
-        *self.0.borrow_mut() = Some(loaded.clone());
+        if !loaded.as_ref().is_err_and(|e| e.is_transient()) {
+            *self.0.borrow_mut() = Some(loaded.clone());
+        }
         loaded
     }
 }
 
 /// A token source and the token it last returned, kept until it is about
-/// to expire or a registry refuses it.
+/// to expire.
 struct SharedToken {
     source: Box<dyn GcpTokenSource>,
     token: CredentialCache<AccessToken>,
@@ -125,17 +129,11 @@ impl SharedToken {
             })
             .await
     }
-
-    /// Drop the kept token if it is `refused`, so one registry's refusal
-    /// does not discard a token another has fetched since.
-    async fn refuse(&self, refused: &google::Secret) {
-        self.token.clear_if(|kept| kept.token == *refused).await;
-    }
 }
 
-/// How long `token` is kept. A token with no expiry is kept until a
-/// registry refuses it, as upstream never refreshes one: the cache holds a
-/// lifetime past what the clock can hold as never expiring.
+/// How long `token` is kept. A token with no expiry is kept for the run, as
+/// upstream never refreshes one: the cache holds a lifetime past what the
+/// clock can hold as never expiring.
 fn lifetime(token: &AccessToken) -> Duration {
     token.expiry.map_or(Duration::MAX, remaining)
 }
@@ -202,9 +200,6 @@ pub struct GcpAuth {
     http: reqwest::Client,
     /// The Google token, shared by the run's GAR and GCR providers.
     google_token: Arc<SharedToken>,
-    /// The Google token this provider last exchanged, dropped from the
-    /// shared cache when a registry refuses this provider's tokens.
-    last_used: Mutex<Option<google::Secret>>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
@@ -281,7 +276,6 @@ impl GcpAuth {
             hostname,
             http,
             google_token,
-            last_used: Mutex::new(None),
             tokens: TokenCache::new(),
             challenge_cache: token_exchange::ChallengeCache::new(),
         }
@@ -311,11 +305,9 @@ impl GcpAuth {
                 format!("GCP access token request failed: {}", error_chain(&*e)),
             )
         })?;
-        let password = token.token.expose().to_owned();
-        *self.last_used.lock().expect("not poisoned") = Some(token.token);
         Ok(Credentials::Basic {
             username: GCP_USERNAME.to_owned(),
-            password,
+            password: token.token.expose().to_owned(),
         })
     }
 }
@@ -362,13 +354,10 @@ impl AuthProvider for GcpAuth {
             let entries = self.tokens.len().await;
             tracing::debug!(base_url = %self.base_url, entries, "invalidating GCP token cache");
             self.tokens.clear().await;
+            // The Google token stays: a refusal is of the registry's token,
+            // which the kept Google token exchanges for anew without a
+            // request to Google, as upstream's own cache did.
             self.challenge_cache.clear().await;
-            // Also drop the Google token this provider used from the run's
-            // shared cache, so it is fetched anew on next use.
-            let refused = self.last_used.lock().expect("not poisoned").take();
-            if let Some(refused) = refused {
-                self.google_token.refuse(&refused).await;
-            }
         })
     }
 }
@@ -604,47 +593,29 @@ mod tests {
     }
 
     /// The registries of one run share one load of the credentials and one
-    /// Google token. A refusal drops the token only if it is the one the
-    /// refusing registry used. Breaks if each registry fetches its own
-    /// token, a refused token is handed out again, or one registry's late
-    /// refusal discards a token another has fetched since.
+    /// Google token, and a registry's refusal of its own token does not
+    /// fetch another from Google. Breaks if each registry fetches its own
+    /// Google token or a refusal drops it.
     #[tokio::test]
     async fn registries_share_the_google_token() {
         let server = MockServer::start().await;
-        let answer = |token: &str| {
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": token, "token_type": "Bearer", "expires_in": 3600
-            }))
-        };
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(answer("ya29.first"))
-            .up_to_n_times(1)
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(answer("ya29.second"))
-            .expect(1)
-            .mount(&server)
-            .await;
+        mount_user_token(&server, 1).await;
         let host = user_host(&server);
         let shared = GcpCredentials::default();
         let us = adc_auth("https://us-docker.pkg.dev", &host, &shared).await;
         let europe = adc_auth("https://europe-docker.pkg.dev", &host, &shared).await;
 
-        assert_eq!(password(&us).await, "ya29.first");
-        assert_eq!(password(&europe).await, "ya29.first");
+        assert_eq!(password(&us).await, "ya29.user");
+        assert_eq!(password(&europe).await, "ya29.user");
         us.invalidate().await;
-        assert_eq!(password(&us).await, "ya29.second");
         europe.invalidate().await;
-        assert_eq!(password(&europe).await, "ya29.second");
+        assert_eq!(password(&us).await, "ya29.user");
+        assert_eq!(password(&europe).await, "ya29.user");
     }
 
-    /// A failed load is kept for the run, so a second registry fails at
-    /// once with the same error. Breaks if each registry repeats the load,
-    /// here the region lookup of an AWS subject token source.
+    /// A load that fails for good is kept for the run, so a second registry
+    /// fails at once with the same error. Breaks if each registry repeats
+    /// the load, here the region lookup of an AWS subject token source.
     #[tokio::test]
     async fn a_failed_load_is_kept_for_the_run() {
         let server = MockServer::start().await;
@@ -654,21 +625,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let file = serde_json::json!({
-            "type": "external_account",
-            "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
-            "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
-            "token_url": "https://sts.googleapis.com/v1/token",
-            "credential_source": {
-                "environment_id": "aws1",
-                "region_url": format!("{}/zone", server.uri()),
-            },
-        });
-        let host = google::tests::host(
-            crate::aws::Platform::Unix,
-            &[("GOOGLE_APPLICATION_CREDENTIALS", "/adc.json")],
-            &[("/adc.json", file.to_string().into_bytes())],
-        );
+        let host = aws_source_host(&server);
         let shared = GcpCredentials::default();
         let aws_credentials = AwsCredentialProviders::default();
 
@@ -684,6 +641,72 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains("status 404"), "{error}");
         }
+    }
+
+    /// A load that fails transiently is not kept, so the next registry
+    /// loads again and succeeds. Breaks if every failure is kept.
+    #[tokio::test]
+    async fn a_transient_load_failure_is_tried_again() {
+        let server = MockServer::start().await;
+        let attempts = u64::from(crate::retry::MAX_TRANSIENT_RETRIES) + 1;
+        Mock::given(method("GET"))
+            .and(path("/zone"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(attempts)
+            .expect(attempts)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/zone"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("us-east-1a"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let host = aws_source_host(&server);
+        let shared = GcpCredentials::default();
+        let aws_credentials = AwsCredentialProviders::default();
+        for (registry, status) in [
+            ("https://us-docker.pkg.dev", Some("status 503")),
+            ("https://europe-docker.pkg.dev", None),
+        ] {
+            let loaded = GcpAuth::on_host(
+                &registry.parse().unwrap(),
+                crate::test_http_client(),
+                &host,
+                &aws_credentials,
+                &shared,
+            )
+            .await;
+            match status {
+                Some(status) => {
+                    let error = loaded.unwrap_err();
+                    assert!(error.to_string().contains(status), "{error}");
+                }
+                None => {
+                    loaded.unwrap();
+                }
+            }
+        }
+    }
+
+    /// A host whose credentials are an external account with an AWS
+    /// source, its region looked up at `server`.
+    fn aws_source_host(server: &MockServer) -> crate::aws::Host {
+        let file = serde_json::json!({
+            "type": "external_account",
+            "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
+            "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+            "token_url": "https://sts.googleapis.com/v1/token",
+            "credential_source": {
+                "environment_id": "aws1",
+                "region_url": format!("{}/zone", server.uri()),
+            },
+        });
+        google::tests::host(
+            crate::aws::Platform::Unix,
+            &[("GOOGLE_APPLICATION_CREDENTIALS", "/adc.json")],
+            &[("/adc.json", file.to_string().into_bytes())],
+        )
     }
 
     /// An authorized user's token endpoint at `server`, answering `calls`
@@ -730,8 +753,10 @@ mod tests {
         .unwrap()
     }
 
+    /// Invalidation clears the registry's token and challenge, so both are
+    /// fetched again. Breaks if either is kept.
     #[tokio::test]
-    async fn invalidation_clears_all_caches() {
+    async fn invalidation_clears_the_registry_caches() {
         let server = MockServer::start().await;
 
         // /v2/ hit twice: once before invalidation, once after.
@@ -764,8 +789,8 @@ mod tests {
         );
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.invalidate().await;
-        // After invalidation: SDK creds re-fetched, challenge cache cleared,
-        // Bearer cache cleared. /v2/ is pinged again.
+        // The challenge and Bearer token are fetched again: /v2/ is pinged
+        // a second time.
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }
 

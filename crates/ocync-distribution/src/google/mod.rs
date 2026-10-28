@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
+use url::Url;
 
 use crate::REDACTED;
 use crate::aws::{AwsCredentialProviders, Clock, Env, Host, Platform};
@@ -56,11 +57,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// The HTTP clients the credentials are fetched with.
 #[derive(Debug, Clone)]
 pub(crate) struct Clients {
-    /// Google's token, STS and IAM endpoints and a federation URL source,
-    /// through `HTTPS_PROXY` like registry traffic.
+    /// Google's token, STS and IAM endpoints and a remote federation URL
+    /// source, through `HTTPS_PROXY` like registry traffic.
     api: reqwest::Client,
-    /// The GCE metadata server and the EC2 instance metadata service: no
-    /// proxy, so a token never reaches a proxy host.
+    /// The GCE metadata server, the EC2 instance metadata service and a
+    /// local federation URL source: no proxy, so a token never reaches a
+    /// proxy host.
     metadata: reqwest::Client,
 }
 
@@ -542,6 +544,11 @@ impl CredentialType {
     }
 }
 
+/// `url`, the value of `field`.
+fn parse_url(field: &'static str, url: &str) -> Result<Url, Error> {
+    Url::parse(url).map_err(|source| Error::Url { field, source })
+}
+
 /// What credentials are built with.
 struct Setup<'a> {
     host: &'a Host,
@@ -553,7 +560,7 @@ struct Setup<'a> {
 /// server: the file `GOOGLE_APPLICATION_CREDENTIALS` names, which must
 /// exist, else gcloud's well-known file if it does.
 fn find_file(host: &Host) -> Result<Option<Vec<u8>>, Error> {
-    if let Some(path) = host.env.get(CREDENTIALS_VARIABLE) {
+    if let Some(path) = host.env.get_os(CREDENTIALS_VARIABLE) {
         let path = PathBuf::from(path);
         return match host.fs.read(&path) {
             Ok(contents) => Ok(Some(contents)),
@@ -575,8 +582,8 @@ fn find_file(host: &Host) -> Result<Option<Vec<u8>>, Error> {
 /// root variable is unset.
 fn well_known_path(env: &Env, platform: Platform) -> Option<PathBuf> {
     let (root, dirs): (_, &[&str]) = match platform {
-        Platform::Unix => (env.get("HOME")?, &[UNIX_CONFIG_DIR]),
-        Platform::Windows => (env.get("APPDATA")?, &[]),
+        Platform::Unix => (env.get_os("HOME")?, &[UNIX_CONFIG_DIR]),
+        Platform::Windows => (env.get_os("APPDATA")?, &[]),
     };
     let mut path = PathBuf::from(root);
     path.extend(dirs.iter().chain(&WELL_KNOWN_FILE));

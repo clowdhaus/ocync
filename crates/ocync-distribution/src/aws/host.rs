@@ -6,6 +6,7 @@
 #[cfg(test)]
 use std::collections::HashMap;
 use std::env::VarError;
+use std::ffi::OsString;
 use std::io::{self, Write as _};
 use std::net::IpAddr;
 use std::path::Path;
@@ -189,6 +190,9 @@ pub(crate) enum Env {
     /// A fixed set.
     #[cfg(test)]
     Fixed(HashMap<String, String>),
+    /// A fixed set whose values need not be UTF-8.
+    #[cfg(test)]
+    FixedOs(HashMap<String, OsString>),
 }
 
 impl Env {
@@ -206,6 +210,20 @@ impl Env {
             },
             #[cfg(test)]
             Self::Fixed(vars) => vars.get(key).cloned(),
+            #[cfg(test)]
+            Self::FixedOs(vars) => vars.get(key)?.clone().into_string().ok(),
+        }
+    }
+
+    /// The value of `key` as the platform holds it, UTF-8 or not, or `None`
+    /// when unset. For a variable naming a path.
+    pub(crate) fn get_os(&self, key: &str) -> Option<OsString> {
+        match self {
+            Self::Process => std::env::var_os(key),
+            #[cfg(test)]
+            Self::Fixed(vars) => vars.get(key).map(OsString::from),
+            #[cfg(test)]
+            Self::FixedOs(vars) => vars.get(key).cloned(),
         }
     }
 }
