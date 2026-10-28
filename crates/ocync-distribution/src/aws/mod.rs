@@ -22,10 +22,11 @@ use self::config::{Config, ServiceId};
 use self::credentials::{Chain, Credentials};
 use self::host::{Host, Network, Transport};
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -775,11 +776,82 @@ impl Provider {
     }
 }
 
+/// A credential provider and the credential it last loaded, shared by every
+/// client built for one profile and region.
+struct Source {
+    provider: Provider,
+    cache: CredentialCache<Credentials>,
+}
+
+impl Source {
+    fn new(provider: Provider) -> Self {
+        Self {
+            provider,
+            cache: CredentialCache::new(),
+        }
+    }
+
+    /// The cached credential, loaded again shortly before it expires.
+    /// Concurrent callers share one load instead of each asking IMDS or STS.
+    async fn credentials(&self) -> Result<Credentials, Failure> {
+        self.cache
+            .get_or_refresh(async {
+                let loaded = tokio::time::timeout(CREDENTIALS_LOAD_TIMEOUT, self.provider.load())
+                    .await
+                    .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))??;
+                let ttl = loaded.expiry().map_or(DEFAULT_EXPIRATION, remaining);
+                Ok((loaded, ttl))
+            })
+            .await
+            .map_err(Failure::Credentials)
+    }
+}
+
+/// What a shared [`Source`] is keyed by. The region is part of it because the
+/// chain calls STS in its client's region.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SourceKey {
+    /// The resolved profile name, so a named profile and the same profile
+    /// selected through `AWS_PROFILE` share one source.
+    profile: String,
+    region: Region,
+}
+
+/// The credential sources clients share, so the ECR auth provider and the
+/// batch checker for one registry load credentials once. Synchronized, not
+/// `Rc<RefCell<_>>`, because the AWS client is a `Send + Sync` leaf; the lock
+/// is never held across an `.await`.
+#[derive(Default)]
+struct Sources(Mutex<HashMap<SourceKey, Arc<Source>>>);
+
+impl Sources {
+    /// The sources this process shares.
+    fn process() -> &'static Self {
+        static PROCESS: OnceLock<Sources> = OnceLock::new();
+        PROCESS.get_or_init(Self::default)
+    }
+
+    /// The source for `key`, built by `build` when there is none yet. A
+    /// failed build is not kept, so it fails only its caller.
+    fn get_or_try_insert<E>(
+        &self,
+        key: SourceKey,
+        build: impl FnOnce() -> Result<Source, E>,
+    ) -> Result<Arc<Source>, E> {
+        let mut sources = self.0.lock().expect("no panic while held");
+        if let Some(source) = sources.get(&key) {
+            return Ok(Arc::clone(source));
+        }
+        let source = Arc::new(build()?);
+        sources.insert(key, Arc::clone(&source));
+        Ok(source)
+    }
+}
+
 /// A client for one AWS JSON API in one region.
 pub(crate) struct Client {
     api: Api,
-    provider: Provider,
-    credentials: CredentialCache<Credentials>,
+    source: Arc<Source>,
     service: Service,
 }
 
@@ -794,7 +866,7 @@ impl fmt::Debug for Client {
 
 /// Everything a [`Client`] is built from.
 struct Parts {
-    provider: Provider,
+    source: Arc<Source>,
     service: Service,
     network: Network,
     api: ApiParts,
@@ -803,22 +875,43 @@ struct Parts {
 impl Client {
     /// A client for `service` in `region`, configured from the process
     /// environment and the shared AWS files, `profile` naming the profile
-    /// to use in place of `AWS_PROFILE`.
+    /// to use in place of `AWS_PROFILE`. Clients for one profile and region
+    /// share their credentials across the process.
     pub(crate) fn from_env(
         region: &str,
         profile: Option<&str>,
         service: Service,
     ) -> Result<Self, ConfigError> {
-        Self::new(&Host::current(), region, profile, service)
+        Self::with_sources(
+            &Host::current(),
+            region,
+            profile,
+            service,
+            Sources::process(),
+        )
     }
 
     /// A client for `service` in `region`, with the endpoint, retry,
-    /// clock-skew and credential settings `host` holds for `profile`.
+    /// clock-skew and credential settings `host` holds for `profile`, and
+    /// credentials of its own.
+    #[cfg(test)]
     fn new(
         host: &Host,
         region: &str,
         profile: Option<&str>,
         service: Service,
+    ) -> Result<Self, ConfigError> {
+        Self::with_sources(host, region, profile, service, &Sources::default())
+    }
+
+    /// As [`Self::new`], taking the credentials for the profile and region
+    /// from `sources`.
+    fn with_sources(
+        host: &Host,
+        region: &str,
+        profile: Option<&str>,
+        service: Service,
+        sources: &Sources,
     ) -> Result<Self, ConfigError> {
         let config = Config::load(host, profile);
         let region = Region::parse(region)?;
@@ -838,10 +931,17 @@ impl Client {
             stall_timeout: STALL_TIMEOUT,
             region,
         };
-        let chain =
-            Chain::new(host, &api.region, config, &retry).map_err(ConfigError::HttpClient)?;
+        let key = SourceKey {
+            profile: config.profile_name().to_owned(),
+            region: api.region.clone(),
+        };
+        let source = sources.get_or_try_insert(key, || {
+            let chain =
+                Chain::new(host, &api.region, config, &retry).map_err(ConfigError::HttpClient)?;
+            Ok::<_, ConfigError>(Source::new(Provider::Chain(Box::new(chain))))
+        })?;
         Self::from_parts(Parts {
-            provider: Provider::Chain(Box::new(chain)),
+            source,
             service,
             network: host.network.clone(),
             api,
@@ -850,15 +950,14 @@ impl Client {
 
     fn from_parts(parts: Parts) -> Result<Self, ConfigError> {
         let Parts {
-            provider,
+            source,
             service,
             network,
             api,
         } = parts;
         Ok(Self {
             api: Api::new(&network, service.api_id(), api).map_err(ConfigError::HttpClient)?,
-            provider,
-            credentials: CredentialCache::new(),
+            source,
             service,
         })
     }
@@ -877,7 +976,7 @@ impl Client {
         };
         self.api
             .call(&request, || async {
-                self.credentials().await.map(Signing::Signed)
+                self.source.credentials().await.map(Signing::Signed)
             })
             .await
             .and_then(|body| serde_json::from_slice(&body).map_err(Failure::Decode))
@@ -886,21 +985,6 @@ impl Client {
                 operation: O::NAME,
                 source,
             })
-    }
-
-    /// The cached credential, loaded again shortly before it expires.
-    /// Concurrent callers share one load instead of each asking IMDS or STS.
-    async fn credentials(&self) -> Result<Credentials, Failure> {
-        self.credentials
-            .get_or_refresh(async {
-                let loaded = tokio::time::timeout(CREDENTIALS_LOAD_TIMEOUT, self.provider.load())
-                    .await
-                    .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))??;
-                let ttl = loaded.expiry().map_or(DEFAULT_EXPIRATION, remaining);
-                Ok((loaded, ttl))
-            })
-            .await
-            .map_err(Failure::Credentials)
     }
 }
 
@@ -970,7 +1054,7 @@ mod tests {
     /// [`api_parts`] for `endpoint`.
     fn parts(endpoint: &str) -> Parts {
         Parts {
-            provider: static_credentials(None),
+            source: Arc::new(Source::new(static_credentials(None))),
             service: Service::Ecr,
             network: Network::Real,
             api: api_parts(endpoint),
@@ -1028,7 +1112,7 @@ mod tests {
             .await;
 
         let client = Client::from_parts(Parts {
-            provider: static_credentials(Some("session")),
+            source: Arc::new(Source::new(static_credentials(Some("session")))),
             ..parts(&server.uri())
         })
         .unwrap();
@@ -1498,16 +1582,16 @@ mod tests {
             let count = Arc::new(AtomicUsize::new(0));
             let counted = Arc::clone(&count);
             let client = Client::from_parts(Parts {
-                provider: Provider::Test(Box::new(move || {
+                source: Arc::new(Source::new(Provider::Test(Box::new(move || {
                     counted.fetch_add(1, Ordering::Relaxed);
                     let expiry = SystemTime::now() + lifetime;
                     Box::pin(async move { Ok(credentials::tests::key(None, Some(expiry))) })
-                })),
+                })))),
                 ..parts("https://example.com")
             })
             .unwrap();
-            client.credentials().await.unwrap();
-            client.credentials().await.unwrap();
+            client.source.credentials().await.unwrap();
+            client.source.credentials().await.unwrap();
             assert_eq!(count.load(Ordering::Relaxed), loads, "{lifetime:?}");
         }
     }
@@ -1518,7 +1602,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn gives_up_on_a_credential_source_that_hangs() {
         let client = Client::from_parts(Parts {
-            provider: Provider::Test(Box::new(|| Box::pin(std::future::pending()))),
+            source: Arc::new(Source::new(Provider::Test(Box::new(|| {
+                Box::pin(std::future::pending())
+            })))),
             ..parts("https://example.com")
         })
         .unwrap();
@@ -1587,6 +1673,58 @@ mod tests {
         assert_eq!(host_name(Some("other")), "api.ecr.us-west-2.amazonaws.com");
     }
 
+    /// One source per profile and region: a second request for the same key
+    /// builds nothing, another region or profile builds its own, and a failed
+    /// build is not kept.
+    #[test]
+    fn shares_a_source_per_profile_and_region() {
+        let sources = Sources::default();
+        let builds = AtomicUsize::new(0);
+        let get = |profile: &str, region: &str| {
+            let key = SourceKey {
+                profile: profile.to_owned(),
+                region: Region::parse(region).unwrap(),
+            };
+            sources
+                .get_or_try_insert(key, || {
+                    builds.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, ()>(Source::new(static_credentials(None)))
+                })
+                .unwrap()
+        };
+        let first = get("default", "us-west-2");
+        assert!(Arc::ptr_eq(&first, &get("default", "us-west-2")));
+        assert!(!Arc::ptr_eq(&first, &get("default", "us-east-1")));
+        assert!(!Arc::ptr_eq(&first, &get("other", "us-west-2")));
+        assert_eq!(builds.load(Ordering::Relaxed), 3);
+
+        let key = SourceKey {
+            profile: "failing".to_owned(),
+            region: Region::parse("us-west-2").unwrap(),
+        };
+        assert!(sources.get_or_try_insert(key.clone(), || Err(())).is_err());
+        sources
+            .get_or_try_insert(key, || Ok::<_, ()>(Source::new(static_credentials(None))))
+            .unwrap();
+    }
+
+    /// Clients for different services share the credentials of one profile
+    /// in one region, whether the profile is named or selected through
+    /// `AWS_PROFILE`. Breaks if each client builds its own chain.
+    #[test]
+    fn clients_for_one_profile_and_region_share_credentials() {
+        let host = config::tests::host(&[("AWS_PROFILE", "other")], "[profile other]\n");
+        let sources = Sources::default();
+        let client = |profile, region, service| {
+            Client::with_sources(&host, region, profile, service, &sources).unwrap()
+        };
+        let auth = client(None, "us-east-1", Service::Ecr);
+        let public = client(Some("other"), "us-east-1", Service::EcrPublic);
+        assert!(Arc::ptr_eq(&auth.source, &public.source));
+        let elsewhere = client(None, "us-west-2", Service::Ecr);
+        assert!(!Arc::ptr_eq(&auth.source, &elsewhere.source));
+    }
+
     /// A transport failure does not carry the endpoint URL, whose path may
     /// hold a key, into the error.
     #[tokio::test]
@@ -1620,7 +1758,9 @@ mod tests {
             .mount(&server)
             .await;
         let client = Client::from_parts(Parts {
-            provider: static_credentials(Some("token\nwith a newline")),
+            source: Arc::new(Source::new(static_credentials(Some(
+                "token\nwith a newline",
+            )))),
             ..parts(&server.uri())
         })
         .unwrap();

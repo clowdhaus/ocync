@@ -199,9 +199,10 @@ impl EcrAuth {
     ///
     /// When `profile` is `Some`, credential resolution is scoped to that
     /// named profile in the shared credentials/config file. When `None`,
-    /// the ambient default credential chain is used unchanged. Each
-    /// `EcrAuth` instance holds its own AWS client, so per-instance profile
-    /// overrides do not leak across registries.
+    /// the ambient default credential chain is used unchanged. Credentials
+    /// are shared only with clients for the same profile and region, such as
+    /// this registry's batch checker, so a profile override does not leak
+    /// across registries.
     pub fn new(hostname: impl Into<String>, profile: Option<&str>) -> Result<Self, Error> {
         let hostname = hostname.into();
         let client = crate::ecr::api_client(&hostname, profile)
