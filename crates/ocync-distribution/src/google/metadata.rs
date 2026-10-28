@@ -205,43 +205,4 @@ mod tests {
             .unwrap();
         assert_eq!(token.expiry, crate::google::Expiry::Never);
     }
-
-    /// Upstream `credentials_headers_retryable_error`, `_nonretryable_error`
-    /// and `_malformed_response_is_nonretryable`: a 503 may be sent again, a
-    /// 401 and an answer that does not decode may not. Breaks if the status
-    /// rules or the decode rule change.
-    #[tokio::test]
-    async fn classifies_failures() {
-        for (status, body, transient) in [
-            (503, "try again", true),
-            (401, "no", false),
-            (200, "not json", false),
-        ] {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .respond_with(ResponseTemplate::new(status).set_body_string(body))
-                .mount(&server)
-                .await;
-            let error = Server::new(&server_env(&server), Scopes::Default)
-                .unwrap()
-                .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
-                .await
-                .unwrap_err();
-            assert_eq!(error.is_transient(), transient, "{status}: {error}");
-        }
-    }
-
-    /// A host with no metadata server fails at once and is not tried again,
-    /// as upstream tries it once. Breaks if a refused connection becomes
-    /// transient for the metadata server.
-    #[tokio::test]
-    async fn a_refused_connection_is_final() {
-        let error = Server::new(&host_env("127.0.0.1:1"), Scopes::Default)
-            .unwrap()
-            .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, Error::Transport { .. }), "{error}");
-        assert!(!error.is_transient());
-    }
 }

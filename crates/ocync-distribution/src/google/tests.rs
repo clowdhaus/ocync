@@ -117,80 +117,68 @@ fn reads_a_path_that_is_not_utf8() {
     assert_eq!(find_file(&host).unwrap(), Some(b"{}".to_vec()));
 }
 
-/// Upstream `adc_path_from_env` and `load_adc_success`: the file the
-/// variable names, before the well-known file. Breaks if the variable is
-/// read after the well-known file.
-#[tokio::test]
-async fn reads_the_file_the_variable_names() {
-    let host = host(
-        Platform::Unix,
-        &[(CREDENTIALS_VARIABLE, "/keys/sa.json"), ("HOME", "/home/u")],
-        &[
-            ("/keys/sa.json", service_account_bytes()),
-            (
-                "/home/u/.config/gcloud/application_default_credentials.json",
-                b"{\"type\":\"authorized_user\"}".to_vec(),
-            ),
-        ],
-    );
-    let credentials = load(&host).await.unwrap();
-    assert!(
-        matches!(credentials, Credentials::ServiceAccount(_)),
-        "{credentials:?}"
-    );
-}
-
-/// Upstream `load_adc_no_file_at_env_is_error` and
-/// `create_access_token_credentials_errors_if_adc_env_is_not_a_file`: a
-/// missing file the variable names is an error, not the metadata server.
-/// Breaks if it falls back.
-#[tokio::test]
-async fn a_missing_named_file_is_an_error() {
-    let host = host(
-        Platform::Unix,
-        &[(CREDENTIALS_VARIABLE, "/keys/none.json")],
-        &[],
-    );
-    let error = load(&host).await.unwrap_err();
-    assert!(matches!(error, Error::MissingFile(_)), "{error}");
-    assert!(error.to_string().contains("GOOGLE_APPLICATION_CREDENTIALS"));
-}
-
-/// Upstream `load_adc_no_well_known_path_fallback_to_mds`,
+/// Upstream `adc_path_from_env`, `load_adc_success`,
+/// `load_adc_no_file_at_env_is_error`,
+/// `create_access_token_credentials_errors_if_adc_env_is_not_a_file`,
+/// `load_adc_no_well_known_path_fallback_to_mds`,
 /// `load_adc_no_file_at_well_known_path_fallback_to_mds` and
-/// `create_access_token_credentials_fallback_to_mds`: with no variable,
-/// no home or no well-known file, the metadata server is used. Breaks if
-/// either case is an error.
+/// `create_access_token_credentials_fallback_to_mds`: the file the variable
+/// names comes first and must exist, then the well-known file, then the
+/// metadata server. Breaks if the order changes, a missing named file
+/// falls back, or no file is an error.
 #[tokio::test]
-async fn falls_back_to_the_metadata_server() {
-    for host in [
-        host(Platform::Unix, &[], &[]),
-        host(Platform::Unix, &[("HOME", "/home/u")], &[]),
-    ] {
-        let credentials = load(&host).await.unwrap();
-        assert!(
-            matches!(credentials, Credentials::Metadata(_)),
-            "{credentials:?}"
-        );
+async fn finds_the_credentials_in_order() {
+    let well_known = "/home/u/.config/gcloud/application_default_credentials.json";
+    let user = b"{\"type\":\"authorized_user\"}".to_vec();
+    let named = [(CREDENTIALS_VARIABLE, "/keys/sa.json"), ("HOME", "/home/u")];
+    type Check = fn(&Result<Credentials, Error>) -> bool;
+    type Case<'a> = (
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        Vec<(&'a str, Vec<u8>)>,
+        Check,
+    );
+    let service_account: Check = |r| matches!(r, Ok(Credentials::ServiceAccount(_)));
+    let metadata: Check = |r| matches!(r, Ok(Credentials::Metadata(_)));
+    let missing: Check = |r| match r {
+        Err(e @ Error::MissingFile(_)) => e.to_string().contains(CREDENTIALS_VARIABLE),
+        _ => false,
+    };
+    let cases: [Case<'_>; 5] = [
+        (
+            "the named file before the well-known one",
+            &named,
+            vec![
+                ("/keys/sa.json", service_account_bytes()),
+                (well_known, user.clone()),
+            ],
+            service_account,
+        ),
+        (
+            "a missing named file",
+            &[(CREDENTIALS_VARIABLE, "/keys/none.json")],
+            vec![],
+            missing,
+        ),
+        (
+            "the well-known file",
+            &[("HOME", "/home/u")],
+            vec![(well_known, service_account_bytes())],
+            service_account,
+        ),
+        ("no home", &[], vec![], metadata),
+        (
+            "no well-known file",
+            &[("HOME", "/home/u")],
+            vec![],
+            metadata,
+        ),
+    ];
+    for (case, vars, files, expected) in cases {
+        let host = host(Platform::Unix, vars, &files);
+        let found = load(&host).await;
+        assert!(expected(&found), "{case}: {found:?}");
     }
-}
-
-/// The well-known file is read when it exists. Breaks if it is skipped.
-#[tokio::test]
-async fn reads_the_well_known_file() {
-    let host = host(
-        Platform::Unix,
-        &[("HOME", "/home/u")],
-        &[(
-            "/home/u/.config/gcloud/application_default_credentials.json",
-            service_account_bytes(),
-        )],
-    );
-    let credentials = load(&host).await.unwrap();
-    assert!(
-        matches!(credentials, Credentials::ServiceAccount(_)),
-        "{credentials:?}"
-    );
 }
 
 /// Upstream `create_access_token_credentials_malformed_adc_is_error` and
@@ -283,6 +271,36 @@ fn refuses_a_lifetime_the_clock_cannot_hold() {
     ));
     let token = expiring("t".to_owned(), now, Some(60)).unwrap();
     assert_eq!(token.expiry, Expiry::At(now + Duration::from_secs(60)));
+}
+
+/// Upstream's status rule: a 5xx, 408 or 429 may succeed if sent again,
+/// any other refusal and an answer that does not decode may not. Breaks if
+/// one of the three transient kinds stops being retried on its own, or a
+/// refusal is retried.
+#[test]
+fn classifies_answers() {
+    let status = |code: u16| Error::Status {
+        call: Call::UserToken,
+        status: http::StatusCode::from_u16(code).unwrap(),
+        body: String::new(),
+    };
+    for (code, transient) in [
+        (500, true),
+        (503, true),
+        (408, true),
+        (429, true),
+        (400, false),
+        (401, false),
+        (403, false),
+        (404, false),
+    ] {
+        assert_eq!(status(code).is_transient(), transient, "{code}");
+    }
+    let undecodable = Error::Decode {
+        call: Call::UserToken,
+        source: serde_json::from_str::<Value>("{").unwrap_err(),
+    };
+    assert!(!undecodable.is_transient());
 }
 
 /// A request that does not connect is final for a metadata service, which

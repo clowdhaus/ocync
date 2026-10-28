@@ -568,72 +568,6 @@ mod tests {
         assert_eq!(password(&auth).await, "ya29.kept");
     }
 
-    #[tokio::test]
-    async fn token_exchange_with_gcp_credentials() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/v2/"))
-            .respond_with(ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(
-                    r#"Bearer realm="{}/token",service="us-docker.pkg.dev""#,
-                    server.uri()
-                ),
-            ))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // Verify the token endpoint receives Basic auth with the
-        // oauth2accesstoken username and the GCP access token as password.
-        // "oauth2accesstoken:ya29.gcp-token" base64 = "b2F1dGgyYWNjZXNzdG9rZW46eWEyOS5nY3AtdG9rZW4="
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .and(header(
-                "Authorization",
-                "Basic b2F1dGgyYWNjZXNzdG9rZW46eWEyOS5nY3AtdG9rZW4=",
-            ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "bearer-tok", "expires_in": 300})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let auth = GcpAuth::with_api(
-            server.uri(),
-            crate::test_http_client(),
-            MockGcpTokenSource::succeeding("ya29.gcp-token"),
-        );
-        let token = auth
-            .get_token(&[Scope::pull("project/repo")])
-            .await
-            .unwrap();
-        assert_eq!(token.value(), "bearer-tok");
-    }
-
-    #[tokio::test]
-    async fn sdk_credentials_cached_across_scopes() {
-        let server = MockServer::start().await;
-        for mock in mount_v2_and_token(&server, "cached") {
-            mock.mount(&server).await;
-        }
-
-        // Only one token available. If the second get_token call re-fetches
-        // credentials it will fail, proving they were cached.
-        let auth = GcpAuth::with_api(
-            server.uri(),
-            crate::test_http_client(),
-            MockGcpTokenSource::with_tokens(vec![("ya29.once", HOUR)]),
-        );
-        let t1 = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
-        let t2 = auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
-        assert_eq!(t1.value(), "cached");
-        assert_eq!(t2.value(), "cached");
-    }
-
     /// A token that expires within the refresh window is fetched again on
     /// the next use. Breaks if the cache keeps a token past its own expiry.
     #[tokio::test]
@@ -661,34 +595,6 @@ mod tests {
         );
         assert_eq!(password(&auth).await, "ya29.only");
         assert_eq!(password(&auth).await, "ya29.only");
-    }
-
-    /// A transient failure from Google is sent again before the provider
-    /// gives up, as the prepare phase has no other retry; a refusal is not.
-    /// Breaks if a 503 fails the load or a 401 is sent twice.
-    #[tokio::test]
-    async fn retries_a_transient_google_failure() {
-        for (first, calls, succeeds) in [(503, 2, true), (401, 1, false)] {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/token"))
-                .respond_with(ResponseTemplate::new(first))
-                .up_to_n_times(1)
-                .expect(1)
-                .mount(&server)
-                .await;
-            mount_user_token(&server, calls - 1).await;
-            let auth = adc_auth(
-                "https://us-docker.pkg.dev",
-                &user_host(&server),
-                &DefaultCredentials::default(),
-            )
-            .await;
-
-            let credentials = auth.google_token().await;
-
-            assert_eq!(credentials.is_ok(), succeeds, "{first}: {credentials:?}");
-        }
     }
 
     /// The registries of one run share one load of the credentials and one

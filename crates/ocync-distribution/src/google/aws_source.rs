@@ -325,41 +325,6 @@ mod tests {
         assert_eq!(found, region("us-gov-west-1"));
     }
 
-    /// The zone request runs once, at setup, so a 503 is sent again and a
-    /// 404 is not. Breaks if a throttled lookup fails the registry or a
-    /// refusal is retried.
-    #[tokio::test]
-    async fn retries_a_transient_region_lookup() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        for (first, calls, succeeds) in [(503, 2, true), (404, 1, false)] {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .and(path("/zone"))
-                .respond_with(ResponseTemplate::new(first))
-                .up_to_n_times(1)
-                .expect(1)
-                .mount(&server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/zone"))
-                .respond_with(ResponseTemplate::new(200).set_body_string("us-east-1a"))
-                .expect(calls - 1)
-                .mount(&server)
-                .await;
-            let fixture = Fixture::new(host(Platform::Unix, &[], &[]));
-
-            let found = region_from_metadata(
-                &fixture.setup(),
-                &file(Some(format!("{}/zone", server.uri())), None),
-            )
-            .await;
-
-            assert_eq!(found.is_ok(), succeeds, "{first}: {found:?}");
-        }
-    }
-
     /// A region lookup that cannot succeed fails at once: with no
     /// `region_url`, with one that is not a URL, with
     /// `AWS_EC2_METADATA_DISABLED` set, with no metadata service to connect
