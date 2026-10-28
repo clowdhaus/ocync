@@ -118,10 +118,16 @@ impl CachedGoogleToken {
                 // holds a lifetime past what the clock can hold as never
                 // expiring.
                 let ttl = match token.expiry {
-                    Expiry::At(expiry) => remaining(expiry),
-                    Expiry::Never => Duration::MAX,
+                    Expiry::At(expiry) => {
+                        let ttl = remaining(expiry);
+                        tracing::debug!(ttl_secs = ttl.as_secs(), "GCP OAuth2 token refreshed");
+                        ttl
+                    }
+                    Expiry::Never => {
+                        tracing::debug!("GCP OAuth2 token refreshed, with no expiry");
+                        Duration::MAX
+                    }
                 };
-                tracing::debug!(expiry = ?token.expiry, "GCP OAuth2 token refreshed");
                 Ok((token, ttl))
             })
             .await
