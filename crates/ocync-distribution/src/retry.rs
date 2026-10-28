@@ -63,7 +63,9 @@ pub fn is_transient_status(status: http::StatusCode) -> bool {
         || status == http::StatusCode::TOO_MANY_REQUESTS
 }
 
-/// Whether an error is worth re-sending: a throttle, or a transport failure.
+/// Whether an error from a [`retrying`] call is worth re-sending: a
+/// throttle, or a transport failure. A 5xx here is the caller's answer;
+/// only [`send_retrying`]'s auth requests re-send one.
 ///
 /// A 429 is backpressure rather than a refusal. AIMD has already halved the
 /// window by the time one surfaces, so the retry is paced by the throttle it
@@ -168,11 +170,13 @@ where
     }
 }
 
-/// Send `request`, re-sending it while the answer looks transient.
+/// Send `request`, re-sending it while the answer looks transient: a
+/// transport failure or an [`is_transient_status`] answer.
 ///
-/// Returns the **final response**, including a throttled one, rather than
-/// turning a 429 into an error. That distinction is load-bearing for the auth
-/// paths: their callers collapse any non-success into
+/// Returns the **final response**, including a throttled or failing one,
+/// rather than turning a 429 or 5xx into an error. That distinction is
+/// load-bearing for the auth paths: their callers collapse any non-success
+/// into
 /// `Error::RegistryPing`, `Error::TokenEndpoint` or `Error::AuthFailed`,
 /// none of which carries a `status_code()`, and the engine's `with_retry` therefore
 /// cannot classify it as retryable. Surfacing a 429 as a typed error instead
@@ -200,11 +204,12 @@ pub(crate) async fn send_retrying(
             .expect("request was confirmed cloneable above");
         let outcome = this_attempt.send().await;
 
-        let transient = match &outcome {
-            Ok(resp) => resp.status() == http::StatusCode::TOO_MANY_REQUESTS,
-            Err(e) => is_transient_transport(e),
+        let cause = match &outcome {
+            Ok(resp) if is_transient_status(resp.status()) => resp.status().to_string(),
+            Err(e) if is_transient_transport(e) => crate::error::error_chain(e),
+            _ => return Ok(outcome?),
         };
-        if !transient || attempt >= MAX_TRANSIENT_RETRIES {
+        if attempt >= MAX_TRANSIENT_RETRIES {
             return Ok(outcome?);
         }
 
@@ -213,6 +218,7 @@ pub(crate) async fn send_retrying(
             what,
             attempt,
             delay_ms = delay.as_millis(),
+            error = %cause,
             "transient failure; backing off and retrying"
         );
         tokio::time::sleep(delay).await;
@@ -299,9 +305,10 @@ mod tests {
         );
     }
 
-    /// Only a 429 is re-sent; other registry statuses are the caller's answer.
+    /// Through `retrying`, only a 429 is re-sent; other registry statuses
+    /// are the caller's answer.
     #[test]
-    fn only_a_throttle_is_transient_among_statuses() {
+    fn retrying_resends_only_a_throttle_among_statuses() {
         let throttled = Error::RegistryError {
             status: http::StatusCode::TOO_MANY_REQUESTS,
             message: "Rate exceeded".into(),
