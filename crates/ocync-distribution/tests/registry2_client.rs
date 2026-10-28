@@ -147,8 +147,12 @@ async fn sweep_removes_only_containers_past_their_age() {
     let image = format!("{}:{}", common::REGISTRY_NAME, common::REGISTRY_TAG);
     // Pulled only when missing, as testcontainers does, to spare Docker
     // Hub's pull limit.
-    if docker.inspect_image(&image).await.is_err() {
-        docker
+    match docker.inspect_image(&image).await {
+        Ok(_) => {}
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: common::NOT_FOUND,
+            ..
+        }) => docker
             .create_image(
                 Some(CreateImageOptions {
                     from_image: Some(common::REGISTRY_NAME.to_owned()),
@@ -160,7 +164,9 @@ async fn sweep_removes_only_containers_past_their_age() {
             )
             .try_collect::<Vec<_>>()
             .await
-            .expect("Docker pulls the registry image");
+            .map(drop)
+            .expect("Docker pulls the registry image"),
+        Err(e) => panic!("Docker inspects the registry image: {e}"),
     }
     let value = format!(
         "sweep-check-{}-{}",
@@ -252,24 +258,14 @@ fn orphan_rule() {
     }
 }
 
-/// A start that fails removes its container at once. Breaks if the
-/// container Docker created is left for a later run's sweep.
-#[tokio::test]
-async fn a_failed_start_removes_its_container() {
-    use testcontainers::ImageExt;
-
-    let docker = testcontainers::core::client::docker_client_instance()
-        .await
-        .expect("Docker is reachable");
-    let value = format!("failed-start-{}", std::process::id());
-    // The registry never logs before a millisecond is up, so the start
-    // times out after Docker has created the container.
-    let request = common::registry().with_startup_timeout(Duration::from_millis(1));
-    assert!(common::start_labeled(request, &value).await.is_err());
-    assert_eq!(
-        labeled_ids(&docker, &common::label(&value)).await,
-        Vec::<String>::new()
-    );
+/// The sweep keeps containers only when testcontainers is told to keep
+/// them. Breaks if a developer's kept containers are swept, or if any
+/// other value stops the sweep.
+#[test]
+fn keep_command_skips_the_sweep() {
+    for (command, keeps) in [(Some("keep"), true), (Some("remove"), false), (None, false)] {
+        assert_eq!(common::keeps(command), keeps, "{command:?}");
+    }
 }
 
 /// Starting a registry runs the orphan sweep, and the registry is found by

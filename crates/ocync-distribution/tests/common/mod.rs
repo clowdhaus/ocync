@@ -21,6 +21,10 @@ pub fn test_digest(data: &[u8]) -> Digest {
 /// matches the key with any value.
 pub const LABEL_KEY: &str = "dev.ocync.test";
 
+/// The label value on the registry containers. Descriptive only: the
+/// orphan sweep matches [`LABEL_KEY`] with any value.
+const REGISTRY_LABEL_VALUE: &str = "registry";
+
 /// The name of the registry image the tests run.
 pub const REGISTRY_NAME: &str = "registry";
 
@@ -69,6 +73,13 @@ const ORPHANS: OrphanAge = OrphanAge {
     stopped: LONGEST_START.saturating_mul(2),
     any_state: LONGEST_RUN,
 };
+
+/// Docker's answer for a container or image that does not exist.
+pub const NOT_FOUND: u16 = reqwest::StatusCode::NOT_FOUND.as_u16();
+
+/// Docker's answer to force-removing a container whose removal is already
+/// in progress.
+const CONFLICT: u16 = reqwest::StatusCode::CONFLICT.as_u16();
 
 /// Why a sweep failed.
 #[derive(Debug, thiserror::Error)]
@@ -161,7 +172,7 @@ pub async fn sweep(filter: &str, ages: OrphanAge, now: SystemTime) -> Result<Swe
             Ok(()) => swept.removed += 1,
             // Already gone, or already being removed by another run.
             Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404 | 409,
+                status_code: NOT_FOUND | CONFLICT,
                 ..
             }) => {}
             Err(e) => swept.failed.push((id, e)),
@@ -178,15 +189,25 @@ pub fn swept() -> bool {
     SWEPT.initialized()
 }
 
+/// Whether the `TESTCONTAINERS_COMMAND` value `command` asks for
+/// containers to be kept for debugging, as testcontainers reads it.
+pub fn keeps(command: Option<&str>) -> bool {
+    command == Some("keep")
+}
+
 /// Sweep up the test containers earlier runs left behind, whatever their
-/// label's value, once per process. The sweep only tidies, so a failure
-/// warns and every test goes on. It writes to stderr directly, as the test
-/// harness hides what a passing test prints.
+/// label's value, once per process, unless [`keeps`] says to keep them.
+/// The sweep only tidies,
+/// so a failure warns and every test goes on. It writes to stderr
+/// directly, as the test harness hides what a passing test prints.
 async fn sweep_orphans() {
     use std::io::Write as _;
 
     SWEPT
         .get_or_init(|| async {
+            if keeps(std::env::var("TESTCONTAINERS_COMMAND").ok().as_deref()) {
+                return;
+            }
             let mut stderr = std::io::stderr();
             match sweep(LABEL_KEY, ORPHANS, SystemTime::now()).await {
                 Ok(swept) => {
@@ -213,7 +234,7 @@ async fn sweep_orphans() {
 }
 
 /// A `registry:2` container listening on port 5000.
-pub fn registry() -> testcontainers::ContainerRequest<testcontainers::GenericImage> {
+fn registry() -> testcontainers::ContainerRequest<testcontainers::GenericImage> {
     use testcontainers::{GenericImage, ImageExt};
 
     GenericImage::new(REGISTRY_NAME, REGISTRY_TAG)
@@ -224,30 +245,7 @@ pub fn registry() -> testcontainers::ContainerRequest<testcontainers::GenericIma
         // Without an init process to reap it, the registry can be left a
         // zombie Docker cannot kill, and the container is never removed.
         .with_host_config_modifier(|config| config.init = Some(true))
-}
-
-/// Start `request` labeled [`LABEL_KEY`]`=value`. A label value of its
-/// own lets a start that fails remove what it left at once, instead of
-/// waiting for a later run's sweep.
-pub async fn start_labeled(
-    request: testcontainers::ContainerRequest<testcontainers::GenericImage>,
-    value: &str,
-) -> testcontainers::core::error::Result<testcontainers::ContainerAsync<testcontainers::GenericImage>>
-{
-    use testcontainers::ImageExt;
-    use testcontainers::runners::AsyncRunner;
-
-    let started = request.with_label(LABEL_KEY, value).start().await;
-    if started.is_err() {
-        // Every container with this label is this start's, so a `now` past
-        // the longest run counts each as left behind.
-        let any = OrphanAge {
-            stopped: Duration::ZERO,
-            any_state: Duration::ZERO,
-        };
-        let _ = sweep(&label(value), any, SystemTime::now() + LONGEST_RUN).await;
-    }
-    started
+        .with_label(LABEL_KEY, REGISTRY_LABEL_VALUE)
 }
 
 /// Start `request` and return the container with its `scheme` base URL.
@@ -258,17 +256,11 @@ async fn start(
     testcontainers::ContainerAsync<testcontainers::GenericImage>,
     Url,
 ) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static STARTS: AtomicUsize = AtomicUsize::new(0);
+    use testcontainers::runners::AsyncRunner;
 
     sweep_orphans().await;
-    let value = format!(
-        "registry-{}-{}",
-        std::process::id(),
-        STARTS.fetch_add(1, Ordering::Relaxed)
-    );
-    let container = start_labeled(request, &value)
+    let container = request
+        .start()
         .await
         .expect("failed to start registry container");
     let port = container

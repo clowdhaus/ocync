@@ -40,7 +40,7 @@ url = { workspace = true }
 [dev-dependencies]
 httpdate = { version = "1", default-features = false }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
-testcontainers = { version = "0.28", default-features = false }
+testcontainers = { version = "0.28", default-features = false, features = ["watchdog"] }
 tokio = { workspace = true, features = ["sync", "time", "test-util", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 wiremock = { version = "0.6", default-features = false }
