@@ -205,4 +205,18 @@ mod tests {
             .unwrap();
         assert_eq!(token.expiry, crate::google::Expiry::Never);
     }
+
+    /// A host with no metadata server fails at once and is not tried again,
+    /// as upstream tries it once. Breaks if a refused connection becomes
+    /// transient for the metadata server.
+    #[tokio::test]
+    async fn a_refused_connection_is_final() {
+        let error = Server::new(&host_env("127.0.0.1:1"), Scopes::Default)
+            .unwrap()
+            .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Transport { .. }), "{error}");
+        assert!(!error.is_transient());
+    }
 }

@@ -807,7 +807,7 @@ impl SharedCredentials {
     /// not one per waiting client.
     async fn load(&self) -> Result<Credentials, Failure> {
         self.cache
-            .get_or_refresh_shared(async {
+            .get_or_refresh_sharing_failure(async {
                 let loaded = tokio::time::timeout(CREDENTIALS_LOAD_TIMEOUT, self.provider.load())
                     .await
                     .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))

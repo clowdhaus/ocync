@@ -364,8 +364,8 @@ pub(crate) enum Error {
     #[error("invalid AWS instance metadata session token")]
     AwsMetadataToken(#[source] http::header::InvalidHeaderValue),
     /// A URL in the credentials file names no host.
-    #[error("invalid `{0}`: missing host")]
-    UrlHost(&'static str),
+    #[error("invalid `{field}`: missing host")]
+    UrlHost { field: &'static str },
     /// The AWS settings for an AWS subject token are invalid.
     #[error("invalid AWS configuration for the AWS subject token")]
     AwsConfig(#[source] crate::aws::ConfigError),

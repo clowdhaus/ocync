@@ -26,7 +26,7 @@ pub(crate) fn remaining(until: SystemTime) -> Duration {
 /// the AWS API client and the instance metadata session token. Time is
 /// tokio's, so a test with paused time moves it.
 ///
-/// `E` is the error [`Self::get_or_refresh_shared`] hands to the callers
+/// `E` is the error [`Self::get_or_refresh_sharing_failure`] hands to the callers
 /// that waited on a refresh that failed. A cache that never shares one
 /// leaves it [`Infallible`].
 pub(crate) struct CredentialCache<T, E = Infallible> {
@@ -103,8 +103,11 @@ impl<T: Clone + Send + Sync, E> CredentialCache<T, E> {
     /// As [`Self::get_or_refresh`], but a caller that was waiting on a
     /// refresh that failed gets its error instead of refreshing again. A
     /// failing source then costs one refresh per wave of callers, not one
-    /// per caller, while a caller that arrives later tries afresh.
-    pub(crate) async fn get_or_refresh_shared(
+    /// per caller. Whether a caller gets a stored error depends only on when
+    /// it asked, not on the order callers reach the lock: one that asked
+    /// before a failure gets that failure's error, and one that asked after
+    /// it refreshes.
+    pub(crate) async fn get_or_refresh_sharing_failure(
         &self,
         refresh: impl Future<Output = Result<(T, Duration), E>>,
     ) -> Result<T, E>
@@ -124,7 +127,6 @@ impl<T: Clone + Send + Sync, E> CredentialCache<T, E> {
         match refresh.await {
             Ok((value, ttl)) => {
                 slot.entry = Some(CacheEntry::new(value.clone(), ttl));
-                slot.failed = None;
                 Ok(value)
             }
             Err(error) => {
@@ -226,15 +228,15 @@ mod tests {
         };
 
         let (first, second) = tokio::join!(
-            cache.get_or_refresh_shared(failing()),
-            cache.get_or_refresh_shared(failing()),
+            cache.get_or_refresh_sharing_failure(failing()),
+            cache.get_or_refresh_sharing_failure(failing()),
         );
 
         assert_eq!((first, second), (Err("down"), Err("down")));
         assert_eq!(refreshes.get(), 1);
         tokio::time::advance(Duration::from_secs(1)).await;
         let later = cache
-            .get_or_refresh_shared(async { Ok((7, Duration::from_secs(1000))) })
+            .get_or_refresh_sharing_failure(async { Ok((7, Duration::from_secs(1000))) })
             .await;
         assert_eq!(later, Ok(7));
     }

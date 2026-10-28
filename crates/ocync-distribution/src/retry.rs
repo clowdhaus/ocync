@@ -162,8 +162,9 @@ where
 ///
 /// Returns the **final response**, including a throttled one, rather than
 /// turning a 429 into an error. That distinction is load-bearing for the auth
-/// paths: their callers collapse any non-success into `Error::AuthFailed`,
-/// which carries no `status_code()`, and the engine's `with_retry` therefore
+/// paths: their callers collapse any non-success into
+/// `Error::TokenEndpoint` or `Error::AuthFailed`, neither of which carries a
+/// `status_code()`, and the engine's `with_retry` therefore
 /// cannot classify it as retryable. Surfacing a 429 as a typed error instead
 /// would hand the engine a retryable auth failure and multiply this retry by
 /// the engine's own, aiming 4x the requests at a registry that is already

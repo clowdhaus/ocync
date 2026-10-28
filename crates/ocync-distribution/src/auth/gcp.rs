@@ -110,7 +110,7 @@ impl SharedToken {
     /// failed get its error rather than each asking again.
     async fn get(&self) -> Result<AccessToken, Arc<google::Error>> {
         self.token
-            .get_or_refresh_shared(async {
+            .get_or_refresh_sharing_failure(async {
                 tracing::debug!("GCP OAuth2 token expired or missing, refreshing");
                 let token = self.source.access_token().await.map_err(Arc::new)?;
                 match token.expiry {
@@ -133,8 +133,26 @@ impl SharedToken {
     }
 }
 
+/// Where a Google credential failure happened.
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    /// Reading and parsing the credentials, when a registry is set up.
+    Setup,
+    /// Fetching a token with them.
+    TokenRequest,
+}
+
+impl fmt::Display for Stage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Setup => "GCP credential setup failed",
+            Self::TokenRequest => "GCP access token request failed",
+        })
+    }
+}
+
 /// The error for `registry` when Google's credentials failed at `stage`.
-fn credentials_failed(registry: &str, stage: &str, error: &google::Error) -> Error {
+fn credentials_failed(registry: &str, stage: Stage, error: &google::Error) -> Error {
     Error::GoogleCredentials {
         registry: registry.to_owned(),
         reason: format!("{stage}: {}", error_chain(error)),
@@ -260,7 +278,7 @@ impl GcpAuth {
         let google_token = gcp_credentials
             .token(host, aws_credentials)
             .await
-            .map_err(|e| credentials_failed(&hostname, "GCP credential setup failed", &e))?;
+            .map_err(|e| credentials_failed(&hostname, Stage::Setup, &e))?;
         Ok(Self::with_token(
             registry_origin(registry),
             hostname,
@@ -325,7 +343,7 @@ impl GcpAuth {
     async fn google_token(&self) -> Result<google::Secret, Error> {
         let token = self.google_token.get().await.map_err(|e| {
             tracing::warn!(error = %e, "GCP access token request failed");
-            credentials_failed(&self.hostname, "GCP access token request failed", &e)
+            credentials_failed(&self.hostname, Stage::TokenRequest, &e)
         })?;
         Ok(token.token)
     }
@@ -389,6 +407,7 @@ impl AuthProvider for GcpAuth {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::sync::Mutex;
     use wiremock::MockServer;
@@ -411,9 +430,43 @@ mod tests {
                 status,
                 body: String::new(),
             };
-            let error = credentials_failed("gcr.io", "GCP access token request failed", &failure);
+            let error = credentials_failed("gcr.io", Stage::TokenRequest, &failure);
             assert_eq!(error.is_auth_error(), auth_error, "{status}");
         }
+    }
+
+    /// A token source whose every fetch fails after a second, counted.
+    #[derive(Debug)]
+    struct SlowlyFailing(Arc<AtomicUsize>);
+
+    impl GcpTokenSource for SlowlyFailing {
+        fn access_token(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<AccessToken, google::Error>> + Send + '_>> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(google::Error::Status {
+                    call: google::Call::Metadata,
+                    status: http::StatusCode::SERVICE_UNAVAILABLE,
+                    body: String::new(),
+                })
+            })
+        }
+    }
+
+    /// Registries waiting on a token fetch that fails get its error rather
+    /// than each fetching again. Breaks if the Google token stops sharing a
+    /// failed fetch.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn waiting_registries_share_a_failed_token_fetch() {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let shared = SharedToken::new(SlowlyFailing(Arc::clone(&fetches)));
+
+        let (first, second) = tokio::join!(shared.get(), shared.get());
+
+        assert!(first.is_err() && second.is_err());
+        assert_eq!(fetches.load(Ordering::Relaxed), 1);
     }
 
     /// How long the mock's tokens last unless a test says otherwise.

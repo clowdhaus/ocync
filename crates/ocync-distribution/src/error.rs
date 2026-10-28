@@ -65,7 +65,7 @@ pub enum Error {
     },
 
     /// Google's credentials yielded no token for the registry.
-    #[error("authentication failed for registry '{registry}': {reason}")]
+    #[error("no Google token for registry '{registry}': {reason}")]
     GoogleCredentials {
         /// The registry the token was for.
         registry: String,
@@ -221,18 +221,20 @@ impl Error {
 
     /// Whether this error represents an authentication or authorization failure.
     ///
-    /// Returns `true` for [`AuthFailed`](Self::AuthFailed) and
-    /// [`TokenEndpoint`](Self::TokenEndpoint) errors, Google credentials that
-    /// fail for good, and registry responses with HTTP 401 Unauthorized or
-    /// 403 Forbidden status codes.
+    /// Returns `true` for [`AuthFailed`](Self::AuthFailed) errors, a token
+    /// endpoint's 4xx other than 429 Too Many Requests, Google credentials
+    /// that fail for good, and registry responses with HTTP 401 Unauthorized
+    /// or 403 Forbidden status codes.
     pub fn is_auth_error(&self) -> bool {
         match self {
             Self::AuthFailed { .. }
-            | Self::TokenEndpoint { .. }
             | Self::GoogleCredentials {
                 transience: Transience::Final,
                 ..
             } => true,
+            Self::TokenEndpoint { status, .. } => {
+                status.is_client_error() && *status != http::StatusCode::TOO_MANY_REQUESTS
+            }
             Self::RegistryError { status, .. } => {
                 *status == http::StatusCode::UNAUTHORIZED || *status == http::StatusCode::FORBIDDEN
             }
@@ -451,13 +453,23 @@ mod tests {
         assert!(err.is_auth_error());
     }
 
+    /// A token endpoint that refuses is an auth error, and one that is
+    /// throttled or failing is not. Breaks if a 503 or 429 exits as refused
+    /// credentials.
     #[test]
     fn is_auth_error_token_endpoint() {
-        let err = Error::TokenEndpoint {
-            registry: "example.com".into(),
-            status: http::StatusCode::UNAUTHORIZED,
-        };
-        assert!(err.is_auth_error());
+        for (status, auth_error) in [
+            (http::StatusCode::UNAUTHORIZED, true),
+            (http::StatusCode::NOT_FOUND, true),
+            (http::StatusCode::TOO_MANY_REQUESTS, false),
+            (http::StatusCode::SERVICE_UNAVAILABLE, false),
+        ] {
+            let err = Error::TokenEndpoint {
+                registry: "example.com".into(),
+                status,
+            };
+            assert_eq!(err.is_auth_error(), auth_error, "{status}");
+        }
     }
 
     #[test]

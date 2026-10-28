@@ -101,7 +101,9 @@ impl Source {
     ) -> Result<Self, Error> {
         let url = sts_url(verification_url, signer.region())?;
         if !url.has_host() {
-            return Err(Error::UrlHost(VERIFICATION_URL_FIELD));
+            return Err(Error::UrlHost {
+                field: VERIFICATION_URL_FIELD,
+            });
         }
         Ok(Self {
             url,
@@ -281,8 +283,42 @@ mod tests {
         );
         assert!(matches!(
             no_host,
-            Err(Error::UrlHost(VERIFICATION_URL_FIELD))
+            Err(Error::UrlHost {
+                field: VERIFICATION_URL_FIELD,
+            })
         ));
+    }
+
+    /// The zone request runs once, at setup, so a 503 is sent again.
+    /// Breaks if a throttled lookup fails the registry.
+    #[tokio::test]
+    async fn retries_a_transient_region_lookup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/zone"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/zone"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("us-east-1a"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let fixture = Fixture::new(host(Platform::Unix, &[], &[]));
+
+        let found = region_from_metadata(
+            &fixture.setup(),
+            &file(Some(format!("{}/zone", server.uri())), None),
+        )
+        .await;
+
+        assert_eq!(found.unwrap().as_str(), "us-east-1");
     }
 
     fn file(region_url: Option<String>, imdsv2_url: Option<String>) -> SourceFile {

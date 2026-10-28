@@ -298,9 +298,7 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Gar | AuthType::Gcr) => {
-            let auth = GcpAuth::new(&url, http, aws_credentials, &credentials.gcp)
-                .await
-                .map_err(|e| CliError::Auth(format!("GCP auth setup for '{bare_host}': {e}")))?;
+            let auth = GcpAuth::new(&url, http, aws_credentials, &credentials.gcp).await?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Acr) => {
@@ -344,11 +342,7 @@ pub(crate) async fn build_registry_client(
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Gar | ProviderKind::Gcr) => {
-                    let auth = GcpAuth::new(&url, http, aws_credentials, &credentials.gcp)
-                        .await
-                        .map_err(|e| {
-                            CliError::Auth(format!("GCP auth setup for '{bare_host}': {e}"))
-                        })?;
+                    let auth = GcpAuth::new(&url, http, aws_credentials, &credentials.gcp).await?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Acr) => {
