@@ -20,7 +20,7 @@ use ocync_distribution::auth::ecr::EcrAuth;
 use ocync_distribution::auth::ecr_public::EcrPublicAuth;
 use ocync_distribution::auth::gcp::GcpAuth;
 use ocync_distribution::auth::static_token::StaticTokenAuth;
-use ocync_distribution::{AwsCredentialSources, RegistryClient};
+use ocync_distribution::{AwsCredentialProviders, RegistryClient};
 
 use std::sync::Once;
 #[cfg(test)]
@@ -220,10 +220,10 @@ impl<'a> Registry<'a> {
 
 /// Build a [`RegistryClient`] for `registry`, using the appropriate auth
 /// provider based on explicit `auth_type` or hostname auto-detection. ECR
-/// providers take their AWS credentials from `aws`, which one run shares.
+/// providers take their AWS credentials from `aws_credentials`, which one run shares.
 pub(crate) async fn build_registry_client(
     registry: Registry<'_>,
-    aws: &AwsCredentialSources,
+    aws_credentials: &AwsCredentialProviders,
 ) -> Result<RegistryClient, CliError> {
     // Idempotent: required before any reqwest::Client::new() call below
     // because reqwest is built with rustls-no-provider. The production
@@ -260,7 +260,7 @@ pub(crate) async fn build_registry_client(
     let mut builder = match auth_type {
         Some(AuthType::Ecr) => {
             let profile = registry_config.and_then(|r| r.aws_profile.as_deref());
-            let auth = EcrAuth::new(bare_host, profile, aws)
+            let auth = EcrAuth::new(bare_host, profile, aws_credentials)
                 .map_err(|e| CliError::Auth(format!("ECR auth setup for '{bare_host}': {e}")))?;
             RegistryClient::builder(url).auth(auth)
         }
@@ -323,13 +323,13 @@ pub(crate) async fn build_registry_client(
             // the result to avoid redundant regex evaluation.
             match detect_provider_kind(bare_host) {
                 Some(ProviderKind::Ecr) => {
-                    let auth = EcrAuth::new(bare_host, None, aws).map_err(|e| {
+                    let auth = EcrAuth::new(bare_host, None, aws_credentials).map_err(|e| {
                         CliError::Auth(format!("ECR auth setup for '{bare_host}': {e}"))
                     })?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::EcrPublic) => {
-                    let auth = EcrPublicAuth::new(http.clone(), aws)
+                    let auth = EcrPublicAuth::new(http.clone(), aws_credentials)
                         .map_err(|e| CliError::Auth(format!("ECR Public auth setup: {e}")))?;
                     RegistryClient::builder(url).auth(auth)
                 }

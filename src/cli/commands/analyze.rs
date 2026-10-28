@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use futures_util::StreamExt;
-use ocync_distribution::AwsCredentialSources;
+use ocync_distribution::AwsCredentialProviders;
 use ocync_distribution::ecr::BatchBlobChecker;
 use ocync_distribution::spec::ManifestKind;
 use ocync_distribution::{Digest, RepositoryName};
@@ -106,8 +106,14 @@ pub(crate) async fn run(
     // stretch it exists for stays silent.
     let tracker = PrepareTracker::default();
     let analysis = with_prepare_progress(&tracker, "analysis", async {
-        let aws = AwsCredentialSources::default();
-        let clients = build_clients(&config, &referenced_registries(&config), &tracker, &aws).await;
+        let aws_credentials = AwsCredentialProviders::default();
+        let clients = build_clients(
+            &config,
+            &referenced_registries(&config),
+            &tracker,
+            &aws_credentials,
+        )
+        .await;
         collect_analysis(
             &config,
             &clients,

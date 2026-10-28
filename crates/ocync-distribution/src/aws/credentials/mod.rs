@@ -465,7 +465,7 @@ pub(super) mod tests {
         ];
         let err = chain(&vars, "").load().await.unwrap_err();
         assert_eq!(
-            super::super::Failure::Credentials(err).to_string(),
+            super::super::Failure::Credentials(std::sync::Arc::new(err)).to_string(),
             "failed to load AWS credentials: \
              failed to load credentials from web identity: \
              failed to read the web identity token file /missing.jwt: \

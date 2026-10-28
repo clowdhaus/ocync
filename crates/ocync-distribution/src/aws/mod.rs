@@ -26,8 +26,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -427,8 +427,9 @@ enum Failure {
     /// No credentials could be loaded. The credential errors leave their
     /// causes to `source`, and this text is all a caller keeps, so it names
     /// every cause, and is not a source itself.
-    #[error("failed to load AWS credentials: {}", credentials::error_chain(.0))]
-    Credentials(credentials::Error),
+    /// Shared, because clients waiting on one failed load all report it.
+    #[error("failed to load AWS credentials: {}", credentials::error_chain(&**.0))]
+    Credentials(Arc<credentials::Error>),
     /// The request did not complete.
     #[error("request failed: {0}")]
     Transport(#[source] TransportError),
@@ -778,10 +779,15 @@ impl Provider {
 }
 
 /// A credential provider and the credential it last loaded, shared by every
-/// client built for one profile and region in one run.
+/// client built for one profile and region in one run. Held in an `Arc`, and
+/// synchronized, because the AWS client is a `Send + Sync` leaf: the auth
+/// providers holding it must be `Send + Sync`.
 struct SharedCredentials {
     provider: Provider,
     cache: CredentialCache<Credentials>,
+    /// When the last load failed, and why. The lock is never held across an
+    /// `.await`.
+    failed: Mutex<Option<(tokio::time::Instant, Arc<credentials::Error>)>>,
 }
 
 impl SharedCredentials {
@@ -789,17 +795,34 @@ impl SharedCredentials {
         Self {
             provider,
             cache: CredentialCache::new(),
+            failed: Mutex::new(None),
         }
     }
 
     /// The cached credential, loaded again shortly before it expires.
-    /// Concurrent callers share one load instead of each asking IMDS or STS.
+    /// Concurrent callers share one load instead of each asking IMDS or STS,
+    /// and a caller that was waiting on a load that failed gets its error
+    /// rather than running the chain again, so a hung source costs one bound,
+    /// not one per waiting client.
     async fn load(&self) -> Result<Credentials, Failure> {
+        let asked = tokio::time::Instant::now();
         self.cache
             .get_or_refresh(async {
+                if let Some((at, error)) = &*self.failed.lock().expect("no panic while held")
+                    && *at > asked
+                {
+                    return Err(Arc::clone(error));
+                }
                 let loaded = tokio::time::timeout(CREDENTIALS_LOAD_TIMEOUT, self.provider.load())
                     .await
-                    .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))??;
+                    .map_err(|_| credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT))
+                    .and_then(|loaded| loaded)
+                    .map_err(|error| {
+                        let error = Arc::new(error);
+                        *self.failed.lock().expect("no panic while held") =
+                            Some((tokio::time::Instant::now(), Arc::clone(&error)));
+                        error
+                    })?;
                 let ttl = loaded.expiry().map_or(DEFAULT_EXPIRATION, remaining);
                 Ok((loaded, ttl))
             })
@@ -811,7 +834,7 @@ impl SharedCredentials {
 /// What [`SharedCredentials`] are keyed by. The region is part of it because
 /// the chain calls STS in its client's region.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SourceKey {
+struct ProviderKey {
     /// The resolved profile name, so a named profile and the same profile
     /// selected through `AWS_PROFILE` share one entry.
     profile: String,
@@ -819,26 +842,27 @@ struct SourceKey {
 }
 
 /// The AWS credentials one run's clients share, by profile and region, so
-/// the ECR auth provider and the batch checker for a registry load
-/// credentials once. Create one per run: the next run, such as the next watch
+/// the ECR auth provider and the batch checker for a registry load them per
+/// profile and region rather than per client, reloading them shortly before
+/// they expire. Create one per run: the next run, such as the next watch
 /// cycle, then reads the shared AWS files again and drops credentials AWS may
 /// have revoked.
 #[derive(Default)]
-pub struct AwsCredentialSources(RefCell<HashMap<SourceKey, Arc<SharedCredentials>>>);
+pub struct AwsCredentialProviders(RefCell<HashMap<ProviderKey, Arc<SharedCredentials>>>);
 
-impl fmt::Debug for AwsCredentialSources {
+impl fmt::Debug for AwsCredentialProviders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AwsCredentialSources")
+        f.debug_struct("AwsCredentialProviders")
             .finish_non_exhaustive()
     }
 }
 
-impl AwsCredentialSources {
+impl AwsCredentialProviders {
     /// The credentials for `key`, built by `build` when there are none yet.
     /// A failed build is not kept, so it fails only its caller.
     fn get_or_try_insert<E>(
         &self,
-        key: SourceKey,
+        key: ProviderKey,
         build: impl FnOnce() -> Result<SharedCredentials, E>,
     ) -> Result<Arc<SharedCredentials>, E> {
         if let Some(shared) = self.0.borrow().get(&key) {
@@ -849,9 +873,10 @@ impl AwsCredentialSources {
         Ok(shared)
     }
 
-    /// For each set of credentials held, how many clients use it.
-    #[cfg(test)]
-    pub(crate) fn users(&self) -> Vec<usize> {
+    /// For each set of credentials held, how many clients use it, in
+    /// ascending order. A test hook for the CLI's wiring.
+    #[doc(hidden)]
+    pub fn users(&self) -> Vec<usize> {
         let mut users: Vec<usize> = self
             .0
             .borrow()
@@ -891,25 +916,25 @@ impl Client {
     /// A client for `service` in `region`, configured from the process
     /// environment and the shared AWS files, `profile` naming the profile
     /// to use in place of `AWS_PROFILE`, with credentials shared through
-    /// `sources`.
+    /// `aws_credentials`.
     pub(crate) fn from_env(
         region: &str,
         profile: Option<&str>,
         service: Service,
-        sources: &AwsCredentialSources,
+        aws_credentials: &AwsCredentialProviders,
     ) -> Result<Self, ConfigError> {
-        Self::new(&Host::current(), region, profile, service, sources)
+        Self::new(&Host::current(), region, profile, service, aws_credentials)
     }
 
     /// A client for `service` in `region`, with the endpoint, retry,
     /// clock-skew and credential settings `host` holds for `profile`, taking
-    /// the credentials for that profile and region from `sources`.
+    /// the credentials for that profile and region from `aws_credentials`.
     fn new(
         host: &Host,
         region: &str,
         profile: Option<&str>,
         service: Service,
-        sources: &AwsCredentialSources,
+        aws_credentials: &AwsCredentialProviders,
     ) -> Result<Self, ConfigError> {
         let config = Config::load(host, profile);
         let region = Region::parse(region)?;
@@ -929,11 +954,11 @@ impl Client {
             stall_timeout: STALL_TIMEOUT,
             region,
         };
-        let key = SourceKey {
+        let key = ProviderKey {
             profile: config.profile_name().to_owned(),
             region: api.region.clone(),
         };
-        let credentials = sources.get_or_try_insert(key, || {
+        let credentials = aws_credentials.get_or_try_insert(key, || {
             let chain =
                 Chain::new(host, &api.region, config, &retry).map_err(ConfigError::HttpClient)?;
             Ok::<_, ConfigError>(SharedCredentials::new(Provider::Chain(Box::new(chain))))
@@ -1596,6 +1621,26 @@ mod tests {
         }
     }
 
+    /// Clients waiting on one load that fails all get its error instead of
+    /// each running the chain again in turn. A later request loads again.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_clients_share_a_failed_load() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&count);
+        let shared = SharedCredentials::new(Provider::Test(Box::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(credentials::Error::NotLoaded("down".to_owned()))
+            })
+        })));
+        let (a, b, c) = tokio::join!(shared.load(), shared.load(), shared.load());
+        assert!(a.is_err() && b.is_err() && c.is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        shared.load().await.unwrap_err();
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+
     /// A credential source that never answers, such as a hung
     /// `credential_process`, fails the call after the SDK's bound instead of
     /// holding it forever.
@@ -1628,7 +1673,7 @@ mod tests {
                 region,
                 None,
                 Service::Ecr,
-                &AwsCredentialSources::default(),
+                &AwsCredentialProviders::default(),
             )
         };
         client("us-west-2").unwrap();
@@ -1654,7 +1699,7 @@ mod tests {
                 "us-west-2",
                 None,
                 Service::Ecr,
-                &AwsCredentialSources::default(),
+                &AwsCredentialProviders::default(),
             )
         };
         let client = new(&host).unwrap();
@@ -1683,7 +1728,7 @@ mod tests {
                 "us-west-2",
                 profile,
                 Service::Ecr,
-                &AwsCredentialSources::default(),
+                &AwsCredentialProviders::default(),
             )
             .unwrap()
             .api
@@ -1700,14 +1745,14 @@ mod tests {
     /// own, and a failed build is not kept, so the next request builds again.
     #[test]
     fn shares_credentials_per_profile_and_region() {
-        let sources = AwsCredentialSources::default();
+        let aws_credentials = AwsCredentialProviders::default();
         let builds = AtomicUsize::new(0);
-        let key = |profile: &str, region: &str| SourceKey {
+        let key = |profile: &str, region: &str| ProviderKey {
             profile: profile.to_owned(),
             region: Region::parse(region).unwrap(),
         };
         let get = |key| {
-            sources.get_or_try_insert(key, || {
+            aws_credentials.get_or_try_insert(key, || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, ()>(SharedCredentials::new(static_credentials(None)))
             })
@@ -1727,7 +1772,7 @@ mod tests {
         ));
         assert_eq!(builds.load(Ordering::Relaxed), 3);
 
-        let failed = sources.get_or_try_insert(key("failing", "us-west-2"), || Err(()));
+        let failed = aws_credentials.get_or_try_insert(key("failing", "us-west-2"), || Err(()));
         assert!(failed.is_err());
         get(key("failing", "us-west-2")).unwrap();
         assert_eq!(
@@ -1737,21 +1782,19 @@ mod tests {
         );
     }
 
-    /// Clients for different services share the credentials of one profile
-    /// in one region, whether the profile is named or selected through
-    /// `AWS_PROFILE`. Breaks if each client builds its own chain.
+    /// A named profile and the same profile selected through `AWS_PROFILE`
+    /// share credentials, across services. Breaks if the key were the raw
+    /// profile argument instead of the resolved name.
     #[test]
-    fn clients_for_one_profile_and_region_share_credentials() {
+    fn clients_share_credentials_for_the_resolved_profile() {
         let host = config::tests::host(&[("AWS_PROFILE", "other")], "[profile other]\n");
-        let sources = AwsCredentialSources::default();
-        let client = |profile, region, service| {
-            Client::new(&host, region, profile, service, &sources).unwrap()
+        let aws_credentials = AwsCredentialProviders::default();
+        let client = |profile, service| {
+            Client::new(&host, "us-east-1", profile, service, &aws_credentials).unwrap()
         };
-        let auth = client(None, "us-east-1", Service::Ecr);
-        let public = client(Some("other"), "us-east-1", Service::EcrPublic);
+        let auth = client(None, Service::Ecr);
+        let public = client(Some("other"), Service::EcrPublic);
         assert!(Arc::ptr_eq(&auth.credentials, &public.credentials));
-        let elsewhere = client(None, "us-west-2", Service::Ecr);
-        assert!(!Arc::ptr_eq(&auth.credentials, &elsewhere.credentials));
     }
 
     /// A transport failure does not carry the endpoint URL, whose path may

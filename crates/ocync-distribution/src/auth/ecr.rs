@@ -169,7 +169,7 @@ impl AuthorizationToken {
 /// expiry. The actual token lifetime is read from the API response, falling
 /// back to 12 hours if not provided.
 ///
-/// Supports all AWS credential sources via the default credential chain:
+/// Supports all AWS credential aws_credentials via the default credential chain:
 /// environment variables, shared config/credential files, IMDS/ECS
 /// container credentials, IRSA (IAM Roles for Service Accounts), and
 /// EKS Pod Identity.
@@ -200,16 +200,16 @@ impl EcrAuth {
     /// When `profile` is `Some`, credential resolution is scoped to that
     /// named profile in the shared credentials/config file. When `None`,
     /// the ambient default credential chain is used unchanged. Credentials
-    /// come from `sources`, shared only with clients for the same profile and
+    /// come from `aws_credentials`, shared only with clients for the same profile and
     /// region, such as this registry's batch checker, so a profile override
     /// does not leak across registries.
     pub fn new(
         hostname: impl Into<String>,
         profile: Option<&str>,
-        sources: &crate::AwsCredentialSources,
+        aws_credentials: &crate::AwsCredentialProviders,
     ) -> Result<Self, Error> {
         let hostname = hostname.into();
-        let client = crate::ecr::api_client(&hostname, profile, sources)
+        let client = crate::ecr::api_client(&hostname, profile, aws_credentials)
             .map_err(|e| Error::auth_failed(&hostname, e))?;
         let registry = hostname.clone();
 
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn new_rejects_non_ecr_hostname() {
-        let result = EcrAuth::new("ghcr.io", None, &crate::AwsCredentialSources::default());
+        let result = EcrAuth::new("ghcr.io", None, &crate::AwsCredentialProviders::default());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("region"));
     }
@@ -610,7 +610,7 @@ mod tests {
         let auth = EcrAuth::new(
             "123456789012.dkr.ecr.us-east-1.amazonaws.com",
             Some("nonexistent-test-profile"),
-            &crate::AwsCredentialSources::default(),
+            &crate::AwsCredentialProviders::default(),
         );
         assert!(
             auth.is_ok(),

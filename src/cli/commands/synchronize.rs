@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use ocync_distribution::AwsCredentialSources;
+use ocync_distribution::AwsCredentialProviders;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
 use ocync_distribution::{RegistryClient, RepositoryName};
@@ -640,9 +640,10 @@ pub(crate) async fn run(
         let referenced = referenced_registries(&config);
         // One run's clients share AWS credentials; the next run, such as the
         // next watch cycle, loads them afresh.
-        let aws = AwsCredentialSources::default();
-        let clients = build_clients(&config, &referenced, &tracker, &aws).await;
-        let batch_checkers = build_batch_checkers(&config, &clients, &referenced, &tracker, &aws);
+        let aws_credentials = AwsCredentialProviders::default();
+        let clients = build_clients(&config, &referenced, &tracker, &aws_credentials).await;
+        let batch_checkers =
+            build_batch_checkers(&config, &clients, &referenced, &tracker, &aws_credentials);
         resolve_all(
             &config,
             &clients,
@@ -1145,7 +1146,7 @@ pub(crate) async fn build_clients(
     config: &Config,
     referenced: &Referenced,
     tracker: &PrepareTracker,
-    aws: &AwsCredentialSources,
+    aws_credentials: &AwsCredentialProviders,
 ) -> ClientMap {
     tracker.begin(PreparePhase::Registries, referenced.len());
     let mut clients = ClientMap::with_capacity(referenced.len());
@@ -1157,7 +1158,7 @@ pub(crate) async fn build_clients(
         // wedged provider is named in the progress line rather than showing up
         // as a stalled count.
         let _item = tracker.track(name);
-        let entry = match build_registry_client(Registry::Configured(reg), aws).await {
+        let entry = match build_registry_client(Registry::Configured(reg), aws_credentials).await {
             Ok(client) => Ok(Arc::new(client)),
             Err(err) => {
                 tracing::error!(
@@ -1292,7 +1293,7 @@ fn build_batch_checkers(
     clients: &ClientMap,
     referenced: &Referenced,
     tracker: &PrepareTracker,
-    aws: &AwsCredentialSources,
+    aws_credentials: &AwsCredentialProviders,
 ) -> HashMap<String, Rc<dyn BatchBlobChecker>> {
     let mut checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
@@ -1328,7 +1329,7 @@ fn build_batch_checkers(
         // API. Losing it costs an optimization, not correctness -- `with_retry`
         // still catches the `BLOB_UPLOAD_UNKNOWN` this would have avoided -- so
         // a failure here degrades rather than aborting the run.
-        match BatchChecker::from_hostname(hostname, reg.aws_profile.as_deref(), aws) {
+        match BatchChecker::from_hostname(hostname, reg.aws_profile.as_deref(), aws_credentials) {
             Ok(checker) => {
                 checkers.insert(name.clone(), Rc::new(checker));
             }
@@ -3493,7 +3494,7 @@ mappings:
             &config,
             &referenced_registries(&config),
             &PrepareTracker::default(),
-            &AwsCredentialSources::default(),
+            &AwsCredentialProviders::default(),
         )
         .await;
 
@@ -3644,9 +3645,10 @@ mappings:
 
         let tracker = PrepareTracker::default();
         let referenced = referenced_registries(&config);
-        let aws = AwsCredentialSources::default();
-        let clients = build_clients(&config, &referenced, &tracker, &aws).await;
-        let checkers = build_batch_checkers(&config, &clients, &referenced, &tracker, &aws);
+        let aws_credentials = AwsCredentialProviders::default();
+        let clients = build_clients(&config, &referenced, &tracker, &aws_credentials).await;
+        let checkers =
+            build_batch_checkers(&config, &clients, &referenced, &tracker, &aws_credentials);
 
         assert!(checkers.is_empty(), "neither registry is ECR");
         let p = tracker.snapshot();
@@ -3655,6 +3657,42 @@ mappings:
             "only the target registry is a checker candidate; the map is read by target alias"
         );
         assert_eq!(p.done, p.total, "every registry considered must be counted");
+    }
+
+    /// An ECR target's auth provider and batch checker, built for one run,
+    /// share one set of AWS credentials. Breaks if either builder makes
+    /// credentials of its own.
+    #[tokio::test]
+    async fn ecr_client_and_batch_checker_share_credentials() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+registries:
+  src:
+    url: source.test
+    auth_type: static_token
+    token: t
+  dst:
+    url: 123456789012.dkr.ecr.us-west-2.amazonaws.com
+defaults:
+  source: src
+  targets: [dst]
+mappings:
+  - from: repo/one
+    tags:
+      glob: ["v1"]
+"#,
+        )
+        .expect("config yaml parses");
+
+        let tracker = PrepareTracker::default();
+        let referenced = referenced_registries(&config);
+        let aws_credentials = AwsCredentialProviders::default();
+        let clients = build_clients(&config, &referenced, &tracker, &aws_credentials).await;
+        let checkers =
+            build_batch_checkers(&config, &clients, &referenced, &tracker, &aws_credentials);
+
+        assert!(checkers.contains_key("dst"));
+        assert_eq!(aws_credentials.users(), vec![2]);
     }
 
     /// A watch cycle re-reporting the same dead mirror is noise; a different

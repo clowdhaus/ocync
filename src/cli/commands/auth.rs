@@ -1,6 +1,6 @@
 //! The `auth check` subcommand - credential validation.
 
-use ocync_distribution::AwsCredentialSources;
+use ocync_distribution::AwsCredentialProviders;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -20,6 +20,7 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
     // client construction. Keeping the classification is what lets a wholly
     // denied check exit 4 instead of a generic partial failure.
     let mut worst = Worst::Clean;
+    let aws_credentials = AwsCredentialProviders::default();
 
     for path in configs {
         // `-c` is repeatable and the files are independent, so one unreadable
@@ -33,10 +34,9 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
             }
         };
 
-        let aws = AwsCredentialSources::default();
         for (name, reg) in &config.registries {
             let safe_url = redact_url(&reg.url);
-            match build_registry_client(Registry::Configured(reg), &aws).await {
+            match build_registry_client(Registry::Configured(reg), &aws_credentials).await {
                 Ok(client) => match client.ping().await {
                     Ok(()) => {
                         let _ = writeln!(out, "  OK    {name} ({safe_url})");

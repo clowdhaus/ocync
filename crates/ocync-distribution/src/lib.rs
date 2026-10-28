@@ -114,7 +114,7 @@ pub fn test_http_client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
-pub use aws::AwsCredentialSources;
+pub use aws::AwsCredentialProviders;
 pub use blob::MountResult;
 pub use client::{RegistryClient, RegistryClientBuilder};
 pub use digest::Digest;
