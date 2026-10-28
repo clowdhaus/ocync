@@ -22,17 +22,11 @@ order: 5
 
 ## Dependency weight
 
-The FIPS build of the `ocync` binary resolves 201 crates (normal and build dependencies). The one cloud SDK left accounts for most of what can be removed:
-
-| Dependency | Used for | Crates only it brings |
-|---|---|---|
-| `google-cloud-auth` | one access token | 39 |
-
-The pure-Rust `sha2` and `hmac` crates in the build come from it alone. No AWS SDK crate is in the binary: `xtask`'s benchmark tooling still uses `aws-config` and `aws-sdk-ecr`, and is not shipped.
+The FIPS build of the `ocync` binary resolves 161 crates (normal and build dependencies), down from 201 with `google-cloud-auth`. No cloud SDK crate is in the binary, and neither are the pure-Rust `sha2` and `hmac` crates or a pure-Rust ChaCha20 generator. `xtask`'s benchmark tooling still uses `aws-config` and `aws-sdk-ecr`, and is not shipped.
 
 ## TLS uses only FIPS-approved algorithms
 
-The `fips` feature enables `rustls/fips`. That feature applies to every `rustls` user in the build, so `aws_lc_rs::default_provider()` drops ChaCha20-Poly1305 and every key exchange group the module does not approve, for `reqwest`, which `google-cloud-auth` also uses. TLS 1.2 also requires extended master secret.
+The `fips` feature enables `rustls/fips`. That feature applies to every `rustls` user in the build, so `aws_lc_rs::default_provider()` drops ChaCha20-Poly1305 and every key exchange group the module does not approve, for `reqwest`, which the AWS and Google authentication also use. TLS 1.2 also requires extended master secret.
 
 At startup a FIPS build checks `tls_fips()`, which asks `rustls` whether the installed provider is FIPS-approved, including whether the module is in approved mode. Every command except `version` refuses to start if it is not, so `version` can still report the failing state. `ocync version` prints the AWS-LC-FIPS module number a certificate names (`module: AWS-LC-FIPS 4`), the AWS-LC release (`release: AWS-LC 4.2.0`) and the result (`tls: approved`), in the shape `openssl list -providers` uses. A FIPS build decides all of this from one constant, `CRYPTO_BUILD` in `ocync-distribution`, so the CLI cannot disagree with the linked module.
 
@@ -65,15 +59,39 @@ Scanners that read the embedded list directly still see the dropped crates until
 
 ## Owned Google authentication
 
-> **Status: Planned.**
+`ocync` resolves Google Application Default Credentials itself, in `crates/ocync-distribution/src/google/`, as `google-cloud-auth` 1.18.0 does, which hashed and signed with the pure-Rust `sha2` and `hmac` crates and drew randomness from a pure-Rust ChaCha20 generator. Every hash, signature and random number now comes from `aws-lc-rs`. The sources, in upstream's order:
 
-`google-cloud-auth` signs and hashes with the pure-Rust `sha2` and `hmac` crates and draws randomness from a pure-Rust ChaCha20 generator. Replace it with an owned Application Default Credentials resolver that matches upstream behavior:
+- The file `GOOGLE_APPLICATION_CREDENTIALS` names, which must exist, then gcloud's well-known file (`$HOME/.config/gcloud/application_default_credentials.json`, or `%APPDATA%\gcloud\application_default_credentials.json` on Windows), then the GCE and GKE metadata server, at `GCE_METADATA_HOST` when it is set.
+- Service account keys: a self-signed RS256 JWT, signed with an `aws-lc-rs` RSA key and used directly as the access token, as upstream uses it. Only PKCS#8 keys are accepted, as upstream.
+- Authorized users (`gcloud auth application-default login`): the refresh token exchanged at the file's `token_uri`.
+- External accounts (Workload Identity Federation), with the subject token from a file (such as a projected Kubernetes service account token), a URL, or AWS, exchanged at Google's STS, then for a service account's token when `service_account_impersonation_url` is set.
+- Impersonated service accounts (`impersonated_service_account`), with any of the above as the source and `delegates` passed on.
+- The token's real lifetime from `expires_in` or `expireTime`, replacing the fixed 10 minutes `auth/gcp.rs` assumed. A token with no expiry is kept until a registry refuses it, as upstream never refreshes one.
 
-- `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud well-known file, then the GCE and GKE metadata server.
-- Credential file types: service account keys (RS256 signed assertion via `aws-lc-rs`), authorized user (refresh token), and external account (Workload Identity Federation).
-- Federation subject tokens from a file (such as a projected Kubernetes service account token), a URL, or AWS. The AWS source signs `GetCallerIdentity` with the owned AWS signer, so `ocync` on EKS reaches Artifact Registry with no long-lived key.
-- Service account impersonation after the federation exchange (`service_account_impersonation_url`).
-- The real token lifetime from `expires_in`, replacing the fixed 10-minute assumption in `auth/gcp.rs`.
+The upstream tests of the behavior `ocync` keeps are ported against the owned code, with an `aws-lc-rs` key made for the test where upstream makes one, and the AWS subject token's signature is checked against one computed independently. While both implementations existed, a differential test ran both against the same mock endpoints, comparing the requests sent (method, path, query, headers and body) and the tokens returned. All six cases matched: an authorized user, an external account with a JSON file source, client authentication and impersonation, an external account with a URL source and a workforce pool project, an impersonated account with delegates and an authorized user source, the metadata server, and a service account JWT's header and claims.
+
+Deliberate differences from upstream:
+
+- AWS subject token: signed with the owned AWS signer and credentials from `ocync`'s AWS chain for that region, so IRSA, EKS Pod Identity, profiles and every other AWS source work. Upstream reads only the `AWS_*` key variables and the instance metadata role URL the file names, which `ocync` does not read. The region still comes from `AWS_REGION`, `AWS_DEFAULT_REGION`, then the file's `region_url`, and is resolved when the registry is set up.
+- The metadata server and the `region_url` lookup use no proxy, so a token never reaches a proxy host, and are bounded: 1 second to connect, 10 seconds per read. Upstream honors the system proxy and sets no timeout. The other Google calls, including a URL subject token source, honor `HTTPS_PROXY` and `NO_PROXY`, as upstream, with 5 seconds to connect and 20 seconds per read.
+- No call follows a redirect, so a body carrying a secret is never sent on to another host.
+- A transient failure of a token load (an HTTP 5xx, 408 or 429, or a request that did not connect or complete) is sent again on the crate's jittered schedule, up to 4 times, because the prepare phase reaches it before the engine's retry exists. Upstream tries most calls once and retries only the IAM call. A metadata server that does not answer is not retried: a host without one never gets one.
+- An impersonated token whose `expireTime` has already passed is an error. Upstream panics.
+- A service account's key is parsed when the credentials are loaded, so a bad key fails when the registry is set up rather than at the first token.
+- An error keeps at most the first 200 bytes of an answer's body, and a missing subject token field is not shown with the document it was looked for in, as either can hold a token.
+- The `x-goog-api-client` telemetry header is not sent.
+
+Not supported, each failing with an error that names it: the executable subject token source, `gdch_service_account` and any other credential type not listed above. ID tokens, the signer, API keys and credential access boundaries are not used by `ocync` and are not built.
+
+Upstream tests not ported, and why:
+
+- `token_cache.rs`: `ocync` caches the token in its registry provider's `CredentialCache` and refreshes it before expiry on use, without upstream's background task.
+- `retry.rs` and `errors.rs`: the retry is the crate's own, and the classification is tested on each call's failures.
+- Each type's caching tests (`header_caching`, `token_caching`, `creds_from_json_custom_uri_with_caching`): the same cache serves every type, and is tested once.
+- The AWS key and role URL tests (`test_resolve_credentials_env`, `_imds`, `test_subject_token_imdsv2_success`): `ocync` takes AWS credentials from its own chain, whose tests cover them.
+- The metadata server's error-message, email and endpoint-listing tests (`error_message_with_adc`, `adc_no_mds`, `validate_default_endpoint_urls`): `ocync` asks the server only for a token, and its own tests cover the endpoint and failures.
+- The quota project tests, including `GOOGLE_CLOUD_QUOTA_PROJECT`: the quota project goes only in upstream's request headers for Google APIs, which `ocync` does not call. An authorized user's `quota_project_id` is still forwarded to IAM when that user is an impersonation source, as upstream forwards its source's headers.
+- The `idtoken`, `gdch`, `signer`, access boundary, API key, executable source and universe-domain lookup tests: none of that is built.
 
 ## Owned AWS request signing
 

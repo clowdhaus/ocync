@@ -874,9 +874,6 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "bytes-utils"
@@ -1518,82 +1515,6 @@ dependencies = [
  "bstr",
  "regex-automata",
  "regex-syntax",
-]
-
-[[package]]
-name = "google-cloud-auth"
-version = "1.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d563c7b987f40249c274a4e6a671661df6be2d084f08476dda2f0f931576cfcf"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "bytes",
- "google-cloud-gax",
- "hex",
- "hmac",
- "http",
- "jiff",
- "reqwest",
- "rustc_version",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "time",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "google-cloud-gax"
-version = "1.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc64ee071c0d22cb68662b454f1bea5424506cafeaddc51260fbc585bac1d29d"
-dependencies = [
- "bytes",
- "futures",
- "google-cloud-rpc",
- "google-cloud-wkt",
- "http",
- "pin-project",
- "rand",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
-name = "google-cloud-rpc"
-version = "1.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2162c08a89118130979ba261080e960e44cdcb2d6e2ab8ca9b1da245285d353"
-dependencies = [
- "bytes",
- "google-cloud-wkt",
- "serde",
- "serde_json",
- "serde_with",
-]
-
-[[package]]
-name = "google-cloud-wkt"
-version = "1.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75baa147c141fa2b11047827e7ff4eea3a84ab00c3d2cf44fccd132b2ed326cf"
-dependencies = [
- "base64 0.23.1",
- "bytes",
- "serde",
- "serde_json",
- "serde_with",
- "thiserror",
- "time",
- "url",
 ]
 
 [[package]]
@@ -2353,7 +2274,6 @@ dependencies = [
  "bytes",
  "fastrand",
  "futures-util",
- "google-cloud-auth",
  "hex",
  "http",
  "httpdate",
@@ -2865,7 +2785,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
- "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",
@@ -3526,7 +3445,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]
