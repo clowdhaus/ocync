@@ -1,6 +1,7 @@
 //! An authorized user, as `gcloud auth application-default login` writes
 //! one: a refresh token exchanged at the `OAuth2` token endpoint.
 
+use http::HeaderValue;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,7 +43,9 @@ pub(crate) struct AuthorizedUser {
     client_secret: Secret,
     refresh_token: Secret,
     token_uri: Url,
-    quota_project_id: Option<String>,
+    /// The project billed for calls made as this user, as the header
+    /// carries it.
+    quota_project: Option<HeaderValue>,
     /// The space-joined scopes, or `None` for the token's own.
     scopes: Option<String>,
 }
@@ -87,7 +90,10 @@ impl AuthorizedUser {
                 TOKEN_URI_FIELD,
                 file.token_uri.as_deref().unwrap_or(TOKEN_URI),
             )?,
-            quota_project_id: file.quota_project_id,
+            quota_project: file
+                .quota_project_id
+                .map(|project| HeaderValue::from_str(&project).map_err(Error::QuotaProject))
+                .transpose()?,
             scopes: scopes
                 .registry_or_endpoint_default()
                 .map(|scopes| scopes.joined(" ")),
@@ -95,12 +101,11 @@ impl AuthorizedUser {
     }
 
     /// The project billed for calls made as this user.
-    pub(super) fn quota_project_id(&self) -> Option<&str> {
-        self.quota_project_id.as_deref()
+    pub(super) fn quota_project(&self) -> Option<&HeaderValue> {
+        self.quota_project.as_ref()
     }
 
-    /// A token for the refresh token, asked for once: the caller retries a
-    /// transient failure.
+    /// A token for the refresh token.
     pub(super) async fn access_token(
         &self,
         clients: &Clients,
@@ -197,8 +202,9 @@ mod tests {
 
     /// Upstream `builder_rejects_non_default_universe` and
     /// `authorized_user_parse_fail`: another universe, a file missing the
-    /// refresh token, and a `token_uri` that is not a URL, are refused when
-    /// the file loads. Breaks if any is accepted.
+    /// refresh token, a `token_uri` that is not a URL, and a quota project
+    /// no header can carry, are refused when the file loads. Breaks if any
+    /// is accepted or left to fail at the first request.
     #[test]
     fn refuses_bad_files() {
         let mut other_universe = user_file(TOKEN_URI);
@@ -218,6 +224,13 @@ mod tests {
                 })
             ),
             "{bad_uri:?}"
+        );
+        let mut bad_project = user_file(TOKEN_URI);
+        bad_project["quota_project_id"] = "line\nbreak".into();
+        let bad_project = AuthorizedUser::from_json(bad_project, Scopes::Registry);
+        assert!(
+            matches!(bad_project, Err(Error::QuotaProject(_))),
+            "{bad_project:?}"
         );
     }
 

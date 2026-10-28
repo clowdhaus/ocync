@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
 
+use http::HeaderValue;
 use serde_json::Value;
 use url::Url;
 
@@ -155,16 +156,23 @@ pub(crate) enum Call {
     AwsRegion,
 }
 
-impl fmt::Display for Call {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl Call {
+    /// What failed, as the error says it.
+    fn as_str(self) -> &'static str {
+        match self {
             Self::UserToken => "failed to refresh user access token",
             Self::StsExchange => "failed to exchange token",
             Self::Impersonation => "failed to generate access token",
             Self::Metadata => "failed to fetch access token",
             Self::SubjectUrl => "failed to request subject token",
             Self::AwsRegion => "could not resolve AWS region",
-        })
+        }
+    }
+}
+
+impl fmt::Display for Call {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -275,6 +283,9 @@ pub(crate) enum Error {
     /// An executable subject token source, which ocync does not run.
     #[error("unsupported subject token source `executable`")]
     ExecutableSource,
+    /// An authorized user's `quota_project_id` cannot be sent as a header.
+    #[error("invalid `quota_project_id`")]
+    QuotaProject(#[source] http::header::InvalidHeaderValue),
     /// A URL subject token source names a header that is not valid.
     #[error("invalid subject token URL header `{0}`")]
     SubjectHeader(String),
@@ -288,6 +299,19 @@ pub(crate) enum Error {
     /// The AWS region for an AWS subject token was not found.
     #[error("could not resolve AWS region")]
     NoAwsRegion,
+    /// No AWS region is configured, and `AWS_EC2_METADATA_DISABLED` keeps
+    /// it from being asked of the instance metadata service.
+    #[error(
+        "could not resolve AWS region: none is configured and AWS_EC2_METADATA_DISABLED is set"
+    )]
+    AwsMetadataDisabled,
+    /// The AWS region configured or answered is not a valid region.
+    #[error("invalid AWS region")]
+    AwsRegion(#[source] crate::aws::InvalidRegion),
+    /// The instance metadata service answered with a session token a
+    /// header cannot carry.
+    #[error("invalid AWS instance metadata session token")]
+    AwsMetadataToken(#[source] http::header::InvalidHeaderValue),
     /// The AWS STS URL does not parse.
     #[error("invalid AWS STS URL")]
     StsUrl(#[source] url::ParseError),
@@ -352,11 +376,13 @@ impl Error {
 /// it. The prepare phase reaches these calls before the engine's retry
 /// exists, which is why they retry themselves.
 async fn send(call: Call, request: reqwest::RequestBuilder) -> Result<Vec<u8>, Error> {
-    retrying(&call.to_string(), &mut Bounded(Error::is_transient), |_| {
-        let request = request
-            .try_clone()
-            .expect("a Google request's body is buffered, so it clones");
-        send_once(call, request)
+    // A builder that holds an error does not clone: sent once, it returns
+    // that error.
+    if request.try_clone().is_none() {
+        return send_once(call, request).await;
+    }
+    retrying(call.as_str(), &mut Bounded(Error::is_transient), |_| {
+        send_once(call, request.try_clone().expect("cloned above"))
     })
     .await
 }
@@ -443,7 +469,7 @@ impl ScopeList {
 /// made with: the token, and the project billed when the source names one.
 struct SourceAuth {
     bearer: Secret,
-    quota_project: Option<String>,
+    quota_project: Option<HeaderValue>,
 }
 
 impl SourceAuth {
@@ -482,10 +508,7 @@ impl Credentials {
             aws_credentials,
         };
         match find_file(host)? {
-            None => Ok(Self::Metadata(metadata::Server::new(
-                &host.env,
-                Scopes::Registry,
-            ))),
+            None => metadata::Server::new(&host.env, Scopes::Registry).map(Self::Metadata),
             Some(contents) => {
                 let json: Value = serde_json::from_slice(&contents).map_err(Error::Parse)?;
                 let kind = CredentialType::of(&json)?;
@@ -546,7 +569,7 @@ impl Credentials {
     async fn source_auth(&self, clients: &Clients, clock: Clock) -> Result<SourceAuth, Error> {
         let token = self.access_token(clients, clock).await?;
         let quota_project = match self {
-            Self::AuthorizedUser(user) => user.quota_project_id().map(str::to_owned),
+            Self::AuthorizedUser(user) => user.quota_project().cloned(),
             _ => None,
         };
         Ok(SourceAuth {

@@ -5,7 +5,7 @@
 
 use std::num::NonZeroU32;
 
-use super::endpoint::{DualStack, Endpoint, Fips};
+use super::endpoint::{DualStack, Endpoint, Fips, InvalidRegion, Region};
 use super::host::{Env, Host};
 use super::profile::{self, Location, ParseError, Properties, Sections};
 use super::{ConfigError, SkewCorrection, retry};
@@ -179,11 +179,14 @@ impl Config {
 
     /// The region `AWS_REGION`, `AWS_DEFAULT_REGION` or the selected
     /// profile's `region` names, in the SDK's order.
-    pub(super) fn region(&self) -> Option<String> {
-        REGION_VARIABLES
-            .iter()
-            .find_map(|name| self.env.get(name))
-            .or_else(|| self.profile()?.get(REGION_PROPERTY).cloned())
+    pub(super) fn region(&self) -> Result<Option<Region>, InvalidRegion> {
+        if let Some(region) = REGION_VARIABLES.iter().find_map(|name| self.env.get(name)) {
+            return Region::parse(&region).map(Some);
+        }
+        self.profile()
+            .and_then(|profile| profile.get(REGION_PROPERTY))
+            .map(|region| Region::parse(region))
+            .transpose()
     }
 
     /// The selected profile's name.

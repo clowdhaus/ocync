@@ -12,10 +12,12 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use super::{Call, Error, Secret, Setup, send_text};
+use http::HeaderValue;
+
+use super::{Call, Error, Secret, Setup, parse_url, send_text};
 use crate::aws::{
-    CallerIdentitySigner, InvalidRegion, Region, TOKEN_HEADER, TOKEN_TTL, TOKEN_TTL_HEADER,
-    configured_region,
+    CallerIdentityConfig, CallerIdentitySigner, IMDS_TOKEN_HEADER, IMDS_TOKEN_TTL,
+    IMDS_TOKEN_TTL_HEADER, Region, host_header, imds_disabled,
 };
 
 /// The STS URL when the file names none. `{region}` is replaced.
@@ -25,8 +27,8 @@ const DEFAULT_VERIFICATION_URL: &str =
 /// The header naming the federation audience, signed with the request.
 const TARGET_RESOURCE: &str = "x-goog-cloud-target-resource";
 
-/// The request signed.
-const METHOD: http::Method = http::Method::POST;
+/// The key Google reads the signature under in the subject token.
+const AUTHORIZATION_KEY: &str = "Authorization";
 
 /// An AWS subject token source as the credentials file writes it.
 /// `environment_id` selects it and is not read further, as upstream; the
@@ -45,8 +47,6 @@ pub(super) struct SourceFile {
 pub(super) struct Source {
     signer: CallerIdentitySigner,
     url: Url,
-    /// The host of `url`, signed as `host`.
-    host: String,
     audience: String,
 }
 
@@ -75,12 +75,13 @@ impl Source {
         file: &SourceFile,
         audience: &str,
     ) -> Result<Self, Error> {
-        let region = match configured_region(setup.host) {
+        let config = CallerIdentityConfig::load(setup.host);
+        let region = match config.region().map_err(Error::AwsRegion)? {
             Some(region) => region,
             None => region_from_metadata(setup, file).await?,
-        }
-        .map_err(|e| Error::AwsConfig(e.into()))?;
-        let signer = CallerIdentitySigner::new(setup.host, region, setup.aws_credentials)
+        };
+        let signer = config
+            .signer(setup.host, region, setup.aws_credentials)
             .map_err(Error::AwsConfig)?;
         Self::with_signer(
             signer,
@@ -95,8 +96,10 @@ impl Source {
         audience: &str,
     ) -> Result<Self, Error> {
         let url = sts_url(verification_url, signer.region())?;
+        if !url.has_host() {
+            return Err(Error::StsUrlHost);
+        }
         Ok(Self {
-            host: signed_host(&url)?,
             url,
             signer,
             audience: audience.to_owned(),
@@ -105,27 +108,25 @@ impl Source {
 
     /// The subject token signed at `now`.
     pub(super) async fn subject_token(&self, now: SystemTime) -> Result<Secret, Error> {
-        let unsigned = [
-            ("host", self.host.as_str()),
-            (TARGET_RESOURCE, self.audience.as_str()),
-        ];
+        let unsigned = [(TARGET_RESOURCE, self.audience.as_str())];
         let signed = self
             .signer
-            .sign(&METHOD, &self.url, &unsigned, now)
+            .sign(&self.url, &unsigned, now)
             .await
             .map_err(Error::AwsSigning)?;
-        let headers: BTreeMap<&str, &str> = unsigned
+        let headers: BTreeMap<&str, &str> = [("host", host_header(&self.url))]
             .into_iter()
+            .chain(unsigned)
             .chain(signed.date_and_token())
             .collect();
         let headers = headers
             .into_iter()
-            .chain([("Authorization", signed.authorization.as_str())])
+            .chain([(AUTHORIZATION_KEY, signed.authorization())])
             .map(|(key, value)| Header { key, value })
             .collect();
         let json = serde_json::to_string(&SignedRequest {
             url: self.url.as_str(),
-            method: METHOD.as_str(),
+            method: CallerIdentitySigner::METHOD.as_str(),
             headers,
             body: "",
         })
@@ -136,42 +137,43 @@ impl Source {
     }
 }
 
-/// The `host` header `url` is signed with: its host, and its port when it
-/// is not the scheme's, as the request carries it.
-fn signed_host(url: &Url) -> Result<String, Error> {
-    let host = url.host_str().ok_or(Error::StsUrlHost)?;
-    Ok(match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_owned(),
-    })
-}
-
 /// The region of the availability zone `file`'s `region_url` answers, with
 /// an `IMDSv2` token from its `imdsv2_session_token_url` when it names one.
-async fn region_from_metadata(
-    setup: &Setup<'_>,
-    file: &SourceFile,
-) -> Result<Result<Region, InvalidRegion>, Error> {
+/// With `AWS_EC2_METADATA_DISABLED` set it is not asked, as the AWS chain
+/// asks nothing of the instance metadata service then either.
+async fn region_from_metadata(setup: &Setup<'_>, file: &SourceFile) -> Result<Region, Error> {
     let Some(region_url) = &file.region_url else {
         return Err(Error::NoAwsRegion);
     };
+    if imds_disabled(&setup.host.env) {
+        return Err(Error::AwsMetadataDisabled);
+    }
+    let region_url = parse_url("region_url", region_url)?;
+    let token_url = file
+        .imdsv2_session_token_url
+        .as_deref()
+        .map(|url| parse_url("imdsv2_session_token_url", url))
+        .transpose()?;
     let client = &setup.clients.metadata;
-    let token = match &file.imdsv2_session_token_url {
+    let token = match token_url {
         Some(url) => {
             let request = client
                 .put(url)
-                .header(TOKEN_TTL_HEADER, TOKEN_TTL.as_secs());
-            Some(send_text(Call::AwsRegion, request).await?)
+                .header(IMDS_TOKEN_TTL_HEADER, IMDS_TOKEN_TTL.as_secs());
+            let token = send_text(Call::AwsRegion, request).await?;
+            let mut token = HeaderValue::try_from(token).map_err(Error::AwsMetadataToken)?;
+            token.set_sensitive(true);
+            Some(token)
         }
         None => None,
     };
     let mut request = client.get(region_url);
-    if let Some(token) = &token {
-        request = request.header(TOKEN_HEADER, token);
+    if let Some(token) = token {
+        request = request.header(IMDS_TOKEN_HEADER, token);
     }
-    region_from_zone(&send_text(Call::AwsRegion, request).await?)
-        .map(Region::parse)
-        .ok_or(Error::NoAwsRegion)
+    let zone = send_text(Call::AwsRegion, request).await?;
+    let region = region_from_zone(&zone).ok_or(Error::NoAwsRegion)?;
+    Region::parse(region).map_err(Error::AwsRegion)
 }
 
 /// The region of zone `zone`: the name up to its first part that is a
@@ -296,11 +298,50 @@ mod tests {
                 &vars,
                 &[("/h/.aws/config", config.clone())],
             );
-            let found = configured_region(&host).map(Result::unwrap);
+            let found = CallerIdentityConfig::load(&host).region().unwrap();
             assert_eq!(found, expected.map(region), "{vars:?}");
         }
         let bare = super::super::tests::host(crate::aws::Platform::Unix, &[], &[]);
-        assert!(configured_region(&bare).is_none());
+        assert!(
+            CallerIdentityConfig::load(&bare)
+                .region()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// What a test's [`Setup`] borrows.
+    struct Fixture {
+        host: crate::aws::Host,
+        clients: super::super::Clients,
+        aws_credentials: crate::aws::AwsCredentialProviders,
+    }
+
+    impl Fixture {
+        fn new(vars: &[(&str, &str)], files: &[(&str, Vec<u8>)]) -> Self {
+            Self {
+                host: super::super::tests::host(crate::aws::Platform::Unix, vars, files),
+                clients: super::super::Clients::new().unwrap(),
+                aws_credentials: crate::aws::AwsCredentialProviders::default(),
+            }
+        }
+
+        fn setup(&self) -> Setup<'_> {
+            Setup {
+                host: &self.host,
+                clients: &self.clients,
+                aws_credentials: &self.aws_credentials,
+            }
+        }
+    }
+
+    fn file(region_url: Option<String>, imdsv2_url: Option<String>) -> SourceFile {
+        SourceFile {
+            _environment_id: IgnoredAny,
+            region_url,
+            regional_cred_verification_url: None,
+            imdsv2_session_token_url: imdsv2_url,
+        }
     }
 
     /// Upstream `test_resolve_region_imds` and `test_resolve_imdsv2_token`:
@@ -316,49 +357,31 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/latest/api/token"))
-            .and(header(TOKEN_TTL_HEADER, "21600"))
+            .and(header(IMDS_TOKEN_TTL_HEADER, "21600"))
             .respond_with(ResponseTemplate::new(200).set_body_string("imds-token"))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/zone"))
-            .and(header(TOKEN_HEADER, "imds-token"))
+            .and(header(IMDS_TOKEN_HEADER, "imds-token"))
             .respond_with(ResponseTemplate::new(200).set_body_string("us-gov-west-1a"))
             .expect(1)
             .mount(&server)
             .await;
-        let host = super::super::tests::host(crate::aws::Platform::Unix, &[], &[]);
-        let clients = super::super::Clients::new().unwrap();
-        let aws_credentials = crate::aws::AwsCredentialProviders::default();
-        let setup = Setup {
-            host: &host,
-            clients: &clients,
-            aws_credentials: &aws_credentials,
-        };
+        let fixture = Fixture::new(&[], &[]);
 
-        let file = |region_url: Option<String>, imdsv2_url: Option<String>| SourceFile {
-            _environment_id: IgnoredAny,
-            region_url,
-            regional_cred_verification_url: None,
-            imdsv2_session_token_url: imdsv2_url,
-        };
         let found = region_from_metadata(
-            &setup,
+            &fixture.setup(),
             &file(
                 Some(format!("{}/zone", server.uri())),
                 Some(format!("{}/latest/api/token", server.uri())),
             ),
         )
         .await
-        .unwrap()
         .unwrap();
 
         assert_eq!(found, region("us-gov-west-1"));
-        assert!(matches!(
-            region_from_metadata(&setup, &file(None, None)).await,
-            Err(Error::NoAwsRegion)
-        ));
     }
 
     /// The zone request runs once, at setup, so a 503 is sent again and a
@@ -384,81 +407,66 @@ mod tests {
                 .expect(calls - 1)
                 .mount(&server)
                 .await;
-            let host = super::super::tests::host(crate::aws::Platform::Unix, &[], &[]);
-            let clients = super::super::Clients::new().unwrap();
-            let aws_credentials = crate::aws::AwsCredentialProviders::default();
-            let setup = Setup {
-                host: &host,
-                clients: &clients,
-                aws_credentials: &aws_credentials,
-            };
-            let file = SourceFile {
-                _environment_id: IgnoredAny,
-                region_url: Some(format!("{}/zone", server.uri())),
-                regional_cred_verification_url: None,
-                imdsv2_session_token_url: None,
-            };
+            let fixture = Fixture::new(&[], &[]);
 
-            let found = region_from_metadata(&setup, &file).await;
+            let found = region_from_metadata(
+                &fixture.setup(),
+                &file(Some(format!("{}/zone", server.uri())), None),
+            )
+            .await;
 
             assert_eq!(found.is_ok(), succeeds, "{first}: {found:?}");
         }
     }
 
-    /// The signed `host` keeps a port the URL names, and drops the
-    /// scheme's own. Breaks if a custom STS port is signed without it.
-    #[test]
-    fn signs_the_host_with_its_port() {
-        for (url, host) in [
-            (
-                "https://sts.internal.example:8443/",
-                "sts.internal.example:8443",
-            ),
-            (
-                "https://sts.us-east-1.amazonaws.com:443/",
-                "sts.us-east-1.amazonaws.com",
-            ),
-            (
-                "https://sts.us-east-1.amazonaws.com/",
-                "sts.us-east-1.amazonaws.com",
-            ),
-        ] {
-            assert_eq!(signed_host(&Url::parse(url).unwrap()).unwrap(), host);
-        }
-    }
-
-    /// A host with no instance metadata service fails the region lookup
-    /// at once. Breaks if a refused connection is sent again, which stalls
-    /// a workstation with AWS profile credentials for seconds per registry.
+    /// A region lookup that cannot succeed fails at once: with no
+    /// `region_url`, with one that is not a URL, with
+    /// `AWS_EC2_METADATA_DISABLED` set, or with no metadata service to
+    /// connect to. Breaks if a bad URL panics, the variable is ignored, or
+    /// a refused connection is sent again, which stalls a workstation with
+    /// AWS profile credentials for seconds per registry.
     #[tokio::test]
-    async fn a_refused_region_lookup_is_final() {
-        let host = super::super::tests::host(crate::aws::Platform::Unix, &[], &[]);
-        let clients = super::super::Clients::new().unwrap();
-        let aws_credentials = crate::aws::AwsCredentialProviders::default();
-        let setup = Setup {
-            host: &host,
-            clients: &clients,
-            aws_credentials: &aws_credentials,
+    async fn fails_a_region_lookup_at_once() {
+        let no_url: fn(&Error) -> bool = |e| matches!(e, Error::NoAwsRegion);
+        let bad_url: fn(&Error) -> bool = |e| {
+            matches!(
+                e,
+                Error::Url {
+                    field: "region_url",
+                    ..
+                }
+            )
         };
-        let file = SourceFile {
-            _environment_id: IgnoredAny,
-            region_url: Some("http://127.0.0.1:1/zone".to_owned()),
-            regional_cred_verification_url: None,
-            imdsv2_session_token_url: None,
-        };
+        let disabled: fn(&Error) -> bool = |e| matches!(e, Error::AwsMetadataDisabled);
+        let refused: fn(&Error) -> bool =
+            |e| matches!(e, Error::Transport { .. }) && !e.is_transient();
+        let unreachable = "http://127.0.0.1:1/zone";
+        for (vars, region_url, expected) in [
+            (&[][..], None, no_url),
+            (&[][..], Some("169.254.169.254/zone"), bad_url),
+            (
+                &[("AWS_EC2_METADATA_DISABLED", "true")][..],
+                Some(unreachable),
+                disabled,
+            ),
+            (&[][..], Some(unreachable), refused),
+        ] {
+            let fixture = Fixture::new(vars, &[]);
 
-        let error = region_from_metadata(&setup, &file).await.unwrap_err();
+            let error =
+                region_from_metadata(&fixture.setup(), &file(region_url.map(str::to_owned), None))
+                    .await
+                    .unwrap_err();
 
-        assert!(matches!(error, Error::Transport { .. }), "{error}");
-        assert!(!error.is_transient());
+            assert!(expected(&error), "{region_url:?}: {error}");
+        }
     }
 
     /// The region, profile and keys all come from the injected host. Breaks
     /// if the signer reads the process environment or the real AWS files.
     #[tokio::test]
     async fn signs_with_the_host_it_is_given() {
-        let host = super::super::tests::host(
-            crate::aws::Platform::Unix,
+        let fixture = Fixture::new(
             &[("HOME", "/home/u"), ("AWS_REGION", "eu-west-3")],
             &[(
                 "/home/u/.aws/credentials",
@@ -466,21 +474,10 @@ mod tests {
                     .to_vec(),
             )],
         );
-        let clients = super::super::Clients::new().unwrap();
-        let aws_credentials = crate::aws::AwsCredentialProviders::default();
-        let setup = Setup {
-            host: &host,
-            clients: &clients,
-            aws_credentials: &aws_credentials,
-        };
-        let file = SourceFile {
-            _environment_id: IgnoredAny,
-            region_url: None,
-            regional_cred_verification_url: None,
-            imdsv2_session_token_url: None,
-        };
 
-        let source = Source::new(&setup, &file, "audience").await.unwrap();
+        let source = Source::new(&fixture.setup(), &file(None, None), "audience")
+            .await
+            .unwrap();
         let token = source.subject_token(UNIX_EPOCH).await.unwrap();
 
         let json: String = url::form_urlencoded::parse(token.expose().as_bytes())

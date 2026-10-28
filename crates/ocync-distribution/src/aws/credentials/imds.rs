@@ -452,7 +452,7 @@ async fn request_token(
 }
 
 /// Whether `AWS_EC2_METADATA_DISABLED` is `true`, any case.
-fn disabled(env: &Env) -> bool {
+pub(crate) fn disabled(env: &Env) -> bool {
     env.get(DISABLED)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }

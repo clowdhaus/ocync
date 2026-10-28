@@ -18,7 +18,7 @@ mod sso_token;
 mod sts;
 mod web_identity;
 
-pub(crate) use imds::{TOKEN_HEADER, TOKEN_TTL, TOKEN_TTL_HEADER};
+pub(crate) use imds::{TOKEN_HEADER, TOKEN_TTL, TOKEN_TTL_HEADER, disabled as imds_disabled};
 pub(super) use sso_token::Sessions;
 
 use std::fmt;

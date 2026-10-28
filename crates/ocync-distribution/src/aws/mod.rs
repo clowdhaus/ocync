@@ -21,7 +21,10 @@ mod xml;
 pub(crate) use self::calendar::parse_rfc3339_with_offset;
 use self::config::{Config, ServiceId};
 use self::credentials::{Chain, Credentials};
-pub(crate) use self::credentials::{TOKEN_HEADER, TOKEN_TTL, TOKEN_TTL_HEADER};
+pub(crate) use self::credentials::{
+    TOKEN_HEADER as IMDS_TOKEN_HEADER, TOKEN_TTL as IMDS_TOKEN_TTL,
+    TOKEN_TTL_HEADER as IMDS_TOKEN_TTL_HEADER, imds_disabled,
+};
 pub(crate) use self::host::Host;
 pub(crate) use self::host::{Clock, Env, Fs, Platform, Timeouts, credential_endpoint_client};
 use self::host::{Network, Transport};
@@ -707,8 +710,8 @@ impl Api {
                 },
                 applied.apply(sent),
             );
-            for (name, value) in signed.into_headers() {
-                let value = HeaderValue::try_from(value).map_err(Failure::InvalidHeader)?;
+            for (name, value) in signed.headers() {
+                let value = HeaderValue::from_str(value).map_err(Failure::InvalidHeader)?;
                 headers.insert(HeaderName::from_static(name), value);
             }
         }
@@ -917,44 +920,68 @@ impl fmt::Debug for CallerIdentitySigner {
 #[error(transparent)]
 pub(crate) struct SigningError(Failure);
 
-impl CallerIdentitySigner {
-    /// A signer for `region`, configured from `host`'s environment and
-    /// shared AWS files, taking the credentials from `aws_credentials`.
-    pub(crate) fn new(
+/// The AWS settings a [`CallerIdentitySigner`] is built from: the
+/// environment and shared files, read once.
+pub(crate) struct CallerIdentityConfig(Config);
+
+impl CallerIdentityConfig {
+    /// The settings of `host`.
+    pub(crate) fn load(host: &Host) -> Self {
+        Self(Config::load(host, None))
+    }
+
+    /// The region `AWS_REGION`, `AWS_DEFAULT_REGION` or the selected
+    /// profile's `region` names, or `None` when none does.
+    pub(crate) fn region(&self) -> Result<Option<Region>, InvalidRegion> {
+        self.0.region()
+    }
+
+    /// A signer for `region`, taking the credentials from
+    /// `aws_credentials`.
+    pub(crate) fn signer(
+        self,
         host: &Host,
         region: Region,
         aws_credentials: &AwsCredentialProviders,
-    ) -> Result<Self, ConfigError> {
-        let config = Config::load(host, None);
-        let retry = config.retry()?;
-        let credentials = shared_credentials(host, config, &region, &retry, aws_credentials)?;
-        Ok(Self {
+    ) -> Result<CallerIdentitySigner, ConfigError> {
+        let retry = self.0.retry()?;
+        let credentials = shared_credentials(host, self.0, &region, &retry, aws_credentials)?;
+        Ok(CallerIdentitySigner {
             credentials,
             region,
         })
     }
+}
+
+impl CallerIdentitySigner {
+    /// The method of the request signed.
+    pub(crate) const METHOD: http::Method = http::Method::POST;
 
     /// The region the request is signed for.
     pub(crate) fn region(&self) -> &Region {
         &self.region
     }
 
-    /// Sign a `method` request to `url` with `headers`, which include
-    /// `host`, and an empty body, at `time`. Returns the headers to add.
+    /// Sign a [`Self::METHOD`] request to `url` with `headers` and an empty
+    /// body, at `time`, the `host` header signed as [`host_header`].
+    /// Returns the headers to add.
     pub(crate) async fn sign(
         &self,
-        method: &http::Method,
         url: &Url,
         headers: &[(&str, &str)],
         time: SystemTime,
     ) -> Result<sigv4::Signed, SigningError> {
         let credentials = self.credentials.load().await.map_err(SigningError)?;
+        let headers: Vec<(&str, &str)> = [("host", host_header(url))]
+            .into_iter()
+            .chain(headers.iter().copied())
+            .collect();
         Ok(sigv4::sign(
             &sigv4::Request {
-                method,
+                method: &Self::METHOD,
                 path: url.path(),
                 query: url.query().unwrap_or_default(),
-                headers,
+                headers: &headers,
                 body: &[],
             },
             sigv4::AccessKey {
@@ -969,6 +996,12 @@ impl CallerIdentitySigner {
             time,
         ))
     }
+}
+
+/// The `host` header a request to `url` carries: its host, and its port
+/// when it is not the scheme's.
+pub(crate) fn host_header(url: &Url) -> &str {
+    &url[url::Position::BeforeHost..url::Position::AfterPort]
 }
 
 #[cfg(test)]
@@ -1127,14 +1160,6 @@ fn api_client(stall_timeout: Duration) -> reqwest::ClientBuilder {
         .read_timeout(stall_timeout)
 }
 
-/// The region `host`'s AWS configuration names: `AWS_REGION`,
-/// `AWS_DEFAULT_REGION`, then the selected profile's `region`.
-pub(crate) fn configured_region(host: &Host) -> Option<Result<Region, InvalidRegion>> {
-    Config::load(host, None)
-        .region()
-        .map(|region| Region::parse(&region))
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
@@ -1227,6 +1252,28 @@ mod tests {
             "__type": "ThrottlingException",
             "message": "Rate exceeded"
         }))
+    }
+
+    /// The signed `host` keeps a port the URL names, and drops the
+    /// scheme's own. Breaks if a custom STS port is signed without it.
+    #[test]
+    fn signs_the_host_with_its_port() {
+        for (url, host) in [
+            (
+                "https://sts.internal.example:8443/",
+                "sts.internal.example:8443",
+            ),
+            (
+                "https://sts.us-east-1.amazonaws.com:443/",
+                "sts.us-east-1.amazonaws.com",
+            ),
+            (
+                "https://sts.us-east-1.amazonaws.com/",
+                "sts.us-east-1.amazonaws.com",
+            ),
+        ] {
+            assert_eq!(host_header(&Url::parse(url).unwrap()), host);
+        }
     }
 
     /// The request carries the AWS JSON protocol headers and a signature

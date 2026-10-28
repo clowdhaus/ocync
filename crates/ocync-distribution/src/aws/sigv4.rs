@@ -21,6 +21,9 @@ const X_AMZ_DATE: &str = "x-amz-date";
 /// The header carrying a temporary credential's session token.
 const X_AMZ_SECURITY_TOKEN: &str = "x-amz-security-token";
 
+/// The header the signature itself is sent in.
+const AUTHORIZATION: &str = "authorization";
+
 /// The AWS key to sign with, borrowed from the credential that holds it.
 #[derive(Clone, Copy)]
 pub(super) struct AccessKey<'a> {
@@ -111,8 +114,7 @@ pub(super) fn sign(
 pub(crate) struct Signed {
     amz_date: String,
     security_token: Option<String>,
-    /// The `authorization` header's value.
-    pub(crate) authorization: String,
+    authorization: String,
 }
 
 impl Signed {
@@ -127,15 +129,15 @@ impl Signed {
         .filter_map(|(name, value)| Some((name, value?)))
     }
 
+    /// The `authorization` header's value.
+    pub(crate) fn authorization(&self) -> &str {
+        &self.authorization
+    }
+
     /// Every header to send.
-    pub(super) fn into_headers(self) -> impl Iterator<Item = (&'static str, String)> {
-        [
-            (X_AMZ_DATE, Some(self.amz_date)),
-            (X_AMZ_SECURITY_TOKEN, self.security_token),
-            ("authorization", Some(self.authorization)),
-        ]
-        .into_iter()
-        .filter_map(|(name, value)| Some((name, value?)))
+    pub(super) fn headers(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.date_and_token()
+            .chain([(AUTHORIZATION, self.authorization.as_str())])
     }
 }
 
@@ -527,19 +529,18 @@ mod tests {
             UNIX_EPOCH + Duration::from_secs(SUITE_TIME),
         );
         assert_eq!(
-            signed.into_headers().collect::<Vec<_>>(),
+            signed.headers().collect::<Vec<_>>(),
             [
-                (X_AMZ_DATE, "20150830T123600Z".to_string()),
+                (X_AMZ_DATE, "20150830T123600Z"),
                 (
                     X_AMZ_SECURITY_TOKEN,
-                    "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267".to_string()
+                    "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267"
                 ),
                 (
                     "authorization",
                     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
                      SignedHeaders=host;x-amz-date;x-amz-security-token, \
                      Signature=07ec1639c89043aa0e3e2de82b96708f198cceab042d4a97044c66dd9f74e7f8"
-                        .to_string()
                 ),
             ]
         );

@@ -17,7 +17,6 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use super::super::config::Config;
 use super::super::endpoint::Region;
 use super::super::host::{Clock, Env, Fs, Host, Network};
-use super::super::profile::{self, Location};
 use super::super::replay::Replay;
 use super::{Chain, Credentials, Source};
 use crate::error::error_chain;
@@ -193,25 +192,13 @@ fn read_tree(dir: &Path, root: &Path, files: &mut HashMap<PathBuf, Vec<u8>>) {
     }
 }
 
-/// The region upstream's harness resolves for the case: `AWS_REGION`, then
-/// `AWS_DEFAULT_REGION`, then the selected profile's `region`.
+/// The region upstream's harness resolves for the case: the configured
+/// region, else [`DEFAULT_REGION`].
 fn default_region(host: &Host) -> Region {
-    let from_profile = || {
-        let location = Location::find(&host.env, host.platform);
-        let sections = profile::load(&host.fs, &location).ok()?;
-        sections
-            .profiles
-            .get(&location.profile)?
-            .get("region")
-            .cloned()
-    };
-    let region = host
-        .env
-        .get("AWS_REGION")
-        .or_else(|| host.env.get("AWS_DEFAULT_REGION"))
-        .or_else(from_profile)
-        .unwrap_or_else(|| DEFAULT_REGION.to_owned());
-    Region::parse(&region).unwrap()
+    Config::load(host, None)
+        .region()
+        .unwrap()
+        .unwrap_or_else(|| Region::parse(DEFAULT_REGION).unwrap())
 }
 
 thread_local! {

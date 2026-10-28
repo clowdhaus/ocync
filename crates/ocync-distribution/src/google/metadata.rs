@@ -6,7 +6,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
-use super::{AccessToken, Call, Clients, Error, Scopes, expiring, send_json};
+use url::Url;
+
+use super::{AccessToken, Call, Clients, Error, Scopes, expiring, parse_url, send_json};
 use crate::aws::{Clock, Env, Timeouts};
 
 /// The variable naming the metadata server's `host[:port]`, without a
@@ -33,10 +35,9 @@ pub(super) const TIMEOUTS: Timeouts = Timeouts {
 /// The metadata server's token endpoint.
 #[derive(Debug)]
 pub(crate) struct Server {
-    /// The server, `http://` and the host, with no trailing slash.
-    root: String,
-    /// The comma-joined scopes, or `None` for the server's default.
-    scopes: Option<String>,
+    /// The token URL, with the comma-joined scopes as its query unless the
+    /// server's default is wanted.
+    token_url: Url,
 }
 
 /// The token endpoint's answer.
@@ -50,33 +51,33 @@ struct TokenResponse {
 
 impl Server {
     /// The server [`HOST_VARIABLE`] names, else the default, asking for
-    /// `scopes`.
-    pub(super) fn new(env: &Env, scopes: Scopes) -> Self {
+    /// `scopes`. A host that does not form a URL is an error.
+    pub(super) fn new(env: &Env, scopes: Scopes) -> Result<Self, Error> {
         let root = env
             .get(HOST_VARIABLE)
             .map_or_else(|| DEFAULT_ROOT.to_owned(), |host| format!("http://{host}"));
-        Self {
-            root: root.trim_end_matches('/').to_owned(),
-            scopes: scopes
-                .registry_or_endpoint_default()
-                .map(|scopes| scopes.joined(",")),
+        let mut token_url = parse_url(
+            HOST_VARIABLE,
+            &format!("{}{TOKEN_PATH}", root.trim_end_matches('/')),
+        )?;
+        if let Some(scopes) = scopes.registry_or_endpoint_default() {
+            token_url
+                .query_pairs_mut()
+                .append_pair("scopes", &scopes.joined(","));
         }
+        Ok(Self { token_url })
     }
 
-    /// The default service account's token, asked for once: the caller
-    /// retries a transient failure.
+    /// The default service account's token.
     pub(super) async fn access_token(
         &self,
         clients: &Clients,
         clock: Clock,
     ) -> Result<AccessToken, Error> {
-        let mut request = clients
+        let request = clients
             .metadata
-            .get(format!("{}{TOKEN_PATH}", self.root))
+            .get(self.token_url.clone())
             .header(FLAVOR.0, FLAVOR.1);
-        if let Some(scopes) = &self.scopes {
-            request = request.query(&[("scopes", scopes)]);
-        }
         let response: TokenResponse = send_json(Call::Metadata, request).await?;
         expiring(response.access_token, clock.now(), response.expires_in)
     }
@@ -96,28 +97,43 @@ mod tests {
     const NOW: Duration = Duration::from_secs(1_700_000_000);
 
     fn server_env(server: &MockServer) -> Env {
-        let host = server.uri().trim_start_matches("http://").to_owned();
-        Env::Fixed(HashMap::from([(HOST_VARIABLE.to_owned(), host)]))
+        host_env(server.uri().trim_start_matches("http://"))
     }
 
     fn now() -> SystemTime {
         UNIX_EPOCH + NOW
     }
 
+    fn host_env(host: &str) -> Env {
+        Env::Fixed(HashMap::from([(HOST_VARIABLE.to_owned(), host.to_owned())]))
+    }
+
     /// Upstream `test_resolve_endpoint_default` and `_env_var`: the default
-    /// server, and the variable's host with `http://` before it. Breaks if
-    /// the variable is ignored or given a scheme of its own.
+    /// server, and the variable's host with `http://` before it. A host that
+    /// forms no URL is an error, not a panic at the first request. Breaks if
+    /// the variable is ignored, given a scheme of its own, or not parsed.
     #[test]
     fn resolves_the_server() {
-        let default = Server::new(&Env::Fixed(HashMap::new()), Scopes::Default);
-        assert_eq!(default.root, "http://metadata.google.internal");
-        let env = Env::Fixed(HashMap::from([(
-            HOST_VARIABLE.to_owned(),
-            "10.0.0.1:8080/".to_owned(),
-        )]));
+        let default = Server::new(&Env::Fixed(HashMap::new()), Scopes::Default).unwrap();
         assert_eq!(
-            Server::new(&env, Scopes::Default).root,
-            "http://10.0.0.1:8080"
+            default.token_url.as_str(),
+            format!("http://metadata.google.internal{TOKEN_PATH}")
+        );
+        let custom = Server::new(&host_env("10.0.0.1:8080/"), Scopes::Default).unwrap();
+        assert_eq!(
+            custom.token_url.as_str(),
+            format!("http://10.0.0.1:8080{TOKEN_PATH}")
+        );
+        let error = Server::new(&host_env("bad host"), Scopes::Default).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::Url {
+                    field: HOST_VARIABLE,
+                    ..
+                }
+            ),
+            "{error}"
         );
     }
 
@@ -140,6 +156,7 @@ mod tests {
             .await;
 
         let token = Server::new(&server_env(&server), Scopes::Registry)
+            .unwrap()
             .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
             .await
             .unwrap();
@@ -164,6 +181,7 @@ mod tests {
             .await;
 
         let token = Server::new(&server_env(&server), Scopes::Default)
+            .unwrap()
             .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
             .await
             .unwrap();
@@ -187,6 +205,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let error = Server::new(&server_env(&server), Scopes::Default)
+                .unwrap()
                 .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
                 .await
                 .unwrap_err();
@@ -199,11 +218,8 @@ mod tests {
     /// transient for the metadata server.
     #[tokio::test]
     async fn a_refused_connection_is_final() {
-        let env = Env::Fixed(HashMap::from([(
-            HOST_VARIABLE.to_owned(),
-            "127.0.0.1:1".to_owned(),
-        )]));
-        let error = Server::new(&env, Scopes::Default)
+        let error = Server::new(&host_env("127.0.0.1:1"), Scopes::Default)
+            .unwrap()
             .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
             .await
             .unwrap_err();
