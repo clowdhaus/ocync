@@ -515,14 +515,15 @@ impl retry::Retryable for Failure {
     }
 }
 
-/// Why an AWS call failed, after its retries.
+/// Why an AWS call failed, after its retries. Callers keep only its text,
+/// so the text names every cause, such as the refused connection under a
+/// transport failure, and it is not a source itself.
 #[derive(Debug, thiserror::Error)]
-#[error("{service} {operation} failed: {source}")]
+#[error("{service} {operation} failed: {}", crate::error::error_chain(failure))]
 pub(crate) struct CallError {
     service: Service,
     operation: &'static str,
-    #[source]
-    source: Failure,
+    failure: Failure,
 }
 
 /// How an API writes its error answers.
@@ -1173,10 +1174,10 @@ impl Client {
             })
             .await
             .and_then(|body| serde_json::from_slice(&body).map_err(Failure::Decode))
-            .map_err(|source| CallError {
+            .map_err(|failure| CallError {
                 service: self.service,
                 operation: O::NAME,
-                source,
+                failure,
             })
     }
 }
@@ -1989,10 +1990,11 @@ mod tests {
         assert!(Arc::ptr_eq(&auth.credentials, &public.credentials));
     }
 
-    /// A transport failure does not carry the endpoint URL, whose path may
-    /// hold a key, into the error.
+    /// A transport failure's text names its cause and does not carry the
+    /// endpoint URL, whose path may hold a key. Breaks if the refused
+    /// connection is dropped from the text callers keep.
     #[tokio::test]
-    async fn keeps_the_endpoint_url_out_of_transport_errors() {
+    async fn transport_errors_name_their_cause_without_the_endpoint_url() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
@@ -2000,14 +2002,9 @@ mod tests {
         parts.api.retry = strategy(NonZeroU32::MIN);
         let client = Client::from_parts(parts).unwrap();
         let err = client.call(&Probe {}).await.unwrap_err();
-        let mut chain = format!("{err:?}");
-        let mut source: Option<&dyn std::error::Error> = Some(&err);
-        while let Some(e) = source {
-            chain.push_str(&e.to_string());
-            source = e.source();
-        }
-        assert!(chain.contains("error sending request"), "{chain}");
-        assert!(!chain.contains("secret-key"), "{chain}");
+        let text = err.to_string();
+        assert!(text.contains("tcp connect error"), "{text}");
+        assert!(!format!("{text}{err:?}").contains("secret-key"), "{err:?}");
     }
 
     /// A session token a header cannot carry fails the call before anything
@@ -2029,6 +2026,6 @@ mod tests {
         })
         .unwrap();
         let err = client.call(&Probe {}).await.unwrap_err();
-        assert!(matches!(err.source, Failure::InvalidHeader(_)), "{err}");
+        assert!(matches!(err.failure, Failure::InvalidHeader(_)), "{err}");
     }
 }
