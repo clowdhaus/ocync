@@ -159,12 +159,12 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
 ) -> Result<T, Error> {
     let url = format!("{base_url}{endpoint}");
 
-    // Retried like the other prepare-phase auth paths. A dropped connection
-    // or a throttle here fails every mapping on this registry, not one, and
-    // nothing above the prepare phase would re-send it.
+    // Retried like the other prepare-phase auth paths. A dropped connection,
+    // a throttle or a server error here fails every mapping on this
+    // registry, not one, and nothing above the prepare phase would re-send it.
     //
-    // The throttled response is returned rather than raised, so the non-success
-    // branch below still reads the body: ACR names the exhausted quota there.
+    // The last response is returned rather than raised, so the non-success
+    // branch below still reads the body: ACR names an exhausted quota there.
     let response =
         crate::retry::send_retrying(http.post(&url).form(form), &format!("ACR {endpoint}"))
             .await
