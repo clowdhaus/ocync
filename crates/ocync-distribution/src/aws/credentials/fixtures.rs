@@ -12,8 +12,7 @@ use std::sync::{Arc, Once};
 use std::time::UNIX_EPOCH;
 
 use serde::Deserialize;
-use tracing_subscriber::filter::dynamic_filter_fn;
-use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tokio::runtime::{Handle, RuntimeFlavor};
 
 use super::super::config::Config;
 use super::super::endpoint::Region;
@@ -219,13 +218,15 @@ thread_local! {
     static CAPTURED: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
 }
 
-/// Writes a log line into this thread's capture.
-struct Captured;
+/// Writes a log line into the capture of the thread that wrote it, and
+/// drops it when that thread is not capturing.
+struct CaptureWriter;
 
-impl Write for Captured {
+impl Write for CaptureWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        CAPTURED.with_borrow_mut(|captured| {
-            if let Some(captured) = captured {
+        // A thread logging as it exits finds its capture already gone.
+        let _ = CAPTURED.try_with(|captured| {
+            if let Some(captured) = captured.borrow_mut().as_mut() {
                 captured.extend_from_slice(bytes);
             }
         });
@@ -241,20 +242,28 @@ impl Write for Captured {
 ///
 /// One global subscriber serves every test in the process, because a
 /// subscriber set per test races with the others over tracing's global
-/// level and callsite caches and loses lines when tests run in parallel.
+/// level and callsite caches and loses lines when tests run in parallel. It
+/// has no filter, since tracing caches a filter's answer per log site.
 /// Lines go to the capture of the thread that wrote them, so the future must
-/// run on this thread, as a `current_thread` runtime does.
+/// run on this thread, as a `current_thread` runtime does. Captures do not
+/// nest, and one dropped before it finishes fails the next on its thread.
 pub(super) async fn capture_logs<T>(future: impl Future<Output = T>) -> (T, String) {
-    static SUBSCRIBER: Once = Once::new();
-    SUBSCRIBER.call_once(|| {
-        let capturing = dynamic_filter_fn(|_, _| CAPTURED.with_borrow(Option::is_some));
-        let layer = tracing_subscriber::fmt::layer()
-            .with_writer(|| Captured)
-            .with_filter(capturing);
-        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
-            .unwrap();
+    assert_eq!(
+        Handle::current().runtime_flavor(),
+        RuntimeFlavor::CurrentThread,
+        "lines logged on a runtime's other threads would be missed"
+    );
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(|| CaptureWriter)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other global subscriber in this test binary");
     });
-    CAPTURED.set(Some(Vec::new()));
+    let open = CAPTURED.replace(Some(Vec::new()));
+    assert!(open.is_none(), "a capture is already open on this thread");
     let output = future.await;
     let logs = CAPTURED.take().unwrap();
     (output, String::from_utf8(logs).unwrap())
@@ -314,10 +323,11 @@ async fn a_wrong_answer_fails_the_case() {
 }
 
 /// The capture holds what the awaited future logs at any level, and nothing
-/// another thread logs meanwhile or this thread logs outside it. Every line
-/// comes from one log site, as when parallel tests share one. Breaks if a
-/// site first reached outside a capture stays unheard inside one, a level is
-/// filtered out, or lines reach a capture they were not written in.
+/// another thread logs meanwhile or this thread logs after it. Every line
+/// comes from one log site, first reached on a thread that is not capturing,
+/// as when parallel tests share one. Breaks if that site stays unheard in the
+/// capture, a level is filtered out, or lines reach a capture they were not
+/// written in.
 #[tokio::test(flavor = "current_thread")]
 async fn captures_only_the_awaited_futures_lines() {
     fn log(line: &str) {
@@ -325,21 +335,16 @@ async fn captures_only_the_awaited_futures_lines() {
     }
     // Installs the subscriber, as an earlier test would.
     capture_logs(async {}).await;
-    log("before the capture");
     let ((), logs) = capture_logs(async {
-        log("inside the capture");
         std::thread::spawn(|| log("on another thread"))
             .join()
             .unwrap();
+        log("inside the capture");
     })
     .await;
     log("after the capture");
     assert!(logs.contains("inside the capture"), "{logs}");
-    for line in [
-        "before the capture",
-        "on another thread",
-        "after the capture",
-    ] {
+    for line in ["on another thread", "after the capture"] {
         assert!(!logs.contains(line), "{line}: {logs}");
     }
 }
