@@ -164,8 +164,10 @@ pub async fn sweep(filter: &str, ages: OrphanAge, now: SystemTime) -> Result<Swe
         if !is_orphan(container.state, created, ages, now) {
             continue;
         }
+        // With its anonymous volumes, as testcontainers removes them.
         let options = RemoveContainerOptions {
             force: true,
+            v: true,
             ..Default::default()
         };
         match docker.remove_container(&id, Some(options)).await {

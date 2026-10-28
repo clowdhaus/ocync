@@ -218,7 +218,10 @@ async fn sweep_removes_only_containers_past_their_age() {
     docker
         .remove_container(
             &unrelated,
-            None::<bollard::query_parameters::RemoveContainerOptions>,
+            Some(bollard::query_parameters::RemoveContainerOptions {
+                v: true,
+                ..Default::default()
+            }),
         )
         .await
         .expect("Docker removes the container");
