@@ -267,13 +267,17 @@ impl RegistryClientBuilder {
     /// Build the registry client.
     pub fn build(self) -> Result<RegistryClient, Error> {
         crate::install_crypto_provider();
-        let mut http_builder = reqwest::Client::builder().user_agent(USER_AGENT_VALUE);
-        for (host, addr) in &self.dns_overrides {
-            http_builder = http_builder.resolve(host, *addr);
-        }
-        if self.accept_invalid_certs {
-            http_builder = http_builder.danger_accept_invalid_certs(true);
-        }
+        let base_builder = || {
+            let mut builder = reqwest::Client::builder().user_agent(USER_AGENT_VALUE);
+            for (host, addr) in &self.dns_overrides {
+                builder = builder.resolve(host, *addr);
+            }
+            if self.accept_invalid_certs {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+            builder
+        };
+        let mut http_builder = base_builder();
         if self.force_http1 {
             http_builder = http_builder.http1_only();
         }
@@ -292,6 +296,7 @@ impl RegistryClientBuilder {
             http_builder = http_builder.http2_adaptive_window(true);
         }
         let http = http_builder.build()?;
+        let blob_http = base_builder().http1_only().build()?;
 
         let aimd = AimdController::new(
             self.url.host_str().unwrap_or("unknown"),
@@ -300,6 +305,7 @@ impl RegistryClientBuilder {
         Ok(RegistryClient {
             base_url: self.url,
             http,
+            blob_http,
             auth: self.auth,
             aimd,
             streaming_blob_sem: Arc::new(Semaphore::new(self.streaming_blob_concurrency)),
@@ -317,6 +323,13 @@ impl RegistryClientBuilder {
 pub struct RegistryClient {
     pub(crate) base_url: Url,
     pub(crate) http: reqwest::Client,
+    /// HTTP/1.1 only, for blob downloads. Over HTTP/2 a response body
+    /// holds a share of its connection's receive window until it is read,
+    /// and that window starts at 65,535 bytes, so bodies opened ahead of
+    /// uploads still waiting on a limit can fill it and starve the bodies
+    /// being read. Over HTTP/1.1 each body holds back only its own
+    /// connection.
+    pub(crate) blob_http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
     /// Cap on concurrent long-lived blob streams (push / pull). Acquired
@@ -531,6 +544,18 @@ impl RegistryClient {
         accept: Option<&str>,
         op: RegistryAction,
     ) -> Result<reqwest::Response, Error> {
+        self.get_on(&self.http, repository, path, accept, op).await
+    }
+
+    /// [`get`](Self::get), sent through `http`.
+    pub(crate) async fn get_on(
+        &self,
+        http: &reqwest::Client,
+        repository: &RepositoryName,
+        path: &str,
+        accept: Option<&str>,
+        op: RegistryAction,
+    ) -> Result<reqwest::Response, Error> {
         let url = build_url(&self.base_url, repository, path)?;
         let scopes = [Scope::pull(repository.as_str())];
 
@@ -541,7 +566,7 @@ impl RegistryClient {
                         headers.insert(ACCEPT, val);
                     }
                 }
-                self.http.get(url.clone()).headers(headers)
+                http.get(url.clone()).headers(headers)
             })
             .await?;
 

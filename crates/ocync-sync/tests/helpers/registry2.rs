@@ -83,6 +83,15 @@ async fn push_blob_stream(client: &RegistryClient, repo: &RepositoryName, data: 
         .expect("blob_push_stream");
 }
 
+/// The content of layer `l` of image `i` in [`populate_source`]: zeros,
+/// varied per (image, layer) so digests are unique.
+pub fn layer(i: usize, l: usize, layer_bytes: usize) -> Vec<u8> {
+    let mut layer = vec![0u8; layer_bytes];
+    layer[0] = (i & 0xff) as u8;
+    layer[1] = (l & 0xff) as u8;
+    layer
+}
+
 /// Pushes `n_images` images, each a config and `n_layers` distinct layers
 /// of `layer_bytes`, tagged `v1` in repositories `perf/img-NNNN`.
 pub async fn populate_source(
@@ -102,10 +111,7 @@ pub async fn populate_source(
 
         let mut builder = ManifestBuilder::new(&config_data);
         for l in 0..n_layers {
-            let mut layer = vec![0u8; layer_bytes];
-            // Vary content per (image, layer) so digests are unique.
-            layer[0] = (i & 0xff) as u8;
-            layer[1] = (l & 0xff) as u8;
+            let layer = layer(i, l, layer_bytes);
             push_blob_stream(client, &repo, layer.clone()).await;
             builder = builder.layer(&layer);
         }

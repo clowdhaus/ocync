@@ -25,6 +25,7 @@ Notable behaviors:
 - Lower rate limits than ECR private. Read paths share a single window; write window caps are 10x lower than ECR private.
 - **Tag listing throttles below the documented pull rate.** Measured 2026-08-28: a 95-mapping `--dry-run` against `public.ecr.aws` with AWS credentials loaded drew repeated 429s on `TagList`, halving the AIMD window from 11 to 6 to 3, while ocync's token bucket for ECR Public reads was pacing at 8 requests per second. AWS publishes no TPS quota for tag listing at all; the 8 is derived from the 10 TPS authenticated *pull* quota, and the read window groups tag listing in with pulls. Treat the read pacing for this registry as measured rather than documented.
 - Because of the above, `list_tags` retries a 429 rather than surfacing it. Before that, each throttle failed a whole mapping: the same run lost 5 mappings and exited 1. With the retry it exits 0 and loses none.
+- **Blob downloads come from a CDN that speaks HTTP/2, and it holds a stalled request for minutes.** Measured 2026-10-27: when blob bodies opened ahead of their uploads filled the connection's receive window, a cold sync of the alpine 3.20 index to ECR sat with nothing moving for about 330 seconds until the CDN closed the requests, in 2 of 9 runs. ocync now downloads blobs over HTTP/1.1, so an unread body holds back only its own connection.
 
 ## CLI example
 

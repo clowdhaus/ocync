@@ -1,12 +1,15 @@
-//! Syncs between real `registry:2` containers, for behavior a mock server
-//! cannot show, such as HTTP/2 flow control on the source connection.
+//! Blob downloads and syncs against real `registry:2` containers, for
+//! behavior a mock server cannot show, such as HTTP/2 flow control on the
+//! source connection.
 
 mod helpers;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ocync_distribution::RegistryClientBuilder;
+use futures_util::TryStreamExt;
+use ocync_distribution::sha256::Sha256;
+use ocync_distribution::{Digest, RegistryClientBuilder};
 use ocync_sync::ImageStatus;
 use ocync_sync::engine::{SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
@@ -66,4 +69,32 @@ async fn sync_from_an_http2_source_does_not_stall_on_unread_bodies() {
         report.stats.bytes_transferred,
         (LAYERS * LAYER_BYTES + config) as u64
     );
+}
+
+/// A blob body being read arrives in full while bodies opened before it
+/// are left unread. Breaks if blob downloads share an HTTP/2 connection,
+/// whose receive window the unread bodies fill.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unread_blob_body_does_not_hold_back_another() {
+    let (_container, url) = start_registry_tls().await;
+    let client = RegistryClientBuilder::new(url)
+        .allow_invalid_certs(true)
+        .build()
+        .unwrap();
+    let repos = populate_source(&client, 1, 4, LAYER_BYTES).await;
+    let digest = |l| Digest::from_sha256(Sha256::digest(&layer(0, l, LAYER_BYTES)));
+
+    let mut unread = Vec::new();
+    for l in 0..3 {
+        unread.push(client.blob_pull(&repos[0], &digest(l)).await.unwrap());
+    }
+    let read = client.blob_pull(&repos[0], &digest(3)).await.unwrap();
+    let bytes = read.try_fold(0, |n, chunk| async move { Ok(n + chunk.len()) });
+    let bytes = tokio::time::timeout(Duration::from_secs(30), bytes)
+        .await
+        .expect("the body being read stalled")
+        .unwrap();
+
+    assert_eq!(bytes, LAYER_BYTES);
+    drop(unread);
 }
