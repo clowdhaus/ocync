@@ -625,6 +625,7 @@ impl fmt::Debug for TokenResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::testing;
 
     #[test]
     fn parse_www_authenticate_bearer() {
@@ -723,15 +724,12 @@ mod tests {
     async fn exchange_anonymous() {
         let mock = wiremock::MockServer::start().await;
 
-        crate::auth::testing::challenge(&mock, "test")
+        testing::challenge(&mock, "test")
             .expect(1)
             .mount(&mock)
             .await;
 
-        crate::auth::testing::token("anon-tok")
-            .expect(1)
-            .mount(&mock)
-            .await;
+        testing::token("anon-tok").expect(1).mount(&mock).await;
 
         let http = crate::test_http_client();
         let (token, challenge) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
@@ -1023,7 +1021,7 @@ mod tests {
     async fn exchange_multi_scope_query_params() {
         let mock = wiremock::MockServer::start().await;
 
-        crate::auth::testing::challenge(&mock, "svc")
+        testing::challenge(&mock, "svc")
             .expect(1)
             .mount(&mock)
             .await;
@@ -1128,16 +1126,13 @@ mod tests {
         let mock = wiremock::MockServer::start().await;
 
         // /v2/ should only be hit once -- the second exchange reuses the cached challenge.
-        crate::auth::testing::challenge(&mock, "test")
+        testing::challenge(&mock, "test")
             .expect(1)
             .mount(&mock)
             .await;
 
         // Token endpoint is called twice (different scopes).
-        crate::auth::testing::token("reused")
-            .expect(2)
-            .mount(&mock)
-            .await;
+        testing::token("reused").expect(2).mount(&mock).await;
 
         let http = crate::test_http_client();
 
@@ -1529,9 +1524,7 @@ mod tests {
 
         for from_cache in [true, false] {
             let server = MockServer::start().await;
-            crate::auth::testing::challenge(&server, "test")
-                .mount(&server)
-                .await;
+            testing::challenge(&server, "test").mount(&server).await;
             Mock::given(method("GET"))
                 .and(path("/token"))
                 .respond_with(

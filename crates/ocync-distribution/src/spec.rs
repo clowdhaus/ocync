@@ -641,7 +641,8 @@ mod tests {
             assert!(matches!(m, ManifestKind::Index(_)), "{media_type:?}");
         }
         let other = MediaType::Other("text/plain".into());
-        assert!(ManifestKind::from_json(&other, b"{}").is_err());
+        let err = ManifestKind::from_json(&other, &image).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedMediaType { .. }), "{err:?}");
     }
 
     #[test]

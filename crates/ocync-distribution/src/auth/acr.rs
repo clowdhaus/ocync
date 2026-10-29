@@ -1091,6 +1091,12 @@ mod tests {
     #[tokio::test]
     async fn a_failed_exchange_names_its_cause() {
         crate::install_crypto_provider();
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
         let cases = [
             (
                 ResponseTemplate::new(401).set_body_string("unauthorized"),
@@ -1099,7 +1105,7 @@ mod tests {
             ),
             (
                 ResponseTemplate::new(307)
-                    .insert_header("Location", "http://evil.example.com/steal"),
+                    .insert_header("Location", format!("{}/steal", elsewhere.uri())),
                 "307",
                 Judgment::NotJudged,
             ),

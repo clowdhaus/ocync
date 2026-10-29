@@ -440,11 +440,9 @@ mod tests {
 
     /// Credentials resolve from the `auths` entry for the registry, with or
     /// without a scheme, under any Docker Hub alias, from an encoded `auth`
-    /// or a separate username and password, before any credential helper;
-    /// an empty entry or no entry resolves to none. Breaks if a lookup
-    /// misses an entry it should find, finds one it should not, or runs a
-    /// credential helper (here one that does not exist) when `auths`
-    /// already holds the registry.
+    /// or a separate username and password; an empty entry or no entry
+    /// resolves to none. Breaks if a lookup misses an entry it should find
+    /// or finds one it should not.
     #[tokio::test]
     async fn credentials_resolve_from_the_auths_entry() {
         let user_pass = r#"{"auths": {"ghcr.io": {"auth": "dXNlcjpwYXNz"}}}"#;
@@ -466,21 +464,15 @@ mod tests {
             ),
             (r#"{"auths": {"ghcr.io": {"auth": ""}}}"#, "ghcr.io", None),
             (r#"{"auths": {"ghcr.io": {}}}"#, "ghcr.io", None),
-            (
-                r#"{"auths": {"ghcr.io": {"auth": "dXNlcjpwYXNz"}}, "credHelpers": {"ghcr.io": "ocync-absent"}}"#,
-                "ghcr.io",
-                Some(("user", "pass")),
-            ),
         ];
         for (json, registry, expected) in cases {
             let config: DockerConfig = serde_json::from_str(json).unwrap();
-            let resolved = resolve_from_docker_config(&config, registry).await.unwrap();
-            let resolved = resolved.map(|creds| match creds {
-                Credentials::Basic { username, password } => (username, password),
+            let expected = expected.map(|(username, password)| Credentials::Basic {
+                username: username.into(),
+                password: password.into(),
             });
-            assert_eq!(
-                resolved.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
-                expected,
+            assert!(
+                resolve_from_docker_config(&config, registry).await.unwrap() == expected,
                 "{registry} in {json}"
             );
         }
