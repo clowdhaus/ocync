@@ -61,37 +61,21 @@ impl<'de> Deserialize<'de> for SourceFile {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
 
-        let value = Value::deserialize(deserializer)?;
-        let names = |key: &str| value.get(key).is_some();
+        let fields = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let names = |key: &str| fields.contains_key(key);
         let source = if names("environment_id") {
-            serde_json::from_value(value).map(Self::Aws)
+            serde_json::from_value(Value::Object(fields)).map(Self::Aws)
         } else if names("executable") {
             Ok(Self::Executable)
         } else if names("url") {
-            serde_json::from_value(value).map(Self::Url)
+            serde_json::from_value(Value::Object(fields)).map(Self::Url)
         } else if names("file") {
-            serde_json::from_value(value).map(Self::File)
+            serde_json::from_value(Value::Object(fields)).map(Self::File)
         } else {
-            const NEEDS: &str = "a map naming environment_id, executable, url or file";
-            return Err(match &value {
-                Value::Object(_) => D::Error::invalid_value(
-                    serde::de::Unexpected::Other("a map naming no source"),
-                    &NEEDS,
-                ),
-                Value::Null => D::Error::invalid_type(serde::de::Unexpected::Other("null"), &NEEDS),
-                Value::Bool(_) => {
-                    D::Error::invalid_type(serde::de::Unexpected::Other("boolean"), &NEEDS)
-                }
-                Value::Number(_) => {
-                    D::Error::invalid_type(serde::de::Unexpected::Other("number"), &NEEDS)
-                }
-                Value::String(_) => {
-                    D::Error::invalid_type(serde::de::Unexpected::Other("string"), &NEEDS)
-                }
-                Value::Array(_) => {
-                    D::Error::invalid_type(serde::de::Unexpected::Other("sequence"), &NEEDS)
-                }
-            });
+            return Err(D::Error::invalid_value(
+                serde::de::Unexpected::Map,
+                &"a credential_source naming environment_id, executable, url or file",
+            ));
         };
         source.map_err(D::Error::custom)
     }

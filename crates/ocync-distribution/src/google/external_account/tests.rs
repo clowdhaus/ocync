@@ -417,11 +417,12 @@ fn a_source_naming_none_says_what_it_needs() {
     for (source, expected) in [
         (
             serde_json::json!({"region": "x"}),
-            "invalid value, expected a map naming environment_id, executable, url or file",
+            "invalid value: map, expected a credential_source naming environment_id, \
+             executable, url or file",
         ),
         (
             serde_json::json!("token.txt"),
-            "invalid type: string, expected a map naming environment_id, executable, url or file",
+            "invalid type: string, expected a map",
         ),
     ] {
         let error = crate::json::value_as::<SourceFile>(source)

@@ -282,9 +282,9 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
     helper_credentials(program, registry, &output)
 }
 
-/// The credentials a helper's `output` holds. Its stderr is cut to what can
-/// be quoted and a refused value from its stdout is left out, as either can
-/// hold the secret.
+/// The credentials a helper's `output` holds. Its stderr is cut to the
+/// most of a program's output an error keeps, and a refused value from its
+/// stdout is left out.
 fn helper_credentials(
     program: String,
     registry: &str,
