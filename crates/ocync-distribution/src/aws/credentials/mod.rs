@@ -429,10 +429,10 @@ pub(super) mod tests {
     /// repeats it.
     #[test]
     fn names_a_printed_cause_once() {
-        let decode = serde_json::from_str::<u8>("x").unwrap_err();
+        let decode = crate::error::parse_json::<u8>("x").unwrap_err();
         assert_eq!(
             error_chain(&super::super::Failure::Decode(decode)),
-            "unreadable response: expected value at line 1 column 1"
+            "unreadable response: not JSON at line 1 column 1"
         );
     }
 

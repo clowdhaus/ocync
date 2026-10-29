@@ -333,6 +333,48 @@ fn shown_source<'a>(
         .filter(|source| !(from_http && source.is::<serde_json::Error>()))
 }
 
+/// Text from outside the process, such as an endpoint's answer or a helper's
+/// output, that is not the JSON expected. Its text says how and where the
+/// text failed to parse but not the parser's message, which quotes the
+/// value it refused, and that value can be a secret.
+#[derive(Debug)]
+pub(crate) struct UnreadableJson(serde_json::Error);
+
+/// The serde message for a field that is absent, which names the field and
+/// quotes no value.
+const MISSING_FIELD: &str = "missing field `";
+
+impl std::fmt::Display for UnreadableJson {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let error = &self.0;
+        let message = error.to_string();
+        if message.starts_with(MISSING_FIELD) {
+            return f.write_str(&message);
+        }
+        let kind = match error.classify() {
+            serde_json::error::Category::Syntax => "not JSON",
+            serde_json::error::Category::Eof => "JSON cut off",
+            serde_json::error::Category::Data => "a JSON value of the wrong type",
+            serde_json::error::Category::Io => "JSON that could not be read",
+        };
+        write!(
+            f,
+            "{kind} at line {} column {}",
+            error.line(),
+            error.column()
+        )
+    }
+}
+
+impl std::error::Error for UnreadableJson {}
+
+/// Parse `text`, from outside the process, as JSON of type `T`.
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(
+    text: impl AsRef<[u8]>,
+) -> Result<T, UnreadableJson> {
+    serde_json::from_slice(text.as_ref()).map_err(UnreadableJson)
+}
+
 /// The most of an external body or stream kept in an error, in bytes.
 pub(crate) const MAX_QUOTED_BYTES: usize = 200;
 
@@ -427,6 +469,33 @@ mod tests {
         );
         assert!(!text.contains("s3cret"), "{text}");
         assert!(!error_chain(&err).contains("s3cret"), "{err}");
+    }
+
+    /// Text that fails to parse names how and where, and an absent field by
+    /// name, but never the value refused. Breaks if the parser's quote of a
+    /// value reaches the text.
+    #[test]
+    fn unreadable_json_leaves_the_value_out() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Answer {
+            #[allow(dead_code)]
+            expires_in: u64,
+        }
+        for (text, expected) in [
+            (
+                r#"{"expires_in": "s3cret"}"#,
+                "a JSON value of the wrong type at line 1 column 23",
+            ),
+            (r#"{"expires_in": s3cret}"#, "not JSON at line 1 column 16"),
+            (r#"{"expires_in": "#, "JSON cut off at line 1 column 15"),
+            (
+                r#"{"token": "s3cret"}"#,
+                "missing field `expires_in` at line 1 column 19",
+            ),
+        ] {
+            let error = parse_json::<Answer>(text).unwrap_err();
+            assert_eq!(error.to_string(), expected, "{text}");
+        }
     }
 
     #[test]

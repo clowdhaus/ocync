@@ -30,7 +30,7 @@ use crate::scheme::{Scheme, UnsupportedScheme};
 
 use crate::REDACTED;
 use crate::aws::{AwsCredentialProviders, Clock, Env, Host, Platform};
-use crate::error::{MAX_QUOTED_BYTES, truncate_quoted};
+use crate::error::{MAX_QUOTED_BYTES, UnreadableJson, parse_json, truncate_quoted};
 use crate::retry::{Bounded, retrying};
 
 /// The scope every registry token is asked for: push and pull on Artifact
@@ -293,7 +293,7 @@ pub(crate) enum Error {
     Decode {
         call: Call,
         #[source]
-        source: serde_json::Error,
+        source: UnreadableJson,
     },
     /// An endpoint's answer is not UTF-8.
     #[error("{call}: the answer is not UTF-8")]
@@ -307,7 +307,7 @@ pub(crate) enum Error {
     SubjectNotUtf8(#[source] std::string::FromUtf8Error),
     /// A JSON subject token document does not parse.
     #[error("the subject token document is not JSON")]
-    SubjectJson(#[source] serde_json::Error),
+    SubjectJson(#[source] UnreadableJson),
     /// A `json` subject token format names no field to read.
     #[error("credential_source.format of type json names no subject_token_field_name")]
     NoSubjectField,
@@ -495,7 +495,7 @@ async fn send_json<T: serde::de::DeserializeOwned>(
     build: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
 ) -> Result<T, Error> {
     let body = send(clients, call, build).await?;
-    serde_json::from_slice(&body).map_err(|source| Error::Decode { call, source })
+    parse_json(&body).map_err(|source| Error::Decode { call, source })
 }
 
 /// [`send`] the request `build` makes for `call`, and read its answer as

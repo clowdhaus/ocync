@@ -298,7 +298,7 @@ fn classifies_answers() {
     }
     let undecodable = Error::Decode {
         call: Call::UserToken,
-        source: serde_json::from_str::<Value>("{").unwrap_err(),
+        source: parse_json::<Value>("{").unwrap_err(),
     };
     assert!(!undecodable.is_transient());
 }

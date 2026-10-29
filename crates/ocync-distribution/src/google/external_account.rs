@@ -151,7 +151,8 @@ impl Format {
         match self {
             Self::Text => Ok(Secret(text)),
             Self::Json { field } => {
-                let mut json: Value = serde_json::from_str(&text).map_err(Error::SubjectJson)?;
+                let mut json: Value =
+                    crate::error::parse_json(&text).map_err(Error::SubjectJson)?;
                 match json.get_mut(field).map(Value::take) {
                     Some(Value::String(token)) => Ok(Secret(token)),
                     _ => Err(Error::SubjectField(field.clone())),

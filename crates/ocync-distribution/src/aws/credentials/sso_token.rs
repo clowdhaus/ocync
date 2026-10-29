@@ -148,7 +148,7 @@ enum RefreshError {
     /// The answer holds no token, or an expiry that is not a count of
     /// seconds.
     #[error("SSO OIDC CreateToken answer could not be read")]
-    Answer(#[source] serde_json::Error),
+    Answer(#[source] crate::error::UnreadableJson),
     /// The refresh did not finish within [`REFRESH_TIMEOUT`].
     #[error("SSO OIDC CreateToken timed out after {} seconds", REFRESH_TIMEOUT.as_secs_f64())]
     TimedOut,
@@ -373,7 +373,7 @@ async fn refresh(
         .call_unsigned(&request, &[])
         .await
         .map_err(RefreshError::Call)?;
-    serde_json::from_slice(&answer).map_err(RefreshError::Answer)
+    crate::error::parse_json(&answer).map_err(RefreshError::Answer)
 }
 
 /// Write `refreshed` over the token cached at `path`, as upstream writes

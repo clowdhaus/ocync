@@ -297,7 +297,7 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
     }
 
     let resp: HelperResponse =
-        serde_json::from_slice(&output.stdout).map_err(|e| Error::CredentialHelperFailed {
+        crate::error::parse_json(&output.stdout).map_err(|e| Error::CredentialHelperFailed {
             helper: program,
             reason: format!("invalid JSON response: {e}"),
         })?;
