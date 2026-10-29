@@ -5,7 +5,7 @@
 //! optional credentials.
 
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use base64::Engine;
@@ -269,10 +269,8 @@ fn validate_realm_url(realm: &reqwest::Url, registry_base: &reqwest::Url) -> Res
     match realm.host() {
         Some(Host::Ipv4(ip)) => validate_ipv4(&ip, registry_is_loopback, realm, registry_str)?,
         Some(Host::Ipv6(ip)) => validate_ipv6(&ip, registry_is_loopback, realm, registry_str)?,
-        Some(Host::Domain(d)) => {
-            // `localhost` resolves to loopback -- apply the same conditional
-            // block as IP-based loopback addresses.
-            if d.eq_ignore_ascii_case("localhost") && !registry_is_loopback {
+        Some(Host::Domain(_)) => {
+            if is_loopback(realm) && !registry_is_loopback {
                 return Err(realm_err(
                     registry_str,
                     format!("realm URL '{realm}' points to localhost but registry is not loopback"),
@@ -295,15 +293,29 @@ fn validate_realm_url(realm: &reqwest::Url, registry_base: &reqwest::Url) -> Res
 }
 
 /// Whether `url` names this host: a loopback address, IPv4-mapped or not,
-/// or `localhost`.
+/// or `localhost`, with or without its trailing dot.
 fn is_loopback(url: &reqwest::Url) -> bool {
     match url.host() {
+        Some(Host::Domain(d)) => d.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
         Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip
-            .to_ipv4_mapped()
-            .map_or(ip.is_loopback(), |v4| v4.is_loopback()),
-        Some(Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv6(ip)) => ip_of(&ip).is_loopback(),
         None => false,
+    }
+}
+
+/// An IPv6 host as the address it names: an IPv4-mapped one is its IPv4
+/// address. Only the mapped form is read, since this grants: a translated
+/// or NAT64 address goes through a translator off this host.
+fn ip_of(ip: &Ipv6Addr) -> IpAddr {
+    ip.to_ipv4_mapped().map_or(IpAddr::V6(*ip), IpAddr::V4)
+}
+
+/// The address an IP host names, or none for a name.
+fn address(host: &Host<&str>) -> Option<IpAddr> {
+    match host {
+        Host::Domain(_) => None,
+        Host::Ipv4(ip) => Some(IpAddr::V4(*ip)),
+        Host::Ipv6(ip) => Some(ip_of(ip)),
     }
 }
 
@@ -332,12 +344,15 @@ fn validate_domain_binding(
             (realm_host, registry_host)
         }
         _ if is_loopback(realm) && is_loopback(registry_base) => return Ok(()),
-        (Some(realm_ip), Some(registry_ip)) if realm_ip == registry_ip => return Ok(()),
+        (Some(realm_ip), Some(registry_ip)) if address(&realm_ip) == address(&registry_ip) => {
+            return Ok(());
+        }
         _ => {
             return Err(realm_err(
                 registry_str,
                 format!(
-                    "realm URL '{realm}' is not on the registry's address '{}'",
+                    "realm URL '{realm}' is not on the registry's address '{}'; \
+                     configure the registry by the realm's IP address, or by name for a named realm",
                     registry_base.host_str().unwrap_or_default()
                 ),
             ));
@@ -1237,6 +1252,18 @@ mod tests {
                 "http://10.0.0.1:9999/token",
                 "http://localhost:5000",
                 Verdict::Rejected("is not on the registry's address"),
+            ),
+            // allows the registry's own address written IPv4-mapped
+            (
+                "https://[::ffff:192.168.1.50]/token",
+                "https://192.168.1.50",
+                Verdict::Allowed,
+            ),
+            // allows a loopback realm for `localhost.`
+            (
+                "http://127.0.0.1:9999/token",
+                "http://localhost.:5000",
+                Verdict::Allowed,
             ),
             // allows another port on the registry's own address
             (
