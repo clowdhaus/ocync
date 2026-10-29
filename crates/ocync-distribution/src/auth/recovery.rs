@@ -24,14 +24,22 @@ pub(super) enum Judgment {
     NotJudged,
 }
 
-/// The judgment of a failed OCI token exchange: the token endpoint answering
-/// 401 refused the credentials sent.
+/// The judgment of the status a token endpoint answered with: 401 refused
+/// the credentials sent, and any other status, such as a 403 or 404 for one
+/// repository, judges nothing.
+pub(super) fn judge_status(status: http::StatusCode) -> Judgment {
+    if status == http::StatusCode::UNAUTHORIZED {
+        Judgment::Refused
+    } else {
+        Judgment::NotJudged
+    }
+}
+
+/// The judgment of a failed OCI token exchange, by the token endpoint's
+/// answer.
 pub(super) fn judge_token_endpoint(error: &Error) -> Judgment {
     match error {
-        Error::TokenEndpoint {
-            status: http::StatusCode::UNAUTHORIZED,
-            ..
-        } => Judgment::Refused,
+        Error::TokenEndpoint { status, .. } => judge_status(*status),
         _ => Judgment::NotJudged,
     }
 }

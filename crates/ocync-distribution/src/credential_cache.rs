@@ -99,7 +99,7 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         refresh: impl Future<Output = Result<(T, Duration), F>>,
         share: impl FnOnce(&Result<(T, Duration), F>) -> Option<Result<T, E>>,
     ) -> Landed<Result<(T, Duration), F>, Result<T, E>> {
-        let land = |result: &Result<(T, Duration), F>| {
+        let land = |result: &Result<(T, Duration), F>, _| {
             let mut state = self.write();
             let refused = std::mem::take(&mut state.refused);
             if let Ok((value, ttl)) = result {
@@ -110,12 +110,9 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
             drop(state);
             share(result)
         };
-        let fetch = || {
-            self.write().refused.clear();
-            refresh
-        };
+        let begin = || self.write().refused.clear();
         self.flights
-            .run(&(), || self.fresh().map(Ok), fetch, land)
+            .run(&(), || self.fresh().map(Ok), begin, || refresh, land)
             .await
     }
 

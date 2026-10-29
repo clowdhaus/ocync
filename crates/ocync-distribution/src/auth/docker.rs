@@ -424,7 +424,7 @@ impl AuthProvider for DockerConfigAuth {
 
     fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            self.tokens.refuse(&refused).await;
+            self.tokens.refuse(&self.base_url, &refused).await;
         })
     }
 }

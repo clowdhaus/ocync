@@ -33,10 +33,20 @@ pub(crate) enum Landed<R, V> {
     Shared(V),
 }
 
+/// Whether a fetch is still the one under its key when it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// No [`Flights::forget`] has taken its key since it began.
+    Attached,
+    /// A [`Flights::forget`] took its key, so callers that asked since have
+    /// not joined it and it may be using what the forget dropped.
+    Detached,
+}
+
 /// A fetch this caller leads. Its entry is the one under `key` only until
-/// the fetch lands. Dropping it removes that entry before the sender goes,
-/// so a waiter woken by the sender closing never finds it again, and
-/// leaves alone an entry a later fetch put there.
+/// the fetch lands or is forgotten. Dropping it removes that entry before
+/// the sender goes, so a waiter woken by the sender closing never finds it
+/// again, and leaves alone an entry a later fetch put there.
 struct Lead<'a, K: Eq + Hash, V> {
     flights: &'a Flights<K, V>,
     key: &'a K,
@@ -45,12 +55,21 @@ struct Lead<'a, K: Eq + Hash, V> {
 }
 
 impl<K: Eq + Hash, V> Lead<'_, K, V> {
-    /// Remove this fetch's entry, if it is still the one under its key.
-    fn detach(&self, in_flight: &mut HashMap<K, watch::Receiver<Option<V>>>) {
+    /// Whether this fetch's entry is still the one under its key.
+    fn standing(&self, in_flight: &HashMap<K, watch::Receiver<Option<V>>>) -> Standing {
         if in_flight
             .get(self.key)
             .is_some_and(|receiver| receiver.same_channel(&self.receiver))
         {
+            Standing::Attached
+        } else {
+            Standing::Detached
+        }
+    }
+
+    /// Remove this fetch's entry, if it is still the one under its key.
+    fn detach(&self, in_flight: &mut HashMap<K, watch::Receiver<Option<V>>>) {
+        if self.standing(in_flight) == Standing::Attached {
             in_flight.remove(self.key);
         }
     }
@@ -76,29 +95,47 @@ impl<K: Eq + Hash, V> Flights<K, V> {
         let in_flight = self.lock();
         inspect(in_flight.contains_key(key))
     }
+
+    /// Run `drop_stored`, which drops stored values and returns their
+    /// keys, and detach the fetches in flight for those keys, under one
+    /// lock: a caller that asks afterwards finds neither and starts a fetch
+    /// of its own, while each detached fetch still lands, as
+    /// [`Standing::Detached`], and serves the callers already waiting on
+    /// it. Fetches for other keys are left alone. Returns the keys dropped.
+    pub(crate) fn forget(&self, drop_stored: impl FnOnce() -> Vec<K>) -> Vec<K> {
+        let mut in_flight = self.lock();
+        let dropped = drop_stored();
+        for key in &dropped {
+            in_flight.remove(key);
+        }
+        dropped
+    }
 }
 
 impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
     /// The value `stored` finds, else what the fetch in flight for `key`
     /// shares, else the result of `fetch`, run by this caller.
     ///
-    /// `fetch` is called under the lock `stored` is read under, as the fetch
-    /// is registered, to make the future this caller runs: whatever it sets
-    /// up is in place before any caller can see the fetch in flight. `land`
-    /// is given the result under that lock too. It stores the value and
-    /// returns what the waiters get: `None` sends each of them to fetch for
-    /// itself, as a fetch whose caller is dropped does.
+    /// `begin` runs under the lock `stored` is read under, as the fetch is
+    /// registered, so whatever it sets up is in place before any caller can
+    /// see the fetch in flight. It must not panic. `fetch` runs after the
+    /// lock is released, to make the future this caller awaits. `land` is
+    /// given the result, and the fetch's [`Standing`], under the lock
+    /// `stored` is read under. It stores the value, if it is to be kept,
+    /// and returns what the waiters get: `None` sends each of them to fetch
+    /// for itself, as a fetch whose caller is dropped does.
     pub(crate) async fn run<R, Fut>(
         &self,
         key: &K,
         stored: impl Fn() -> Option<V>,
+        begin: impl FnOnce(),
         fetch: impl FnOnce() -> Fut,
-        land: impl FnOnce(&R) -> Option<V>,
+        land: impl FnOnce(&R, Standing) -> Option<V>,
     ) -> Landed<R, V>
     where
         Fut: Future<Output = R>,
     {
-        let mut work = Some((fetch, land));
+        let mut work = Some((begin, fetch, land));
         loop {
             let role = {
                 let mut in_flight = self.lock();
@@ -108,16 +145,21 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
                 match in_flight.get(key) {
                     Some(receiver) => Err(receiver.clone()),
                     None => {
-                        let (fetch, land) = work.take().expect("a caller leads at most once");
+                        let (begin, fetch, land) =
+                            work.take().expect("a caller leads at most once");
+                        begin();
                         let (sender, receiver) = watch::channel(None);
                         in_flight.insert(key.clone(), receiver.clone());
-                        let lead = Lead {
-                            flights: self,
-                            key,
-                            sender,
-                            receiver,
-                        };
-                        Ok((lead, fetch(), land))
+                        Ok((
+                            Lead {
+                                flights: self,
+                                key,
+                                sender,
+                                receiver,
+                            },
+                            fetch,
+                            land,
+                        ))
                     }
                 }
             };
@@ -128,13 +170,14 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
                         return Landed::Shared(value.clone().expect("waited for a value"));
                     }
                 }
-                Ok((lead, fetching, land)) => {
-                    let result = fetching.await;
+                Ok((lead, fetch, land)) => {
+                    let result = fetch().await;
                     // Landed and removed under one lock, so no caller joins
                     // a fetch that has landed.
                     let mut in_flight = self.lock();
+                    let standing = lead.standing(&in_flight);
                     lead.detach(&mut in_flight);
-                    if let Some(value) = land(&result) {
+                    if let Some(value) = land(&result, standing) {
                         lead.sender.send_replace(Some(value));
                     }
                     drop(in_flight);
@@ -162,7 +205,7 @@ mod tests {
             tokio::task::yield_now().await;
             7
         };
-        let run = || flights.run(&(), || None, fetch, |value: &u32| Some(*value));
+        let run = || flights.run(&(), || None, || {}, fetch, |value: &u32, _| Some(*value));
         let (first, second) = tokio::join!(run(), run());
         assert!(matches!(first, Landed::Own(7)), "{first:?}");
         assert!(matches!(second, Landed::Shared(7)), "{second:?}");
@@ -181,20 +224,31 @@ mod tests {
             tokio::task::yield_now().await;
             fetches.get()
         };
-        let unshared = || flights.run(&(), || None, fetch, |_: &u32| None);
+        let unshared = || flights.run(&(), || None, || {}, fetch, |_: &u32, _| None);
         let (first, second) = tokio::join!(unshared(), unshared());
         assert!(matches!(first, Landed::Own(1)), "{first:?}");
         assert!(matches!(second, Landed::Own(2)), "{second:?}");
 
-        let mut stalled =
-            Box::pin(flights.run(&(), || None, std::future::pending::<u32>, |_| Some(0)));
+        let mut stalled = Box::pin(flights.run(
+            &(),
+            || None,
+            || {},
+            std::future::pending::<u32>,
+            |_, _| Some(0),
+        ));
         // Polled once, so it leads a fetch that never lands.
         std::future::poll_fn(|cx| {
             assert!(stalled.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())
         })
         .await;
-        let waiter = flights.run(&(), || None, || async { 9 }, |value: &u32| Some(*value));
+        let waiter = flights.run(
+            &(),
+            || None,
+            || {},
+            || async { 9 },
+            |value: &u32, _| Some(*value),
+        );
         let (landed, ()) = tokio::join!(waiter, async move {
             tokio::task::yield_now().await;
             drop(stalled);
@@ -216,15 +270,20 @@ mod tests {
             1
         };
         let (landed, during) = tokio::join!(
-            flights.run(&(), || None, fetch, |value: &u32| Some(*value)),
+            flights.run(&(), || None, || {}, fetch, |value: &u32, _| Some(*value)),
             async { running() },
         );
         assert!(matches!(landed, Landed::Own(1)), "{landed:?}");
         assert!(during);
         assert!(!running());
 
-        let mut stalled =
-            Box::pin(flights.run(&(), || None, std::future::pending::<u32>, |_| Some(0)));
+        let mut stalled = Box::pin(flights.run(
+            &(),
+            || None,
+            || {},
+            std::future::pending::<u32>,
+            |_, _| Some(0),
+        ));
         std::future::poll_fn(|cx| {
             assert!(stalled.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())
@@ -235,28 +294,118 @@ mod tests {
         assert!(!running());
     }
 
-    /// `inspect`, `fetch` and `land` all run holding the lock fetches start
-    /// and land under, and `fetch` runs before any caller sees the fetch in
-    /// flight. Breaks if any runs outside it, as a fetch could then start
-    /// or land between a check and the record made from it.
+    /// `inspect`, `begin` and `land` run holding the lock fetches start and
+    /// land under, and `fetch` runs after it is released. Breaks if any of
+    /// the first three runs outside the lock, as a fetch could then start
+    /// or land between a check and the record made from it, or if `fetch`
+    /// runs inside it, as a panic there would meet the lock again in
+    /// `Lead::drop`.
     #[tokio::test(flavor = "current_thread")]
-    async fn inspect_fetch_and_land_run_under_the_lock() {
+    async fn inspect_begin_and_land_run_under_the_lock() {
         let flights = Flights::<(), u32>::default();
         let held = || flights.in_flight.try_lock().is_err();
         assert!(flights.inspect(&(), |_| held()));
 
-        let fetched_under_lock = Cell::new(false);
+        let began_under_lock = Cell::new(false);
+        let fetched_under_lock = Cell::new(true);
         let landed_under_lock = Cell::new(false);
+        let begin = || began_under_lock.set(held());
         let fetch = || {
             fetched_under_lock.set(held());
             async { 1 }
         };
-        let land = |value: &u32| {
+        let land = |value: &u32, _| {
             landed_under_lock.set(held());
             Some(*value)
         };
-        flights.run(&(), || None, fetch, land).await;
-        assert!(fetched_under_lock.get());
+        flights.run(&(), || None, begin, fetch, land).await;
+        assert!(began_under_lock.get());
+        assert!(!fetched_under_lock.get());
         assert!(landed_under_lock.get());
+    }
+
+    /// A fetch that panics while making its future unwinds without
+    /// deadlocking on the lock, and leaves no fetch in flight. Breaks if
+    /// the lock is held when `fetch` runs, as `Lead::drop` then waits on it
+    /// forever.
+    #[test]
+    fn a_fetch_that_panics_unwinds_without_deadlock() {
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let flights = Flights::<(), u32>::default();
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(flights.run(
+                    &(),
+                    || None,
+                    || {},
+                    || -> std::future::Ready<u32> { panic!("building the future") },
+                    |value: &u32, _| Some(*value),
+                ))
+            }));
+            let running = flights.inspect(&(), |running| running);
+            let _ = done.send((panicked.is_err(), running));
+        });
+        let (panicked, running) = outcome
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the unwind deadlocked");
+        assert!(panicked);
+        assert!(!running);
+    }
+
+    /// A forget detaches the fetches in flight for the keys it drops: a
+    /// caller that asks afterwards starts its own, the detached fetch lands
+    /// as `Detached` and still serves the callers that joined it, and a
+    /// fetch for another key is left attached. Breaks if a forget detaches
+    /// nothing, or too much.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forget_detaches_only_the_keys_it_drops() {
+        let flights = Flights::<u8, u32>::default();
+        let standings = std::cell::RefCell::new(Vec::new());
+        let run = |key: u8, value: u32| {
+            let flights = &flights;
+            let standings = &standings;
+            async move {
+                flights
+                    .run(
+                        &key,
+                        || None,
+                        || {},
+                        || async move {
+                            tokio::task::yield_now().await;
+                            tokio::task::yield_now().await;
+                            value
+                        },
+                        |value: &u32, standing| {
+                            standings.borrow_mut().push((key, standing));
+                            Some(*value)
+                        },
+                    )
+                    .await
+            }
+        };
+        let forgetting = async {
+            tokio::task::yield_now().await;
+            assert_eq!(flights.forget(|| vec![1]), vec![1]);
+            // Asks after the forget, so it starts its own fetch.
+            run(1, 20).await
+        };
+        let (first, other, joined, later) =
+            tokio::join!(run(1, 10), run(2, 30), run(1, 11), forgetting);
+        assert!(matches!(first, Landed::Own(10)), "{first:?}");
+        assert!(matches!(other, Landed::Own(30)), "{other:?}");
+        assert!(matches!(joined, Landed::Shared(10)), "{joined:?}");
+        assert!(matches!(later, Landed::Own(20)), "{later:?}");
+        let standings = standings.into_inner();
+        assert!(
+            standings.contains(&(1, Standing::Detached)),
+            "{standings:?}"
+        );
+        assert!(
+            standings.contains(&(2, Standing::Attached)),
+            "{standings:?}"
+        );
     }
 }

@@ -271,7 +271,7 @@ impl AuthProvider for EcrPublicAuth {
         Box::pin(async move {
             // The credentials stay: only the token exchange that uses them
             // judges them.
-            self.tokens.refuse(&refused).await;
+            self.tokens.refuse(&self.base_url, &refused).await;
         })
     }
 }

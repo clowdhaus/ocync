@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use super::recovery::{Judgment, Recovery};
+use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Refusal, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
@@ -154,15 +154,10 @@ struct ExchangeError {
 }
 
 impl ExchangeError {
-    /// What the failure says of the credential sent: the endpoint answering
-    /// 401 refused it. Any other answer, such as a 403 or 404 for one
-    /// repository, judges nothing.
+    /// What the failure says of the credential sent, by the endpoint's
+    /// answer. A failure with no answer judges nothing.
     fn judgment(&self) -> Judgment {
-        if self.status == Some(http::StatusCode::UNAUTHORIZED) {
-            Judgment::Refused
-        } else {
-            Judgment::NotJudged
-        }
+        self.status.map_or(Judgment::NotJudged, judge_status)
     }
 }
 
@@ -824,7 +819,7 @@ impl AuthProvider for AcrAuth {
         Box::pin(async move {
             // The refresh token and credential chain stay: only the
             // exchanges that use them judge them.
-            self.tokens.refuse(&refused).await;
+            self.tokens.refuse(&self.base_url, &refused).await;
         })
     }
 }

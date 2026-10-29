@@ -372,7 +372,7 @@ impl AuthProvider for GcpAuth {
             // token, and the kept Google token exchanges for a new one
             // without a request to Google. An exchange that refuses the
             // Google token drops it.
-            self.tokens.refuse(&refused).await;
+            self.tokens.refuse(&self.base_url, &refused).await;
         })
     }
 }
