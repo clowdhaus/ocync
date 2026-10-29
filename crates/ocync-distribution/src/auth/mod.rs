@@ -132,6 +132,16 @@ pub struct Token {
     scheme: AuthScheme,
 }
 
+/// Two tokens are equal when they send the same `Authorization` header,
+/// whatever their expiry.
+impl PartialEq for Token {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value && self.scheme == other.scheme
+    }
+}
+
+impl Eq for Token {}
+
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Token")
@@ -266,12 +276,14 @@ pub trait AuthProvider: Send + Sync {
         scopes: &[Scope],
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>>;
 
-    /// Invalidate any cached tokens, so the next `get_token` call does not
-    /// reuse them. A fetch already in flight may still answer it.
+    /// Drop a stored token or credential only if it is `refused`, the token
+    /// the registry rejected with 401, so the next `get_token` call does
+    /// not reuse it. A stored value that has since replaced `refused` is
+    /// kept, as other requests may be using it. A fetch already in flight
+    /// may still answer the next call.
     ///
-    /// Called by the client when a request returns 401, indicating the
-    /// current token was rejected by the registry.
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// Called by the client when a request returns 401.
+    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 #[cfg(test)]

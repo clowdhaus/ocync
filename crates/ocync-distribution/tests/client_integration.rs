@@ -87,22 +87,28 @@ impl AuthProvider for MockAuth {
         Box::pin(async move { Ok(token) })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn invalidate(&self, _refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         self.state.invalidate_count.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {})
     }
 }
 
-/// A mock auth provider that returns a different token value after each invalidation.
+/// A mock auth provider that returns a new token (`token-0`, `token-1`, ...)
+/// on every `get_token` call, and records the values it is asked to
+/// invalidate.
 struct RotatingMockAuth {
     call_count: AtomicU32,
+    refused: Arc<Mutex<Vec<String>>>,
 }
 
 impl RotatingMockAuth {
-    fn new() -> Self {
-        Self {
+    fn new() -> (Self, Arc<Mutex<Vec<String>>>) {
+        let refused = Arc::new(Mutex::new(Vec::new()));
+        let auth = Self {
             call_count: AtomicU32::new(0),
-        }
+            refused: Arc::clone(&refused),
+        };
+        (auth, refused)
     }
 }
 
@@ -120,7 +126,11 @@ impl AuthProvider for RotatingMockAuth {
         Box::pin(async move { Ok(Token::new(token_value)) })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.refused
+            .lock()
+            .unwrap()
+            .push(refused.value().to_owned());
         Box::pin(async {})
     }
 }
@@ -239,6 +249,10 @@ async fn get_double_401_returns_unauthorized() {
     );
 }
 
+/// A refused request is retried once, and the token invalidated is the one
+/// the request carried, not whatever the provider would hand out now.
+/// Breaks if the client retries again, or names another token, so a
+/// provider drops a replacement.
 #[tokio::test]
 async fn get_401_retry_only_happens_once() {
     let server = MockServer::start().await;
@@ -251,7 +265,7 @@ async fn get_401_retry_only_happens_once() {
         .mount(&server)
         .await;
 
-    let auth = RotatingMockAuth::new();
+    let (auth, refused) = RotatingMockAuth::new();
     let client = RegistryClientBuilder::new(mock_base_url(&server))
         .auth(auth)
         .build()
@@ -267,6 +281,7 @@ async fn get_401_retry_only_happens_once() {
         )
         .await;
     assert!(result.is_err());
+    assert_eq!(*refused.lock().unwrap(), ["token-0"]);
 }
 
 #[tokio::test]
@@ -1098,9 +1113,9 @@ async fn list_tags_does_not_request_a_page_size() {
     assert_eq!(tags, vec!["v1"]);
 }
 
-/// A streamed upload answered 401 drops the token and says so, for the
-/// caller to send it again. Breaks if the refused token is kept, or the
-/// refusal reads as any other registry error.
+/// A streamed upload answered 401 drops the token it carried and says so,
+/// for the caller to send it again. Breaks if the refused token is kept, a
+/// different one is named, or the refusal reads as any other registry error.
 #[tokio::test]
 async fn a_refused_upload_drops_the_token() {
     let server = MockServer::start().await;
@@ -1115,7 +1130,7 @@ async fn a_refused_upload_drops_the_token() {
         .expect(1)
         .mount(&server)
         .await;
-    let (auth, state) = MockAuth::new("token");
+    let (auth, refused) = RotatingMockAuth::new();
     let client = RegistryClientBuilder::new(server.uri().parse().unwrap())
         .auth(auth)
         .build()
@@ -1132,5 +1147,6 @@ async fn a_refused_upload_drops_the_token() {
         .unwrap_err();
 
     assert!(matches!(err, Error::UploadTokenRefused { .. }), "{err:?}");
-    assert_eq!(state.invalidate_count(), 1);
+    // The POST carried `token-0` and the PUT `token-1`: the PUT's is refused.
+    assert_eq!(*refused.lock().unwrap(), ["token-1"]);
 }

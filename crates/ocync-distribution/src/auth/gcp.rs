@@ -135,7 +135,8 @@ impl CachedGoogleToken {
     /// Drop the kept token if it is `refused`, so one registry's refusal
     /// does not discard a token another has fetched since.
     fn refuse(&self, refused: &google::Secret) {
-        self.token.clear_if(|kept| kept.token == *refused);
+        let refused = refused.clone();
+        self.token.refuse_if(move |kept| kept.token == refused);
     }
 }
 
@@ -393,16 +394,18 @@ impl AuthProvider for GcpAuth {
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let refused = refused.clone();
         Box::pin(async move {
             let entries = self.tokens.len();
             tracing::debug!(base_url = %self.base_url, entries, "invalidating GCP token cache");
-            self.tokens.clear();
             // The Google token stays: a refusal here is of the registry's
             // token, and the kept Google token exchanges for a new one
             // without a request to Google. An exchange that refuses the
             // Google token drops it.
-            self.challenge_cache.clear().await;
+            if self.tokens.drop_refused(&refused) {
+                self.challenge_cache.clear().await;
+            }
         })
     }
 }
@@ -813,8 +816,9 @@ mod tests {
 
         assert_eq!(password(&us).await, "ya29.user");
         assert_eq!(password(&europe).await, "ya29.user");
-        us.invalidate().await;
-        europe.invalidate().await;
+        let refused = Token::new("registry-token");
+        us.invalidate(&refused).await;
+        europe.invalidate(&refused).await;
         assert_eq!(password(&us).await, "ya29.user");
         assert_eq!(password(&europe).await, "ya29.user");
     }
@@ -987,8 +991,8 @@ mod tests {
             crate::test_http_client(),
             MockGcpTokenSource::succeeding("ya29.test"),
         );
-        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-        auth.invalidate().await;
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        auth.invalidate(&refused).await;
         // The challenge and Bearer token are fetched again: /v2/ is pinged
         // a second time.
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();

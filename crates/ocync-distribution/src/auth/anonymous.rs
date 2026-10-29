@@ -82,12 +82,14 @@ impl AuthProvider for AnonymousAuth {
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let refused = refused.clone();
         Box::pin(async move {
             let entries = self.tokens.len();
             tracing::debug!(base_url = %self.base_url, entries, "invalidating token cache");
-            self.tokens.clear();
-            self.challenge_cache.clear().await;
+            if self.tokens.drop_refused(&refused) {
+                self.challenge_cache.clear().await;
+            }
         })
     }
 }
@@ -189,8 +191,14 @@ mod tests {
             .await;
 
         let auth = AnonymousAuth::new(&server.uri().parse().unwrap(), crate::test_http_client());
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        // A refusal of some other token keeps both caches: the one `/v2/`
+        // and token request so far serve this call too.
+        auth.invalidate(&Token::new("other")).await;
+        assert!(auth.challenge_cache.get().await.is_some());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-        auth.invalidate().await;
+        auth.invalidate(&refused).await;
+        assert!(auth.challenge_cache.get().await.is_none());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }
 

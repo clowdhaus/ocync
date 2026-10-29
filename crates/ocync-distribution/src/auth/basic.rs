@@ -89,12 +89,14 @@ impl AuthProvider for BasicAuth {
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let refused = refused.clone();
         Box::pin(async move {
             let entries = self.tokens.len();
             tracing::debug!(base_url = %self.base_url, entries, "invalidating token cache");
-            self.tokens.clear();
-            self.challenge_cache.clear().await;
+            if self.tokens.drop_refused(&refused) {
+                self.challenge_cache.clear().await;
+            }
         })
     }
 }
@@ -238,8 +240,8 @@ mod tests {
             test_credentials(),
         );
         let scopes = [Scope::pull("library/nginx")];
-        auth.get_token(&scopes).await.unwrap();
-        auth.invalidate().await;
+        let refused = auth.get_token(&scopes).await.unwrap();
+        auth.invalidate(&refused).await;
         auth.get_token(&scopes).await.unwrap();
     }
 

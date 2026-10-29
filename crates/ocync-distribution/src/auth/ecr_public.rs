@@ -138,7 +138,7 @@ pub struct EcrPublicAuth {
     /// ECR Public API for credential refresh.
     api: Box<dyn EcrApi>,
     /// Cached registry credentials (username/password) with TTL-based refresh.
-    credential_cache: CredentialCache<Credentials>,
+    credential_cache: CredentialCache<Credentials, Error>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
     /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
@@ -203,7 +203,7 @@ impl EcrPublicAuth {
     /// Get or refresh registry credentials from `GetAuthorizationToken`.
     async fn ensure_credentials(&self) -> Result<Credentials, Error> {
         self.credential_cache
-            .get_or_refresh(async {
+            .get_or_refresh_sharing_failure(async {
                 tracing::debug!("ECR Public registry credentials expired or missing, refreshing");
                 let response = self.api.get_authorization_token().await.map_err(|e| {
                     tracing::warn!(error = %e, "ECR Public GetAuthorizationToken failed");
@@ -258,14 +258,17 @@ impl AuthProvider for EcrPublicAuth {
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let refused = refused.clone();
         Box::pin(async move {
             let entries = self.tokens.len();
             tracing::debug!(base_url = %self.base_url, entries, "invalidating ECR Public token cache");
-            self.tokens.clear();
-            self.challenge_cache.clear().await;
-            // Also clear registry credentials so they are re-fetched on next use.
-            self.credential_cache.clear();
+            if self.tokens.drop_refused(&refused) {
+                self.challenge_cache.clear().await;
+                // The refused token is the one kept, so the credentials
+                // behind it are suspect: fetch them again on next use.
+                self.credential_cache.clear();
+            }
         })
     }
 }
@@ -477,13 +480,13 @@ mod tests {
         );
 
         // First call fetches registry credentials (TTL=1s).
-        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
 
         // Wait for registry credentials to expire.
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Clear Bearer token cache so the next call re-checks registry credentials.
-        auth.invalidate().await;
+        auth.invalidate(&refused).await;
 
         // Second call should refresh registry credentials from the mock queue.
         // If it doesn't, the expired credentials will still work for token
@@ -525,8 +528,12 @@ mod tests {
             crate::test_http_client(),
             MockEcrApi::succeeding(&encoded),
         );
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        // A refusal of some other token keeps the caches: no second `/v2/`
+        // ping.
+        auth.invalidate(&Token::new("other")).await;
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-        auth.invalidate().await;
+        auth.invalidate(&refused).await;
         // After invalidation: registry creds re-fetched, challenge cache cleared,
         // Bearer cache cleared. /v2/ is pinged again.
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();

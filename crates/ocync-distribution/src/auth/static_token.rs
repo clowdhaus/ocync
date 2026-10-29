@@ -68,7 +68,7 @@ impl AuthProvider for StaticTokenAuth {
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn invalidate(&self, _refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {
             tracing::warn!(
                 registry = %self.registry,
@@ -104,7 +104,7 @@ mod tests {
     #[tokio::test]
     async fn static_token_errors_after_invalidate() {
         let auth = StaticTokenAuth::new("ghcr.io", "revoked-token");
-        auth.invalidate().await;
+        auth.invalidate(&Token::new("revoked-token")).await;
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
         assert!(err.to_string().contains("invalidated"), "error: {err}");
         assert!(err.to_string().contains("ghcr.io"), "error: {err}");

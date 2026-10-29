@@ -9,7 +9,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::aimd::{AimdController, RegistryAction};
-use crate::auth::{AuthProvider, Scope};
+use crate::auth::{AuthProvider, Scope, Token};
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
@@ -674,54 +674,58 @@ impl RegistryClient {
         context: &str,
         build_request: impl Fn(HeaderMap) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, Error> {
-        let headers = self.auth_headers(scopes).await?;
-        let resp = build_request(headers).send().await?;
+        let sent = self.auth_token(scopes).await?;
+        let resp = build_request(auth_headers(sent.as_ref())?).send().await?;
 
         if resp.status() != StatusCode::UNAUTHORIZED {
             return Ok(resp);
         }
 
         tracing::debug!(context, "got 401, invalidating token and retrying");
-        self.invalidate_auth().await;
-        let headers = self.auth_headers(scopes).await?;
-        Ok(build_request(headers).send().await?)
+        self.invalidate_auth(sent.as_ref()).await;
+        let retry = self.auth_token(scopes).await?;
+        Ok(build_request(auth_headers(retry.as_ref())?).send().await?)
     }
 
-    /// Invalidate the cached auth token.
+    /// Invalidate the token the registry refused with 401, if one was sent.
     ///
     /// Call this before retrying a request after a 401 response so the auth
     /// provider fetches a fresh token instead of returning the stale one.
-    pub(crate) async fn invalidate_auth(&self) {
-        if let Some(ref auth) = self.auth {
-            auth.invalidate().await;
+    /// The provider keeps any token that has replaced `refused`.
+    pub(crate) async fn invalidate_auth(&self, refused: Option<&Token>) {
+        if let (Some(auth), Some(refused)) = (&self.auth, refused) {
+            auth.invalidate(refused).await;
         }
     }
 
-    /// Build auth headers for a request.
-    pub(crate) async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
-        let mut headers = HeaderMap::new();
-
-        if let Some(ref auth) = self.auth {
-            let token = auth.get_token(scopes).await?;
-            let value = token.value();
-            if !value.is_empty() {
-                let prefix = match token.scheme() {
-                    AuthScheme::Bearer => "Bearer",
-                    AuthScheme::Basic => "Basic",
-                };
-                let header_value =
-                    HeaderValue::from_str(&format!("{prefix} {value}")).map_err(|e| {
-                        Error::InvalidHeaderValue {
-                            header: "Authorization".into(),
-                            reason: e.to_string(),
-                        }
-                    })?;
-                headers.insert(AUTHORIZATION, header_value);
-            }
+    /// The token to send with a request, or `None` with no auth provider.
+    pub(crate) async fn auth_token(&self, scopes: &[Scope]) -> Result<Option<Token>, Error> {
+        match &self.auth {
+            Some(auth) => auth.get_token(scopes).await.map(Some),
+            None => Ok(None),
         }
-
-        Ok(headers)
     }
+}
+
+/// The request headers that carry `token`, none when there is no token or
+/// its value is empty.
+pub(crate) fn auth_headers(token: Option<&Token>) -> Result<HeaderMap, Error> {
+    let mut headers = HeaderMap::new();
+    if let Some(token) = token.filter(|token| !token.value().is_empty()) {
+        let prefix = match token.scheme() {
+            AuthScheme::Bearer => "Bearer",
+            AuthScheme::Basic => "Basic",
+        };
+        let header_value =
+            HeaderValue::from_str(&format!("{prefix} {}", token.value())).map_err(|e| {
+                Error::InvalidHeaderValue {
+                    header: "Authorization".into(),
+                    reason: e.to_string(),
+                }
+            })?;
+        headers.insert(AUTHORIZATION, header_value);
+    }
+    Ok(headers)
 }
 
 /// Report AIMD permit outcome based on the HTTP response.
@@ -844,7 +848,7 @@ mod tests {
             Box::pin(async { Ok(Token::new("stub-token".to_owned())) })
         }
 
-        fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        fn invalidate(&self, _refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(async {})
         }
     }

@@ -237,7 +237,7 @@ impl AuthProvider for RotatingAuth {
         Box::pin(async move { Ok(token) })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn invalidate(&self, _refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {})
     }

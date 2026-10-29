@@ -620,7 +620,7 @@ pub struct AcrAuth {
     service: String,
     exchange_http: reqwest::Client,
     api: Box<dyn AzureTokenSource>,
-    refresh_cache: CredentialCache<String>,
+    refresh_cache: CredentialCache<String, Error>,
     tokens: TokenCache,
 }
 
@@ -664,7 +664,7 @@ impl AcrAuth {
 
     async fn ensure_refresh_token(&self) -> Result<String, Error> {
         self.refresh_cache
-            .get_or_refresh(async {
+            .get_or_refresh_sharing_failure(async {
                 tracing::debug!(service = %self.service, "ACR refresh token expired, re-acquiring");
                 let aad_access_token = self.api.get_token().await?;
                 let refresh_token = exchange_refresh_token(
@@ -724,13 +724,17 @@ impl AuthProvider for AcrAuth {
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let refused = refused.clone();
         Box::pin(async move {
             let entries = self.tokens.len();
             tracing::debug!(service = %self.service, entries, "invalidating ACR token cache");
-            self.tokens.clear();
-            self.refresh_cache.clear();
-            self.api.reset();
+            if self.tokens.drop_refused(&refused) {
+                // The refused token is the one kept, so the credentials
+                // behind it are suspect: acquire them again on next use.
+                self.refresh_cache.clear();
+                self.api.reset();
+            }
         })
     }
 }
@@ -1365,13 +1369,19 @@ mod tests {
         let reset_count = mock.reset_count.clone();
 
         let auth = AcrAuth::with_api(&server.uri(), "myregistry.azurecr.io", mock);
-        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         assert_eq!(reset_count.load(Ordering::Relaxed), 0);
-        auth.invalidate().await;
+        auth.invalidate(&Token::new("other")).await;
+        assert_eq!(
+            reset_count.load(Ordering::Relaxed),
+            0,
+            "a refusal of another token must not reset the chain"
+        );
+        auth.invalidate(&refused).await;
         assert_eq!(
             reset_count.load(Ordering::Relaxed),
             1,
-            "invalidate() must call api.reset()"
+            "a refusal of the kept token must call api.reset()"
         );
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }

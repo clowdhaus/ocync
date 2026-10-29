@@ -172,8 +172,8 @@ async fn invalidate_clears_cache() {
     );
     let scopes = [Scope::pull("library/nginx")];
 
-    let _ = auth.get_token(&scopes).await.unwrap();
-    auth.invalidate().await;
+    let refused = auth.get_token(&scopes).await.unwrap();
+    auth.invalidate(&refused).await;
     let _ = auth.get_token(&scopes).await.unwrap();
 }
 

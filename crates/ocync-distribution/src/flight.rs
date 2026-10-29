@@ -69,15 +69,17 @@ impl<K, V> Flights<K, V> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Run `drop_stored`, which drops stored values, and detach the
-    /// fetches in flight, under one lock: a caller that asks afterwards
-    /// finds neither and starts a fetch of its own, while each detached
-    /// fetch still lands, storing its value and serving the callers already
-    /// waiting on it.
-    pub(crate) fn forget(&self, drop_stored: impl FnOnce()) {
+    /// Run `drop_stored`, which drops stored values and says whether it
+    /// dropped any, and if it did detach the fetches in flight, under one
+    /// lock: a caller that asks afterwards finds neither and starts a fetch
+    /// of its own, while each detached fetch still lands and serves the
+    /// callers already waiting on it. When nothing was dropped the fetches
+    /// in flight are left alone.
+    pub(crate) fn forget(&self, drop_stored: impl FnOnce() -> bool) {
         let mut in_flight = self.lock();
-        drop_stored();
-        in_flight.clear();
+        if drop_stored() {
+            in_flight.clear();
+        }
     }
 }
 
@@ -202,11 +204,11 @@ mod tests {
         assert!(matches!(landed, Landed::Own(9)), "{landed:?}");
     }
 
-    /// A forget sends a later caller to fetch for itself, while the fetch
-    /// it detached still lands and serves the caller waiting on it, and
-    /// leaves the later fetch's entry alone. Breaks if a later caller joins
-    /// the detached fetch, its waiter is dropped, or its landing removes
-    /// the later entry and a fourth caller fetches again.
+    /// A forget that dropped something sends a later caller to fetch for
+    /// itself, while the fetch it detached still lands and serves the caller
+    /// waiting on it, and leaves the later fetch's entry alone. Breaks if a
+    /// later caller joins the detached fetch, its waiter is dropped, or its
+    /// landing removes the later entry and a fourth caller fetches again.
     #[tokio::test(flavor = "current_thread")]
     async fn a_forget_detaches_the_fetch_in_flight() {
         let flights = Flights::<(), u32>::default();
@@ -227,7 +229,7 @@ mod tests {
             flights.run(&(), || None, || async { 0 }, share),
             async {
                 tokio::task::yield_now().await;
-                flights.forget(|| ());
+                flights.forget(|| true);
                 flights.run(&(), || None, || yields(4, 2), share).await
             },
             async {
@@ -239,5 +241,25 @@ mod tests {
         assert!(matches!(waiter, Landed::Shared(1)), "{waiter:?}");
         assert!(matches!(later, Landed::Own(2)), "{later:?}");
         assert!(matches!(fourth, Landed::Shared(2)), "{fourth:?}");
+    }
+
+    /// A forget that dropped nothing leaves the fetch in flight to be
+    /// joined. Breaks if it detaches anyway and the later caller fetches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forget_that_drops_nothing_leaves_the_fetch_alone() {
+        let flights = Flights::<(), u32>::default();
+        let share = |value: &u32| Some(*value);
+        let slow = || async {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            1
+        };
+        let (leader, later) = tokio::join!(flights.run(&(), || None, slow, share), async {
+            tokio::task::yield_now().await;
+            flights.forget(|| false);
+            flights.run(&(), || None, || async { 2 }, share).await
+        });
+        assert!(matches!(leader, Landed::Own(1)), "{leader:?}");
+        assert!(matches!(later, Landed::Shared(1)), "{later:?}");
     }
 }

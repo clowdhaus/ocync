@@ -14,11 +14,23 @@ use super::Token;
 use crate::error::Error;
 use crate::flight::{Flights, Landed};
 
+/// The live tokens, each stamped with the epoch at which it was stored.
+#[derive(Debug, Default)]
+struct Tokens {
+    by_key: HashMap<String, (Token, u64)>,
+    /// Counts the stores, so a fetch can tell whether its key was stored
+    /// since it began.
+    epoch: u64,
+}
+
 /// Coalescing token cache. See the module docs.
+///
+/// A fetch that lands never overwrites a token stored for its key after the
+/// fetch began; the callers that waited on it still get its token.
 #[derive(Debug, Default)]
 pub(super) struct TokenCache {
-    cache: Mutex<HashMap<String, Token>>,
-    flights: Flights<String, Result<Token, Error>>,
+    cache: Mutex<Tokens>,
+    flights: Flights<String, (u64, Result<Token, Error>)>,
 }
 
 impl TokenCache {
@@ -26,14 +38,14 @@ impl TokenCache {
         Self::default()
     }
 
-    fn tokens(&self) -> MutexGuard<'_, HashMap<String, Token>> {
+    fn tokens(&self) -> MutexGuard<'_, Tokens> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Number of entries currently in the token cache. Used for log
     /// diagnostics on invalidation.
     pub(super) fn len(&self) -> usize {
-        self.tokens().len()
+        self.tokens().by_key.len()
     }
 
     /// Look up a cached token for `key`, or invoke `fetch` to produce
@@ -46,28 +58,59 @@ impl TokenCache {
     {
         let stored = || {
             self.tokens()
+                .by_key
                 .get(&key)
+                .map(|(token, _)| token)
                 .filter(|token| token.is_valid())
                 .cloned()
-                .map(Ok)
+                // The epoch of a stored token is not read.
+                .map(|token| (0, Ok(token)))
         };
-        let land = |result: &Result<Token, Error>| {
+        let fetch = || {
+            let began = self.tokens().epoch;
+            async move { (began, fetch().await) }
+        };
+        let land = |landed: &(u64, Result<Token, Error>)| {
+            let (began, result) = landed;
             if let Ok(token) = result {
-                self.tokens().insert(key.clone(), token.clone());
+                let mut tokens = self.tokens();
+                let overtaken = tokens
+                    .by_key
+                    .get(&key)
+                    .is_some_and(|(_, stored_at)| stored_at > began);
+                if !overtaken {
+                    tokens.epoch += 1;
+                    let stored_at = tokens.epoch;
+                    tokens
+                        .by_key
+                        .insert(key.clone(), (token.clone(), stored_at));
+                }
             }
-            Some(result.clone())
+            Some(landed.clone())
         };
         match self.flights.run(&key, stored, fetch, land).await {
-            Landed::Own(result) | Landed::Shared(result) => result,
+            Landed::Own((_, result)) | Landed::Shared((_, result)) => result,
         }
     }
 
-    /// Drop every cached token, and detach the exchanges in flight: a
-    /// caller that asks afterwards exchanges again rather than joining one
-    /// that may be using a refused credential. A detached exchange still
-    /// stores its token when it lands.
-    pub(super) fn clear(&self) {
-        self.flights.forget(|| self.tokens().clear());
+    /// Drop every cached token that is `refused`, and if any was, detach
+    /// the exchanges in flight: a caller that asks afterwards exchanges
+    /// again rather than joining one that may be using the credential
+    /// behind the refused token. A detached exchange still serves the
+    /// callers waiting on it, and stores its token only if nothing newer is
+    /// stored for its scope. Returns whether any token was dropped. When
+    /// none was, the cache and the exchanges in flight are left alone.
+    pub(super) fn drop_refused(&self, refused: &Token) -> bool {
+        let mut dropped = false;
+        self.flights.forget(|| {
+            self.tokens().by_key.retain(|_, (token, _)| {
+                let keep = token != refused;
+                dropped |= !keep;
+                keep
+            });
+            dropped
+        });
+        dropped
     }
 }
 
@@ -204,12 +247,16 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
-    /// A caller that asks after a clear exchanges for itself rather than
-    /// joining the exchange in flight. Breaks if the clear leaves it to
-    /// be joined.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_clear_detaches_the_exchange_in_flight() {
+    /// When an exchange is in flight for a scope whose kept token is
+    /// `kept`, run `exchange` for a refusal of `refused`, then ask again:
+    /// the exchange count says whether the second ask joined the first.
+    async fn ask_during_a_flight(refused: &str) -> (Token, Token, usize) {
         let cache = TokenCache::new();
+        let kept = Token::with_ttl("kept", Duration::from_secs(10));
+        cache
+            .get_or_fetch("scope".to_string(), || async { Ok(kept) })
+            .await
+            .unwrap();
         let exchanges = std::cell::Cell::new(0);
         let exchange = |value: &'static str| {
             let exchanges = &exchanges;
@@ -220,45 +267,136 @@ mod tests {
                 Ok(token(value))
             }
         };
-        let (before, after) = tokio::join!(
-            cache.get_or_fetch("scope".to_string(), || exchange("refused")),
+        let (first, second) = tokio::join!(
+            cache.get_or_fetch("scope".to_string(), || exchange("first")),
             async {
                 tokio::task::yield_now().await;
-                cache.clear();
+                cache.drop_refused(&token(refused));
                 cache
-                    .get_or_fetch("scope".to_string(), || exchange("fresh"))
+                    .get_or_fetch("scope".to_string(), || exchange("second"))
                     .await
             },
         );
-        assert_eq!(before.unwrap().value(), "refused");
-        assert_eq!(after.unwrap().value(), "fresh");
-        assert_eq!(exchanges.get(), 2);
+        (first.unwrap(), second.unwrap(), exchanges.get())
     }
 
+    /// Dropping the refused token detaches the exchange in flight, so a
+    /// caller that asks afterwards exchanges for itself. Breaks if the drop
+    /// leaves the exchange to be joined.
     #[tokio::test(flavor = "current_thread")]
-    async fn clear_drops_the_cache() {
-        // Seed the cache.
+    async fn dropping_the_refused_token_detaches_the_exchange_in_flight() {
+        let (first, second, exchanges) = ask_during_a_flight("kept").await;
+        assert_eq!(first.value(), "first");
+        assert_eq!(second.value(), "second");
+        assert_eq!(exchanges, 2);
+    }
+
+    /// A refusal of some other token leaves the exchange in flight to be
+    /// joined. Breaks if any refusal detaches it, as a stale refusal then
+    /// costs an extra exchange.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refusal_of_another_token_leaves_the_exchange_alone() {
+        let (first, second, exchanges) = ask_during_a_flight("other").await;
+        assert_eq!(first.value(), "first");
+        assert_eq!(second.value(), "first");
+        assert_eq!(exchanges, 1);
+    }
+
+    /// An exchange detached by a drop does not overwrite the token a later
+    /// exchange stored for its scope. Breaks if a landing stores over a
+    /// token stored after it began.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_detached_exchange_does_not_overwrite_a_newer_token() {
         let cache = TokenCache::new();
+        let kept = Token::with_ttl("kept", Duration::from_secs(10));
         cache
-            .get_or_fetch("scope".to_string(), || async { Ok(token("first")) })
+            .get_or_fetch("scope".to_string(), || async { Ok(kept.clone()) })
             .await
             .unwrap();
+        let slow = async {
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            Ok(token("old"))
+        };
+        let (old, new) = tokio::join!(cache.get_or_fetch("scope".to_string(), || slow), async {
+            tokio::task::yield_now().await;
+            cache.drop_refused(&kept);
+            cache
+                .get_or_fetch("scope".to_string(), || async { Ok(token("new")) })
+                .await
+        },);
+        assert_eq!(old.unwrap().value(), "old");
+        assert_eq!(new.unwrap().value(), "new");
+        let kept = cache
+            .get_or_fetch("scope".to_string(), || async { Ok(token("unexpected")) })
+            .await
+            .unwrap();
+        assert_eq!(kept.value(), "new");
+    }
+
+    /// An exchange for one scope that lands after another scope's keeps its
+    /// token. Breaks if a store for one scope makes the landing of another
+    /// look overtaken, and every caller of it exchanges again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_store_for_another_scope_does_not_overtake_an_exchange() {
+        let cache = TokenCache::new();
+        let slow = async {
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            Ok(token("a"))
+        };
+        let (a, b) = tokio::join!(
+            cache.get_or_fetch("scope-a".to_string(), || slow),
+            cache.get_or_fetch("scope-b".to_string(), || async { Ok(token("b")) }),
+        );
+        assert_eq!((a.unwrap().value(), b.unwrap().value()), ("a", "b"));
+        let exchanges = std::cell::Cell::new(0);
+        for scope in ["scope-a", "scope-b"] {
+            cache
+                .get_or_fetch(scope.to_string(), || async {
+                    exchanges.set(exchanges.get() + 1);
+                    Ok(token("again"))
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(exchanges.get(), 0);
+    }
+
+    /// Only the refused token is dropped. Breaks if a refusal drops every
+    /// token, or one that is not the refused one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_refused_drops_only_the_refused_token() {
+        let cache = TokenCache::new();
+        for (scope, value) in [("scope-a", "a"), ("scope-b", "b")] {
+            cache
+                .get_or_fetch(scope.to_string(), || async { Ok(token(value)) })
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.len(), 2);
+
+        assert!(!cache.drop_refused(&token("other")));
+        assert_eq!(cache.len(), 2);
+
+        assert!(cache.drop_refused(&token("a")));
         assert_eq!(cache.len(), 1);
 
-        cache.clear();
-        assert_eq!(cache.len(), 0);
-
-        // Post-clear, a same-key fetch must reach the fetcher again.
+        // The refused scope reaches the fetcher again; the other does not.
         let attempts = Arc::new(AtomicUsize::new(0));
-        let attempts_ref = Arc::clone(&attempts);
-        let t = cache
-            .get_or_fetch("scope".to_string(), || async move {
-                attempts_ref.fetch_add(1, Ordering::SeqCst);
-                Ok(token("second"))
-            })
-            .await
-            .unwrap();
-        assert_eq!(t.value(), "second");
+        for (scope, expected) in [("scope-a", "second"), ("scope-b", "b")] {
+            let attempts = Arc::clone(&attempts);
+            let t = cache
+                .get_or_fetch(scope.to_string(), || async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(token("second"))
+                })
+                .await
+                .unwrap();
+            assert_eq!(t.value(), expected);
+        }
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }
