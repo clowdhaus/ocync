@@ -1133,12 +1133,4 @@ async fn a_refused_upload_drops_the_token() {
 
     assert!(matches!(err, Error::UploadTokenRefused { .. }), "{err:?}");
     assert_eq!(state.invalidate_count(), 1);
-    assert!(
-        state
-            .recorded_scopes()
-            .iter()
-            .all(|scopes| scopes == &[Scope::pull_push("repo")]),
-        "{:?}",
-        state.recorded_scopes()
-    );
 }

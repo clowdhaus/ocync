@@ -198,6 +198,12 @@ pub(crate) fn retries_made() -> u32 {
     RETRIES.try_with(Cell::get).unwrap_or(0)
 }
 
+/// Count one retry against the enclosing [`count_retries`]. Outside one (the
+/// CLI's own walks) there is no image to attribute it to.
+fn record_retry() {
+    let _ = RETRIES.try_with(|n| n.set(n.get() + 1));
+}
+
 /// Whether [`with_retry`] has sent a refused upload again yet.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TokenRetry {
@@ -236,9 +242,9 @@ where
             Err(ocync_distribution::Error::UploadTokenRefused { message })
                 if refusal == TokenRetry::Available =>
             {
-                tracing::warn!(operation, message, "retrying under a new token");
+                tracing::warn!(operation, error = %message, "retrying under a new token");
                 refusal = TokenRetry::Spent;
-                let _ = RETRIES.try_with(|n| n.set(n.get() + 1));
+                record_retry();
             }
             Err(e) => {
                 let retryable = if let Some(status) = e.status_code() {
@@ -261,9 +267,7 @@ where
                     );
                     tokio::time::sleep(backoff).await;
                     attempt += 1;
-                    // Outside `count_retries` (the CLI's own walks) there is
-                    // no image to attribute the retry to.
-                    let _ = RETRIES.try_with(|n| n.set(n.get() + 1));
+                    record_retry();
                     continue;
                 }
                 return Err(e);
