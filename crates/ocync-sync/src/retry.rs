@@ -198,6 +198,19 @@ pub(crate) fn retries_made() -> u32 {
     RETRIES.try_with(Cell::get).unwrap_or(0)
 }
 
+/// Count one retry against the enclosing [`count_retries`]. Outside one (the
+/// CLI's own walks) there is no image to attribute it to.
+fn record_retry() {
+    let _ = RETRIES.try_with(|n| n.set(n.get() + 1));
+}
+
+/// Whether [`with_retry`] has sent a refused upload again yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenRetry {
+    Available,
+    Spent,
+}
+
 /// Retry an async operation with exponential backoff on transient errors.
 ///
 /// Calls `f()` in a loop. Retries on HTTP 408/429/5xx, transport-level
@@ -206,6 +219,11 @@ pub(crate) fn retries_made() -> u32 {
 /// [`is_blob_upload_unknown`] (ECR returns this code on manifest
 /// push when blob upload PUT-201s haven't fully propagated).
 /// Waits with jittered exponential backoff up to `config.max_retries` times.
+///
+/// A streamed upload answered 401, whose token the client has dropped, is
+/// sent once more at once, outside that budget: nothing is throttled, and a
+/// second refusal is the credential's, not the token's age.
+///
 /// Returns the first `Ok` or the final `Err`.
 pub async fn with_retry<T, F, Fut>(
     config: &RetryConfig,
@@ -217,9 +235,17 @@ where
     Fut: Future<Output = Result<T, ocync_distribution::Error>>,
 {
     let mut attempt = 0;
+    let mut refusal = TokenRetry::Available;
     loop {
         match f().await {
             Ok(val) => return Ok(val),
+            Err(ocync_distribution::Error::UploadTokenRefused { message })
+                if refusal == TokenRetry::Available =>
+            {
+                tracing::warn!(operation, error = %message, "retrying under a new token");
+                refusal = TokenRetry::Spent;
+                record_retry();
+            }
             Err(e) => {
                 let retryable = if let Some(status) = e.status_code() {
                     should_retry(status, attempt, config.max_retries)
@@ -241,9 +267,7 @@ where
                     );
                     tokio::time::sleep(backoff).await;
                     attempt += 1;
-                    // Outside `count_retries` (the CLI's own walks) there is
-                    // no image to attribute the retry to.
-                    let _ = RETRIES.try_with(|n| n.set(n.get() + 1));
+                    record_retry();
                     continue;
                 }
                 return Err(e);
@@ -467,6 +491,50 @@ mod tests {
             source: std::io::Error::other("staging read failed").into(),
         };
         assert!(!should_retry_transport(&err));
+    }
+
+    /// A streamed upload whose token was refused is sent once more at once,
+    /// after any transient retries, and a second refusal is final. Breaks if
+    /// the refusal is never retried, waits out a backoff, is retried only on
+    /// the first attempt, or is retried until the attempts run out.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_upload_token_is_retried_once() {
+        #[derive(Clone, Copy, Debug)]
+        enum Failure {
+            Refused,
+            Unavailable,
+        }
+        use Failure::{Refused, Unavailable};
+        let config = RetryConfig::default();
+        // Each case: the failures before success, the calls made, whether it
+        // succeeds, and whether it waited out a backoff.
+        let cases: [(&[Failure], usize, bool, bool); 3] = [
+            (&[Refused], 2, true, false),
+            (&[Unavailable, Refused], 3, true, true),
+            (&[Refused, Refused, Refused], 2, false, false),
+        ];
+        for (failures, expected_calls, succeeds, waits) in cases {
+            let calls = Cell::new(0);
+            let started = tokio::time::Instant::now();
+            let result = with_retry(&config, "blob transfer", || {
+                let call = calls.get();
+                calls.set(call + 1);
+                let failure = failures.get(call).map(|failure| match failure {
+                    Refused => ocync_distribution::Error::UploadTokenRefused {
+                        message: "registry/repo".into(),
+                    },
+                    Unavailable => ocync_distribution::Error::RegistryError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: "registry/repo".into(),
+                    },
+                });
+                async move { failure.map_or(Ok(()), Err) }
+            })
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "{failures:?}");
+            assert_eq!(calls.get(), expected_calls, "{failures:?}");
+            assert_eq!(started.elapsed() > Duration::ZERO, waits, "{failures:?}");
+        }
     }
 
     /// Positive-path test: a real reqwest connection failure (refused port)

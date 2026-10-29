@@ -3,10 +3,17 @@
 
 mod helpers;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use ocync_distribution::RegistryClientBuilder;
+use ocync_distribution::auth::{AuthProvider, Scope, Token};
 use ocync_distribution::spec::MediaType;
 use ocync_sync::engine::TagPair;
 use ocync_sync::{ImageStatus, SkipReason};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use helpers::*;
@@ -210,6 +217,67 @@ async fn sync_blob_transfer_retries_on_source_500() {
     let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(report.stats.blobs_transferred, 2);
+}
+
+/// Hands out `token-0`, then `token-1` after an invalidation, and so on.
+struct RotatingAuth(AtomicU32);
+
+impl AuthProvider for RotatingAuth {
+    fn name(&self) -> &'static str {
+        "rotating"
+    }
+
+    fn get_token(
+        &self,
+        _scopes: &[Scope],
+    ) -> Pin<Box<dyn Future<Output = Result<Token, ocync_distribution::Error>> + Send + '_>> {
+        let token = Token::new(format!("token-{}", self.0.load(Ordering::SeqCst)));
+        Box::pin(async move { Ok(token) })
+    }
+
+    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {})
+    }
+}
+
+/// A blob upload the target answers with 401 drops the token and is sent
+/// again under a new one, and the image syncs. Breaks if the refusal fails
+/// the image, or the upload is resent with the refused token.
+#[tokio::test]
+async fn sync_retries_an_upload_whose_token_was_refused() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let parts = ManifestBuilder::new(b"config").layer(b"layer-data").build();
+    parts.mount_source(&source_server, "repo", "v1").await;
+    Mock::given(method("PUT"))
+        .and(query_param(
+            "digest",
+            parts.layer_descs[0].digest.to_string(),
+        ))
+        .and(header("authorization", "Bearer token-0"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(1)
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    parts.mount_target(&target_server, "repo", "v1").await;
+
+    let target = RegistryClientBuilder::new(mock_url(&target_server))
+        .auth(RotatingAuth(AtomicU32::new(0)))
+        .build()
+        .unwrap();
+    let mapping = resolved_mapping(
+        mock_client(&source_server),
+        "repo",
+        "repo",
+        vec![target_entry("target", Arc::new(target))],
+        vec![TagPair::same("v1")],
+    );
+    let report = run_sync(vec![mapping]).await;
+
     assert_status!(report, 0, ImageStatus::Synced);
     assert_eq!(report.stats.blobs_transferred, 2);
 }

@@ -131,6 +131,16 @@ pub enum Error {
         message: String,
     },
 
+    /// The registry answered a streamed blob upload with 401 Unauthorized.
+    /// The body was the stream itself and cannot be sent again, so the token
+    /// is dropped and the upload is left for the caller to send again, from
+    /// the start, under a new one.
+    #[error("registry answered the upload with 401 Unauthorized: {message}")]
+    UploadTokenRefused {
+        /// Human-readable context (typically registry/repository and response body).
+        message: String,
+    },
+
     /// A URL could not be constructed or joined.
     #[error("URL construction failed for '{path}': {reason}")]
     UrlConstruction {
@@ -244,6 +254,7 @@ impl Error {
     pub fn status_code(&self) -> Option<http::StatusCode> {
         match self {
             Self::RegistryError { status, .. } => Some(*status),
+            Self::UploadTokenRefused { .. } => Some(http::StatusCode::UNAUTHORIZED),
             _ => None,
         }
     }
@@ -257,12 +268,13 @@ impl Error {
     ///
     /// Returns `true` for [`AuthFailed`](Self::AuthFailed) errors, a token
     /// endpoint's 4xx other than 408 Request Timeout and 429 Too Many
-    /// Requests, Google credentials
-    /// that fail for good, and registry responses with HTTP 401 Unauthorized
-    /// or 403 Forbidden status codes.
+    /// Requests, Google credentials that fail for good, a refused upload
+    /// ([`UploadTokenRefused`](Self::UploadTokenRefused)), and registry
+    /// responses with HTTP 401 Unauthorized or 403 Forbidden status codes.
     pub fn is_auth_error(&self) -> bool {
         match self {
             Self::AuthFailed { .. }
+            | Self::UploadTokenRefused { .. }
             | Self::GoogleCredentials {
                 transience: Transience::Final,
                 ..
@@ -614,6 +626,17 @@ mod tests {
             status: http::StatusCode::UNAUTHORIZED,
             message: "denied".into(),
         };
+        assert!(err.is_auth_error());
+    }
+
+    /// A refused upload reports 401 and counts as an auth error, like any
+    /// other 401 from a registry. Breaks if either is lost.
+    #[test]
+    fn upload_token_refused_is_a_401_auth_error() {
+        let err = Error::UploadTokenRefused {
+            message: "registry/repo".into(),
+        };
+        assert_eq!(err.status_code(), Some(http::StatusCode::UNAUTHORIZED));
         assert!(err.is_auth_error());
     }
 
