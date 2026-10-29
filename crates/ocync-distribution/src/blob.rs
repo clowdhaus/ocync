@@ -81,7 +81,7 @@ async fn expect_status(
 /// `min(n, MAX_BUFFER_PREALLOC)` bytes -- the manifest-declared size
 /// is capped at [`MAX_BUFFER_PREALLOC`] because the hint is
 /// attacker-controllable; larger streams grow the `Vec` organically via
-/// amortised doubling. Used by fallback upload paths (GAR, GHCR, ACR)
+/// amortised doubling. Used by fallback upload paths (GHCR, ACR)
 /// that cannot stream chunks to the registry.
 async fn buffer_stream(
     stream: impl Stream<Item = Result<Bytes, Error>>,
@@ -251,10 +251,6 @@ impl RegistryClient {
     /// upload is broken - each PATCH overwrites all previous chunks. Blobs
     /// pushed to `ghcr.io` use a single PATCH with no `Content-Range` header.
     ///
-    /// **GAR fallback**: Google Artifact Registry does not support chunked
-    /// uploads, so hosts ending in `-docker.pkg.dev` buffer the entire stream
-    /// and delegate to [`blob_push`](Self::blob_push).
-    ///
     /// **ACR fallback**: Azure Container Registry rejects streaming PUT bodies
     /// above ~20 MB. Hosts on `*.azurecr.io` buffer the stream and upload via
     /// multiple chunked `PATCHes` under [`ACR_PATCH_CHUNK_SIZE`] each, then PUT
@@ -289,15 +285,6 @@ impl RegistryClient {
                     .blob_push_stream_ghcr(repository, expected_digest, known_size, stream)
                     .await;
             }
-            // GAR: buffer entire stream and use monolithic push.
-            // GAR (Artifact Registry) does not support chunked uploads;
-            // legacy gcr.io hosts support it fine, so only Gar triggers
-            // this path.
-            Some(ProviderKind::Gar) => {
-                return self
-                    .blob_push_stream_gar(repository, expected_digest, known_size, stream)
-                    .await;
-            }
             // ACR: chunked PATCH under ACR's ~20 MB streaming-PUT body
             // limit. Buffers the stream so the digest can be verified
             // before any PATCH fires (avoids wasted upload bandwidth on
@@ -308,11 +295,15 @@ impl RegistryClient {
                     .await;
             }
             // Default: streaming PUT below. Every other ProviderKind
-            // (Ecr, EcrPublic, Gcr, DockerHub, Chainguard) uses the
+            // (Ecr, EcrPublic, Gar, Gcr, DockerHub, Chainguard) uses the
             // default path; new variants must be added here explicitly.
+            // Artifact Registry answers a second PATCH in one session with
+            // 405 and a monolithic POST with 502, but takes the streaming
+            // PUT.
             Some(
                 ProviderKind::Ecr
                 | ProviderKind::EcrPublic
+                | ProviderKind::Gar
                 | ProviderKind::Gcr
                 | ProviderKind::DockerHub
                 | ProviderKind::Chainguard,
@@ -367,7 +358,7 @@ impl RegistryClient {
     /// POST `/v2/{repository}/blobs/uploads/` to initiate an upload session.
     ///
     /// Returns the upload URL extracted from the response's `Location` header.
-    /// Shared by every blob upload path (monolithic, streaming, GHCR/GAR/ACR
+    /// Shared by every blob upload path (monolithic, streaming, GHCR/ACR
     /// fallbacks) so the response-classification, expected-status, and
     /// Location-extraction sequence has a single implementation.
     async fn initiate_blob_upload(
@@ -384,45 +375,6 @@ impl RegistryClient {
             .await?;
         let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
         extract_location(&resp, &self.base_url)
-    }
-
-    /// GAR fallback: buffer the entire stream and delegate to monolithic push.
-    ///
-    /// Google Artifact Registry does not support chunked uploads, so the
-    /// entire stream is buffered in memory and sent as a monolithic upload.
-    /// The digest returned by the monolithic push is verified against the
-    /// caller's expected digest to catch data corruption.
-    async fn blob_push_stream_gar(
-        &self,
-        repository: &RepositoryName,
-        expected_digest: &Digest,
-        known_size: Option<u64>,
-        stream: impl Stream<Item = Result<Bytes, Error>>,
-    ) -> Result<Digest, Error> {
-        warn!(
-            repository = repository.as_str(),
-            host = self.base_url.host_str().unwrap_or("unknown"),
-            "GAR does not support chunked uploads; buffering entire blob in memory"
-        );
-        // Two complementary caps for buffered fallback uploads:
-        //   1. `blob_upload_sem` bounds the *count* of in-flight
-        //      buffered uploads, the same cap as streamed uploads.
-        //   2. `buffered_blob_bytes_sem` bounds total *bytes* held
-        //      across in-flight buffered uploads.
-        // The helper acquires both in the right order; the returned
-        // tuple drops bytes_permit before upload_permit on scope exit.
-        let _permits = self.acquire_buffered_upload_permits(known_size).await;
-        let body = buffer_stream(stream, known_size).await?;
-        let actual_digest = self.blob_push(repository, &body).await?;
-
-        if &actual_digest != expected_digest {
-            return Err(Error::DigestMismatch {
-                expected: expected_digest.clone(),
-                actual: actual_digest,
-            });
-        }
-
-        Ok(actual_digest)
     }
 
     /// GHCR fallback: single PATCH upload to avoid multi-PATCH corruption.
@@ -444,7 +396,7 @@ impl RegistryClient {
         );
 
         // Count cap (h2-stream) + byte cap (cross-call memory budget).
-        // See `blob_push_stream_gar` for the layering rationale.
+        // See `acquire_buffered_upload_permits` for the layering rationale.
         let _permits = self.acquire_buffered_upload_permits(known_size).await;
         let scopes = [Scope::pull_push(repository.as_str())];
         let upload_url = self
@@ -527,7 +479,7 @@ impl RegistryClient {
         );
 
         // Count cap (h2-stream) + byte cap (cross-call memory budget).
-        // See `blob_push_stream_gar` for the layering rationale.
+        // See `acquire_buffered_upload_permits` for the layering rationale.
         let _permits = self.acquire_buffered_upload_permits(known_size).await;
 
         let raw = buffer_stream(stream, known_size).await?;
@@ -859,56 +811,6 @@ mod tests {
         futures_util::stream::iter(chunks)
     }
 
-    #[tokio::test]
-    async fn blob_push_stream_gar_uses_monolithic_upload() {
-        let server = wiremock::MockServer::start().await;
-        let data = b"gar blob content";
-        let digest = test_digest(data);
-        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
-
-        // POST: initiate monolithic upload.
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path(
-                "/v2/my-project/my-repo/blobs/uploads/",
-            ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202)
-                    .append_header("Location", "/v2/my-project/my-repo/blobs/uploads/gar-uuid"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // PUT: monolithic upload with full body.
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::query_param(
-                "digest",
-                digest.to_string(),
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(201))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // PATCH: must NOT be called for GAR.
-        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
-            .respond_with(wiremock::ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let client = build_test_client("us-docker.pkg.dev", port);
-
-        let repo = RepositoryName::new("my-project/my-repo").unwrap();
-        let result = client
-            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
-            .await
-            .unwrap();
-
-        assert_eq!(result, digest);
-    }
-
-    /// GHCR: single PATCH with Content-Length, no Content-Range.
     #[tokio::test]
     async fn blob_push_stream_ghcr_uses_single_patch() {
         let server = wiremock::MockServer::start().await;
@@ -1459,10 +1361,18 @@ mod tests {
         }
     }
 
-    /// Default upload path uses streaming PUT (POST + PUT). PATCH must
-    /// never be called - the entire blob flows through a single PUT request.
+    /// The default upload path, Artifact Registry's included, sends the
+    /// blob as one streaming PUT after the POST: no PATCH, and no
+    /// `Content-Length`, as the body is never buffered. Breaks if a host
+    /// takes a buffered or chunked path.
     #[tokio::test]
     async fn blob_push_stream_uses_streaming_put() {
+        for host in ["registry.example.com", "us-docker.pkg.dev"] {
+            streams_one_put(host).await;
+        }
+    }
+
+    async fn streams_one_put(host: &str) {
         let server = wiremock::MockServer::start().await;
         let data = b"streaming upload blob data";
         let digest = test_digest(data);
@@ -1497,7 +1407,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_test_client("registry.example.com", port);
+        let client = build_test_client(host, port);
 
         let repo = RepositoryName::new("stream/repo").unwrap();
         let result = client
@@ -1505,11 +1415,22 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, digest);
+        assert_eq!(result, digest, "{host}");
+        let requests = server.received_requests().await.unwrap();
+        let put = requests
+            .iter()
+            .find(|request| request.method == wiremock::http::Method::PUT)
+            .unwrap();
+        assert!(
+            !put.headers.contains_key("content-length"),
+            "{host}: {:?}",
+            put.headers
+        );
+        assert_eq!(put.body, data, "{host}");
     }
 
     /// Pins the byte-budget queueing contract for the buffered fallback
-    /// paths (GHCR / GAR / ACR).
+    /// paths (GHCR / ACR).
     ///
     /// Two concurrent GHCR uploads, each declaring half the budget plus
     /// a few bytes, would together exceed the byte budget if they ran

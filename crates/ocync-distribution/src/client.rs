@@ -63,8 +63,8 @@ const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: usize = DEFAULT_BLOB_UPLOAD_CONCURRENCY
 
 /// Default per-target byte budget for in-flight buffered blob bodies.
 ///
-/// The fallback upload paths (GHCR single-PATCH, GAR monolithic PUT, ACR
-/// chunked PATCH) all buffer the entire blob in memory because the target
+/// The fallback upload paths (GHCR single-PATCH, ACR chunked PATCH) both
+/// buffer the entire blob in memory because the target
 /// registry cannot accept a streaming body. With
 /// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] = 64 and no byte cap, 64
 /// concurrent 1 GB layers (common for CUDA/ML images) would hold ~64 GB
@@ -100,7 +100,7 @@ pub struct RegistryClientBuilder {
     /// [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
     blob_download_concurrency: usize,
     /// Byte budget for in-flight buffered blob bodies on fallback upload
-    /// paths (GHCR / GAR / ACR). Defaults to [`DEFAULT_BUFFERED_BLOB_BYTES`].
+    /// paths (GHCR / ACR). Defaults to [`DEFAULT_BUFFERED_BLOB_BYTES`].
     buffered_blob_bytes: usize,
     /// Static DNS overrides applied to the internal reqwest client.
     /// Each entry maps a hostname to a fixed socket address, bypassing
@@ -197,7 +197,7 @@ impl RegistryClientBuilder {
     /// Set the byte budget for in-flight buffered blob bodies.
     ///
     /// Caps total resident memory across the fallback upload paths
-    /// (GHCR / GAR / ACR) that must buffer a blob before sending. Each
+    /// (GHCR / ACR) that must buffer a blob before sending. Each
     /// fallback upload acquires permits equal to its declared blob size
     /// (capped at the budget) and releases them when the upload
     /// completes; concurrent uploads that would exceed the budget queue.

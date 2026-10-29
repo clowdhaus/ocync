@@ -327,7 +327,7 @@ Each registry has different upload protocol requirements. The engine detects the
 | ECR | POST + streaming PUT | 2 | `Transfer-Encoding: chunked`, zero buffering |
 | Docker Hub | POST + streaming PUT | 2 | Same streaming path as ECR |
 | GHCR | POST + single PATCH + PUT | 3 | Multi-PATCH broken (last PATCH overwrites previous chunks). Single PATCH without `Content-Range` headers. Blob size from source manifest descriptor sets `Content-Length` on the streaming body |
-| GAR | POST + buffered monolithic PUT | 2 | PATCH errors entirely. Full blob buffered in memory |
+| GAR | POST + streaming PUT | 2 | Same streaming path as ECR. A second PATCH in one session answers 405 and a monolithic POST answers 502 |
 | ACR | POST + streaming PUT | 2 | Known ~20 MB body limit; chunked PATCH not yet implemented |
 
 The GHCR fallback is a correctness fix, not an optimization. GHCR's chunked upload implementation is broken: the last PATCH overwrites all previous chunks. Any blob larger than `chunk_size` pushed via multi-PATCH produces silently corrupt data because `CompleteLayerUpload` succeeds but the blob contains only the final chunk. This is a documented conformance gap.
@@ -434,7 +434,7 @@ Rejected. Partitioning concurrency permits by measured throughput does not reduc
 
 ### Chunk-level upload resume
 
-Rejected. Medium implementation complexity. Only helps for multi-GB blobs on ECR/Hub/ACR (not GAR/GHCR which do not support chunked uploads). The existing retry (restart pull+push) is sufficient. Revisit when users report large-blob failure issues.
+Rejected. Medium implementation complexity. Only helps for multi-GB blobs on ECR/Hub/ACR (not GAR/GHCR, which reject a second PATCH in one upload). The existing retry (restart pull+push) is sufficient. Revisit when users report large-blob failure issues.
 
 ### Full dynamic priority scheduler
 

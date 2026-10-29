@@ -20,7 +20,7 @@ See the [GCP ADC docs](https://cloud.google.com/docs/authentication/application-
 Notable behaviors:
 
 - The OAuth2 access token is sent as the password half of HTTP Basic credentials (username `oauth2accesstoken`) to drive a standard OCI `/v2/token` Bearer exchange. This matches what `gcloud auth configure-docker` writes into the docker config.
-- Monolithic uploads: GAR does not support OCI chunked uploads. ocync buffers the full blob in memory and performs a single PUT, so RSS scales with blob size during pushes; a 2 GB layer spikes memory accordingly.
+- Streaming uploads: ocync uploads each blob as a POST followed by one streaming PUT (`Transfer-Encoding: chunked`), so memory does not grow with blob size. On 2026-10-28 that path peaked at 21.6 MB while pushing 382,663,875 bytes across 8 blobs, where buffering each blob for a single PUT peaked at 452.8 MB for 224,330,551 bytes. A second PATCH in one upload session answers 405, and a monolithic POST answers 502, so ocync uses neither.
 - Cross-repo blob mounts between two images in the same Artifact Registry repository are fulfilled: on 2026-10-28 a sync into `<repo>/main/static` mounted all 4 blobs an earlier sync had pushed to `<repo>/branch/static` in the same repository, transferring 0 bytes. Mounts between different repositories have not been tested. ocync attempts the mount POST anyway (cheap, ~100 ms) and falls through to upload on 202.
 - GAR enforces a single per-project quota across all operation types; ocync uses one AIMD window per project rather than per-action.
 - The access token is kept for its real lifetime, from the token endpoint's `expires_in` or impersonation's `expireTime`, and fetched again 30 seconds before it expires.
