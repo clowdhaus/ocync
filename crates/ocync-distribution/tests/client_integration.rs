@@ -1097,3 +1097,48 @@ async fn list_tags_does_not_request_a_page_size() {
     let tags = client.list_tags(&repo).await.unwrap();
     assert_eq!(tags, vec!["v1"]);
 }
+
+/// A streamed upload answered 401 drops the token and says so, for the
+/// caller to send it again. Breaks if the refused token is kept, or the
+/// refusal reads as any other registry error.
+#[tokio::test]
+async fn a_refused_upload_drops_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(202).append_header("Location", "/v2/repo/blobs/uploads/id"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (auth, state) = MockAuth::new("token");
+    let client = RegistryClientBuilder::new(server.uri().parse().unwrap())
+        .auth(auth)
+        .build()
+        .unwrap();
+
+    let repo = RepositoryName::new("repo").unwrap();
+    let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        .parse()
+        .unwrap();
+    let body = futures_util::stream::iter([Ok::<_, Error>(bytes::Bytes::from_static(b"blob"))]);
+    let err = client
+        .blob_push_stream(&repo, &digest, None, body)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::UploadTokenRefused { .. }), "{err:?}");
+    assert_eq!(state.invalidate_count(), 1);
+    assert!(
+        state
+            .recorded_scopes()
+            .iter()
+            .all(|scopes| scopes == &[Scope::pull_push("repo")]),
+        "{:?}",
+        state.recorded_scopes()
+    );
+}

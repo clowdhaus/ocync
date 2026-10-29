@@ -214,8 +214,8 @@ async fn sync_blob_transfer_retries_on_source_500() {
     assert_eq!(report.stats.blobs_transferred, 2);
 }
 
-/// A blob upload whose token the target refuses is sent again under a new
-/// token, and the image syncs. Breaks if the refusal fails the image.
+/// A blob upload the target answers with 401 is sent again, and the image
+/// syncs. Breaks if the refusal fails the image.
 #[tokio::test]
 async fn sync_retries_an_upload_whose_token_was_refused() {
     let source_server = MockServer::start().await;

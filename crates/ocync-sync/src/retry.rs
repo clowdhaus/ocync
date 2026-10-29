@@ -198,11 +198,11 @@ pub(crate) fn retries_made() -> u32 {
     RETRIES.try_with(Cell::get).unwrap_or(0)
 }
 
-/// A streamed upload whose token the registry refused, which the client
-/// has dropped. Sent once more, under a new token; a second refusal is the
-/// credential's, not the token's age.
-fn is_refused_upload_token(error: &ocync_distribution::Error) -> bool {
-    matches!(error, ocync_distribution::Error::UploadTokenRefused { .. })
+/// Whether [`with_retry`] has sent a refused upload again yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenRetry {
+    Available,
+    Spent,
 }
 
 /// Retry an async operation with exponential backoff on transient errors.
@@ -213,6 +213,11 @@ fn is_refused_upload_token(error: &ocync_distribution::Error) -> bool {
 /// [`is_blob_upload_unknown`] (ECR returns this code on manifest
 /// push when blob upload PUT-201s haven't fully propagated).
 /// Waits with jittered exponential backoff up to `config.max_retries` times.
+///
+/// A streamed upload answered 401, whose token the client has dropped, is
+/// sent once more at once, outside that budget: nothing is throttled, and a
+/// second refusal is the credential's, not the token's age.
+///
 /// Returns the first `Ok` or the final `Err`.
 pub async fn with_retry<T, F, Fut>(
     config: &RetryConfig,
@@ -224,14 +229,21 @@ where
     Fut: Future<Output = Result<T, ocync_distribution::Error>>,
 {
     let mut attempt = 0;
+    let mut refusal = TokenRetry::Available;
     loop {
         match f().await {
             Ok(val) => return Ok(val),
+            Err(ocync_distribution::Error::UploadTokenRefused { message })
+                if refusal == TokenRetry::Available =>
+            {
+                tracing::warn!(operation, message, "retrying under a new token");
+                refusal = TokenRetry::Spent;
+                let _ = RETRIES.try_with(|n| n.set(n.get() + 1));
+            }
             Err(e) => {
                 let retryable = if let Some(status) = e.status_code() {
                     should_retry(status, attempt, config.max_retries)
                         || (attempt < config.max_retries && is_blob_upload_unknown(&e))
-                        || (attempt == 0 && is_refused_upload_token(&e))
                 } else {
                     // Transport-level errors (connection refused, DNS failure,
                     // request timeout) are retryable when attempts remain.
@@ -477,6 +489,50 @@ mod tests {
         assert!(!should_retry_transport(&err));
     }
 
+    /// A streamed upload whose token was refused is sent once more at once,
+    /// after any transient retries, and a second refusal is final. Breaks if
+    /// the refusal is never retried, waits out a backoff, is retried only on
+    /// the first attempt, or is retried until the attempts run out.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_upload_token_is_retried_once() {
+        #[derive(Clone, Copy, Debug)]
+        enum Failure {
+            Refused,
+            Unavailable,
+        }
+        use Failure::{Refused, Unavailable};
+        let config = RetryConfig::default();
+        // Each case: the failures before success, the calls made, whether it
+        // succeeds, and whether it waited out a backoff.
+        let cases: [(&[Failure], usize, bool, bool); 3] = [
+            (&[Refused], 2, true, false),
+            (&[Unavailable, Refused], 3, true, true),
+            (&[Refused, Refused, Refused], 2, false, false),
+        ];
+        for (failures, expected_calls, succeeds, waits) in cases {
+            let calls = Cell::new(0);
+            let started = tokio::time::Instant::now();
+            let result = with_retry(&config, "blob transfer", || {
+                let call = calls.get();
+                calls.set(call + 1);
+                let failure = failures.get(call).map(|failure| match failure {
+                    Refused => ocync_distribution::Error::UploadTokenRefused {
+                        message: "registry/repo".into(),
+                    },
+                    Unavailable => ocync_distribution::Error::RegistryError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: "registry/repo".into(),
+                    },
+                });
+                async move { failure.map_or(Ok(()), Err) }
+            })
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "{failures:?}");
+            assert_eq!(calls.get(), expected_calls, "{failures:?}");
+            assert_eq!(started.elapsed() > Duration::ZERO, waits, "{failures:?}");
+        }
+    }
+
     /// Positive-path test: a real reqwest connection failure (refused port)
     /// must be classified as retryable through `is_request()` alone.
     ///
@@ -485,28 +541,6 @@ mod tests {
     /// sufficient to catch them. If a future reqwest version changes this
     /// wrapping, this test will fail and the predicate set must be
     /// re-evaluated.
-    /// A streamed upload whose token was refused is sent once more, and a
-    /// second refusal is final. Breaks if the refusal is never retried, or
-    /// retried until the attempts run out.
-    #[tokio::test(start_paused = true)]
-    async fn a_refused_upload_token_is_retried_once() {
-        let refused = || ocync_distribution::Error::UploadTokenRefused {
-            message: "registry/repo".into(),
-        };
-        let config = RetryConfig::default();
-        for (refusals, expected_calls, succeeds) in [(1, 2, true), (5, 2, false)] {
-            let calls = Cell::new(0);
-            let result = with_retry(&config, "blob transfer", || {
-                calls.set(calls.get() + 1);
-                let refuse = calls.get() <= refusals;
-                async move { if refuse { Err(refused()) } else { Ok(()) } }
-            })
-            .await;
-            assert_eq!(result.is_ok(), succeeds, "{refusals} refusals");
-            assert_eq!(calls.get(), expected_calls, "{refusals} refusals");
-        }
-    }
-
     #[tokio::test]
     async fn should_retry_transport_on_connect_failure() {
         ocync_distribution::install_crypto_provider();
