@@ -164,10 +164,9 @@ impl AuthorizationToken {
 ///
 /// Obtains authorization tokens via `GetAuthorizationToken`, through a
 /// client created once at construction time. Tokens are cached via
-/// [`CredentialCache`] (read-lock fast path for concurrent cache hits,
-/// write-lock with double-check for fetches) and refreshed when they approach
-/// expiry. The actual token lifetime is read from the API response, falling
-/// back to 12 hours if not provided.
+/// [`CredentialCache`] and refreshed when they approach expiry, one refresh
+/// shared by the callers that ask while it is in flight. The token lifetime
+/// is read from the API response, falling back to 12 hours.
 ///
 /// Supports all AWS credential sources via the default credential chain:
 /// environment variables, shared config/credential files, IMDS/ECS
@@ -232,10 +231,8 @@ impl EcrAuth {
 
     /// Replace the cached token (test helper).
     #[cfg(test)]
-    async fn set_cached_token(&self, token: Token) {
-        self.credential_cache
-            .set(token, Duration::from_secs(10))
-            .await;
+    fn set_cached_token(&self, token: Token) {
+        self.credential_cache.set(token, Duration::from_secs(10));
     }
 
     async fn get_token_inner(&self) -> Result<Token, Error> {
@@ -273,7 +270,7 @@ impl AuthProvider for EcrAuth {
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             tracing::debug!(registry = %self.hostname, "invalidating cached ECR token");
-            self.credential_cache.clear().await;
+            self.credential_cache.clear();
         })
     }
 }
@@ -464,8 +461,7 @@ mod tests {
         );
 
         // Inject a near-expiry token (10s remaining < 30s EARLY_REFRESH_WINDOW).
-        auth.set_cached_token(Token::with_ttl("stale", Duration::from_secs(10)))
-            .await;
+        auth.set_cached_token(Token::with_ttl("stale", Duration::from_secs(10)));
 
         // Should trigger refresh because should_refresh() returns true.
         let token = auth.get_token(&[]).await.unwrap();

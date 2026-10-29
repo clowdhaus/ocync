@@ -402,7 +402,7 @@ Optimizations can amplify each other's failure modes. This matrix captures non-o
 
 | Trigger | Failure Mode | Mitigation |
 |---|---|---|
-| ECR token expiry (12h) | Mass 401 across all concurrent futures, thundering herd on GetAuthorizationToken | Auth token refresh lock: first future acquires write lock and refreshes, subsequent futures re-check and find fresh token. Exactly one GetAuthorizationToken call regardless of concurrent waiters |
+| ECR token expiry (12h) | Mass 401 across all concurrent futures, thundering herd on GetAuthorizationToken | Shared refresh: the first future refreshes, and every future that asks while it is in flight, a 401 among them, waits for its result. One GetAuthorizationToken call per wave of waiters |
 | Stale cache + mount failure | Retry also fails if source blob GC'd, cascading image failures | On double failure: mark blob as permanently unknown, proceed to full HEAD -> pull -> push. Do not propagate `Failed` status from stale cache to new sync |
 | CronJob overlap (`concurrencyPolicy: Allow`) | Two runs read/write cache file simultaneously, second write overwrites first's updates | Document `Forbid` as required. Detect concurrent access via advisory file lock; log warning and skip persistence if locked |
 | Disk full during staging | Partial temp file, subsequent reads corrupt | Atomic rename pattern (`.tmp.{random}` -> `{digest}`). On ENOSPC: disable disk staging for remainder of run (circuit breaker), continue with fresh source pulls per target |

@@ -117,8 +117,7 @@ fn decode_ecr_credentials(
 /// targeting `us-east-1`), then uses them as HTTP Basic credentials in
 /// the standard OCI Bearer token exchange flow.
 ///
-/// Registry credentials are cached via [`CredentialCache`] with the same
-/// read-lock fast path / write-lock refresh pattern as
+/// Registry credentials are cached via [`CredentialCache`] as in
 /// [`super::ecr::EcrAuth`], supporting long-running processes (watch mode).
 ///
 /// Bearer tokens are coalesced per scope via [`TokenCache`]: concurrent
@@ -254,12 +253,12 @@ impl AuthProvider for EcrPublicAuth {
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len().await;
+            let entries = self.tokens.len();
             tracing::debug!(base_url = %self.base_url, entries, "invalidating ECR Public token cache");
-            self.tokens.clear().await;
+            self.tokens.clear();
             self.challenge_cache.clear().await;
             // Also clear registry credentials so they are re-fetched on next use.
-            self.credential_cache.clear().await;
+            self.credential_cache.clear();
         })
     }
 }

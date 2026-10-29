@@ -134,8 +134,8 @@ impl CachedGoogleToken {
 
     /// Drop the kept token if it is `refused`, so one registry's refusal
     /// does not discard a token another has fetched since.
-    async fn refuse(&self, refused: &google::Secret) {
-        self.token.clear_if(|kept| kept.token == *refused).await;
+    fn refuse(&self, refused: &google::Secret) {
+        self.token.clear_if(|kept| kept.token == *refused);
     }
 }
 
@@ -373,7 +373,7 @@ impl AuthProvider for GcpAuth {
                             status: http::StatusCode::UNAUTHORIZED,
                             ..
                         }) if !identity_refused => {
-                            self.cached_token.refuse(&google_token).await;
+                            self.cached_token.refuse(&google_token);
                             let fresh = self.google_token().await?;
                             let exchanged = self.exchange(&scopes, &fresh).await;
                             if let Err(Error::TokenEndpoint {
@@ -399,9 +399,9 @@ impl AuthProvider for GcpAuth {
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len().await;
+            let entries = self.tokens.len();
             tracing::debug!(base_url = %self.base_url, entries, "invalidating GCP token cache");
-            self.tokens.clear().await;
+            self.tokens.clear();
             // The Google token stays: a refusal here is of the registry's
             // token, and the kept Google token exchanges for a new one
             // without a request to Google. An exchange that refuses the

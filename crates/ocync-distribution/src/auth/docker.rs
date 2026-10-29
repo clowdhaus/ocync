@@ -419,9 +419,9 @@ impl AuthProvider for DockerConfigAuth {
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len().await;
+            let entries = self.tokens.len();
             tracing::debug!(base_url = %self.base_url, entries, "invalidating token cache");
-            self.tokens.clear().await;
+            self.tokens.clear();
             self.challenge_cache.clear().await;
         })
     }
