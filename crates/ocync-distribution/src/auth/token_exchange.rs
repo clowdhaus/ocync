@@ -951,25 +951,39 @@ mod tests {
         }
     }
 
-    /// The token is read from `token`, else `access_token`, and one with no
-    /// or a zero `expires_in` never expires; an answer with neither field is
-    /// refused. Breaks if either field is ignored, a missing lifetime is
-    /// read as already expired, or an empty answer yields an empty token.
+    /// How long an exchanged token is kept.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Lifetime {
+        /// Never expires.
+        Permanent,
+        /// Expires within the early-refresh window.
+        Short,
+    }
+
+    /// The token is read from `token`, else `access_token`; a positive
+    /// `expires_in` sets its lifetime, and one with no or a zero
+    /// `expires_in` never expires; an answer with neither field is refused.
+    /// Breaks if either field is ignored, a positive lifetime is dropped or
+    /// a missing one is read as already expired, or an empty answer yields
+    /// an empty token.
     #[tokio::test]
     async fn the_token_answer_is_read() {
         let cases = [
             (
                 serde_json::json!({"token": "tok", "access_token": "other"}),
-                Some("tok"),
+                Some(("tok", Lifetime::Permanent)),
             ),
             (
                 serde_json::json!({"access_token": "fallback-tok"}),
-                Some("fallback-tok"),
+                Some(("fallback-tok", Lifetime::Permanent)),
             ),
-            (serde_json::json!({"token": "perm-tok"}), Some("perm-tok")),
+            (
+                serde_json::json!({"token": "short-tok", "expires_in": 10}),
+                Some(("short-tok", Lifetime::Short)),
+            ),
             (
                 serde_json::json!({"token": "zero-tok", "expires_in": 0}),
-                Some("zero-tok"),
+                Some(("zero-tok", Lifetime::Permanent)),
             ),
             (serde_json::json!({}), None),
         ];
@@ -994,10 +1008,15 @@ mod tests {
             let http = crate::test_http_client();
             let exchanged = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None).await;
             match expected {
-                Some(value) => {
+                Some((value, lifetime)) => {
                     let (token, _) = exchanged.unwrap();
                     assert_eq!(token.value(), value, "{body}");
-                    assert!(!token.is_expired() && !token.should_refresh(), "{body}");
+                    assert!(!token.is_expired(), "{body}");
+                    assert_eq!(
+                        token.should_refresh(),
+                        lifetime == Lifetime::Short,
+                        "{body}"
+                    );
                 }
                 None => assert!(
                     matches!(exchanged, Err(Error::AuthFailed { .. })),

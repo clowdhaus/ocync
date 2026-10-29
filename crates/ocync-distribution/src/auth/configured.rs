@@ -242,6 +242,11 @@ mod tests {
             };
             assert_eq!(auth.name(), name, "{case}");
             let debug = format!("{auth:?}");
+            let shown = format!("has_credentials: {}", expected.is_some());
+            assert!(
+                debug.contains(name) && debug.contains(&shown),
+                "{case}: {debug}"
+            );
             for secret in ["testuser", "testpass", "user:pass"] {
                 assert!(!debug.contains(secret), "{case}: {debug}");
             }
