@@ -2,8 +2,7 @@
 //!
 //! Implements the challenge-response protocol used by Docker-compatible registries:
 //! ping `/v2/` → parse `WWW-Authenticate: Bearer` challenge → request token with
-//! optional credentials. Used by both [`super::anonymous::AnonymousAuth`] and
-//! [`super::basic::BasicAuth`].
+//! optional credentials. Used by [`super::challenge::ChallengeAuth`].
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -952,102 +951,54 @@ mod tests {
         }
     }
 
+    /// The token is read from `token`, else `access_token`, and one with no
+    /// or a zero `expires_in` never expires; an answer with neither field is
+    /// refused. Breaks if either field is ignored, a missing lifetime is
+    /// read as already expired, or an empty answer yields an empty token.
     #[tokio::test]
-    async fn exchange_access_token_fallback() {
-        let mock = wiremock::MockServer::start().await;
+    async fn the_token_answer_is_read() {
+        let cases = [
+            (
+                serde_json::json!({"access_token": "fallback-tok"}),
+                Some("fallback-tok"),
+            ),
+            (serde_json::json!({"token": "perm-tok"}), Some("perm-tok")),
+            (
+                serde_json::json!({"token": "zero-tok", "expires_in": 0}),
+                Some("zero-tok"),
+            ),
+            (serde_json::json!({}), None),
+        ];
+        for (body, expected) in cases {
+            let mock = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v2/"))
+                .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
+                    "WWW-Authenticate",
+                    format!(r#"Bearer realm="{}/token""#, mock.uri()),
+                ))
+                .mount(&mock)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/token"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&body))
+                .mount(&mock)
+                .await;
 
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v2/"))
-            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{}/token""#, mock.uri()),
-            ))
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        // Response uses access_token field instead of token.
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/token"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"access_token": "fallback-tok"})),
-            )
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        let http = crate::test_http_client();
-        let (token, _) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
-            .await
-            .unwrap();
-        assert_eq!(token.value(), "fallback-tok");
-    }
-
-    #[tokio::test]
-    async fn exchange_no_expiry_produces_permanent_token() {
-        let mock = wiremock::MockServer::start().await;
-
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v2/"))
-            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{}/token""#, mock.uri()),
-            ))
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        // No expires_in field -- token should be permanent.
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/token"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "perm-tok"})),
-            )
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        let http = crate::test_http_client();
-        let (token, _) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
-            .await
-            .unwrap();
-        assert_eq!(token.value(), "perm-tok");
-        assert!(!token.is_expired());
-        assert!(!token.should_refresh());
-    }
-
-    #[tokio::test]
-    async fn exchange_zero_expiry_treated_as_permanent() {
-        let mock = wiremock::MockServer::start().await;
-
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v2/"))
-            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{}/token""#, mock.uri()),
-            ))
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/token"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "zero-tok", "expires_in": 0})),
-            )
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        let http = crate::test_http_client();
-        let (token, _) = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None)
-            .await
-            .unwrap();
-        assert_eq!(token.value(), "zero-tok");
-        assert!(!token.is_expired());
+            let http = crate::test_http_client();
+            let exchanged = exchange(&http, &mock.uri(), &[Scope::pull("repo")], None, None).await;
+            match expected {
+                Some(value) => {
+                    let (token, _) = exchanged.unwrap();
+                    assert_eq!(token.value(), value, "{body}");
+                    assert!(!token.is_expired() && !token.should_refresh(), "{body}");
+                }
+                None => assert!(
+                    matches!(exchanged, Err(Error::AuthFailed { .. })),
+                    "{body}: {exchanged:?}"
+                ),
+            }
+        }
     }
 
     #[tokio::test]

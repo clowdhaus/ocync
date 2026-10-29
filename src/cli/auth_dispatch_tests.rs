@@ -210,7 +210,7 @@ async fn explicit_ghcr_alias_dispatches_to_docker_config() {
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("ghcr.io", Some(AuthType::Ghcr));
     let client = build(&cfg).await.expect("build client");
-    // The Ghcr branch routes to DockerConfigAuth and emits a warn-level
+    // The Ghcr branch routes to Docker config sign-in and emits a warn-level
     // deprecation hint at most once per process via `warn_ghcr_deprecation_once`
     // (see `ghcr_deprecation_fires_at_most_once` for the Once-gating
     // assertion). Routing is verified here.
@@ -333,7 +333,7 @@ async fn autodetect_cgr_dev_with_docker_config_uses_docker_config() {
     let client = build(&cfg).await.expect("build client");
     // Provider name is "docker-config" regardless of whether the config
     // contains a matching entry for cgr.dev. Per-host credential lookup
-    // happens inside DockerConfigAuth and does not affect the name.
+    // happens inside the provider and does not affect the name.
     assert_eq!(client.auth_name(), Some("docker-config"));
 }
 

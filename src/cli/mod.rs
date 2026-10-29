@@ -12,10 +12,9 @@ mod auth_dispatch_tests;
 
 use ocync_distribution::auth::Credentials;
 use ocync_distribution::auth::acr::AcrAuth;
-use ocync_distribution::auth::anonymous::AnonymousAuth;
-use ocync_distribution::auth::basic::BasicAuth;
+use ocync_distribution::auth::challenge::ChallengeAuth;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
-use ocync_distribution::auth::docker::{DockerConfig, DockerConfigAuth};
+use ocync_distribution::auth::docker::DockerConfig;
 use ocync_distribution::auth::ecr::EcrAuth;
 use ocync_distribution::auth::ecr_public::EcrPublicAuth;
 use ocync_distribution::auth::gcp::{GcpAuth, SharedGoogleToken};
@@ -278,7 +277,7 @@ pub(crate) async fn build_registry_client(
             let creds = registry_config
                 .and_then(|r| r.credentials.as_ref())
                 .expect("basic auth requires credentials (validated)");
-            let auth = BasicAuth::new(
+            let auth = ChallengeAuth::basic(
                 &url,
                 http,
                 Credentials::Basic {
@@ -316,11 +315,11 @@ pub(crate) async fn build_registry_client(
                     "failed to load docker config for '{bare_host}': {e}"
                 ))
             })?;
-            let auth = DockerConfigAuth::new(&url, endpoint, &docker_config, http).await?;
+            let auth = ChallengeAuth::docker_config(&url, endpoint, &docker_config, http).await?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Anonymous) => {
-            let auth = AnonymousAuth::new(&url, http);
+            let auth = ChallengeAuth::anonymous(&url, http);
             RegistryClient::builder(url).auth(auth)
         }
         None => {
@@ -348,7 +347,8 @@ pub(crate) async fn build_registry_client(
                     // Try docker config - falls back to anonymous exchange if no creds found.
                     match DockerConfig::load_default() {
                         Ok(config) => {
-                            let auth = DockerConfigAuth::new(&url, endpoint, &config, http).await?;
+                            let auth =
+                                ChallengeAuth::docker_config(&url, endpoint, &config, http).await?;
                             RegistryClient::builder(url).auth(auth)
                         }
                         Err(_) => {
@@ -357,7 +357,7 @@ pub(crate) async fn build_registry_client(
                                 registry = bare_host,
                                 "no docker config found, using anonymous auth"
                             );
-                            let auth = AnonymousAuth::new(&url, http);
+                            let auth = ChallengeAuth::anonymous(&url, http);
                             RegistryClient::builder(url).auth(auth)
                         }
                     }
