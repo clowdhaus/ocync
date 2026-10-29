@@ -691,7 +691,7 @@ impl RegistryClient {
     ///
     /// Call this before retrying a request after a 401 response so the auth
     /// provider fetches a fresh token instead of returning the stale one.
-    async fn invalidate_auth(&self) {
+    pub(crate) async fn invalidate_auth(&self) {
         if let Some(ref auth) = self.auth {
             auth.invalidate().await;
         }

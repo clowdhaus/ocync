@@ -198,6 +198,13 @@ pub(crate) fn retries_made() -> u32 {
     RETRIES.try_with(Cell::get).unwrap_or(0)
 }
 
+/// A streamed upload whose token the registry refused, which the client
+/// has dropped. Sent once more, under a new token; a second refusal is the
+/// credential's, not the token's age.
+fn is_refused_upload_token(error: &ocync_distribution::Error) -> bool {
+    matches!(error, ocync_distribution::Error::UploadTokenRefused { .. })
+}
+
 /// Retry an async operation with exponential backoff on transient errors.
 ///
 /// Calls `f()` in a loop. Retries on HTTP 408/429/5xx, transport-level
@@ -224,6 +231,7 @@ where
                 let retryable = if let Some(status) = e.status_code() {
                     should_retry(status, attempt, config.max_retries)
                         || (attempt < config.max_retries && is_blob_upload_unknown(&e))
+                        || (attempt == 0 && is_refused_upload_token(&e))
                 } else {
                     // Transport-level errors (connection refused, DNS failure,
                     // request timeout) are retryable when attempts remain.
@@ -477,6 +485,28 @@ mod tests {
     /// sufficient to catch them. If a future reqwest version changes this
     /// wrapping, this test will fail and the predicate set must be
     /// re-evaluated.
+    /// A streamed upload whose token was refused is sent once more, and a
+    /// second refusal is final. Breaks if the refusal is never retried, or
+    /// retried until the attempts run out.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_upload_token_is_retried_once() {
+        let refused = || ocync_distribution::Error::UploadTokenRefused {
+            message: "registry/repo".into(),
+        };
+        let config = RetryConfig::default();
+        for (refusals, expected_calls, succeeds) in [(1, 2, true), (5, 2, false)] {
+            let calls = Cell::new(0);
+            let result = with_retry(&config, "blob transfer", || {
+                calls.set(calls.get() + 1);
+                let refuse = calls.get() <= refusals;
+                async move { if refuse { Err(refused()) } else { Ok(()) } }
+            })
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "{refusals} refusals");
+            assert_eq!(calls.get(), expected_calls, "{refusals} refusals");
+        }
+    }
+
     #[tokio::test]
     async fn should_retry_transport_on_connect_failure() {
         ocync_distribution::install_crypto_provider();

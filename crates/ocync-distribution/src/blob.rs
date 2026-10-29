@@ -333,8 +333,8 @@ impl RegistryClient {
         // Cannot use send_with_aimd here: the stream is consumed once, so
         // the 401-retry closure pattern (which rebuilds the request) does
         // not work. Auth was validated by the POST above; a 401 on this PUT
-        // fails the blob for the run, as neither this client nor the engine
-        // retries a 401.
+        // drops the token and is returned as `UploadTokenRefused`, for the
+        // caller to send the upload again under a new one.
         let permit = self.aimd.acquire(RegistryAction::BlobUploadComplete).await;
         let headers = self.auth_headers(&scopes).await?;
         let digest_str = expected_digest.to_string();
@@ -351,9 +351,17 @@ impl RegistryClient {
             .map_err(Error::from);
         report_permit(permit, &result);
         let resp = result?;
-        expect_status(resp, StatusCode::CREATED, &self.base_url, repository).await?;
-
-        Ok(expected_digest.clone())
+        match expect_status(resp, StatusCode::CREATED, &self.base_url, repository).await {
+            Ok(_) => Ok(expected_digest.clone()),
+            Err(Error::RegistryError {
+                status: StatusCode::UNAUTHORIZED,
+                message,
+            }) => {
+                self.invalidate_auth().await;
+                Err(Error::UploadTokenRefused { message })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// POST `/v2/{repository}/blobs/uploads/` to initiate an upload session.
@@ -1361,6 +1369,64 @@ mod tests {
                 case.host, case.server
             );
         }
+    }
+
+    /// A streamed upload answered 401 drops the token and says so, for the
+    /// caller to send it again. Breaks if the refused token is kept, or the
+    /// refusal reads as any other registry error.
+    #[tokio::test]
+    async fn a_refused_upload_drops_the_token() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(Arc<AtomicUsize>);
+        impl crate::auth::AuthProvider for Counting {
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+            fn get_token(
+                &self,
+                _scopes: &[Scope],
+            ) -> std::pin::Pin<
+                Box<dyn Future<Output = Result<crate::auth::Token, Error>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(crate::auth::Token::new("token".to_owned())) })
+            }
+            fn invalidate(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {})
+            }
+        }
+
+        let server = wiremock::MockServer::start().await;
+        let data = b"refused upload";
+        let digest = test_digest(data);
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/repo/blobs/uploads/id"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let client = crate::client::RegistryClientBuilder::new(server.uri().parse().unwrap())
+            .auth(Counting(Arc::clone(&invalidations)))
+            .build()
+            .unwrap();
+
+        let repo = RepositoryName::new("repo").unwrap();
+        let err = client
+            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::UploadTokenRefused { .. }), "{err:?}");
+        assert_eq!(invalidations.load(Ordering::SeqCst), 1);
     }
 
     /// The default upload path, Artifact Registry's included, sends the

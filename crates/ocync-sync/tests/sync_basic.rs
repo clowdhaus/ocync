@@ -214,6 +214,39 @@ async fn sync_blob_transfer_retries_on_source_500() {
     assert_eq!(report.stats.blobs_transferred, 2);
 }
 
+/// A blob upload whose token the target refuses is sent again under a new
+/// token, and the image syncs. Breaks if the refusal fails the image.
+#[tokio::test]
+async fn sync_retries_an_upload_whose_token_was_refused() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let parts = ManifestBuilder::new(b"config").layer(b"layer-data").build();
+    parts.mount_source(&source_server, "repo", "v1").await;
+    Mock::given(method("PUT"))
+        .and(query_param(
+            "digest",
+            parts.layer_descs[0].digest.to_string(),
+        ))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&target_server)
+        .await;
+    parts.mount_target(&target_server, "repo", "v1").await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::same("v1")],
+    );
+    let report = run_sync(vec![mapping]).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(report.stats.blobs_transferred, 2);
+}
+
 #[tokio::test]
 async fn sync_dedup_across_tags() {
     let source_server = MockServer::start().await;

@@ -131,6 +131,16 @@ pub enum Error {
         message: String,
     },
 
+    /// The registry refused the token sent with a streamed blob upload. The
+    /// body was the stream itself and cannot be sent again, so the token is
+    /// dropped and the upload is left for the caller to send again, from
+    /// the start, under a new one.
+    #[error("registry refused the upload's token: {message}")]
+    UploadTokenRefused {
+        /// Human-readable context (typically registry/repository and response body).
+        message: String,
+    },
+
     /// A URL could not be constructed or joined.
     #[error("URL construction failed for '{path}': {reason}")]
     UrlConstruction {
@@ -244,6 +254,7 @@ impl Error {
     pub fn status_code(&self) -> Option<http::StatusCode> {
         match self {
             Self::RegistryError { status, .. } => Some(*status),
+            Self::UploadTokenRefused { .. } => Some(http::StatusCode::UNAUTHORIZED),
             _ => None,
         }
     }
@@ -263,6 +274,7 @@ impl Error {
     pub fn is_auth_error(&self) -> bool {
         match self {
             Self::AuthFailed { .. }
+            | Self::UploadTokenRefused { .. }
             | Self::GoogleCredentials {
                 transience: Transience::Final,
                 ..
