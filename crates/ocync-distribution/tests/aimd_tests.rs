@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use ocync_distribution::aimd::{
-    AimdController, RegistryAction, WindowKey, window_key_for_registry,
+    AimdController, DockerHubGroup, RegistryAction, WindowKey, window_key_for_registry,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,38 +43,30 @@ fn ecr_every_action_gets_distinct_key() {
     }
 }
 
+/// Docker Hub meters HEADs, manifest reads and everything else apart.
+/// Breaks if HEADs or manifest reads fall into the shared window, where a
+/// throttled upload slows them.
 #[test]
-fn docker_hub_head_operations_share_key() {
-    let host = "registry-1.docker.io";
-    let manifest_head = window_key_for_registry(host, RegistryAction::ManifestHead);
-    let blob_head = window_key_for_registry(host, RegistryAction::BlobHead);
-    assert_eq!(
-        manifest_head, blob_head,
-        "Docker Hub HEAD operations should share a window"
-    );
-}
-
-#[test]
-fn docker_hub_manifest_read_separate_from_heads() {
-    let host = "registry-1.docker.io";
-    let head_key = window_key_for_registry(host, RegistryAction::ManifestHead);
-    let read_key = window_key_for_registry(host, RegistryAction::ManifestRead);
-    assert_ne!(
-        head_key, read_key,
-        "Docker Hub manifest reads should have their own quota window"
-    );
-}
-
-#[test]
-fn docker_hub_non_head_non_read_share_key() {
-    let host = "registry-1.docker.io";
-    let init = window_key_for_registry(host, RegistryAction::BlobUploadInit);
-    let chunk = window_key_for_registry(host, RegistryAction::BlobUploadChunk);
-    let complete = window_key_for_registry(host, RegistryAction::BlobUploadComplete);
-    let write = window_key_for_registry(host, RegistryAction::ManifestWrite);
-    assert_eq!(init, chunk);
-    assert_eq!(chunk, complete);
-    assert_eq!(complete, write);
+fn docker_hub_groups_actions_by_quota() {
+    use RegistryAction::*;
+    let cases = [
+        (ManifestHead, DockerHubGroup::Heads),
+        (BlobHead, DockerHubGroup::Heads),
+        (ManifestRead, DockerHubGroup::ManifestRead),
+        (BlobRead, DockerHubGroup::Other),
+        (ManifestWrite, DockerHubGroup::Other),
+        (BlobUploadInit, DockerHubGroup::Other),
+        (BlobUploadChunk, DockerHubGroup::Other),
+        (BlobUploadComplete, DockerHubGroup::Other),
+        (TagList, DockerHubGroup::Other),
+    ];
+    for (action, group) in cases {
+        assert_eq!(
+            window_key_for_registry("registry-1.docker.io", action),
+            WindowKey::DockerHub(group),
+            "{action:?}"
+        );
+    }
 }
 
 #[test]

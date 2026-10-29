@@ -1223,6 +1223,18 @@ mod tests {
                 "https://registry.example.com",
                 Realm::Rejected("userinfo"),
             ),
+            // rejects a username without a password
+            (
+                "https://user@evil.com/token",
+                "https://registry.example.com",
+                Realm::Rejected("userinfo"),
+            ),
+            // allows a public IPv6 realm for a hostname registry
+            (
+                "https://[2001:db8::1]/token",
+                "https://registry.example.com",
+                Realm::Allowed,
+            ),
             // rejects non web scheme
             (
                 "ftp://evil.com/token",
