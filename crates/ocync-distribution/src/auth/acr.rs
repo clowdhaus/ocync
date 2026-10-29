@@ -165,9 +165,8 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
     let response =
         crate::retry::send_retrying(http.post(&url).form(form), &format!("ACR {endpoint}"))
             .await
-            // Unwrapped so the reason reads as it always has: `Error::Http`
-            // Displays as "HTTP request failed: ..." and would double the
-            // prefix this line already writes. The chain names the cause,
+            // Unwrapped: `Error::Http` Displays as "HTTP request failed: ..."
+            // and would double the prefix this line already writes. The chain names the cause,
             // such as a refused connection.
             .map_err(|e| match &e {
                 Error::Http(inner) => Error::cloud_credentials(
@@ -480,10 +479,12 @@ impl AzureCredentialChain {
                 }
             })?;
 
+        // The CLI refuses a token when its login is missing, expired or
+        // revoked: each needs a new `az login`.
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(CredentialError::Failed(
-                CredentialFailure::Failed,
+                CredentialFailure::Refused,
                 format!("az CLI failed: {}", truncate_quoted(&stderr)),
             ));
         }
@@ -524,14 +525,16 @@ impl AzureTokenSource for AzureCredentialChain {
             if cached != SOURCE_NONE {
                 let name = Self::source_name(cached);
                 return self.try_source(cached).await.map_err(|e| {
-                    let failure = match e {
-                        CredentialError::NotConfigured => CredentialFailure::Failed,
-                        CredentialError::Failed(failure, _) => failure,
+                    let (failure, reason) = match e {
+                        CredentialError::NotConfigured => {
+                            (CredentialFailure::Failed, "not configured".to_owned())
+                        }
+                        CredentialError::Failed(failure, reason) => (failure, reason),
                     };
                     Error::cloud_credentials(
                         "ACR",
                         failure,
-                        format_args!("{name} credential failed"),
+                        format_args!("{name} credential failed: {reason}"),
                     )
                 });
             }

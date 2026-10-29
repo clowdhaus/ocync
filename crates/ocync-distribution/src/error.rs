@@ -588,6 +588,16 @@ mod tests {
             Error::CredentialConfig {
                 reason: "not found".into(),
             },
+            Error::CloudCredentials {
+                registry: "gcr.io".into(),
+                reason: "throttled".into(),
+                failure: CredentialFailure::Transient,
+            },
+            Error::CloudCredentials {
+                registry: "gcr.io".into(),
+                reason: "no credentials".into(),
+                failure: CredentialFailure::Failed,
+            },
             Error::Io {
                 context: "test",
                 source: std::io::Error::other("disk full").into(),
