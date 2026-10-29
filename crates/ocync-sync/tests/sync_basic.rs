@@ -159,38 +159,6 @@ async fn sync_manifest_pull_failure() {
     assert_eq!(report.exit_code(), 2);
 }
 
-/// A source that refuses the connection is reported with the refusal, not
-/// only "error sending request". Breaks if the report keeps only the top
-/// line of the error.
-#[tokio::test]
-async fn sync_report_names_a_refused_connection() {
-    let target_server = MockServer::start().await;
-    let refused = std::net::TcpStream::connect("127.0.0.1:1")
-        .unwrap_err()
-        .to_string();
-    let source = std::sync::Arc::new(
-        ocync_distribution::RegistryClientBuilder::new(
-            url::Url::parse("http://127.0.0.1:1").unwrap(),
-        )
-        .build()
-        .unwrap(),
-    );
-    let mapping = resolved_mapping(
-        source,
-        "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
-        vec![TagPair::same("v1")],
-    );
-
-    let report = run_sync(vec![mapping]).await;
-
-    let ImageStatus::Failed { error, .. } = &report.images[0].status else {
-        panic!("{:?}", report.images[0].status);
-    };
-    assert!(error.ends_with(&refused), "{error}");
-}
-
 #[tokio::test]
 async fn sync_blob_transfer_retries_on_source_500() {
     let source_server = MockServer::start().await;

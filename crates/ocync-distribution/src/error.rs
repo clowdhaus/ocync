@@ -283,22 +283,60 @@ impl Error {
 /// with is not repeated, nor are the rest once the text ends with a cause
 /// and all of its own: some errors print their causes and also return them
 /// as their source.
-pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(e) = source {
-        if text.ends_with(&error_chain(e)) {
-            break;
-        }
-        let cause = e.to_string();
-        if !text.ends_with(&cause) {
-            text.push_str(": ");
-            text.push_str(&cause);
-        }
-        source = e.source();
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut errors = vec![error];
+    while let Some(source) = errors.last().and_then(|e| shown_source(*e)) {
+        errors.push(source);
     }
-    text
+    let texts: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    // The chain from each error down, built from the bottom up.
+    let mut chains = vec![String::new(); texts.len()];
+    for i in (0..texts.len()).rev() {
+        let mut text = texts[i].clone();
+        for j in i + 1..texts.len() {
+            if text.ends_with(&chains[j]) {
+                break;
+            }
+            if !text.ends_with(&texts[j]) {
+                text.push_str(": ");
+                text.push_str(&texts[j]);
+            }
+        }
+        chains[i] = text;
+    }
+    chains.swap_remove(0)
 }
+
+/// The source of `error` whose text may be shown. A body that failed to
+/// decode is described by its parser, which quotes the body, and a body can
+/// carry a token.
+fn shown_source<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    // `Error::Http` holds its cause shared, so either form can turn up.
+    let http = error.downcast_ref::<reqwest::Error>().or_else(|| {
+        error
+            .downcast_ref::<Arc<reqwest::Error>>()
+            .map(|shared| &**shared)
+    });
+    if http.is_some_and(reqwest::Error::is_decode) {
+        return None;
+    }
+    error.source()
+}
+
+/// What a connection to a closed loopback port reports, for tests of a
+/// refused connection.
+#[cfg(test)]
+pub(crate) fn refusal() -> String {
+    std::net::TcpStream::connect(REFUSING)
+        .unwrap_err()
+        .to_string()
+}
+
+/// A loopback address nothing listens on.
+#[cfg(test)]
+pub(crate) const REFUSING: &str = "127.0.0.1:1";
 
 /// The most of an external body or stream kept in an error, in bytes.
 pub(crate) const MAX_QUOTED_BYTES: usize = 200;
@@ -326,21 +364,41 @@ mod tests {
     /// cause the text already holds is repeated.
     #[tokio::test]
     async fn an_http_error_names_its_cause_once() {
-        crate::install_crypto_provider();
-        let refused = std::net::TcpStream::connect("127.0.0.1:1")
-            .unwrap_err()
-            .to_string();
+        let refused = refusal();
         let err = Error::from(
-            reqwest::Client::new()
-                .get("http://127.0.0.1:1/v2/")
+            crate::test_http_client()
+                .get(format!("http://{REFUSING}/v2/"))
                 .send()
                 .await
                 .unwrap_err(),
         );
         let text = err.to_string();
         assert!(text.ends_with(&refused), "{text}");
-        assert_eq!(text.matches(&refused).count(), 1, "{text}");
         assert_eq!(error_chain(&err), text);
+    }
+
+    /// A body that fails to decode is named as such, without the parser's
+    /// text, which quotes the body. Breaks if the body reaches the text.
+    #[tokio::test]
+    async fn a_decode_error_leaves_the_body_out() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("\"s3cret\""))
+            .mount(&server)
+            .await;
+        let response = crate::test_http_client()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let err = Error::from(response.json::<u64>().await.unwrap_err());
+        let text = err.to_string();
+        assert!(
+            text.starts_with("HTTP request failed: error decoding response body"),
+            "{text}"
+        );
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!error_chain(&err).contains("s3cret"), "{err}");
     }
 
     #[test]

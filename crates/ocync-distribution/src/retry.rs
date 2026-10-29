@@ -140,7 +140,7 @@ impl<E, F: Fn(&E) -> bool> Policy<E> for Bounded<F> {
 /// and token exchanges, which are.
 pub(crate) async fn retrying<T, E, P, F, Fut>(what: &str, policy: &mut P, op: F) -> Result<T, E>
 where
-    E: std::error::Error,
+    E: std::error::Error + 'static,
     P: Policy<E>,
     F: Fn(u32) -> Fut,
     Fut: Future<Output = Result<T, E>>,
