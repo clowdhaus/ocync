@@ -958,13 +958,15 @@ mod tests {
         Permanent,
         /// Expires within the early-refresh window.
         Short,
+        /// Expires well past the early-refresh window.
+        Long,
     }
 
     /// The token is read from `token`, else `access_token`; a positive
     /// `expires_in` sets its lifetime, and one with no or a zero
     /// `expires_in` never expires; an answer with neither field is refused.
     /// Breaks if either field is ignored, a positive lifetime is dropped or
-    /// a missing one is read as already expired, or an empty answer yields
+    /// shortened, a missing one is read as already expired, or an empty answer yields
     /// an empty token.
     #[tokio::test]
     async fn the_token_answer_is_read() {
@@ -980,6 +982,10 @@ mod tests {
             (
                 serde_json::json!({"token": "short-tok", "expires_in": 10}),
                 Some(("short-tok", Lifetime::Short)),
+            ),
+            (
+                serde_json::json!({"token": "long-tok", "expires_in": 3600}),
+                Some(("long-tok", Lifetime::Long)),
             ),
             (
                 serde_json::json!({"token": "zero-tok", "expires_in": 0}),
