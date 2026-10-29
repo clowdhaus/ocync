@@ -291,7 +291,7 @@ mod tests {
 
     use super::super::recovery::Judgment;
     use super::*;
-    use crate::auth::testing::mount_v2_and_token;
+    use crate::auth::testing;
 
     /// A throttle that outlasts its retries is not an auth error, and an
     /// access denial is. Breaks if every AWS failure exits as refused
@@ -417,9 +417,10 @@ mod tests {
     #[tokio::test]
     async fn token_exchange_with_sdk_credentials() {
         let server = MockServer::start().await;
-        for mock in mount_v2_and_token(&server, "public.ecr.aws", "bearer-tok") {
-            mock.mount(&server).await;
-        }
+        testing::challenge(&server, "public.ecr.aws")
+            .mount(&server)
+            .await;
+        testing::token("bearer-tok").mount(&server).await;
 
         let encoded = BASE64.encode("AWS:test-password");
         let auth = EcrPublicAuth::with_api(
@@ -434,9 +435,10 @@ mod tests {
     #[tokio::test]
     async fn sdk_credentials_cached_across_scopes() {
         let server = MockServer::start().await;
-        for mock in mount_v2_and_token(&server, "public.ecr.aws", "cached") {
-            mock.mount(&server).await;
-        }
+        testing::challenge(&server, "public.ecr.aws")
+            .mount(&server)
+            .await;
+        testing::token("cached").mount(&server).await;
 
         // Only one API response available. If the second get_token call
         // re-fetches registry credentials it will fail, proving they were cached.
@@ -458,9 +460,10 @@ mod tests {
     #[tokio::test]
     async fn sdk_credentials_refresh_on_expiry() {
         let server = MockServer::start().await;
-        for mock in mount_v2_and_token(&server, "public.ecr.aws", "refreshed") {
-            mock.mount(&server).await;
-        }
+        testing::challenge(&server, "public.ecr.aws")
+            .mount(&server)
+            .await;
+        testing::token("refreshed").mount(&server).await;
 
         let encoded1 = BASE64.encode("AWS:first");
         let encoded2 = BASE64.encode("AWS:second");
@@ -505,15 +508,7 @@ mod tests {
         let server = MockServer::start().await;
 
         // /v2/ hit twice: once before the refusal, once after.
-        Mock::given(method("GET"))
-            .and(path("/v2/"))
-            .respond_with(ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(
-                    r#"Bearer realm="{}/token",service="public.ecr.aws""#,
-                    server.uri()
-                ),
-            ))
+        testing::challenge(&server, "public.ecr.aws")
             .expect(2)
             .mount(&server)
             .await;
@@ -547,15 +542,7 @@ mod tests {
     /// credentials whose password is `old` for one exchange and refuses them
     /// after, and always accepts those whose password is `new`.
     async fn mount_revoked_credentials(server: &MockServer, old: &str, new: &str) {
-        Mock::given(method("GET"))
-            .and(path("/v2/"))
-            .respond_with(ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(
-                    r#"Bearer realm="{}/token",service="public.ecr.aws""#,
-                    server.uri()
-                ),
-            ))
+        testing::challenge(server, "public.ecr.aws")
             .mount(server)
             .await;
         let basic = |password: &str| format!("Basic {}", BASE64.encode(format!("AWS:{password}")));
@@ -616,15 +603,7 @@ mod tests {
     /// credentials whose password is in `accepted` and refuses all others,
     /// `refusals` times in all.
     async fn mount_token_endpoint(server: &MockServer, accepted: &[&str], refusals: u64) {
-        Mock::given(method("GET"))
-            .and(path("/v2/"))
-            .respond_with(ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(
-                    r#"Bearer realm="{}/token",service="public.ecr.aws""#,
-                    server.uri()
-                ),
-            ))
+        testing::challenge(server, "public.ecr.aws")
             .mount(server)
             .await;
         for password in accepted {

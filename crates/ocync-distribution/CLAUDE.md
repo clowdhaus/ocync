@@ -16,7 +16,7 @@ OCI Distribution Specification client library - registry auth, blob/manifest tra
 - Token caching: `EARLY_REFRESH_WINDOW` = 30s. Docker Hub issues 300s tokens; a 15m window was a bug that bypassed the cache entirely.
 - Per-scope tokens: format `repository:<name>:<actions>` where actions = `pull`, `push`, or `pull,push`. Per-scope caching (`scopes_cache_key` in `auth/mod.rs`) is universal across every Bearer-issuing provider (anonymous, basic, docker-config, ecr-public, gcp, acr). It is NOT a Chainguard-specific feature.
 - cgr.dev's specific quirk is *enforcement*: it returns 403 on cross-scope token reuse where some registries silently accept it. The scope-keyed cache is what makes ocync correct against this enforcement -- but the cache itself exists for every Bearer flow.
-- Per-scope coalescing: every Bearer provider routes its cache through `TokenCache` in `auth/token_cache.rs`. The helper holds the cache mutex only for brief reads and writes; the actual token exchange runs under an `Arc<Mutex<()>>` keyed by scope, so concurrent fetches for the same scope coalesce to one exchange while distinct scopes proceed in parallel. The helper owns the contract; per-provider tests verify wiring, not the contract.
+- Per-scope coalescing: every Bearer provider routes its cache through `TokenCache` in `auth/token_cache.rs`. The helper holds the cache mutex only for brief reads and writes; the exchange runs as one flight per scope (`Flights` in `flight.rs`), so concurrent fetches for the same scope coalesce to one exchange while distinct scopes proceed in parallel. The helper owns the contract; per-provider tests verify wiring, not the contract.
 
 ## Provider dispatch (auto-detection)
 
@@ -48,7 +48,7 @@ With `auth_type` unset, `cgr.dev`, `ghcr.io`, `docker.io`, and any unrecognized 
 
 ## Upload protocol quirks
 
-- Default: POST + streaming PUT with `Transfer-Encoding: chunked` (2 requests/blob). Streaming PUT body is gated by a per-`RegistryClient` semaphore (`streaming_blob_sem`, default cap 64) to stay under the per-h2-connection `SETTINGS_MAX_CONCURRENT_STREAMS` budget (100-128 across major registries probed 2026-06-01).
+- Default: POST + streaming PUT with `Transfer-Encoding: chunked` (2 requests/blob). Streaming PUT body is gated by a per-`RegistryClient` semaphore (`blob_upload_sem`, default cap `DEFAULT_BLOB_UPLOAD_CONCURRENCY` = 64) to stay under the per-h2-connection `SETTINGS_MAX_CONCURRENT_STREAMS` budget (100-128 across major registries probed 2026-06-01).
 - GHCR: multi-PATCH chunked broken (last PATCH overwrites previous). Client falls back to POST + single PATCH + PUT (3 requests/blob), `blob_push_stream_ghcr`.
 - GAR: the default streaming path. A second PATCH in one session answers 405 and a monolithic POST answers 502, so neither is used.
 - ACR: ~20 MB streaming PUT body limit. Client buffers the full blob, verifies digest, then uploads in 16 MB PATCH chunks (OCI `{start}-{end}` Content-Range, NOT RFC 7233) followed by a finalize PUT, `blob_push_stream_acr`. Zero-byte blobs (e.g. signature empty-config) skip the PATCH loop and go straight to finalize PUT. Each PATCH response's `Location` header is checked against the initiate host to prevent cross-host credential forwarding via a compromised proxy.
@@ -68,7 +68,7 @@ With `auth_type` unset, `cgr.dev`, `ghcr.io`, `docker.io`, and any unrecognized 
 - Mock trait impls must honor the real contract - filter inputs, assert context params (repo, registry) match expected values.
 - Realm validation tests: realm and registry must use the same scheme (both `https://` or both `http://`) unless the test specifically targets the scheme check. Mismatched schemes cause the scheme check to fire first, masking the intended denylist rule. Always assert on the error message substring, not just `is_err()`.
 - Per-provider auth coverage convention: in-file `#[cfg(test)] mod tests` next to the provider, using `wiremock::MockServer` against `configured::Auth::anonymous` / `basic` / `docker_config`, `AcrAuth::with_api` or `GcpAuth::with_api`. New behavioral tests for an existing provider are added to that in-file module, not a parallel `tests/auth_*.rs`.
-- Reusable helpers in `auth/configured.rs`'s test module: `mount_v2_challenge`, `mount_token` (filters by `scope`), `credentials`.
+- Shared provider mocks live in `auth::testing`: `challenge` (the `/v2/` Bearer challenge for a service) and `token` (a token endpoint answering one value).
 - Concurrent-coalescing tests use `#[tokio::test(flavor = "current_thread")]` (as in `auth/token_cache.rs`) -- the production binary uses single-threaded tokio, so coalescing under that runtime model is the contract that matters.
 
 ## Provider name surface (testability)

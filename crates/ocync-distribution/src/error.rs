@@ -565,13 +565,13 @@ mod tests {
         assert_send_sync::<Error>();
     }
 
-    // --- Display (pre-existing variants, guards against accidental message changes) ---
+    // --- Display ---
 
     /// Each error shows what a user needs to act on: the input, the reason,
     /// the header or path. Breaks if a message drops a field it names.
     #[test]
     fn errors_show_their_fields() {
-        let cases: Vec<(Error, &[&str])> = vec![
+        let cases: [(Error, &[&str]); 11] = [
             // invalid reference
             (
                 Error::InvalidReference {
@@ -940,8 +940,6 @@ mod tests {
             assert!(!err.is_auth_error(), "expected false for {err}");
         }
     }
-
-    // --- Display (new variants) ---
 
     // --- Structured fields ---
 

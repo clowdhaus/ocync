@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use http::{Method, StatusCode};
 use ocync_distribution::Error;
 use ocync_distribution::RepositoryName;
+use ocync_distribution::aimd::RegistryAction;
 use ocync_distribution::auth::{AuthProvider, Scope, Token};
 use ocync_distribution::client::RegistryClientBuilder;
 use url::Url;
@@ -162,7 +163,7 @@ async fn get_success_no_retry() {
             &repo,
             "manifests/latest",
             None,
-            ocync_distribution::aimd::RegistryAction::ManifestRead,
+            RegistryAction::ManifestRead,
         )
         .await
         .unwrap();
@@ -199,7 +200,7 @@ async fn get_401_triggers_refuse_and_retry() {
             &repo,
             "manifests/latest",
             None,
-            ocync_distribution::aimd::RegistryAction::ManifestRead,
+            RegistryAction::ManifestRead,
         )
         .await
         .unwrap();
@@ -218,11 +219,15 @@ async fn get_401_triggers_refuse_and_retry() {
 /// refusal is sent twice.
 #[tokio::test]
 async fn a_second_401_fails_after_one_refusal() {
-    for verb in [Method::GET, Method::HEAD] {
+    for (verb, action) in [
+        (Method::GET, RegistryAction::ManifestRead),
+        (Method::HEAD, RegistryAction::ManifestHead),
+    ] {
         let server = MockServer::start().await;
         Mock::given(method(verb.as_str()))
             .and(path("/v2/repo/manifests/latest"))
             .respond_with(ResponseTemplate::new(401))
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -233,27 +238,12 @@ async fn a_second_401_fails_after_one_refusal() {
             .unwrap();
 
         let repo = RepositoryName::new("repo").unwrap();
-        let err = if verb == Method::GET {
-            client
-                .get(
-                    &repo,
-                    "manifests/latest",
-                    None,
-                    ocync_distribution::aimd::RegistryAction::ManifestRead,
-                )
-                .await
-                .unwrap_err()
-        } else {
-            client
-                .head(
-                    &repo,
-                    "manifests/latest",
-                    None,
-                    ocync_distribution::aimd::RegistryAction::ManifestHead,
-                )
-                .await
-                .unwrap_err()
-        };
+        let err = match verb {
+            Method::GET => client.get(&repo, "manifests/latest", None, action).await,
+            Method::HEAD => client.head(&repo, "manifests/latest", None, action).await,
+            _ => unreachable!("only GET and HEAD rows"),
+        }
+        .unwrap_err();
         assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED), "{verb}");
         assert_eq!(state.refuse_count(), 1, "{verb}");
     }
@@ -287,7 +277,7 @@ async fn get_401_retry_only_happens_once() {
             &repo,
             "manifests/latest",
             None,
-            ocync_distribution::aimd::RegistryAction::ManifestRead,
+            RegistryAction::ManifestRead,
         )
         .await;
     assert!(result.is_err());
@@ -316,7 +306,7 @@ async fn get_403_returns_forbidden() {
             &repo,
             "manifests/latest",
             None,
-            ocync_distribution::aimd::RegistryAction::ManifestRead,
+            RegistryAction::ManifestRead,
         )
         .await;
     let err = result.unwrap_err();
@@ -345,7 +335,7 @@ async fn get_404_returns_not_found() {
             &repo,
             "manifests/nonexistent",
             None,
-            ocync_distribution::aimd::RegistryAction::ManifestRead,
+            RegistryAction::ManifestRead,
         )
         .await;
     assert!(result.unwrap_err().is_not_found());
@@ -373,7 +363,7 @@ async fn get_500_returns_registry_error() {
             &repo,
             "manifests/latest",
             None,
-            ocync_distribution::aimd::RegistryAction::ManifestRead,
+            RegistryAction::ManifestRead,
         )
         .await;
     let err = result.unwrap_err();
@@ -400,7 +390,7 @@ async fn no_auth_provider_sends_no_header() {
             &repo,
             "manifests/latest",
             None,
-            ocync_distribution::aimd::RegistryAction::ManifestRead,
+            RegistryAction::ManifestRead,
         )
         .await
         .unwrap();
@@ -477,7 +467,7 @@ async fn head_401_triggers_retry() {
             &repo,
             "manifests/latest",
             None,
-            ocync_distribution::aimd::RegistryAction::ManifestHead,
+            RegistryAction::ManifestHead,
         )
         .await
         .unwrap();
@@ -795,7 +785,7 @@ async fn get_429_retries_and_succeeds() {
             &repo,
             "blobs/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             None,
-            ocync_distribution::aimd::RegistryAction::BlobRead,
+            RegistryAction::BlobRead,
         )
         .await;
 
@@ -809,7 +799,7 @@ async fn get_429_retries_and_succeeds() {
             &repo,
             "blobs/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             None,
-            ocync_distribution::aimd::RegistryAction::BlobRead,
+            RegistryAction::BlobRead,
         )
         .await
         .unwrap();

@@ -151,6 +151,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::auth::testing;
 
     /// A Docker config key no parsed URL produces: Docker keys credentials
     /// by the registry as the user wrote it.
@@ -164,12 +165,7 @@ mod tests {
     }
 
     async fn mount_v2_challenge(server: &MockServer, expect: u64) {
-        Mock::given(method("GET"))
-            .and(path("/v2/"))
-            .respond_with(ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{}/token",service="test""#, server.uri()),
-            ))
+        testing::challenge(server, "test")
             .expect(expect)
             .mount(server)
             .await;

@@ -626,8 +626,6 @@ impl fmt::Debug for TokenResponse {
 mod tests {
     use super::*;
 
-    /// Assert that realm validation rejects with an error containing `needle`.
-    #[track_caller]
     #[test]
     fn parse_www_authenticate_bearer() {
         let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io""#;
@@ -1193,11 +1191,11 @@ mod tests {
         // wiremock expect(1) on /v2/ verifies it was not called a second time.
     }
 
-    // --- Layer 1: structural validation ---
+    // --- Realm validation ---
 
     /// What a realm check decides.
     #[derive(Debug, Clone, Copy)]
-    enum Realm {
+    enum Verdict {
         Allowed,
         /// Refused, with this text in the error.
         Rejected(&'static str),
@@ -1215,201 +1213,194 @@ mod tests {
             (
                 "http://evil.com/token",
                 "https://registry.example.com",
-                Realm::Rejected("http"),
+                Verdict::Rejected("http"),
             ),
             // rejects userinfo
             (
                 "https://user:pass@evil.com/token",
                 "https://registry.example.com",
-                Realm::Rejected("userinfo"),
+                Verdict::Rejected("userinfo"),
             ),
             // rejects a username without a password
             (
                 "https://user@evil.com/token",
                 "https://registry.example.com",
-                Realm::Rejected("userinfo"),
+                Verdict::Rejected("userinfo"),
             ),
             // allows a public IPv6 realm for a hostname registry
             (
                 "https://[2001:db8::1]/token",
                 "https://registry.example.com",
-                Realm::Allowed,
+                Verdict::Allowed,
             ),
             // rejects non web scheme
             (
                 "ftp://evil.com/token",
                 "https://registry.example.com",
-                Realm::Rejected("unsupported scheme"),
+                Verdict::Rejected("unsupported scheme"),
             ),
             // rejects no host
             (
                 "data:text/plain,hello",
                 "https://registry.example.com",
-                Realm::Rejected("no host"),
+                Verdict::Rejected("no host"),
             ),
-            // allows https cross domain
+            // Docker Hub: registry-1.docker.io hands out tokens from its
+            // sibling auth.docker.io, under the same parent docker.io.
             (
                 "https://auth.docker.io/token",
                 "https://registry-1.docker.io",
-                Realm::Allowed,
+                Verdict::Allowed,
             ),
             // allows http when registry is http
             (
                 "http://my-registry:5000/token",
                 "http://my-registry:5000",
-                Realm::Allowed,
+                Verdict::Allowed,
             ),
             // allows same host different port
             (
                 "https://host:8443/token",
                 "https://host:5000",
-                Realm::Allowed,
+                Verdict::Allowed,
             ),
             // rejects link local ipv4
             (
                 "https://169.254.169.254/latest/meta-data",
                 "https://registry.example.com",
-                Realm::Rejected("link-local"),
+                Verdict::Rejected("link-local"),
             ),
             // rejects ipv4 mapped ipv6 metadata
             (
                 "https://[::ffff:169.254.169.254]/token",
                 "https://registry.example.com",
-                Realm::Rejected("link-local"),
+                Verdict::Rejected("link-local"),
             ),
             // rejects aws ipv6 imds
             (
                 "https://[fd00:ec2::254]/token",
                 "https://registry.example.com",
-                Realm::Rejected("AWS IPv6 IMDS"),
+                Verdict::Rejected("AWS IPv6 IMDS"),
             ),
             // rejects unspecified ipv4
             (
                 "http://0.0.0.0/token",
                 "http://0.0.0.0",
-                Realm::Rejected("unspecified"),
+                Verdict::Rejected("unspecified"),
             ),
             // rejects link local ipv6
             (
                 "http://[fe80::1]/token",
                 "http://[fe80::1]",
-                Realm::Rejected("link-local"),
+                Verdict::Rejected("link-local"),
             ),
             // rejects unspecified ipv6
             (
                 "http://[::]/token",
                 "http://[::]",
-                Realm::Rejected("unspecified"),
+                Verdict::Rejected("unspecified"),
             ),
             // rejects alibaba metadata
             (
                 "https://100.100.100.200/token",
                 "https://registry.example.com",
-                Realm::Rejected("Alibaba"),
+                Verdict::Rejected("Alibaba"),
             ),
             // rejects loopback when registry is not loopback
             (
                 "https://127.0.0.1/token",
                 "https://registry.example.com",
-                Realm::Rejected("loopback"),
+                Verdict::Rejected("loopback"),
             ),
-            // allows loopback when registry is loopback
+            // allows loopback when registry is loopback; an IP realm skips
+            // the domain binding, which only compares hostnames
             (
                 "http://127.0.0.1:9999/token",
                 "http://127.0.0.1:5000",
-                Realm::Allowed,
+                Verdict::Allowed,
             ),
-            // allows loopback when registry is loopback
+            // allows an IPv4-mapped loopback realm for a registry on this host
             (
                 "http://[::ffff:127.0.0.1]:9999/token",
                 "http://[::ffff:127.0.0.1]:5000",
-                Realm::Allowed,
+                Verdict::Allowed,
             ),
             // allows private ip
             (
                 "https://192.168.1.50/token",
                 "https://192.168.1.50",
-                Realm::Allowed,
+                Verdict::Allowed,
             ),
             // rejects localhost when registry is not loopback
             (
                 "https://localhost:9999/token",
                 "https://registry.example.com",
-                Realm::Rejected("localhost"),
+                Verdict::Rejected("localhost"),
             ),
             // allows localhost when registry is localhost
             (
                 "http://localhost:9999/token",
                 "http://localhost:5000",
-                Realm::Allowed,
+                Verdict::Allowed,
             ),
             // rejects ipv6 loopback when registry is not loopback
             (
                 "https://[::1]/token",
                 "https://registry.example.com",
-                Realm::Rejected("loopback"),
+                Verdict::Rejected("loopback"),
             ),
             // rejects ipv4 mapped ipv6 loopback when registry is not loopback
             (
                 "https://[::ffff:127.0.0.1]/token",
                 "https://registry.example.com",
-                Realm::Rejected("loopback"),
+                Verdict::Rejected("loopback"),
             ),
-            // rejects ipv4 translated metadata
+            // RFC 6145 IPv4-translated: ::ffff:0:a9fe:a9fe embeds 169.254.169.254
             (
                 "https://[::ffff:0:a9fe:a9fe]/token",
                 "https://registry.example.com",
-                Realm::Rejected("link-local"),
+                Verdict::Rejected("link-local"),
             ),
-            // rejects nat64 metadata
+            // RFC 6052 NAT64 well-known prefix: 64:ff9b::a9fe:a9fe embeds
+            // 169.254.169.254
             (
                 "https://[64:ff9b::a9fe:a9fe]/token",
                 "https://registry.example.com",
-                Realm::Rejected("link-local"),
+                Verdict::Rejected("link-local"),
             ),
             // allows same host
-            ("https://ghcr.io/token", "https://ghcr.io", Realm::Allowed),
-            // allows sibling subdomain
-            (
-                "https://auth.docker.io/token",
-                "https://registry-1.docker.io",
-                Realm::Allowed,
-            ),
+            ("https://ghcr.io/token", "https://ghcr.io", Verdict::Allowed),
             // rejects unrelated domain
             (
                 "https://attacker.com/steal",
                 "https://registry.example.com",
-                Realm::Rejected("does not match"),
+                Verdict::Rejected("does not match"),
             ),
             // rejects different tld
             (
                 "https://auth.docker.com/token",
                 "https://registry-1.docker.io",
-                Realm::Rejected("does not match"),
+                Verdict::Rejected("does not match"),
             ),
-            // rejects short host cross domain
+            // ghcr.io has only two labels, so only an exact match passes:
+            // dropping one would leave every .io domain
             (
                 "https://evil.io/token",
                 "https://ghcr.io",
-                Realm::Rejected("does not match"),
-            ),
-            // allows ip realm skips domain binding
-            (
-                "http://127.0.0.1:9999/token",
-                "http://127.0.0.1:5000",
-                Realm::Allowed,
+                Verdict::Rejected("does not match"),
             ),
             // allows domain realm for ip registry
             (
                 "https://auth.example.com/token",
                 "https://192.168.1.50",
-                Realm::Allowed,
+                Verdict::Allowed,
             ),
-            // rejects subdomain of short host
+            // quay.io has only two labels, so even its own subdomain needs an
+            // exact match
             (
                 "https://auth.quay.io/token",
                 "https://quay.io",
-                Realm::Rejected("does not match"),
+                Verdict::Rejected("does not match"),
             ),
         ];
         for (realm, registry, expected) in cases {
@@ -1418,8 +1409,10 @@ mod tests {
                 &reqwest::Url::parse(registry).unwrap(),
             );
             match expected {
-                Realm::Allowed => result.unwrap_or_else(|e| panic!("{realm} for {registry}: {e}")),
-                Realm::Rejected(needle) => {
+                Verdict::Allowed => {
+                    result.unwrap_or_else(|e| panic!("{realm} for {registry}: {e}"))
+                }
+                Verdict::Rejected(needle) => {
                     let err = result.expect_err(realm).to_string();
                     assert!(err.contains(needle), "{realm} for {registry}: {err}");
                 }
@@ -1427,9 +1420,7 @@ mod tests {
         }
     }
 
-    // --- Layer 2: IP denylist ---
-
-    // --- Layer 3: integration tests ---
+    // --- Realm validation in an exchange ---
 
     #[tokio::test]
     async fn exchange_rejects_realm_redirect() {
@@ -1550,10 +1541,6 @@ mod tests {
             "expected domain binding rejection: {msg}"
         );
     }
-
-    // --- IPv6 edge cases (bypass prevention) ---
-
-    // --- Layer 4: domain binding ---
 
     /// An exchange that started from the cached challenge, and was cleared
     /// while it ran, does not store the challenge it learned, and one that

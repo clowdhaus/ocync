@@ -384,20 +384,33 @@ mod tests {
     #[test]
     fn rejects_malformed_references() {
         let long = format!("ghcr.io/repo:{}", "a".repeat(129));
-        let cases: [(&str, &[&str]); 7] = [
-            ("", &[]),
-            ("ghcr.io/repo?evil:tag", &["invalid character"]),
-            ("ghcr.io/repo#fragment:tag", &[]),
-            ("ghcr.io/repo name:tag", &[]),
-            ("ghcr.io/repo\x01name:tag", &[]),
-            ("ghcr.io/repo:v1.0+build", &["tag", "invalid character"]),
-            (long.as_str(), &["128"]),
+        let cases = [
+            ("", "empty string"),
+            (
+                "ghcr.io/repo?evil:tag",
+                "repository name contains invalid character '?'",
+            ),
+            (
+                "ghcr.io/repo#fragment:tag",
+                "repository name contains invalid character '#'",
+            ),
+            (
+                "ghcr.io/repo name:tag",
+                "repository name contains invalid character ' '",
+            ),
+            (
+                "ghcr.io/repo\x01name:tag",
+                "repository name contains invalid character '\x01'",
+            ),
+            (
+                "ghcr.io/repo:v1.0+build",
+                "tag contains invalid character '+'",
+            ),
+            (long.as_str(), "tag exceeds 128 characters"),
         ];
-        for (input, needles) in cases {
+        for (input, needle) in cases {
             let err = input.parse::<Reference>().unwrap_err().to_string();
-            for needle in needles {
-                assert!(err.contains(needle), "{input:?}: {err}");
-            }
+            assert!(err.contains(needle), "{input:?}: {err}");
         }
     }
 }

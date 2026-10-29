@@ -1085,7 +1085,7 @@ mod tests {
     }
 
     /// A failed exchange names its cause, and only a 401 judges the
-    /// credential refused. A redirect is never followed, so a 307 cannot
+    /// credential refused, which resets the sign-in chain. A redirect is never followed, so a 307 cannot
     /// replay the credential elsewhere. Breaks if a redirect is followed,
     /// an unreadable answer is taken as a refusal, or a 401 is not.
     #[tokio::test]
@@ -1095,18 +1095,18 @@ mod tests {
             (
                 ResponseTemplate::new(401).set_body_string("unauthorized"),
                 "401",
-                CredentialFailure::Refused,
+                Judgment::Refused,
             ),
             (
                 ResponseTemplate::new(307)
                     .insert_header("Location", "http://evil.example.com/steal"),
                 "307",
-                CredentialFailure::Transient,
+                Judgment::NotJudged,
             ),
             (
                 ResponseTemplate::new(200).set_body_string("not json"),
                 "unreadable answer from",
-                CredentialFailure::Transient,
+                Judgment::NotJudged,
             ),
         ];
         for (answer, cause, judged) in cases {
@@ -1118,19 +1118,20 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let err = exchange_refresh_token(
+            let failure = exchange_refresh_token(
                 &no_redirect_http_client(),
                 &server.uri(),
                 "myregistry.azurecr.io",
                 "aad-tok",
             )
             .await
-            .unwrap_err()
-            .error;
+            .unwrap_err();
+            let err = &failure.error;
             assert!(err.to_string().contains(cause), "{cause}: {err}");
+            assert_eq!(failure.judgment(), judged, "{cause}: {err}");
             assert_eq!(
                 err.is_auth_error(),
-                judged == CredentialFailure::Refused,
+                judged == Judgment::Refused,
                 "{cause}: {err}"
             );
         }
