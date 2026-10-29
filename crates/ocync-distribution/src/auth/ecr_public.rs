@@ -25,9 +25,9 @@ use serde::Deserialize;
 
 use super::detect::ECR_PUBLIC_HOST;
 use super::ecr::{AuthorizationData, AuthorizationToken, EcrApi, EcrTokenResponse};
+use super::recovery::{Recovery, judge_token_endpoint};
 use super::token_cache::TokenCache;
-use super::token_exchange;
-use super::{AuthProvider, Credentials, Refusal, Scope, Token, scopes_cache_key};
+use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error};
 
@@ -118,18 +118,6 @@ fn decode_ecr_credentials(
     ))
 }
 
-/// Whether a token exchange failed because the token endpoint answered 401,
-/// refusing the credentials sent.
-fn is_credentials_refusal(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::TokenEndpoint {
-            status: http::StatusCode::UNAUTHORIZED,
-            ..
-        }
-    )
-}
-
 /// AWS ECR Public authentication provider.
 ///
 /// Obtains AWS credentials via `ecr-public:GetAuthorizationToken` (always
@@ -153,6 +141,8 @@ pub struct EcrPublicAuth {
     credential_cache: CredentialCache<Credentials, Error>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
+    /// What the token endpoint's refusals of the credentials come to.
+    recovery: Recovery<Credentials>,
 }
 
 impl fmt::Debug for EcrPublicAuth {
@@ -189,6 +179,7 @@ impl EcrPublicAuth {
             api: Box::new(AwsEcrPublicApi { client }),
             credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
+            recovery: Recovery::default(),
         })
     }
 
@@ -205,33 +196,17 @@ impl EcrPublicAuth {
             api: Box::new(api),
             credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
+            recovery: Recovery::default(),
         }
-    }
-
-    /// The token endpoint refused `refused`: drop them if they are still the
-    /// credentials kept.
-    fn refuse_credentials(&self, refused: &Credentials) -> Refusal {
-        let refused = refused.clone();
-        self.credential_cache
-            .refuse_if(move |kept| *kept == refused)
     }
 
     /// Exchange `credentials` for a registry token for `scopes`. A token
     /// endpoint that answers 401 has refused the credentials.
-    async fn exchange(
-        &self,
-        scopes: &[Scope],
-        credentials: &Credentials,
-    ) -> Result<(Token, Option<token_exchange::WwwAuthenticate>), Error> {
-        let cached_challenge = self.tokens.challenge().get().await;
-        token_exchange::exchange(
-            &self.http,
-            &self.base_url,
-            scopes,
-            Some(credentials),
-            cached_challenge.as_ref(),
-        )
-        .await
+    async fn exchange(&self, scopes: &[Scope], credentials: &Credentials) -> Result<Token, Error> {
+        self.tokens
+            .challenge()
+            .exchange(&self.http, &self.base_url, scopes, Some(credentials))
+            .await
     }
 
     /// Get or refresh registry credentials from `GetAuthorizationToken`.
@@ -269,29 +244,23 @@ impl AuthProvider for EcrPublicAuth {
             let key = scopes_cache_key(&scopes);
             self.tokens
                 .get_or_fetch(key.clone(), || async {
-                    // Ensure registry credentials are fresh before token exchange.
-                    let credentials = self.ensure_credentials().await?;
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-                    // The token endpoint refusing the credentials judges
-                    // them. If they were the ones kept they are dropped, and
-                    // the exchange is sent once more with fresh ones.
-                    let exchanged = match self.exchange(&scopes, &credentials).await {
-                        Err(refused) if is_credentials_refusal(&refused)
-                            && self.refuse_credentials(&credentials) == Refusal::Current =>
-                        {
-                            let fresh = self.ensure_credentials().await?;
-                            let retried = self.exchange(&scopes, &fresh).await;
-                            if matches!(&retried, Err(e) if is_credentials_refusal(e)) {
-                                self.refuse_credentials(&fresh);
-                            }
-                            retried
-                        }
-                        exchanged => exchanged,
-                    };
-                    let (token, challenge) = exchanged.inspect_err(|e| {
+                    let scopes = &scopes;
+                    let exchanged = self
+                        .recovery
+                        .exchange(
+                            || self.ensure_credentials(),
+                            |credentials| async move { self.exchange(scopes, &credentials).await },
+                            judge_token_endpoint,
+                            |refused| {
+                                let refused = refused.clone();
+                                self.credential_cache.refuse_if(move |kept| *kept == refused);
+                            },
+                        )
+                        .await;
+                    let token = exchanged.inspect_err(|e| {
                         tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
                     })?;
-                    self.tokens.challenge().set(challenge).await;
                     Ok(token)
                 })
                 .await
@@ -320,6 +289,7 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, ResponseTemplate};
 
+    use super::super::recovery::Judgment;
     use super::*;
 
     /// A throttle that outlasts its retries is not an auth error, and an
@@ -659,12 +629,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    /// Credentials refused again after they were replaced are not replaced
-    /// a second time: two token exchanges and two credential fetches for
-    /// the request, and it fails. Breaks if the recovery loops.
-    #[tokio::test]
-    async fn refused_replacement_credentials_are_not_replaced_again() {
-        let server = MockServer::start().await;
+    /// Mount the `/v2/` challenge, and a `/token` endpoint that accepts the
+    /// credentials whose password is in `accepted` and refuses all others,
+    /// `refusals` times in all.
+    async fn mount_token_endpoint(server: &MockServer, accepted: &[&str], refusals: u64) {
         Mock::given(method("GET"))
             .and(path("/v2/"))
             .respond_with(ResponseTemplate::new(401).insert_header(
@@ -674,50 +642,83 @@ mod tests {
                     server.uri()
                 ),
             ))
-            .mount(&server)
+            .mount(server)
             .await;
+        for password in accepted {
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .and(header(
+                    "authorization",
+                    format!("Basic {}", BASE64.encode(format!("AWS:{password}"))).as_str(),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"token": "fresh", "expires_in": 300})),
+                )
+                .mount(server)
+                .await;
+        }
         Mock::given(method("GET"))
             .and(path("/token"))
             .respond_with(ResponseTemplate::new(401))
-            .expect(2)
-            .mount(&server)
+            .expect(refusals)
+            .mount(server)
             .await;
-        let api = MockEcrApi::succeeding(&BASE64.encode("AWS:test"));
+    }
+
+    /// Requests that all used credentials revoked while kept are all
+    /// refused, and each is sent again with the replacement one of them
+    /// fetched: one `GetAuthorizationToken` call in all. Breaks if only the
+    /// request that dropped the credentials recovers, or each fetches its
+    /// own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn requests_refused_with_one_revoked_credential_share_its_replacement() {
+        let server = MockServer::start().await;
+        mount_token_endpoint(&server, &["new"], 5).await;
+        let api = MockEcrApi::with_responses(vec![response_for("new")]);
+        let calls = api.calls();
+        let auth = EcrPublicAuth::with_api(server.uri(), crate::test_http_client(), api);
+        auth.credential_cache.set(
+            Credentials::Basic {
+                username: "AWS".to_owned(),
+                password: "old".to_owned(),
+            },
+            Duration::from_secs(3600),
+        );
+
+        let results = tokio::join!(
+            auth.get_token(&[Scope::pull("a")]),
+            auth.get_token(&[Scope::pull("b")]),
+            auth.get_token(&[Scope::pull("c")]),
+            auth.get_token(&[Scope::pull("d")]),
+            auth.get_token(&[Scope::pull("e")]),
+        );
+
+        for result in [results.0, results.1, results.2, results.3, results.4] {
+            result.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Credentials the token endpoint refuses although they were fetched
+    /// for the retry cost one recovery: two `GetAuthorizationToken` calls
+    /// and four exchanges for three scopes, all failing. Breaks if the
+    /// retry is retried, or each later scope signs in again.
+    #[tokio::test]
+    async fn refused_replacement_credentials_cost_one_recovery() {
+        let server = MockServer::start().await;
+        mount_token_endpoint(&server, &[], 4).await;
+        let api =
+            MockEcrApi::with_responses(["one", "two", "three", "four"].map(response_for).into());
         let calls = api.calls();
         let auth = EcrPublicAuth::with_api(server.uri(), crate::test_http_client(), api);
 
-        let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
+        for repo in ["a", "b", "c"] {
+            let err = auth.get_token(&[Scope::pull(repo)]).await.unwrap_err();
+            assert_eq!(judge_token_endpoint(&err), Judgment::Refused, "{err:?}");
+        }
 
-        assert!(is_credentials_refusal(&err), "{err:?}");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    /// A refusal of credentials that have been replaced keeps the
-    /// replacement. Breaks if a refusal drops whatever is kept.
-    #[tokio::test]
-    async fn a_refusal_of_replaced_credentials_keeps_the_replacement() {
-        let api = MockEcrApi::succeeding(&BASE64.encode("AWS:test"));
-        let calls = api.calls();
-        let auth =
-            EcrPublicAuth::with_api("https://public.ecr.aws", crate::test_http_client(), api);
-        let credentials = |password: &str| Credentials::Basic {
-            username: "AWS".to_owned(),
-            password: password.to_owned(),
-        };
-        auth.credential_cache
-            .set(credentials("new"), Duration::from_secs(3600));
-
-        assert_eq!(auth.refuse_credentials(&credentials("old")), Refusal::Stale);
-        let kept = auth.ensure_credentials().await.unwrap();
-        assert_eq!(kept, credentials("new"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-
-        assert_eq!(
-            auth.refuse_credentials(&credentials("new")),
-            Refusal::Current
-        );
-        auth.ensure_credentials().await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Callers waiting on a refresh that fails share its error, across

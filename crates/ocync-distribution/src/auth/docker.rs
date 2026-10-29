@@ -11,7 +11,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 
 use super::token_cache::TokenCache;
-use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 
@@ -408,20 +407,15 @@ impl AuthProvider for DockerConfigAuth {
             self.tokens
                 .get_or_fetch(key.clone(), || async {
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-                    let cached_challenge = self.tokens.challenge().get().await;
-                    let (token, challenge) = token_exchange::exchange(
-                        &self.http,
-                        &self.base_url,
-                        &scopes,
-                        self.credentials.as_ref(),
-                        cached_challenge.as_ref(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                        e
-                    })?;
-                    self.tokens.challenge().set(challenge).await;
+                    let token = self
+                        .tokens
+                        .challenge()
+                        .exchange(&self.http, &self.base_url, &scopes, self.credentials.as_ref())
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                            e
+                        })?;
                     Ok(token)
                 })
                 .await

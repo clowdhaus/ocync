@@ -167,24 +167,26 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         &self,
         is_refused: impl Fn(&T) -> bool + Send + Sync + 'static,
     ) -> Refusal {
-        // Read before the cache lock is taken: a landing holds the flight
-        // lock first and the cache lock second.
-        let refreshing = self.flights.is_running(&());
-        let mut state = self.write();
-        let refusal = if state
-            .entry
-            .as_ref()
-            .is_some_and(|entry| is_refused(&entry.value))
-        {
-            state.entry = None;
-            Refusal::Current
-        } else {
-            Refusal::Stale
-        };
-        if refreshing {
-            state.refused.push(Box::new(is_refused));
-        }
-        refusal
+        // Under the flight lock, as a landing is: no refresh starts or
+        // lands between telling whether one is running and recording the
+        // refusal against it.
+        self.flights.inspect(&(), |refreshing| {
+            let mut state = self.write();
+            let refusal = if state
+                .entry
+                .as_ref()
+                .is_some_and(|entry| is_refused(&entry.value))
+            {
+                state.entry = None;
+                Refusal::Current
+            } else {
+                Refusal::Stale
+            };
+            if refreshing {
+                state.refused.push(Box::new(is_refused));
+            }
+            refusal
+        })
     }
 
     /// Replace the cached value (test helper).

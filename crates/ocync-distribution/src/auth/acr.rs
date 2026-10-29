@@ -18,6 +18,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
+use super::recovery::{Judgment, Recovery};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Refusal, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
@@ -124,9 +125,11 @@ trait AzureTokenSource: Send + Sync + fmt::Debug {
     fn get_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>>;
 
     /// Reset cached credential source so the chain re-probes.
-    /// Called when the token endpoint refuses the refresh token, to
-    /// support credential rotation in watch mode. Default no-op for test mocks. Exceeds upstream which never
-    /// resets the cached source.
+    /// Called when ACR refuses what the chain gave: the Azure AD token at
+    /// `/oauth2/exchange`, or a refresh token made from it at
+    /// `/oauth2/token`. Supports credential rotation in watch mode. Default
+    /// no-op for test mocks. Exceeds upstream which never resets the cached
+    /// source.
     fn reset(&self) {}
 }
 
@@ -148,6 +151,19 @@ struct AccessTokenResponse {
 struct ExchangeError {
     error: Error,
     status: Option<http::StatusCode>,
+}
+
+impl ExchangeError {
+    /// What the failure says of the credential sent: the endpoint answering
+    /// 401 refused it. Any other answer, such as a 403 or 404 for one
+    /// repository, judges nothing.
+    fn judgment(&self) -> Judgment {
+        if self.status == Some(http::StatusCode::UNAUTHORIZED) {
+            Judgment::Refused
+        } else {
+            Judgment::NotJudged
+        }
+    }
 }
 
 impl From<Error> for ExchangeError {
@@ -643,6 +659,8 @@ pub struct AcrAuth {
     api: Box<dyn AzureTokenSource>,
     refresh_cache: CredentialCache<String, Error>,
     tokens: TokenCache,
+    /// What the token endpoint's refusals of the refresh token come to.
+    recovery: Recovery<String>,
     /// How many times the credential chain has been reset. A chain answer
     /// is still the current one if the count has not moved since it was
     /// asked for.
@@ -671,6 +689,7 @@ impl AcrAuth {
             api,
             refresh_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
+            recovery: Recovery::default(),
             chain_resets: AtomicU64::new(0),
         })
     }
@@ -685,6 +704,7 @@ impl AcrAuth {
             api: Box::new(api),
             refresh_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
+            recovery: Recovery::default(),
             chain_resets: AtomicU64::new(0),
         }
     }
@@ -708,21 +728,13 @@ impl AcrAuth {
         }
     }
 
-    /// The access-token exchange failed with `failure`. If the token
-    /// endpoint answered 401 it refused `refresh_token`: drop it if it is
-    /// still the one kept, and then re-probe the credential chain it came
-    /// from. Any other failure, such as a 403 or 404 for one repository,
-    /// judges nothing.
-    fn judge_refresh_token(&self, refresh_token: &str, failure: &ExchangeError) -> Refusal {
-        if failure.status != Some(http::StatusCode::UNAUTHORIZED) {
-            return Refusal::Stale;
-        }
+    /// The token endpoint refused `refresh_token`: drop it if it is still
+    /// the one kept, and then re-probe the credential chain it came from.
+    fn refuse_refresh_token(&self, refresh_token: &str) {
         let refused = refresh_token.to_owned();
-        let refusal = self.refresh_cache.refuse_if(move |kept| *kept == refused);
-        if refusal == Refusal::Current {
+        if self.refresh_cache.refuse_if(move |kept| *kept == refused) == Refusal::Current {
             self.reset_chain();
         }
-        refusal
     }
 
     async fn ensure_refresh_token(&self) -> Result<String, Error> {
@@ -739,7 +751,7 @@ impl AcrAuth {
                 )
                 .await
                 .map_err(|failure| {
-                    if failure.status == Some(http::StatusCode::UNAUTHORIZED) {
+                    if failure.judgment() == Judgment::Refused {
                         self.reset_chain_after(resets);
                     }
                     failure.error
@@ -754,32 +766,26 @@ impl AcrAuth {
             .await
     }
 
-    /// Exchange the refresh token for an access token for `scope`. A token
-    /// endpoint that refuses a refresh token that was still the one kept
-    /// has it dropped, and the exchange is sent once more with a fresh one.
+    /// Exchange the refresh token for an access token for `scope`.
     async fn access_token_for(&self, scope: &str) -> Result<String, Error> {
-        let refresh_token = self.ensure_refresh_token().await?;
-        let exchange = |refresh_token| {
-            exchange_access_token(
-                &self.exchange_http,
-                &self.base_url,
-                &self.service,
-                refresh_token,
-                scope,
+        self.recovery
+            .exchange(
+                || self.ensure_refresh_token(),
+                |refresh_token| async move {
+                    exchange_access_token(
+                        &self.exchange_http,
+                        &self.base_url,
+                        &self.service,
+                        &refresh_token,
+                        scope,
+                    )
+                    .await
+                },
+                ExchangeError::judgment,
+                |refused| self.refuse_refresh_token(refused),
             )
-        };
-        let access_token = match exchange(&refresh_token).await {
-            Err(failure)
-                if self.judge_refresh_token(&refresh_token, &failure) == Refusal::Current =>
-            {
-                let fresh = self.ensure_refresh_token().await?;
-                exchange(&fresh).await.inspect_err(|failure| {
-                    self.judge_refresh_token(&fresh, failure);
-                })
-            }
-            exchanged => exchanged,
-        };
-        access_token.map_err(|failure| failure.error)
+            .await
+            .map_err(|failure| failure.error)
     }
 }
 
@@ -1553,35 +1559,98 @@ mod tests {
         assert_eq!(get_count.load(Ordering::Relaxed), 2);
     }
 
-    /// A refresh token that is refused again after it was replaced is not
-    /// replaced a second time: two access-token exchanges for the request,
-    /// and it fails. Breaks if the recovery loops.
-    #[tokio::test]
-    async fn a_refused_replacement_is_not_replaced_again() {
+    /// Requests that all used a refresh token revoked while kept are all
+    /// refused, and each is sent again with the replacement one of them
+    /// fetched: one Azure AD token and one `/oauth2/exchange` in all, and
+    /// the chain reset once. Breaks if only the request that dropped the
+    /// refresh token recovers, each fetches its own, or each resets the
+    /// chain.
+    #[tokio::test(flavor = "current_thread")]
+    async fn requests_refused_with_one_revoked_refresh_token_share_its_replacement() {
         let server = MockServer::start().await;
+        let revoked = fake_jwt_with_exp(r#""n":1"#, 10800);
+        let replacement = fake_jwt_with_exp(r#""n":2"#, 10800);
+        let access = fake_jwt_with_exp("", 4500);
         Mock::given(method("POST"))
             .and(path("/oauth2/exchange"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({"refresh_token": fake_jwt_with_exp("", 10800)}),
-                ),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "refresh_token": &replacement })),
             )
-            .expect(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .and(body_string_contains(format!("refresh_token={replacement}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": &access})),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/oauth2/token"))
             .respond_with(ResponseTemplate::new(401))
-            .expect(2)
+            .expect(5)
             .mount(&server)
             .await;
-        let auth = AcrAuth::with_api(
-            &server.uri(),
-            "myregistry.azurecr.io",
-            MockAzureTokenSource::succeeding("aad-tok"),
+        let mock = MockAzureTokenSource::succeeding("aad-tok");
+        let reset_count = mock.reset_count.clone();
+        let get_count = mock.get_count.clone();
+        let auth = AcrAuth::with_api(&server.uri(), "myregistry.azurecr.io", mock);
+        auth.refresh_cache.set(revoked, Duration::from_secs(3600));
+
+        let results = tokio::join!(
+            auth.get_token(&[Scope::pull("a")]),
+            auth.get_token(&[Scope::pull("b")]),
+            auth.get_token(&[Scope::pull("c")]),
+            auth.get_token(&[Scope::pull("d")]),
+            auth.get_token(&[Scope::pull("e")]),
         );
 
-        assert!(auth.get_token(&[Scope::pull("repo")]).await.is_err());
+        for result in [results.0, results.1, results.2, results.3, results.4] {
+            result.unwrap();
+        }
+        assert_eq!(get_count.load(Ordering::Relaxed), 1);
+        assert_eq!(reset_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// A refresh token the token endpoint refuses although it was fetched
+    /// for the retry costs one recovery: two refresh tokens, two Azure AD
+    /// tokens and four access-token exchanges for three scopes, all
+    /// failing. Breaks if the retry is retried, or each later scope signs in
+    /// again.
+    #[tokio::test]
+    async fn a_refused_replacement_costs_one_recovery() {
+        let server = MockServer::start().await;
+        for n in [1, 2] {
+            Mock::given(method("POST"))
+                .and(path("/oauth2/exchange"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                    {"refresh_token": fake_jwt_with_exp(&format!(r#""n":{n}"#), 10800)}
+                )))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(4)
+            .mount(&server)
+            .await;
+        let mock = MockAzureTokenSource::succeeding("aad-tok");
+        let get_count = mock.get_count.clone();
+        let auth = AcrAuth::with_api(&server.uri(), "myregistry.azurecr.io", mock);
+
+        for repo in ["a", "b", "c"] {
+            let err = auth.get_token(&[Scope::pull(repo)]).await.unwrap_err();
+            assert!(err.to_string().contains("401"), "{err}");
+        }
+
+        assert_eq!(get_count.load(Ordering::Relaxed), 2);
     }
 
     /// A 403 or 404 from the token endpoint, as for one repository the
@@ -1672,11 +1741,12 @@ mod tests {
         assert_eq!(reset_count.load(Ordering::Relaxed), 1);
     }
 
-    /// Only a 401 for the refresh token that is still kept judges it.
-    /// Breaks if a refusal of a replaced token, or another status, drops
-    /// the refresh token or resets the chain.
+    /// A refusal of a refresh token that was replaced keeps the replacement
+    /// and the chain, and one of the kept refresh token drops it and resets
+    /// the chain. Breaks if a refusal of a replaced token drops the kept one
+    /// or resets the chain.
     #[tokio::test]
-    async fn only_a_refusal_of_the_kept_refresh_token_judges_it() {
+    async fn only_a_refusal_of_the_kept_refresh_token_resets_the_chain() {
         let mock = MockAzureTokenSource::succeeding("aad-tok");
         let reset_count = mock.reset_count.clone();
         let get_count = mock.get_count.clone();
@@ -1687,28 +1757,13 @@ mod tests {
         );
         auth.refresh_cache
             .set("new".to_owned(), Duration::from_secs(3600));
-        let answered = |status| ExchangeError {
-            error: Error::cloud_credentials("acr", CredentialFailure::Refused, "refused"),
-            status: Some(status),
-        };
 
-        let unauthorized = http::StatusCode::UNAUTHORIZED;
-        assert_eq!(
-            auth.judge_refresh_token("old", &answered(unauthorized)),
-            Refusal::Stale
-        );
-        assert_eq!(
-            auth.judge_refresh_token("new", &answered(http::StatusCode::FORBIDDEN)),
-            Refusal::Stale
-        );
+        auth.refuse_refresh_token("old");
         assert_eq!(auth.ensure_refresh_token().await.unwrap(), "new");
         assert_eq!(reset_count.load(Ordering::Relaxed), 0);
         assert_eq!(get_count.load(Ordering::Relaxed), 0);
 
-        assert_eq!(
-            auth.judge_refresh_token("new", &answered(unauthorized)),
-            Refusal::Current
-        );
+        auth.refuse_refresh_token("new");
         assert_eq!(reset_count.load(Ordering::Relaxed), 1);
     }
 

@@ -321,10 +321,10 @@ mod tests {
             .unwrap();
         cache
             .challenge()
-            .set(Some(WwwAuthenticate {
+            .set(WwwAuthenticate {
                 realm: "https://auth.example/token".to_owned(),
                 service: None,
-            }))
+            })
             .await;
 
         cache.refuse(&token("other")).await;

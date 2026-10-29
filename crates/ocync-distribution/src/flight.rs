@@ -69,9 +69,12 @@ impl<K: Eq + Hash, V> Flights<K, V> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether a fetch for `key` is in flight.
-    pub(crate) fn is_running(&self, key: &K) -> bool {
-        self.lock().contains_key(key)
+    /// Run `inspect`, given whether a fetch for `key` is in flight, under
+    /// the lock fetches are started and landed under: no fetch starts or
+    /// lands until it returns, so what it records is ordered against both.
+    pub(crate) fn inspect<T>(&self, key: &K, inspect: impl FnOnce(bool) -> T) -> T {
+        let in_flight = self.lock();
+        inspect(in_flight.contains_key(key))
     }
 }
 
@@ -79,10 +82,12 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
     /// The value `stored` finds, else what the fetch in flight for `key`
     /// shares, else the result of `fetch`, run by this caller.
     ///
-    /// `land` is given the result under the lock `stored` is read under.
-    /// It stores the value and returns what the waiters get: `None` sends
-    /// each of them to fetch for itself, as a fetch whose caller is
-    /// dropped does.
+    /// `fetch` is called under the lock `stored` is read under, as the fetch
+    /// is registered, to make the future this caller runs: whatever it sets
+    /// up is in place before any caller can see the fetch in flight. `land`
+    /// is given the result under that lock too. It stores the value and
+    /// returns what the waiters get: `None` sends each of them to fetch for
+    /// itself, as a fetch whose caller is dropped does.
     pub(crate) async fn run<R, Fut>(
         &self,
         key: &K,
@@ -103,14 +108,16 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
                 match in_flight.get(key) {
                     Some(receiver) => Err(receiver.clone()),
                     None => {
+                        let (fetch, land) = work.take().expect("a caller leads at most once");
                         let (sender, receiver) = watch::channel(None);
                         in_flight.insert(key.clone(), receiver.clone());
-                        Ok(Lead {
+                        let lead = Lead {
                             flights: self,
                             key,
                             sender,
                             receiver,
-                        })
+                        };
+                        Ok((lead, fetch(), land))
                     }
                 }
             };
@@ -121,9 +128,8 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
                         return Landed::Shared(value.clone().expect("waited for a value"));
                     }
                 }
-                Ok(lead) => {
-                    let (fetch, land) = work.take().expect("a caller leads at most once");
-                    let result = fetch().await;
+                Ok((lead, fetching, land)) => {
+                    let result = fetching.await;
                     // Landed and removed under one lock, so no caller joins
                     // a fetch that has landed.
                     let mut in_flight = self.lock();
@@ -203,18 +209,19 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_fetch_is_running_until_it_lands_or_is_dropped() {
         let flights = Flights::<(), u32>::default();
-        assert!(!flights.is_running(&()));
+        let running = || flights.inspect(&(), |running| running);
+        assert!(!running());
         let fetch = || async {
             tokio::task::yield_now().await;
             1
         };
         let (landed, during) = tokio::join!(
             flights.run(&(), || None, fetch, |value: &u32| Some(*value)),
-            async { flights.is_running(&()) },
+            async { running() },
         );
         assert!(matches!(landed, Landed::Own(1)), "{landed:?}");
         assert!(during);
-        assert!(!flights.is_running(&()));
+        assert!(!running());
 
         let mut stalled =
             Box::pin(flights.run(&(), || None, std::future::pending::<u32>, |_| Some(0)));
@@ -223,8 +230,33 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
-        assert!(flights.is_running(&()));
+        assert!(running());
         drop(stalled);
-        assert!(!flights.is_running(&()));
+        assert!(!running());
+    }
+
+    /// `inspect`, `fetch` and `land` all run holding the lock fetches start
+    /// and land under, and `fetch` runs before any caller sees the fetch in
+    /// flight. Breaks if any runs outside it, as a fetch could then start
+    /// or land between a check and the record made from it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inspect_fetch_and_land_run_under_the_lock() {
+        let flights = Flights::<(), u32>::default();
+        let held = || flights.in_flight.try_lock().is_err();
+        assert!(flights.inspect(&(), |_| held()));
+
+        let fetched_under_lock = Cell::new(false);
+        let landed_under_lock = Cell::new(false);
+        let fetch = || {
+            fetched_under_lock.set(held());
+            async { 1 }
+        };
+        let land = |value: &u32| {
+            landed_under_lock.set(held());
+            Some(*value)
+        };
+        flights.run(&(), || None, fetch, land).await;
+        assert!(fetched_under_lock.get());
+        assert!(landed_under_lock.get());
     }
 }
