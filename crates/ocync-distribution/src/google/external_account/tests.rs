@@ -409,22 +409,25 @@ fn selects_the_source_in_upstream_order() {
     ));
 }
 
-/// A `credential_source` naming no source, of any JSON type, says which
-/// keys it needs. Breaks if the reason is lost to the generic text.
+/// A `credential_source` naming no source says which keys it needs, and
+/// one that is not a map says it must be one. Breaks if the reason is lost
+/// to the generic text.
 #[test]
 fn a_source_naming_none_says_what_it_needs() {
-    for source in [
-        serde_json::json!({"region": "x"}),
-        serde_json::json!("token.txt"),
+    for (source, expected) in [
+        (
+            serde_json::json!({"region": "x"}),
+            "invalid value, expected a map naming environment_id, executable, url or file",
+        ),
+        (
+            serde_json::json!("token.txt"),
+            "invalid type: string, expected a map naming environment_id, executable, url or file",
+        ),
     ] {
         let error = crate::json::value_as::<SourceFile>(source)
             .err()
             .expect("refused");
-        assert_eq!(
-            error.to_string(),
-            "invalid value: a credential_source with no source, expected one naming \
-             environment_id, executable, url or file"
-        );
+        assert_eq!(error.to_string(), expected);
     }
 }
 

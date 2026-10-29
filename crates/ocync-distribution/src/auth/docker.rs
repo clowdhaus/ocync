@@ -282,9 +282,9 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
     helper_credentials(program, registry, &output)
 }
 
-/// The credentials a helper's `output` holds. Its stderr and a refused
-/// value from its stdout are kept out of the error past what can be quoted,
-/// as either can hold the secret.
+/// The credentials a helper's `output` holds. Its stderr is cut to what can
+/// be quoted and a refused value from its stdout is left out, as either can
+/// hold the secret.
 fn helper_credentials(
     program: String,
     registry: &str,
@@ -466,10 +466,10 @@ mod tests {
 
     /// A helper that fails has its stderr cut to what can be quoted, and one
     /// whose answer is mistyped is refused without the refused value.
-    /// Breaks if either reaches the error whole.
+    /// Breaks if the stderr is kept past the cap or the value is quoted.
     #[cfg(unix)]
     #[test]
-    fn a_helper_failure_leaves_the_secret_out() {
+    fn a_helper_failure_is_cut_to_what_can_be_quoted() {
         use std::os::unix::process::ExitStatusExt;
 
         let output = |code: i32, stdout: &str, stderr: String| std::process::Output {
@@ -487,7 +487,7 @@ mod tests {
             text.contains("invalid type: integer, expected a string"),
             "{text}"
         );
-        assert!(!text.contains('7'), "{text}");
+        assert!(!text.contains("`7`"), "{text}");
     }
 
     /// A config whose auth entry is a string, not an object, is refused

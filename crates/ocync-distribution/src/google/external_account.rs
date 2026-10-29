@@ -72,10 +72,26 @@ impl<'de> Deserialize<'de> for SourceFile {
         } else if names("file") {
             serde_json::from_value(value).map(Self::File)
         } else {
-            return Err(D::Error::invalid_value(
-                serde::de::Unexpected::Other("a credential_source with no source"),
-                &"one naming environment_id, executable, url or file",
-            ));
+            const NEEDS: &str = "a map naming environment_id, executable, url or file";
+            return Err(match &value {
+                Value::Object(_) => D::Error::invalid_value(
+                    serde::de::Unexpected::Other("a map naming no source"),
+                    &NEEDS,
+                ),
+                Value::Null => D::Error::invalid_type(serde::de::Unexpected::Other("null"), &NEEDS),
+                Value::Bool(_) => {
+                    D::Error::invalid_type(serde::de::Unexpected::Other("boolean"), &NEEDS)
+                }
+                Value::Number(_) => {
+                    D::Error::invalid_type(serde::de::Unexpected::Other("number"), &NEEDS)
+                }
+                Value::String(_) => {
+                    D::Error::invalid_type(serde::de::Unexpected::Other("string"), &NEEDS)
+                }
+                Value::Array(_) => {
+                    D::Error::invalid_type(serde::de::Unexpected::Other("sequence"), &NEEDS)
+                }
+            });
         };
         source.map_err(D::Error::custom)
     }
