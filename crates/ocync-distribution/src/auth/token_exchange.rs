@@ -2,7 +2,7 @@
 //!
 //! Implements the challenge-response protocol used by Docker-compatible registries:
 //! ping `/v2/` → parse `WWW-Authenticate: Bearer` challenge → request token with
-//! optional credentials. Used by [`super::challenge::ChallengeAuth`].
+//! optional credentials.
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -959,6 +959,10 @@ mod tests {
     async fn the_token_answer_is_read() {
         let cases = [
             (
+                serde_json::json!({"token": "tok", "access_token": "other"}),
+                Some("tok"),
+            ),
+            (
                 serde_json::json!({"access_token": "fallback-tok"}),
                 Some("fallback-tok"),
             ),
@@ -977,11 +981,13 @@ mod tests {
                     "WWW-Authenticate",
                     format!(r#"Bearer realm="{}/token""#, mock.uri()),
                 ))
+                .expect(1)
                 .mount(&mock)
                 .await;
             wiremock::Mock::given(wiremock::matchers::method("GET"))
                 .and(wiremock::matchers::path("/token"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&body))
+                .expect(1)
                 .mount(&mock)
                 .await;
 

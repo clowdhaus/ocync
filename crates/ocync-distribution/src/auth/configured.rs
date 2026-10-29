@@ -1,5 +1,7 @@
 //! Auth provider for registries that issue their own tokens, named in the
-//! `WWW-Authenticate: Bearer` challenge of a `401` from `/v2/`.
+//! `WWW-Authenticate: Bearer` challenge of a `401` from `/v2/`, signing in
+//! with credentials from configuration: the ocync config, a Docker
+//! `config.json`, or none.
 
 use std::fmt;
 use std::future::Future;
@@ -10,7 +12,7 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 
-/// Where a [`ChallengeAuth`] got the credentials it sends to the token
+/// Where a [`ConfiguredAuth`] got the credentials it sends to the token
 /// endpoint.
 enum SignIn {
     /// No credentials: the token request carries no `Authorization` header.
@@ -38,7 +40,7 @@ impl SignIn {
 /// its credentials, if any, as HTTP Basic. Tokens are coalesced per scope:
 /// concurrent fetches for the same scope produce one token exchange while
 /// distinct scopes run in parallel.
-pub struct ChallengeAuth {
+pub struct ConfiguredAuth {
     /// The registry base URL (e.g. `https://registry-1.docker.io`).
     base_url: String,
     /// HTTP client for token requests.
@@ -49,9 +51,9 @@ pub struct ChallengeAuth {
     tokens: TokenCache,
 }
 
-impl fmt::Debug for ChallengeAuth {
+impl fmt::Debug for ConfiguredAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ChallengeAuth")
+        f.debug_struct("ConfiguredAuth")
             .field("base_url", &self.base_url)
             .field("sign_in", &self.name())
             .field("has_credentials", &self.sign_in.credentials().is_some())
@@ -59,7 +61,7 @@ impl fmt::Debug for ChallengeAuth {
     }
 }
 
-impl ChallengeAuth {
+impl ConfiguredAuth {
     /// Create an anonymous provider for the registry at `registry`, the base
     /// URL its client uses.
     pub fn anonymous(registry: &url::Url, http: reqwest::Client) -> Self {
@@ -80,9 +82,9 @@ impl ChallengeAuth {
     /// anonymously.
     pub async fn docker_config(
         registry: &url::Url,
+        http: reqwest::Client,
         credentials_key: &str,
         config: &DockerConfig,
-        http: reqwest::Client,
     ) -> Result<Self, Error> {
         let credentials = resolve_from_docker_config(config, credentials_key).await?;
         if credentials.is_some() {
@@ -103,7 +105,7 @@ impl ChallengeAuth {
     }
 }
 
-impl AuthProvider for ChallengeAuth {
+impl AuthProvider for ConfiguredAuth {
     fn name(&self) -> &'static str {
         match self.sign_in {
             SignIn::Anonymous => "anonymous",
@@ -150,6 +152,10 @@ mod tests {
 
     use super::*;
 
+    /// A Docker config key no parsed URL produces: Docker keys credentials
+    /// by the registry as the user wrote it.
+    const AS_WRITTEN: &str = "Registry.Example:443";
+
     fn credentials() -> Credentials {
         Credentials::Basic {
             username: "testuser".into(),
@@ -186,46 +192,59 @@ mod tests {
         server.uri().parse().unwrap()
     }
 
-    async fn docker_config_auth(server: &MockServer, entry: Option<&str>) -> ChallengeAuth {
-        let host = url(server).authority().to_owned();
+    async fn docker_config_auth(server: &MockServer, entry: Option<&str>) -> ConfiguredAuth {
         let auths = entry.map_or_else(String::new, |userpass| {
-            format!(r#""{host}": {{"auth": "{}"}}"#, BASE64.encode(userpass))
+            format!(
+                r#""{AS_WRITTEN}": {{"auth": "{}"}}"#,
+                BASE64.encode(userpass)
+            )
         });
         let config: DockerConfig =
             crate::json::parse(format!(r#"{{"auths": {{{auths}}}}}"#).as_bytes()).unwrap();
-        ChallengeAuth::docker_config(&url(server), &host, &config, crate::test_http_client())
+        ConfiguredAuth::docker_config(&url(server), crate::test_http_client(), AS_WRITTEN, &config)
             .await
             .unwrap()
     }
 
-    /// Each sign-in sends its own credentials, and only those, to the token
-    /// endpoint. Breaks if anonymous sends credentials, a Docker config
-    /// entry is not looked up under the registry as written, or a provider
-    /// sends credentials it does not hold.
+    /// Each sign-in keeps its name and sends its own credentials, and only
+    /// those, to the token endpoint, and Debug never prints them. Breaks if
+    /// anonymous sends credentials, a Docker config entry is looked up by
+    /// anything but the registry as written, a provider sends credentials it
+    /// does not hold, or Debug prints a username or password.
     #[tokio::test]
     async fn each_sign_in_sends_its_credentials() {
         let basic = format!("Basic {}", BASE64.encode("testuser:testpass"));
         let docker = format!("Basic {}", BASE64.encode("user:pass"));
-        let cases: [(&str, Option<&str>); 4] = [
-            ("anonymous", None),
-            ("basic", Some(&basic)),
-            ("docker-config with an entry", Some(&docker)),
-            ("docker-config without one", None),
+        let cases = [
+            ("anonymous", None, "anonymous"),
+            ("basic", Some(basic.as_str()), "basic"),
+            (
+                "docker config with an entry",
+                Some(docker.as_str()),
+                "docker-config",
+            ),
+            ("docker config without one", None, "docker-config"),
         ];
-        for (case, expected) in cases {
+        for (case, expected, name) in cases {
             let server = MockServer::start().await;
             mount_v2_challenge(&server, 1).await;
             mount_token(&server, "repository:repo:pull", "tok", 1).await;
             let auth = match case {
-                "anonymous" => ChallengeAuth::anonymous(&url(&server), crate::test_http_client()),
+                "anonymous" => ConfiguredAuth::anonymous(&url(&server), crate::test_http_client()),
                 "basic" => {
-                    ChallengeAuth::basic(&url(&server), crate::test_http_client(), credentials())
+                    ConfiguredAuth::basic(&url(&server), crate::test_http_client(), credentials())
                 }
-                "docker-config with an entry" => {
+                "docker config with an entry" => {
                     docker_config_auth(&server, Some("user:pass")).await
                 }
-                _ => docker_config_auth(&server, None).await,
+                "docker config without one" => docker_config_auth(&server, None).await,
+                _ => unreachable!("{case}"),
             };
+            assert_eq!(auth.name(), name, "{case}");
+            let debug = format!("{auth:?}");
+            for secret in ["testuser", "testpass", "user:pass"] {
+                assert!(!debug.contains(secret), "{case}: {debug}");
+            }
             assert_eq!(
                 auth.get_token(&[Scope::pull("repo")])
                     .await
@@ -255,7 +274,7 @@ mod tests {
         mount_token(&server, "repository:repo:pull", "pull", 1).await;
         mount_token(&server, "repository:repo:pull,push", "push", 1).await;
         mount_token(&server, "repository:other:pull", "other", 1).await;
-        let auth = ChallengeAuth::anonymous(&url(&server), crate::test_http_client());
+        let auth = ConfiguredAuth::anonymous(&url(&server), crate::test_http_client());
 
         for (scope, expected) in [
             (Scope::pull("repo"), "pull"),
@@ -275,7 +294,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_v2_challenge(&server, 2).await;
         mount_token(&server, "repository:repo:pull", "tok", 2).await;
-        let auth = ChallengeAuth::anonymous(&url(&server), crate::test_http_client());
+        let auth = ConfiguredAuth::anonymous(&url(&server), crate::test_http_client());
 
         let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.refuse(Token::new("other")).await;
@@ -298,48 +317,12 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let auth = ChallengeAuth::basic(&url(&server), crate::test_http_client(), credentials());
+        let auth = ConfiguredAuth::basic(&url(&server), crate::test_http_client(), credentials());
 
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
         assert!(
             matches!(err, Error::TokenEndpoint { status, .. } if status == http::StatusCode::FORBIDDEN),
             "{err:?}"
         );
-    }
-
-    /// Each sign-in keeps its own name, and Debug never prints credentials.
-    #[tokio::test]
-    async fn name_and_debug_per_sign_in() {
-        let registry: url::Url = "https://example.com".parse().unwrap();
-        let http = crate::test_http_client();
-        let cases = [
-            (
-                ChallengeAuth::anonymous(&registry, http.clone()),
-                "anonymous",
-            ),
-            (
-                ChallengeAuth::basic(&registry, http.clone(), credentials()),
-                "basic",
-            ),
-            (
-                ChallengeAuth::docker_config(
-                    &registry,
-                    "example.com",
-                    &DockerConfig::default(),
-                    http,
-                )
-                .await
-                .unwrap(),
-                "docker-config",
-            ),
-        ];
-        for (auth, name) in cases {
-            assert_eq!(auth.name(), name);
-            let debug = format!("{auth:?}");
-            assert!(
-                !debug.contains("testuser") && !debug.contains("testpass"),
-                "{debug}"
-            );
-        }
     }
 }

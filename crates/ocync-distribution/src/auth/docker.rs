@@ -337,7 +337,6 @@ fn default_config_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     /// A helper that fails has its stderr cut to what can be quoted, and one
