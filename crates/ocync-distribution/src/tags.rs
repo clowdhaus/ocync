@@ -119,7 +119,8 @@ impl RegistryClient {
                         .and_then(|v| v.to_str().ok())
                         .and_then(parse_next_link);
 
-                    let tag_list: TagListResponse = resp.json().await?;
+                    let tag_list: TagListResponse =
+                        crate::json::answer(resp, crate::json::NO_LIMIT).await?;
                     Ok((next_url, tag_list))
                 })
                 .await?;
@@ -275,6 +276,33 @@ mod tests {
         assert!(
             msg.contains("exceeded") && msg.contains("pages"),
             "unexpected error: {msg}"
+        );
+    }
+
+    /// A tag list page that arrives whole and is not the JSON expected is
+    /// asked for once, not re-sent. Breaks if an unreadable answer is
+    /// retried, which spends the registry's rate limit on a body that
+    /// cannot change.
+    #[tokio::test]
+    async fn an_unreadable_tag_list_is_asked_for_once() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/repo/tags/list"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("<html>"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = url::Url::parse(&server.uri()).unwrap();
+        let client = crate::client::RegistryClientBuilder::new(base_url)
+            .build()
+            .unwrap();
+
+        let repo = RepositoryName::new("repo").unwrap();
+        let err = client.list_tags(&repo).await.unwrap_err();
+        assert!(
+            matches!(err, Error::UnreadableAnswer { .. }),
+            "unexpected error: {err}"
         );
     }
 }

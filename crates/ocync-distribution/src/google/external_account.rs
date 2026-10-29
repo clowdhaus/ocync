@@ -58,6 +58,10 @@ enum SourceFile {
 }
 
 impl<'de> Deserialize<'de> for SourceFile {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "its error reaches the reader that cleans it, as this deserializer's own"
+    )]
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
 

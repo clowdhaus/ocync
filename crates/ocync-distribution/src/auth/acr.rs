@@ -183,7 +183,7 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = crate::json::error_body(response).await;
         return Err(Error::cloud_credentials(
             service,
             CredentialFailure::of_status(status),
@@ -194,13 +194,15 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
         ));
     }
 
-    response.json().await.map_err(|e| {
-        Error::cloud_credentials(
-            service,
-            CredentialFailure::Failed,
-            format_args!("ACR {endpoint} response parse failed: {}", error_chain(&e)),
-        )
-    })
+    crate::json::answer(response, crate::json::MAX_SMALL_ANSWER)
+        .await
+        .map_err(|e| {
+            Error::cloud_credentials(
+                service,
+                CredentialFailure::of_unreadable(&e),
+                format_args!("ACR {endpoint}: {}", error_chain(&e)),
+            )
+        })
 }
 
 /// Exchange an AAD access token for an ACR refresh token.
@@ -355,19 +357,21 @@ impl AzureCredentialChain {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::json::error_body(resp).await;
             return Err(CredentialError::Failed(
                 CredentialFailure::of_oauth(status, OAuthCode::read(body.as_bytes())),
                 format!("{source} auth failed: {}", truncate_quoted(&body)),
             ));
         }
 
-        let body: EntraTokenResponse = resp.json().await.map_err(|e| {
-            CredentialError::Failed(
-                CredentialFailure::Failed,
-                format!("{source} response parse failed: {}", error_chain(&e)),
-            )
-        })?;
+        let body: EntraTokenResponse = crate::json::answer(resp, crate::json::MAX_SMALL_ANSWER)
+            .await
+            .map_err(|e| {
+                CredentialError::Failed(
+                    CredentialFailure::of_unreadable(&e),
+                    format!("{source}: {}", error_chain(&e)),
+                )
+            })?;
 
         Ok(body.access_token)
     }
@@ -444,7 +448,7 @@ impl AzureCredentialChain {
         let status = resp.status();
         if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED
         {
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::json::error_body(resp).await;
             return Err(CredentialError::Failed(
                 CredentialFailure::Failed,
                 format!(
@@ -463,12 +467,14 @@ impl AzureCredentialChain {
             ));
         }
 
-        let body: ImdsTokenResponse = resp.json().await.map_err(|_| {
-            CredentialError::Failed(
-                CredentialFailure::Failed,
-                "IMDS response parse failed".into(),
-            )
-        })?;
+        let body: ImdsTokenResponse = crate::json::answer(resp, crate::json::MAX_SMALL_ANSWER)
+            .await
+            .map_err(|e| {
+                CredentialError::Failed(
+                    CredentialFailure::of_unreadable(&e),
+                    format!("IMDS: {}", error_chain(&e)),
+                )
+            })?;
 
         Ok(body.access_token)
     }
@@ -1050,7 +1056,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains("response parse failed"),
+            err.to_string().contains("unreadable answer from"),
             "got: {err}"
         );
         assert!(!err.is_auth_error(), "{err}");

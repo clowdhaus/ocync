@@ -133,6 +133,9 @@ pub(in crate::aws) enum TokenError {
     /// The request did not complete, such as off EC2.
     #[error("could not communicate with IMDS")]
     Transport(#[source] TransportError),
+    /// The answer is longer than any session token.
+    #[error("the answer is over {} bytes", crate::json::MAX_SMALL_ANSWER)]
+    TooLarge,
     /// The answer failed the request.
     #[error(transparent)]
     Request(#[from] RequestError),
@@ -162,6 +165,9 @@ pub(in crate::aws) enum Error {
     /// The answer failed the request.
     #[error(transparent)]
     Request(#[from] RequestError),
+    /// The answer is longer than any credentials document or role name.
+    #[error("the answer is over {} bytes", crate::json::MAX_SMALL_ANSWER)]
+    TooLarge,
     /// The role name is not text.
     #[error("IMDS did not return valid UTF-8")]
     NotUtf8(#[source] Utf8Error),
@@ -347,7 +353,7 @@ impl Provider {
             .get(endpoint, transport, &format!("{CREDENTIALS_PATH}{role}"))
             .await
             .map_err(ChainError::Imds)?;
-        match json::parse(&body).map_err(|e| ChainError::Imds(Error::Json(e)))? {
+        match json::read_document(&body).map_err(|e| ChainError::Imds(Error::Json(e)))? {
             Document::Credentials(mut credentials) => {
                 credentials.expiry = credentials.expiry.map(|expiry| self.extend(expiry));
                 *self.last.lock().expect("no panic while held") = Some(credentials.clone());
@@ -389,12 +395,15 @@ impl Provider {
             let mut request = reqwest::Request::new(Method::GET, url.clone());
             request.headers_mut().insert(TOKEN_HEADER, token);
             within(ATTEMPT_TIMEOUT, async {
-                let response = transport.send(request).await.map_err(Error::from)?;
+                let mut response = transport.send(request).await.map_err(Error::from)?;
                 let status = response.status();
                 if !status.is_success() {
                     return Err(RequestError::Status(status).into());
                 }
-                response.bytes().await.map_err(Error::from)
+                crate::json::read_capped(&mut response, crate::json::MAX_SMALL_ANSWER)
+                    .await?
+                    .map(Bytes::from)
+                    .ok_or(Error::TooLarge)
             })
             .await
         });
@@ -433,7 +442,7 @@ async fn request_token(
     transport: &Transport,
     request: reqwest::Request,
 ) -> Result<(HeaderValue, Duration), TokenError> {
-    let response = transport.send(request).await.map_err(TokenError::from)?;
+    let mut response = transport.send(request).await.map_err(TokenError::from)?;
     match response.status() {
         StatusCode::BAD_REQUEST => return Err(TokenError::InvalidParameters),
         StatusCode::FORBIDDEN => return Err(TokenError::Forbidden),
@@ -450,7 +459,9 @@ async fn request_token(
         .and_then(|ttl| ttl.parse().map_err(TtlError::NotSeconds))
         .map(Duration::from_secs)
         .map_err(TokenError::InvalidTtl)?;
-    let body = response.bytes().await.map_err(TokenError::from)?;
+    let body = crate::json::read_capped(&mut response, crate::json::MAX_SMALL_ANSWER)
+        .await?
+        .ok_or(TokenError::TooLarge)?;
     let token = session_token(&body).map_err(TokenError::InvalidToken)?;
     Ok((token, ttl))
 }
@@ -647,6 +658,32 @@ mod tests {
             run += 1;
         }
         assert_eq!((run, skipped), (11, 3));
+    }
+
+    /// A session token answer longer than any token is refused, not
+    /// buffered, and not re-sent. Breaks if the body is read whatever its
+    /// length.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversized_token_answer_is_refused() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(TOKEN_TTL_HEADER, "21600")
+                    .set_body_bytes(vec![b'a'; crate::json::MAX_SMALL_ANSWER + 1]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let vars = HashMap::from([("AWS_EC2_METADATA_SERVICE_ENDPOINT".to_owned(), server.uri())]);
+        let host = host(vars, HashMap::new(), Clock::System, Network::Real);
+        let err = imds(&host).load().await.unwrap_err();
+        assert!(
+            matches!(err, ChainError::Imds(Error::Token(TokenError::TooLarge))),
+            "{err:?}"
+        );
     }
 
     /// Off EC2 the endpoint never answers. The token request times out on

@@ -106,6 +106,10 @@ fn config_path(provider: &str) -> PathBuf {
 }
 
 /// Read and parse bench.json for the given provider.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads the bench's own configuration"
+)]
 fn read_config(provider: &str) -> Result<BenchConfig, Box<dyn std::error::Error>> {
     // Validate the provider directory exists before reading config.
     let provider_dir = PathBuf::from(format!("bench/terraform/{provider}"));

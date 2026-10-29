@@ -5,6 +5,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::Digest;
+pub use crate::json::Unreadable;
 
 /// Errors returned by OCI distribution operations.
 ///
@@ -123,6 +124,29 @@ pub enum Error {
     /// lookup, so this names them.
     #[error("HTTP request failed: {}", error_chain(&**.0))]
     Http(#[source] Arc<reqwest::Error>),
+
+    /// An answer's body is longer than any answer of its kind, so it is
+    /// not read further.
+    #[error("answer from {url} over {max} bytes")]
+    AnswerTooLarge {
+        /// The address that answered.
+        url: Box<reqwest::Url>,
+        /// The most read.
+        max: usize,
+    },
+
+    /// An answer's body is not the JSON expected. The cause names where
+    /// and why it failed to parse but no value from the body, which can be
+    /// a token. Sending the request again gets the same body, so it is
+    /// final.
+    #[error("unreadable answer from {url}: {source}")]
+    UnreadableAnswer {
+        /// The address that answered.
+        url: Box<reqwest::Url>,
+        /// Where and why the body failed to parse.
+        #[source]
+        source: Unreadable,
+    },
 
     /// The registry returned a non-success HTTP status.
     #[error("registry returned {status}: {message}")]
@@ -327,6 +351,16 @@ impl CredentialFailure {
             Self::Failed
         }
     }
+
+    /// A credential answer [`crate::json::answer`] could not read: a body
+    /// cut short may arrive whole if asked again, and one that arrived and
+    /// does not parse will not.
+    pub(crate) fn of_unreadable(error: &Error) -> Self {
+        match error {
+            Error::Http(source) => Self::of_transport(source),
+            _ => Self::Failed,
+        }
+    }
 }
 
 impl From<serde_json::Error> for Error {
@@ -402,7 +436,7 @@ impl Error {
 /// as their source.
 pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut errors = vec![error];
-    while let Some(source) = errors.last().and_then(|e| shown_source(*e)) {
+    while let Some(source) = errors.last().and_then(|e| e.source()) {
         errors.push(source);
     }
     let texts: Vec<String> = errors.iter().map(ToString::to_string).collect();
@@ -422,20 +456,6 @@ pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         chains[i] = text;
     }
     chains.swap_remove(0)
-}
-
-/// The source of `error` whose text may be shown. The JSON parser's text
-/// for a response body the HTTP client could not decode quotes the value it
-/// refused, and a body can carry a token, so it is not shown.
-fn shown_source<'a>(
-    error: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a (dyn std::error::Error + 'static)> {
-    // `Error::Http` holds the client's error shared, so either form can be
-    // the parent.
-    let from_http = error.is::<reqwest::Error>() || error.is::<Arc<reqwest::Error>>();
-    error
-        .source()
-        .filter(|source| !(from_http && source.is::<serde_json::Error>()))
 }
 
 /// The most of an external body or stream kept in an error, in bytes.
@@ -477,8 +497,9 @@ mod tests {
         assert_eq!(error_chain(&err), text);
     }
 
-    /// A body cut off partway names why reading it stopped. Breaks if a
-    /// body-read failure is cut back to its top line.
+    /// A body cut off partway names why reading it stopped, and a credential
+    /// answer cut off may arrive whole if asked again. Breaks if a body-read
+    /// failure is cut back to its top line or judged final.
     #[tokio::test]
     async fn a_cut_off_body_names_its_cause() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -499,7 +520,13 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let err = Error::from(response.bytes().await.unwrap_err());
+        let err = crate::json::answer::<u64>(response, crate::json::MAX_SMALL_ANSWER)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            CredentialFailure::of_unreadable(&err),
+            CredentialFailure::Transient
+        );
         let text = err.to_string();
         assert!(
             text.ends_with(
@@ -508,30 +535,6 @@ mod tests {
             "{text}"
         );
         assert_eq!(error_chain(&err), text);
-    }
-
-    /// A body that fails to decode is named as such, without the parser's
-    /// text, which quotes the body. Breaks if the body reaches the text.
-    #[tokio::test]
-    async fn a_decode_error_leaves_the_body_out() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::any())
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("\"s3cret\""))
-            .mount(&server)
-            .await;
-        let response = crate::test_http_client()
-            .get(server.uri())
-            .send()
-            .await
-            .unwrap();
-        let err = Error::from(response.json::<u64>().await.unwrap_err());
-        let text = err.to_string();
-        assert!(
-            text.starts_with("HTTP request failed: error decoding response body"),
-            "{text}"
-        );
-        assert!(!text.contains("s3cret"), "{text}");
-        assert!(!error_chain(&err).contains("s3cret"), "{err}");
     }
 
     #[test]

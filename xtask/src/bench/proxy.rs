@@ -201,6 +201,7 @@ pub(crate) async fn stop(
 }
 
 /// Reads a JSONL proxy log file and returns the parsed entries.
+#[expect(clippy::disallowed_methods, reason = "reads the bench proxy's own log")]
 fn parse_log(path: &Path) -> Result<Vec<ProxyEntry>, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
     let mut entries = Vec::new();

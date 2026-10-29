@@ -142,6 +142,9 @@ pub(in crate::aws) enum Error {
     /// The credentials document does not read.
     #[error(transparent)]
     Json(json::Error),
+    /// The answer is longer than any credentials document.
+    #[error("the answer is over {} bytes", crate::json::MAX_SMALL_ANSWER)]
+    TooLarge,
     /// An error document in place of credentials.
     #[error("failed to load credentials [{code}]: {message}")]
     Document {
@@ -172,6 +175,7 @@ impl Retryable for Error {
             | Self::Client(_)
             | Self::TokenFile { .. }
             | Self::InvalidToken(_)
+            | Self::TooLarge
             | Self::Document { .. } => None,
         }
     }
@@ -328,7 +332,7 @@ impl Provider {
         tracing::debug!("loading credentials from the container endpoint");
         let mut policy = retry::CallPolicy::new(&self.retry, &self.partition);
         retrying("container credentials request", &mut policy, |_| async {
-            let response = transport
+            let mut response = transport
                 .send(request(url, token.as_ref()))
                 .await
                 .map_err(Error::from)?;
@@ -336,8 +340,10 @@ impl Provider {
             if !status.is_success() {
                 return Err(Error::Status(status));
             }
-            let body = response.bytes().await.map_err(Error::from)?;
-            match json::parse(&body).map_err(Error::Json)? {
+            let body = crate::json::read_capped(&mut response, crate::json::MAX_SMALL_ANSWER)
+                .await?
+                .ok_or(Error::TooLarge)?;
+            match json::read_document(&body).map_err(Error::Json)? {
                 Document::Credentials(credentials) => Ok(credentials),
                 Document::Error { code, message } => Err(Error::Document { code, message }),
             }
@@ -703,6 +709,33 @@ mod tests {
         assert!(sent.headers()[AUTHORIZATION].is_sensitive());
         assert!(!format!("{token:?}").contains("the-token"));
         assert!(!request(&url, None).headers().contains_key(AUTHORIZATION));
+    }
+
+    /// An answer longer than any credentials document is refused, not
+    /// buffered, and not re-sent. Breaks if the body is read whatever its
+    /// length.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversized_answer_is_refused() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                b' ';
+                crate::json::MAX_SMALL_ANSWER
+                    + 1
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let uri = format!("{}/creds", server.uri());
+        let vars = [(FULL_URI, uri.as_str())];
+        let host = host(&vars, &[], &[], Network::Real);
+        let err = Provider::new(&host).unwrap().load().await.unwrap_err();
+        assert!(
+            matches!(err, ChainError::Container(Error::TooLarge)),
+            "{err:?}"
+        );
     }
 
     /// Over the network a redirect is not followed, so the token goes to

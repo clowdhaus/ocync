@@ -102,6 +102,7 @@ pub fn is_blob_upload_unknown(error: &ocync_distribution::Error) -> bool {
 
 /// The `errors[].code` values of an OCI distribution-spec error body; none
 /// when the body is not that shape.
+#[expect(clippy::disallowed_methods, reason = "a parse error is dropped unread")]
 pub(crate) fn oci_error_codes(message: &str) -> impl Iterator<Item = String> {
     serde_json::from_str::<OciErrorBody>(message)
         .map(|body| body.errors)
@@ -125,20 +126,20 @@ struct OciError {
 ///
 /// Returns `true` for connection failures, request timeouts, mid-stream
 /// send failures (connection reset during body upload), and response body
-/// errors (premature EOF, truncated body, decode failures from corrupted
-/// transport) surfaced by `reqwest`. These are transient by nature and
-/// safe to retry idempotent OCI operations on. Deterministic decode
-/// failures (e.g. malformed registry responses) are bounded by
-/// `max_retries`.
+/// errors (premature EOF, truncated body) surfaced by `reqwest`, which
+/// reports a body cut short as a decode failure. These are transient by
+/// nature and safe to retry idempotent OCI operations on. An answer that
+/// arrived whole and is not the JSON expected is final.
 ///
 /// # Predicate set
 ///
 /// `reqwest::Error::is_request()` covers errors raised during request
 /// dispatch (including connect failures and timeouts on the async hyper
 /// path - both are wrapped as `Kind::Request` by reqwest). `is_body()`
-/// and `is_decode()` cover the response-body and decoder phases, which
-/// are NOT classified as `Kind::Request`. Together these three predicates
-/// cover the transient-network surface without overlap.
+/// and `is_decode()` cover the response-body phase, which is NOT
+/// classified as `Kind::Request`: reqwest reports a body cut short while
+/// read as a decode failure. Together these three predicates cover the
+/// transient-network surface without overlap.
 ///
 /// The `should_retry_transport_*` tests below verify that connection
 /// failures and timeouts both classify as retryable through `is_request()`
@@ -151,6 +152,10 @@ struct OciError {
 /// - `Error::Io { .. }` -- local filesystem errors, never transient (typed `io::Error`)
 /// - `Error::RegistryError { .. }` -- HTTP-level; retried via `should_retry()` instead
 /// - `Error::RegistryProtocol { .. }` -- deterministic spec violation, never transient
+/// - `Error::UnreadableAnswer { .. }` -- an answer that arrived whole and does
+///   not parse; the same body comes back if asked again
+/// - `Error::AnswerTooLarge { .. }` -- an answer past a fixed limit, which
+///   asking again does not raise
 ///
 /// If operators observe unretrieved transient errors, the debug log below will
 /// show which variant was encountered so the match can be extended.

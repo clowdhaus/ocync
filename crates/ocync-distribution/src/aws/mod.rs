@@ -337,7 +337,7 @@ impl ServiceError {
         modeled: &'static [ModeledError],
     ) -> Self {
         let body: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(body).unwrap_or_default();
+            crate::json::parse(body).unwrap_or_default();
         let text = |key: &str| body.get(key).and_then(serde_json::Value::as_str);
         let code = header_code
             .and_then(|raw| ErrorCode::parse(raw, modeled))
@@ -472,6 +472,9 @@ enum Failure {
     /// The service's answer could not be read.
     #[error("unreadable response: {0}")]
     Decode(#[source] crate::json::Unreadable),
+    /// The service's answer is longer than any answer it gives.
+    #[error("the answer is over {} bytes", crate::json::MAX_SMALL_ANSWER)]
+    TooLarge,
     /// A header to send, such as a credential's session token, holds a byte
     /// a header cannot carry.
     #[error("request has a header that cannot be sent: {0}")]
@@ -544,7 +547,9 @@ impl retry::Retryable for Failure {
                 _ => None,
             },
             Self::ClockSkewed { .. } => Some(retry::Kind::Server),
-            Self::Credentials(_) | Self::Decode(_) | Self::InvalidHeader(_) => None,
+            Self::Credentials(_) | Self::Decode(_) | Self::TooLarge | Self::InvalidHeader(_) => {
+                None
+            }
         }
     }
 
@@ -554,6 +559,7 @@ impl retry::Retryable for Failure {
             Self::Credentials(_)
             | Self::Transport(_)
             | Self::Decode(_)
+            | Self::TooLarge
             | Self::InvalidHeader(_) => None,
         }
     }
@@ -765,7 +771,7 @@ impl Api {
                 headers.insert(HeaderName::from_static(name), value);
             }
         }
-        let response = self.http.send(outgoing).await?;
+        let mut response = self.http.send(outgoing).await?;
         let measured = match self.skew_correction {
             SkewCorrection::On => ClockSkew::measure(response.headers(), sent, SystemTime::now()),
             SkewCorrection::Off => None,
@@ -780,10 +786,14 @@ impl Api {
             .get(X_AMZ_RETRY_AFTER)
             .and_then(|v| v.to_str().ok()?.parse().ok())
             .map(Duration::from_millis);
-        let bytes = response.bytes().await?;
         if status.is_success() {
-            return Ok(bytes);
+            return crate::json::read_capped(&mut response, crate::json::MAX_SMALL_ANSWER)
+                .await?
+                .map(Bytes::from)
+                .ok_or(Failure::TooLarge);
         }
+        let mut bytes = Vec::new();
+        crate::json::read_start(&mut response, &mut bytes).await?;
         let modeled = request.modeled_errors;
         let error = ServiceError {
             retry_after,
@@ -1384,6 +1394,71 @@ pub(crate) mod tests {
         ] {
             assert_eq!(host_header(&Url::parse(url).unwrap()), host);
         }
+    }
+
+    /// An answer longer than any AWS answer is refused, not buffered, and
+    /// not re-sent. Breaks if the body is read whatever its length.
+    #[tokio::test]
+    async fn an_oversized_answer_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                b' ';
+                crate::json::MAX_SMALL_ANSWER
+                    + 1
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::from_parts(parts(&server.uri())).unwrap();
+        let err = client.call(&Probe {}).await.unwrap_err();
+        assert!(matches!(err.failure, Failure::TooLarge), "{err}");
+    }
+
+    /// An error answer longer than the limit is still the service's error,
+    /// classified by its status, so a large proxy error page is retried or
+    /// refused by what it says. Breaks if the limit applies to error answers.
+    #[tokio::test]
+    async fn an_oversized_error_answer_is_the_service_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_bytes(vec![
+                b' ';
+                crate::json::MAX_SMALL_ANSWER
+                    + 1
+            ]))
+            .mount(&server)
+            .await;
+
+        let client = Client::from_parts(parts(&server.uri())).unwrap();
+        let err = client.call(&Probe {}).await.unwrap_err();
+        assert!(matches!(err.failure, Failure::Service(_)), "{err}");
+    }
+
+    /// An error answer cut off partway is a transport failure, which may
+    /// pass if sent again, not the service's error read from a part. Breaks
+    /// if a cut-off error body is parsed as if whole.
+    #[tokio::test]
+    async fn a_cut_off_error_answer_is_a_transport_failure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.read(&mut [0; 4096]).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 100\r\n\r\n{")
+                    .await;
+            }
+        });
+
+        let mut parts = parts(&endpoint);
+        parts.api.retry = strategy(NonZeroU32::MIN);
+        let client = Client::from_parts(parts).unwrap();
+        let err = client.call(&Probe {}).await.unwrap_err();
+        assert!(matches!(err.failure, Failure::Transport(_)), "{err}");
     }
 
     /// The request carries the AWS JSON protocol headers and a signature

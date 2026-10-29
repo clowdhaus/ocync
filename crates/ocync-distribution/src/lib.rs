@@ -1,4 +1,11 @@
 //! OCI distribution client library - types, authentication, and registry operations.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read JSON they wrote themselves"
+    )
+)]
 
 /// AIMD concurrency controller - adaptive rate limiting via 429 feedback.
 pub mod aimd;

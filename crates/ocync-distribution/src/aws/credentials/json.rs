@@ -123,7 +123,7 @@ pub(super) fn field<'a, T>(
 /// Read `body`. Fields are found as [`field`] finds them, string values
 /// only. A document with no `Code`, or `Code` of `Success`, must carry a
 /// key, token and expiry.
-pub(super) fn parse(body: &[u8]) -> Result<Document, Error> {
+pub(super) fn read_document(body: &[u8]) -> Result<Document, Error> {
     let fields: serde_json::Map<String, serde_json::Value> =
         crate::json::parse(body).map_err(Error::Json)?;
     let field = |names: &[&str]| field(&fields, names, serde_json::Value::as_str);
@@ -182,7 +182,7 @@ mod tests {
         let body = br#"{"code": "Success", "type": "AWS-HMAC", "accesskeyid": "ASIA",
             "SECRETACCESSKEY": "secret", "SessionToken": "token",
             "ExpiresAt": "2021-09-21T04:16:53Z", "AccountId": "123", "Extra": 7}"#;
-        let Document::Credentials(credentials) = parse(body).unwrap() else {
+        let Document::Credentials(credentials) = read_document(body).unwrap() else {
             panic!("not credentials");
         };
         assert_eq!(credentials.access_key_id(), "ASIA");
@@ -193,13 +193,14 @@ mod tests {
             Some(UNIX_EPOCH + Duration::from_secs(1_632_197_813))
         );
 
-        let error = parse(br#"{"Code": "AssumeRoleUnauthorizedAccess", "Message": "denied"}"#);
+        let error =
+            read_document(br#"{"Code": "AssumeRoleUnauthorizedAccess", "Message": "denied"}"#);
         assert!(
             matches!(error, Ok(Document::Error { code: Code::AssumeRoleUnauthorizedAccess, ref message })
                 if message == "denied"),
             "{error:?}"
         );
-        let other = parse(br#"{"Code": "Throttled"}"#);
+        let other = read_document(br#"{"Code": "Throttled"}"#);
         assert!(
             matches!(other, Ok(Document::Error { code: Code::Other(ref code), ref message })
                 if code == "Throttled" && message == "no message"),
@@ -224,7 +225,7 @@ mod tests {
             ),
             (b"[]", "invalid JSON"),
         ] {
-            let err = parse(body).unwrap_err().to_string();
+            let err = read_document(body).unwrap_err().to_string();
             assert!(err.contains(text), "{err}");
         }
     }

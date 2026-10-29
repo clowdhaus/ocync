@@ -65,7 +65,7 @@ async fn expect_status(
         Ok(resp)
     } else {
         let registry = base_url.host_str().unwrap_or("unknown");
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::json::error_body(resp).await;
         let message = if body.is_empty() {
             format!("{registry}/{repository}")
         } else {
@@ -630,7 +630,7 @@ async fn classify_mount_response(
         StatusCode::ACCEPTED => Ok(MountResult::NotMounted),
         _ => {
             let registry = base_url.host_str().unwrap_or("unknown");
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::json::error_body(resp).await;
             let message = if body.is_empty() {
                 format!("{registry}/{repository}")
             } else {

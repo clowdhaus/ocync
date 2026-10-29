@@ -358,7 +358,7 @@ async fn refuses_an_answer_past_the_cap() {
 
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::any())
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_BODY + 1]))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_SMALL_ANSWER + 1]))
         .mount(&server)
         .await;
     let clients = Clients::new().unwrap();

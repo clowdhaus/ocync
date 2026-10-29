@@ -438,7 +438,8 @@ pub(crate) async fn exchange(
             status,
         });
     }
-    let token_resp = resp.json::<TokenResponse>().await?;
+    let token_resp: TokenResponse =
+        crate::json::answer(resp, crate::json::MAX_SMALL_ANSWER).await?;
 
     let token_value = token_resp
         .token

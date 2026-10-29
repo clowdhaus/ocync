@@ -1,4 +1,11 @@
 //! xtask -- workspace automation commands.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read JSON they wrote themselves"
+    )
+)]
 
 mod bench;
 

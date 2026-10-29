@@ -43,9 +43,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// `is_request()` covers errors raised during request dispatch, which on the
 /// async hyper path includes connect failures and timeouts: reqwest wraps both
 /// as `Kind::Request`. `is_body()` and `is_decode()` cover the response-body
-/// and decoder phases, which are not classified as `Kind::Request`. A status
-/// error means the registry answered, so whether to re-send it is the status
-/// arm of [`is_transient`] rather than this.
+/// phase, which is not classified as `Kind::Request`: reqwest reports a body
+/// cut short while read as a decode failure. A status error means the
+/// registry answered, so whether to re-send it is the status arm of
+/// [`is_transient`] rather than this.
 ///
 /// This is the single definition of the transient-transport surface for the
 /// workspace. `ocync_sync::retry::should_retry_transport` delegates here

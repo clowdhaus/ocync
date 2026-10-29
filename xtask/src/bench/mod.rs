@@ -1336,6 +1336,10 @@ async fn cdn_prewarm(corpus: &Corpus) {
 
             if let Ok(r) = resp {
                 if let Ok(body) = r.text().await {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a public image manifest; a parse error is dropped unread"
+                    )]
                     if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&body) {
                         extract_blob_digests(
                             &client,
@@ -1629,6 +1633,10 @@ async fn extract_blob_digests(
                 .await;
             if let Ok(r) = resp {
                 if let Ok(body) = r.text().await {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a public image manifest; a parse error is dropped unread"
+                    )]
                     if let Ok(child_manifest) = serde_json::from_str::<serde_json::Value>(&body) {
                         collect_image_blobs(&child_manifest, registry, repo, blobs);
                     }
@@ -1711,6 +1719,7 @@ async fn oci_token(
     }
 
     let text = token_resp.text().await.ok()?;
+    #[expect(clippy::disallowed_methods, reason = "a parse error is dropped unread")]
     let body: serde_json::Value = serde_json::from_str(&text).ok()?;
     body.get("token")
         .or_else(|| body.get("access_token"))
@@ -1734,6 +1743,7 @@ fn parse_timing_file(path: &Path) -> BTreeMap<String, u64> {
     let mut map = BTreeMap::new();
     if let Ok(content) = std::fs::read_to_string(path) {
         for line in content.lines() {
+            #[expect(clippy::disallowed_methods, reason = "a timing file the bench wrote")]
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if let (Some(phase), Some(ms)) = (v["phase"].as_str(), v["elapsed_ms"].as_u64()) {
                     map.insert(phase.to_owned(), ms);

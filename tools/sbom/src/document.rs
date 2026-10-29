@@ -17,6 +17,10 @@ const AWS_LC_REF: &str = "aws-lc";
 
 /// Keep only crates `compiled` lists, add the linked AWS-LC library, and
 /// confirm the result describes this source tree's `ocync` and AWS-LC build.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads syft's bill of materials, which holds no credential"
+)]
 pub(crate) fn finish(
     raw: &str,
     compiled: &Compiled,
