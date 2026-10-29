@@ -116,8 +116,10 @@ pub enum Error {
         reason: String,
     },
 
-    /// An HTTP request to the registry failed.
-    #[error("HTTP request failed: {0}")]
+    /// An HTTP request to the registry failed. The HTTP client's text
+    /// leaves out its causes, such as a refused connection or a failed DNS
+    /// lookup, so this names them.
+    #[error("HTTP request failed: {}", error_chain(&**.0))]
     Http(#[source] Arc<reqwest::Error>),
 
     /// The registry returned a non-success HTTP status.
@@ -278,20 +280,45 @@ impl Error {
 
 /// `error` and each of its sources, joined as upstream prints them, so a
 /// reason kept as text still names its cause. A cause the text already ends
-/// with is not repeated: some errors print their cause and also return it as
-/// their source.
-pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(e) = source {
-        let cause = e.to_string();
-        if !text.ends_with(&cause) {
-            text.push_str(": ");
-            text.push_str(&cause);
-        }
-        source = e.source();
+/// with is not repeated, nor are the rest once the text ends with a cause
+/// and all of its own: some errors print their causes and also return them
+/// as their source.
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut errors = vec![error];
+    while let Some(source) = errors.last().and_then(|e| shown_source(*e)) {
+        errors.push(source);
     }
-    text
+    let texts: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    // The chain from each error down, built from the bottom up.
+    let mut chains = vec![String::new(); texts.len()];
+    for i in (0..texts.len()).rev() {
+        let mut text = texts[i].clone();
+        for j in i + 1..texts.len() {
+            if text.ends_with(&chains[j]) {
+                break;
+            }
+            if !text.ends_with(&texts[j]) {
+                text.push_str(": ");
+                text.push_str(&texts[j]);
+            }
+        }
+        chains[i] = text;
+    }
+    chains.swap_remove(0)
+}
+
+/// The source of `error` whose text may be shown. The JSON parser's text
+/// for a response body the HTTP client could not decode quotes the value it
+/// refused, and a body can carry a token, so it is not shown.
+fn shown_source<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    // `Error::Http` holds the client's error shared, so either form can be
+    // the parent.
+    let from_http = error.is::<reqwest::Error>() || error.is::<Arc<reqwest::Error>>();
+    error
+        .source()
+        .filter(|source| !(from_http && source.is::<serde_json::Error>()))
 }
 
 /// The most of an external body or stream kept in an error, in bytes.
@@ -314,6 +341,81 @@ pub(crate) fn truncate_quoted(body: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed request names its cause once, and joining its sources adds
+    /// nothing. Breaks if the text stops at "error sending request", or a
+    /// cause the text already holds is repeated.
+    #[tokio::test]
+    async fn an_http_error_names_its_cause_once() {
+        let refused = crate::refusal();
+        let err = Error::from(
+            crate::test_http_client()
+                .get(format!("http://{}/v2/", crate::REFUSING))
+                .send()
+                .await
+                .unwrap_err(),
+        );
+        let text = err.to_string();
+        assert!(text.ends_with(&refused), "{text}");
+        assert_eq!(error_chain(&err), text);
+    }
+
+    /// A body cut off partway names why reading it stopped. Breaks if a
+    /// body-read failure is cut back to its top line.
+    #[tokio::test]
+    async fn a_cut_off_body_names_its_cause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        let response = crate::test_http_client()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let err = Error::from(response.bytes().await.unwrap_err());
+        let text = err.to_string();
+        assert!(
+            text.ends_with(
+                "error reading a body from connection: end of file before message length reached"
+            ),
+            "{text}"
+        );
+        assert_eq!(error_chain(&err), text);
+    }
+
+    /// A body that fails to decode is named as such, without the parser's
+    /// text, which quotes the body. Breaks if the body reaches the text.
+    #[tokio::test]
+    async fn a_decode_error_leaves_the_body_out() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("\"s3cret\""))
+            .mount(&server)
+            .await;
+        let response = crate::test_http_client()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let err = Error::from(response.json::<u64>().await.unwrap_err());
+        let text = err.to_string();
+        assert!(
+            text.starts_with("HTTP request failed: error decoding response body"),
+            "{text}"
+        );
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!error_chain(&err).contains("s3cret"), "{err}");
+    }
 
     #[test]
     fn truncate_quoted_short() {

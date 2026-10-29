@@ -1995,16 +1995,12 @@ mod tests {
     /// refused connection is dropped from the text callers keep.
     #[tokio::test]
     async fn transport_errors_name_their_cause_without_the_endpoint_url() {
-        let mut parts = parts("http://127.0.0.1:1/secret-key");
+        let mut parts = parts(&format!("http://{}/secret-key", crate::REFUSING));
         parts.api.retry = strategy(NonZeroU32::MIN);
         let client = Client::from_parts(parts).unwrap();
         let err = client.call(&Probe {}).await.unwrap_err();
         let text = err.to_string();
-        // The operating system's own words for the refusal, from a plain
-        // connection to the same closed port.
-        let refused = std::net::TcpStream::connect("127.0.0.1:1")
-            .unwrap_err()
-            .to_string();
+        let refused = crate::refusal();
         assert!(
             text.ends_with(&refused),
             "{text} does not end with {refused}"

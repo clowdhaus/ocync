@@ -196,7 +196,7 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
 
     response.json().await.map_err(|e| Error::AuthFailed {
         registry: service.to_owned(),
-        reason: format!("ACR {endpoint} response parse failed: {e}"),
+        reason: format!("ACR {endpoint} response parse failed: {}", error_chain(&e)),
     })
 }
 
@@ -325,10 +325,12 @@ impl AzureCredentialChain {
             )));
         }
 
-        let body: EntraTokenResponse = resp
-            .json()
-            .await
-            .map_err(|e| CredentialError::Failed(format!("{source} response parse failed: {e}")))?;
+        let body: EntraTokenResponse = resp.json().await.map_err(|e| {
+            CredentialError::Failed(format!(
+                "{source} response parse failed: {}",
+                error_chain(&e)
+            ))
+        })?;
 
         Ok(body.access_token)
     }
@@ -833,10 +835,8 @@ mod tests {
     #[tokio::test]
     async fn a_refused_connection_is_named() {
         crate::install_crypto_provider();
-        let address = "127.0.0.1:1";
-        let refused = std::net::TcpStream::connect(address)
-            .unwrap_err()
-            .to_string();
+        let address = crate::REFUSING;
+        let refused = crate::refusal();
         let base_url = format!("http://{address}");
         let http = no_redirect_http_client();
 
