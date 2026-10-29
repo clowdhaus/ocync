@@ -193,17 +193,25 @@ pub(crate) async fn read_capped(
     Ok(Some(body))
 }
 
-/// The text of an error answer's body, read up to [`MAX_SMALL_ANSWER`]
-/// bytes and as far as it arrives.
-pub(crate) async fn error_body(mut response: reqwest::Response) -> String {
+/// The start of `response`'s body, up to [`MAX_SMALL_ANSWER`] bytes.
+pub(crate) async fn read_start(
+    response: &mut reqwest::Response,
+) -> Result<Vec<u8>, reqwest::Error> {
     let mut body = Vec::new();
     while body.len() < MAX_SMALL_ANSWER {
-        match response.chunk().await {
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-            Ok(None) | Err(_) => break,
-        }
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        body.extend_from_slice(&chunk);
     }
     body.truncate(MAX_SMALL_ANSWER);
+    Ok(body)
+}
+
+/// The text of an error answer's body, read up to [`MAX_SMALL_ANSWER`]
+/// bytes; empty when it does not arrive.
+pub(crate) async fn error_body(mut response: reqwest::Response) -> String {
+    let body = read_start(&mut response).await.unwrap_or_default();
     String::from_utf8_lossy(&body).into_owned()
 }
 

@@ -152,8 +152,10 @@ struct OciError {
 /// - `Error::Io { .. }` -- local filesystem errors, never transient (typed `io::Error`)
 /// - `Error::RegistryError { .. }` -- HTTP-level; retried via `should_retry()` instead
 /// - `Error::RegistryProtocol { .. }` -- deterministic spec violation, never transient
-/// - `Error::UnreadableAnswer { .. }`, `Error::AnswerTooLarge { .. }` -- an answer
-///   that arrived whole; the same body comes back if asked again
+/// - `Error::UnreadableAnswer { .. }` -- an answer that arrived whole and does
+///   not parse; the same body comes back if asked again
+/// - `Error::AnswerTooLarge { .. }` -- an answer past a fixed limit, which
+///   asking again does not raise
 ///
 /// If operators observe unretrieved transient errors, the debug log below will
 /// show which variant was encountered so the match can be extended.

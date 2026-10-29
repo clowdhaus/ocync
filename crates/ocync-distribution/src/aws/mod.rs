@@ -792,7 +792,7 @@ impl Api {
                 .map(Bytes::from)
                 .ok_or(Failure::TooLarge);
         }
-        let bytes = crate::json::error_body(response).await.into_bytes();
+        let bytes = crate::json::read_start(&mut response).await?;
         let modeled = request.modeled_errors;
         let error = ServiceError {
             retry_after,
@@ -1417,7 +1417,7 @@ pub(crate) mod tests {
 
     /// An error answer longer than the limit is still the service's error,
     /// classified by its status, so a large proxy error page is retried or
-    /// refused as before. Breaks if the limit applies to error answers.
+    /// refused by what it says. Breaks if the limit applies to error answers.
     #[tokio::test]
     async fn an_oversized_error_answer_is_the_service_error() {
         let server = MockServer::start().await;
@@ -1433,6 +1433,31 @@ pub(crate) mod tests {
         let client = Client::from_parts(parts(&server.uri())).unwrap();
         let err = client.call(&Probe {}).await.unwrap_err();
         assert!(matches!(err.failure, Failure::Service(_)), "{err}");
+    }
+
+    /// An error answer cut off partway is a transport failure, which may
+    /// pass if sent again, not the service's error read from a part. Breaks
+    /// if a cut-off error body is parsed as if whole.
+    #[tokio::test]
+    async fn a_cut_off_error_answer_is_a_transport_failure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.read(&mut [0; 4096]).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 100\r\n\r\n{")
+                    .await;
+            }
+        });
+
+        let mut parts = parts(&endpoint);
+        parts.api.retry = strategy(NonZeroU32::MIN);
+        let client = Client::from_parts(parts).unwrap();
+        let err = client.call(&Probe {}).await.unwrap_err();
+        assert!(matches!(err.failure, Failure::Transport(_)), "{err}");
     }
 
     /// The request carries the AWS JSON protocol headers and a signature
