@@ -119,7 +119,7 @@ impl RegistryClient {
                         .and_then(|v| v.to_str().ok())
                         .and_then(parse_next_link);
 
-                    let tag_list: TagListResponse = resp.json().await?;
+                    let tag_list: TagListResponse = crate::json::answer(resp).await?;
                     Ok((next_url, tag_list))
                 })
                 .await?;

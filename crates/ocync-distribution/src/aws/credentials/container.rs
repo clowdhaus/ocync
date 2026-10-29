@@ -337,7 +337,7 @@ impl Provider {
                 return Err(Error::Status(status));
             }
             let body = response.bytes().await.map_err(Error::from)?;
-            match json::parse(&body).map_err(Error::Json)? {
+            match json::read_document(&body).map_err(Error::Json)? {
                 Document::Credentials(credentials) => Ok(credentials),
                 Document::Error { code, message } => Err(Error::Document { code, message }),
             }

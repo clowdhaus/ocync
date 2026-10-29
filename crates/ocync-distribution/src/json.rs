@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use crate::Error;
+
 /// Read a JSON `null` as the type's default, as the SDK reads a field that
 /// is null or absent, and as a registry that sends `null` for an empty tag
 /// list means it. Use with
@@ -147,13 +149,33 @@ impl std::fmt::Display for Unreadable {
 impl std::error::Error for Unreadable {}
 
 /// Parse `text`, which holds or may hold a credential, as JSON of type `T`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the reader whose error is cleaned"
+)]
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(
     text: impl AsRef<[u8]>,
 ) -> Result<T, Unreadable> {
     Ok(serde_json::from_slice(text.as_ref())?)
 }
 
+/// Read `response`'s body, which holds or may hold a credential, as JSON of
+/// type `T`. A body that does not arrive is [`Error::Http`]; one that is not
+/// the JSON expected is [`Error::UnreadableAnswer`], with no value from it.
+pub(crate) async fn answer<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, Error> {
+    let body = response.bytes().await?;
+    parse(&body).map_err(|e| Error::UnreadableAnswer {
+        reason: e.to_string(),
+    })
+}
+
 /// Read `value`, which holds or may hold a credential, as type `T`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the reader whose error is cleaned"
+)]
 pub(crate) fn value_as<T: serde::de::DeserializeOwned>(
     value: serde_json::Value,
 ) -> Result<T, Unreadable> {

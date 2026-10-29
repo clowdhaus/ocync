@@ -1,0 +1,13 @@
+# Replaces the workspace clippy.toml for this crate, so it repeats its settings.
+too-many-lines-threshold = 200
+doc-valid-idents = ["CycloneDX", ".."]
+
+# JSON this crate reads can hold a credential, and these readers put the
+# value they refuse into their error. `crate::json` reads it instead.
+disallowed-methods = [
+    { path = "serde_json::from_slice", reason = "quotes a refused value in its error; use crate::json::parse" },
+    { path = "serde_json::from_str", reason = "quotes a refused value in its error; use crate::json::parse" },
+    { path = "serde_json::from_value", reason = "quotes a refused value in its error; use crate::json::value_as" },
+    { path = "serde_json::from_reader", reason = "quotes a refused value in its error; use crate::json::parse" },
+    { path = "reqwest::Response::json", reason = "quotes a refused value in its error; use crate::json::answer" },
+]

@@ -337,7 +337,7 @@ impl ServiceError {
         modeled: &'static [ModeledError],
     ) -> Self {
         let body: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(body).unwrap_or_default();
+            crate::json::parse(body).unwrap_or_default();
         let text = |key: &str| body.get(key).and_then(serde_json::Value::as_str);
         let code = header_code
             .and_then(|raw| ErrorCode::parse(raw, modeled))

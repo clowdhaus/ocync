@@ -146,7 +146,8 @@ struct OciError {
 ///
 /// # Known limitation
 ///
-/// Only inspects `ocync_distribution::Error::Http`. Transport
+/// Only inspects `ocync_distribution::Error::Http` and an answer that is
+/// not the JSON expected (`Error::UnreadableAnswer`). Transport
 /// errors that arrive wrapped in other variants are NOT retried:
 /// - `Error::Io { .. }` -- local filesystem errors, never transient (typed `io::Error`)
 /// - `Error::RegistryError { .. }` -- HTTP-level; retried via `should_retry()` instead
@@ -155,18 +156,14 @@ struct OciError {
 /// If operators observe unretrieved transient errors, the debug log below will
 /// show which variant was encountered so the match can be extended.
 pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
-    if let ocync_distribution::Error::Http(reqwest_err) = error {
-        // One definition, in the crate that owns the reqwest surface. Two
-        // copies of this predicate drift; the prepare-phase retry in
-        // `ocync_distribution::retry` needs the same answer this does.
-        ocync_distribution::retry::is_transient_transport(reqwest_err)
-    } else {
-        tracing::debug!(
-            error = %error,
-            "non-Http error variant not inspectable for transport retry"
-        );
-        false
+    // One definition, in the crate that owns the reqwest surface. Two
+    // copies of this predicate drift; the prepare-phase retry in
+    // `ocync_distribution::retry` needs the same answer this does.
+    let transient = ocync_distribution::retry::is_transient_answer(error);
+    if !transient {
+        tracing::debug!(error = %error, "error not retried as a transport failure");
     }
+    transient
 }
 
 /// Apply multiplicative jitter to a backoff duration.

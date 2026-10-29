@@ -257,7 +257,7 @@ async fn classify_referrers_response(resp: reqwest::Response) -> Result<Option<I
 
     match status {
         StatusCode::OK => {
-            let index: ImageIndex = resp.json().await?;
+            let index: ImageIndex = crate::json::answer(resp).await?;
             Ok(Some(index))
         }
         StatusCode::NOT_FOUND => Ok(None),

@@ -194,7 +194,7 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
         ));
     }
 
-    response.json().await.map_err(|e| {
+    crate::json::answer(response).await.map_err(|e| {
         Error::cloud_credentials(
             service,
             CredentialFailure::Failed,
@@ -362,7 +362,7 @@ impl AzureCredentialChain {
             ));
         }
 
-        let body: EntraTokenResponse = resp.json().await.map_err(|e| {
+        let body: EntraTokenResponse = crate::json::answer(resp).await.map_err(|e| {
             CredentialError::Failed(
                 CredentialFailure::Failed,
                 format!("{source} response parse failed: {}", error_chain(&e)),
@@ -463,7 +463,7 @@ impl AzureCredentialChain {
             ));
         }
 
-        let body: ImdsTokenResponse = resp.json().await.map_err(|_| {
+        let body: ImdsTokenResponse = crate::json::answer(resp).await.map_err(|_| {
             CredentialError::Failed(
                 CredentialFailure::Failed,
                 "IMDS response parse failed".into(),

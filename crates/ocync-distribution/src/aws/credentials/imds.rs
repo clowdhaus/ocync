@@ -347,7 +347,7 @@ impl Provider {
             .get(endpoint, transport, &format!("{CREDENTIALS_PATH}{role}"))
             .await
             .map_err(ChainError::Imds)?;
-        match json::parse(&body).map_err(|e| ChainError::Imds(Error::Json(e)))? {
+        match json::read_document(&body).map_err(|e| ChainError::Imds(Error::Json(e)))? {
             Document::Credentials(mut credentials) => {
                 credentials.expiry = credentials.expiry.map(|expiry| self.extend(expiry));
                 *self.last.lock().expect("no panic while held") = Some(credentials.clone());

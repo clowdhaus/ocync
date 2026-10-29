@@ -406,6 +406,10 @@ impl ManifestKind {
     /// Deserialize a manifest from JSON bytes, using the media type to discriminate.
     ///
     /// Validates that `schemaVersion` is `2` as required by the OCI spec.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a manifest holds no credential, and the refused value helps fix it"
+    )]
     pub fn from_json(media_type: &MediaType, bytes: &[u8]) -> Result<Self, Error> {
         match media_type {
             MediaType::OciManifest | MediaType::DockerManifestV2 => {
