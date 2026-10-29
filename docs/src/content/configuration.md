@@ -126,7 +126,7 @@ registries:
 | `docker_config` | Reads `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) |
 | `anonymous` | No credentials; still performs the `/v2/token` Bearer exchange when challenged |
 
-Auto-detected from hostname. ECR (private and Public), GAR, GCR, and ACR each route to a dedicated native-auth provider. GHCR, Docker Hub, Chainguard, and any unrecognized hostname share the same fallback path: `docker_config` first (using `~/.docker/config.json` or `$DOCKER_CONFIG/config.json`), then anonymous if no entry is found. Set `auth_type` explicitly to override detection.
+Auto-detected from hostname. ECR (private and Public), GAR, GCR, and ACR each route to a dedicated native-auth provider. GHCR, Docker Hub, Chainguard, and any unrecognized hostname share the same fallback path: `docker_config` first (using `~/.docker/config.json` or `$DOCKER_CONFIG/config.json`), then anonymous if it holds no credentials for the registry. Set `auth_type` explicitly to override detection.
 
 See the [registry guides](/registries/ecr) for provider-specific auth details.
 
@@ -384,7 +384,7 @@ registries:
 
 The `DOCKER_CONFIG` environment variable controls the Docker config file location. If set, `ocync` reads `$DOCKER_CONFIG/config.json`. Otherwise, it defaults to `~/.docker/config.json`.
 
-Credentials come from the config in the Docker CLI's order: the registry's `credHelpers` entry, then the default `credsStore`, then `auths`. A `credHelpers` helper that fails is an error. A `credsStore` with nothing for the registry falls through to `auths`.
+Credentials come from the config as the Docker CLI reads them. A credential helper, the registry's `credHelpers` entry or else the default `credsStore`, answers in place of `auths`. A helper that holds nothing for the registry means anonymous, and a helper that fails, or is not installed, is an error for that registry. Docker Hub is asked about as `https://index.docker.io/v1/`. With no helper, the `auths` entry is used.
 
 ## Example configurations
 
