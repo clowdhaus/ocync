@@ -197,8 +197,8 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
     crate::json::answer(response).await.map_err(|e| {
         Error::cloud_credentials(
             service,
-            CredentialFailure::Failed,
-            format_args!("ACR {endpoint} response parse failed: {}", error_chain(&e)),
+            CredentialFailure::of_unreadable(&e),
+            format_args!("ACR {endpoint} answer unreadable: {}", error_chain(&e)),
         )
     })
 }
@@ -364,8 +364,8 @@ impl AzureCredentialChain {
 
         let body: EntraTokenResponse = crate::json::answer(resp).await.map_err(|e| {
             CredentialError::Failed(
-                CredentialFailure::Failed,
-                format!("{source} response parse failed: {}", error_chain(&e)),
+                CredentialFailure::of_unreadable(&e),
+                format!("{source} answer unreadable: {}", error_chain(&e)),
             )
         })?;
 
@@ -463,10 +463,10 @@ impl AzureCredentialChain {
             ));
         }
 
-        let body: ImdsTokenResponse = crate::json::answer(resp).await.map_err(|_| {
+        let body: ImdsTokenResponse = crate::json::answer(resp).await.map_err(|e| {
             CredentialError::Failed(
-                CredentialFailure::Failed,
-                "IMDS response parse failed".into(),
+                CredentialFailure::of_unreadable(&e),
+                format!("IMDS answer unreadable: {}", error_chain(&e)),
             )
         })?;
 
@@ -1049,10 +1049,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            err.to_string().contains("response parse failed"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("answer unreadable"), "got: {err}");
         assert!(!err.is_auth_error(), "{err}");
     }
 

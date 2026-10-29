@@ -5,6 +5,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::Digest;
+pub use crate::json::Unreadable;
 
 /// Errors returned by OCI distribution operations.
 ///
@@ -124,13 +125,17 @@ pub enum Error {
     #[error("HTTP request failed: {}", error_chain(&**.0))]
     Http(#[source] Arc<reqwest::Error>),
 
-    /// An answer's body is not the JSON expected. The reason names where
+    /// An answer's body is not the JSON expected. The cause names where
     /// and why it failed to parse but no value from the body, which can be
-    /// a token.
-    #[error("unreadable answer: {reason}")]
+    /// a token. Sending the request again gets the same body, so it is
+    /// final.
+    #[error("unreadable answer from {url}: {source}")]
     UnreadableAnswer {
+        /// The address that answered.
+        url: Box<reqwest::Url>,
         /// Where and why the body failed to parse.
-        reason: String,
+        #[source]
+        source: Unreadable,
     },
 
     /// The registry returned a non-success HTTP status.
@@ -336,6 +341,16 @@ impl CredentialFailure {
             Self::Failed
         }
     }
+
+    /// A credential answer [`crate::json::answer`] could not read: a body
+    /// cut short may arrive whole if asked again, and one that arrived and
+    /// does not parse will not.
+    pub(crate) fn of_unreadable(error: &Error) -> Self {
+        match error {
+            Error::Http(source) => Self::of_transport(source),
+            _ => Self::Failed,
+        }
+    }
 }
 
 impl From<serde_json::Error> for Error {
@@ -472,8 +487,9 @@ mod tests {
         assert_eq!(error_chain(&err), text);
     }
 
-    /// A body cut off partway names why reading it stopped. Breaks if a
-    /// body-read failure is cut back to its top line.
+    /// A body cut off partway names why reading it stopped, and a credential
+    /// answer cut off may arrive whole if asked again. Breaks if a body-read
+    /// failure is cut back to its top line or judged final.
     #[tokio::test]
     async fn a_cut_off_body_names_its_cause() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -494,7 +510,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let err = Error::from(response.bytes().await.unwrap_err());
+        let err = crate::json::answer::<u64>(response).await.unwrap_err();
+        assert_eq!(
+            CredentialFailure::of_unreadable(&err),
+            CredentialFailure::Transient
+        );
         let text = err.to_string();
         assert!(
             text.ends_with(
@@ -503,31 +523,6 @@ mod tests {
             "{text}"
         );
         assert_eq!(error_chain(&err), text);
-    }
-
-    /// An answer that is not the JSON expected names where and why, with
-    /// no value from the body in its text or debug form, and is re-sent as
-    /// the client's decode failures are. Breaks if the body reaches either,
-    /// or the answer stops being retried.
-    #[tokio::test]
-    async fn an_unreadable_answer_leaves_the_body_out() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::any())
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("\"s3cret\""))
-            .mount(&server)
-            .await;
-        let response = crate::test_http_client()
-            .get(server.uri())
-            .send()
-            .await
-            .unwrap();
-        let err = crate::json::answer::<u64>(response).await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "unreadable answer: invalid type: string, expected u64 at line 1 column 8"
-        );
-        assert!(!format!("{err:?}").contains("s3cret"), "{err:?}");
-        assert!(crate::retry::is_transient_answer(&err));
     }
 
     #[test]

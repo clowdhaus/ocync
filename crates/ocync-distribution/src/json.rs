@@ -16,16 +16,16 @@ where
     Ok(<Option<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// JSON that holds or may hold a credential, such as an endpoint's answer,
-/// a helper's output or a credentials file, and is not the JSON expected.
+/// Why JSON that holds or may hold a credential, such as an endpoint's
+/// answer, a helper's output or a credentials file, could not be read.
 /// It keeps where and why the JSON failed to parse but no text taken from
 /// the input, such as a refused value or an unknown key, which can be a
 /// secret. What the type expected is kept only from a message in exactly
 /// the form serde writes, and any other part of a message is dropped. A
 /// deserializer that writes input into what it says it expected, or into a
 /// message of serde's form, defeats this.
-#[derive(Debug)]
-pub(crate) struct Unreadable(String);
+#[derive(Debug, Clone)]
+pub struct Unreadable(String);
 
 /// Starts of the parser's messages that quote no input.
 const WHOLE: [&str; 2] = ["missing field `", "duplicate field `"];
@@ -159,16 +159,30 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(text.as_ref())?)
 }
 
+/// The longest answer [`answer`] reads: far above any token answer, tag
+/// list page or referrers index, and a bound on the memory an endpoint that
+/// never stops sending can take.
+const MAX_ANSWER: usize = 64 * 1024 * 1024;
+
 /// Read `response`'s body, which holds or may hold a credential, as JSON of
-/// type `T`. A body that does not arrive is [`Error::Http`]; one that is not
-/// the JSON expected is [`Error::UnreadableAnswer`], with no value from it.
+/// type `T`. A body that does not arrive is [`Error::Http`]; one over
+/// [`MAX_ANSWER`] bytes or not the JSON expected is
+/// [`Error::UnreadableAnswer`], with no value from it.
 pub(crate) async fn answer<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
 ) -> Result<T, Error> {
-    let body = response.bytes().await?;
-    parse(&body).map_err(|e| Error::UnreadableAnswer {
-        reason: e.to_string(),
-    })
+    let url = Box::new(response.url().clone());
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_ANSWER {
+            return Err(Error::UnreadableAnswer {
+                url,
+                source: Unreadable(format!("answer over {MAX_ANSWER} bytes")),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    parse(&body).map_err(|source| Error::UnreadableAnswer { url, source })
 }
 
 /// Read `value`, which holds or may hold a credential, as type `T`.
@@ -185,6 +199,64 @@ pub(crate) fn value_as<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An answer that is not the JSON expected names who sent it and where
+    /// and why it failed, with no value from the body in its text or debug
+    /// form, and is not re-sent. Breaks if the body reaches either, the
+    /// address is dropped, or the answer is retried.
+    #[tokio::test]
+    async fn an_unreadable_answer_leaves_the_body_out() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("\"s3cret\""))
+            .mount(&server)
+            .await;
+        let response = crate::test_http_client()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let err = answer::<u64>(response).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unreadable answer from {}/: invalid type: string, expected u64 at line 1 column 8",
+                server.uri()
+            )
+        );
+        assert!(!format!("{err:?}").contains("s3cret"), "{err:?}");
+        assert!(!crate::retry::is_transient(&err));
+        assert_eq!(
+            crate::error::CredentialFailure::of_unreadable(&err),
+            crate::error::CredentialFailure::Failed
+        );
+    }
+
+    /// An answer longer than [`MAX_ANSWER`] is refused once it passes the
+    /// limit. Breaks if the whole body is read whatever its length.
+    #[tokio::test]
+    async fn an_answer_over_the_limit_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_ANSWER + 1]),
+            )
+            .mount(&server)
+            .await;
+        let response = crate::test_http_client()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let err = answer::<u64>(response).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unreadable answer from {}/: answer over 67108864 bytes",
+                server.uri()
+            )
+        );
+    }
 
     /// JSON that fails to parse names where and why, but no text from the
     /// input, in its text or its `Debug`. Breaks if a refused value, an

@@ -43,14 +43,14 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// `is_request()` covers errors raised during request dispatch, which on the
 /// async hyper path includes connect failures and timeouts: reqwest wraps both
 /// as `Kind::Request`. `is_body()` and `is_decode()` cover the response-body
-/// and decoder phases, which are not classified as `Kind::Request`. A status
-/// error means the registry answered, so whether to re-send it is the status
-/// arm of [`is_transient`] rather than this.
+/// phase, which is not classified as `Kind::Request`: reqwest reports a body
+/// cut short while read as a decode failure. A status error means the
+/// registry answered, so whether to re-send it is the status arm of
+/// [`is_transient`] rather than this.
 ///
 /// This is the single definition of the transient-transport surface for the
-/// workspace. `ocync_sync::retry::should_retry_transport` reaches it through
-/// [`is_transient_answer`] rather than repeating the predicate, because two
-/// copies drift.
+/// workspace. `ocync_sync::retry::should_retry_transport` delegates here
+/// rather than repeating the predicate, because two copies drift.
 pub fn is_transient_transport(error: &reqwest::Error) -> bool {
     error.is_request() || error.is_body() || error.is_decode()
 }
@@ -72,17 +72,9 @@ pub fn is_transient_status(status: http::StatusCode) -> bool {
 /// window by the time one surfaces, so the retry is paced by the throttle it
 /// caused.
 pub(crate) fn is_transient(error: &Error) -> bool {
-    is_transient_answer(error) || error.status_code() == Some(http::StatusCode::TOO_MANY_REQUESTS)
-}
-
-/// Whether `error` is an answer a re-send may get whole: a transport
-/// failure [`is_transient_transport`] passes, or a body that is not the JSON
-/// expected, re-sent as the client's decode failures are.
-pub fn is_transient_answer(error: &Error) -> bool {
     match error {
         Error::Http(e) => is_transient_transport(e),
-        Error::UnreadableAnswer { .. } => true,
-        _ => false,
+        other => other.status_code() == Some(http::StatusCode::TOO_MANY_REQUESTS),
     }
 }
 

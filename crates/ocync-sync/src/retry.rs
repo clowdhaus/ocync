@@ -102,6 +102,7 @@ pub fn is_blob_upload_unknown(error: &ocync_distribution::Error) -> bool {
 
 /// The `errors[].code` values of an OCI distribution-spec error body; none
 /// when the body is not that shape.
+#[expect(clippy::disallowed_methods, reason = "a parse error is dropped unread")]
 pub(crate) fn oci_error_codes(message: &str) -> impl Iterator<Item = String> {
     serde_json::from_str::<OciErrorBody>(message)
         .map(|body| body.errors)
@@ -125,11 +126,10 @@ struct OciError {
 ///
 /// Returns `true` for connection failures, request timeouts, mid-stream
 /// send failures (connection reset during body upload), and response body
-/// errors (premature EOF, truncated body, decode failures from corrupted
-/// transport) surfaced by `reqwest`. These are transient by nature and
-/// safe to retry idempotent OCI operations on. Deterministic decode
-/// failures (e.g. malformed registry responses) are bounded by
-/// `max_retries`.
+/// errors (premature EOF, truncated body) surfaced by `reqwest`, which
+/// reports a body cut short as a decode failure. These are transient by
+/// nature and safe to retry idempotent OCI operations on. An answer that
+/// arrived whole and is not the JSON expected is final.
 ///
 /// # Predicate set
 ///
@@ -146,8 +146,7 @@ struct OciError {
 ///
 /// # Known limitation
 ///
-/// Only inspects `ocync_distribution::Error::Http` and an answer that is
-/// not the JSON expected (`Error::UnreadableAnswer`). Transport
+/// Only inspects `ocync_distribution::Error::Http`. Transport
 /// errors that arrive wrapped in other variants are NOT retried:
 /// - `Error::Io { .. }` -- local filesystem errors, never transient (typed `io::Error`)
 /// - `Error::RegistryError { .. }` -- HTTP-level; retried via `should_retry()` instead
@@ -156,14 +155,18 @@ struct OciError {
 /// If operators observe unretrieved transient errors, the debug log below will
 /// show which variant was encountered so the match can be extended.
 pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
-    // One definition, in the crate that owns the reqwest surface. Two
-    // copies of this predicate drift; the prepare-phase retry in
-    // `ocync_distribution::retry` needs the same answer this does.
-    let transient = ocync_distribution::retry::is_transient_answer(error);
-    if !transient {
-        tracing::debug!(error = %error, "error not retried as a transport failure");
+    if let ocync_distribution::Error::Http(reqwest_err) = error {
+        // One definition, in the crate that owns the reqwest surface. Two
+        // copies of this predicate drift; the prepare-phase retry in
+        // `ocync_distribution::retry` needs the same answer this does.
+        ocync_distribution::retry::is_transient_transport(reqwest_err)
+    } else {
+        tracing::debug!(
+            error = %error,
+            "non-Http error variant not inspectable for transport retry"
+        );
+        false
     }
-    transient
 }
 
 /// Apply multiplicative jitter to a backoff duration.

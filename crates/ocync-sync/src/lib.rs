@@ -1,4 +1,11 @@
 //! OCI registry sync orchestration - tag filtering, transfer planning, and execution.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read JSON they wrote themselves"
+    )
+)]
 
 /// Persistent transfer state cache wrapping [`plan::BlobDedupMap`].
 pub mod cache;

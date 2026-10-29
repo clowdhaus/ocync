@@ -1,2 +1,16 @@
 too-many-lines-threshold = 200
 doc-valid-idents = ["CycloneDX", ".."]
+
+# JSON a registry or sign-in answers can hold a credential, and these
+# readers put the value they refuse into their error. The distribution
+# crate's `json` module reads such JSON, and leaves the value out.
+disallowed-methods = [
+    { path = "serde_json::from_slice", reason = "puts the value it refuses, which can be a credential, into its error" },
+    { path = "serde_json::from_str", reason = "puts the value it refuses, which can be a credential, into its error" },
+    { path = "serde_json::from_value", reason = "puts the value it refuses, which can be a credential, into its error" },
+    { path = "serde_json::from_reader", reason = "puts the value it refuses, which can be a credential, into its error" },
+    { path = "serde_json::Deserializer::from_slice", reason = "puts the value it refuses, which can be a credential, into its error" },
+    { path = "serde_json::Deserializer::from_str", reason = "puts the value it refuses, which can be a credential, into its error" },
+    { path = "serde_json::Deserializer::from_reader", reason = "puts the value it refuses, which can be a credential, into its error" },
+    { path = "reqwest::Response::json", reason = "puts the value it refuses, which can be a credential, into its error" },
+]

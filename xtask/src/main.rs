@@ -1,4 +1,8 @@
 //! xtask -- workspace automation commands.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "reads JSON it or a tool wrote, which holds no credential"
+)]
 
 mod bench;
 

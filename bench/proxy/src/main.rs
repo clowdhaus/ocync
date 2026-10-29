@@ -22,6 +22,10 @@
 //!   bootstrap; install the cert into the system trust store.
 //! - `serve --ca <cert.pem> --ca-key <key.pem> --listen <addr> --log <file>`:
 //!   run the proxy until SIGTERM/SIGINT.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "reads JSON it or a tool wrote, which holds no credential"
+)]
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
