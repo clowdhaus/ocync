@@ -629,8 +629,9 @@ mod tests {
         assert!(err.is_auth_error());
     }
 
-    /// A refused upload reports 401 and counts as an auth error, so a
-    /// second refusal exits as refused credentials. Breaks if either is lost.
+    /// A refused upload reports 401 and counts as an auth error, as the
+    /// registry's 401 did before it had its own variant. Breaks if either
+    /// is lost.
     #[test]
     fn upload_token_refused_is_a_401_auth_error() {
         let err = Error::UploadTokenRefused {
