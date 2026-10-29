@@ -384,6 +384,8 @@ registries:
 
 The `DOCKER_CONFIG` environment variable controls the Docker config file location. If set, `ocync` reads `$DOCKER_CONFIG/config.json`. Otherwise, it defaults to `~/.docker/config.json`.
 
+Credentials come from the config in the Docker CLI's order: the registry's `credHelpers` entry, then the default `credsStore`, then `auths`. A `credHelpers` helper that fails is an error. A `credsStore` with nothing for the registry falls through to `auths`.
+
 ## Example configurations
 
 ### Chainguard to ECR

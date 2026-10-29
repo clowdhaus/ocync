@@ -78,39 +78,58 @@ impl DockerConfig {
 
 /// Resolve credentials for a registry from a Docker config.
 ///
-/// Checks `auths` first (static credentials), then `credHelpers`, then the
-/// default `credsStore`. Handles Docker Hub hostname normalization.
+/// Asks a credential helper before reading `auths`, as the Docker CLI does,
+/// so a stale `auths` entry left by `docker login` never shadows a helper
+/// that mints fresh credentials. A registry's own `credHelpers` entry
+/// decides, and its failure is an error. The default `credsStore` may hold
+/// nothing for the registry, so its failure falls through to `auths`.
+/// Handles Docker Hub hostname normalization.
 pub async fn resolve_from_docker_config(
     config: &DockerConfig,
     registry: &str,
 ) -> Result<Option<Credentials>, Error> {
-    // Try static auths first.
-    if let Some(creds) = lookup_auths(config, registry)? {
-        return Ok(Some(creds));
-    }
-
-    // Try credential helpers.
-    if let Some(helper) = lookup_cred_helper(config, registry) {
-        let creds = run_credential_helper(&helper, registry).await?;
-        return Ok(Some(creds));
-    }
-
-    // Try default credential store.
-    if let Some(ref store) = config.creds_store {
-        match run_credential_helper(store, registry).await {
+    match helper_for(config, registry) {
+        Some(Helper::Registry(helper)) => {
+            return run_credential_helper(helper, registry).await.map(Some);
+        }
+        Some(Helper::Store(store)) => match run_credential_helper(store, registry).await {
             Ok(creds) => return Ok(Some(creds)),
             Err(_) => {
-                // Default store may not have creds for this registry -- not an error.
                 tracing::debug!(
                     registry,
                     store,
                     "default credential store had no credentials"
                 );
             }
-        }
+        },
+        None => {}
     }
+    lookup_auths(config, registry)
+}
 
-    Ok(None)
+/// The credential helper Docker asks for a registry.
+#[derive(Debug, PartialEq, Eq)]
+enum Helper<'a> {
+    /// The registry's own `credHelpers` entry.
+    Registry(&'a str),
+    /// The default `credsStore`.
+    Store(&'a str),
+}
+
+/// The helper Docker asks for `registry`: its `credHelpers` entry, under
+/// any Docker Hub alias, else the default `credsStore`.
+fn helper_for<'a>(config: &'a DockerConfig, registry: &str) -> Option<Helper<'a>> {
+    let own = config.cred_helpers.get(registry).or_else(|| {
+        is_docker_hub(registry)
+            .then(|| {
+                DOCKER_HUB_ALIASES
+                    .iter()
+                    .find_map(|alias| config.cred_helpers.get(*alias))
+            })
+            .flatten()
+    });
+    own.map(|helper| Helper::Registry(helper))
+        .or_else(|| config.creds_store.as_deref().map(Helper::Store))
 }
 
 /// Look up static credentials from the `auths` map.
@@ -143,24 +162,6 @@ fn lookup_auths(config: &DockerConfig, registry: &str) -> Result<Option<Credenti
     }
 
     Ok(None)
-}
-
-/// Look up a credential helper for the given registry.
-fn lookup_cred_helper(config: &DockerConfig, registry: &str) -> Option<String> {
-    if let Some(helper) = config.cred_helpers.get(registry) {
-        return Some(helper.clone());
-    }
-
-    // Docker Hub aliases.
-    if is_docker_hub(registry) {
-        for alias in DOCKER_HUB_ALIASES {
-            if let Some(helper) = config.cred_helpers.get(*alias) {
-                return Some(helper.clone());
-            }
-        }
-    }
-
-    None
 }
 
 /// Convert an `AuthEntry` to `Credentials`.
@@ -553,16 +554,59 @@ mod tests {
         assert!(config.auths.is_empty());
     }
 
+    /// A registry's own helper, under any Docker Hub alias, is asked
+    /// before the default store, and either before `auths`. Breaks if the
+    /// store shadows a registry's helper or a helper is skipped.
     #[test]
-    fn cred_helper_docker_hub_alias_lookup() {
-        let json = r#"{
-            "credHelpers": {
-                "https://index.docker.io/v1/": "desktop"
-            }
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-        let helper = lookup_cred_helper(&config, "docker.io");
-        assert_eq!(helper.as_deref(), Some("desktop"));
+    fn the_helper_docker_would_ask() {
+        let cases = [
+            (
+                r#"{"credHelpers": {"ghcr.io": "gh"}, "credsStore": "desktop"}"#,
+                "ghcr.io",
+                Some(Helper::Registry("gh")),
+            ),
+            (
+                r#"{"credHelpers": {"https://index.docker.io/v1/": "hub"}}"#,
+                "docker.io",
+                Some(Helper::Registry("hub")),
+            ),
+            (
+                r#"{"credHelpers": {"quay.io": "quay"}, "credsStore": "desktop"}"#,
+                "ghcr.io",
+                Some(Helper::Store("desktop")),
+            ),
+            (
+                r#"{"auths": {"ghcr.io": {"auth": "dXNlcjpwYXNz"}}}"#,
+                "ghcr.io",
+                None,
+            ),
+        ];
+        for (json, registry, expected) in cases {
+            let config: DockerConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                helper_for(&config, registry),
+                expected,
+                "{registry} in {json}"
+            );
+        }
+    }
+
+    /// A registry's helper is asked before its `auths` entry, and its
+    /// failure is the answer. Breaks if a stale `auths` entry is sent in
+    /// place of the helper's credentials.
+    #[tokio::test]
+    async fn a_registry_helper_shadows_its_auths_entry() {
+        let config: DockerConfig = serde_json::from_str(
+            r#"{"auths": {"ghcr.io": {"auth": "dXNlcjpwYXNz"}}, "credHelpers": {"ghcr.io": "ocync-absent"}}"#,
+        )
+        .unwrap();
+        let err = resolve_from_docker_config(&config, "ghcr.io")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::CredentialHelperFailed { helper, .. } if helper == "docker-credential-ocync-absent"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
