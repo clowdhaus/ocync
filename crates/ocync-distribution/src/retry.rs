@@ -278,7 +278,7 @@ mod tests {
             "a refused connection must be retryable: {err:?}"
         );
         assert!(
-            is_transient(&Error::Http(err)),
+            is_transient(&Error::from(err)),
             "and must stay retryable once wrapped"
         );
     }

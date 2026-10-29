@@ -331,7 +331,8 @@ mod tests {
                 source: std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "permission denied",
-                ),
+                )
+                .into(),
             },
         };
         let msg = err.to_string();

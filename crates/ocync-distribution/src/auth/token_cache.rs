@@ -3,30 +3,41 @@
 //! Wraps two maps:
 //!
 //! - `cache` -- the live tokens, keyed by scope.
-//! - `inflight` -- per-scope `Arc<Mutex<()>>` slots so concurrent callers
-//!   for the same scope serialize through a single fetch while callers
-//!   for distinct scopes proceed in parallel.
+//! - `inflight` -- per-scope slots, each holding the scope's last failed
+//!   fetch, so concurrent callers for the same scope serialize through a
+//!   single fetch while callers for distinct scopes proceed in parallel.
 //!
 //! The double-checked cache read after the per-scope mutex is acquired
 //! makes a waiter wake to a populated cache when a peer completes
 //! successfully, so a successful fetch produces exactly one token
-//! exchange regardless of fan-out.
+//! exchange regardless of fan-out. A waiter that wakes to a fetch that
+//! failed after it asked gets that failure, so a failing endpoint also
+//! costs one exchange per wave of callers, not one per caller.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
 use super::Token;
 use crate::error::Error;
 
+/// A scope's fetch slot, held while fetching: the scope's last failed fetch
+/// and its count in [`TokenCache::failures`].
+type Slot = Arc<Mutex<Option<(u64, Error)>>>;
+
 /// Coalescing token cache. Same-scope fetches serialize, distinct scopes
 /// run in parallel. See module-level docs for the synchronization model.
 #[derive(Debug, Default)]
 pub(super) struct TokenCache {
     cache: Mutex<HashMap<String, Token>>,
-    inflight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Per scope, the fetch slot.
+    inflight: Mutex<HashMap<String, Slot>>,
+    /// How many fetches have failed, so a caller can tell a failure that
+    /// came after it asked from one that came before, without a clock.
+    failures: AtomicU64,
 }
 
 impl TokenCache {
@@ -44,8 +55,9 @@ impl TokenCache {
     /// one. Concurrent callers for the same `key` coalesce through a
     /// per-scope mutex; callers for distinct keys hold distinct
     /// mutexes and run in parallel. On a successful fetch the token
-    /// is inserted into the cache; on error the entry is left empty
-    /// so the next caller can retry.
+    /// is inserted into the cache. On error the entry is left empty: a
+    /// caller that asked before the failure gets its error, and one that
+    /// asks after it fetches again.
     pub(super) async fn get_or_fetch<F, Fut>(&self, key: String, fetch: F) -> Result<Token, Error>
     where
         F: FnOnce() -> Fut,
@@ -62,14 +74,15 @@ impl TokenCache {
             return Ok(token);
         }
 
+        let asked = self.failures.load(Ordering::Acquire);
         let key_mutex = {
             let mut map = self.inflight.lock().await;
             Arc::clone(
                 map.entry(key.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+                    .or_insert_with(|| Arc::new(Mutex::new(None))),
             )
         };
-        let _guard = key_mutex.lock().await;
+        let mut failed = key_mutex.lock().await;
 
         // Re-check the cache after acquiring the per-scope mutex: a
         // concurrent caller for the same scope may have populated it.
@@ -84,11 +97,23 @@ impl TokenCache {
             return Ok(token);
         }
 
-        let token = fetch().await?;
+        if let Some((failure, error)) = &*failed
+            && *failure > asked
+        {
+            return Err(error.clone());
+        }
 
-        self.cache.lock().await.insert(key, token.clone());
-
-        Ok(token)
+        match fetch().await {
+            Ok(token) => {
+                self.cache.lock().await.insert(key, token.clone());
+                Ok(token)
+            }
+            Err(error) => {
+                let failure = self.failures.fetch_add(1, Ordering::AcqRel) + 1;
+                *failed = Some((failure, error.clone()));
+                Err(error)
+            }
+        }
     }
 
     /// Drop every cached token and every per-scope coalescing slot.
@@ -201,10 +226,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn concurrent_same_key_callers_share_one_error() {
-        // When the first caller's fetch fails, queued waiters wake to
-        // an empty cache and each retry independently. This documents
-        // the current behaviour: errors are not shared, but no caller
-        // is left dangling.
+        // When the first caller's fetch fails, the callers queued behind
+        // it get its error instead of fetching again. Breaks if each
+        // waiter runs its own exchange against a failing endpoint.
         let cache = Arc::new(TokenCache::new());
         let attempts = Arc::new(AtomicUsize::new(0));
 
@@ -228,8 +252,7 @@ mod tests {
         for t in tasks {
             assert!(t.await.unwrap().is_err());
         }
-        // Each waiter wakes to a cache miss and runs its own fetch.
-        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

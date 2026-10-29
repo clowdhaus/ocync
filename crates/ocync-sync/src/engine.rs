@@ -2717,7 +2717,7 @@ async fn transfer_claimed_blob(
                         .begin_write(digest)
                         .map_err(|e| ocync_distribution::Error::Io {
                             context: "staging create",
-                            source: e,
+                            source: e.into(),
                         })?;
                 let stream = io.source_client.blob_pull(io.source_repo, digest).await?;
                 futures_util::pin_mut!(stream);
@@ -2727,12 +2727,12 @@ async fn transfer_claimed_blob(
                         .write_chunk(&chunk)
                         .map_err(|e| ocync_distribution::Error::Io {
                             context: "staging write",
-                            source: e,
+                            source: e.into(),
                         })?;
                 }
                 writer.finish().map_err(|e| ocync_distribution::Error::Io {
                     context: "staging finalize",
-                    source: e,
+                    source: e.into(),
                 })?;
                 Ok::<(), ocync_distribution::Error>(())
             })
@@ -2788,13 +2788,13 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
             .open_read(digest)
             .map_err(|e| ocync_distribution::Error::Io {
                 context: "staging open",
-                source: e,
+                source: e.into(),
             })?;
         let file_size = file.metadata().map(|m| m.len()).ok();
         let stream = file_read_stream(file).map(|r| {
             r.map_err(|e| ocync_distribution::Error::Io {
                 context: "staging read",
-                source: e,
+                source: e.into(),
             })
         });
         io.target_client
@@ -3517,7 +3517,7 @@ mod tests {
         let digest = Digest::from_sha256(Sha256::digest(b"blob"));
         let unreadable = futures_util::stream::iter([Err(ocync_distribution::Error::Io {
             context: "staging read",
-            source: std::io::Error::other("disk read failed"),
+            source: std::io::Error::other("disk read failed").into(),
         })]);
 
         let source = client
@@ -3542,7 +3542,7 @@ mod tests {
             digest: digest.clone(),
             source: ocync_distribution::Error::Io {
                 context: "staging write",
-                source: std::io::Error::other("disk full"),
+                source: std::io::Error::other("disk full").into(),
             },
         };
         let registry = crate::Error::BlobTransfer {

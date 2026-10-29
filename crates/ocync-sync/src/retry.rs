@@ -146,7 +146,7 @@ struct OciError {
 ///
 /// # Known limitation
 ///
-/// Only inspects `ocync_distribution::Error::Http(reqwest::Error)`. Transport
+/// Only inspects `ocync_distribution::Error::Http`. Transport
 /// errors that arrive wrapped in other variants are NOT retried:
 /// - `Error::Io { .. }` -- local filesystem errors, never transient (typed `io::Error`)
 /// - `Error::RegistryError { .. }` -- HTTP-level; retried via `should_retry()` instead
@@ -464,7 +464,7 @@ mod tests {
     fn should_retry_transport_on_io() {
         let err = ocync_distribution::Error::Io {
             context: "staging read",
-            source: std::io::Error::other("staging read failed"),
+            source: std::io::Error::other("staging read failed").into(),
         };
         assert!(!should_retry_transport(&err));
     }
@@ -496,7 +496,7 @@ mod tests {
             reqwest_err.is_request(),
             "is_request() must cover connect failures (predicate-set invariant); got: {reqwest_err}"
         );
-        let err = ocync_distribution::Error::Http(reqwest_err);
+        let err = ocync_distribution::Error::from(reqwest_err);
         assert!(
             should_retry_transport(&err),
             "connection refused should be retryable"
@@ -546,7 +546,7 @@ mod tests {
             reqwest_err.is_request(),
             "is_request() must cover timeouts (predicate-set invariant); got: {reqwest_err}"
         );
-        let err = ocync_distribution::Error::Http(reqwest_err);
+        let err = ocync_distribution::Error::from(reqwest_err);
         assert!(
             should_retry_transport(&err),
             "request timeout should be retryable"
