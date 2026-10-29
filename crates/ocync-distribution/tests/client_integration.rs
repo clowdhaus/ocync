@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use http::{Method, StatusCode};
+use http::StatusCode;
 use ocync_distribution::Error;
 use ocync_distribution::RepositoryName;
 use ocync_distribution::aimd::RegistryAction;
@@ -219,12 +219,18 @@ async fn get_401_triggers_refuse_and_retry() {
 /// refusal is sent twice.
 #[tokio::test]
 async fn a_second_401_fails_after_one_refusal() {
-    for (verb, action) in [
-        (Method::GET, RegistryAction::ManifestRead),
-        (Method::HEAD, RegistryAction::ManifestHead),
-    ] {
+    #[derive(Debug, Clone, Copy)]
+    enum Verb {
+        Get,
+        Head,
+    }
+    for verb in [Verb::Get, Verb::Head] {
+        let (name, action) = match verb {
+            Verb::Get => ("GET", RegistryAction::ManifestRead),
+            Verb::Head => ("HEAD", RegistryAction::ManifestHead),
+        };
         let server = MockServer::start().await;
-        Mock::given(method(verb.as_str()))
+        Mock::given(method(name))
             .and(path("/v2/repo/manifests/latest"))
             .respond_with(ResponseTemplate::new(401))
             .expect(2)
@@ -239,13 +245,12 @@ async fn a_second_401_fails_after_one_refusal() {
 
         let repo = RepositoryName::new("repo").unwrap();
         let err = match verb {
-            Method::GET => client.get(&repo, "manifests/latest", None, action).await,
-            Method::HEAD => client.head(&repo, "manifests/latest", None, action).await,
-            _ => unreachable!("only GET and HEAD rows"),
+            Verb::Get => client.get(&repo, "manifests/latest", None, action).await,
+            Verb::Head => client.head(&repo, "manifests/latest", None, action).await,
         }
         .unwrap_err();
-        assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED), "{verb}");
-        assert_eq!(state.refuse_count(), 1, "{verb}");
+        assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED), "{name}");
+        assert_eq!(state.refuse_count(), 1, "{name}");
     }
 }
 

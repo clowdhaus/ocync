@@ -1188,7 +1188,7 @@ mod tests {
             (
                 "http://evil.com/token",
                 "https://registry.example.com",
-                Verdict::Rejected("http"),
+                Verdict::Rejected("uses http but registry uses https"),
             ),
             // rejects userinfo
             (
@@ -1202,7 +1202,7 @@ mod tests {
                 "https://registry.example.com",
                 Verdict::Rejected("userinfo"),
             ),
-            // allows an IPv6 realm on its own IPv6 registry
+            // allows a public IPv6 realm, which no denylist entry matches
             (
                 "https://[2001:db8::1]/token",
                 "https://[2001:db8::1]:5000",
@@ -1310,7 +1310,7 @@ mod tests {
             (
                 "https://localhost:9999/token",
                 "https://registry.example.com",
-                Verdict::Rejected("localhost"),
+                Verdict::Rejected("points to localhost but registry is not loopback"),
             ),
             // allows localhost when registry is localhost
             (

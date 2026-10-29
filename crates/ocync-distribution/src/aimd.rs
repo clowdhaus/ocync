@@ -836,81 +836,50 @@ mod tests {
 
     // - Window-key routing tests --
 
+    /// Each registry meters actions by its own published quotas: ECR per
+    /// action, ECR Public by its five groups, Docker Hub with HEADs and
+    /// manifest reads apart, GAR and GHCR as one shared cap, ACR as reads
+    /// and writes, and an unknown registry by five coarse groups. Breaks if
+    /// an action lands in another window, so its throttling slows actions
+    /// the registry meters apart, or escapes a shared cap.
     #[test]
-    fn ecr_public_window_keys_route_per_action() {
-        use EcrPublicGroup as G;
+    fn window_keys_follow_each_registry_quota() {
+        use AcrGroup as Acr;
+        use DockerHubGroup as Hub;
+        use EcrPublicGroup as Public;
         use RegistryAction::*;
-        let host = "public.ecr.aws";
-        let cases: &[(RegistryAction, WindowKey)] = &[
-            (ManifestHead, WindowKey::EcrPublic(G::Read)),
-            (ManifestRead, WindowKey::EcrPublic(G::Read)),
-            (BlobHead, WindowKey::EcrPublic(G::Read)),
-            (BlobRead, WindowKey::EcrPublic(G::Read)),
-            (TagList, WindowKey::EcrPublic(G::Read)),
-            (ManifestWrite, WindowKey::EcrPublic(G::ManifestWrite)),
-            (BlobUploadInit, WindowKey::EcrPublic(G::BlobUploadInit)),
-            (BlobUploadChunk, WindowKey::EcrPublic(G::BlobUploadChunk)),
-            (
-                BlobUploadComplete,
-                WindowKey::EcrPublic(G::BlobUploadComplete),
-            ),
+        use UnknownGroup as Other;
+        use WindowKey as K;
+        let hosts = [
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com",
+            "public.ecr.aws",
+            "registry-1.docker.io",
+            "us-central1-docker.pkg.dev",
+            "ghcr.io",
+            "myreg.azurecr.io",
+            "quay.io",
         ];
-        for &(action, expected) in cases {
-            assert_eq!(
-                window_key_for_registry(host, action),
-                expected,
-                "ECR Public {action:?} -> key"
-            );
-        }
-    }
-
-    #[test]
-    fn ghcr_window_keys_route_to_shared() {
-        // GitHub enforces a single 2000 RPM aggregate cap across all
-        // actions for an authenticated principal. Reads and writes must
-        // land in the same WindowKey so the bucket bounds them jointly.
-        use RegistryAction::*;
-        let host = "ghcr.io";
-        for action in [
-            ManifestHead,
-            ManifestRead,
-            ManifestWrite,
-            BlobHead,
-            BlobRead,
-            BlobUploadInit,
-            BlobUploadChunk,
-            BlobUploadComplete,
-            TagList,
-        ] {
-            assert_eq!(
-                window_key_for_registry(host, action),
-                WindowKey::GhcrShared,
-                "GHCR {action:?} -> key (must be GhcrShared)"
-            );
-        }
-    }
-
-    #[test]
-    fn acr_window_keys_route_read_vs_write() {
-        use RegistryAction::*;
-        let host = "myreg.azurecr.io";
-        let cases: &[(RegistryAction, WindowKey)] = &[
-            (ManifestHead, WindowKey::Acr(AcrGroup::Read)),
-            (ManifestRead, WindowKey::Acr(AcrGroup::Read)),
-            (BlobHead, WindowKey::Acr(AcrGroup::Read)),
-            (BlobRead, WindowKey::Acr(AcrGroup::Read)),
-            (TagList, WindowKey::Acr(AcrGroup::Read)),
-            (ManifestWrite, WindowKey::Acr(AcrGroup::Write)),
-            (BlobUploadInit, WindowKey::Acr(AcrGroup::Write)),
-            (BlobUploadChunk, WindowKey::Acr(AcrGroup::Write)),
-            (BlobUploadComplete, WindowKey::Acr(AcrGroup::Write)),
+        #[rustfmt::skip]
+        let rows: [(RegistryAction, [WindowKey; 8]); 9] = [
+            (ManifestHead, [K::Ecr(ManifestHead), K::Ecr(ManifestHead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Heads), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Heads)]),
+            (BlobHead, [K::Ecr(BlobHead), K::Ecr(BlobHead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Heads), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Heads)]),
+            (ManifestRead, [K::Ecr(ManifestRead), K::Ecr(ManifestRead), K::EcrPublic(Public::Read), K::DockerHub(Hub::ManifestRead), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Reads)]),
+            (BlobRead, [K::Ecr(BlobRead), K::Ecr(BlobRead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Reads)]),
+            (TagList, [K::Ecr(TagList), K::Ecr(TagList), K::EcrPublic(Public::Read), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::TagList)]),
+            (ManifestWrite, [K::Ecr(ManifestWrite), K::Ecr(ManifestWrite), K::EcrPublic(Public::ManifestWrite), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::ManifestWrite)]),
+            (BlobUploadInit, [K::Ecr(BlobUploadInit), K::Ecr(BlobUploadInit), K::EcrPublic(Public::BlobUploadInit), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads)]),
+            (BlobUploadChunk, [K::Ecr(BlobUploadChunk), K::Ecr(BlobUploadChunk), K::EcrPublic(Public::BlobUploadChunk), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads)]),
+            (BlobUploadComplete, [K::Ecr(BlobUploadComplete), K::Ecr(BlobUploadComplete), K::EcrPublic(Public::BlobUploadComplete), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads)]),
         ];
-        for &(action, expected) in cases {
-            assert_eq!(
-                window_key_for_registry(host, action),
-                expected,
-                "ACR {action:?} -> key"
-            );
+        for (action, keys) in rows {
+            for (host, key) in hosts.into_iter().zip(keys) {
+                assert_eq!(
+                    window_key_for_registry(host, action),
+                    key,
+                    "{host} {action:?}"
+                );
+            }
         }
     }
 
