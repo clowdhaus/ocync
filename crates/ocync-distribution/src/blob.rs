@@ -694,58 +694,39 @@ mod tests {
         assert!(msg.contains("myorg/myrepo"), "missing repo in error: {msg}");
     }
 
+    /// The upload `Location` resolves against the registry, absolute or
+    /// relative, keeping its query; a missing header is refused. Breaks if
+    /// the query that carries upload state is dropped or a relative path
+    /// is not joined to the registry.
     #[test]
-    fn extract_location_absolute() {
-        let resp = http::Response::builder()
-            .header("Location", "https://registry.example.com/upload/uuid-1")
-            .body("")
-            .unwrap();
-        let reqwest_resp = reqwest::Response::from(resp);
+    fn the_upload_location_resolves_against_the_registry() {
         let base = url::Url::parse("https://registry.example.com").unwrap();
-        let result = extract_location(&reqwest_resp, &base).unwrap();
-        assert_eq!(result, "https://registry.example.com/upload/uuid-1");
-    }
-
-    #[test]
-    fn extract_location_relative() {
-        let resp = http::Response::builder()
-            .header("Location", "/v2/repo/blobs/uploads/uuid-1")
-            .body("")
-            .unwrap();
-        let reqwest_resp = reqwest::Response::from(resp);
-        let base = url::Url::parse("https://registry.example.com").unwrap();
-        let result = extract_location(&reqwest_resp, &base).unwrap();
-        assert_eq!(
-            result,
-            "https://registry.example.com/v2/repo/blobs/uploads/uuid-1"
-        );
-    }
-
-    #[test]
-    fn extract_location_missing() {
-        let resp = http::Response::builder().body("").unwrap();
-        let reqwest_resp = reqwest::Response::from(resp);
-        let base = url::Url::parse("https://registry.example.com").unwrap();
-        let result = extract_location(&reqwest_resp, &base);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn extract_location_preserves_query_params() {
-        let resp = http::Response::builder()
-            .header(
-                "Location",
-                "/v2/repo/blobs/uploads/uuid-1?_state=token123&foo=bar",
-            )
-            .body("")
-            .unwrap();
-        let reqwest_resp = reqwest::Response::from(resp);
-        let base = url::Url::parse("https://registry.example.com").unwrap();
-        let result = extract_location(&reqwest_resp, &base).unwrap();
-        assert_eq!(
-            result,
-            "https://registry.example.com/v2/repo/blobs/uploads/uuid-1?_state=token123&foo=bar"
-        );
+        let cases = [
+            (
+                Some("https://registry.example.com/upload/uuid-1"),
+                Some("https://registry.example.com/upload/uuid-1"),
+            ),
+            (
+                Some("/v2/repo/blobs/uploads/uuid-1"),
+                Some("https://registry.example.com/v2/repo/blobs/uploads/uuid-1"),
+            ),
+            (
+                Some("/v2/repo/blobs/uploads/uuid-1?_state=token123&foo=bar"),
+                Some(
+                    "https://registry.example.com/v2/repo/blobs/uploads/uuid-1?_state=token123&foo=bar",
+                ),
+            ),
+            (None, None),
+        ];
+        for (header, expected) in cases {
+            let mut resp = http::Response::builder();
+            if let Some(location) = header {
+                resp = resp.header("Location", location);
+            }
+            let resp = reqwest::Response::from(resp.body("").unwrap());
+            let result = extract_location(&resp, &base).ok();
+            assert_eq!(result.as_deref(), expected, "{header:?}");
+        }
     }
 
     /// Build a `RegistryClient` with the given hostname, routing all traffic
@@ -821,7 +802,9 @@ mod tests {
         futures_util::stream::iter(chunks)
     }
 
-    /// GHCR: single PATCH with Content-Length, no Content-Range.
+    /// GHCR: the whole blob, streamed in several chunks, goes in one PATCH
+    /// with Content-Length and no Content-Range. Breaks if GHCR is sent
+    /// more than one PATCH, which it overwrites, or a ranged one.
     #[tokio::test]
     async fn blob_push_stream_ghcr_uses_single_patch() {
         let server = wiremock::MockServer::start().await;
@@ -868,8 +851,6 @@ mod tests {
 
         let client = build_test_client("ghcr.io", port);
 
-        // Pass None so the monolithic threshold does not intercept the call;
-        // we are verifying the GHCR-specific single-PATCH path directly.
         let repo = RepositoryName::new("my-org/my-image").unwrap();
         let result = client
             .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
@@ -877,6 +858,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, digest);
+        let requests = server.received_requests().await.unwrap();
+        let patch = requests
+            .iter()
+            .find(|request| request.method == wiremock::http::Method::PATCH)
+            .unwrap();
+        assert_eq!(patch.body, data);
+        assert!(
+            patch.headers.contains_key("content-length"),
+            "{:?}",
+            patch.headers
+        );
+        assert!(
+            !patch.headers.contains_key("content-range"),
+            "{:?}",
+            patch.headers
+        );
     }
 
     /// ACR: small blob (under chunk size) takes the ACR path with one
@@ -1236,57 +1233,6 @@ mod tests {
             !saw_auth.load(Ordering::SeqCst),
             "Authorization header must NOT be forwarded across hosts -- would leak registry credentials to the redirect target"
         );
-    }
-
-    /// GHCR: exactly one PATCH regardless of blob size vs `chunk_size`.
-    #[tokio::test]
-    async fn blob_push_stream_ghcr_single_patch_large_blob() {
-        let server = wiremock::MockServer::start().await;
-        // 16 bytes >> chunk_size=4; only one PATCH must be issued.
-        let data = b"abcdefghijklmnop";
-        let digest = test_digest(data);
-        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
-
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/v2/repo/blobs/uploads/"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202)
-                    .append_header("Location", "/v2/repo/blobs/uploads/ghcr-id"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // One PATCH with the full 16-byte body.
-        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202)
-                    .append_header("Location", "/v2/repo/blobs/uploads/ghcr-id?done"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::query_param(
-                "digest",
-                digest.to_string(),
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(201))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = build_test_client("ghcr.io", port);
-
-        // No known_size - GHCR path still taken based on hostname alone.
-        let repo = RepositoryName::new("repo").unwrap();
-        let result = client
-            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
-            .await
-            .unwrap();
-
-        assert_eq!(result, digest);
     }
 
     /// Covers the hostname-keyed mount routing:

@@ -438,74 +438,44 @@ mod tests {
         );
     }
 
+    /// Credentials resolve from the `auths` entry for the registry, with or
+    /// without a scheme, under any Docker Hub alias, from an encoded `auth`
+    /// or a separate username and password; an empty entry or no entry
+    /// resolves to none. Breaks if a lookup misses an entry it should find
+    /// or finds one it should not.
     #[tokio::test]
-    async fn lookup_exact_match() {
-        let json = r#"{
-            "auths": {
-                "ghcr.io": { "auth": "dXNlcjpwYXNz" }
-            }
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-        let creds = resolve_from_docker_config(&config, "ghcr.io")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(creds, Credentials::Basic { username, password } if username == "user" && password == "pass")
-        );
-    }
-
-    #[tokio::test]
-    async fn lookup_with_scheme_prefix() {
-        let json = r#"{
-            "auths": {
-                "https://ghcr.io": { "auth": "dXNlcjpwYXNz" }
-            }
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-        let creds = resolve_from_docker_config(&config, "ghcr.io")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(creds, Credentials::Basic { .. }));
-    }
-
-    #[tokio::test]
-    async fn lookup_not_found() {
-        let json = r#"{
-            "auths": {
-                "ghcr.io": { "auth": "dXNlcjpwYXNz" }
-            }
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-        let result = resolve_from_docker_config(&config, "quay.io")
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn lookup_docker_hub_alias() {
-        let json = r#"{
-            "auths": {
-                "https://index.docker.io/v1/": { "auth": "ZG9ja2VyOnNlY3JldA==" }
-            }
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-
-        // Look up via "docker.io" -- should find the creds stored under the full URL alias.
-        let creds = resolve_from_docker_config(&config, "docker.io")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(&creds, Credentials::Basic { username, .. } if username == "docker"));
-
-        // Also via "registry-1.docker.io".
-        let creds = resolve_from_docker_config(&config, "registry-1.docker.io")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(creds, Credentials::Basic { .. }));
+    async fn credentials_resolve_from_the_auths_entry() {
+        let user_pass = r#"{"auths": {"ghcr.io": {"auth": "dXNlcjpwYXNz"}}}"#;
+        let hub = r#"{"auths": {"https://index.docker.io/v1/": {"auth": "ZG9ja2VyOnNlY3JldA=="}}}"#;
+        let cases = [
+            (user_pass, "ghcr.io", Some(("user", "pass"))),
+            (user_pass, "quay.io", None),
+            (
+                r#"{"auths": {"https://ghcr.io": {"auth": "dXNlcjpwYXNz"}}}"#,
+                "ghcr.io",
+                Some(("user", "pass")),
+            ),
+            (hub, "docker.io", Some(("docker", "secret"))),
+            (hub, "registry-1.docker.io", Some(("docker", "secret"))),
+            (
+                r#"{"auths": {"custom.io": {"username": "myuser", "password": "mypass"}}}"#,
+                "custom.io",
+                Some(("myuser", "mypass")),
+            ),
+            (r#"{"auths": {"ghcr.io": {"auth": ""}}}"#, "ghcr.io", None),
+            (r#"{"auths": {"ghcr.io": {}}}"#, "ghcr.io", None),
+        ];
+        for (json, registry, expected) in cases {
+            let config: DockerConfig = serde_json::from_str(json).unwrap();
+            let expected = expected.map(|(username, password)| Credentials::Basic {
+                username: username.into(),
+                password: password.into(),
+            });
+            assert!(
+                resolve_from_docker_config(&config, registry).await.unwrap() == expected,
+                "{registry} in {json}"
+            );
+        }
     }
 
     #[test]
@@ -545,26 +515,6 @@ mod tests {
         assert!(config.creds_store.is_none());
     }
 
-    #[tokio::test]
-    async fn entry_with_separate_username_password() {
-        let json = r#"{
-            "auths": {
-                "custom.io": {
-                    "username": "myuser",
-                    "password": "mypass"
-                }
-            }
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-        let creds = resolve_from_docker_config(&config, "custom.io")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(&creds, Credentials::Basic { username, password } if username == "myuser" && password == "mypass")
-        );
-    }
-
     #[test]
     fn is_docker_hub_variants() {
         assert!(is_docker_hub("docker.io"));
@@ -573,34 +523,6 @@ mod tests {
         assert!(is_docker_hub("https://index.docker.io/v1/"));
         assert!(!is_docker_hub("ghcr.io"));
         assert!(!is_docker_hub("quay.io"));
-    }
-
-    #[tokio::test]
-    async fn empty_auth_field_returns_none() {
-        let json = r#"{
-            "auths": {
-                "ghcr.io": { "auth": "" }
-            }
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-        let result = resolve_from_docker_config(&config, "ghcr.io")
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn empty_auth_object_returns_none() {
-        let json = r#"{
-            "auths": {
-                "ghcr.io": {}
-            }
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-        let result = resolve_from_docker_config(&config, "ghcr.io")
-            .await
-            .unwrap();
-        assert!(result.is_none());
     }
 
     #[test]
@@ -641,22 +563,6 @@ mod tests {
         let config: DockerConfig = serde_json::from_str(json).unwrap();
         let helper = lookup_cred_helper(&config, "docker.io");
         assert_eq!(helper.as_deref(), Some("desktop"));
-    }
-
-    #[tokio::test]
-    async fn creds_store_not_checked_when_auths_match() {
-        let json = r#"{
-            "auths": {
-                "ghcr.io": { "auth": "dXNlcjpwYXNz" }
-            },
-            "credsStore": "desktop"
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-        let creds = resolve_from_docker_config(&config, "ghcr.io")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(creds, Credentials::Basic { username, .. } if username == "user"));
     }
 
     #[tokio::test]

@@ -883,31 +883,30 @@ mod tests {
         );
     }
 
+    /// A request path joins the base, `/v2/`, the repository and the
+    /// endpoint. Breaks if a part is dropped or reordered.
     #[test]
-    fn build_url_manifests() {
-        let url = build_url(&test_base_url(), "library/nginx", "manifests/latest").unwrap();
-        assert_eq!(
-            url.as_str(),
-            "https://registry-1.docker.io/v2/library/nginx/manifests/latest"
-        );
-    }
-
-    #[test]
-    fn build_url_blobs() {
-        let url = build_url(&test_base_url(), "library/nginx", "blobs/sha256:abc123").unwrap();
-        assert_eq!(
-            url.as_str(),
-            "https://registry-1.docker.io/v2/library/nginx/blobs/sha256:abc123"
-        );
-    }
-
-    #[test]
-    fn build_url_tags_list() {
-        let url = build_url(&test_base_url(), "clowdhaus/ocync", "tags/list").unwrap();
-        assert_eq!(
-            url.as_str(),
-            "https://registry-1.docker.io/v2/clowdhaus/ocync/tags/list"
-        );
+    fn build_url_joins_repository_and_endpoint() {
+        for (repository, endpoint, expected) in [
+            (
+                "library/nginx",
+                "manifests/latest",
+                "https://registry-1.docker.io/v2/library/nginx/manifests/latest",
+            ),
+            (
+                "library/nginx",
+                "blobs/sha256:abc123",
+                "https://registry-1.docker.io/v2/library/nginx/blobs/sha256:abc123",
+            ),
+            (
+                "clowdhaus/ocync",
+                "tags/list",
+                "https://registry-1.docker.io/v2/clowdhaus/ocync/tags/list",
+            ),
+        ] {
+            let url = build_url(&test_base_url(), repository, endpoint).unwrap();
+            assert_eq!(url.as_str(), expected);
+        }
     }
 
     #[test]

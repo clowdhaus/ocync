@@ -393,6 +393,7 @@ mod tests {
     use wiremock::{Mock, ResponseTemplate};
 
     use super::*;
+    use crate::auth::testing;
 
     /// Only a refusal, by Google or by AWS for an AWS subject token, is an
     /// auth error: a failure that may pass, a token exchange for a pool that
@@ -546,24 +547,6 @@ mod tests {
         auth.google_token().await.unwrap().expose().to_owned()
     }
 
-    fn mount_v2_and_token(server: &MockServer, token_value: &str) -> Vec<Mock> {
-        vec![
-            Mock::given(method("GET")).and(path("/v2/")).respond_with(
-                ResponseTemplate::new(401).insert_header(
-                    "WWW-Authenticate",
-                    format!(
-                        r#"Bearer realm="{}/token",service="us-docker.pkg.dev""#,
-                        server.uri()
-                    ),
-                ),
-            ),
-            Mock::given(method("GET")).and(path("/token")).respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": token_value, "expires_in": 300})),
-            ),
-        ]
-    }
-
     #[tokio::test]
     async fn auth_name() {
         let auth = GcpAuth::with_api(
@@ -579,8 +562,7 @@ mod tests {
     #[tokio::test]
     async fn exchanges_as_oauth2accesstoken() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
-            .remove(0)
+        testing::challenge(&server, "us-docker.pkg.dev")
             .mount(&server)
             .await;
         // base64 of `oauth2accesstoken:ya29.test-token`.
@@ -613,8 +595,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_exchange_drops_the_google_token() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
-            .remove(0)
+        testing::challenge(&server, "us-docker.pkg.dev")
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -624,15 +605,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "registry", "expires_in": 300})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
+        testing::token("registry").expect(1).mount(&server).await;
         let auth = GcpAuth::with_api(
             server.uri(),
             crate::test_http_client(),
@@ -649,8 +622,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_identity_fetches_one_more_google_token() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
-            .remove(0)
+        testing::challenge(&server, "us-docker.pkg.dev")
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -684,8 +656,7 @@ mod tests {
         use base64::Engine;
 
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
-            .remove(0)
+        testing::challenge(&server, "us-docker.pkg.dev")
             .mount(&server)
             .await;
         let fresh =
@@ -736,8 +707,7 @@ mod tests {
     #[tokio::test]
     async fn a_later_token_may_be_refused_and_replaced() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
-            .remove(0)
+        testing::challenge(&server, "us-docker.pkg.dev")
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -747,15 +717,7 @@ mod tests {
             .expect(3)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "registry", "expires_in": 300})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
+        testing::token("registry").expect(1).mount(&server).await;
         let auth = GcpAuth::with_api(
             server.uri(),
             crate::test_http_client(),
@@ -778,8 +740,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_scope_keeps_the_google_token() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
-            .remove(0)
+        testing::challenge(&server, "us-docker.pkg.dev")
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -837,9 +798,10 @@ mod tests {
         mount_user_token(&server, 1).await;
         let host = user_host(&server);
         let shared = SharedGoogleToken::default();
-        for mock in mount_v2_and_token(&server, "registry-token") {
-            mock.mount(&server).await;
-        }
+        testing::challenge(&server, "us-docker.pkg.dev")
+            .mount(&server)
+            .await;
+        testing::token("registry-token").mount(&server).await;
         let us = adc_auth(&server.uri(), &host, &shared).await;
         let europe = adc_auth(&server.uri(), &host, &shared).await;
 
@@ -998,27 +960,12 @@ mod tests {
         let server = MockServer::start().await;
 
         // /v2/ hit twice: once before the refusal, once after.
-        Mock::given(method("GET"))
-            .and(path("/v2/"))
-            .respond_with(ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(
-                    r#"Bearer realm="{}/token",service="us-docker.pkg.dev""#,
-                    server.uri()
-                ),
-            ))
+        testing::challenge(&server, "us-docker.pkg.dev")
             .expect(2)
             .mount(&server)
             .await;
 
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "fresh", "expires_in": 300})),
-            )
-            .mount(&server)
-            .await;
+        testing::token("fresh").mount(&server).await;
 
         let auth = GcpAuth::with_api(
             server.uri(),
@@ -1042,29 +989,13 @@ mod tests {
         let server = MockServer::start().await;
 
         // /v2/ exactly once; challenge cached for second call.
-        Mock::given(method("GET"))
-            .and(path("/v2/"))
-            .respond_with(ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(
-                    r#"Bearer realm="{}/token",service="us-docker.pkg.dev""#,
-                    server.uri()
-                ),
-            ))
+        testing::challenge(&server, "us-docker.pkg.dev")
             .expect(1)
             .mount(&server)
             .await;
 
         // /token hit twice: different scopes produce separate Bearer tokens.
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "tok", "expires_in": 300})),
-            )
-            .expect(2)
-            .mount(&server)
-            .await;
+        testing::token("tok").expect(2).mount(&server).await;
 
         let auth = GcpAuth::with_api(
             server.uri(),

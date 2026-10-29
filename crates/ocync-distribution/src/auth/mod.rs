@@ -292,6 +292,34 @@ pub trait AuthProvider: Send + Sync {
     fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
+/// Mocks shared by the provider tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A `/v2/` challenge naming `service`, with the realm on `server`.
+    pub(crate) fn challenge(server: &MockServer, service: &str) -> Mock {
+        Mock::given(method("GET")).and(path("/v2/")).respond_with(
+            ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="{service}""#,
+                    server.uri()
+                ),
+            ),
+        )
+    }
+
+    /// A token endpoint answering `value` to every request.
+    pub(crate) fn token(value: &str) -> Mock {
+        Mock::given(method("GET")).and(path("/token")).respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token": value, "expires_in": 300})),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
