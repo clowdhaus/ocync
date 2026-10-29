@@ -58,6 +58,10 @@ pub(crate) fn compare(
 }
 
 /// Loads a [`Baseline`] from a JSON file at `path`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads a baseline the bench wrote"
+)]
 pub(crate) fn load_baseline(path: &Path) -> Result<Baseline, String> {
     let contents =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;

@@ -265,6 +265,10 @@ impl InstanceInfo {
 /// `aws-sdk-ec2` which compiles every EC2 API and adds ~220 crates.
 ///
 /// Returns `(arch, cpu_manufacturer, vcpus, memory_mib, network_performance)`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads the AWS CLI's instance type answer, which holds no credential"
+)]
 fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize, u64, String)> {
     let output = std::process::Command::new("aws")
         .args([
@@ -870,6 +874,10 @@ fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), Stri
 /// `[record]`. If it exists, the record is appended. If the file
 /// contains invalid JSON, an error is returned (never silently
 /// overwrite corrupt data).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads a record file the bench wrote"
+)]
 pub(crate) fn append_record(
     results_dir: &Path,
     registry_key: &str,

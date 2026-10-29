@@ -198,7 +198,7 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
         Error::cloud_credentials(
             service,
             CredentialFailure::of_unreadable(&e),
-            format_args!("ACR {endpoint} answer unreadable: {}", error_chain(&e)),
+            format_args!("ACR {endpoint}: {}", error_chain(&e)),
         )
     })
 }
@@ -365,7 +365,7 @@ impl AzureCredentialChain {
         let body: EntraTokenResponse = crate::json::answer(resp).await.map_err(|e| {
             CredentialError::Failed(
                 CredentialFailure::of_unreadable(&e),
-                format!("{source} answer unreadable: {}", error_chain(&e)),
+                format!("{source}: {}", error_chain(&e)),
             )
         })?;
 
@@ -466,7 +466,7 @@ impl AzureCredentialChain {
         let body: ImdsTokenResponse = crate::json::answer(resp).await.map_err(|e| {
             CredentialError::Failed(
                 CredentialFailure::of_unreadable(&e),
-                format!("IMDS answer unreadable: {}", error_chain(&e)),
+                format!("IMDS: {}", error_chain(&e)),
             )
         })?;
 
@@ -1049,7 +1049,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("answer unreadable"), "got: {err}");
+        assert!(
+            err.to_string().contains("unreadable answer from"),
+            "got: {err}"
+        );
         assert!(!err.is_auth_error(), "{err}");
     }
 

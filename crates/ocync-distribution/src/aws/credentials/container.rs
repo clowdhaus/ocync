@@ -142,6 +142,9 @@ pub(in crate::aws) enum Error {
     /// The credentials document does not read.
     #[error(transparent)]
     Json(json::Error),
+    /// The answer is longer than any credentials document.
+    #[error("the answer is over {} bytes", crate::json::MAX_CREDENTIAL_ANSWER)]
+    TooLarge,
     /// An error document in place of credentials.
     #[error("failed to load credentials [{code}]: {message}")]
     Document {
@@ -172,6 +175,7 @@ impl Retryable for Error {
             | Self::Client(_)
             | Self::TokenFile { .. }
             | Self::InvalidToken(_)
+            | Self::TooLarge
             | Self::Document { .. } => None,
         }
     }
@@ -336,7 +340,9 @@ impl Provider {
             if !status.is_success() {
                 return Err(Error::Status(status));
             }
-            let body = response.bytes().await.map_err(Error::from)?;
+            let body = crate::json::read_capped(response, crate::json::MAX_CREDENTIAL_ANSWER)
+                .await?
+                .ok_or(Error::TooLarge)?;
             match json::read_document(&body).map_err(Error::Json)? {
                 Document::Credentials(credentials) => Ok(credentials),
                 Document::Error { code, message } => Err(Error::Document { code, message }),

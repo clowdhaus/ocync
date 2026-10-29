@@ -1,4 +1,5 @@
-//! JSON decoding shared by the registry, AWS and Google clients.
+//! Answer reading and JSON decoding shared by the registry, AWS and Google
+//! clients.
 
 use serde::Deserialize;
 
@@ -159,29 +160,52 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(text.as_ref())?)
 }
 
-/// The longest answer [`answer`] reads: far above any token answer, tag
-/// list page or referrers index, and a bound on the memory an endpoint that
-/// never stops sending can take.
+/// The longest registry answer [`answer`] reads: far above any token
+/// answer, tag list page or referrers index, and a bound on the memory an
+/// endpoint that never stops sending can take.
 const MAX_ANSWER: usize = 64 * 1024 * 1024;
 
-/// Read `response`'s body, which holds or may hold a credential, as JSON of
-/// type `T`. A body that does not arrive is [`Error::Http`]; one over
-/// [`MAX_ANSWER`] bytes or not the JSON expected is
-/// [`Error::UnreadableAnswer`], with no value from it.
-pub(crate) async fn answer<T: serde::de::DeserializeOwned>(
+/// The longest answer read from a cloud credential endpoint: well past any
+/// token, JWT, credentials document or zone a Google, AWS or metadata
+/// endpoint returns, and short of a body that would exhaust memory.
+pub(crate) const MAX_CREDENTIAL_ANSWER: usize = 1024 * 1024;
+
+/// `response`'s body, or `None` once it is known to pass `max` bytes: from
+/// its declared length before any is read, else as it arrives.
+pub(crate) async fn read_capped(
     mut response: reqwest::Response,
-) -> Result<T, Error> {
-    let url = Box::new(response.url().clone());
+    max: usize,
+) -> Result<Option<Vec<u8>>, reqwest::Error> {
+    if response
+        .content_length()
+        .is_some_and(|length| usize::try_from(length).map_or(true, |length| length > max))
+    {
+        return Ok(None);
+    }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > MAX_ANSWER {
-            return Err(Error::UnreadableAnswer {
-                url,
-                source: Unreadable(format!("answer over {MAX_ANSWER} bytes")),
-            });
+        if body.len() + chunk.len() > max {
+            return Ok(None);
         }
         body.extend_from_slice(&chunk);
     }
+    Ok(Some(body))
+}
+
+/// Read `response`'s body, which holds or may hold a credential, as JSON of
+/// type `T`. A body that does not arrive is [`Error::Http`], one over
+/// [`MAX_ANSWER`] bytes is [`Error::AnswerTooLarge`], and one that is not
+/// the JSON expected is [`Error::UnreadableAnswer`], with no value from it.
+pub(crate) async fn answer<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, Error> {
+    let url = Box::new(response.url().clone());
+    let Some(body) = read_capped(response, MAX_ANSWER).await? else {
+        return Err(Error::AnswerTooLarge {
+            url,
+            max: MAX_ANSWER,
+        });
+    };
     parse(&body).map_err(|source| Error::UnreadableAnswer { url, source })
 }
 
@@ -232,6 +256,42 @@ mod tests {
         );
     }
 
+    /// A body past the limit is refused from its declared length before any
+    /// is read, or as it streams when none is declared, and one at the limit
+    /// is read. Breaks if either check is dropped or is off by one.
+    #[tokio::test]
+    async fn read_capped_stops_at_the_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// The body a server answering `head` then `body` gives under a
+        /// limit of 4 bytes.
+        async fn read(head: &'static str, body: &'static str) -> Option<Vec<u8>> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = stream.read(&mut [0; 1024]).await.unwrap();
+                stream
+                    .write_all(format!("HTTP/1.1 200 OK\r\n{head}\r\n{body}").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let response = crate::test_http_client()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            read_capped(response, 4).await.unwrap()
+        }
+        // Declared too long and never sent in full: refused before reading.
+        assert_eq!(read("content-length: 5\r\n", "1234").await, None);
+        assert_eq!(read("connection: close\r\n", "12345").await, None);
+        assert_eq!(
+            read("connection: close\r\n", "1234").await,
+            Some(b"1234".to_vec())
+        );
+    }
+
     /// An answer longer than [`MAX_ANSWER`] is refused once it passes the
     /// limit. Breaks if the whole body is read whatever its length.
     #[tokio::test]
@@ -251,10 +311,7 @@ mod tests {
         let err = answer::<u64>(response).await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!(
-                "unreadable answer from {}/: answer over 67108864 bytes",
-                server.uri()
-            )
+            format!("answer from {}/ over 67108864 bytes", server.uri())
         );
     }
 

@@ -133,6 +133,9 @@ pub(in crate::aws) enum TokenError {
     /// The request did not complete, such as off EC2.
     #[error("could not communicate with IMDS")]
     Transport(#[source] TransportError),
+    /// The answer is longer than any session token.
+    #[error("the answer is over {} bytes", crate::json::MAX_CREDENTIAL_ANSWER)]
+    TooLarge,
     /// The answer failed the request.
     #[error(transparent)]
     Request(#[from] RequestError),
@@ -162,6 +165,9 @@ pub(in crate::aws) enum Error {
     /// The answer failed the request.
     #[error(transparent)]
     Request(#[from] RequestError),
+    /// The answer is longer than any credentials document or role name.
+    #[error("the answer is over {} bytes", crate::json::MAX_CREDENTIAL_ANSWER)]
+    TooLarge,
     /// The role name is not text.
     #[error("IMDS did not return valid UTF-8")]
     NotUtf8(#[source] Utf8Error),
@@ -394,7 +400,10 @@ impl Provider {
                 if !status.is_success() {
                     return Err(RequestError::Status(status).into());
                 }
-                response.bytes().await.map_err(Error::from)
+                crate::json::read_capped(response, crate::json::MAX_CREDENTIAL_ANSWER)
+                    .await?
+                    .map(Bytes::from)
+                    .ok_or(Error::TooLarge)
             })
             .await
         });
@@ -450,7 +459,9 @@ async fn request_token(
         .and_then(|ttl| ttl.parse().map_err(TtlError::NotSeconds))
         .map(Duration::from_secs)
         .map_err(TokenError::InvalidTtl)?;
-    let body = response.bytes().await.map_err(TokenError::from)?;
+    let body = crate::json::read_capped(response, crate::json::MAX_CREDENTIAL_ANSWER)
+        .await?
+        .ok_or(TokenError::TooLarge)?;
     let token = session_token(&body).map_err(TokenError::InvalidToken)?;
     Ok((token, ttl))
 }

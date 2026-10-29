@@ -1212,6 +1212,10 @@ struct PrewarmStats {
 /// OCI token exchange for authentication so requests succeed (2xx) and
 /// `CloudFront` actually caches the responses. Unauthenticated 401s are
 /// NOT cached by CDN and would warm nothing.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads a public image manifest, and drops a parse error unread"
+)]
 async fn cdn_prewarm(corpus: &Corpus) {
     let total = corpus.total_tags();
     eprintln!("bench: pre-warming CDN ({total} manifests)...");
@@ -1595,6 +1599,10 @@ async fn cdn_prewarm(corpus: &Corpus) {
 ///
 /// Works for both image manifests (`layers` + `config`) and index manifests
 /// (`manifests` array -- fetches each child to discover its layers).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads a public image manifest, and drops a parse error unread"
+)]
 async fn extract_blob_digests(
     client: &reqwest::Client,
     manifest: &serde_json::Value,
@@ -1670,6 +1678,7 @@ fn collect_image_blobs(
 /// Follows the standard flow: challenge /v2/, parse `WWW-Authenticate`,
 /// request a bearer token from the auth realm. For Docker Hub, includes
 /// basic auth credentials if available in the corpus.
+#[expect(clippy::disallowed_methods, reason = "a parse error is dropped unread")]
 async fn oci_token(
     client: &reqwest::Client,
     registry: &str,
@@ -1730,6 +1739,10 @@ fn parse_auth_param(header: &str, key: &str) -> Option<String> {
 ///
 /// Each line is `{"phase":"...","elapsed_ms":NNN}`. Malformed lines are
 /// silently skipped (the timing file is best-effort telemetry, not critical data).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads a timing file the bench wrote"
+)]
 fn parse_timing_file(path: &Path) -> BTreeMap<String, u64> {
     let mut map = BTreeMap::new();
     if let Ok(content) = std::fs::read_to_string(path) {

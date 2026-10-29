@@ -125,6 +125,16 @@ pub enum Error {
     #[error("HTTP request failed: {}", error_chain(&**.0))]
     Http(#[source] Arc<reqwest::Error>),
 
+    /// An answer's body is longer than any answer of its kind, so it is
+    /// not read further.
+    #[error("answer from {url} over {max} bytes")]
+    AnswerTooLarge {
+        /// The address that answered.
+        url: Box<reqwest::Url>,
+        /// The most read.
+        max: usize,
+    },
+
     /// An answer's body is not the JSON expected. The cause names where
     /// and why it failed to parse but no value from the body, which can be
     /// a token. Sending the request again gets the same body, so it is

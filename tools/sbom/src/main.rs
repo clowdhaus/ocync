@@ -11,9 +11,12 @@
 //! checks the result describes the binary being released. A crate of its own
 //! so release jobs build it in seconds, before any registry credentials
 //! exist.
-#![allow(
-    clippy::disallowed_methods,
-    reason = "reads JSON it or a tool wrote, which holds no credential"
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read JSON they wrote themselves"
+    )
 )]
 
 mod binary;
