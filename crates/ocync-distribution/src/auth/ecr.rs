@@ -164,9 +164,9 @@ impl AuthorizationToken {
 ///
 /// Obtains authorization tokens via `GetAuthorizationToken`, through a
 /// client created once at construction time. Tokens are cached via
-/// [`CredentialCache`], one refresh shared by the callers that ask while it
-/// is in flight, and refreshed when they approach expiry. The actual token lifetime is read from the API response, falling
-/// back to 12 hours if not provided.
+/// [`CredentialCache`] and refreshed when they approach expiry, one refresh
+/// shared by the callers that ask while it is in flight. The token lifetime
+/// is read from the API response, falling back to 12 hours.
 ///
 /// Supports all AWS credential sources via the default credential chain:
 /// environment variables, shared config/credential files, IMDS/ECS

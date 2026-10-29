@@ -65,14 +65,12 @@ impl TokenCache {
         }
     }
 
-    /// Drop every cached token, and cut off the exchanges in flight: a
-    /// caller that asks afterwards exchanges again, and an exchange begun
-    /// before neither stores its token nor hands it to a later caller.
+    /// Drop every cached token, and detach the exchanges in flight: a
+    /// caller that asks afterwards exchanges again rather than joining one
+    /// that may be using a refused credential.
     pub(super) fn clear(&self) {
-        self.flights.forget(|| {
-            self.tokens().clear();
-            true
-        });
+        self.flights.forget();
+        self.tokens().clear();
     }
 }
 

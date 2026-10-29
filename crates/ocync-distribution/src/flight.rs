@@ -36,7 +36,7 @@ pub(crate) enum Landed<R, V> {
 /// A fetch this caller leads. Its entry is the one under `key` only until
 /// the fetch lands or is forgotten. Dropping it removes that entry before
 /// the sender goes, so a waiter woken by the sender closing never finds
-/// it again.
+/// it again, and leaves alone an entry a later fetch put there.
 struct Lead<'a, K: Eq + Hash, V> {
     flights: &'a Flights<K, V>,
     key: &'a K,
@@ -46,14 +46,13 @@ struct Lead<'a, K: Eq + Hash, V> {
 
 impl<K: Eq + Hash, V> Lead<'_, K, V> {
     /// Remove this fetch's entry, if it is still the one under its key.
-    fn detach(&self, in_flight: &mut HashMap<K, watch::Receiver<Option<V>>>) -> bool {
-        let owned = in_flight
+    fn detach(&self, in_flight: &mut HashMap<K, watch::Receiver<Option<V>>>) {
+        if in_flight
             .get(self.key)
-            .is_some_and(|receiver| receiver.same_channel(&self.receiver));
-        if owned {
+            .is_some_and(|receiver| receiver.same_channel(&self.receiver))
+        {
             in_flight.remove(self.key);
         }
-        owned
     }
 }
 
@@ -70,15 +69,11 @@ impl<K, V> Flights<K, V> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Run `drop_stored`, which drops stored values, and if it says it
-    /// dropped any, cut off the fetches in flight: a caller that asks
-    /// afterwards starts a fetch of its own, and a fetch begun before
-    /// lands without storing or sharing its result.
-    pub(crate) fn forget(&self, drop_stored: impl FnOnce() -> bool) {
-        let mut in_flight = self.lock();
-        if drop_stored() {
-            in_flight.clear();
-        }
+    /// Detach the fetches in flight: a caller that asks afterwards starts
+    /// a fetch of its own, while each detached fetch still lands and
+    /// serves the callers already waiting on it.
+    pub(crate) fn forget(&self) {
+        self.lock().clear();
     }
 }
 
@@ -86,10 +81,10 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
     /// The value `stored` finds, else what the fetch in flight for `key`
     /// shares, else the result of `fetch`, run by this caller.
     ///
-    /// `land` is given the result under the lock `stored` is read under,
-    /// and only if nothing was forgotten since the fetch began. It stores
-    /// the value and returns what the waiters get: `None` sends each of
-    /// them to fetch for itself, as a fetch whose caller is dropped does.
+    /// `land` is given the result under the lock `stored` is read under.
+    /// It stores the value and returns what the waiters get: `None` sends
+    /// each of them to fetch for itself, as a fetch whose caller is
+    /// dropped does.
     pub(crate) async fn run<R, Fut>(
         &self,
         key: &K,
@@ -134,9 +129,8 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
                     // Landed and removed under one lock, so no caller joins
                     // a fetch that has landed.
                     let mut in_flight = self.lock();
-                    if lead.detach(&mut in_flight)
-                        && let Some(value) = land(&result)
-                    {
+                    lead.detach(&mut in_flight);
+                    if let Some(value) = land(&result) {
                         lead.sender.send_replace(Some(value));
                     }
                     drop(in_flight);
@@ -204,37 +198,42 @@ mod tests {
         assert!(matches!(landed, Landed::Own(9)), "{landed:?}");
     }
 
-    /// A fetch begun before a forget neither lands its value nor is joined
-    /// by a caller asking after it. Breaks if an invalidated value is
-    /// stored, or a later caller gets a result from before the forget.
+    /// A forget sends a later caller to fetch for itself, while the fetch
+    /// it detached still lands and serves the caller waiting on it, and
+    /// leaves the later fetch's entry alone. Breaks if a later caller joins
+    /// the detached fetch, its waiter is dropped, or its landing removes
+    /// the later entry and a fourth caller fetches again.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_forget_cuts_off_the_fetch_in_flight() {
+    async fn a_forget_detaches_the_fetch_in_flight() {
         let flights = Flights::<(), u32>::default();
-        let landed = Cell::new(Vec::new());
-        let land = |value: &u32| {
-            let mut seen = landed.take();
-            seen.push(*value);
-            landed.set(seen);
-            Some(*value)
-        };
+        let share = |value: &u32| Some(*value);
         let slow = || async {
             tokio::task::yield_now().await;
             tokio::task::yield_now().await;
             1
         };
-        let (before, after) = tokio::join!(flights.run(&(), || None, slow, land), async {
-            tokio::task::yield_now().await;
-            flights.forget(|| true);
-            flights
-                .run(&(), || None, || async { 2 }, |value: &u32| Some(*value))
-                .await
-        });
-        assert!(matches!(before, Landed::Own(1)), "{before:?}");
-        assert!(matches!(after, Landed::Own(2)), "{after:?}");
-        assert_eq!(
-            landed.take(),
-            Vec::<u32>::new(),
-            "a forgotten fetch lands nothing"
+        let yields = |count: u32, value: u32| async move {
+            for _ in 0..count {
+                tokio::task::yield_now().await;
+            }
+            value
+        };
+        let (leader, waiter, later, fourth) = tokio::join!(
+            flights.run(&(), || None, slow, share),
+            flights.run(&(), || None, || async { 0 }, share),
+            async {
+                tokio::task::yield_now().await;
+                flights.forget();
+                flights.run(&(), || None, || yields(4, 2), share).await
+            },
+            async {
+                yields(3, 0).await;
+                flights.run(&(), || None, || async { 3 }, share).await
+            },
         );
+        assert!(matches!(leader, Landed::Own(1)), "{leader:?}");
+        assert!(matches!(waiter, Landed::Shared(1)), "{waiter:?}");
+        assert!(matches!(later, Landed::Own(2)), "{later:?}");
+        assert!(matches!(fourth, Landed::Shared(2)), "{fourth:?}");
     }
 }

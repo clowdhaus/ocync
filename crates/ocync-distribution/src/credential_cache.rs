@@ -133,27 +133,20 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
             .map_err(|(Landed::Own(error) | Landed::Shared(error))| error)
     }
 
-    /// Clear the cached value, and cut off a refresh in flight: a caller
-    /// that asks afterwards refreshes again, and a refresh begun before
-    /// neither stores its value nor hands it to a later caller.
+    /// Clear the cached value. A caller that asks afterwards joins the
+    /// refresh in flight, if any, since it fetches a new value: a burst of
+    /// refusals costs one refresh.
     pub(crate) fn clear(&self) {
-        self.flights.forget(|| {
-            *self.write() = None;
-            true
-        });
+        *self.write() = None;
     }
 
     /// As [`Self::clear`], if `matches` says the cached value is the one to
     /// drop.
     pub(crate) fn clear_if(&self, matches: impl FnOnce(&T) -> bool) {
-        self.flights.forget(|| {
-            let mut entry = self.write();
-            let drop = entry.as_ref().is_some_and(|entry| matches(&entry.value));
-            if drop {
-                *entry = None;
-            }
-            drop
-        });
+        let mut entry = self.write();
+        if entry.as_ref().is_some_and(|entry| matches(&entry.value)) {
+            *entry = None;
+        }
     }
 
     /// Replace the cached value (test helper).
@@ -234,26 +227,30 @@ mod tests {
         assert_eq!(refreshes.get(), 1);
     }
 
-    /// A refresh in flight when the cache is cleared stores nothing, and a
-    /// caller that asks after the clear refreshes for itself. Breaks if the
-    /// value cleared away is stored or handed to the later caller.
+    /// A caller that asks after a clear joins the refresh in flight. Breaks
+    /// if a burst of refusals starts one refresh per refusal.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_clear_cuts_off_the_refresh_in_flight() {
+    async fn a_clear_joins_the_refresh_in_flight() {
+        use std::cell::Cell;
+
         let cache: CredentialCache<_> = CredentialCache::new();
-        let load = |value: u32| async move {
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-            Ok::<_, Infallible>((value, Duration::from_secs(1000)))
+        let refreshes = Cell::new(0);
+        let load = |value: u32| {
+            let refreshes = &refreshes;
+            async move {
+                refreshes.set(refreshes.get() + 1);
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+                Ok::<_, Infallible>((value, Duration::from_secs(1000)))
+            }
         };
         let (before, after) = tokio::join!(cache.get_or_refresh(load(1)), async {
             tokio::task::yield_now().await;
             cache.clear();
-            cache
-                .get_or_refresh(async { Ok::<_, Infallible>((2, Duration::from_secs(1000))) })
-                .await
+            cache.get_or_refresh(load(2)).await
         });
-        assert_eq!((before, after), (Ok(1), Ok(2)));
-        assert_eq!(cache.get_or_refresh(load(3)).await, Ok(2));
+        assert_eq!((before, after), (Ok(1), Ok(1)));
+        assert_eq!(refreshes.get(), 1);
     }
 
     /// Callers waiting on a refresh that fails get its error, and one that
