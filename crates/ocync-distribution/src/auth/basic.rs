@@ -498,12 +498,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn basic_auth_concurrent_same_scope_share_one_error_then_retry() {
         // Five concurrent callers for the same scope race a failing
-        // token endpoint. The first to acquire the per-scope coalescing
-        // slot fails, drops the slot, and the next caller retries; no
-        // caller is left dangling waiting on a stale slot. The
-        // challenge cache is not populated on error, so every retry
-        // re-runs the `/v2/` ping -- documenting current behavior, not
-        // asserting on the exact count.
+        // token endpoint. The first to take the per-scope slot fails, and
+        // the four queued behind it get its error without asking again.
+        // Breaks if each waiter sends its own token request.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v2/"))
@@ -520,6 +517,7 @@ mod tests {
             .and(path("/token"))
             .and(header("Authorization", expected_basic_header().as_str()))
             .respond_with(ResponseTemplate::new(403))
+            .expect(1)
             .mount(&server)
             .await;
 

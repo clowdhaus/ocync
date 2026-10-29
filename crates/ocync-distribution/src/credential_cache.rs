@@ -19,6 +19,56 @@ pub(crate) fn remaining(until: SystemTime) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+/// How many refreshes have failed, so a caller can tell a failure that came
+/// after it asked from one that came before, without a clock. A failure
+/// is handed only to the callers that asked before it: they waited on the
+/// refresh that failed, and one that asks after it refreshes again.
+#[derive(Debug, Default)]
+pub(crate) struct Failures(AtomicU64);
+
+/// When a caller asked, as the failure count it saw.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Asked(u64);
+
+/// The last refresh that failed, and its place in a [`Failures`] count.
+#[derive(Debug)]
+pub(crate) struct LastFailure<E>(Option<(u64, E)>);
+
+impl<E> Default for LastFailure<E> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl Failures {
+    /// Note when a caller asked, before it waits on a refresh.
+    pub(crate) fn ask(&self) -> Asked {
+        Asked(self.0.load(Ordering::Acquire))
+    }
+
+    /// Record a refresh that succeeded, so no caller gets an earlier
+    /// failure after it.
+    pub(crate) fn succeeded<E>(&self, last: &mut LastFailure<E>) {
+        last.0 = None;
+    }
+
+    /// Record `error` as the latest failure, in `last`.
+    pub(crate) fn record<E>(&self, last: &mut LastFailure<E>, error: E) {
+        let count = self.0.fetch_add(1, Ordering::AcqRel) + 1;
+        last.0 = Some((count, error));
+    }
+}
+
+impl<E: Clone> LastFailure<E> {
+    /// The error of the last failure, if it came after `asked`.
+    pub(crate) fn since(&self, asked: Asked) -> Option<E> {
+        match &self.0 {
+            Some((count, error)) if *count > asked.0 => Some(error.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// Cached credential with TTL tracking.
 ///
 /// Generic cache for credentials that uses a read-lock fast path
@@ -34,17 +84,13 @@ pub(crate) struct CredentialCache<T, E = Infallible> {
     cached: RwLock<Slot<T, E>>,
     /// A value with less than this left is refreshed.
     refresh_window: Duration,
-    /// How many refreshes have failed, so a caller can tell a failure that
-    /// came after it asked from one that came before, without a clock.
-    failures: AtomicU64,
+    failures: Failures,
 }
 
 /// What a [`CredentialCache`] holds.
 struct Slot<T, E> {
     entry: Option<CacheEntry<T>>,
-    /// The last refresh that failed, and its count in
-    /// [`CredentialCache::failures`].
-    failed: Option<(u64, E)>,
+    failed: LastFailure<E>,
 }
 
 struct CacheEntry<T> {
@@ -81,10 +127,10 @@ impl<T: Clone + Send + Sync, E> CredentialCache<T, E> {
         Self {
             cached: RwLock::new(Slot {
                 entry: None,
-                failed: None,
+                failed: LastFailure::default(),
             }),
             refresh_window: window,
-            failures: AtomicU64::new(0),
+            failures: Failures::default(),
         }
     }
 
@@ -120,24 +166,22 @@ impl<T: Clone + Send + Sync, E> CredentialCache<T, E> {
     where
         E: Clone,
     {
-        let asked = self.failures.load(Ordering::Acquire);
+        let asked = self.failures.ask();
         let mut slot = match self.fresh_or_lock().await {
             ControlFlow::Break(value) => return Ok(value),
             ControlFlow::Continue(slot) => slot,
         };
-        if let Some((failure, error)) = &slot.failed
-            && *failure > asked
-        {
-            return Err(error.clone());
+        if let Some(error) = slot.failed.since(asked) {
+            return Err(error);
         }
         match refresh.await {
             Ok((value, ttl)) => {
+                self.failures.succeeded(&mut slot.failed);
                 slot.entry = Some(CacheEntry::new(value.clone(), ttl));
                 Ok(value)
             }
             Err(error) => {
-                let failure = self.failures.fetch_add(1, Ordering::AcqRel) + 1;
-                slot.failed = Some((failure, error.clone()));
+                self.failures.record(&mut slot.failed, error.clone());
                 Err(error)
             }
         }
@@ -194,6 +238,22 @@ impl<T: Clone + Send + Sync, E> CredentialCache<T, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure is handed only to callers that asked before it, and never
+    /// after a later refresh succeeded. Breaks if a stale error outlives a
+    /// success, or a caller that asked after the failure gets it.
+    #[test]
+    fn a_failure_reaches_only_earlier_callers_until_a_success() {
+        let failures = Failures::default();
+        let mut last = LastFailure::default();
+        let before = failures.ask();
+        failures.record(&mut last, "refused");
+        let after = failures.ask();
+        assert_eq!(last.since(before), Some("refused"));
+        assert_eq!(last.since(after), None);
+        failures.succeeded(&mut last);
+        assert_eq!(last.since(before), None);
+    }
 
     #[test]
     fn an_expiry_in_the_past_leaves_no_time() {

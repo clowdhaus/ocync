@@ -17,16 +17,15 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
 use super::Token;
+use crate::credential_cache::{Failures, LastFailure};
 use crate::error::Error;
 
-/// A scope's fetch slot, held while fetching: the scope's last failed fetch
-/// and its count in [`TokenCache::failures`].
-type Slot = Arc<Mutex<Option<(u64, Error)>>>;
+/// A scope's fetch slot, held while fetching: the scope's last failed fetch.
+type Slot = Arc<Mutex<LastFailure<Error>>>;
 
 /// Coalescing token cache. Same-scope fetches serialize, distinct scopes
 /// run in parallel. See module-level docs for the synchronization model.
@@ -35,9 +34,7 @@ pub(super) struct TokenCache {
     cache: Mutex<HashMap<String, Token>>,
     /// Per scope, the fetch slot.
     inflight: Mutex<HashMap<String, Slot>>,
-    /// How many fetches have failed, so a caller can tell a failure that
-    /// came after it asked from one that came before, without a clock.
-    failures: AtomicU64,
+    failures: Failures,
 }
 
 impl TokenCache {
@@ -74,13 +71,10 @@ impl TokenCache {
             return Ok(token);
         }
 
-        let asked = self.failures.load(Ordering::Acquire);
+        let asked = self.failures.ask();
         let key_mutex = {
             let mut map = self.inflight.lock().await;
-            Arc::clone(
-                map.entry(key.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(None))),
-            )
+            Arc::clone(map.entry(key.clone()).or_insert_with(Slot::default))
         };
         let mut failed = key_mutex.lock().await;
 
@@ -97,20 +91,18 @@ impl TokenCache {
             return Ok(token);
         }
 
-        if let Some((failure, error)) = &*failed
-            && *failure > asked
-        {
-            return Err(error.clone());
+        if let Some(error) = failed.since(asked) {
+            return Err(error);
         }
 
         match fetch().await {
             Ok(token) => {
+                self.failures.succeeded(&mut failed);
                 self.cache.lock().await.insert(key, token.clone());
                 Ok(token)
             }
             Err(error) => {
-                let failure = self.failures.fetch_add(1, Ordering::AcqRel) + 1;
-                *failed = Some((failure, error.clone()));
+                self.failures.record(&mut failed, error.clone());
                 Err(error)
             }
         }
