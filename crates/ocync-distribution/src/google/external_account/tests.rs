@@ -409,11 +409,34 @@ fn selects_the_source_in_upstream_order() {
     ));
 }
 
+/// A `credential_source` naming no source says which keys it needs, and
+/// one that is not a map says it must be one. Breaks if the reason is lost
+/// to the generic text.
+#[test]
+fn a_source_naming_none_says_what_it_needs() {
+    for (source, expected) in [
+        (
+            serde_json::json!({"region": "x"}),
+            "invalid value: map, expected a credential_source naming environment_id, \
+             executable, url or file",
+        ),
+        (
+            serde_json::json!("token.txt"),
+            "invalid type: string, expected a map",
+        ),
+    ] {
+        let error = crate::json::value_as::<SourceFile>(source)
+            .err()
+            .expect("refused");
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
 /// An AWS source with a malformed field is an error, not the URL source
 /// it also names. Breaks if a later source is tried once AWS is selected.
 #[test]
 fn a_malformed_aws_source_is_an_error() {
-    let source = serde_json::from_value::<SourceFile>(serde_json::json!({
+    let source = crate::json::value_as::<SourceFile>(serde_json::json!({
         "environment_id": "aws1",
         "region_url": 7,
         "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials",
@@ -421,7 +444,7 @@ fn a_malformed_aws_source_is_an_error() {
     let error = source.err().expect("refused");
     assert_eq!(
         error.to_string(),
-        "invalid type: integer `7`, expected a string"
+        "invalid type: integer, expected a string"
     );
 }
 

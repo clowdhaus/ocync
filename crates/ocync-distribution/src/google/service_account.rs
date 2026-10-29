@@ -98,7 +98,7 @@ impl Account {
     /// The service account `json` describes, asking for `scopes`. The key
     /// is parsed here, so a bad key fails when the credentials are loaded.
     pub(super) fn from_json(json: Value, scopes: Scopes) -> Result<Self, Error> {
-        let file: KeyFile = serde_json::from_value(json).map_err(Error::Parse)?;
+        let file: KeyFile = crate::json::value_as(json).map_err(Error::Parse)?;
         Ok(Self {
             key: parse_pkcs8_pem(file.private_key.expose()).map_err(Error::PrivateKey)?,
             client_email: file.client_email,

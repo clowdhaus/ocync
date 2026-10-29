@@ -57,7 +57,7 @@ impl std::fmt::Display for Code {
 pub(in crate::aws) enum Error {
     /// The text is not a JSON object.
     #[error("invalid JSON in response: {0}")]
-    Json(#[source] serde_json::Error),
+    Json(#[source] crate::json::Unreadable),
     /// A field a success needs is missing.
     #[error("Expected field `{0}` in response but it was missing")]
     Missing(Required),
@@ -125,7 +125,7 @@ pub(super) fn field<'a, T>(
 /// key, token and expiry.
 pub(super) fn parse(body: &[u8]) -> Result<Document, Error> {
     let fields: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(body).map_err(Error::Json)?;
+        crate::json::parse(body).map_err(Error::Json)?;
     let field = |names: &[&str]| field(&fields, names, serde_json::Value::as_str);
     let required = |name: Required| field(name.names()).ok_or(Error::Missing(name));
     match field(CODE) {

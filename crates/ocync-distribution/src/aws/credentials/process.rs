@@ -71,7 +71,7 @@ pub(in crate::aws) enum Error {
 pub(in crate::aws) enum Invalid {
     /// Not a JSON object.
     #[error("invalid JSON in response")]
-    Json(#[source] serde_json::Error),
+    Json(#[source] crate::json::Unreadable),
     /// A required field is missing or not of its type.
     #[error("Expected field `{0}` in response but it was missing")]
     Missing(&'static str),
@@ -128,7 +128,7 @@ fn shell(command: &str) -> tokio::process::Command {
 /// missing.
 fn parse(output: &str) -> Result<Credentials, Invalid> {
     let document: serde_json::Map<String, Value> =
-        serde_json::from_str(output).map_err(Invalid::Json)?;
+        crate::json::parse(output).map_err(Invalid::Json)?;
     let text = |name: &'static str| json::field(&document, &[name], Value::as_str);
     let version = json::field(&document, &["Version"], Value::as_number)
         .ok_or(Invalid::Missing("Version"))?;

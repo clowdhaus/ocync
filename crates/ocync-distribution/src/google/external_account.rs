@@ -61,19 +61,20 @@ impl<'de> Deserialize<'de> for SourceFile {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
 
-        let value = Value::deserialize(deserializer)?;
-        let names = |key: &str| value.get(key).is_some();
+        let fields = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let names = |key: &str| fields.contains_key(key);
         let source = if names("environment_id") {
-            serde_json::from_value(value).map(Self::Aws)
+            serde_json::from_value(Value::Object(fields)).map(Self::Aws)
         } else if names("executable") {
             Ok(Self::Executable)
         } else if names("url") {
-            serde_json::from_value(value).map(Self::Url)
+            serde_json::from_value(Value::Object(fields)).map(Self::Url)
         } else if names("file") {
-            serde_json::from_value(value).map(Self::File)
+            serde_json::from_value(Value::Object(fields)).map(Self::File)
         } else {
-            return Err(D::Error::custom(
-                "credential_source names no environment_id, executable, url or file",
+            return Err(D::Error::invalid_value(
+                serde::de::Unexpected::Map,
+                &"a credential_source naming environment_id, executable, url or file",
             ));
         };
         source.map_err(D::Error::custom)
@@ -151,7 +152,7 @@ impl Format {
         match self {
             Self::Text => Ok(Secret(text)),
             Self::Json { field } => {
-                let mut json: Value = serde_json::from_str(&text).map_err(Error::SubjectJson)?;
+                let mut json: Value = crate::json::parse(&text).map_err(Error::SubjectJson)?;
                 match json.get_mut(field).map(Value::take) {
                     Some(Value::String(token)) => Ok(Secret(token)),
                     _ => Err(Error::SubjectField(field.clone())),
@@ -358,7 +359,7 @@ impl Account {
         scopes: Scopes,
         setup: &Setup<'_>,
     ) -> Result<Self, Error> {
-        let file: AccountFile = serde_json::from_value(json).map_err(Error::Parse)?;
+        let file: AccountFile = crate::json::value_as(json).map_err(Error::Parse)?;
         if file.workforce_pool_user_project.is_some() && Pool::of(&file.audience) == Pool::Other {
             return Err(Error::WorkforceProject);
         }

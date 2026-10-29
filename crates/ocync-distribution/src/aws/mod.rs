@@ -452,7 +452,7 @@ enum Failure {
     },
     /// The service's answer could not be read.
     #[error("unreadable response: {0}")]
-    Decode(#[source] serde_json::Error),
+    Decode(#[source] crate::json::Unreadable),
     /// A header to send, such as a credential's session token, holds a byte
     /// a header cannot carry.
     #[error("request has a header that cannot be sent: {0}")]
@@ -1173,7 +1173,7 @@ impl Client {
                 self.credentials.load().await.map(Signing::Signed)
             })
             .await
-            .and_then(|body| serde_json::from_slice(&body).map_err(Failure::Decode))
+            .and_then(|body| crate::json::parse(&body).map_err(Failure::Decode))
             .map_err(|failure| CallError {
                 service: self.service,
                 operation: O::NAME,
@@ -1487,7 +1487,7 @@ mod tests {
         }
         assert_eq!(kind(501, None), None);
         assert_eq!(kind(400, Some("InvalidParameterException")), None);
-        let undecodable = serde_json::from_slice::<ProbeOutput>(b"{").unwrap_err();
+        let undecodable = crate::json::parse::<ProbeOutput>(b"{").unwrap_err();
         assert_eq!(Failure::Decode(undecodable).retry_kind(), None);
     }
 

@@ -39,7 +39,7 @@ fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, Error> {
             registry: "ACR".into(),
             reason: format!("JWT payload base64 decode failed: {e}"),
         })?;
-    serde_json::from_slice(&decoded).map_err(|e| Error::AuthFailed {
+    crate::json::parse(&decoded).map_err(|e| Error::AuthFailed {
         registry: "ACR".into(),
         reason: format!("JWT payload is not valid JSON: {e}"),
     })
@@ -240,6 +240,14 @@ async fn exchange_access_token(
     let resp: AccessTokenResponse =
         exchange_post(http, base_url, service, "/oauth2/token", &form).await?;
     Ok(resp.access_token)
+}
+
+/// The access token in the Azure CLI's `stdout`. A refused value is left
+/// out of the error, as it can be the token.
+fn cli_access_token(stdout: &[u8]) -> Result<String, CredentialError> {
+    let body: CliTokenResponse = crate::json::parse(stdout)
+        .map_err(|e| CredentialError::Failed(format!("az CLI output parse failed: {e}")))?;
+    Ok(body.access_token)
 }
 
 /// Internal error for credential chain control flow.
@@ -452,10 +460,7 @@ impl AzureCredentialChain {
             )));
         }
 
-        let body: CliTokenResponse = serde_json::from_slice(&output.stdout)
-            .map_err(|e| CredentialError::Failed(format!("az CLI output parse failed: {e}")))?;
-
-        Ok(body.access_token)
+        cli_access_token(&output.stdout)
     }
 
     async fn try_source(&self, index: usize) -> Result<String, CredentialError> {
@@ -674,6 +679,21 @@ impl AuthProvider for AcrAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Azure CLI output with a mistyped token is refused without the
+    /// value. Breaks if the output is read with the raw parser.
+    #[test]
+    fn mistyped_cli_output_leaves_the_token_out() {
+        let Err(CredentialError::Failed(reason)) = cli_access_token(br#"{"accessToken": 735017}"#)
+        else {
+            panic!("accepted");
+        };
+        assert!(
+            reason.contains("invalid type: integer, expected a string"),
+            "{reason}"
+        );
+        assert!(!reason.contains("735017"), "{reason}");
+    }
 
     use std::collections::VecDeque;
 

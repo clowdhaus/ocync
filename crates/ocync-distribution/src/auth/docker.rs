@@ -74,7 +74,7 @@ impl DockerConfig {
         let contents = std::fs::read_to_string(path).map_err(|e| Error::CredentialConfig {
             reason: format!("failed to read config at {}: {e}", path.display()),
         })?;
-        serde_json::from_str(&contents).map_err(|e| Error::CredentialConfig {
+        crate::json::parse(&contents).map_err(|e| Error::CredentialConfig {
             reason: format!("failed to parse config at {}: {e}", path.display()),
         })
     }
@@ -279,12 +279,27 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
         }
     })?;
 
+    helper_credentials(program, registry, &output)
+}
+
+/// The credentials a helper's `output` holds. Its stderr is cut to the
+/// most of a program's output an error keeps, and a refused value from its
+/// stdout is left out.
+fn helper_credentials(
+    program: String,
+    registry: &str,
+    output: &std::process::Output,
+) -> Result<Credentials, Error> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::debug!(helper = %program, registry, status = %output.status, "credential helper exited with error");
         return Err(Error::CredentialHelperFailed {
             helper: program,
-            reason: format!("exited with {}: {}", output.status, stderr.trim()),
+            reason: format!(
+                "exited with {}: {}",
+                output.status,
+                crate::error::truncate_quoted(stderr.trim())
+            ),
         });
     }
 
@@ -297,7 +312,7 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
     }
 
     let resp: HelperResponse =
-        serde_json::from_slice(&output.stdout).map_err(|e| Error::CredentialHelperFailed {
+        crate::json::parse(&output.stdout).map_err(|e| Error::CredentialHelperFailed {
             helper: program,
             reason: format!("invalid JSON response: {e}"),
         })?;
@@ -448,6 +463,47 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    /// A helper that fails has its stderr cut to what can be quoted, and one
+    /// whose answer is mistyped is refused without the refused value.
+    /// Breaks if the stderr is kept past the cap or the value is quoted.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_failure_is_cut_to_what_can_be_quoted() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = |code: i32, stdout: &str, stderr: String| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.into_bytes(),
+        };
+        let failed = output(1, "", format!("{}s3cret", "x".repeat(200)));
+        let error = helper_credentials("helper".into(), "r", &failed).unwrap_err();
+        assert!(!error.to_string().contains("s3cret"), "{error}");
+        let mistyped = output(0, r#"{"Username": "u", "Secret": 7}"#, String::new());
+        let error = helper_credentials("helper".into(), "r", &mistyped).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("invalid type: integer, expected a string"),
+            "{text}"
+        );
+        assert!(!text.contains("`7`"), "{text}");
+    }
+
+    /// A config whose auth entry is a string, not an object, is refused
+    /// without quoting the string, which holds the encoded password. Breaks
+    /// if the parser's message reaches the error.
+    #[test]
+    fn a_mistyped_config_leaves_the_password_out() {
+        let path = std::env::temp_dir().join(format!("ocync-docker-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"auths": {"ghcr.io": "dXNlcjpzM2NyZXQ="}}"#).unwrap();
+        let result = DockerConfig::load_from(&path);
+        std::fs::remove_file(&path).unwrap();
+        let error = result.unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("expected struct AuthEntry"), "{text}");
+        assert!(!text.contains("dXNlcjpzM2NyZXQ="), "{text}");
+    }
 
     #[test]
     fn parse_config_with_auths() {
