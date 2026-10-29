@@ -46,6 +46,7 @@ use self::endpoint::Endpoint;
 pub(crate) use self::endpoint::{InvalidRegion, Region};
 use self::sigv4::encode_pairs;
 use crate::credential_cache::{CredentialCache, remaining};
+use crate::error::CredentialFailure;
 use crate::retry::{is_transient_transport, retrying};
 use crate::scheme::UnsupportedScheme;
 
@@ -126,6 +127,24 @@ const CLOCK_SKEW_CODES: &[&str] = &[
     "AuthFailure",
     "RequestTimeTooSkewed",
     "AccessDeniedException",
+];
+
+/// Error codes a service refuses a request's credentials with, whatever the
+/// status: AWS's common errors and their query protocol forms.
+const REFUSED_CODES: &[&str] = &[
+    "AccessDenied",
+    "AccessDeniedException",
+    "AuthFailure",
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "IncompleteSignature",
+    "InvalidClientTokenId",
+    "InvalidSignatureException",
+    "MissingAuthenticationToken",
+    "NotAuthorized",
+    "SignatureDoesNotMatch",
+    "UnauthorizedException",
+    "UnrecognizedClientException",
 ];
 
 /// What sets one AWS API apart from another to its calls.
@@ -484,6 +503,31 @@ impl From<reqwest::Error> for Failure {
     }
 }
 
+impl Failure {
+    /// Whether AWS refused the identity, the call may pass if sent again,
+    /// or something else failed. A failure the call re-sends may pass; a
+    /// service answer refuses with a 401, a 403 or a [`REFUSED_CODES`] code.
+    fn credential_failure(&self) -> CredentialFailure {
+        use retry::Retryable as _;
+        match self {
+            Self::Credentials(error) => error.credential_failure(),
+            _ if self.retry_kind().is_some() => CredentialFailure::Transient,
+            Self::Service(error)
+                if matches!(
+                    error.status,
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ) || error
+                    .code
+                    .as_ref()
+                    .is_some_and(|c| REFUSED_CODES.contains(&c.text.as_str())) =>
+            {
+                CredentialFailure::Refused
+            }
+            _ => CredentialFailure::Failed,
+        }
+    }
+}
+
 impl retry::Retryable for Failure {
     /// A throttle code wins over the status it came with, as in the SDK.
     fn retry_kind(&self) -> Option<retry::Kind> {
@@ -524,6 +568,14 @@ pub(crate) struct CallError {
     service: Service,
     operation: &'static str,
     failure: Failure,
+}
+
+impl CallError {
+    /// Whether AWS refused the identity, the call may pass if sent again,
+    /// or something else failed.
+    pub(crate) fn credential_failure(&self) -> CredentialFailure {
+        self.failure.credential_failure()
+    }
 }
 
 /// How an API writes its error answers.
@@ -903,6 +955,14 @@ impl fmt::Debug for CallerIdentitySigner {
 #[error(transparent)]
 pub(crate) struct SigningError(Failure);
 
+impl SigningError {
+    /// Whether AWS refused the identity, loading it may pass if tried
+    /// again, or something else failed.
+    pub(crate) fn credential_failure(&self) -> CredentialFailure {
+        self.0.credential_failure()
+    }
+}
+
 /// The AWS settings a [`CallerIdentitySigner`] is built from: the
 /// environment and shared files of one host, read once.
 pub(crate) struct CallerIdentityConfig<'h> {
@@ -1033,6 +1093,26 @@ impl fmt::Debug for CallerIdentityHeaders {
 /// when it is not the scheme's.
 fn host_header(url: &Url) -> &str {
     &url[url::Position::BeforeHost..url::Position::AfterPort]
+}
+
+#[cfg(test)]
+impl SigningError {
+    /// The error of a credential load that timed out.
+    pub(crate) fn timed_out() -> Self {
+        Self(Failure::Credentials(Arc::new(
+            credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT),
+        )))
+    }
+
+    /// The error of a call AWS answered with 403 Forbidden.
+    pub(crate) fn forbidden() -> Self {
+        Self(Failure::Service(ServiceError::parse(
+            StatusCode::FORBIDDEN,
+            None,
+            b"",
+            &[],
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -1192,7 +1272,7 @@ fn api_client(stall_timeout: Duration) -> reqwest::ClientBuilder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::num::NonZeroU32;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -1268,7 +1348,8 @@ mod tests {
         }
     }
 
-    fn client(server: &MockServer, max_attempts: NonZeroU32) -> Client {
+    /// An ECR client for `server` that makes `max_attempts` attempts.
+    pub(crate) fn client(server: &MockServer, max_attempts: NonZeroU32) -> Client {
         let mut parts = parts(&server.uri());
         parts.api.retry = strategy(max_attempts);
         Client::from_parts(parts).unwrap()
@@ -1278,7 +1359,8 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true}))
     }
 
-    fn throttle() -> ResponseTemplate {
+    /// ECR's answer to a throttled request.
+    pub(crate) fn throttle() -> ResponseTemplate {
         ResponseTemplate::new(400).set_body_json(serde_json::json!({
             "__type": "ThrottlingException",
             "message": "Rate exceeded"
@@ -1368,6 +1450,7 @@ mod tests {
                 err.to_string(),
                 "ECR GetAuthorizationToken failed: ThrottlingException (HTTP 400 Bad Request): Rate exceeded"
             );
+            assert_eq!(err.credential_failure(), CredentialFailure::Transient);
         }
 
         let server = MockServer::start().await;
@@ -1418,20 +1501,23 @@ mod tests {
         held.abort();
     }
 
+    /// ECR's answer to a request whose identity may not call it.
+    pub(crate) fn access_denied() -> ResponseTemplate {
+        ResponseTemplate::new(400)
+            .insert_header(
+                "x-amzn-errortype",
+                "AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/",
+            )
+            .set_body_json(serde_json::json!({"Message": "not authorized"}))
+    }
+
     /// A refused request is final: re-sending an access denial only spends
     /// the account's request quota.
     #[tokio::test]
     async fn does_not_retry_a_permanent_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(400)
-                    .insert_header(
-                        "x-amzn-errortype",
-                        "AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/",
-                    )
-                    .set_body_json(serde_json::json!({"Message": "not authorized"})),
-            )
+            .respond_with(access_denied())
             .expect(1)
             .mount(&server)
             .await;
@@ -1444,6 +1530,59 @@ mod tests {
             err.to_string(),
             "ECR GetAuthorizationToken failed: AccessDeniedException (HTTP 400 Bad Request): not authorized"
         );
+        assert_eq!(err.credential_failure(), CredentialFailure::Refused);
+    }
+
+    /// A failure the call re-sends may pass, an answer with a 401, a 403 or
+    /// a code that refuses credentials is refused, and anything else failed.
+    /// Breaks if a throttle or a credential timeout exits as refused
+    /// credentials, or a refusal stops counting as one.
+    #[test]
+    fn classifies_what_aws_refuses() {
+        let service = |status: u16, code: Option<&str>| {
+            Failure::Service(ServiceError::parse(
+                StatusCode::from_u16(status).unwrap(),
+                code,
+                b"",
+                &[],
+            ))
+        };
+        let load = |error| Failure::Credentials(Arc::new(error));
+        for (failure, expected) in [
+            (
+                service(400, Some("ThrottlingException")),
+                CredentialFailure::Transient,
+            ),
+            (service(503, None), CredentialFailure::Transient),
+            (
+                service(403, Some("ThrottlingException")),
+                CredentialFailure::Transient,
+            ),
+            (
+                service(400, Some("UnrecognizedClientException")),
+                CredentialFailure::Refused,
+            ),
+            (
+                service(400, Some("ExpiredTokenException")),
+                CredentialFailure::Refused,
+            ),
+            (service(401, None), CredentialFailure::Refused),
+            (service(403, None), CredentialFailure::Refused),
+            (
+                service(400, Some("InvalidParameterException")),
+                CredentialFailure::Failed,
+            ),
+            (
+                load(credentials::Error::TimedOut(CREDENTIALS_LOAD_TIMEOUT)),
+                CredentialFailure::Transient,
+            ),
+            (
+                load(credentials::Error::NotLoaded("no keys".to_owned())),
+                CredentialFailure::Failed,
+            ),
+        ] {
+            assert_eq!(failure.credential_failure(), expected, "{failure}");
+        }
     }
 
     /// A throttle code wins over the status it came with, a timeout code or

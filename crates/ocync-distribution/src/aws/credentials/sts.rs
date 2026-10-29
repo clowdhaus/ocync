@@ -20,6 +20,7 @@ use super::super::{
 };
 use super::web_identity::Token;
 use super::{Credentials, credential_api};
+use crate::error::CredentialFailure;
 
 /// The STS API version every request names.
 const VERSION: &str = "2011-06-15";
@@ -53,13 +54,9 @@ const ASSUME_ROLE_WITH_WEB_IDENTITY: Operation = Operation {
     action: "AssumeRoleWithWebIdentity",
     modeled_errors: &[
         EXPIRED_TOKEN,
-        ModeledError {
-            code: "IDPCommunicationError",
-            name: "IdpCommunicationErrorException",
-            retry: ModeledRetry::Transient,
-        },
-        modeled("IDPRejectedClaim", "IdpRejectedClaimException"),
-        modeled("InvalidIdentityToken", "InvalidIdentityTokenException"),
+        IDP_COMMUNICATION_ERROR,
+        IDP_REJECTED_CLAIM,
+        INVALID_IDENTITY_TOKEN,
         MALFORMED_POLICY,
         PACKED_POLICY_TOO_LARGE,
         REGION_DISABLED,
@@ -67,6 +64,14 @@ const ASSUME_ROLE_WITH_WEB_IDENTITY: Operation = Operation {
 };
 
 const EXPIRED_TOKEN: ModeledError = modeled("ExpiredTokenException", "ExpiredTokenException");
+const IDP_COMMUNICATION_ERROR: ModeledError = ModeledError {
+    code: "IDPCommunicationError",
+    name: "IdpCommunicationErrorException",
+    retry: ModeledRetry::Transient,
+};
+const IDP_REJECTED_CLAIM: ModeledError = modeled("IDPRejectedClaim", "IdpRejectedClaimException");
+const INVALID_IDENTITY_TOKEN: ModeledError =
+    modeled("InvalidIdentityToken", "InvalidIdentityTokenException");
 const MALFORMED_POLICY: ModeledError = modeled(
     "MalformedPolicyDocument",
     "MalformedPolicyDocumentException",
@@ -143,6 +148,31 @@ pub(in crate::aws) enum Error {
     /// The expiry is not an RFC 3339 time.
     #[error("STS credential expiration '{0}' is not an RFC 3339 time")]
     Expiration(String),
+}
+
+impl Error {
+    /// Whether STS refused the token or the role, the call may pass if
+    /// sent again, or something else failed. An expired, rejected or
+    /// invalid identity token is refused; an identity provider STS could
+    /// not reach may pass.
+    pub(super) fn credential_failure(&self) -> CredentialFailure {
+        match self {
+            Self::Exception(Exception { name, .. }) => {
+                if *name == IDP_COMMUNICATION_ERROR.name {
+                    CredentialFailure::Transient
+                } else if [EXPIRED_TOKEN, IDP_REJECTED_CLAIM, INVALID_IDENTITY_TOKEN]
+                    .iter()
+                    .any(|refused| refused.name == *name)
+                {
+                    CredentialFailure::Refused
+                } else {
+                    CredentialFailure::Failed
+                }
+            }
+            Self::Call(failure) => failure.credential_failure(),
+            _ => CredentialFailure::Failed,
+        }
+    }
 }
 
 impl From<Failure> for Error {
@@ -416,6 +446,32 @@ mod tests {
         }
         let not_utf8 = credentials(&ASSUME_ROLE, b"\xff").unwrap_err();
         assert!(matches!(not_utf8, Error::NotUtf8(_)), "{not_utf8}");
+    }
+
+    /// An expired, rejected or invalid identity token and an access denial
+    /// are refused, an identity provider STS could not reach or a server
+    /// error may pass, and any other answer failed. Breaks if a transient
+    /// STS failure exits as refused credentials, or a refusal stops counting
+    /// as one.
+    #[test]
+    fn classifies_what_sts_refuses() {
+        for (status, code, expected) in [
+            (400, "IDPRejectedClaim", CredentialFailure::Refused),
+            (400, "InvalidIdentityToken", CredentialFailure::Refused),
+            (400, "ExpiredTokenException", CredentialFailure::Refused),
+            (403, "AccessDenied", CredentialFailure::Refused),
+            (400, "IDPCommunicationError", CredentialFailure::Transient),
+            (503, "InternalFailure", CredentialFailure::Transient),
+            (400, "MalformedPolicyDocument", CredentialFailure::Failed),
+        ] {
+            let error = Error::from(Failure::Service(ServiceError {
+                status: StatusCode::from_u16(status).unwrap(),
+                code: ErrorCode::parse(code, ASSUME_ROLE_WITH_WEB_IDENTITY.modeled_errors),
+                message: None,
+                retry_after: None,
+            }));
+            assert_eq!(error.credential_failure(), expected, "{code}");
+        }
     }
 
     /// A code the operation models is reported by the SDK's name for it,

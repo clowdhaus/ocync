@@ -30,7 +30,7 @@ use crate::scheme::{Scheme, UnsupportedScheme};
 
 use crate::REDACTED;
 use crate::aws::{AwsCredentialProviders, Clock, Env, Host, Platform};
-use crate::error::{MAX_QUOTED_BYTES, truncate_quoted};
+use crate::error::{CredentialFailure, MAX_QUOTED_BYTES, truncate_quoted};
 use crate::retry::{Bounded, retrying};
 
 /// The scope every registry token is asked for: push and pull on Artifact
@@ -411,6 +411,19 @@ impl Error {
                 !final_failure && crate::retry::is_transient_transport(source)
             }
             _ => false,
+        }
+    }
+
+    /// Whether Google refused the identity, the call may pass if sent
+    /// again, or something else failed. A 4xx answer that is not
+    /// [transient](Self::is_transient) refuses; an AWS subject token that
+    /// was not signed is classified as the AWS failure under it.
+    pub(crate) fn credential_failure(&self) -> CredentialFailure {
+        match self {
+            Self::AwsSigning(error) => error.credential_failure(),
+            Self::Status { status, .. } => CredentialFailure::of_status(*status),
+            _ if self.is_transient() => CredentialFailure::Transient,
+            _ => CredentialFailure::Failed,
         }
     }
 

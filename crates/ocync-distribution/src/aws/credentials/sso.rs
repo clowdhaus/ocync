@@ -14,6 +14,7 @@ use super::super::host::Host;
 use super::super::{ApiRequest, ConfigError, Failure, retry};
 use super::sso_token::{self, Login};
 use super::{Credentials, credential_api};
+use crate::error::CredentialFailure;
 
 /// The header that carries the login token: the call is not signed.
 const BEARER_TOKEN: HeaderName = HeaderName::from_static("x-amz-sso_bearer_token");
@@ -64,6 +65,19 @@ pub(in crate::aws) enum Error {
     /// The expiry is out of the clock's range.
     #[error("expiration could not be converted into a system time")]
     Expiration,
+}
+
+impl Error {
+    /// Whether the login or the role was refused, the call may pass if sent
+    /// again, or something else failed. An expired login is refused: it
+    /// needs a new sign-in.
+    pub(super) fn credential_failure(&self) -> CredentialFailure {
+        match self {
+            Self::Token(sso_token::Error::Expired) => CredentialFailure::Refused,
+            Self::Call(failure) => failure.credential_failure(),
+            _ => CredentialFailure::Failed,
+        }
+    }
 }
 
 /// The credentials of `role`, from the portal in its region, with the

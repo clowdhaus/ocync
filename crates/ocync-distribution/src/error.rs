@@ -69,15 +69,17 @@ pub enum Error {
         reason: String,
     },
 
-    /// Google's credentials yielded no token for the registry.
-    #[error("no Google token for registry '{registry}': {reason}")]
-    GoogleCredentials {
+    /// A cloud provider's credentials (AWS, Google or Azure) yielded no
+    /// token for the registry.
+    #[error("no cloud token for registry '{registry}': {reason}")]
+    CloudCredentials {
         /// The registry the token was for.
         registry: String,
         /// Why no token was had, with its causes.
         reason: String,
-        /// Whether asking again may succeed.
-        transience: Transience,
+        /// Whether the identity was refused, the failure may pass, or
+        /// something else failed.
+        failure: CredentialFailure,
     },
 
     /// A registry's token endpoint answered with an error status. 401
@@ -220,13 +222,42 @@ pub enum Error {
     },
 }
 
-/// Whether a failure may pass if the same request is sent again.
+/// Why a cloud provider's credentials yielded no token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transience {
-    /// It may pass, as a server error, a throttle or a timeout can.
+pub enum CredentialFailure {
+    /// The provider rejected the identity, as for an expired, revoked or
+    /// unauthorized credential. Only this is an authentication failure.
+    Refused,
+    /// It may pass if asked again, as a throttle, a server error or a
+    /// timeout can.
     Transient,
-    /// It fails again, as refused credentials do.
-    Final,
+    /// Anything else, such as no credential configured or an answer that
+    /// does not read.
+    Failed,
+}
+
+impl CredentialFailure {
+    /// What an error answer with `status` from a token endpoint means: a
+    /// 408, 429 or 5xx may pass, any other 4xx refuses.
+    pub(crate) fn of_status(status: http::StatusCode) -> Self {
+        if crate::retry::is_transient_status(status) {
+            Self::Transient
+        } else if status.is_client_error() {
+            Self::Refused
+        } else {
+            Self::Failed
+        }
+    }
+
+    /// What a request that did not complete means: one the crate re-sends
+    /// may pass.
+    pub(crate) fn of_transport(error: &reqwest::Error) -> Self {
+        if crate::retry::is_transient_transport(error) {
+            Self::Transient
+        } else {
+            Self::Failed
+        }
+    }
 }
 
 impl From<serde_json::Error> for Error {
@@ -242,11 +273,17 @@ impl From<reqwest::Error> for Error {
 }
 
 impl Error {
-    /// An [`Error::AuthFailed`] for `registry`, with `reason` as its text.
-    pub(crate) fn auth_failed(registry: &str, reason: impl std::fmt::Display) -> Self {
-        Self::AuthFailed {
+    /// An [`Error::CloudCredentials`] for `registry`, with `reason` as its
+    /// text.
+    pub(crate) fn cloud_credentials(
+        registry: &str,
+        failure: CredentialFailure,
+        reason: impl std::fmt::Display,
+    ) -> Self {
+        Self::CloudCredentials {
             registry: registry.to_owned(),
             reason: reason.to_string(),
+            failure,
         }
     }
 
@@ -268,19 +305,19 @@ impl Error {
     ///
     /// Returns `true` for [`AuthFailed`](Self::AuthFailed) errors, a token
     /// endpoint's 4xx other than 408 Request Timeout and 429 Too Many
-    /// Requests, Google credentials that fail for good, a refused upload
+    /// Requests, cloud credentials the provider refused, a refused upload
     /// ([`UploadTokenRefused`](Self::UploadTokenRefused)), and registry
     /// responses with HTTP 401 Unauthorized or 403 Forbidden status codes.
     pub fn is_auth_error(&self) -> bool {
         match self {
             Self::AuthFailed { .. }
             | Self::UploadTokenRefused { .. }
-            | Self::GoogleCredentials {
-                transience: Transience::Final,
+            | Self::CloudCredentials {
+                failure: CredentialFailure::Refused,
                 ..
             } => true,
             Self::TokenEndpoint { status, .. } | Self::RegistryPing { status, .. } => {
-                status.is_client_error() && !crate::retry::is_transient_status(*status)
+                CredentialFailure::of_status(*status) == CredentialFailure::Refused
             }
             Self::RegistryError { status, .. } => {
                 *status == http::StatusCode::UNAUTHORIZED || *status == http::StatusCode::FORBIDDEN

@@ -10,6 +10,7 @@ use super::super::profile::{DEFAULT_PROFILE, ParseError, Properties, Sections};
 use super::sso_token::Login;
 use super::web_identity::{self, Origin};
 use super::{Credentials, Error as ChainError, Source, process, sso, sts};
+use crate::error::CredentialFailure;
 
 const ROLE_ARN: &str = "role_arn";
 const EXTERNAL_ID: &str = "external_id";
@@ -205,6 +206,20 @@ pub(in crate::aws) enum Error {
         #[source]
         source: sts::Error,
     },
+}
+
+impl Error {
+    /// Whether the base credentials or the role were refused, loading may
+    /// pass if tried again, or something else failed, such as the profile's
+    /// settings or a `credential_process`.
+    pub(super) fn credential_failure(&self) -> CredentialFailure {
+        match self {
+            Self::Base(error) => error.credential_failure(),
+            Self::Sso(error) => error.credential_failure(),
+            Self::AssumeRole { source, .. } => source.credential_failure(),
+            _ => CredentialFailure::Failed,
+        }
+    }
 }
 
 /// What is wrong with a profile's credential settings.
