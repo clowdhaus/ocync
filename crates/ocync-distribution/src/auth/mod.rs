@@ -16,6 +16,8 @@ pub mod ecr;
 pub mod ecr_public;
 /// Google Artifact Registry / Container Registry authentication provider.
 pub mod gcp;
+/// Recovery from a token endpoint refusing a cloud credential.
+mod recovery;
 /// Static bearer token authentication provider.
 pub mod static_token;
 /// Coalescing token cache used by every Bearer-token auth provider.
@@ -181,6 +183,12 @@ impl Token {
         &self.value
     }
 
+    /// Whether the two tokens send the same `Authorization` header,
+    /// whatever their expiry.
+    pub(crate) fn sends_same_header(&self, other: &Token) -> bool {
+        self.value == other.value && self.scheme == other.scheme
+    }
+
     /// The auth scheme for this token.
     pub fn scheme(&self) -> &AuthScheme {
         &self.scheme
@@ -226,7 +234,7 @@ pub(crate) fn scopes_cache_key(scopes: &[Scope]) -> String {
 }
 
 /// Credentials for authenticating to a registry.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Credentials {
     /// HTTP Basic authentication.
     Basic {
@@ -249,6 +257,15 @@ impl fmt::Debug for Credentials {
     }
 }
 
+/// What a refusal of a credential found stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The refused credential was the one stored, and is dropped.
+    Current,
+    /// Another credential, or none, was stored, and it is kept.
+    Stale,
+}
+
 /// Trait for providers that can obtain authentication tokens for registries.
 ///
 /// Uses `Pin<Box<dyn Future>>` for object safety, allowing `Box<dyn AuthProvider>`.
@@ -266,12 +283,15 @@ pub trait AuthProvider: Send + Sync {
         scopes: &[Scope],
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>>;
 
-    /// Invalidate any cached tokens, so the next `get_token` call does not
-    /// reuse them. A fetch already in flight may still answer it.
+    /// The registry rejected `refused` with 401. Drop the stored token only
+    /// if it is `refused`, so the next `get_token` call does not reuse it.
+    /// A stored token that has since replaced `refused` is kept, as other
+    /// requests may be using it. A fetch already in flight may still answer
+    /// the next call. The cloud credential a token was exchanged with is
+    /// judged only by the exchange that uses it, not by this call.
     ///
-    /// Called by the client when a request returns 401, indicating the
-    /// current token was rejected by the registry.
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// Called by the client when a request returns 401.
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 #[cfg(test)]

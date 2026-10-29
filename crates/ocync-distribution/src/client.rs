@@ -9,7 +9,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::aimd::{AimdController, RegistryAction};
-use crate::auth::{AuthProvider, Scope};
+use crate::auth::{AuthProvider, Scope, Token};
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
@@ -569,7 +569,7 @@ impl RegistryClient {
     /// Perform an authenticated GET request.
     ///
     /// Acquires an AIMD permit for the given operation, attaches auth headers,
-    /// and retries once on 401 (invalidating the cached token first). Reports
+    /// and retries once on 401 (refusing the token sent first). Reports
     /// throttle on 429 so the AIMD window adapts.
     pub async fn get(
         &self,
@@ -662,10 +662,10 @@ impl RegistryClient {
         result
     }
 
-    /// Send a request with 401 retry and token invalidation.
+    /// Send a request with 401 retry and token refusal.
     ///
     /// Builds the request via `build_request` (called with fresh auth headers),
-    /// sends it, and if a 401 is returned, invalidates the cached token and
+    /// sends it, and if a 401 is returned, refuses the token it sent and
     /// retries once. Does NOT acquire an AIMD permit - callers manage their
     /// own permits.
     async fn send_with_retry(
@@ -674,54 +674,59 @@ impl RegistryClient {
         context: &str,
         build_request: impl Fn(HeaderMap) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, Error> {
-        let headers = self.auth_headers(scopes).await?;
-        let resp = build_request(headers).send().await?;
+        let sent = self.auth_token(scopes).await?;
+        let resp = build_request(auth_headers(sent.as_ref())?).send().await?;
 
         if resp.status() != StatusCode::UNAUTHORIZED {
             return Ok(resp);
         }
 
-        tracing::debug!(context, "got 401, invalidating token and retrying");
-        self.invalidate_auth().await;
-        let headers = self.auth_headers(scopes).await?;
-        Ok(build_request(headers).send().await?)
+        tracing::debug!(context, "got 401, refusing the token and retrying");
+        self.refuse_auth(sent).await;
+        let retry = self.auth_token(scopes).await?;
+        Ok(build_request(auth_headers(retry.as_ref())?).send().await?)
     }
 
-    /// Invalidate the cached auth token.
+    /// Tell the auth provider the registry refused `refused` with 401, if a
+    /// token was sent.
     ///
     /// Call this before retrying a request after a 401 response so the auth
     /// provider fetches a fresh token instead of returning the stale one.
-    pub(crate) async fn invalidate_auth(&self) {
-        if let Some(ref auth) = self.auth {
-            auth.invalidate().await;
+    /// The provider keeps any token that has replaced `refused`.
+    pub(crate) async fn refuse_auth(&self, refused: Option<Token>) {
+        if let (Some(auth), Some(refused)) = (&self.auth, refused) {
+            auth.refuse(refused).await;
         }
     }
 
-    /// Build auth headers for a request.
-    pub(crate) async fn auth_headers(&self, scopes: &[Scope]) -> Result<HeaderMap, Error> {
-        let mut headers = HeaderMap::new();
-
-        if let Some(ref auth) = self.auth {
-            let token = auth.get_token(scopes).await?;
-            let value = token.value();
-            if !value.is_empty() {
-                let prefix = match token.scheme() {
-                    AuthScheme::Bearer => "Bearer",
-                    AuthScheme::Basic => "Basic",
-                };
-                let header_value =
-                    HeaderValue::from_str(&format!("{prefix} {value}")).map_err(|e| {
-                        Error::InvalidHeaderValue {
-                            header: "Authorization".into(),
-                            reason: e.to_string(),
-                        }
-                    })?;
-                headers.insert(AUTHORIZATION, header_value);
-            }
+    /// The token to send with a request, or `None` with no auth provider.
+    pub(crate) async fn auth_token(&self, scopes: &[Scope]) -> Result<Option<Token>, Error> {
+        match &self.auth {
+            Some(auth) => auth.get_token(scopes).await.map(Some),
+            None => Ok(None),
         }
-
-        Ok(headers)
     }
+}
+
+/// The request headers that carry `token`, none when there is no token or
+/// its value is empty.
+pub(crate) fn auth_headers(token: Option<&Token>) -> Result<HeaderMap, Error> {
+    let mut headers = HeaderMap::new();
+    if let Some(token) = token.filter(|token| !token.value().is_empty()) {
+        let prefix = match token.scheme() {
+            AuthScheme::Bearer => "Bearer",
+            AuthScheme::Basic => "Basic",
+        };
+        let header_value =
+            HeaderValue::from_str(&format!("{prefix} {}", token.value())).map_err(|e| {
+                Error::InvalidHeaderValue {
+                    header: "Authorization".into(),
+                    reason: e.to_string(),
+                }
+            })?;
+        headers.insert(AUTHORIZATION, header_value);
+    }
+    Ok(headers)
 }
 
 /// Report AIMD permit outcome based on the HTTP response.
@@ -844,7 +849,7 @@ mod tests {
             Box::pin(async { Ok(Token::new("stub-token".to_owned())) })
         }
 
-        fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        fn refuse(&self, _refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(async {})
         }
     }

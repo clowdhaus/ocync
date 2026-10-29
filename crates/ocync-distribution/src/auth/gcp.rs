@@ -20,10 +20,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 
+use super::recovery::{Recovery, judge_token_endpoint};
 use super::token_cache::TokenCache;
-use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
@@ -135,7 +135,13 @@ impl CachedGoogleToken {
     /// Drop the kept token if it is `refused`, so one registry's refusal
     /// does not discard a token another has fetched since.
     fn refuse(&self, refused: &google::Secret) {
-        self.token.clear_if(|kept| kept.token == *refused);
+        // Only the token is compared, so the expiry is a placeholder.
+        let refused = AccessToken {
+            token: refused.clone(),
+            expiry: Expiry::Never,
+        };
+        self.token
+            .refuse(refused, |kept, refused| kept.token == refused.token);
     }
 }
 
@@ -221,13 +227,8 @@ pub struct GcpAuth {
     cached_token: Arc<CachedGoogleToken>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
-    /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
-    challenge_cache: token_exchange::ChallengeCache,
-    /// A Google token the registry refused although it was fetched fresh
-    /// for it: the identity, not the token, is refused, so another refusal
-    /// of the same token fetches no other. A different token kept later,
-    /// such as one refreshed at expiry, is tried again.
-    refused_fresh: Mutex<Option<google::Secret>>,
+    /// What the token endpoint's refusals of the Google token come to.
+    recovery: Recovery<google::Secret>,
 }
 
 impl fmt::Debug for GcpAuth {
@@ -291,8 +292,7 @@ impl GcpAuth {
             http,
             cached_token,
             tokens: TokenCache::new(),
-            challenge_cache: token_exchange::ChallengeCache::new(),
-            refused_fresh: Mutex::new(None),
+            recovery: Recovery::default(),
         }
     }
 
@@ -315,20 +315,15 @@ impl GcpAuth {
         &self,
         scopes: &[Scope],
         google_token: &google::Secret,
-    ) -> Result<(Token, Option<token_exchange::WwwAuthenticate>), Error> {
+    ) -> Result<Token, Error> {
         let credentials = Credentials::Basic {
             username: GCP_USERNAME.to_owned(),
             password: google_token.expose().to_owned(),
         };
-        let cached_challenge = self.challenge_cache.get().await;
-        token_exchange::exchange(
-            &self.http,
-            &self.base_url,
-            scopes,
-            Some(&credentials),
-            cached_challenge.as_ref(),
-        )
-        .await
+        self.tokens
+            .challenge()
+            .exchange(&self.http, &self.base_url, scopes, Some(&credentials))
+            .await
     }
 
     /// The current Google token.
@@ -357,52 +352,32 @@ impl AuthProvider for GcpAuth {
             self.tokens
                 .get_or_fetch(key.clone(), || async {
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-                    let google_token = self.google_token().await?;
-                    let identity_refused =
-                        self.refused_fresh.lock().await.as_ref() == Some(&google_token);
-                    let exchanged = match self.exchange(&scopes, &google_token).await {
-                        // The Google token itself was refused, as when it was
-                        // revoked or Google's clock has passed it: one more
-                        // try with a fresh one. Any other failure, such as a
-                        // scope the identity cannot reach, keeps it.
-                        Err(Error::TokenEndpoint {
-                            status: http::StatusCode::UNAUTHORIZED,
-                            ..
-                        }) if !identity_refused => {
-                            self.cached_token.refuse(&google_token);
-                            let fresh = self.google_token().await?;
-                            let exchanged = self.exchange(&scopes, &fresh).await;
-                            if let Err(Error::TokenEndpoint {
-                                status: http::StatusCode::UNAUTHORIZED,
-                                ..
-                            }) = exchanged
-                            {
-                                *self.refused_fresh.lock().await = Some(fresh);
-                            }
-                            exchanged
-                        }
-                        exchanged => exchanged,
-                    };
-                    let (token, challenge) = exchanged.inspect_err(|e| {
+                    let scopes = &scopes;
+                    let exchanged = self
+                        .recovery
+                        .exchange(
+                            || self.google_token(),
+                            |google_token| async move { self.exchange(scopes, &google_token).await },
+                            judge_token_endpoint,
+                            |refused| self.cached_token.refuse(refused),
+                        )
+                        .await;
+                    let token = exchanged.inspect_err(|e| {
                         tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
                     })?;
-                    self.challenge_cache.set(challenge).await;
                     Ok(token)
                 })
                 .await
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len();
-            tracing::debug!(base_url = %self.base_url, entries, "invalidating GCP token cache");
-            self.tokens.clear();
             // The Google token stays: a refusal here is of the registry's
             // token, and the kept Google token exchanges for a new one
             // without a request to Google. An exchange that refuses the
             // Google token drops it.
-            self.challenge_cache.clear().await;
+            self.tokens.refuse(&self.base_url, &refused).await;
         })
     }
 }
@@ -700,6 +675,60 @@ mod tests {
         assert_eq!(password(&auth).await, "ya29.second");
     }
 
+    /// Requests that all used a Google token revoked while kept are all
+    /// refused, and each is sent again with the replacement one of them
+    /// fetched: one Google token request in all. Breaks if only the request
+    /// that dropped the token recovers, or each fetches its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn requests_refused_with_one_revoked_google_token_share_its_replacement() {
+        use base64::Engine;
+
+        let server = MockServer::start().await;
+        mount_v2_and_token(&server, "registry")
+            .remove(0)
+            .mount(&server)
+            .await;
+        let fresh =
+            base64::engine::general_purpose::STANDARD.encode("oauth2accesstoken:ya29.fresh");
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(header("authorization", format!("Basic {fresh}").as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "registry", "expires_in": 300})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(5)
+            .mount(&server)
+            .await;
+        let source = MockGcpTokenSource::with_tokens(vec![("ya29.fresh", None)]);
+        let auth = GcpAuth::with_api(server.uri(), crate::test_http_client(), source);
+        auth.cached_token.token.set(
+            AccessToken {
+                token: "ya29.revoked".to_owned().into(),
+                expiry: Expiry::Never,
+            },
+            Duration::MAX,
+        );
+
+        let results = tokio::join!(
+            auth.get_token(&[Scope::pull("a")]),
+            auth.get_token(&[Scope::pull("b")]),
+            auth.get_token(&[Scope::pull("c")]),
+            auth.get_token(&[Scope::pull("d")]),
+            auth.get_token(&[Scope::pull("e")]),
+        );
+
+        for result in [results.0, results.1, results.2, results.3, results.4] {
+            result.unwrap();
+        }
+        assert_eq!(password(&auth).await, "ya29.fresh");
+    }
+
     /// A refused identity holds back only the token refused: one refreshed
     /// at expiry may again be dropped for a fresh one, as when the
     /// identity's access arrived since. Breaks if one double refusal stops
@@ -808,15 +837,23 @@ mod tests {
         mount_user_token(&server, 1).await;
         let host = user_host(&server);
         let shared = SharedGoogleToken::default();
-        let us = adc_auth("https://us-docker.pkg.dev", &host, &shared).await;
-        let europe = adc_auth("https://europe-docker.pkg.dev", &host, &shared).await;
+        for mock in mount_v2_and_token(&server, "registry-token") {
+            mock.mount(&server).await;
+        }
+        let us = adc_auth(&server.uri(), &host, &shared).await;
+        let europe = adc_auth(&server.uri(), &host, &shared).await;
 
+        let scopes = [Scope::pull("repo")];
+        let refused = us.get_token(&scopes).await.unwrap();
+        europe.get_token(&scopes).await.unwrap();
         assert_eq!(password(&us).await, "ya29.user");
         assert_eq!(password(&europe).await, "ya29.user");
-        us.invalidate().await;
-        europe.invalidate().await;
+        us.refuse(refused).await;
         assert_eq!(password(&us).await, "ya29.user");
         assert_eq!(password(&europe).await, "ya29.user");
+        // The refused registry token is exchanged again with the kept
+        // Google token.
+        us.get_token(&scopes).await.unwrap();
     }
 
     /// A failed load is kept for the run, so a second registry fails at
@@ -953,13 +990,14 @@ mod tests {
         .unwrap()
     }
 
-    /// Invalidation clears the registry's token and challenge, so both are
-    /// fetched again. Breaks if either is kept.
+    /// A refusal of the registry's token clears the token and challenge, so
+    /// both are fetched again, and one of another token clears neither.
+    /// Breaks if either is kept after the refusal, or dropped without it.
     #[tokio::test]
-    async fn invalidation_clears_the_registry_caches() {
+    async fn refusal_clears_the_registry_caches() {
         let server = MockServer::start().await;
 
-        // /v2/ hit twice: once before invalidation, once after.
+        // /v2/ hit twice: once before the refusal, once after.
         Mock::given(method("GET"))
             .and(path("/v2/"))
             .respond_with(ResponseTemplate::new(401).insert_header(
@@ -987,8 +1025,13 @@ mod tests {
             crate::test_http_client(),
             MockGcpTokenSource::succeeding("ya29.test"),
         );
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        // A refusal of some other token keeps both caches.
+        auth.refuse(Token::new("other")).await;
+        assert!(auth.tokens.challenge().get().await.is_some());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-        auth.invalidate().await;
+        auth.refuse(refused).await;
+        assert!(auth.tokens.challenge().get().await.is_none());
         // The challenge and Bearer token are fetched again: /v2/ is pinged
         // a second time.
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();

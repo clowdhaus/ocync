@@ -198,7 +198,7 @@ pub struct EcrAuth {
     /// The ECR registry hostname.
     hostname: String,
     /// Cached ECR token with TTL-based refresh.
-    credential_cache: CredentialCache<Token>,
+    credential_cache: CredentialCache<Token, Error>,
     /// ECR API implementation.
     api: Box<dyn EcrApi>,
 }
@@ -259,7 +259,7 @@ impl EcrAuth {
 
     async fn get_token_inner(&self) -> Result<Token, Error> {
         self.credential_cache
-            .get_or_refresh(async {
+            .get_or_refresh_sharing_failure(async {
                 tracing::debug!(registry = %self.hostname, "token cache miss, calling GetAuthorizationToken");
                 let response = self.api.get_authorization_token().await.map_err(|e| {
                     tracing::warn!(registry = %self.hostname, error = %e, "ECR GetAuthorizationToken failed");
@@ -289,10 +289,12 @@ impl AuthProvider for EcrAuth {
         Box::pin(async move { self.get_token_inner().await })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            tracing::debug!(registry = %self.hostname, "invalidating cached ECR token");
-            self.credential_cache.clear();
+            let refusal = self
+                .credential_cache
+                .refuse(refused, Token::sends_same_header);
+            tracing::debug!(registry = %self.hostname, ?refusal, "registry refused a token");
         })
     }
 }
@@ -301,6 +303,7 @@ impl AuthProvider for EcrAuth {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::sync::Mutex;
 
@@ -338,9 +341,17 @@ mod tests {
     /// exactly N responses for N expected fetches.
     struct MockEcrApi {
         responses: Mutex<VecDeque<Option<EcrTokenResponse>>>,
+        /// How many times `get_authorization_token` was called.
+        calls: Arc<AtomicUsize>,
     }
 
     impl MockEcrApi {
+        /// A handle on the call count, usable after the mock has moved
+        /// into the provider.
+        fn calls(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.calls)
+        }
+
         /// Create a mock that returns the given encoded token on every call.
         fn succeeding(encoded_token: &str) -> Self {
             let response = EcrTokenResponse {
@@ -350,6 +361,7 @@ mod tests {
             let responses = std::iter::repeat_n(Some(response), 10).collect();
             Self {
                 responses: Mutex::new(responses),
+                calls: Arc::default(),
             }
         }
 
@@ -357,6 +369,7 @@ mod tests {
         fn failing() -> Self {
             Self {
                 responses: Mutex::new(VecDeque::new()),
+                calls: Arc::default(),
             }
         }
 
@@ -373,6 +386,7 @@ mod tests {
                 .collect();
             Self {
                 responses: Mutex::new(responses),
+                calls: Arc::default(),
             }
         }
 
@@ -380,6 +394,7 @@ mod tests {
         fn with_responses(responses: Vec<Option<EcrTokenResponse>>) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
+                calls: Arc::default(),
             }
         }
     }
@@ -389,6 +404,9 @@ mod tests {
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
             Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Yield so callers that ask meanwhile find the call in flight.
+                tokio::task::yield_now().await;
                 let mut responses = self.responses.lock().await;
                 match responses.pop_front() {
                     Some(Some(response)) => Ok(response),
@@ -572,7 +590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_invalidation_forces_refetch() {
+    async fn auth_refusal_forces_refetch() {
         let encoded1 = BASE64.encode("AWS:first-token");
         let encoded2 = BASE64.encode("AWS:second-token");
         let auth = EcrAuth::with_api(
@@ -583,10 +601,69 @@ mod tests {
         let t1 = auth.get_token(&[]).await.unwrap();
         assert_eq!(t1.value(), encoded1);
 
-        auth.invalidate().await;
+        auth.refuse(t1).await;
 
         let t2 = auth.get_token(&[]).await.unwrap();
         assert_eq!(t2.value(), encoded2);
+    }
+
+    /// N requests that carry one stale token are each refused, some before
+    /// the refresh lands and some after, and all cost one
+    /// `GetAuthorizationToken` call. Breaks if a refusal for a token that
+    /// has been replaced drops the replacement, or one that arrives while
+    /// the refresh runs starts another.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refusals_of_one_stale_token_cost_one_refresh() {
+        let fresh = BASE64.encode("AWS:fresh");
+        let api = MockEcrApi::with_tokens(vec![Some(fresh.clone())]);
+        let calls = api.calls();
+        let auth = EcrAuth::with_api(TEST_HOST, api);
+        let stale =
+            Token::with_ttl("stale", Duration::from_secs(10)).with_scheme(AuthScheme::Basic);
+        auth.set_cached_token(stale.clone());
+
+        let refused_after = |yields: usize| {
+            let (auth, stale) = (&auth, &stale);
+            async move {
+                for _ in 0..yields {
+                    tokio::task::yield_now().await;
+                }
+                auth.refuse(stale.clone()).await;
+                auth.get_token(&[]).await.unwrap()
+            }
+        };
+        let tokens = tokio::join!(
+            refused_after(0),
+            refused_after(0),
+            refused_after(1),
+            refused_after(5),
+            refused_after(5),
+        );
+
+        for token in [&tokens.0, &tokens.1, &tokens.2, &tokens.3, &tokens.4] {
+            assert_eq!(token.value(), fresh);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Callers waiting on a refresh that fails share its error. Breaks if
+    /// each waiter repeats the failed call against the same endpoint.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiters_on_a_failed_refresh_share_its_error() {
+        let api = MockEcrApi::failing();
+        let calls = api.calls();
+        let auth = EcrAuth::with_api(TEST_HOST, api);
+
+        let (first, second, third) = tokio::join!(
+            auth.get_token(&[]),
+            auth.get_token(&[]),
+            auth.get_token(&[]),
+        );
+
+        for result in [first, second, third] {
+            assert!(result.unwrap_err().to_string().contains("mock"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

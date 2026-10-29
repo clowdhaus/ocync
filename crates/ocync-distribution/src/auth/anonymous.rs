@@ -5,7 +5,6 @@ use std::future::Future;
 use std::pin::Pin;
 
 use super::token_cache::TokenCache;
-use super::token_exchange;
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 
@@ -22,8 +21,6 @@ pub struct AnonymousAuth {
     http: reqwest::Client,
     /// Per-scope coalescing token cache.
     tokens: TokenCache,
-    /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
-    challenge_cache: token_exchange::ChallengeCache,
 }
 
 impl fmt::Debug for AnonymousAuth {
@@ -42,7 +39,6 @@ impl AnonymousAuth {
             base_url: registry_origin(registry),
             http,
             tokens: TokenCache::new(),
-            challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 }
@@ -62,32 +58,24 @@ impl AuthProvider for AnonymousAuth {
             self.tokens
                 .get_or_fetch(key.clone(), || async {
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-                    let cached_challenge = self.challenge_cache.get().await;
-                    let (token, challenge) = token_exchange::exchange(
-                        &self.http,
-                        &self.base_url,
-                        &scopes,
-                        None,
-                        cached_challenge.as_ref(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                        e
-                    })?;
-                    self.challenge_cache.set(challenge).await;
+                    let token = self
+                        .tokens
+                        .challenge()
+                        .exchange(&self.http, &self.base_url, &scopes, None)
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                            e
+                        })?;
                     Ok(token)
                 })
                 .await
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len();
-            tracing::debug!(base_url = %self.base_url, entries, "invalidating token cache");
-            self.tokens.clear();
-            self.challenge_cache.clear().await;
+            self.tokens.refuse(&self.base_url, &refused).await;
         })
     }
 }
@@ -165,7 +153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anonymous_auth_invalidate_clears_cache() {
+    async fn anonymous_auth_refusal_clears_cache() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -189,9 +177,52 @@ mod tests {
             .await;
 
         let auth = AnonymousAuth::new(&server.uri().parse().unwrap(), crate::test_http_client());
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        // A refusal of some other token keeps both caches: the one `/v2/`
+        // and token request so far serve this call too.
+        auth.refuse(Token::new("other")).await;
+        assert!(auth.tokens.challenge().get().await.is_some());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-        auth.invalidate().await;
+        auth.refuse(refused).await;
+        assert!(auth.tokens.challenge().get().await.is_none());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+    }
+
+    /// A refusal that clears the challenge while another scope's exchange,
+    /// begun with it, is in flight: the exchange lands without putting the
+    /// challenge back. Breaks if a landing restores a cleared challenge.
+    #[tokio::test]
+    async fn a_refusal_during_an_exchange_leaves_the_challenge_cleared() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(r#"Bearer realm="{}/token""#, server.uri()),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "tok", "expires_in": 3600}))
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let auth = AnonymousAuth::new(&server.uri().parse().unwrap(), crate::test_http_client());
+        let refused = auth.get_token(&[Scope::pull("a")]).await.unwrap();
+        assert!(auth.tokens.challenge().get().await.is_some());
+
+        // The exchange for `b` starts from the cached challenge and is
+        // waiting on the token endpoint when the refusal clears it.
+        let (exchanged, ()) =
+            tokio::join!(auth.get_token(&[Scope::pull("b")]), auth.refuse(refused));
+
+        exchanged.unwrap();
+        assert!(auth.tokens.challenge().get().await.is_none());
     }
 
     #[tokio::test]

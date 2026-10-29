@@ -27,29 +27,73 @@ use crate::scheme::Scheme;
 ///
 /// Stores the parsed realm + service from the first `/v2/` ping so
 /// subsequent token exchanges skip the ping entirely.
-pub(crate) struct ChallengeCache(Mutex<Option<WwwAuthenticate>>);
+///
+/// A challenge learned by an exchange that started from the cached one, and
+/// began before the cache was last cleared, is not stored: the clearing
+/// judged the challenge that exchange started from. An exchange that pinged
+/// `/v2/` for its own keeps what it learned.
+#[derive(Debug, Default)]
+pub(crate) struct ChallengeCache(Mutex<Cached>);
+
+/// What a [`ChallengeCache`] holds.
+#[derive(Debug, Default)]
+struct Cached {
+    challenge: Option<WwwAuthenticate>,
+    /// How many times the cache has been cleared.
+    clears: u64,
+}
 
 impl ChallengeCache {
-    /// Create an empty challenge cache.
-    pub(crate) fn new() -> Self {
-        Self(Mutex::new(None))
-    }
-
-    /// Read the cached challenge (clones to release the lock before await).
-    pub(crate) async fn get(&self) -> Option<WwwAuthenticate> {
-        self.0.lock().await.clone()
-    }
-
-    /// Store a challenge if one was returned.
-    pub(crate) async fn set(&self, challenge: Option<WwwAuthenticate>) {
-        if let Some(ch) = challenge {
-            *self.0.lock().await = Some(ch);
+    /// Exchange `credentials` for a token for `scopes`, skipping the ping
+    /// when a challenge is cached, and keep the challenge the exchange
+    /// learned unless it started from the cached one and the cache was
+    /// cleared while it ran.
+    pub(crate) async fn exchange(
+        &self,
+        http: &reqwest::Client,
+        base_url: &str,
+        scopes: &[Scope],
+        credentials: Option<&Credentials>,
+    ) -> Result<Token, Error> {
+        let (started_from_cache, clears) = {
+            let cached = self.0.lock().await;
+            (cached.challenge.clone(), cached.clears)
+        };
+        let (token, learned) = exchange(
+            http,
+            base_url,
+            scopes,
+            credentials,
+            started_from_cache.as_ref(),
+        )
+        .await?;
+        if let Some(challenge) = learned {
+            let mut cached = self.0.lock().await;
+            if started_from_cache.is_none() || cached.clears == clears {
+                cached.challenge = Some(challenge);
+            }
         }
+        Ok(token)
     }
 
-    /// Clear the cached challenge.
+    /// The cached challenge (test helper).
+    #[cfg(test)]
+    pub(crate) async fn get(&self) -> Option<WwwAuthenticate> {
+        self.0.lock().await.challenge.clone()
+    }
+
+    /// Cache `challenge` (test helper).
+    #[cfg(test)]
+    pub(crate) async fn set(&self, challenge: WwwAuthenticate) {
+        self.0.lock().await.challenge = Some(challenge);
+    }
+
+    /// Clear the cached challenge, and so discard what exchanges that began
+    /// earlier learn.
     pub(crate) async fn clear(&self) {
-        *self.0.lock().await = None;
+        let mut cached = self.0.lock().await;
+        cached.challenge = None;
+        cached.clears += 1;
     }
 }
 
@@ -1527,5 +1571,65 @@ mod tests {
         let realm = reqwest::Url::parse("https://auth.quay.io/token").unwrap();
         let registry = reqwest::Url::parse("https://quay.io").unwrap();
         assert_realm_rejected(validate_realm_url(&realm, &registry), "does not match");
+    }
+
+    /// An exchange that started from the cached challenge, and was cleared
+    /// while it ran, does not store the challenge it learned, and one that
+    /// pinged `/v2/` itself does. Breaks if a landing puts back the
+    /// challenge a clearing judged, or an exchange that never used it
+    /// discards what it learned.
+    #[tokio::test]
+    async fn only_an_exchange_from_a_cleared_challenge_discards_what_it_learned() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for from_cache in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/"))
+                .respond_with(ResponseTemplate::new(401).insert_header(
+                    "WWW-Authenticate",
+                    format!(r#"Bearer realm="{}/token",service="test""#, server.uri()),
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"token": "tok", "expires_in": 300}))
+                        .set_delay(Duration::from_millis(300)),
+                )
+                .mount(&server)
+                .await;
+            let http = crate::test_http_client();
+            let uri = server.uri();
+            let cache = ChallengeCache::default();
+            if from_cache {
+                cache
+                    .set(WwwAuthenticate {
+                        realm: format!("{uri}/token"),
+                        service: Some("test".to_owned()),
+                    })
+                    .await;
+            }
+            let scopes = [Scope::pull("repo")];
+
+            // The clearing lands once the exchange has sent its first
+            // request and waits on the delayed token endpoint.
+            let (token, ()) = tokio::join!(cache.exchange(&http, &uri, &scopes, None), async {
+                while server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                cache.clear().await;
+            },);
+            token.unwrap();
+            assert_eq!(cache.get().await.is_some(), !from_cache, "{from_cache}");
+        }
     }
 }

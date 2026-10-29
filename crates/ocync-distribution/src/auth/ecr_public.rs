@@ -25,8 +25,8 @@ use serde::Deserialize;
 
 use super::detect::ECR_PUBLIC_HOST;
 use super::ecr::{AuthorizationData, AuthorizationToken, EcrApi, EcrTokenResponse};
+use super::recovery::{Recovery, judge_token_endpoint};
 use super::token_cache::TokenCache;
-use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error};
@@ -138,11 +138,11 @@ pub struct EcrPublicAuth {
     /// ECR Public API for credential refresh.
     api: Box<dyn EcrApi>,
     /// Cached registry credentials (username/password) with TTL-based refresh.
-    credential_cache: CredentialCache<Credentials>,
+    credential_cache: CredentialCache<Credentials, Error>,
     /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
-    /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
-    challenge_cache: token_exchange::ChallengeCache,
+    /// What the token endpoint's refusals of the credentials come to.
+    recovery: Recovery<Credentials>,
 }
 
 impl fmt::Debug for EcrPublicAuth {
@@ -179,7 +179,7 @@ impl EcrPublicAuth {
             api: Box::new(AwsEcrPublicApi { client }),
             credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
-            challenge_cache: token_exchange::ChallengeCache::new(),
+            recovery: Recovery::default(),
         })
     }
 
@@ -196,14 +196,23 @@ impl EcrPublicAuth {
             api: Box::new(api),
             credential_cache: CredentialCache::new(),
             tokens: TokenCache::new(),
-            challenge_cache: token_exchange::ChallengeCache::new(),
+            recovery: Recovery::default(),
         }
+    }
+
+    /// Exchange `credentials` for a registry token for `scopes`. A token
+    /// endpoint that answers 401 has refused the credentials.
+    async fn exchange(&self, scopes: &[Scope], credentials: &Credentials) -> Result<Token, Error> {
+        self.tokens
+            .challenge()
+            .exchange(&self.http, &self.base_url, scopes, Some(credentials))
+            .await
     }
 
     /// Get or refresh registry credentials from `GetAuthorizationToken`.
     async fn ensure_credentials(&self) -> Result<Credentials, Error> {
         self.credential_cache
-            .get_or_refresh(async {
+            .get_or_refresh_sharing_failure(async {
                 tracing::debug!("ECR Public registry credentials expired or missing, refreshing");
                 let response = self.api.get_authorization_token().await.map_err(|e| {
                     tracing::warn!(error = %e, "ECR Public GetAuthorizationToken failed");
@@ -235,37 +244,34 @@ impl AuthProvider for EcrPublicAuth {
             let key = scopes_cache_key(&scopes);
             self.tokens
                 .get_or_fetch(key.clone(), || async {
-                    // Ensure registry credentials are fresh before token exchange.
-                    let credentials = self.ensure_credentials().await?;
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-                    let cached_challenge = self.challenge_cache.get().await;
-                    let (token, challenge) = token_exchange::exchange(
-                        &self.http,
-                        &self.base_url,
-                        &scopes,
-                        Some(&credentials),
-                        cached_challenge.as_ref(),
-                    )
-                    .await
-                    .map_err(|e| {
+                    let scopes = &scopes;
+                    let exchanged = self
+                        .recovery
+                        .exchange(
+                            || self.ensure_credentials(),
+                            |credentials| async move { self.exchange(scopes, &credentials).await },
+                            judge_token_endpoint,
+                            |refused| {
+                                self.credential_cache
+                                    .refuse(refused.clone(), Credentials::eq);
+                            },
+                        )
+                        .await;
+                    let token = exchanged.inspect_err(|e| {
                         tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                        e
                     })?;
-                    self.challenge_cache.set(challenge).await;
                     Ok(token)
                 })
                 .await
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len();
-            tracing::debug!(base_url = %self.base_url, entries, "invalidating ECR Public token cache");
-            self.tokens.clear();
-            self.challenge_cache.clear().await;
-            // Also clear registry credentials so they are re-fetched on next use.
-            self.credential_cache.clear();
+            // The credentials stay: only the token exchange that uses them
+            // judges them.
+            self.tokens.refuse(&self.base_url, &refused).await;
         })
     }
 }
@@ -273,14 +279,17 @@ impl AuthProvider for EcrPublicAuth {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use tokio::sync::Mutex;
     use wiremock::MockServer;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, ResponseTemplate};
 
+    use super::super::recovery::Judgment;
     use super::*;
 
     /// A throttle that outlasts its retries is not an auth error, and an
@@ -329,13 +338,22 @@ mod tests {
     /// Mock ECR API that returns pre-configured responses in order.
     struct MockEcrApi {
         responses: Mutex<VecDeque<EcrTokenResponse>>,
+        /// How many times `get_authorization_token` was called.
+        calls: Arc<AtomicUsize>,
     }
 
     impl MockEcrApi {
         fn with_responses(responses: Vec<EcrTokenResponse>) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
+                calls: Arc::default(),
             }
+        }
+
+        /// A handle on the call count, usable after the mock has moved
+        /// into the provider.
+        fn calls(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.calls)
         }
 
         fn succeeding(encoded_token: &str) -> Self {
@@ -352,6 +370,9 @@ mod tests {
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
             Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Yield so callers that ask meanwhile find the call in flight.
+                tokio::task::yield_now().await;
                 self.responses.lock().await.pop_front().ok_or_else(|| {
                     Error::cloud_credentials(
                         ECR_PUBLIC_HOST,
@@ -477,13 +498,13 @@ mod tests {
         );
 
         // First call fetches registry credentials (TTL=1s).
-        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
 
         // Wait for registry credentials to expire.
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Clear Bearer token cache so the next call re-checks registry credentials.
-        auth.invalidate().await;
+        auth.refuse(refused).await;
 
         // Second call should refresh registry credentials from the mock queue.
         // If it doesn't, the expired credentials will still work for token
@@ -492,11 +513,15 @@ mod tests {
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
     }
 
+    /// A refusal of the registry token drops the token and the challenge
+    /// and keeps the cloud credentials, so the next token costs a `/v2/`
+    /// ping but no `GetAuthorizationToken`. Breaks if a registry 401 judges
+    /// the cloud credentials, or a refusal of another token drops anything.
     #[tokio::test]
-    async fn invalidation_clears_all_caches() {
+    async fn a_registry_refusal_keeps_the_cloud_credentials() {
         let server = MockServer::start().await;
 
-        // /v2/ hit twice: once before invalidation, once after.
+        // /v2/ hit twice: once before the refusal, once after.
         Mock::given(method("GET"))
             .and(path("/v2/"))
             .respond_with(ResponseTemplate::new(401).insert_header(
@@ -520,15 +545,201 @@ mod tests {
             .await;
 
         let encoded = BASE64.encode("AWS:test");
-        let auth = EcrPublicAuth::with_api(
-            server.uri(),
-            crate::test_http_client(),
-            MockEcrApi::succeeding(&encoded),
+        let api = MockEcrApi::succeeding(&encoded);
+        let calls = api.calls();
+        let auth = EcrPublicAuth::with_api(server.uri(), crate::test_http_client(), api);
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        // A refusal of some other token keeps the caches: no second `/v2/`
+        // ping.
+        auth.refuse(Token::new("other")).await;
+        assert!(auth.tokens.challenge().get().await.is_some());
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        auth.refuse(refused).await;
+        assert!(auth.tokens.challenge().get().await.is_none());
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Mount the `/v2/` challenge, and a `/token` endpoint that accepts the
+    /// credentials whose password is `old` for one exchange and refuses them
+    /// after, and always accepts those whose password is `new`.
+    async fn mount_revoked_credentials(server: &MockServer, old: &str, new: &str) {
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="public.ecr.aws""#,
+                    server.uri()
+                ),
+            ))
+            .mount(server)
+            .await;
+        let basic = |password: &str| format!("Basic {}", BASE64.encode(format!("AWS:{password}")));
+        let accepted = ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"token": "fresh", "expires_in": 300}));
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(header("authorization", basic(old).as_str()))
+            .respond_with(accepted.clone())
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(header("authorization", basic(old).as_str()))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(header("authorization", basic(new).as_str()))
+            .respond_with(accepted)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    /// An `EcrTokenResponse` for the password `password`.
+    fn response_for(password: &str) -> EcrTokenResponse {
+        EcrTokenResponse {
+            encoded_token: BASE64.encode(format!("AWS:{password}")),
+            expires_in: None,
+        }
+    }
+
+    /// Credentials revoked while kept and still fresh are refused by the
+    /// token endpoint, dropped, and replaced within the one request: two
+    /// `GetAuthorizationToken` calls and three token exchanges in all.
+    /// Breaks if the refusal is not recovered from, or the credentials are
+    /// kept.
+    #[tokio::test]
+    async fn revoked_credentials_are_replaced_within_the_request() {
+        let server = MockServer::start().await;
+        mount_revoked_credentials(&server, "old", "new").await;
+        let api = MockEcrApi::with_responses(vec![response_for("old"), response_for("new")]);
+        let calls = api.calls();
+        let auth = EcrPublicAuth::with_api(server.uri(), crate::test_http_client(), api);
+
+        auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
+        auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Mount the `/v2/` challenge, and a `/token` endpoint that accepts the
+    /// credentials whose password is in `accepted` and refuses all others,
+    /// `refusals` times in all.
+    async fn mount_token_endpoint(server: &MockServer, accepted: &[&str], refusals: u64) {
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "WWW-Authenticate",
+                format!(
+                    r#"Bearer realm="{}/token",service="public.ecr.aws""#,
+                    server.uri()
+                ),
+            ))
+            .mount(server)
+            .await;
+        for password in accepted {
+            Mock::given(method("GET"))
+                .and(path("/token"))
+                .and(header(
+                    "authorization",
+                    format!("Basic {}", BASE64.encode(format!("AWS:{password}"))).as_str(),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"token": "fresh", "expires_in": 300})),
+                )
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(refusals)
+            .mount(server)
+            .await;
+    }
+
+    /// Requests that all used credentials revoked while kept are all
+    /// refused, and each is sent again with the replacement one of them
+    /// fetched: one `GetAuthorizationToken` call in all. Breaks if only the
+    /// request that dropped the credentials recovers, or each fetches its
+    /// own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn requests_refused_with_one_revoked_credential_share_its_replacement() {
+        let server = MockServer::start().await;
+        mount_token_endpoint(&server, &["new"], 5).await;
+        let api = MockEcrApi::with_responses(vec![response_for("new")]);
+        let calls = api.calls();
+        let auth = EcrPublicAuth::with_api(server.uri(), crate::test_http_client(), api);
+        auth.credential_cache.set(
+            Credentials::Basic {
+                username: "AWS".to_owned(),
+                password: "old".to_owned(),
+            },
+            Duration::from_secs(3600),
         );
-        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-        auth.invalidate().await;
-        // After invalidation: registry creds re-fetched, challenge cache cleared,
-        // Bearer cache cleared. /v2/ is pinged again.
-        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+
+        let results = tokio::join!(
+            auth.get_token(&[Scope::pull("a")]),
+            auth.get_token(&[Scope::pull("b")]),
+            auth.get_token(&[Scope::pull("c")]),
+            auth.get_token(&[Scope::pull("d")]),
+            auth.get_token(&[Scope::pull("e")]),
+        );
+
+        for result in [results.0, results.1, results.2, results.3, results.4] {
+            result.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Credentials the token endpoint refuses although they were fetched
+    /// for the retry cost one recovery: two `GetAuthorizationToken` calls
+    /// and four exchanges for three scopes, all failing. Breaks if the
+    /// retry is retried, or each later scope signs in again.
+    #[tokio::test]
+    async fn refused_replacement_credentials_cost_one_recovery() {
+        let server = MockServer::start().await;
+        mount_token_endpoint(&server, &[], 4).await;
+        let api =
+            MockEcrApi::with_responses(["one", "two", "three", "four"].map(response_for).into());
+        let calls = api.calls();
+        let auth = EcrPublicAuth::with_api(server.uri(), crate::test_http_client(), api);
+
+        for repo in ["a", "b", "c"] {
+            let err = auth.get_token(&[Scope::pull(repo)]).await.unwrap_err();
+            assert_eq!(judge_token_endpoint(&err), Judgment::Refused, "{err:?}");
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Callers waiting on a refresh that fails share its error, across
+    /// scopes. Breaks if each waiter repeats the failed call against the
+    /// same endpoint.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiters_on_a_failed_refresh_share_its_error() {
+        let api = MockEcrApi::with_responses(vec![]);
+        let calls = api.calls();
+        let auth =
+            EcrPublicAuth::with_api("https://public.ecr.aws", crate::test_http_client(), api);
+
+        let (first, second, third) = tokio::join!(
+            auth.get_token(&[Scope::pull("repo-a")]),
+            auth.get_token(&[Scope::pull("repo-b")]),
+            auth.get_token(&[Scope::pull("repo-c")]),
+        );
+
+        for result in [first, second, third] {
+            assert!(result.unwrap_err().to_string().contains("mock"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -11,7 +11,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 
 use super::token_cache::TokenCache;
-use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 
@@ -339,8 +338,6 @@ pub struct DockerConfigAuth {
     credentials: Option<Credentials>,
     /// Per-scope coalescing token cache.
     tokens: TokenCache,
-    /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
-    challenge_cache: token_exchange::ChallengeCache,
 }
 
 impl fmt::Debug for DockerConfigAuth {
@@ -376,7 +373,6 @@ impl DockerConfigAuth {
             http,
             credentials,
             tokens: TokenCache::new(),
-            challenge_cache: token_exchange::ChallengeCache::new(),
         })
     }
 
@@ -392,7 +388,6 @@ impl DockerConfigAuth {
             http,
             credentials,
             tokens: TokenCache::new(),
-            challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 }
@@ -412,32 +407,24 @@ impl AuthProvider for DockerConfigAuth {
             self.tokens
                 .get_or_fetch(key.clone(), || async {
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-                    let cached_challenge = self.challenge_cache.get().await;
-                    let (token, challenge) = token_exchange::exchange(
-                        &self.http,
-                        &self.base_url,
-                        &scopes,
-                        self.credentials.as_ref(),
-                        cached_challenge.as_ref(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
-                        e
-                    })?;
-                    self.challenge_cache.set(challenge).await;
+                    let token = self
+                        .tokens
+                        .challenge()
+                        .exchange(&self.http, &self.base_url, &scopes, self.credentials.as_ref())
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
+                            e
+                        })?;
                     Ok(token)
                 })
                 .await
         })
     }
 
-    fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len();
-            tracing::debug!(base_url = %self.base_url, entries, "invalidating token cache");
-            self.tokens.clear();
-            self.challenge_cache.clear().await;
+            self.tokens.refuse(&self.base_url, &refused).await;
         })
     }
 }
@@ -893,7 +880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docker_config_auth_invalidate_clears_cache() {
+    async fn docker_config_auth_refusal_clears_cache() {
         let mock = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -917,8 +904,13 @@ mod tests {
             .await;
 
         let auth = DockerConfigAuth::with_base_url(mock.uri(), crate::test_http_client(), None);
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        // A refusal of some other token keeps both caches.
+        auth.refuse(Token::new("other")).await;
+        assert!(auth.tokens.challenge().get().await.is_some());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-        auth.invalidate().await;
+        auth.refuse(refused).await;
+        assert!(auth.tokens.challenge().get().await.is_none());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         // expect(2) proves cache was cleared.
     }

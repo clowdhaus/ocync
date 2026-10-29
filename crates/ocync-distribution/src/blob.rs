@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::aimd::RegistryAction;
 use crate::auth::Scope;
 use crate::auth::detect::{ProviderKind, detect_provider_kind};
-use crate::client::{RegistryClient, build_url, report_permit};
+use crate::client::{RegistryClient, auth_headers, build_url, report_permit};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
@@ -336,7 +336,8 @@ impl RegistryClient {
         // drops the token and is returned as `UploadTokenRefused`, for the
         // caller to send the upload again under a new one.
         let permit = self.aimd.acquire(RegistryAction::BlobUploadComplete).await;
-        let headers = self.auth_headers(&scopes).await?;
+        let sent = self.auth_token(&scopes).await?;
+        let headers = auth_headers(sent.as_ref())?;
         let digest_str = expected_digest.to_string();
         let body = reqwest::Body::wrap_stream(stream);
         let result = self
@@ -357,7 +358,7 @@ impl RegistryClient {
                 status: StatusCode::UNAUTHORIZED,
                 message,
             }) => {
-                self.invalidate_auth().await;
+                self.refuse_auth(sent).await;
                 Err(Error::UploadTokenRefused { message })
             }
             Err(error) => Err(error),
