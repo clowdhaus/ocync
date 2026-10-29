@@ -1,5 +1,6 @@
 //! Docker `config.json` credential resolution and helper execution.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -11,14 +12,21 @@ use serde::Deserialize;
 use super::Credentials;
 use crate::error::Error;
 
+/// The server address the Docker CLI keys Docker Hub credentials under.
+const DOCKER_HUB_SERVER: &str = "https://index.docker.io/v1/";
+
 /// Docker Hub hostnames that all resolve to the same credential entry.
 const DOCKER_HUB_ALIASES: &[&str] = &[
     "docker.io",
     "index.docker.io",
     "registry-1.docker.io",
-    "https://index.docker.io/v1/",
+    DOCKER_HUB_SERVER,
     "https://index.docker.io/v2/",
 ];
+
+/// What a credential helper prints when it holds nothing for a server, per
+/// the docker-credential-helpers protocol.
+const CREDENTIALS_NOT_FOUND: &str = "credentials not found in native keychain";
 
 /// Deserialized `~/.docker/config.json`.
 #[derive(Debug, Deserialize, Default)]
@@ -76,91 +84,69 @@ impl DockerConfig {
     }
 }
 
-/// Resolve credentials for a registry from a Docker config.
-///
-/// Checks `auths` first (static credentials), then `credHelpers`, then the
-/// default `credsStore`. Handles Docker Hub hostname normalization.
+/// Resolve credentials for a registry from a Docker config, as the Docker
+/// CLI does: a credential helper, the registry's own `credHelpers` entry or
+/// else the default `credsStore`, answers in place of `auths`, so a stale
+/// `auths` entry left by `docker login` never shadows it. A helper holding
+/// nothing for the registry means none (anonymous), and any other helper
+/// failure is an error. Handles Docker Hub hostname normalization.
 pub async fn resolve_from_docker_config(
     config: &DockerConfig,
     registry: &str,
 ) -> Result<Option<Credentials>, Error> {
-    // Try static auths first.
-    if let Some(creds) = lookup_auths(config, registry)? {
-        return Ok(Some(creds));
+    match helper_for(config, registry) {
+        Some(helper) => run_credential_helper(helper, server_address(registry)).await,
+        None => lookup_auths(config, registry),
     }
+}
 
-    // Try credential helpers.
-    if let Some(helper) = lookup_cred_helper(config, registry) {
-        let creds = run_credential_helper(&helper, registry).await?;
-        return Ok(Some(creds));
+/// The helper Docker asks for `registry`: its `credHelpers` entry, else
+/// the default `credsStore`. An empty name is no helper, and an empty
+/// `credHelpers` entry also turns off the default store for its registry.
+fn helper_for<'a>(config: &'a DockerConfig, registry: &str) -> Option<&'a str> {
+    entry_keys(registry)
+        .find_map(|key| config.cred_helpers.get(key.as_ref()))
+        .or(config.creds_store.as_ref())
+        .map(String::as_str)
+        .filter(|helper| !helper.is_empty())
+}
+
+/// The address a helper is asked about: Docker keys Docker Hub under its
+/// index server, and every other registry under its host.
+fn server_address(registry: &str) -> &str {
+    if is_docker_hub(registry) {
+        DOCKER_HUB_SERVER
+    } else {
+        registry
     }
+}
 
-    // Try default credential store.
-    if let Some(ref store) = config.creds_store {
-        match run_credential_helper(store, registry).await {
-            Ok(creds) => return Ok(Some(creds)),
-            Err(_) => {
-                // Default store may not have creds for this registry -- not an error.
-                tracing::debug!(
-                    registry,
-                    store,
-                    "default credential store had no credentials"
-                );
-            }
-        }
-    }
-
-    Ok(None)
+/// The keys a registry's entry may sit under in a Docker config map, most
+/// specific first: the host, then the host with a scheme, or every alias
+/// for a Docker Hub host.
+fn entry_keys(registry: &str) -> impl Iterator<Item = Cow<'_, str>> {
+    let rest: Vec<Cow<'_, str>> = if is_docker_hub(registry) {
+        DOCKER_HUB_ALIASES
+            .iter()
+            .filter(|alias| **alias != registry)
+            .map(|alias| Cow::Borrowed(*alias))
+            .collect()
+    } else {
+        vec![Cow::Owned(format!("https://{registry}"))]
+    };
+    std::iter::once(Cow::Borrowed(registry)).chain(rest)
 }
 
 /// Look up static credentials from the `auths` map.
 fn lookup_auths(config: &DockerConfig, registry: &str) -> Result<Option<Credentials>, Error> {
-    // Direct match.
-    if let Some(entry) = config.auths.get(registry) {
-        if let Some(creds) = entry_to_credentials(entry, registry)? {
-            return Ok(Some(creds));
-        }
-    }
-
-    // Try with/without https:// prefix.
-    let with_scheme = format!("https://{registry}");
-    if let Some(entry) = config.auths.get(&with_scheme) {
-        if let Some(creds) = entry_to_credentials(entry, registry)? {
-            return Ok(Some(creds));
-        }
-    }
-
-    // Docker Hub aliases -- if the requested registry is any Docker Hub alias,
-    // try all other aliases.
-    if is_docker_hub(registry) {
-        for alias in DOCKER_HUB_ALIASES {
-            if let Some(entry) = config.auths.get(*alias) {
-                if let Some(creds) = entry_to_credentials(entry, registry)? {
-                    return Ok(Some(creds));
-                }
+    for key in entry_keys(registry) {
+        if let Some(entry) = config.auths.get(key.as_ref()) {
+            if let Some(creds) = entry_to_credentials(entry, registry)? {
+                return Ok(Some(creds));
             }
         }
     }
-
     Ok(None)
-}
-
-/// Look up a credential helper for the given registry.
-fn lookup_cred_helper(config: &DockerConfig, registry: &str) -> Option<String> {
-    if let Some(helper) = config.cred_helpers.get(registry) {
-        return Some(helper.clone());
-    }
-
-    // Docker Hub aliases.
-    if is_docker_hub(registry) {
-        for alias in DOCKER_HUB_ALIASES {
-            if let Some(helper) = config.cred_helpers.get(*alias) {
-                return Some(helper.clone());
-            }
-        }
-    }
-
-    None
 }
 
 /// Convert an `AuthEntry` to `Credentials`.
@@ -209,23 +195,8 @@ fn decode_auth(encoded: &str, registry: &str) -> Result<(String, String), Error>
 /// Runs `docker-credential-{helper} get` with the registry on stdin.
 /// Uses `tokio::process::Command` to avoid blocking the single-threaded
 /// tokio runtime.
-async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentials, Error> {
-    // Validate helper name to prevent command injection via crafted
-    // `credsStore` / `credHelpers` values in Docker config.json.
-    if !helper
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return Err(Error::CredentialHelperFailed {
-            helper: helper.to_owned(),
-            reason: format!(
-                "invalid credential helper name: {helper:?} \
-                 (must be alphanumeric and hyphens only)"
-            ),
-        });
-    }
-
-    let program = format!("docker-credential-{helper}");
+async fn run_credential_helper(helper: &str, registry: &str) -> Result<Option<Credentials>, Error> {
+    let program = helper_program(helper)?;
 
     let mut child = tokio::process::Command::new(&program)
         .arg("get")
@@ -278,15 +249,39 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
     helper_credentials(program, registry, &output)
 }
 
-/// The credentials a helper's `output` holds. Its stderr is cut to the
-/// most of a program's output an error keeps, and a refused value from its
-/// stdout is left out.
+/// The program a helper name runs. The name comes from a config file, so
+/// one that could reach outside the `docker-credential-` prefix, through a
+/// path separator or a shell character, is refused.
+fn helper_program(helper: &str) -> Result<String, Error> {
+    if helper
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return Ok(format!("docker-credential-{helper}"));
+    }
+    Err(Error::CredentialHelperFailed {
+        helper: helper.to_owned(),
+        reason: format!(
+            "invalid credential helper name: {helper:?} \
+             (must be alphanumeric, hyphens and dots only)"
+        ),
+    })
+}
+
+/// The credentials a helper's `output` holds, or none when it reports it
+/// holds nothing for the server. Its stderr is cut to the most of a
+/// program's output an error keeps, and a refused value from its stdout is
+/// left out.
 fn helper_credentials(
     program: String,
     registry: &str,
     output: &std::process::Output,
-) -> Result<Credentials, Error> {
+) -> Result<Option<Credentials>, Error> {
     if !output.status.success() {
+        if String::from_utf8_lossy(&output.stdout).trim() == CREDENTIALS_NOT_FOUND {
+            tracing::debug!(helper = %program, registry, "credential helper holds no credentials");
+            return Ok(None);
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::debug!(helper = %program, registry, status = %output.status, "credential helper exited with error");
         return Err(Error::CredentialHelperFailed {
@@ -313,10 +308,10 @@ fn helper_credentials(
             reason: format!("invalid JSON response: {e}"),
         })?;
 
-    Ok(Credentials::Basic {
+    Ok(Some(Credentials::Basic {
         username: resp.username,
         password: resp.secret,
-    })
+    }))
 }
 
 /// Check if a hostname is a Docker Hub alias.
@@ -339,9 +334,11 @@ fn default_config_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// A helper that fails has its stderr cut to what can be quoted, and one
-    /// whose answer is mistyped is refused without the refused value.
-    /// Breaks if the stderr is kept past the cap or the value is quoted.
+    /// A helper that holds nothing for the server answers none, one that
+    /// fails has its stderr cut to what can be quoted, and one whose answer
+    /// is mistyped is refused without the refused value. Breaks if a
+    /// not-found answer is taken as a failure, the stderr is kept past the
+    /// cap, or the value is quoted.
     #[cfg(unix)]
     #[test]
     fn a_helper_failure_is_cut_to_what_can_be_quoted() {
@@ -352,6 +349,16 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.into_bytes(),
         };
+        let not_found = output(
+            1,
+            "credentials not found in native keychain\n",
+            String::new(),
+        );
+        assert!(
+            helper_credentials("helper".into(), "r", &not_found)
+                .unwrap()
+                .is_none()
+        );
         let failed = output(1, "", format!("{}s3cret", "x".repeat(200)));
         let error = helper_credentials("helper".into(), "r", &failed).unwrap_err();
         assert!(!error.to_string().contains("s3cret"), "{error}");
@@ -553,52 +560,94 @@ mod tests {
         assert!(config.auths.is_empty());
     }
 
+    /// A registry's own helper, under any Docker Hub alias, is asked
+    /// before the default store, an empty name is no helper, and a helper
+    /// is asked about Docker Hub under its index server. Breaks if the
+    /// store shadows a registry's helper, an empty name is run, or Docker
+    /// Hub is asked about under a name Docker never stores it by.
     #[test]
-    fn cred_helper_docker_hub_alias_lookup() {
-        let json = r#"{
-            "credHelpers": {
-                "https://index.docker.io/v1/": "desktop"
-            }
-        }"#;
-        let config: DockerConfig = serde_json::from_str(json).unwrap();
-        let helper = lookup_cred_helper(&config, "docker.io");
-        assert_eq!(helper.as_deref(), Some("desktop"));
+    fn the_helper_docker_would_ask() {
+        let cases = [
+            (
+                r#"{"credHelpers": {"ghcr.io": "gh"}, "credsStore": "desktop"}"#,
+                "ghcr.io",
+                Some("gh"),
+                "ghcr.io",
+            ),
+            (
+                r#"{"credHelpers": {"https://index.docker.io/v1/": "hub"}}"#,
+                "docker.io",
+                Some("hub"),
+                "https://index.docker.io/v1/",
+            ),
+            (
+                r#"{"credHelpers": {"quay.io": "quay"}, "credsStore": "desktop"}"#,
+                "registry-1.docker.io",
+                Some("desktop"),
+                "https://index.docker.io/v1/",
+            ),
+            (
+                r#"{"auths": {"ghcr.io": {"auth": "dXNlcjpwYXNz"}}}"#,
+                "ghcr.io",
+                None,
+                "ghcr.io",
+            ),
+            (r#"{"credsStore": ""}"#, "ghcr.io", None, "ghcr.io"),
+            (
+                r#"{"credHelpers": {"ghcr.io": ""}, "credsStore": "desktop"}"#,
+                "ghcr.io",
+                None,
+                "ghcr.io",
+            ),
+        ];
+        for (json, registry, helper, server) in cases {
+            let config: DockerConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                helper_for(&config, registry),
+                helper,
+                "{registry} in {json}"
+            );
+            assert_eq!(server_address(registry), server, "{registry}");
+        }
     }
 
+    /// A helper, the registry's own or the default store, answers in place
+    /// of the `auths` entry, and its failure is the answer. Breaks if a
+    /// stale `auths` entry is sent in place of the helper's credentials.
     #[tokio::test]
-    async fn credential_helper_rejects_path_traversal() {
-        let err = run_credential_helper("../../evil", "registry.example.com")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("invalid credential helper name"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn credential_helper_rejects_shell_metacharacters() {
-        let err = run_credential_helper("helper;rm -rf /", "registry.example.com")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("invalid credential helper name"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn credential_helper_accepts_valid_names() {
-        // These should pass validation but fail to execute (no such binary).
-        // Verify the error is CredentialHelperFailed with "failed to execute",
-        // NOT the name-validation error.
-        for name in ["gcloud", "ecr-login", "osxkeychain", "desktop"] {
-            let err = run_credential_helper(name, "registry.example.com")
+    async fn a_helper_shadows_the_auths_entry() {
+        for json in [
+            r#"{"auths": {"ghcr.io": {"auth": "dXNlcjpwYXNz"}}, "credHelpers": {"ghcr.io": "ocync-absent"}}"#,
+            r#"{"auths": {"ghcr.io": {"auth": "dXNlcjpwYXNz"}}, "credsStore": "ocync-absent"}"#,
+        ] {
+            let config: DockerConfig = serde_json::from_str(json).unwrap();
+            let err = resolve_from_docker_config(&config, "ghcr.io")
                 .await
                 .unwrap_err();
             assert!(
-                !err.to_string().contains("invalid credential helper name"),
-                "valid name {name:?} was rejected: {err}"
+                matches!(&err, Error::CredentialHelperFailed { helper, .. } if helper == "docker-credential-ocync-absent"),
+                "{json}: {err}"
+            );
+        }
+    }
+
+    /// A helper name runs its `docker-credential-` program, and one that
+    /// could reach another program is refused. Breaks if a path or shell
+    /// character gets through, or a real helper name, WSL's `desktop.exe`
+    /// among them, is refused.
+    #[test]
+    fn a_helper_name_runs_only_its_own_program() {
+        for name in ["gcloud", "ecr-login", "osxkeychain", "desktop.exe"] {
+            assert_eq!(
+                helper_program(name).unwrap(),
+                format!("docker-credential-{name}")
+            );
+        }
+        for name in ["../../evil", "helper;rm -rf /", "a/b"] {
+            let err = helper_program(name).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid credential helper name"),
+                "{name}: {err}"
             );
         }
     }
