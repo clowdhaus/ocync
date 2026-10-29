@@ -30,7 +30,7 @@ use crate::scheme::{Scheme, UnsupportedScheme};
 
 use crate::REDACTED;
 use crate::aws::{AwsCredentialProviders, Clock, Env, Host, Platform};
-use crate::error::{MAX_QUOTED_BYTES, truncate_quoted};
+use crate::error::{CredentialFailure, OAuthCode, truncate_quoted};
 use crate::retry::{Bounded, retrying};
 
 /// The scope every registry token is asked for: push and pull on Artifact
@@ -281,12 +281,13 @@ pub(crate) enum Error {
         source: reqwest::Error,
     },
     /// An endpoint answered with an error. The body is cut short, as it can
-    /// hold a token.
+    /// hold a token; `code` is the OAuth error code the whole body names.
     #[error("{call}, status {status}, body=<{body}>")]
     Status {
         call: Call,
         status: http::StatusCode,
         body: String,
+        code: Option<OAuthCode>,
     },
     /// An endpoint's answer is not the JSON expected.
     #[error("{call}: unreadable response")]
@@ -414,6 +415,29 @@ impl Error {
         }
     }
 
+    /// Whether Google refused the identity, the call may pass if sent
+    /// again, or something else failed. Google's OAuth token endpoints
+    /// refuse by their error code; impersonation and the metadata server
+    /// refuse only with 401 or 403, so a metadata 404 is a host with no
+    /// service account. A subject token source or the AWS region lookup
+    /// never refuses, as neither is Google judging the identity; an AWS
+    /// subject token that was not signed is classified as the AWS failure
+    /// under it.
+    pub(crate) fn credential_failure(&self) -> CredentialFailure {
+        match self {
+            Self::AwsSigning(error) => error.credential_failure(),
+            Self::Status {
+                status, call, code, ..
+            } => match call {
+                Call::UserToken | Call::StsExchange => CredentialFailure::of_oauth(*status, *code),
+                Call::Impersonation | Call::Metadata => CredentialFailure::of_service(*status),
+                Call::SubjectUrl(_) | Call::AwsRegion => CredentialFailure::of_unjudged(*status),
+            },
+            _ if self.is_transient() => CredentialFailure::Transient,
+            _ => CredentialFailure::Failed,
+        }
+    }
+
     /// A request of `call` that did not complete, its URL dropped.
     fn transport(call: Call, source: reqwest::Error) -> Self {
         Self::Transport {
@@ -423,11 +447,11 @@ impl Error {
     }
 
     /// An error for an answer whose status is not a success, its body read
-    /// no further than is quoted.
+    /// up to [`MAX_BODY`] for its OAuth error code and quoted cut short.
     async fn status(call: Call, mut response: reqwest::Response) -> Self {
         let status = response.status();
         let mut body = Vec::new();
-        while body.len() <= MAX_QUOTED_BYTES {
+        while body.len() <= MAX_BODY {
             match response.chunk().await {
                 Ok(Some(chunk)) => body.extend_from_slice(&chunk),
                 Ok(None) | Err(_) => break,
@@ -437,6 +461,7 @@ impl Error {
             call,
             status,
             body: truncate_quoted(&String::from_utf8_lossy(&body)).to_owned(),
+            code: OAuthCode::read(&body),
         }
     }
 }

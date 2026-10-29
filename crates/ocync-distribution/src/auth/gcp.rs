@@ -27,7 +27,7 @@ use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
-use crate::error::{Error, Transience, error_chain};
+use crate::error::{Error, error_chain};
 use crate::google::{self, AccessToken, Expiry};
 
 /// Username for GCP `OAuth2` token exchange.
@@ -159,15 +159,11 @@ impl fmt::Display for Stage {
 
 /// The error for `registry` when Google's credentials failed at `stage`.
 fn credentials_failed(registry: &str, stage: Stage, error: &google::Error) -> Error {
-    Error::GoogleCredentials {
-        registry: registry.to_owned(),
-        reason: format!("{stage}: {}", error_chain(error)),
-        transience: if error.is_transient() {
-            Transience::Transient
-        } else {
-            Transience::Final
-        },
-    }
+    Error::cloud_credentials(
+        registry,
+        error.credential_failure(),
+        format_args!("{stage}: {}", error_chain(error)),
+    )
 }
 
 /// Default [`GcpTokenSource`]: the run's Application Default Credentials.
@@ -423,22 +419,62 @@ mod tests {
 
     use super::*;
 
-    /// A Google failure that may pass is not an auth error, and one that
-    /// fails again is. Breaks if every Google failure exits as refused
-    /// credentials, or a refusal stops counting as one.
+    /// Only a refusal, by Google or by AWS for an AWS subject token, is an
+    /// auth error: a failure that may pass, a token exchange for a pool that
+    /// does not exist, a metadata server with no
+    /// service account, an AWS region lookup refused, an AWS subject token
+    /// whose credentials timed out, or credentials that do not read are not.
+    /// Breaks if any of these exits as refused credentials, or a refusal
+    /// stops counting as one.
     #[test]
-    fn only_a_final_google_failure_is_an_auth_error() {
-        for (status, auth_error) in [
-            (http::StatusCode::SERVICE_UNAVAILABLE, false),
-            (http::StatusCode::UNAUTHORIZED, true),
+    fn only_a_google_refusal_is_an_auth_error() {
+        let answer = |call, status, body: &str| google::Error::Status {
+            call,
+            status,
+            body: body.to_owned(),
+            code: crate::error::OAuthCode::read(body.as_bytes()),
+        };
+        let status = |call, status| answer(call, status, "");
+        let metadata = google::Call::Metadata;
+        for (failure, auth_error) in [
+            (
+                status(metadata, http::StatusCode::SERVICE_UNAVAILABLE),
+                false,
+            ),
+            (status(metadata, http::StatusCode::UNAUTHORIZED), true),
+            (status(metadata, http::StatusCode::NOT_FOUND), false),
+            (
+                answer(
+                    google::Call::StsExchange,
+                    http::StatusCode::BAD_REQUEST,
+                    r#"{"error": "invalid_grant"}"#,
+                ),
+                true,
+            ),
+            (
+                answer(
+                    google::Call::StsExchange,
+                    http::StatusCode::BAD_REQUEST,
+                    r#"{"error": "invalid_target"}"#,
+                ),
+                false,
+            ),
+            (
+                status(google::Call::AwsRegion, http::StatusCode::UNAUTHORIZED),
+                false,
+            ),
+            (
+                google::Error::AwsSigning(crate::aws::SigningError::timed_out()),
+                false,
+            ),
+            (
+                google::Error::AwsSigning(crate::aws::SigningError::refused()),
+                true,
+            ),
+            (google::Error::NoSubjectField, false),
         ] {
-            let failure = google::Error::Status {
-                call: google::Call::Metadata,
-                status,
-                body: String::new(),
-            };
             let error = credentials_failed("gcr.io", Stage::TokenRequest, &failure);
-            assert_eq!(error.is_auth_error(), auth_error, "{status}");
+            assert_eq!(error.is_auth_error(), auth_error, "{failure}");
         }
     }
 
@@ -457,6 +493,7 @@ mod tests {
                     call: google::Call::Metadata,
                     status: http::StatusCode::SERVICE_UNAVAILABLE,
                     body: String::new(),
+                    code: None,
                 })
             })
         }
@@ -517,6 +554,7 @@ mod tests {
                             call: google::Call::Metadata,
                             status: http::StatusCode::UNAUTHORIZED,
                             body: "mock: no more tokens".to_owned(),
+                            code: None,
                         })?;
                 Ok(AccessToken {
                     token: token.into(),

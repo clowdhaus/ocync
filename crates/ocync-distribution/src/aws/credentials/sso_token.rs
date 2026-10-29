@@ -134,6 +134,13 @@ pub(in crate::aws) enum Error {
     /// A session's token has expired and cannot be refreshed.
     #[error("the SSO token has expired and cannot be refreshed")]
     Expired,
+    /// A session's token has expired, and a refresh failed less than
+    /// [`MIN_REFRESH_INTERVAL`] ago: the next may pass.
+    #[error(
+        "the SSO token has expired, and its last refresh failed less than {} seconds ago",
+        MIN_REFRESH_INTERVAL.as_secs()
+    )]
+    RefreshFailed,
 }
 
 /// Why a refresh gave no token. Logged: the cached token is kept.
@@ -190,6 +197,9 @@ enum Decision<'a> {
     Refresh(&'a Registration),
     /// Fail: it has expired and cannot be refreshed.
     Expired,
+    /// Fail for now: it has expired, and a refresh was tried too recently
+    /// to try again.
+    RefreshFailed,
 }
 
 impl<'a> Decision<'a> {
@@ -202,15 +212,17 @@ impl<'a> Decision<'a> {
             now.duration_since(at)
                 .is_ok_and(|since| since >= MIN_REFRESH_INTERVAL)
         });
-        let refreshable = cached
+        let registered = cached
             .registration
             .as_ref()
-            .filter(|registration| registration.expires_at > now && interval_passed);
+            .filter(|registration| registration.expires_at > now);
+        let refreshable = registered.filter(|_| interval_passed);
         let expires_soon = cached
             .expires_at
             .checked_sub(REFRESH_BUFFER)
             .is_none_or(|at| at <= now);
         match refreshable {
+            None if cached.expires_at <= now && registered.is_some() => Self::RefreshFailed,
             None if cached.expires_at <= now => Self::Expired,
             Some(registration) if expires_soon => Self::Refresh(registration),
             _ => Self::Use,
@@ -243,6 +255,7 @@ pub(super) async fn load(
     let registration = match Decision::of(&cached, &last, now) {
         Decision::Use => return Ok(cached.access_token),
         Decision::Expired => return Err(Error::Expired),
+        Decision::RefreshFailed => return Err(Error::RefreshFailed),
         Decision::Refresh(registration) => registration,
     };
     tracing::debug!("refreshing the SSO token");
@@ -661,6 +674,29 @@ mod tests {
             let message = parse(file.as_bytes()).err().unwrap().to_string();
             assert_eq!(message, error, "{file}");
         }
+    }
+
+    /// An expired token whose registration holds is refreshed, unless a
+    /// refresh was tried less than the minimum interval ago. Breaks if a
+    /// token waiting on a failed refresh reads as one that cannot be
+    /// refreshed.
+    #[test]
+    fn waits_out_a_failed_refresh_of_an_expired_token() {
+        let cached = parse(refreshable("2021-12-25T13:00:00Z").as_bytes()).unwrap();
+        let now = calendar::parse_rfc3339("2021-12-25T14:00:00Z").unwrap();
+        let tried = |ago| LastRefresh(Some(now - Duration::from_secs(ago)));
+        assert!(matches!(
+            Decision::of(&cached, &LastRefresh(None), now),
+            Decision::Refresh(_)
+        ));
+        assert!(matches!(
+            Decision::of(&cached, &tried(1), now),
+            Decision::RefreshFailed
+        ));
+        assert!(matches!(
+            Decision::of(&cached, &tried(MIN_REFRESH_INTERVAL.as_secs()), now),
+            Decision::Refresh(_)
+        ));
     }
 
     /// A token that is not about to expire is used as cached, an expired

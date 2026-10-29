@@ -28,6 +28,7 @@ use super::endpoint::{self, CredentialApi, Region};
 use super::host::Host;
 use super::{Api, ApiParts, ConfigError, STALL_TIMEOUT, retry};
 use crate::REDACTED;
+use crate::error::CredentialFailure;
 
 /// An access key, with the session token and expiry a temporary one
 /// carries.
@@ -105,6 +106,34 @@ pub(super) enum Error {
     /// The instance metadata service failed.
     #[error("failed to load credentials from IMDS")]
     Imds(#[source] imds::Error),
+}
+
+impl Error {
+    /// Whether the source refused the identity, loading may pass if tried
+    /// again, or something else failed. A source that is not configured
+    /// failed; a timeout, or a container or instance metadata failure the
+    /// source re-sends, may pass.
+    pub(super) fn credential_failure(&self) -> CredentialFailure {
+        match self {
+            Self::TimedOut(_) => CredentialFailure::Transient,
+            Self::Profile(error) => error.credential_failure(),
+            Self::WebIdentity(web_identity::Error::Sts(error)) => error.credential_failure(),
+            Self::Container(error) => retried(error),
+            Self::Imds(error) => retried(error),
+            Self::NotLoaded(_) | Self::NoSource(_) | Self::WebIdentity(_) => {
+                CredentialFailure::Failed
+            }
+        }
+    }
+}
+
+/// A failure the source re-sends may pass; any other failed.
+fn retried(error: &impl retry::Retryable) -> CredentialFailure {
+    if error.retry_kind().is_some() {
+        CredentialFailure::Transient
+    } else {
+        CredentialFailure::Failed
+    }
 }
 
 impl From<profile::Error> for Error {
@@ -320,6 +349,18 @@ pub(super) mod tests {
         }
     }
 
+    /// STS answering a call with 403 Forbidden.
+    fn sts_refused() -> sts::Error {
+        sts::Error::Call(Box::new(super::super::Failure::Service(
+            super::super::ServiceError::parse(http::StatusCode::FORBIDDEN, None, b"", &[]),
+        )))
+    }
+
+    /// A web identity load that STS refused.
+    pub(in crate::aws) fn web_identity_refused() -> Error {
+        Error::WebIdentity(web_identity::Error::Sts(sts_refused()))
+    }
+
     /// The chain of `host` with `profile` selected, for calls in
     /// `us-east-1`.
     fn chain_of(host: &Host, profile: Option<&str>) -> Chain {
@@ -488,6 +529,49 @@ pub(super) mod tests {
              the STS client could not be set up: \
              Invalid Configuration: FIPS and custom endpoint are not supported"
         );
+    }
+
+    /// A timeout, a container failure the source re-sends or an SSO login
+    /// waiting on a failed refresh may pass, an expired SSO login or STS
+    /// refusing a web identity, a role or a base profile is refused, and a
+    /// source that is not configured or a container that refuses failed.
+    /// Breaks if a credential that never loaded exits as refused, or a
+    /// refusal stops counting as one.
+    #[test]
+    fn classifies_a_failed_load() {
+        let status = |status| Error::Container(container::Error::Status(status));
+        let expired = profile::Error::Sso(sso::Error::Token(sso_token::Error::Expired));
+        let role = profile::Error::AssumeRole {
+            arn: "arn:aws:iam::123456789012:role/test-role".to_owned(),
+            source: sts_refused(),
+        };
+        let base = profile::Error::Base(Box::new(web_identity_refused()));
+        for (error, expected) in [
+            (Error::from(role), CredentialFailure::Refused),
+            (Error::from(base), CredentialFailure::Refused),
+            (
+                Error::TimedOut(Duration::from_secs(5)),
+                CredentialFailure::Transient,
+            ),
+            (
+                status(http::StatusCode::SERVICE_UNAVAILABLE),
+                CredentialFailure::Transient,
+            ),
+            (
+                status(http::StatusCode::FORBIDDEN),
+                CredentialFailure::Failed,
+            ),
+            (Error::NoSource(Vec::new()), CredentialFailure::Failed),
+            (Error::from(expired), CredentialFailure::Refused),
+            (
+                Error::from(profile::Error::Sso(sso::Error::Token(
+                    sso_token::Error::RefreshFailed,
+                ))),
+                CredentialFailure::Transient,
+            ),
+        ] {
+            assert_eq!(error.credential_failure(), expected, "{error}");
+        }
     }
 
     /// With no source configured, the error is final and names each source

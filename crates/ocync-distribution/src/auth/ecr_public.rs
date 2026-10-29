@@ -29,7 +29,7 @@ use super::token_cache::TokenCache;
 use super::token_exchange;
 use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
 use crate::credential_cache::{CredentialCache, remaining};
-use crate::error::Error;
+use crate::error::{CredentialFailure, Error};
 
 /// The only region ECR Public's API serves.
 const ECR_PUBLIC_REGION: &str = "us-east-1";
@@ -68,15 +68,22 @@ impl EcrApi for AwsEcrPublicApi {
                 .client
                 .call(&GetAuthorizationToken {})
                 .await
-                .map_err(|e| Error::auth_failed(ECR_PUBLIC_HOST, e))?;
+                .map_err(|e| {
+                    Error::cloud_credentials(ECR_PUBLIC_HOST, e.credential_failure(), e)
+                })?;
 
             let auth_data = output.authorization_data.ok_or_else(|| {
-                Error::auth_failed(ECR_PUBLIC_HOST, "ECR Public returned no authorization data")
+                Error::cloud_credentials(
+                    ECR_PUBLIC_HOST,
+                    CredentialFailure::Failed,
+                    "ECR Public returned no authorization data",
+                )
             })?;
 
             let encoded_token = auth_data.authorization_token.ok_or_else(|| {
-                Error::auth_failed(
+                Error::cloud_credentials(
                     ECR_PUBLIC_HOST,
+                    CredentialFailure::Failed,
                     "ECR Public authorization data missing token",
                 )
             })?;
@@ -164,7 +171,7 @@ impl EcrPublicAuth {
             crate::aws::Service::EcrPublic,
             aws_credentials,
         )
-        .map_err(|e| Error::auth_failed(ECR_PUBLIC_HOST, e))?;
+        .map_err(|e| Error::cloud_credentials(ECR_PUBLIC_HOST, CredentialFailure::Failed, e))?;
 
         Ok(Self {
             base_url: format!("https://{ECR_PUBLIC_HOST}"),
@@ -276,6 +283,30 @@ mod tests {
 
     use super::*;
 
+    /// A throttle that outlasts its retries is not an auth error, and an
+    /// access denial is. Breaks if every AWS failure exits as refused
+    /// credentials, or a denial stops counting as one.
+    #[tokio::test]
+    async fn only_an_aws_refusal_is_an_auth_error() {
+        for (answer, auth_error) in [
+            (crate::aws::tests::throttle(), false),
+            (crate::aws::tests::access_denied(), true),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(answer)
+                .mount(&server)
+                .await;
+            let api = AwsEcrPublicApi {
+                client: crate::aws::tests::client(&server, std::num::NonZeroU32::MIN),
+            };
+            let Err(err) = api.get_authorization_token().await else {
+                panic!("accepted");
+            };
+            assert_eq!(err.is_auth_error(), auth_error, "{err}");
+        }
+    }
+
     /// ECR Public answers with one authorization data object where ECR has
     /// a list. Reading it as ECR's list, or ECR's list as it, fails.
     #[test]
@@ -321,11 +352,13 @@ mod tests {
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<EcrTokenResponse, Error>> + Send + '_>> {
             Box::pin(async move {
-                self.responses
-                    .lock()
-                    .await
-                    .pop_front()
-                    .ok_or_else(|| Error::auth_failed(ECR_PUBLIC_HOST, "mock: no more responses"))
+                self.responses.lock().await.pop_front().ok_or_else(|| {
+                    Error::cloud_credentials(
+                        ECR_PUBLIC_HOST,
+                        CredentialFailure::Failed,
+                        "mock: no more responses",
+                    )
+                })
             })
         }
     }

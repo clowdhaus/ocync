@@ -177,7 +177,7 @@ where
 /// rather than turning a 429 or 5xx into an error. That distinction is
 /// load-bearing for the auth paths: their callers collapse any non-success
 /// into
-/// `Error::RegistryPing`, `Error::TokenEndpoint` or `Error::AuthFailed`,
+/// `Error::RegistryPing`, `Error::TokenEndpoint` or `Error::CloudCredentials`,
 /// none of which carries a `status_code()`, and the engine's `with_retry` therefore
 /// cannot classify it as retryable. Surfacing a 429 as a typed error instead
 /// would hand the engine a retryable auth failure and multiply this retry by

@@ -136,6 +136,17 @@ async fn explicit_ecr_dispatches_to_ecr() {
     assert_eq!(client.auth_name(), Some("ecr"));
 }
 
+/// An ECR hostname that names no region is a setup error, not refused
+/// credentials. Breaks if ECR setup errors exit as denied.
+#[tokio::test]
+async fn an_ecr_host_with_no_region_is_not_denied() {
+    let cfg = config("registry.example.com", Some(AuthType::Ecr));
+    let Err(err) = build(&cfg).await else {
+        panic!("built a client for a host with no region");
+    };
+    assert_eq!(err.exit_code(), crate::cli::ExitCode::Failure, "{err}");
+}
+
 #[tokio::test]
 async fn explicit_basic_with_credentials_dispatches_to_basic() {
     let cfg = config_with_basic("registry.example.com");
@@ -238,6 +249,25 @@ async fn explicit_docker_config_dispatches_to_docker_config() {
     let cfg = config("registry.example.com", Some(AuthType::DockerConfig));
     let client = build(&cfg).await.expect("build client");
     assert_eq!(client.auth_name(), Some("docker-config"));
+}
+
+/// A credential helper that cannot run, found by auto-detection, is a
+/// failure, not denied credentials, as with an explicit `docker_config`.
+/// Breaks if the auto-detected path reports every helper failure as denied.
+#[tokio::test]
+async fn a_helper_that_cannot_run_is_not_denied() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"credHelpers": {"registry.example.com": "ocync-test-missing"}}"#,
+    )
+    .expect("write config.json");
+    let _g = EnvGuard::set_docker_config(dir.path());
+    let cfg = config("registry.example.com", None);
+    let Err(err) = build(&cfg).await else {
+        panic!("built a client with a helper that cannot run");
+    };
+    assert_eq!(err.exit_code(), crate::cli::ExitCode::Failure, "{err}");
 }
 
 #[tokio::test]

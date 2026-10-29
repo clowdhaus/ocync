@@ -270,8 +270,7 @@ pub(crate) async fn build_registry_client(
     let mut builder = match auth_type {
         Some(AuthType::Ecr) => {
             let profile = registry_config.and_then(|r| r.aws_profile.as_deref());
-            let auth = EcrAuth::new(bare_host, profile, aws_credentials)
-                .map_err(|e| CliError::Auth(format!("ECR auth setup for '{bare_host}': {e}")))?;
+            let auth = EcrAuth::new(bare_host, profile, aws_credentials)?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Basic) => {
@@ -302,9 +301,7 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Acr) => {
-            let auth = AcrAuth::new(&url)
-                .await
-                .map_err(|e| CliError::Auth(format!("ACR auth setup for '{bare_host}': {e}")))?;
+            let auth = AcrAuth::new(&url).await?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Ghcr | AuthType::DockerConfig) => {
@@ -331,14 +328,11 @@ pub(crate) async fn build_registry_client(
             // the result to avoid redundant regex evaluation.
             match detect_provider_kind(bare_host) {
                 Some(ProviderKind::Ecr) => {
-                    let auth = EcrAuth::new(bare_host, None, aws_credentials).map_err(|e| {
-                        CliError::Auth(format!("ECR auth setup for '{bare_host}': {e}"))
-                    })?;
+                    let auth = EcrAuth::new(bare_host, None, aws_credentials)?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::EcrPublic) => {
-                    let auth = EcrPublicAuth::new(http.clone(), aws_credentials)
-                        .map_err(|e| CliError::Auth(format!("ECR Public auth setup: {e}")))?;
+                    let auth = EcrPublicAuth::new(http.clone(), aws_credentials)?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Gar | ProviderKind::Gcr) => {
@@ -346,9 +340,7 @@ pub(crate) async fn build_registry_client(
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Acr) => {
-                    let auth = AcrAuth::new(&url).await.map_err(|e| {
-                        CliError::Auth(format!("ACR auth setup for '{bare_host}': {e}"))
-                    })?;
+                    let auth = AcrAuth::new(&url).await?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Ghcr | ProviderKind::DockerHub | ProviderKind::Chainguard)
@@ -356,13 +348,7 @@ pub(crate) async fn build_registry_client(
                     // Try docker config - falls back to anonymous exchange if no creds found.
                     match DockerConfig::load_default() {
                         Ok(config) => {
-                            let auth = DockerConfigAuth::new(&url, endpoint, &config, http)
-                                .await
-                                .map_err(|e| {
-                                CliError::Auth(format!(
-                                    "docker config credential resolution for '{bare_host}': {e}"
-                                ))
-                            })?;
+                            let auth = DockerConfigAuth::new(&url, endpoint, &config, http).await?;
                             RegistryClient::builder(url).auth(auth)
                         }
                         Err(_) => {
@@ -533,9 +519,9 @@ mod tests {
 
     #[test]
     fn cli_error_exit_code_auth() {
-        // Credential-provider setup failures carry their own exit code so a
-        // run denied everywhere is distinguishable from a generic failure.
-        let err = CliError::Auth("ECR auth setup for 'x': 403 Forbidden".into());
+        // A mapping denied credentials carries its own exit code, so a run
+        // denied everywhere is distinguishable from a generic failure.
+        let err = CliError::Auth("authentication failed for registry 'x': 403 Forbidden".into());
         assert_eq!(err.exit_code(), ExitCode::AuthError);
         // The negative half: a plain input error must not claim it.
         assert_eq!(

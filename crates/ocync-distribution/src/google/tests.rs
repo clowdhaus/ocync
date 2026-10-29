@@ -214,7 +214,8 @@ fn a_secret_never_prints() {
 }
 
 /// An answer cut short while its body is read may be sent again, from the
-/// metadata server too. Breaks if a body read failure is final, which a
+/// metadata server too, and is not refused credentials. Breaks if a body
+/// read failure is final, which a
 /// reset after the headers would make of a throttled Google endpoint or a
 /// GKE metadata server minting a token.
 #[tokio::test]
@@ -223,6 +224,11 @@ async fn a_body_cut_short_is_transient() {
         let error = cut_short(call).await;
         assert!(matches!(error, Error::Transport { .. }), "{error}");
         assert!(error.is_transient(), "{call}: {error}");
+        assert_eq!(
+            error.credential_failure(),
+            CredentialFailure::Transient,
+            "{call}"
+        );
     }
 }
 
@@ -283,6 +289,7 @@ fn classifies_answers() {
         call: Call::UserToken,
         status: http::StatusCode::from_u16(code).unwrap(),
         body: String::new(),
+        code: None,
     };
     for (code, transient) in [
         (500, true),

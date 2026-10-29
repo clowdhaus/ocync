@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::auth::{AuthProvider, AuthScheme, Scope, Token};
 use crate::credential_cache::{CredentialCache, remaining};
-use crate::error::Error;
+use crate::error::{CredentialFailure, Error};
 
 /// Default ECR token lifetime (12 hours).
 ///
@@ -98,18 +98,26 @@ impl EcrApi for AwsEcrApi {
                 .client
                 .call(&GetAuthorizationToken {})
                 .await
-                .map_err(|e| Error::auth_failed(&self.registry, e))?;
+                .map_err(|e| Error::cloud_credentials(&self.registry, e.credential_failure(), e))?;
 
             let auth_data = output
                 .authorization_data
                 .into_iter()
                 .next()
                 .ok_or_else(|| {
-                    Error::auth_failed(&self.registry, "ECR returned empty authorization data")
+                    Error::cloud_credentials(
+                        &self.registry,
+                        CredentialFailure::Failed,
+                        "ECR returned empty authorization data",
+                    )
                 })?;
 
             let encoded_token = auth_data.authorization_token.ok_or_else(|| {
-                Error::auth_failed(&self.registry, "ECR authorization data missing token")
+                Error::cloud_credentials(
+                    &self.registry,
+                    CredentialFailure::Failed,
+                    "ECR authorization data missing token",
+                )
             })?;
 
             // Prefer the API-provided expiry over the hardcoded default.
@@ -137,14 +145,28 @@ impl AuthorizationToken {
     /// Read `encoded`, naming `registry` in any error.
     pub(super) fn parse(encoded: String, registry: &str) -> Result<Self, Error> {
         let decoded = BASE64.decode(&encoded).map_err(|e| {
-            Error::auth_failed(registry, format!("invalid base64 in ECR token: {e}"))
+            Error::cloud_credentials(
+                registry,
+                CredentialFailure::Failed,
+                format!("invalid base64 in ECR token: {e}"),
+            )
         })?;
         let text = String::from_utf8(decoded).map_err(|e| {
-            Error::auth_failed(registry, format!("ECR token is not valid UTF-8: {e}"))
+            Error::cloud_credentials(
+                registry,
+                CredentialFailure::Failed,
+                format!("ECR token is not valid UTF-8: {e}"),
+            )
         })?;
         let password = text
             .strip_prefix("AWS:")
-            .ok_or_else(|| Error::auth_failed(registry, "ECR token does not start with 'AWS:'"))?
+            .ok_or_else(|| {
+                Error::cloud_credentials(
+                    registry,
+                    CredentialFailure::Failed,
+                    "ECR token does not start with 'AWS:'",
+                )
+            })?
             .to_owned();
         Ok(Self { encoded, password })
     }
@@ -209,7 +231,7 @@ impl EcrAuth {
     ) -> Result<Self, Error> {
         let hostname = hostname.into();
         let client = crate::ecr::api_client(&hostname, profile, aws_credentials)
-            .map_err(|e| Error::auth_failed(&hostname, e))?;
+            .map_err(|e| Error::cloud_credentials(&hostname, CredentialFailure::Failed, e))?;
         let registry = hostname.clone();
 
         Ok(Self {
@@ -284,6 +306,31 @@ mod tests {
 
     use super::*;
 
+    /// A throttle that outlasts its retries is not an auth error, and an
+    /// access denial is. Breaks if every AWS failure exits as refused
+    /// credentials, or a denial stops counting as one.
+    #[tokio::test]
+    async fn only_an_aws_refusal_is_an_auth_error() {
+        for (answer, auth_error) in [
+            (crate::aws::tests::throttle(), false),
+            (crate::aws::tests::access_denied(), true),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(answer)
+                .mount(&server)
+                .await;
+            let api = AwsEcrApi {
+                client: crate::aws::tests::client(&server, std::num::NonZeroU32::MIN),
+                registry: "ecr".to_owned(),
+            };
+            let Err(err) = api.get_authorization_token().await else {
+                panic!("accepted");
+            };
+            assert_eq!(err.is_auth_error(), auth_error, "{err}");
+        }
+    }
+
     /// Mock ECR API that returns pre-configured responses in order.
     ///
     /// Uses a response queue: each call pops the next response. An empty
@@ -345,7 +392,11 @@ mod tests {
                 let mut responses = self.responses.lock().await;
                 match responses.pop_front() {
                     Some(Some(response)) => Ok(response),
-                    _ => Err(Error::auth_failed("mock", "mock: no token available")),
+                    _ => Err(Error::cloud_credentials(
+                        "mock",
+                        CredentialFailure::Failed,
+                        "mock: no token available",
+                    )),
                 }
             })
         }

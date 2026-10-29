@@ -22,27 +22,22 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::CredentialCache;
-use crate::error::{Error, error_chain, truncate_quoted};
+use crate::error::{CredentialFailure, Error, OAuthCode, error_chain, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 
 /// Decode the payload segment of a JWT token as JSON.
 fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, Error> {
-    let payload = token.split('.').nth(1).ok_or_else(|| Error::AuthFailed {
-        registry: "ACR".into(),
-        reason: "JWT has fewer than 2 segments".into(),
-    })?;
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| acr_failed("JWT has fewer than 2 segments"))?;
     let decoded = URL_SAFE_NO_PAD
         .decode(payload)
-        .map_err(|e| Error::AuthFailed {
-            registry: "ACR".into(),
-            reason: format!("JWT payload base64 decode failed: {e}"),
-        })?;
-    crate::json::parse(&decoded).map_err(|e| Error::AuthFailed {
-        registry: "ACR".into(),
-        reason: format!("JWT payload is not valid JSON: {e}"),
-    })
+        .map_err(|e| acr_failed(format_args!("JWT payload base64 decode failed: {e}")))?;
+    crate::json::parse(&decoded)
+        .map_err(|e| acr_failed(format_args!("JWT payload is not valid JSON: {e}")))
 }
 
 /// Extract the `exp` claim from a JWT as a Unix timestamp.
@@ -50,10 +45,12 @@ fn extract_jwt_exp(token: &str) -> Result<i64, Error> {
     let json = decode_jwt_payload(token)?;
     json.get("exp")
         .and_then(|v| v.as_i64())
-        .ok_or_else(|| Error::AuthFailed {
-            registry: "ACR".into(),
-            reason: "JWT missing 'exp' claim".into(),
-        })
+        .ok_or_else(|| acr_failed("JWT missing 'exp' claim"))
+}
+
+/// An ACR token that does not read: [`CredentialFailure::Failed`].
+fn acr_failed(reason: impl fmt::Display) -> Error {
+    Error::cloud_credentials("ACR", CredentialFailure::Failed, reason)
 }
 
 /// Compute remaining TTL from a Unix epoch timestamp.
@@ -168,35 +165,41 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
     let response =
         crate::retry::send_retrying(http.post(&url).form(form), &format!("ACR {endpoint}"))
             .await
-            .map_err(|e| Error::AuthFailed {
-                registry: service.to_owned(),
-                // Unwrapped so the reason reads as it always has: `Error::Http`
-                // Displays as "HTTP request failed: ..." and would double the
-                // prefix this line already writes. The chain names the cause,
-                // such as a refused connection.
-                reason: match &e {
-                    Error::Http(inner) => {
-                        format!("ACR {endpoint} request failed: {}", error_chain(inner))
-                    }
-                    other => format!("ACR {endpoint} request failed: {other}"),
-                },
+            // Unwrapped: `Error::Http` Displays as "HTTP request failed: ..."
+            // and would double the prefix this line already writes. The chain names the cause,
+            // such as a refused connection.
+            .map_err(|e| match &e {
+                Error::Http(inner) => Error::cloud_credentials(
+                    service,
+                    CredentialFailure::of_transport(inner),
+                    format_args!("ACR {endpoint} request failed: {}", error_chain(inner)),
+                ),
+                other => Error::cloud_credentials(
+                    service,
+                    CredentialFailure::Failed,
+                    format_args!("ACR {endpoint} request failed: {other}"),
+                ),
             })?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(Error::AuthFailed {
-            registry: service.to_owned(),
-            reason: format!(
+        return Err(Error::cloud_credentials(
+            service,
+            CredentialFailure::of_status(status),
+            format_args!(
                 "ACR {endpoint} returned {status}: {}",
                 truncate_quoted(&body)
             ),
-        });
+        ));
     }
 
-    response.json().await.map_err(|e| Error::AuthFailed {
-        registry: service.to_owned(),
-        reason: format!("ACR {endpoint} response parse failed: {}", error_chain(&e)),
+    response.json().await.map_err(|e| {
+        Error::cloud_credentials(
+            service,
+            CredentialFailure::Failed,
+            format_args!("ACR {endpoint} response parse failed: {}", error_chain(&e)),
+        )
     })
 }
 
@@ -245,9 +248,34 @@ async fn exchange_access_token(
 /// The access token in the Azure CLI's `stdout`. A refused value is left
 /// out of the error, as it can be the token.
 fn cli_access_token(stdout: &[u8]) -> Result<String, CredentialError> {
-    let body: CliTokenResponse = crate::json::parse(stdout)
-        .map_err(|e| CredentialError::Failed(format!("az CLI output parse failed: {e}")))?;
+    let body: CliTokenResponse = crate::json::parse(stdout).map_err(|e| {
+        CredentialError::Failed(
+            CredentialFailure::Failed,
+            format!("az CLI output parse failed: {e}"),
+        )
+    })?;
     Ok(body.access_token)
+}
+
+/// What an Azure CLI that gave no token says by `stderr`: refused when it
+/// asks for `az login`, as it does for a login that is missing, expired or
+/// revoked; any other failure, such as an unreachable Entra ID, failed.
+fn cli_failure(stderr: &str) -> CredentialFailure {
+    if stderr.contains("az login") {
+        CredentialFailure::Refused
+    } else {
+        CredentialFailure::Failed
+    }
+}
+
+/// The failure of a chain whose sources failed with `failures`: refused
+/// when any refused the identity, as that source needs a new sign-in
+/// whatever the others did; else transient when any may pass; else failed.
+fn chain_failure(failures: &[CredentialFailure]) -> CredentialFailure {
+    [CredentialFailure::Refused, CredentialFailure::Transient]
+        .into_iter()
+        .find(|failure| failures.contains(failure))
+        .unwrap_or(CredentialFailure::Failed)
 }
 
 /// Internal error for credential chain control flow.
@@ -255,7 +283,7 @@ enum CredentialError {
     /// Credential source is not configured (skip to next).
     NotConfigured,
     /// Credential source is configured but failed (stop and report).
-    Failed(String),
+    Failed(CredentialFailure, String),
 }
 
 /// Source index constants for the credential chain.
@@ -319,25 +347,26 @@ impl AzureCredentialChain {
         source: &str,
     ) -> Result<String, CredentialError> {
         let resp = http.post(url).form(form).send().await.map_err(|e| {
-            CredentialError::Failed(format!(
-                "{source} token request failed: {}",
-                error_chain(&e)
-            ))
+            CredentialError::Failed(
+                CredentialFailure::of_transport(&e),
+                format!("{source} token request failed: {}", error_chain(&e)),
+            )
         })?;
 
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(CredentialError::Failed(format!(
-                "{source} auth failed: {}",
-                truncate_quoted(&body)
-            )));
+            return Err(CredentialError::Failed(
+                CredentialFailure::of_oauth(status, OAuthCode::read(body.as_bytes())),
+                format!("{source} auth failed: {}", truncate_quoted(&body)),
+            ));
         }
 
         let body: EntraTokenResponse = resp.json().await.map_err(|e| {
-            CredentialError::Failed(format!(
-                "{source} response parse failed: {}",
-                error_chain(&e)
-            ))
+            CredentialError::Failed(
+                CredentialFailure::Failed,
+                format!("{source} response parse failed: {}", error_chain(&e)),
+            )
         })?;
 
         Ok(body.access_token)
@@ -372,9 +401,10 @@ impl AzureCredentialChain {
             .map_err(|_| CredentialError::NotConfigured)?;
 
         let assertion = tokio::fs::read_to_string(&token_file).await.map_err(|e| {
-            CredentialError::Failed(format!(
-                "failed to read federated token file '{token_file}': {e}"
-            ))
+            CredentialError::Failed(
+                CredentialFailure::Failed,
+                format!("failed to read federated token file '{token_file}': {e}"),
+            )
         })?;
 
         let url = format!("https://{}/{tenant}/oauth2/v2.0/token", self.authority);
@@ -415,19 +445,30 @@ impl AzureCredentialChain {
         if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED
         {
             let body = resp.text().await.unwrap_or_default();
-            return Err(CredentialError::Failed(format!(
-                "managed identity not configured: {}",
-                truncate_quoted(&body)
-            )));
+            return Err(CredentialError::Failed(
+                CredentialFailure::Failed,
+                format!(
+                    "managed identity not configured: {}",
+                    truncate_quoted(&body)
+                ),
+            ));
         }
+        // Another cloud's metadata server can answer at this address, and
+        // Azure's answers 404 or 410 while it updates: no status here
+        // refuses an Azure identity.
         if !status.is_success() {
-            return Err(CredentialError::Failed(format!("IMDS returned {status}")));
+            return Err(CredentialError::Failed(
+                CredentialFailure::of_unjudged(status),
+                format!("IMDS returned {status}"),
+            ));
         }
 
-        let body: ImdsTokenResponse = resp
-            .json()
-            .await
-            .map_err(|_| CredentialError::Failed("IMDS response parse failed".into()))?;
+        let body: ImdsTokenResponse = resp.json().await.map_err(|_| {
+            CredentialError::Failed(
+                CredentialFailure::Failed,
+                "IMDS response parse failed".into(),
+            )
+        })?;
 
         Ok(body.access_token)
     }
@@ -448,16 +489,19 @@ impl AzureCredentialChain {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     CredentialError::NotConfigured
                 } else {
-                    CredentialError::Failed(format!("az CLI execution failed: {e}"))
+                    CredentialError::Failed(
+                        CredentialFailure::Failed,
+                        format!("az CLI execution failed: {e}"),
+                    )
                 }
             })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(CredentialError::Failed(format!(
-                "az CLI failed: {}",
-                truncate_quoted(&stderr)
-            )));
+            return Err(CredentialError::Failed(
+                cli_failure(&stderr),
+                format!("az CLI failed: {}", truncate_quoted(&stderr)),
+            ));
         }
 
         cli_access_token(&output.stdout)
@@ -495,16 +539,23 @@ impl AzureTokenSource for AzureCredentialChain {
 
             if cached != SOURCE_NONE {
                 let name = Self::source_name(cached);
-                return self
-                    .try_source(cached)
-                    .await
-                    .map_err(|_| Error::AuthFailed {
-                        registry: "ACR".into(),
-                        reason: format!("{name} credential failed"),
-                    });
+                return self.try_source(cached).await.map_err(|e| {
+                    let (failure, reason) = match e {
+                        CredentialError::NotConfigured => {
+                            (CredentialFailure::Failed, "not configured".to_owned())
+                        }
+                        CredentialError::Failed(failure, reason) => (failure, reason),
+                    };
+                    Error::cloud_credentials(
+                        "ACR",
+                        failure,
+                        format_args!("{name} credential failed: {reason}"),
+                    )
+                });
             }
 
             let mut errors = Vec::new();
+            let mut failures = Vec::new();
             for index in [
                 SOURCE_CLIENT_SECRET,
                 SOURCE_WORKLOAD_IDENTITY,
@@ -521,16 +572,18 @@ impl AzureTokenSource for AzureCredentialChain {
                     Err(CredentialError::NotConfigured) => {
                         tracing::debug!(source = name, "not configured, skipping");
                     }
-                    Err(CredentialError::Failed(reason)) => {
+                    Err(CredentialError::Failed(failure, reason)) => {
                         tracing::warn!(source = name, "credential failed");
                         errors.push(format!("{name}: {reason}"));
+                        failures.push(failure);
                     }
                 }
             }
 
-            Err(Error::AuthFailed {
-                registry: "ACR".into(),
-                reason: if errors.is_empty() {
+            Err(Error::cloud_credentials(
+                "ACR",
+                chain_failure(&failures),
+                if errors.is_empty() {
                     "no Azure credential sources configured (set AZURE_CLIENT_ID + AZURE_CLIENT_SECRET + AZURE_TENANT_ID, or run on Azure with managed identity, or install Azure CLI)".into()
                 } else {
                     format!(
@@ -538,7 +591,7 @@ impl AzureTokenSource for AzureCredentialChain {
                         errors.join("\n  ")
                     )
                 },
-            })
+            ))
         })
     }
 }
@@ -680,11 +733,53 @@ impl AuthProvider for AcrAuth {
 mod tests {
     use super::*;
 
+    /// A chain is refused when any source refused, whichever failed first,
+    /// else transient when any may pass. Breaks if a refused CLI login is
+    /// hidden by a metadata probe that failed before it, or a refusal
+    /// stops counting as one.
+    #[test]
+    fn a_chain_is_refused_when_any_source_was() {
+        use CredentialFailure::{Failed, Refused, Transient};
+        for (failures, expected) in [
+            (&[][..], Failed),
+            (&[Failed, Refused], Refused),
+            (&[Refused, Transient], Refused),
+            (&[Failed, Transient], Transient),
+            (&[Failed], Failed),
+        ] {
+            assert_eq!(chain_failure(failures), expected, "{failures:?}");
+        }
+    }
+
+    /// An Azure CLI asking for `az login` refuses, and one that cannot
+    /// reach Entra ID failed. Breaks if every CLI failure exits as refused
+    /// credentials, or an expired login stops counting as refused.
+    #[test]
+    fn a_cli_asking_for_login_is_refused() {
+        for (stderr, expected) in [
+            (
+                "ERROR: AADSTS700082: The refresh token has expired. To re-authenticate, please run:\naz login",
+                CredentialFailure::Refused,
+            ),
+            (
+                "ERROR: Please run 'az login' to setup account.",
+                CredentialFailure::Refused,
+            ),
+            (
+                "ERROR: HTTPSConnectionPool(host='login.microsoftonline.com', port=443): Max retries exceeded",
+                CredentialFailure::Failed,
+            ),
+        ] {
+            assert_eq!(cli_failure(stderr), expected, "{stderr}");
+        }
+    }
+
     /// Azure CLI output with a mistyped token is refused without the
     /// value. Breaks if the output is read with the raw parser.
     #[test]
     fn mistyped_cli_output_leaves_the_token_out() {
-        let Err(CredentialError::Failed(reason)) = cli_access_token(br#"{"accessToken": 735017}"#)
+        let Err(CredentialError::Failed(_, reason)) =
+            cli_access_token(br#"{"accessToken": 735017}"#)
         else {
             panic!("accepted");
         };
@@ -801,14 +896,13 @@ mod tests {
     impl AzureTokenSource for MockAzureTokenSource {
         fn get_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>> {
             Box::pin(async move {
-                self.tokens
-                    .lock()
-                    .await
-                    .pop_front()
-                    .ok_or_else(|| Error::AuthFailed {
-                        registry: "mock-acr".into(),
-                        reason: "mock: no more tokens".into(),
-                    })
+                self.tokens.lock().await.pop_front().ok_or_else(|| {
+                    Error::cloud_credentials(
+                        "mock-acr",
+                        CredentialFailure::Failed,
+                        "mock: no more tokens",
+                    )
+                })
             })
         }
 
@@ -849,9 +943,10 @@ mod tests {
         assert_eq!(refresh, "acr-refresh-tok");
     }
 
-    /// A request that cannot connect names the refusal, for the ACR
-    /// exchange and the Entra ID token request alike. Breaks if either
-    /// reason keeps only the top line, "error sending request".
+    /// A request that cannot connect names the refusal and may pass, for
+    /// the ACR exchange and the Entra ID token request alike. Breaks if
+    /// either reason keeps only the top line, "error sending request", or
+    /// either exits as refused credentials.
     #[tokio::test]
     async fn a_refused_connection_is_named() {
         crate::install_crypto_provider();
@@ -863,12 +958,16 @@ mod tests {
         let err = exchange_refresh_token(&http, &base_url, "myregistry.azurecr.io", "aad-tok")
             .await
             .unwrap_err();
-        let Error::AuthFailed { reason, .. } = err else {
+        let Error::CloudCredentials {
+            reason, failure, ..
+        } = err
+        else {
             panic!("{err:?}");
         };
         assert!(reason.ends_with(&refused), "{reason}");
+        assert_eq!(failure, CredentialFailure::Transient);
 
-        let Err(CredentialError::Failed(reason)) = AzureCredentialChain::post_entra_token(
+        let Err(CredentialError::Failed(failure, reason)) = AzureCredentialChain::post_entra_token(
             &http,
             &format!("{base_url}/token"),
             &[],
@@ -879,6 +978,7 @@ mod tests {
             panic!("expected a failed token request");
         };
         assert!(reason.ends_with(&refused), "{reason}");
+        assert_eq!(failure, CredentialFailure::Transient);
     }
 
     #[tokio::test]
@@ -900,6 +1000,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("401"), "got: {err}");
+        assert!(err.is_auth_error(), "{err}");
     }
 
     /// A redirect from an exchange endpoint must be treated as an error,
@@ -952,6 +1053,7 @@ mod tests {
             err.to_string().contains("response parse failed"),
             "got: {err}"
         );
+        assert!(!err.is_auth_error(), "{err}");
     }
 
     #[tokio::test]

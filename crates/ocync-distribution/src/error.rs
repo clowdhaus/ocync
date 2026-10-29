@@ -69,15 +69,17 @@ pub enum Error {
         reason: String,
     },
 
-    /// Google's credentials yielded no token for the registry.
-    #[error("no Google token for registry '{registry}': {reason}")]
-    GoogleCredentials {
+    /// A cloud provider's credentials (AWS, Google or Azure) yielded no
+    /// token for the registry.
+    #[error("no cloud token for registry '{registry}': {reason}")]
+    CloudCredentials {
         /// The registry the token was for.
         registry: String,
         /// Why no token was had, with its causes.
         reason: String,
-        /// Whether asking again may succeed.
-        transience: Transience,
+        /// Whether the identity was refused, the failure may pass, or
+        /// something else failed.
+        failure: CredentialFailure,
     },
 
     /// A registry's token endpoint answered with an error status. 401
@@ -220,13 +222,111 @@ pub enum Error {
     },
 }
 
-/// Whether a failure may pass if the same request is sent again.
+/// Why a cloud provider's credentials yielded no token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transience {
-    /// It may pass, as a server error, a throttle or a timeout can.
+pub enum CredentialFailure {
+    /// The provider rejected the identity, as for an expired, revoked or
+    /// unauthorized credential. Only this is an authentication failure.
+    Refused,
+    /// It may pass if asked again, as a throttle, a server error or a
+    /// timeout can.
     Transient,
-    /// It fails again, as refused credentials do.
-    Final,
+    /// Anything else, such as no credential configured or an answer that
+    /// does not read.
+    Failed,
+}
+
+/// An OAuth 2.0 token endpoint's error code (RFC 6749 section 5.2, RFC 8693
+/// section 2.2.2), as far as it says whether the identity was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OAuthCode {
+    /// The client's own credential, such as a secret, was refused.
+    InvalidClient,
+    /// The grant, such as a refresh token or a subject token, was refused.
+    InvalidGrant,
+    /// The client may not use the grant.
+    UnauthorizedClient,
+    /// A malformed request, an unknown target or scope, and any other code.
+    #[serde(other)]
+    Other,
+}
+
+/// The part of an OAuth 2.0 error answer that classifies it.
+#[derive(serde::Deserialize)]
+struct OAuthAnswer {
+    error: OAuthCode,
+}
+
+impl OAuthCode {
+    /// The code an error answer's whole `body` names, if it is JSON with a
+    /// string `error`.
+    pub(crate) fn read(body: &[u8]) -> Option<Self> {
+        crate::json::parse::<OAuthAnswer>(body)
+            .ok()
+            .map(|answer| answer.error)
+    }
+}
+
+impl CredentialFailure {
+    /// What an error answer with `status` from a registry's token endpoint
+    /// means: a 408, 429 or 5xx may pass, and any other 4xx refuses but a
+    /// proxy's 407, which judges no registry identity.
+    pub(crate) fn of_status(status: http::StatusCode) -> Self {
+        Self::of_answer(status, || {
+            status.is_client_error() && status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        })
+    }
+
+    /// What an OAuth 2.0 token endpoint's error answer means: refused for a
+    /// 401, a 403, or the `code` `invalid_client`, `invalid_grant` or
+    /// `unauthorized_client`; any other code is a request the endpoint could
+    /// not serve, such as an unknown tenant or pool.
+    pub(crate) fn of_oauth(status: http::StatusCode, code: Option<OAuthCode>) -> Self {
+        Self::of_answer(status, || {
+            Self::is_denial(status) || code.is_some_and(|code| code != OAuthCode::Other)
+        })
+    }
+
+    /// What an error answer from a service that answers 401 or 403 for an
+    /// identity it refuses means.
+    pub(crate) fn of_service(status: http::StatusCode) -> Self {
+        Self::of_answer(status, || Self::is_denial(status))
+    }
+
+    /// What an error answer from an endpoint that judges no identity means,
+    /// such as a metadata server that may be another cloud's: never refused.
+    pub(crate) fn of_unjudged(status: http::StatusCode) -> Self {
+        Self::of_answer(status, || false)
+    }
+
+    /// Transient for a 408, 429 or 5xx, else refused when `refused` says.
+    fn of_answer(status: http::StatusCode, refused: impl FnOnce() -> bool) -> Self {
+        if crate::retry::is_transient_status(status) {
+            Self::Transient
+        } else if refused() {
+            Self::Refused
+        } else {
+            Self::Failed
+        }
+    }
+
+    fn is_denial(status: http::StatusCode) -> bool {
+        matches!(
+            status,
+            http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN
+        )
+    }
+
+    /// What a request that did not complete means: one the crate re-sends
+    /// may pass.
+    pub(crate) fn of_transport(error: &reqwest::Error) -> Self {
+        if crate::retry::is_transient_transport(error) {
+            Self::Transient
+        } else {
+            Self::Failed
+        }
+    }
 }
 
 impl From<serde_json::Error> for Error {
@@ -242,11 +342,17 @@ impl From<reqwest::Error> for Error {
 }
 
 impl Error {
-    /// An [`Error::AuthFailed`] for `registry`, with `reason` as its text.
-    pub(crate) fn auth_failed(registry: &str, reason: impl std::fmt::Display) -> Self {
-        Self::AuthFailed {
+    /// An [`Error::CloudCredentials`] for `registry`, with `reason` as its
+    /// text.
+    pub(crate) fn cloud_credentials(
+        registry: &str,
+        failure: CredentialFailure,
+        reason: impl std::fmt::Display,
+    ) -> Self {
+        Self::CloudCredentials {
             registry: registry.to_owned(),
             reason: reason.to_string(),
+            failure,
         }
     }
 
@@ -267,24 +373,23 @@ impl Error {
     /// Whether this error represents an authentication or authorization failure.
     ///
     /// Returns `true` for [`AuthFailed`](Self::AuthFailed) errors, a token
-    /// endpoint's 4xx other than 408 Request Timeout and 429 Too Many
-    /// Requests, Google credentials that fail for good, a refused upload
+    /// endpoint's 4xx other than 407 Proxy Authentication Required, 408
+    /// Request Timeout and 429 Too Many Requests, cloud credentials the
+    /// provider refused, a refused upload
     /// ([`UploadTokenRefused`](Self::UploadTokenRefused)), and registry
     /// responses with HTTP 401 Unauthorized or 403 Forbidden status codes.
     pub fn is_auth_error(&self) -> bool {
         match self {
             Self::AuthFailed { .. }
             | Self::UploadTokenRefused { .. }
-            | Self::GoogleCredentials {
-                transience: Transience::Final,
+            | Self::CloudCredentials {
+                failure: CredentialFailure::Refused,
                 ..
             } => true,
             Self::TokenEndpoint { status, .. } | Self::RegistryPing { status, .. } => {
-                status.is_client_error() && !crate::retry::is_transient_status(*status)
+                CredentialFailure::of_status(*status) == CredentialFailure::Refused
             }
-            Self::RegistryError { status, .. } => {
-                *status == http::StatusCode::UNAUTHORIZED || *status == http::StatusCode::FORBIDDEN
-            }
+            Self::RegistryError { status, .. } => CredentialFailure::is_denial(*status),
             _ => false,
         }
     }
@@ -551,6 +656,16 @@ mod tests {
             Error::CredentialConfig {
                 reason: "not found".into(),
             },
+            Error::CloudCredentials {
+                registry: "gcr.io".into(),
+                reason: "throttled".into(),
+                failure: CredentialFailure::Transient,
+            },
+            Error::CloudCredentials {
+                registry: "gcr.io".into(),
+                reason: "no credentials".into(),
+                failure: CredentialFailure::Failed,
+            },
             Error::Io {
                 context: "test",
                 source: std::io::Error::other("disk full").into(),
@@ -601,14 +716,16 @@ mod tests {
     }
 
     /// A token endpoint that refuses is an auth error, and one that times
-    /// out, is throttled or is failing is not. Breaks if a 408, 429 or 503
-    /// exits as refused credentials.
+    /// out, is throttled or is failing, or a proxy asking for its own
+    /// credentials, is not. Breaks if a 407, 408, 429 or 503 exits as
+    /// refused credentials.
     #[test]
     fn is_auth_error_token_endpoint() {
         for (status, auth_error) in [
             (http::StatusCode::UNAUTHORIZED, true),
             (http::StatusCode::NOT_FOUND, true),
             (http::StatusCode::REQUEST_TIMEOUT, false),
+            (http::StatusCode::PROXY_AUTHENTICATION_REQUIRED, false),
             (http::StatusCode::TOO_MANY_REQUESTS, false),
             (http::StatusCode::SERVICE_UNAVAILABLE, false),
         ] {
@@ -617,6 +734,35 @@ mod tests {
                 status,
             };
             assert_eq!(err.is_auth_error(), auth_error, "{status}");
+        }
+    }
+
+    /// An OAuth token endpoint refuses by its error code, or by a 401 or
+    /// 403 whatever its code; a throttle may pass whatever its code. Breaks if
+    /// an unknown tenant or pool exits as refused credentials, or a refused
+    /// grant or client stops counting as one.
+    #[test]
+    fn classifies_an_oauth_answer() {
+        use CredentialFailure::{Failed, Refused, Transient};
+        for (status, body, expected) in [
+            (400, r#"{"error": "invalid_grant"}"#, Refused),
+            (401, r#"{"error": "invalid_client"}"#, Refused),
+            (400, r#"{"error": "unauthorized_client"}"#, Refused),
+            (400, r#"{"error": "invalid_request"}"#, Failed),
+            (400, r#"{"error": "invalid_target"}"#, Failed),
+            (401, "", Refused),
+            (403, "denied", Refused),
+            (401, r#"{"error": "deleted_client"}"#, Refused),
+            (400, "", Failed),
+            (407, "", Failed),
+            (429, r#"{"error": "invalid_grant"}"#, Transient),
+        ] {
+            let status = http::StatusCode::from_u16(status).unwrap();
+            assert_eq!(
+                CredentialFailure::of_oauth(status, OAuthCode::read(body.as_bytes())),
+                expected,
+                "{status} {body}"
+            );
         }
     }
 
