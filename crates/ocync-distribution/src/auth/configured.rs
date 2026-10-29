@@ -12,7 +12,7 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 
-/// Where a [`Auth`] got the credentials it sends to the token
+/// Where an [`Auth`] got the credentials it sends to the token
 /// endpoint.
 enum SignIn {
     /// No credentials: the token request carries no `Authorization` header.
@@ -315,9 +315,10 @@ mod tests {
         }
     }
 
-    /// A refusal of another token keeps the cached token and challenge, and
-    /// a refusal of the cached one drops both. Breaks if a refusal is not
-    /// matched against the token refused.
+    /// The provider hands the token cache the token refused: a refusal of
+    /// another token costs no request, and one of the cached token makes the
+    /// next call sign in again. Breaks if the provider drops the refused
+    /// token or never passes the refusal on.
     #[tokio::test]
     async fn a_refusal_drops_only_the_refused_token() {
         let server = MockServer::start().await;
@@ -327,11 +328,11 @@ mod tests {
 
         let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.refuse(Token::new("other")).await;
-        assert!(auth.tokens.challenge().get().await.is_some());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
         auth.refuse(refused).await;
-        assert!(auth.tokens.challenge().get().await.is_none());
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        // expect(2) on `/v2/` and `/token`: the first call and the one after
+        // the matching refusal, none after the other.
     }
 
     /// A token endpoint's refusal reaches the caller with its status.

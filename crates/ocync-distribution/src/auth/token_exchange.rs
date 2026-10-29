@@ -1019,6 +1019,11 @@ mod tests {
                     assert_eq!(token.value(), value, "{body}");
                     assert!(!token.is_expired(), "{body}");
                     assert_eq!(
+                        token.expires_at.is_none(),
+                        lifetime == Lifetime::Permanent,
+                        "{body}"
+                    );
+                    assert_eq!(
                         token.should_refresh(),
                         lifetime == Lifetime::Short,
                         "{body}"
