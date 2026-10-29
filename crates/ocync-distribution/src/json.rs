@@ -32,8 +32,8 @@ const WHOLE: [&str; 2] = ["missing field `", "duplicate field `"];
 /// quoted for some kinds, then [`EXPECTED`] and what the type expected.
 const REFUSED: [&str; 2] = ["invalid type: ", "invalid value: "];
 
-/// The kinds of value serde names, none a prefix of another.
-const KINDS: [&str; 18] = [
+/// The kinds of value serde and `serde_json` name, none a prefix of another.
+const KINDS: [&str; 17] = [
     "boolean",
     "integer",
     "floating point",
@@ -51,7 +51,6 @@ const KINDS: [&str; 18] = [
     "tuple variant",
     "struct variant",
     "null",
-    "number",
 ];
 
 /// The start of the parser's message for a sequence of the wrong length:
