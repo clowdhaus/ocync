@@ -46,9 +46,9 @@ type IsRefused<T> = Box<dyn Fn(&T) -> bool + Send + Sync>;
 
 struct State<T> {
     entry: Option<CacheEntry<T>>,
-    /// The refusals made since the refresh in flight began, or `None` while
-    /// no refresh is in flight.
-    refused: Option<Vec<IsRefused<T>>>,
+    /// The refusals made while the refresh in flight ran. Cleared when a
+    /// refresh starts and when it lands.
+    refused: Vec<IsRefused<T>>,
 }
 
 struct CacheEntry<T> {
@@ -85,7 +85,7 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         Self {
             state: RwLock::new(State {
                 entry: None,
-                refused: None,
+                refused: Vec::new(),
             }),
             refresh_window: window,
             flights: Flights::default(),
@@ -99,17 +99,19 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         refresh: impl Future<Output = Result<(T, Duration), F>>,
         share: impl FnOnce(&Result<(T, Duration), F>) -> Option<Result<T, E>>,
     ) -> Landed<Result<(T, Duration), F>, Result<T, E>> {
-        let land = |result: &Result<(T, Duration), F>, _| {
-            let refused = self.write().refused.take().unwrap_or_default();
+        let land = |result: &Result<(T, Duration), F>| {
+            let mut state = self.write();
+            let refused = std::mem::take(&mut state.refused);
             if let Ok((value, ttl)) = result {
                 if !refused.iter().any(|is_refused| is_refused(value)) {
-                    self.write().entry = Some(CacheEntry::new(value.clone(), *ttl));
+                    state.entry = Some(CacheEntry::new(value.clone(), *ttl));
                 }
             }
+            drop(state);
             share(result)
         };
         let fetch = || {
-            self.write().refused = Some(Vec::new());
+            self.write().refused.clear();
             refresh
         };
         self.flights
@@ -157,14 +159,17 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
     }
 
     /// The source or registry refused a value for which `is_refused` is
-    /// true. Drop the cached value if it is that one, and remember the
-    /// refusal until the refresh in flight, if any, lands, so that refresh
-    /// does not store that value. A refresh that begins afterwards stores
-    /// it: the source is issuing it again.
+    /// true. Drop the cached value if it is that one. If a refresh is in
+    /// flight, remember the refusal until it lands, so it does not store
+    /// that value. A refresh that begins afterwards stores it: the source is
+    /// issuing it again.
     pub(crate) fn refuse_if(
         &self,
         is_refused: impl Fn(&T) -> bool + Send + Sync + 'static,
     ) -> Refusal {
+        // Read before the cache lock is taken: a landing holds the flight
+        // lock first and the cache lock second.
+        let refreshing = self.flights.is_running(&());
         let mut state = self.write();
         let refusal = if state
             .entry
@@ -176,8 +181,8 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         } else {
             Refusal::Stale
         };
-        if let Some(refused) = &mut state.refused {
-            refused.push(Box::new(is_refused));
+        if refreshing {
+            state.refused.push(Box::new(is_refused));
         }
         refusal
     }
@@ -373,5 +378,34 @@ mod tests {
         cache.refuse_if(|kept| *kept == 1);
         assert_eq!(cache.get_or_refresh(slow_load(1)).await, Ok(1));
         assert_eq!(cache.get_or_refresh(slow_load(2)).await, Ok(1));
+    }
+
+    /// A refusal records itself only while a refresh is in flight, so
+    /// refusals made with none running, or after one was dropped, leave
+    /// nothing behind. Breaks if the list grows without a refresh to land.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refusal_with_no_refresh_in_flight_records_nothing() {
+        let cache: CredentialCache<u32> = CredentialCache::new();
+        cache.refuse_if(|kept| *kept == 1);
+        assert!(cache.read().refused.is_empty());
+
+        // A refresh polled once, then dropped, leaves no flight behind.
+        let mut stalled = Box::pin(
+            cache.get_or_refresh(std::future::pending::<Result<(u32, Duration), Infallible>>()),
+        );
+        std::future::poll_fn(|cx| {
+            assert!(stalled.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        cache.refuse_if(|kept| *kept == 2);
+        assert_eq!(cache.read().refused.len(), 1);
+        drop(stalled);
+        cache.refuse_if(|kept| *kept == 3);
+        assert_eq!(cache.read().refused.len(), 1);
+
+        // The next refresh starts with none, and lands with none.
+        assert_eq!(cache.get_or_refresh(slow_load(4)).await, Ok(4));
+        assert!(cache.read().refused.is_empty());
     }
 }

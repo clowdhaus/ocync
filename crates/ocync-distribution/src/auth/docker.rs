@@ -430,8 +430,7 @@ impl AuthProvider for DockerConfigAuth {
 
     fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let refusal = self.tokens.refuse(&refused).await;
-            tracing::debug!(base_url = %self.base_url, ?refusal, "registry refused a token");
+            self.tokens.refuse(&refused).await;
         })
     }
 }

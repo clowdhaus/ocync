@@ -397,8 +397,7 @@ impl AuthProvider for GcpAuth {
             // token, and the kept Google token exchanges for a new one
             // without a request to Google. An exchange that refuses the
             // Google token drops it.
-            let refusal = self.tokens.refuse(&refused).await;
-            tracing::debug!(base_url = %self.base_url, ?refusal, "registry refused a token");
+            self.tokens.refuse(&refused).await;
         })
     }
 }

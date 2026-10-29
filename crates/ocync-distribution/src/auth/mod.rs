@@ -232,7 +232,7 @@ pub(crate) fn scopes_cache_key(scopes: &[Scope]) -> String {
 }
 
 /// Credentials for authenticating to a registry.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Credentials {
     /// HTTP Basic authentication.
     Basic {
