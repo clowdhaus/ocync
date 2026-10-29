@@ -11,7 +11,7 @@ Standalone client for the [OCI Distribution Spec](https://github.com/opencontain
 ## Key features
 
 - Registry client with automatic provider detection (ECR, Docker Hub, GHCR, GAR, ACR, Chainguard, anonymous)
-- Streaming blob pull and push (provider-dependent fallback to buffered upload for GHCR/GAR)
+- Streaming blob pull and push (provider-dependent fallback to buffered upload for GHCR/ACR)
 - Cross-repo blob mounting
 - Manifest pull, push, HEAD with OCI and Docker v2 content negotiation
 - Tag listing with automatic pagination

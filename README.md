@@ -183,8 +183,8 @@ Full documentation at [clowdhaus.github.io/ocync](https://clowdhaus.github.io/oc
 | Chainguard | Token exchange | N/A (source) | No rate limits |
 | Docker Hub | Docker config / static | Yes | 10/hr anon, 100/6hr auth manifest GETs; blob GETs unmetered |
 | GitHub Container Registry | Docker config | Yes | Single-PATCH upload fallback |
-| Google Artifact Registry | Docker config | Yes | Monolithic upload only |
-| Azure Container Registry | Docker config | Yes | Streaming PUT (chunked upload planned) |
+| Google Artifact Registry | Docker config | Yes | Streaming upload, one request quota per project |
+| Azure Container Registry | Docker config | Yes | Buffered chunked PATCH upload (16 MB chunks) |
 | Any OCI-compliant registry | Basic / token / anonymous | Varies | Auto-detected |
 
 ## License
