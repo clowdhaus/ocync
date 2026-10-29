@@ -80,22 +80,16 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         &self,
         refresh: impl Future<Output = Result<(T, Duration), F>>,
         share: impl FnOnce(&Result<(T, Duration), F>) -> Option<Result<T, E>>,
-    ) -> Result<T, Landed<F, E>> {
+    ) -> Landed<Result<(T, Duration), F>, Result<T, E>> {
         let land = |result: &Result<(T, Duration), F>| {
             if let Ok((value, ttl)) = result {
                 *self.write() = Some(CacheEntry::new(value.clone(), *ttl));
             }
             share(result)
         };
-        match self
-            .flights
+        self.flights
             .run(&(), || self.fresh().map(Ok), || refresh, land)
             .await
-        {
-            Landed::Own(Ok((value, _))) | Landed::Shared(Ok(value)) => Ok(value),
-            Landed::Own(Err(error)) => Err(Landed::Own(error)),
-            Landed::Shared(Err(error)) => Err(Landed::Shared(error)),
-        }
     }
 
     /// The value, if fresh.
@@ -128,14 +122,17 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
                     .map_err(E::clone),
             )
         };
-        self.refresh(refresh, share)
-            .await
-            .map_err(|(Landed::Own(error) | Landed::Shared(error))| error)
+        match self.refresh(refresh, share).await {
+            Landed::Own(result) => result.map(|(value, _)| value),
+            Landed::Shared(result) => result,
+        }
     }
 
     /// Clear the cached value. A caller that asks afterwards joins the
-    /// refresh in flight, if any, since it fetches a new value: a burst of
-    /// refusals costs one refresh.
+    /// refresh in flight, if any: it fetches a new value rather than the
+    /// refused one, so the refusals that arrive while it runs cost one
+    /// refresh. The registry token cache detaches
+    /// instead, as an exchange in flight may hold the refused credential.
     pub(crate) fn clear(&self) {
         *self.write() = None;
     }
@@ -170,12 +167,11 @@ impl<T: Clone> CredentialCache<T> {
         let share = |result: &Result<(T, Duration), F>| {
             result.as_ref().ok().map(|(value, _)| Ok(value.clone()))
         };
-        self.refresh(refresh, share)
-            .await
-            .map_err(|error| match error {
-                Landed::Own(error) => error,
-                Landed::Shared(never) => match never {},
-            })
+        match self.refresh(refresh, share).await {
+            Landed::Own(result) => result.map(|(value, _)| value),
+            Landed::Shared(Ok(value)) => Ok(value),
+            Landed::Shared(Err(never)) => match never {},
+        }
     }
 }
 

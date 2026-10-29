@@ -266,8 +266,8 @@ pub trait AuthProvider: Send + Sync {
         scopes: &[Scope],
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>>;
 
-    /// Invalidate any cached tokens, forcing the next `get_token` call to
-    /// perform a fresh exchange.
+    /// Invalidate any cached tokens, so the next `get_token` call does not
+    /// reuse them. A fetch already in flight may still answer it.
     ///
     /// Called by the client when a request returns 401, indicating the
     /// current token was rejected by the registry.

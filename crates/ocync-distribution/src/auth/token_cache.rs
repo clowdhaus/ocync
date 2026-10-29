@@ -51,9 +51,6 @@ impl TokenCache {
                 .cloned()
                 .map(Ok)
         };
-        if let Some(hit) = stored() {
-            return hit;
-        }
         let land = |result: &Result<Token, Error>| {
             if let Ok(token) = result {
                 self.tokens().insert(key.clone(), token.clone());
@@ -67,7 +64,8 @@ impl TokenCache {
 
     /// Drop every cached token, and detach the exchanges in flight: a
     /// caller that asks afterwards exchanges again rather than joining one
-    /// that may be using a refused credential.
+    /// that may be using a refused credential. A detached exchange still
+    /// stores its token when it lands.
     pub(super) fn clear(&self) {
         self.flights.forget();
         self.tokens().clear();
@@ -205,6 +203,37 @@ mod tests {
             assert!(t.await.unwrap().is_err());
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// A caller that asks after a clear exchanges for itself rather than
+    /// joining the exchange in flight. Breaks if the clear leaves it to
+    /// be joined.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clear_detaches_the_exchange_in_flight() {
+        let cache = TokenCache::new();
+        let exchanges = std::cell::Cell::new(0);
+        let exchange = |value: &'static str| {
+            let exchanges = &exchanges;
+            async move {
+                exchanges.set(exchanges.get() + 1);
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+                Ok(token(value))
+            }
+        };
+        let (before, after) = tokio::join!(
+            cache.get_or_fetch("scope".to_string(), || exchange("refused")),
+            async {
+                tokio::task::yield_now().await;
+                cache.clear();
+                cache
+                    .get_or_fetch("scope".to_string(), || exchange("fresh"))
+                    .await
+            },
+        );
+        assert_eq!(before.unwrap().value(), "refused");
+        assert_eq!(after.unwrap().value(), "fresh");
+        assert_eq!(exchanges.get(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

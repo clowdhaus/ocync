@@ -70,8 +70,8 @@ impl<K, V> Flights<K, V> {
     }
 
     /// Detach the fetches in flight: a caller that asks afterwards starts
-    /// a fetch of its own, while each detached fetch still lands and
-    /// serves the callers already waiting on it.
+    /// a fetch of its own, while each detached fetch still lands, storing
+    /// its value and serving the callers already waiting on it.
     pub(crate) fn forget(&self) {
         self.lock().clear();
     }

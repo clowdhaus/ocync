@@ -833,7 +833,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_connection_is_named() {
         crate::install_crypto_provider();
-        let (_refusing, address) = crate::test_net::refusing();
+        let address = "127.0.0.1:1";
         let refused = std::net::TcpStream::connect(address)
             .unwrap_err()
             .to_string();

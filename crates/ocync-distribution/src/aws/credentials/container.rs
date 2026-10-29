@@ -771,10 +771,8 @@ mod tests {
     /// which can carry a key. Breaks if the URL reaches the error.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn keeps_the_url_out_of_a_transport_error() {
-        let (_refusing, address) = crate::test_net::refusing();
-        let port = address.port();
-        let uri = format!("http://127.0.0.1:{port}/creds?key=secret-key");
-        let host = host(&[(FULL_URI, &uri)], &[], &[], Network::Real);
+        let uri = "http://127.0.0.1:1/creds?key=secret-key";
+        let host = host(&[(FULL_URI, uri)], &[], &[], Network::Real);
         let err = Provider::new(&host).unwrap().load().await.unwrap_err();
         assert!(
             matches!(err, ChainError::Container(Error::Transport(_))),
@@ -847,8 +845,7 @@ mod tests {
     /// transport failure is not retried.
     #[tokio::test(flavor = "current_thread")]
     async fn retries_a_failed_connection() {
-        let (_refusing, address) = crate::test_net::refusing();
-        let url = Url::parse(&format!("http://{address}/")).unwrap();
+        let url = Url::parse("http://127.0.0.1:1/").unwrap();
         let transport = Network::Real.transport(reqwest::Client::builder()).unwrap();
         let failure = transport.send(request(&url, None)).await.unwrap_err();
         assert_eq!(
