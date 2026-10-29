@@ -336,7 +336,7 @@ impl AzureCredentialChain {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(CredentialError::Failed(
-                CredentialFailure::of_status(status),
+                CredentialFailure::of_oauth(status, &body),
                 format!("{source} auth failed: {}", truncate_quoted(&body)),
             ));
         }
@@ -436,12 +436,8 @@ impl AzureCredentialChain {
         // Azure's answers 404 or 410 while it updates: no status here
         // refuses an Azure identity.
         if !status.is_success() {
-            let failure = match CredentialFailure::of_status(status) {
-                CredentialFailure::Refused => CredentialFailure::Failed,
-                other => other,
-            };
             return Err(CredentialError::Failed(
-                failure,
+                CredentialFailure::of_unjudged(status),
                 format!("IMDS returned {status}"),
             ));
         }

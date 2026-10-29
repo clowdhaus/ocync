@@ -420,18 +420,20 @@ mod tests {
     use super::*;
 
     /// Only a refusal, by Google or by AWS for an AWS subject token, is an
-    /// auth error: a failure that may pass, a metadata server with no
+    /// auth error: a failure that may pass, a token exchange for a pool that
+    /// does not exist, a metadata server with no
     /// service account, an AWS region lookup refused, an AWS subject token
     /// whose credentials timed out, or credentials that do not read are not.
     /// Breaks if any of these exits as refused credentials, or a refusal
     /// stops counting as one.
     #[test]
     fn only_a_google_refusal_is_an_auth_error() {
-        let status = |call, status| google::Error::Status {
+        let answer = |call, status, body: &str| google::Error::Status {
             call,
             status,
-            body: String::new(),
+            body: body.to_owned(),
         };
+        let status = |call, status| answer(call, status, "");
         let metadata = google::Call::Metadata;
         for (failure, auth_error) in [
             (
@@ -441,8 +443,20 @@ mod tests {
             (status(metadata, http::StatusCode::UNAUTHORIZED), true),
             (status(metadata, http::StatusCode::NOT_FOUND), false),
             (
-                status(google::Call::StsExchange, http::StatusCode::BAD_REQUEST),
+                answer(
+                    google::Call::StsExchange,
+                    http::StatusCode::BAD_REQUEST,
+                    r#"{"error": "invalid_grant"}"#,
+                ),
                 true,
+            ),
+            (
+                answer(
+                    google::Call::StsExchange,
+                    http::StatusCode::BAD_REQUEST,
+                    r#"{"error": "invalid_target"}"#,
+                ),
+                false,
             ),
             (
                 status(google::Call::AwsRegion, http::StatusCode::UNAUTHORIZED),

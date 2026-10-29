@@ -136,6 +136,17 @@ async fn explicit_ecr_dispatches_to_ecr() {
     assert_eq!(client.auth_name(), Some("ecr"));
 }
 
+/// An ECR hostname that names no region is a setup error, not refused
+/// credentials. Breaks if ECR setup errors exit as denied.
+#[tokio::test]
+async fn an_ecr_host_with_no_region_is_not_denied() {
+    let cfg = config("registry.example.com", Some(AuthType::Ecr));
+    let Err(err) = build(&cfg).await else {
+        panic!("built a client for a host with no region");
+    };
+    assert_eq!(err.exit_code(), crate::cli::ExitCode::Failure, "{err}");
+}
+
 #[tokio::test]
 async fn explicit_basic_with_credentials_dispatches_to_basic() {
     let cfg = config_with_basic("registry.example.com");

@@ -175,7 +175,7 @@ ocync auth check -c config.yaml -c config2.yaml
 
 A mapping that fails to resolve is skipped rather than aborting the run, and counts as a failure for the exit code: `1` when other mappings still synced or skipped images, `2` when none did, and `4` when nothing ran and every mapping was denied.
 
-For AWS, Google and Azure credentials, only an identity the provider rejected counts as denied, such as an expired, revoked or unauthorized credential. No credential configured, a credential service that is throttled or unreachable, or an answer that does not read is a failure like any other.
+For AWS, Google and Azure credentials, only an identity the provider rejected counts as denied, such as an expired, revoked or unauthorized credential. No credential configured, a sign-in setting that is invalid (such as an ECR hostname that names no region), a token request the provider could not serve (such as an unknown tenant or pool), a proxy asking for its own credentials, a credential service that is throttled or unreachable, or an answer that does not read is a failure like any other.
 
 A mapping that resolved but could not use one of its targets also exits `1`: the images did not reach a registry the config named.
 
