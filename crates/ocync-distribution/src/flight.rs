@@ -69,11 +69,15 @@ impl<K, V> Flights<K, V> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Detach the fetches in flight: a caller that asks afterwards starts
-    /// a fetch of its own, while each detached fetch still lands, storing
-    /// its value and serving the callers already waiting on it.
-    pub(crate) fn forget(&self) {
-        self.lock().clear();
+    /// Run `drop_stored`, which drops stored values, and detach the
+    /// fetches in flight, under one lock: a caller that asks afterwards
+    /// finds neither and starts a fetch of its own, while each detached
+    /// fetch still lands, storing its value and serving the callers already
+    /// waiting on it.
+    pub(crate) fn forget(&self, drop_stored: impl FnOnce()) {
+        let mut in_flight = self.lock();
+        drop_stored();
+        in_flight.clear();
     }
 }
 
@@ -223,7 +227,7 @@ mod tests {
             flights.run(&(), || None, || async { 0 }, share),
             async {
                 tokio::task::yield_now().await;
-                flights.forget();
+                flights.forget(|| ());
                 flights.run(&(), || None, || yields(4, 2), share).await
             },
             async {

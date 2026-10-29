@@ -67,8 +67,7 @@ impl TokenCache {
     /// that may be using a refused credential. A detached exchange still
     /// stores its token when it lands.
     pub(super) fn clear(&self) {
-        self.flights.forget();
-        self.tokens().clear();
+        self.flights.forget(|| self.tokens().clear());
     }
 }
 
