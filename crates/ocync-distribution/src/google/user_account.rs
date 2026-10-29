@@ -281,4 +281,34 @@ mod tests {
             }
         }
     }
+
+    /// A refused refresh token is refused credentials even when its answer
+    /// runs past what is quoted. Breaks if the error code is read from the
+    /// cut body.
+    #[tokio::test]
+    async fn a_long_refusal_is_refused() {
+        let body = serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "x".repeat(500),
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(body))
+            .mount(&server)
+            .await;
+        let user = AuthorizedUser::from_json(
+            user_file(&format!("{}/token", server.uri())),
+            Scopes::Registry,
+        )
+        .unwrap();
+        let error = user
+            .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.credential_failure(),
+            crate::error::CredentialFailure::Refused,
+            "{error}"
+        );
+    }
 }

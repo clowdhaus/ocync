@@ -531,11 +531,12 @@ pub(super) mod tests {
         );
     }
 
-    /// A timeout or a container failure the source re-sends may pass, an
-    /// expired SSO login or STS refusing a web identity, a role or a base
-    /// profile is refused, and a source that is not configured or a
-    /// container that refuses failed. Breaks if a credential that never
-    /// loaded exits as refused, or a refusal stops counting as one.
+    /// A timeout, a container failure the source re-sends or an SSO login
+    /// waiting on a failed refresh may pass, an expired SSO login or STS
+    /// refusing a web identity, a role or a base profile is refused, and a
+    /// source that is not configured or a container that refuses failed.
+    /// Breaks if a credential that never loaded exits as refused, or a
+    /// refusal stops counting as one.
     #[test]
     fn classifies_a_failed_load() {
         let status = |status| Error::Container(container::Error::Status(status));
@@ -562,6 +563,12 @@ pub(super) mod tests {
             ),
             (Error::NoSource(Vec::new()), CredentialFailure::Failed),
             (Error::from(expired), CredentialFailure::Refused),
+            (
+                Error::from(profile::Error::Sso(sso::Error::Token(
+                    sso_token::Error::RefreshFailed,
+                ))),
+                CredentialFailure::Transient,
+            ),
         ] {
             assert_eq!(error.credential_failure(), expected, "{error}");
         }

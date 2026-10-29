@@ -22,7 +22,7 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::CredentialCache;
-use crate::error::{CredentialFailure, Error, error_chain, truncate_quoted};
+use crate::error::{CredentialFailure, Error, OAuthCode, error_chain, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
@@ -257,6 +257,27 @@ fn cli_access_token(stdout: &[u8]) -> Result<String, CredentialError> {
     Ok(body.access_token)
 }
 
+/// What an Azure CLI that gave no token says by `stderr`: refused when it
+/// asks for `az login`, as it does for a login that is missing, expired or
+/// revoked; any other failure, such as an unreachable Entra ID, failed.
+fn cli_failure(stderr: &str) -> CredentialFailure {
+    if stderr.contains("az login") {
+        CredentialFailure::Refused
+    } else {
+        CredentialFailure::Failed
+    }
+}
+
+/// The failure of a chain whose sources failed with `failures`: refused
+/// when any refused the identity, as that source needs a new sign-in
+/// whatever the others did; else transient when any may pass; else failed.
+fn chain_failure(failures: &[CredentialFailure]) -> CredentialFailure {
+    [CredentialFailure::Refused, CredentialFailure::Transient]
+        .into_iter()
+        .find(|failure| failures.contains(failure))
+        .unwrap_or(CredentialFailure::Failed)
+}
+
 /// Internal error for credential chain control flow.
 enum CredentialError {
     /// Credential source is not configured (skip to next).
@@ -336,7 +357,7 @@ impl AzureCredentialChain {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(CredentialError::Failed(
-                CredentialFailure::of_oauth(status, &body),
+                CredentialFailure::of_oauth(status, OAuthCode::read(body.as_bytes())),
                 format!("{source} auth failed: {}", truncate_quoted(&body)),
             ));
         }
@@ -475,12 +496,10 @@ impl AzureCredentialChain {
                 }
             })?;
 
-        // The CLI refuses a token when its login is missing, expired or
-        // revoked: each needs a new `az login`.
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(CredentialError::Failed(
-                CredentialFailure::Refused,
+                cli_failure(&stderr),
                 format!("az CLI failed: {}", truncate_quoted(&stderr)),
             ));
         }
@@ -536,9 +555,7 @@ impl AzureTokenSource for AzureCredentialChain {
             }
 
             let mut errors = Vec::new();
-            // The first source that failed decides, as the one the chain
-            // would have used: a later source's failure says nothing about it.
-            let mut decisive = None;
+            let mut failures = Vec::new();
             for index in [
                 SOURCE_CLIENT_SECRET,
                 SOURCE_WORKLOAD_IDENTITY,
@@ -558,14 +575,14 @@ impl AzureTokenSource for AzureCredentialChain {
                     Err(CredentialError::Failed(failure, reason)) => {
                         tracing::warn!(source = name, "credential failed");
                         errors.push(format!("{name}: {reason}"));
-                        decisive.get_or_insert(failure);
+                        failures.push(failure);
                     }
                 }
             }
 
             Err(Error::cloud_credentials(
                 "ACR",
-                decisive.unwrap_or(CredentialFailure::Failed),
+                chain_failure(&failures),
                 if errors.is_empty() {
                     "no Azure credential sources configured (set AZURE_CLIENT_ID + AZURE_CLIENT_SECRET + AZURE_TENANT_ID, or run on Azure with managed identity, or install Azure CLI)".into()
                 } else {
@@ -715,6 +732,47 @@ impl AuthProvider for AcrAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chain is refused when any source refused, whichever failed first,
+    /// else transient when any may pass. Breaks if a refused CLI login is
+    /// hidden by a metadata probe that failed before it, or a refusal
+    /// stops counting as one.
+    #[test]
+    fn a_chain_is_refused_when_any_source_was() {
+        use CredentialFailure::{Failed, Refused, Transient};
+        for (failures, expected) in [
+            (&[][..], Failed),
+            (&[Failed, Refused], Refused),
+            (&[Refused, Transient], Refused),
+            (&[Failed, Transient], Transient),
+            (&[Failed], Failed),
+        ] {
+            assert_eq!(chain_failure(failures), expected, "{failures:?}");
+        }
+    }
+
+    /// An Azure CLI asking for `az login` refuses, and one that cannot
+    /// reach Entra ID failed. Breaks if every CLI failure exits as refused
+    /// credentials, or an expired login stops counting as refused.
+    #[test]
+    fn a_cli_asking_for_login_is_refused() {
+        for (stderr, expected) in [
+            (
+                "ERROR: AADSTS700082: The refresh token has expired. To re-authenticate, please run:\naz login",
+                CredentialFailure::Refused,
+            ),
+            (
+                "ERROR: Please run 'az login' to setup account.",
+                CredentialFailure::Refused,
+            ),
+            (
+                "ERROR: HTTPSConnectionPool(host='login.microsoftonline.com', port=443): Max retries exceeded",
+                CredentialFailure::Failed,
+            ),
+        ] {
+            assert_eq!(cli_failure(stderr), expected, "{stderr}");
+        }
+    }
 
     /// Azure CLI output with a mistyped token is refused without the
     /// value. Breaks if the output is read with the raw parser.

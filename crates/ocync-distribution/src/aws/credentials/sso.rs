@@ -74,6 +74,7 @@ impl Error {
     pub(super) fn credential_failure(&self) -> CredentialFailure {
         match self {
             Self::Token(sso_token::Error::Expired) => CredentialFailure::Refused,
+            Self::Token(sso_token::Error::RefreshFailed) => CredentialFailure::Transient,
             Self::Call(failure) => failure.credential_failure(),
             _ => CredentialFailure::Failed,
         }

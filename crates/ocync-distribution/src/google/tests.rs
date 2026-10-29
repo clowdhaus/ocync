@@ -289,6 +289,7 @@ fn classifies_answers() {
         call: Call::UserToken,
         status: http::StatusCode::from_u16(code).unwrap(),
         body: String::new(),
+        code: None,
     };
     for (code, transient) in [
         (500, true),

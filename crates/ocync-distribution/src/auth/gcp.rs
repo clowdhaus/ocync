@@ -432,6 +432,7 @@ mod tests {
             call,
             status,
             body: body.to_owned(),
+            code: crate::error::OAuthCode::read(body.as_bytes()),
         };
         let status = |call, status| answer(call, status, "");
         let metadata = google::Call::Metadata;
@@ -492,6 +493,7 @@ mod tests {
                     call: google::Call::Metadata,
                     status: http::StatusCode::SERVICE_UNAVAILABLE,
                     body: String::new(),
+                    code: None,
                 })
             })
         }
@@ -552,6 +554,7 @@ mod tests {
                             call: google::Call::Metadata,
                             status: http::StatusCode::UNAUTHORIZED,
                             body: "mock: no more tokens".to_owned(),
+                            code: None,
                         })?;
                 Ok(AccessToken {
                     token: token.into(),
