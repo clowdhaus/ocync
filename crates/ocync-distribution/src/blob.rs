@@ -332,8 +332,9 @@ impl RegistryClient {
         //
         // Cannot use send_with_aimd here: the stream is consumed once, so
         // the 401-retry closure pattern (which rebuilds the request) does
-        // not work. Auth was validated by the POST above; if the PUT gets
-        // a 401, the engine-level retry re-pulls and re-pushes.
+        // not work. Auth was validated by the POST above; a 401 on this PUT
+        // fails the blob for the run, as neither this client nor the engine
+        // retries a 401.
         let permit = self.aimd.acquire(RegistryAction::BlobUploadComplete).await;
         let headers = self.auth_headers(&scopes).await?;
         let digest_str = expected_digest.to_string();

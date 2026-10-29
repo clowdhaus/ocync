@@ -364,7 +364,7 @@ pub struct RegistryClient {
     /// deadlock if both came from one semaphore.
     pub(crate) blob_download_sem: Arc<Semaphore>,
     /// Byte-budget semaphore for in-flight buffered blob bodies. One
-    /// permit == one byte. Acquired by the GHCR / GAR / ACR fallback
+    /// permit == one byte. Acquired by the GHCR / ACR fallback
     /// upload paths (which buffer the entire blob) before
     /// `buffer_stream`, released when the buffered upload completes. The
     /// total permit count caps cross-call resident bytes regardless of
