@@ -22,7 +22,7 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::CredentialCache;
-use crate::error::{Error, error_chain, parse_json, truncate_quoted};
+use crate::error::{Error, error_chain, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
@@ -39,7 +39,7 @@ fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, Error> {
             registry: "ACR".into(),
             reason: format!("JWT payload base64 decode failed: {e}"),
         })?;
-    parse_json(&decoded).map_err(|e| Error::AuthFailed {
+    crate::json::parse(&decoded).map_err(|e| Error::AuthFailed {
         registry: "ACR".into(),
         reason: format!("JWT payload is not valid JSON: {e}"),
     })
@@ -452,7 +452,7 @@ impl AzureCredentialChain {
             )));
         }
 
-        let body: CliTokenResponse = parse_json(&output.stdout)
+        let body: CliTokenResponse = crate::json::parse(&output.stdout)
             .map_err(|e| CredentialError::Failed(format!("az CLI output parse failed: {e}")))?;
 
         Ok(body.access_token)

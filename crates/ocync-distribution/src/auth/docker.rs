@@ -74,7 +74,7 @@ impl DockerConfig {
         let contents = std::fs::read_to_string(path).map_err(|e| Error::CredentialConfig {
             reason: format!("failed to read config at {}: {e}", path.display()),
         })?;
-        serde_json::from_str(&contents).map_err(|e| Error::CredentialConfig {
+        crate::json::parse(&contents).map_err(|e| Error::CredentialConfig {
             reason: format!("failed to parse config at {}: {e}", path.display()),
         })
     }
@@ -297,7 +297,7 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
     }
 
     let resp: HelperResponse =
-        crate::error::parse_json(&output.stdout).map_err(|e| Error::CredentialHelperFailed {
+        crate::json::parse(&output.stdout).map_err(|e| Error::CredentialHelperFailed {
             helper: program,
             reason: format!("invalid JSON response: {e}"),
         })?;

@@ -46,7 +46,6 @@ use self::endpoint::Endpoint;
 pub(crate) use self::endpoint::{InvalidRegion, Region};
 use self::sigv4::encode_pairs;
 use crate::credential_cache::{CredentialCache, remaining};
-use crate::error::{UnreadableJson, parse_json};
 use crate::retry::{is_transient_transport, retrying};
 use crate::scheme::UnsupportedScheme;
 
@@ -453,7 +452,7 @@ enum Failure {
     },
     /// The service's answer could not be read.
     #[error("unreadable response: {0}")]
-    Decode(#[source] UnreadableJson),
+    Decode(#[source] crate::json::Unreadable),
     /// A header to send, such as a credential's session token, holds a byte
     /// a header cannot carry.
     #[error("request has a header that cannot be sent: {0}")]
@@ -1174,7 +1173,7 @@ impl Client {
                 self.credentials.load().await.map(Signing::Signed)
             })
             .await
-            .and_then(|body| parse_json(&body).map_err(Failure::Decode))
+            .and_then(|body| crate::json::parse(&body).map_err(Failure::Decode))
             .map_err(|failure| CallError {
                 service: self.service,
                 operation: O::NAME,
@@ -1488,7 +1487,7 @@ mod tests {
         }
         assert_eq!(kind(501, None), None);
         assert_eq!(kind(400, Some("InvalidParameterException")), None);
-        let undecodable = parse_json::<ProbeOutput>(b"{").unwrap_err();
+        let undecodable = crate::json::parse::<ProbeOutput>(b"{").unwrap_err();
         assert_eq!(Failure::Decode(undecodable).retry_kind(), None);
     }
 

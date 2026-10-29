@@ -429,7 +429,7 @@ pub(super) mod tests {
     /// repeats it.
     #[test]
     fn names_a_printed_cause_once() {
-        let decode = crate::error::parse_json::<u8>("x").unwrap_err();
+        let decode = crate::json::parse::<u8>("x").unwrap_err();
         assert_eq!(
             error_chain(&super::super::Failure::Decode(decode)),
             "unreadable response: not JSON at line 1 column 1"

@@ -113,7 +113,7 @@ pub(in crate::aws) enum CacheError {
     },
     /// The file is not a JSON object.
     #[error("invalid JSON in cached SSO token file")]
-    Json(#[source] serde_json::Error),
+    Json(#[source] crate::json::Unreadable),
     /// A field a token needs is missing, or not a string.
     #[error("missing field `{0}` in cached SSO token file")]
     Missing(&'static str),
@@ -148,7 +148,7 @@ enum RefreshError {
     /// The answer holds no token, or an expiry that is not a count of
     /// seconds.
     #[error("SSO OIDC CreateToken answer could not be read")]
-    Answer(#[source] crate::error::UnreadableJson),
+    Answer(#[source] crate::json::Unreadable),
     /// The refresh did not finish within [`REFRESH_TIMEOUT`].
     #[error("SSO OIDC CreateToken timed out after {} seconds", REFRESH_TIMEOUT.as_secs_f64())]
     TimedOut,
@@ -296,7 +296,7 @@ fn read(host: &Host, path: &Path) -> Result<Cached, CacheError> {
 /// [`json::field`] finds them: a field of another JSON type counts as
 /// missing. Times are RFC 3339 in UTC.
 fn parse(bytes: &[u8]) -> Result<Cached, CacheError> {
-    let document: Map<String, Value> = serde_json::from_slice(bytes).map_err(CacheError::Json)?;
+    let document: Map<String, Value> = crate::json::parse(bytes).map_err(CacheError::Json)?;
     let text = |name: &'static str| json::field(&document, &[name], Value::as_str);
     let time = |name: &'static str| {
         text(name)
@@ -373,7 +373,7 @@ async fn refresh(
         .call_unsigned(&request, &[])
         .await
         .map_err(RefreshError::Call)?;
-    crate::error::parse_json(&answer).map_err(RefreshError::Answer)
+    crate::json::parse(&answer).map_err(RefreshError::Answer)
 }
 
 /// Write `refreshed` over the token cached at `path`, as upstream writes

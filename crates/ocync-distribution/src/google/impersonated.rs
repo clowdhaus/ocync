@@ -83,7 +83,7 @@ impl Account {
         scopes: Scopes,
         setup: &Setup<'_>,
     ) -> Result<Self, Error> {
-        let file: ImpersonatedFile = serde_json::from_value(json).map_err(Error::Parse)?;
+        let file: ImpersonatedFile = crate::json::value_as(json).map_err(Error::Parse)?;
         let url = parse_impersonation_url(&file.service_account_impersonation_url)?;
         let kind = match CredentialType::of(&file.source_credentials)? {
             CredentialType::Impersonated => return Err(Error::NestedImpersonation),

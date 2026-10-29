@@ -151,8 +151,7 @@ impl Format {
         match self {
             Self::Text => Ok(Secret(text)),
             Self::Json { field } => {
-                let mut json: Value =
-                    crate::error::parse_json(&text).map_err(Error::SubjectJson)?;
+                let mut json: Value = crate::json::parse(&text).map_err(Error::SubjectJson)?;
                 match json.get_mut(field).map(Value::take) {
                     Some(Value::String(token)) => Ok(Secret(token)),
                     _ => Err(Error::SubjectField(field.clone())),
@@ -359,7 +358,7 @@ impl Account {
         scopes: Scopes,
         setup: &Setup<'_>,
     ) -> Result<Self, Error> {
-        let file: AccountFile = serde_json::from_value(json).map_err(Error::Parse)?;
+        let file: AccountFile = crate::json::value_as(json).map_err(Error::Parse)?;
         if file.workforce_pool_user_project.is_some() && Pool::of(&file.audience) == Pool::Other {
             return Err(Error::WorkforceProject);
         }

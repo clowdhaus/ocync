@@ -74,7 +74,7 @@ impl AuthorizedUser {
     /// The user `json` describes, asking for `scopes`. A universe other than
     /// `googleapis.com` is refused, as upstream.
     pub(super) fn from_json(json: Value, scopes: Scopes) -> Result<Self, Error> {
-        let file: UserFile = serde_json::from_value(json).map_err(Error::Parse)?;
+        let file: UserFile = crate::json::value_as(json).map_err(Error::Parse)?;
         if file
             .universe_domain
             .as_deref()

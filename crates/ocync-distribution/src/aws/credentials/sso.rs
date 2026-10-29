@@ -51,7 +51,7 @@ pub(in crate::aws) enum Error {
     Call(#[source] Box<Failure>),
     /// The answer is not the JSON the call answers with.
     #[error("SSO GetRoleCredentials answer could not be read")]
-    Answer(#[source] crate::error::UnreadableJson),
+    Answer(#[source] crate::json::Unreadable),
     /// The answer holds no credentials.
     #[error("SSO did not return credentials")]
     NoCredentials,
@@ -117,7 +117,7 @@ struct RoleCredentials {
 
 /// The credentials in the answer `body`.
 fn credentials(body: &[u8]) -> Result<Credentials, Error> {
-    let answer: Answer = crate::error::parse_json(body).map_err(Error::Answer)?;
+    let answer: Answer = crate::json::parse(body).map_err(Error::Answer)?;
     let role = answer.role_credentials.ok_or(Error::NoCredentials)?;
     let access_key_id = role.access_key_id.ok_or(Error::NoAccessKeyId)?;
     let secret_access_key = role.secret_access_key.ok_or(Error::NoSecretKey)?;
