@@ -1,40 +1,24 @@
 //! Coalescing token cache shared by every Bearer-token auth provider.
 //!
-//! Wraps two maps:
-//!
-//! - `cache` -- the live tokens, keyed by scope.
-//! - `inflight` -- per-scope slots, each holding the scope's last failed
-//!   fetch, so concurrent callers for the same scope serialize through a
-//!   single fetch while callers for distinct scopes proceed in parallel.
-//!
-//! The double-checked cache read after the per-scope mutex is acquired
-//! makes a waiter wake to a populated cache when a peer completes
-//! successfully, so a successful fetch produces exactly one token
-//! exchange regardless of fan-out. A waiter that wakes to a fetch that
-//! failed after it asked gets that failure, so a failing endpoint also
-//! costs one exchange per wave of callers, not one per caller.
+//! The live tokens are kept by scope. A fetch for a scope runs once
+//! however many callers need it: the callers that ask while it is in
+//! flight get its result, a failure included, so a failing endpoint costs
+//! one exchange per wave of callers, not one per caller. Callers for
+//! distinct scopes proceed in parallel.
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
-
-use tokio::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::Token;
-use crate::credential_cache::{Failures, LastFailure};
 use crate::error::Error;
+use crate::flight::{Flights, Landed};
 
-/// A scope's fetch slot, held while fetching: the scope's last failed fetch.
-type Slot = Arc<Mutex<LastFailure<Error>>>;
-
-/// Coalescing token cache. Same-scope fetches serialize, distinct scopes
-/// run in parallel. See module-level docs for the synchronization model.
+/// Coalescing token cache. See the module docs.
 #[derive(Debug, Default)]
 pub(super) struct TokenCache {
     cache: Mutex<HashMap<String, Token>>,
-    /// Per scope, the fetch slot.
-    inflight: Mutex<HashMap<String, Slot>>,
-    failures: Failures,
+    flights: Flights<String, Result<Token, Error>>,
 }
 
 impl TokenCache {
@@ -42,81 +26,54 @@ impl TokenCache {
         Self::default()
     }
 
+    fn tokens(&self) -> MutexGuard<'_, HashMap<String, Token>> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Number of entries currently in the token cache. Used for log
     /// diagnostics on invalidation.
     pub(super) async fn len(&self) -> usize {
-        self.cache.lock().await.len()
+        self.tokens().len()
     }
 
     /// Look up a cached token for `key`, or invoke `fetch` to produce
-    /// one. Concurrent callers for the same `key` coalesce through a
-    /// per-scope mutex; callers for distinct keys hold distinct
-    /// mutexes and run in parallel. On a successful fetch the token
-    /// is inserted into the cache. On error the entry is left empty: a
-    /// caller that asked before the failure gets its error, and one that
-    /// asks after it fetches again.
+    /// one. Concurrent callers for the same `key` share one fetch and its
+    /// result; a caller that asks after a failure fetches again.
     pub(super) async fn get_or_fetch<F, Fut>(&self, key: String, fetch: F) -> Result<Token, Error>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Token, Error>>,
     {
-        if let Some(token) = self
-            .cache
-            .lock()
-            .await
-            .get(&key)
-            .filter(|t| t.is_valid())
-            .cloned()
-        {
-            return Ok(token);
-        }
-
-        let asked = self.failures.ask();
-        let key_mutex = {
-            let mut map = self.inflight.lock().await;
-            Arc::clone(map.entry(key.clone()).or_insert_with(Slot::default))
+        let stored = || {
+            self.tokens()
+                .get(&key)
+                .filter(|token| token.is_valid())
+                .cloned()
+                .map(Ok)
         };
-        let mut failed = key_mutex.lock().await;
-
-        // Re-check the cache after acquiring the per-scope mutex: a
-        // concurrent caller for the same scope may have populated it.
-        if let Some(token) = self
-            .cache
-            .lock()
+        let fetch = || async {
+            let token = fetch().await?;
+            self.tokens().insert(key.clone(), token.clone());
+            Ok(token)
+        };
+        match self
+            .flights
+            .run(key.clone(), stored, fetch, |result| Some(result.clone()))
             .await
-            .get(&key)
-            .filter(|t| t.is_valid())
-            .cloned()
         {
-            return Ok(token);
-        }
-
-        if let Some(error) = failed.since(asked) {
-            return Err(error);
-        }
-
-        match fetch().await {
-            Ok(token) => {
-                self.failures.succeeded(&mut failed);
-                self.cache.lock().await.insert(key, token.clone());
-                Ok(token)
-            }
-            Err(error) => {
-                self.failures.record(&mut failed, error.clone());
-                Err(error)
-            }
+            Landed::Own(result) | Landed::Shared(result) => result,
         }
     }
 
-    /// Drop every cached token and every per-scope coalescing slot.
+    /// Drop every cached token.
     pub(super) async fn clear(&self) {
-        self.cache.lock().await.clear();
-        self.inflight.lock().await.clear();
+        self.tokens().clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -249,18 +206,16 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn clear_drops_cache_and_inflight() {
-        // Seed the cache and the inflight map.
+        // Seed the cache.
         let cache = TokenCache::new();
         cache
             .get_or_fetch("scope".to_string(), || async { Ok(token("first")) })
             .await
             .unwrap();
         assert_eq!(cache.len().await, 1);
-        assert!(!cache.inflight.lock().await.is_empty());
 
         cache.clear().await;
         assert_eq!(cache.len().await, 0);
-        assert!(cache.inflight.lock().await.is_empty());
 
         // Post-clear, a same-key fetch must reach the fetcher again.
         let attempts = Arc::new(AtomicUsize::new(0));

@@ -18,6 +18,8 @@ pub mod digest;
 pub mod ecr;
 /// Error types for OCI distribution operations.
 pub mod error;
+/// One fetch in flight per key, shared with the callers that wait on it.
+mod flight;
 /// Google Cloud Application Default Credentials.
 mod google;
 /// JSON decoding shared by the registry and AWS clients.
