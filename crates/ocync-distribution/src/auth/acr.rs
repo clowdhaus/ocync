@@ -242,6 +242,14 @@ async fn exchange_access_token(
     Ok(resp.access_token)
 }
 
+/// The access token in the Azure CLI's `stdout`. A refused value is left
+/// out of the error, as it can be the token.
+fn cli_access_token(stdout: &[u8]) -> Result<String, CredentialError> {
+    let body: CliTokenResponse = crate::json::parse(stdout)
+        .map_err(|e| CredentialError::Failed(format!("az CLI output parse failed: {e}")))?;
+    Ok(body.access_token)
+}
+
 /// Internal error for credential chain control flow.
 enum CredentialError {
     /// Credential source is not configured (skip to next).
@@ -452,10 +460,7 @@ impl AzureCredentialChain {
             )));
         }
 
-        let body: CliTokenResponse = crate::json::parse(&output.stdout)
-            .map_err(|e| CredentialError::Failed(format!("az CLI output parse failed: {e}")))?;
-
-        Ok(body.access_token)
+        cli_access_token(&output.stdout)
     }
 
     async fn try_source(&self, index: usize) -> Result<String, CredentialError> {
@@ -674,6 +679,21 @@ impl AuthProvider for AcrAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Azure CLI output with a mistyped token is refused without the
+    /// value. Breaks if the output is read with the raw parser.
+    #[test]
+    fn mistyped_cli_output_leaves_the_token_out() {
+        let Err(CredentialError::Failed(reason)) = cli_access_token(br#"{"accessToken": 735017}"#)
+        else {
+            panic!("accepted");
+        };
+        assert!(
+            reason.contains("invalid type: integer, expected a string"),
+            "{reason}"
+        );
+        assert!(!reason.contains("735017"), "{reason}");
+    }
 
     use std::collections::VecDeque;
 
