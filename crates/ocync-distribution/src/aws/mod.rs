@@ -1104,13 +1104,10 @@ impl SigningError {
         )))
     }
 
-    /// The error of a call AWS answered with 403 Forbidden.
-    pub(crate) fn forbidden() -> Self {
-        Self(Failure::Service(ServiceError::parse(
-            StatusCode::FORBIDDEN,
-            None,
-            b"",
-            &[],
+    /// The error of a web identity load that STS refused.
+    pub(crate) fn refused() -> Self {
+        Self(Failure::Credentials(Arc::new(
+            credentials::tests::web_identity_refused(),
         )))
     }
 }

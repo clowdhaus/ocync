@@ -433,9 +433,16 @@ impl AzureCredentialChain {
                 ),
             ));
         }
+        // Another cloud's metadata server can answer at this address, and
+        // Azure's answers 404 or 410 while it updates: no status here
+        // refuses an Azure identity.
         if !status.is_success() {
+            let failure = match CredentialFailure::of_status(status) {
+                CredentialFailure::Refused => CredentialFailure::Failed,
+                other => other,
+            };
             return Err(CredentialError::Failed(
-                CredentialFailure::of_status(status),
+                failure,
                 format!("IMDS returned {status}"),
             ));
         }
@@ -530,7 +537,9 @@ impl AzureTokenSource for AzureCredentialChain {
             }
 
             let mut errors = Vec::new();
-            let mut failures = Vec::new();
+            // The first source that failed decides, as the one the chain
+            // would have used: a later source's failure says nothing about it.
+            let mut decisive = None;
             for index in [
                 SOURCE_CLIENT_SECRET,
                 SOURCE_WORKLOAD_IDENTITY,
@@ -550,14 +559,14 @@ impl AzureTokenSource for AzureCredentialChain {
                     Err(CredentialError::Failed(failure, reason)) => {
                         tracing::warn!(source = name, "credential failed");
                         errors.push(format!("{name}: {reason}"));
-                        failures.push(failure);
+                        decisive.get_or_insert(failure);
                     }
                 }
             }
 
             Err(Error::cloud_credentials(
                 "ACR",
-                combined(&failures),
+                decisive.unwrap_or(CredentialFailure::Failed),
                 if errors.is_empty() {
                     "no Azure credential sources configured (set AZURE_CLIENT_ID + AZURE_CLIENT_SECRET + AZURE_TENANT_ID, or run on Azure with managed identity, or install Azure CLI)".into()
                 } else {
@@ -568,15 +577,6 @@ impl AzureTokenSource for AzureCredentialChain {
                 },
             ))
         })
-    }
-}
-
-/// The failure of a chain whose sources failed with `failures`: refused or
-/// transient only when every one was, else failed.
-fn combined(failures: &[CredentialFailure]) -> CredentialFailure {
-    match failures.split_first() {
-        Some((first, rest)) if rest.iter().all(|f| f == first) => *first,
-        _ => CredentialFailure::Failed,
     }
 }
 
@@ -839,14 +839,13 @@ mod tests {
     impl AzureTokenSource for MockAzureTokenSource {
         fn get_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>> {
             Box::pin(async move {
-                self.tokens
-                    .lock()
-                    .await
-                    .pop_front()
-                    .ok_or_else(|| Error::AuthFailed {
-                        registry: "mock-acr".into(),
-                        reason: "mock: no more tokens".into(),
-                    })
+                self.tokens.lock().await.pop_front().ok_or_else(|| {
+                    Error::cloud_credentials(
+                        "mock-acr",
+                        CredentialFailure::Failed,
+                        "mock: no more tokens",
+                    )
+                })
             })
         }
 
@@ -925,22 +924,6 @@ mod tests {
         assert_eq!(failure, CredentialFailure::Transient);
     }
 
-    /// A chain is refused or transient only when every source that failed
-    /// was. Breaks if one refusal among other failures exits as refused
-    /// credentials, or a chain every source refused stops counting as one.
-    #[test]
-    fn a_chain_fails_as_all_its_sources_did() {
-        use CredentialFailure::{Failed, Refused, Transient};
-        for (failures, expected) in [
-            (&[][..], Failed),
-            (&[Refused, Refused], Refused),
-            (&[Transient], Transient),
-            (&[Refused, Transient], Failed),
-        ] {
-            assert_eq!(combined(failures), expected, "{failures:?}");
-        }
-    }
-
     #[tokio::test]
     async fn acr_exchange_propagates_401() {
         crate::install_crypto_provider();
@@ -1013,6 +996,7 @@ mod tests {
             err.to_string().contains("response parse failed"),
             "got: {err}"
         );
+        assert!(!err.is_auth_error(), "{err}");
     }
 
     #[tokio::test]

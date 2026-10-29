@@ -349,6 +349,18 @@ pub(super) mod tests {
         }
     }
 
+    /// STS answering a call with 403 Forbidden.
+    fn sts_refused() -> sts::Error {
+        sts::Error::Call(Box::new(super::super::Failure::Service(
+            super::super::ServiceError::parse(http::StatusCode::FORBIDDEN, None, b"", &[]),
+        )))
+    }
+
+    /// A web identity load that STS refused.
+    pub(in crate::aws) fn web_identity_refused() -> Error {
+        Error::WebIdentity(web_identity::Error::Sts(sts_refused()))
+    }
+
     /// The chain of `host` with `profile` selected, for calls in
     /// `us-east-1`.
     fn chain_of(host: &Host, profile: Option<&str>) -> Chain {
@@ -528,18 +540,11 @@ pub(super) mod tests {
     fn classifies_a_failed_load() {
         let status = |status| Error::Container(container::Error::Status(status));
         let expired = profile::Error::Sso(sso::Error::Token(sso_token::Error::Expired));
-        let sts_refused = || {
-            sts::Error::Call(Box::new(super::super::Failure::Service(
-                super::super::ServiceError::parse(http::StatusCode::FORBIDDEN, None, b"", &[]),
-            )))
-        };
         let role = profile::Error::AssumeRole {
             arn: "arn:aws:iam::123456789012:role/test-role".to_owned(),
             source: sts_refused(),
         };
-        let base = profile::Error::Base(Box::new(Error::WebIdentity(web_identity::Error::Sts(
-            sts_refused(),
-        ))));
+        let base = profile::Error::Base(Box::new(web_identity_refused()));
         for (error, expected) in [
             (Error::from(role), CredentialFailure::Refused),
             (Error::from(base), CredentialFailure::Refused),

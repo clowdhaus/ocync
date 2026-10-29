@@ -420,26 +420,40 @@ mod tests {
     use super::*;
 
     /// Only a refusal, by Google or by AWS for an AWS subject token, is an
-    /// auth error: a failure that may pass, an AWS subject token whose
-    /// credentials timed out, or credentials that do not read are not.
+    /// auth error: a failure that may pass, a metadata server with no
+    /// service account, an AWS region lookup refused, an AWS subject token
+    /// whose credentials timed out, or credentials that do not read are not.
     /// Breaks if any of these exits as refused credentials, or a refusal
     /// stops counting as one.
     #[test]
     fn only_a_google_refusal_is_an_auth_error() {
-        let status = |status| google::Error::Status {
-            call: google::Call::Metadata,
+        let status = |call, status| google::Error::Status {
+            call,
             status,
             body: String::new(),
         };
+        let metadata = google::Call::Metadata;
         for (failure, auth_error) in [
-            (status(http::StatusCode::SERVICE_UNAVAILABLE), false),
-            (status(http::StatusCode::UNAUTHORIZED), true),
+            (
+                status(metadata, http::StatusCode::SERVICE_UNAVAILABLE),
+                false,
+            ),
+            (status(metadata, http::StatusCode::UNAUTHORIZED), true),
+            (status(metadata, http::StatusCode::NOT_FOUND), false),
+            (
+                status(google::Call::StsExchange, http::StatusCode::BAD_REQUEST),
+                true,
+            ),
+            (
+                status(google::Call::AwsRegion, http::StatusCode::UNAUTHORIZED),
+                false,
+            ),
             (
                 google::Error::AwsSigning(crate::aws::SigningError::timed_out()),
                 false,
             ),
             (
-                google::Error::AwsSigning(crate::aws::SigningError::forbidden()),
+                google::Error::AwsSigning(crate::aws::SigningError::refused()),
                 true,
             ),
             (google::Error::NoSubjectField, false),

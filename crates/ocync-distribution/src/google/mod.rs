@@ -415,13 +415,28 @@ impl Error {
     }
 
     /// Whether Google refused the identity, the call may pass if sent
-    /// again, or something else failed. A 4xx answer that is not
-    /// [transient](Self::is_transient) refuses; an AWS subject token that
-    /// was not signed is classified as the AWS failure under it.
+    /// again, or something else failed. A Google token endpoint's 4xx that
+    /// is not [transient](Self::is_transient) refuses, and the metadata
+    /// server refuses only with 401 or 403: its 404 is a host with no
+    /// service account. A subject token source or the AWS region lookup
+    /// never refuses, as neither is Google judging the identity; an AWS
+    /// subject token that was not signed is classified as the AWS failure
+    /// under it.
     pub(crate) fn credential_failure(&self) -> CredentialFailure {
+        let refusal = |status: http::StatusCode, call: &Call| match call {
+            Call::UserToken | Call::StsExchange | Call::Impersonation => true,
+            Call::Metadata => matches!(
+                status,
+                http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN
+            ),
+            Call::SubjectUrl(_) | Call::AwsRegion => false,
+        };
         match self {
             Self::AwsSigning(error) => error.credential_failure(),
-            Self::Status { status, .. } => CredentialFailure::of_status(*status),
+            Self::Status { status, call, .. } => match CredentialFailure::of_status(*status) {
+                CredentialFailure::Refused if !refusal(*status, call) => CredentialFailure::Failed,
+                other => other,
+            },
             _ if self.is_transient() => CredentialFailure::Transient,
             _ => CredentialFailure::Failed,
         }
