@@ -2,10 +2,8 @@
 
 /// Azure Container Registry authentication provider.
 pub mod acr;
-/// Anonymous token-exchange authentication.
-pub mod anonymous;
-/// HTTP Basic credential token-exchange authentication.
-pub mod basic;
+/// Token-exchange authentication: anonymous, HTTP Basic or Docker config.
+pub mod configured;
 /// Hostname-based registry provider detection.
 pub mod detect;
 /// Docker config.json credential resolution.

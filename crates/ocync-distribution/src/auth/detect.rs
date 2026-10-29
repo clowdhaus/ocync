@@ -11,8 +11,7 @@ use regex_lite::Regex;
 /// Hostnames that don't match any known provider return `None` from
 /// [`detect_provider_kind`] -- these registries (e.g. Quay, Harbor, private
 /// registries) use the standard OCI token-exchange flow via
-/// [`AnonymousAuth`](super::anonymous::AnonymousAuth) or Docker config
-/// credentials.
+/// [`configured::Auth`](super::configured::Auth).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
     /// AWS Elastic Container Registry (private).
