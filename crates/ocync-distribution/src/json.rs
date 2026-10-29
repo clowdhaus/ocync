@@ -175,13 +175,15 @@ pub(crate) async fn read_capped(
     response: &mut reqwest::Response,
     max: usize,
 ) -> Result<Option<Vec<u8>>, reqwest::Error> {
-    let declared = response
+    // The declared length only refuses: a buffer sized from it would let a
+    // server pick how much memory is taken before any byte arrives.
+    if response
         .content_length()
-        .map(|length| usize::try_from(length).unwrap_or(usize::MAX));
-    if declared.is_some_and(|length| length > max) {
+        .is_some_and(|length| usize::try_from(length).map_or(true, |length| length > max))
+    {
         return Ok(None);
     }
-    let mut body = Vec::with_capacity(declared.unwrap_or_default());
+    let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         if body.len() + chunk.len() > max {
             return Ok(None);
