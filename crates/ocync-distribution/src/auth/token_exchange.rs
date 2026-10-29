@@ -723,22 +723,12 @@ mod tests {
     async fn exchange_anonymous() {
         let mock = wiremock::MockServer::start().await;
 
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v2/"))
-            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{}/token",service="test""#, mock.uri()),
-            ))
+        crate::auth::testing::challenge(&mock, "test")
             .expect(1)
             .mount(&mock)
             .await;
 
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/token"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "anon-tok", "expires_in": 300})),
-            )
+        crate::auth::testing::token("anon-tok")
             .expect(1)
             .mount(&mock)
             .await;
@@ -1033,12 +1023,7 @@ mod tests {
     async fn exchange_multi_scope_query_params() {
         let mock = wiremock::MockServer::start().await;
 
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v2/"))
-            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{}/token",service="svc""#, mock.uri()),
-            ))
+        crate::auth::testing::challenge(&mock, "svc")
             .expect(1)
             .mount(&mock)
             .await;
@@ -1143,23 +1128,13 @@ mod tests {
         let mock = wiremock::MockServer::start().await;
 
         // /v2/ should only be hit once -- the second exchange reuses the cached challenge.
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v2/"))
-            .respond_with(wiremock::ResponseTemplate::new(401).insert_header(
-                "WWW-Authenticate",
-                format!(r#"Bearer realm="{}/token",service="test""#, mock.uri()),
-            ))
+        crate::auth::testing::challenge(&mock, "test")
             .expect(1)
             .mount(&mock)
             .await;
 
         // Token endpoint is called twice (different scopes).
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/token"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "reused", "expires_in": 300})),
-            )
+        crate::auth::testing::token("reused")
             .expect(2)
             .mount(&mock)
             .await;
@@ -1227,10 +1202,10 @@ mod tests {
                 "https://registry.example.com",
                 Verdict::Rejected("userinfo"),
             ),
-            // allows a public IPv6 realm for a hostname registry
+            // allows an IPv6 realm on its own IPv6 registry
             (
                 "https://[2001:db8::1]/token",
-                "https://registry.example.com",
+                "https://[2001:db8::1]:5000",
                 Verdict::Allowed,
             ),
             // rejects non web scheme
@@ -1554,12 +1529,7 @@ mod tests {
 
         for from_cache in [true, false] {
             let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .and(path("/v2/"))
-                .respond_with(ResponseTemplate::new(401).insert_header(
-                    "WWW-Authenticate",
-                    format!(r#"Bearer realm="{}/token",service="test""#, server.uri()),
-                ))
+            crate::auth::testing::challenge(&server, "test")
                 .mount(&server)
                 .await;
             Mock::given(method("GET"))

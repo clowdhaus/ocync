@@ -15,27 +15,28 @@ use ocync_distribution::aimd::{
 // Window key registry mapping
 // ---------------------------------------------------------------------------
 
+const ALL_ACTIONS: [RegistryAction; 9] = [
+    RegistryAction::ManifestHead,
+    RegistryAction::ManifestRead,
+    RegistryAction::ManifestWrite,
+    RegistryAction::BlobHead,
+    RegistryAction::BlobRead,
+    RegistryAction::BlobUploadInit,
+    RegistryAction::BlobUploadChunk,
+    RegistryAction::BlobUploadComplete,
+    RegistryAction::TagList,
+];
+
 /// ECR, FIPS endpoint included, gives each of its 9 actions its own
 /// window. Breaks if two actions share one, so one's throttling slows the
 /// other.
 #[test]
 fn ecr_every_action_gets_distinct_key() {
-    let actions = [
-        RegistryAction::ManifestHead,
-        RegistryAction::ManifestRead,
-        RegistryAction::ManifestWrite,
-        RegistryAction::BlobHead,
-        RegistryAction::BlobRead,
-        RegistryAction::BlobUploadInit,
-        RegistryAction::BlobUploadChunk,
-        RegistryAction::BlobUploadComplete,
-        RegistryAction::TagList,
-    ];
     for host in [
         "123456789012.dkr.ecr.us-east-1.amazonaws.com",
         "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com",
     ] {
-        let keys: std::collections::HashSet<WindowKey> = actions
+        let keys: std::collections::HashSet<WindowKey> = ALL_ACTIONS
             .iter()
             .map(|&a| window_key_for_registry(host, a))
             .collect();
@@ -69,26 +70,15 @@ fn docker_hub_groups_actions_by_quota() {
     }
 }
 
+/// GAR meters every action against one project quota. Breaks if any
+/// action gets its own window.
 #[test]
 fn gar_all_actions_share_single_key() {
-    let host = "us-central1-docker.pkg.dev";
-    let actions = [
-        RegistryAction::ManifestHead,
-        RegistryAction::ManifestRead,
-        RegistryAction::ManifestWrite,
-        RegistryAction::BlobHead,
-        RegistryAction::BlobRead,
-        RegistryAction::BlobUploadInit,
-        RegistryAction::BlobUploadChunk,
-        RegistryAction::BlobUploadComplete,
-        RegistryAction::TagList,
-    ];
-    let first_key = window_key_for_registry(host, actions[0]);
-    for &a in &actions[1..] {
+    for action in ALL_ACTIONS {
         assert_eq!(
-            window_key_for_registry(host, a),
-            first_key,
-            "GAR should map all actions to the same window key"
+            window_key_for_registry("us-central1-docker.pkg.dev", action),
+            WindowKey::GarShared,
+            "{action:?}"
         );
     }
 }

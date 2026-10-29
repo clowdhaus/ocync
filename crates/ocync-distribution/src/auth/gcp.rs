@@ -605,15 +605,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "registry", "expires_in": 300})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
+        testing::token("registry").expect(1).mount(&server).await;
         let auth = GcpAuth::with_api(
             server.uri(),
             crate::test_http_client(),
@@ -725,15 +717,7 @@ mod tests {
             .expect(3)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "registry", "expires_in": 300})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
+        testing::token("registry").expect(1).mount(&server).await;
         let auth = GcpAuth::with_api(
             server.uri(),
             crate::test_http_client(),
@@ -981,14 +965,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "fresh", "expires_in": 300})),
-            )
-            .mount(&server)
-            .await;
+        testing::token("fresh").mount(&server).await;
 
         let auth = GcpAuth::with_api(
             server.uri(),
@@ -1018,15 +995,7 @@ mod tests {
             .await;
 
         // /token hit twice: different scopes produce separate Bearer tokens.
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "tok", "expires_in": 300})),
-            )
-            .expect(2)
-            .mount(&server)
-            .await;
+        testing::token("tok").expect(2).mount(&server).await;
 
         let auth = GcpAuth::with_api(
             server.uri(),

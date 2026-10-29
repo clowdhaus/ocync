@@ -513,14 +513,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "fresh", "expires_in": 300})),
-            )
-            .mount(&server)
-            .await;
+        testing::token("fresh").mount(&server).await;
 
         let encoded = BASE64.encode("AWS:test");
         let api = MockEcrApi::succeeding(&encoded);

@@ -164,13 +164,6 @@ mod tests {
         }
     }
 
-    async fn mount_v2_challenge(server: &MockServer, expect: u64) {
-        testing::challenge(server, "test")
-            .expect(expect)
-            .mount(server)
-            .await;
-    }
-
     async fn mount_token(server: &MockServer, scope: &str, value: &str, expect: u64) {
         Mock::given(method("GET"))
             .and(path("/token"))
@@ -255,7 +248,10 @@ mod tests {
             Case::DockerConfigNoEntry,
         ] {
             let server = MockServer::start().await;
-            mount_v2_challenge(&server, 1).await;
+            testing::challenge(&server, "test")
+                .expect(1)
+                .mount(&server)
+                .await;
             mount_token(&server, "repository:repo:pull", "tok", 1).await;
             let auth = case.auth(&server).await;
             let expected = case.sent();
@@ -295,7 +291,10 @@ mod tests {
     #[tokio::test]
     async fn tokens_are_kept_per_scope() {
         let server = MockServer::start().await;
-        mount_v2_challenge(&server, 1).await;
+        testing::challenge(&server, "test")
+            .expect(1)
+            .mount(&server)
+            .await;
         mount_token(&server, "repository:repo:pull", "pull", 1).await;
         mount_token(&server, "repository:repo:pull,push", "push", 1).await;
         mount_token(&server, "repository:other:pull", "other", 1).await;
@@ -318,7 +317,10 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_drops_only_the_refused_token() {
         let server = MockServer::start().await;
-        mount_v2_challenge(&server, 2).await;
+        testing::challenge(&server, "test")
+            .expect(2)
+            .mount(&server)
+            .await;
         mount_token(&server, "repository:repo:pull", "tok", 2).await;
         let auth = Auth::anonymous(&url(&server), crate::test_http_client());
 
@@ -336,7 +338,10 @@ mod tests {
     #[tokio::test]
     async fn a_failed_exchange_returns_its_error() {
         let server = MockServer::start().await;
-        mount_v2_challenge(&server, 1).await;
+        testing::challenge(&server, "test")
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/token"))
             .respond_with(ResponseTemplate::new(403))

@@ -851,8 +851,6 @@ mod tests {
 
         let client = build_test_client("ghcr.io", port);
 
-        // Pass None so the monolithic threshold does not intercept the call;
-        // we are verifying the GHCR-specific single-PATCH path directly.
         let repo = RepositoryName::new("my-org/my-image").unwrap();
         let result = client
             .blob_push_stream(&repo, &digest, None, data_stream(data, 4))

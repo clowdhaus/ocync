@@ -1085,7 +1085,7 @@ mod tests {
     }
 
     /// A failed exchange names its cause, and only a 401 judges the
-    /// credential refused, which resets the sign-in chain. A redirect is never followed, so a 307 cannot
+    /// credential refused. A redirect is never followed, so a 307 cannot
     /// replay the credential elsewhere. Breaks if a redirect is followed,
     /// an unreadable answer is taken as a refusal, or a 401 is not.
     #[tokio::test]
