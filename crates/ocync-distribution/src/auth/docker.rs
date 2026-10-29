@@ -196,22 +196,7 @@ fn decode_auth(encoded: &str, registry: &str) -> Result<(String, String), Error>
 /// Uses `tokio::process::Command` to avoid blocking the single-threaded
 /// tokio runtime.
 async fn run_credential_helper(helper: &str, registry: &str) -> Result<Option<Credentials>, Error> {
-    // Validate helper name to prevent command injection via crafted
-    // `credsStore` / `credHelpers` values in Docker config.json.
-    if !helper
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-    {
-        return Err(Error::CredentialHelperFailed {
-            helper: helper.to_owned(),
-            reason: format!(
-                "invalid credential helper name: {helper:?} \
-                 (must be alphanumeric, hyphens and dots only)"
-            ),
-        });
-    }
-
-    let program = format!("docker-credential-{helper}");
+    let program = helper_program(helper)?;
 
     let mut child = tokio::process::Command::new(&program)
         .arg("get")
@@ -262,6 +247,25 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Option<Cr
     })?;
 
     helper_credentials(program, registry, &output)
+}
+
+/// The program a helper name runs. The name comes from a config file, so
+/// one that could reach outside the `docker-credential-` prefix, through a
+/// path separator or a shell character, is refused.
+fn helper_program(helper: &str) -> Result<String, Error> {
+    if helper
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return Ok(format!("docker-credential-{helper}"));
+    }
+    Err(Error::CredentialHelperFailed {
+        helper: helper.to_owned(),
+        reason: format!(
+            "invalid credential helper name: {helper:?} \
+             (must be alphanumeric, hyphens and dots only)"
+        ),
+    })
 }
 
 /// The credentials a helper's `output` holds, or none when it reports it
@@ -627,46 +631,23 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn credential_helper_rejects_path_traversal() {
-        let err = run_credential_helper("../../evil", "registry.example.com")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("invalid credential helper name"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn credential_helper_rejects_shell_metacharacters() {
-        let err = run_credential_helper("helper;rm -rf /", "registry.example.com")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("invalid credential helper name"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn credential_helper_accepts_valid_names() {
-        // These should pass validation but fail to execute (no such binary).
-        // Verify the error is CredentialHelperFailed with "failed to execute",
-        // NOT the name-validation error.
-        for name in [
-            "gcloud",
-            "ecr-login",
-            "osxkeychain",
-            "desktop",
-            "desktop.exe",
-        ] {
-            let err = run_credential_helper(name, "registry.example.com")
-                .await
-                .unwrap_err();
+    /// A helper name runs its `docker-credential-` program, and one that
+    /// could reach another program is refused. Breaks if a path or shell
+    /// character gets through, or a real helper name, WSL's `desktop.exe`
+    /// among them, is refused.
+    #[test]
+    fn a_helper_name_runs_only_its_own_program() {
+        for name in ["gcloud", "ecr-login", "osxkeychain", "desktop.exe"] {
+            assert_eq!(
+                helper_program(name).unwrap(),
+                format!("docker-credential-{name}")
+            );
+        }
+        for name in ["../../evil", "helper;rm -rf /", "a/b"] {
+            let err = helper_program(name).unwrap_err();
             assert!(
-                !err.to_string().contains("invalid credential helper name"),
-                "valid name {name:?} was rejected: {err}"
+                err.to_string().contains("invalid credential helper name"),
+                "{name}: {err}"
             );
         }
     }
