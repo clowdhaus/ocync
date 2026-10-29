@@ -835,8 +835,8 @@ mod tests {
     #[tokio::test]
     async fn a_refused_connection_is_named() {
         crate::install_crypto_provider();
-        let address = crate::error::REFUSING;
-        let refused = crate::error::refusal();
+        let address = crate::REFUSING;
+        let refused = crate::refusal();
         let base_url = format!("http://{address}");
         let http = no_redirect_http_client();
 

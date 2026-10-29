@@ -122,6 +122,19 @@ pub fn test_http_client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
+/// A loopback address nothing listens on.
+#[cfg(test)]
+const REFUSING: &str = "127.0.0.1:1";
+
+/// What a connection to [`REFUSING`] reports, for tests of a refused
+/// connection.
+#[cfg(test)]
+fn refusal() -> String {
+    std::net::TcpStream::connect(REFUSING)
+        .unwrap_err()
+        .to_string()
+}
+
 pub use aws::AwsCredentialProviders;
 pub use blob::MountResult;
 pub use client::{RegistryClient, RegistryClientBuilder};

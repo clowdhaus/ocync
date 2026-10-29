@@ -2000,11 +2000,7 @@ mod tests {
         let client = Client::from_parts(parts).unwrap();
         let err = client.call(&Probe {}).await.unwrap_err();
         let text = err.to_string();
-        // The operating system's own words for the refusal, from a plain
-        // connection to the same closed port.
-        let refused = std::net::TcpStream::connect("127.0.0.1:1")
-            .unwrap_err()
-            .to_string();
+        let refused = crate::refusal();
         assert!(
             text.ends_with(&refused),
             "{text} does not end with {refused}"

@@ -307,36 +307,19 @@ pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     chains.swap_remove(0)
 }
 
-/// The source of `error` whose text may be shown. A body that failed to
-/// decode is described by its parser, which quotes the body, and a body can
-/// carry a token.
+/// The source of `error` whose text may be shown. The JSON parser's text
+/// for a response body the HTTP client could not decode quotes the value it
+/// refused, and a body can carry a token, so it is not shown.
 fn shown_source<'a>(
     error: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a (dyn std::error::Error + 'static)> {
-    // `Error::Http` holds its cause shared, so either form can turn up.
-    let http = error.downcast_ref::<reqwest::Error>().or_else(|| {
-        error
-            .downcast_ref::<Arc<reqwest::Error>>()
-            .map(|shared| &**shared)
-    });
-    if http.is_some_and(reqwest::Error::is_decode) {
-        return None;
-    }
-    error.source()
+    // `Error::Http` holds the client's error shared, so either form can be
+    // the parent.
+    let from_http = error.is::<reqwest::Error>() || error.is::<Arc<reqwest::Error>>();
+    error
+        .source()
+        .filter(|source| !(from_http && source.is::<serde_json::Error>()))
 }
-
-/// What a connection to a closed loopback port reports, for tests of a
-/// refused connection.
-#[cfg(test)]
-pub(crate) fn refusal() -> String {
-    std::net::TcpStream::connect(REFUSING)
-        .unwrap_err()
-        .to_string()
-}
-
-/// A loopback address nothing listens on.
-#[cfg(test)]
-pub(crate) const REFUSING: &str = "127.0.0.1:1";
 
 /// The most of an external body or stream kept in an error, in bytes.
 pub(crate) const MAX_QUOTED_BYTES: usize = 200;
@@ -364,10 +347,10 @@ mod tests {
     /// cause the text already holds is repeated.
     #[tokio::test]
     async fn an_http_error_names_its_cause_once() {
-        let refused = refusal();
+        let refused = crate::refusal();
         let err = Error::from(
             crate::test_http_client()
-                .get(format!("http://{REFUSING}/v2/"))
+                .get(format!("http://{}/v2/", crate::REFUSING))
                 .send()
                 .await
                 .unwrap_err(),
@@ -375,6 +358,34 @@ mod tests {
         let text = err.to_string();
         assert!(text.ends_with(&refused), "{text}");
         assert_eq!(error_chain(&err), text);
+    }
+
+    /// A body cut off partway names why reading it stopped. Breaks if a
+    /// body-read failure is cut back to its top line.
+    #[tokio::test]
+    async fn a_cut_off_body_names_its_cause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        let response = crate::test_http_client()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let err = Error::from(response.bytes().await.unwrap_err());
+        let text = err.to_string();
+        let top = text.split(": ").take(2).collect::<Vec<_>>().join(": ");
+        assert!(text.len() > top.len(), "{text}");
     }
 
     /// A body that fails to decode is named as such, without the parser's
