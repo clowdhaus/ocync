@@ -42,6 +42,8 @@ pub mod spec;
 pub mod tags;
 #[cfg(test)]
 mod test_logs;
+#[cfg(test)]
+mod test_net;
 
 /// What a secret prints as in a `Debug` rendering.
 pub(crate) const REDACTED: &str = "[REDACTED]";

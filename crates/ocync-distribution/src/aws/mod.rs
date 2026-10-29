@@ -1995,9 +1995,7 @@ mod tests {
     /// refused connection is dropped from the text callers keep.
     #[tokio::test]
     async fn transport_errors_name_their_cause_without_the_endpoint_url() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let (_refusing, address) = crate::test_net::refusing();
         let mut parts = parts(&format!("http://{address}/secret-key"));
         parts.api.retry = strategy(NonZeroU32::MIN);
         let client = Client::from_parts(parts).unwrap();

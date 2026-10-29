@@ -3,7 +3,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::PoisonError;
+use std::sync::{PoisonError, RwLock, RwLockWriteGuard};
 use std::time::{Duration, SystemTime};
 
 use tokio::time::Instant;
@@ -30,7 +30,7 @@ pub(crate) fn remaining(until: SystemTime) -> Duration {
 /// callers that waited on a refresh that failed. A cache that never shares
 /// one leaves it [`Infallible`], and its waiters refresh for themselves.
 pub(crate) struct CredentialCache<T, E = Infallible> {
-    entry: std::sync::RwLock<Option<CacheEntry<T>>>,
+    entry: RwLock<Option<CacheEntry<T>>>,
     /// A value with less than this left is refreshed.
     refresh_window: Duration,
     flights: Flights<(), Result<T, E>>,
@@ -68,7 +68,7 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
     /// Create an empty cache that refreshes `window` before expiry.
     pub(crate) fn with_refresh_window(window: Duration) -> Self {
         Self {
-            entry: std::sync::RwLock::new(None),
+            entry: RwLock::new(None),
             refresh_window: window,
             flights: Flights::default(),
         }
@@ -79,16 +79,23 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
     async fn refresh<F>(
         &self,
         refresh: impl Future<Output = Result<(T, Duration), F>>,
-        share: impl FnOnce(&Result<T, F>) -> Option<Result<T, E>>,
-    ) -> Landed<Result<T, F>, Result<T, E>> {
-        let fetch = || async {
-            let (value, ttl) = refresh.await?;
-            *self.write() = Some(CacheEntry::new(value.clone(), ttl));
-            Ok(value)
+        share: impl FnOnce(&Result<(T, Duration), F>) -> Option<Result<T, E>>,
+    ) -> Result<T, Landed<F, E>> {
+        let land = |result: &Result<(T, Duration), F>| {
+            if let Ok((value, ttl)) = result {
+                *self.write() = Some(CacheEntry::new(value.clone(), *ttl));
+            }
+            share(result)
         };
-        self.flights
-            .run((), || self.fresh().map(Ok), fetch, share)
+        match self
+            .flights
+            .run(&(), || self.fresh().map(Ok), || refresh, land)
             .await
+        {
+            Landed::Own(Ok((value, _))) | Landed::Shared(Ok(value)) => Ok(value),
+            Landed::Own(Err(error)) => Err(Landed::Own(error)),
+            Landed::Shared(Err(error)) => Err(Landed::Shared(error)),
+        }
     }
 
     /// The value, if fresh.
@@ -101,7 +108,7 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
             .map(|entry| entry.value.clone())
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<CacheEntry<T>>> {
+    fn write(&self) -> RwLockWriteGuard<'_, Option<CacheEntry<T>>> {
         self.entry.write().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -113,27 +120,45 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         &self,
         refresh: impl Future<Output = Result<(T, Duration), E>>,
     ) -> Result<T, E> {
-        match self.refresh(refresh, |result| Some(result.clone())).await {
-            Landed::Own(result) | Landed::Shared(result) => result,
-        }
+        let share = |result: &Result<(T, Duration), E>| {
+            Some(
+                result
+                    .as_ref()
+                    .map(|(value, _)| value.clone())
+                    .map_err(E::clone),
+            )
+        };
+        self.refresh(refresh, share)
+            .await
+            .map_err(|(Landed::Own(error) | Landed::Shared(error))| error)
     }
 
-    /// Clear the cached value, forcing the next caller to refresh.
-    pub(crate) async fn clear(&self) {
-        *self.write() = None;
+    /// Clear the cached value, and cut off a refresh in flight: a caller
+    /// that asks afterwards refreshes again, and a refresh begun before
+    /// neither stores its value nor hands it to a later caller.
+    pub(crate) fn clear(&self) {
+        self.flights.forget(|| {
+            *self.write() = None;
+            true
+        });
     }
 
-    /// Clear the cached value if `matches` says it is the one to drop.
-    pub(crate) async fn clear_if(&self, matches: impl FnOnce(&T) -> bool) {
-        let mut entry = self.write();
-        if entry.as_ref().is_some_and(|entry| matches(&entry.value)) {
-            *entry = None;
-        }
+    /// As [`Self::clear`], if `matches` says the cached value is the one to
+    /// drop.
+    pub(crate) fn clear_if(&self, matches: impl FnOnce(&T) -> bool) {
+        self.flights.forget(|| {
+            let mut entry = self.write();
+            let drop = entry.as_ref().is_some_and(|entry| matches(&entry.value));
+            if drop {
+                *entry = None;
+            }
+            drop
+        });
     }
 
     /// Replace the cached value (test helper).
     #[cfg(test)]
-    pub(crate) async fn set(&self, value: T, ttl: Duration) {
+    pub(crate) fn set(&self, value: T, ttl: Duration) {
         *self.write() = Some(CacheEntry::new(value, ttl));
     }
 }
@@ -149,12 +174,15 @@ impl<T: Clone> CredentialCache<T> {
         &self,
         refresh: impl Future<Output = Result<(T, Duration), F>>,
     ) -> Result<T, F> {
-        let share = |result: &Result<T, F>| result.as_ref().ok().cloned().map(Ok);
-        match self.refresh(refresh, share).await {
-            Landed::Own(result) => result,
-            Landed::Shared(Ok(value)) => Ok(value),
-            Landed::Shared(Err(never)) => match never {},
-        }
+        let share = |result: &Result<(T, Duration), F>| {
+            result.as_ref().ok().map(|(value, _)| Ok(value.clone()))
+        };
+        self.refresh(refresh, share)
+            .await
+            .map_err(|error| match error {
+                Landed::Own(error) => error,
+                Landed::Shared(never) => match never {},
+            })
     }
 }
 
@@ -184,6 +212,48 @@ mod tests {
         assert_eq!(cache.get_or_refresh(load(3, u64::MAX)).await, Ok(3));
         tokio::time::advance(Duration::from_secs(1 << 40)).await;
         assert_eq!(cache.get_or_refresh(load(4, 1000)).await, Ok(3));
+    }
+
+    /// Callers waiting on a refresh get its value even when it is already
+    /// within the refresh window. Breaks if a waiter refreshes again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiters_share_a_short_lived_value() {
+        use std::cell::Cell;
+
+        let cache: CredentialCache<_> =
+            CredentialCache::with_refresh_window(Duration::from_secs(120));
+        let refreshes = Cell::new(0);
+        let short = || async {
+            refreshes.set(refreshes.get() + 1);
+            tokio::task::yield_now().await;
+            Ok::<_, Infallible>((7, Duration::from_secs(10)))
+        };
+        let (first, second) =
+            tokio::join!(cache.get_or_refresh(short()), cache.get_or_refresh(short()));
+        assert_eq!((first, second), (Ok(7), Ok(7)));
+        assert_eq!(refreshes.get(), 1);
+    }
+
+    /// A refresh in flight when the cache is cleared stores nothing, and a
+    /// caller that asks after the clear refreshes for itself. Breaks if the
+    /// value cleared away is stored or handed to the later caller.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clear_cuts_off_the_refresh_in_flight() {
+        let cache: CredentialCache<_> = CredentialCache::new();
+        let load = |value: u32| async move {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            Ok::<_, Infallible>((value, Duration::from_secs(1000)))
+        };
+        let (before, after) = tokio::join!(cache.get_or_refresh(load(1)), async {
+            tokio::task::yield_now().await;
+            cache.clear();
+            cache
+                .get_or_refresh(async { Ok::<_, Infallible>((2, Duration::from_secs(1000))) })
+                .await
+        });
+        assert_eq!((before, after), (Ok(1), Ok(2)));
+        assert_eq!(cache.get_or_refresh(load(3)).await, Ok(2));
     }
 
     /// Callers waiting on a refresh that fails get its error, and one that

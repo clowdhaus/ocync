@@ -660,10 +660,10 @@ impl AuthProvider for AcrAuth {
 
     fn invalidate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len().await;
+            let entries = self.tokens.len();
             tracing::debug!(service = %self.service, entries, "invalidating ACR token cache");
-            self.tokens.clear().await;
-            self.refresh_cache.clear().await;
+            self.tokens.clear();
+            self.refresh_cache.clear();
             self.api.reset();
         })
     }
@@ -833,9 +833,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_connection_is_named() {
         crate::install_crypto_provider();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let (_refusing, address) = crate::test_net::refusing();
         let refused = std::net::TcpStream::connect(address)
             .unwrap_err()
             .to_string();

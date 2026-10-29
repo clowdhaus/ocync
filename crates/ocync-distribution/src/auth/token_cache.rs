@@ -32,7 +32,7 @@ impl TokenCache {
 
     /// Number of entries currently in the token cache. Used for log
     /// diagnostics on invalidation.
-    pub(super) async fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.tokens().len()
     }
 
@@ -51,23 +51,28 @@ impl TokenCache {
                 .cloned()
                 .map(Ok)
         };
-        let fetch = || async {
-            let token = fetch().await?;
-            self.tokens().insert(key.clone(), token.clone());
-            Ok(token)
+        if let Some(hit) = stored() {
+            return hit;
+        }
+        let land = |result: &Result<Token, Error>| {
+            if let Ok(token) = result {
+                self.tokens().insert(key.clone(), token.clone());
+            }
+            Some(result.clone())
         };
-        match self
-            .flights
-            .run(key.clone(), stored, fetch, |result| Some(result.clone()))
-            .await
-        {
+        match self.flights.run(&key, stored, fetch, land).await {
             Landed::Own(result) | Landed::Shared(result) => result,
         }
     }
 
-    /// Drop every cached token.
-    pub(super) async fn clear(&self) {
-        self.tokens().clear();
+    /// Drop every cached token, and cut off the exchanges in flight: a
+    /// caller that asks afterwards exchanges again, and an exchange begun
+    /// before neither stores its token nor hands it to a later caller.
+    pub(super) fn clear(&self) {
+        self.flights.forget(|| {
+            self.tokens().clear();
+            true
+        });
     }
 }
 
@@ -205,17 +210,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn clear_drops_cache_and_inflight() {
+    async fn clear_drops_the_cache() {
         // Seed the cache.
         let cache = TokenCache::new();
         cache
             .get_or_fetch("scope".to_string(), || async { Ok(token("first")) })
             .await
             .unwrap();
-        assert_eq!(cache.len().await, 1);
+        assert_eq!(cache.len(), 1);
 
-        cache.clear().await;
-        assert_eq!(cache.len().await, 0);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
 
         // Post-clear, a same-key fetch must reach the fetcher again.
         let attempts = Arc::new(AtomicUsize::new(0));
