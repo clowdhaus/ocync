@@ -384,7 +384,7 @@ registries:
 
 The `DOCKER_CONFIG` environment variable controls the Docker config file location. If set, `ocync` reads `$DOCKER_CONFIG/config.json`. Otherwise, it defaults to `~/.docker/config.json`.
 
-Credentials come from the config as the Docker CLI reads them. A credential helper, the registry's `credHelpers` entry or else the default `credsStore`, answers in place of `auths`. A helper that holds nothing for the registry means anonymous, and a helper that fails, or is not installed, is an error for that registry. Docker Hub is asked about as `https://index.docker.io/v1/`. With no helper, the `auths` entry is used.
+Credentials come from the config as the Docker CLI reads them. A credential helper, the registry's `credHelpers` entry or else the default `credsStore`, answers in place of `auths`; an empty helper name means none. A helper that holds nothing for the registry means anonymous, and a helper that fails, or is not installed, is an error for that registry. Docker Hub is asked about as `https://index.docker.io/v1/`. With no helper, the `auths` entry is used.
 
 ## Example configurations
 

@@ -101,12 +101,14 @@ pub async fn resolve_from_docker_config(
 }
 
 /// The helper Docker asks for `registry`: its `credHelpers` entry, else
-/// the default `credsStore`.
+/// the default `credsStore`. An empty name is no helper, and an empty
+/// `credHelpers` entry also turns off the default store for its registry.
 fn helper_for<'a>(config: &'a DockerConfig, registry: &str) -> Option<&'a str> {
     entry_keys(registry)
         .find_map(|key| config.cred_helpers.get(key.as_ref()))
         .or(config.creds_store.as_ref())
         .map(String::as_str)
+        .filter(|helper| !helper.is_empty())
 }
 
 /// The address a helper is asked about: Docker keys Docker Hub under its
@@ -120,20 +122,19 @@ fn server_address(registry: &str) -> &str {
 }
 
 /// The keys a registry's entry may sit under in a Docker config map, most
-/// specific first: the host, the host with a scheme, then every Docker Hub
-/// alias for a Docker Hub host.
+/// specific first: the host, then the host with a scheme, or every alias
+/// for a Docker Hub host.
 fn entry_keys(registry: &str) -> impl Iterator<Item = Cow<'_, str>> {
-    let hub = if is_docker_hub(registry) {
+    let rest: Vec<Cow<'_, str>> = if is_docker_hub(registry) {
         DOCKER_HUB_ALIASES
+            .iter()
+            .filter(|alias| **alias != registry)
+            .map(|alias| Cow::Borrowed(*alias))
+            .collect()
     } else {
-        &[]
+        vec![Cow::Owned(format!("https://{registry}"))]
     };
-    [
-        Cow::Borrowed(registry),
-        Cow::Owned(format!("https://{registry}")),
-    ]
-    .into_iter()
-    .chain(hub.iter().map(|alias| Cow::Borrowed(*alias)))
+    std::iter::once(Cow::Borrowed(registry)).chain(rest)
 }
 
 /// Look up static credentials from the `auths` map.
@@ -199,13 +200,13 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Option<Cr
     // `credsStore` / `credHelpers` values in Docker config.json.
     if !helper
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
     {
         return Err(Error::CredentialHelperFailed {
             helper: helper.to_owned(),
             reason: format!(
                 "invalid credential helper name: {helper:?} \
-                 (must be alphanumeric and hyphens only)"
+                 (must be alphanumeric, hyphens and dots only)"
             ),
         });
     }
@@ -556,10 +557,10 @@ mod tests {
     }
 
     /// A registry's own helper, under any Docker Hub alias, is asked
-    /// before the default store, and a helper is asked about Docker Hub
-    /// under its index server. Breaks if the store shadows a registry's
-    /// helper, or Docker Hub is asked about under a name Docker never
-    /// stores it by.
+    /// before the default store, an empty name is no helper, and a helper
+    /// is asked about Docker Hub under its index server. Breaks if the
+    /// store shadows a registry's helper, an empty name is run, or Docker
+    /// Hub is asked about under a name Docker never stores it by.
     #[test]
     fn the_helper_docker_would_ask() {
         let cases = [
@@ -583,6 +584,13 @@ mod tests {
             ),
             (
                 r#"{"auths": {"ghcr.io": {"auth": "dXNlcjpwYXNz"}}}"#,
+                "ghcr.io",
+                None,
+                "ghcr.io",
+            ),
+            (r#"{"credsStore": ""}"#, "ghcr.io", None, "ghcr.io"),
+            (
+                r#"{"credHelpers": {"ghcr.io": ""}, "credsStore": "desktop"}"#,
                 "ghcr.io",
                 None,
                 "ghcr.io",
@@ -646,7 +654,13 @@ mod tests {
         // These should pass validation but fail to execute (no such binary).
         // Verify the error is CredentialHelperFailed with "failed to execute",
         // NOT the name-validation error.
-        for name in ["gcloud", "ecr-login", "osxkeychain", "desktop"] {
+        for name in [
+            "gcloud",
+            "ecr-login",
+            "osxkeychain",
+            "desktop",
+            "desktop.exe",
+        ] {
             let err = run_credential_helper(name, "registry.example.com")
                 .await
                 .unwrap_err();
