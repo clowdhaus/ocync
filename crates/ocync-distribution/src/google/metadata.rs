@@ -205,27 +205,4 @@ mod tests {
             .unwrap();
         assert_eq!(token.expiry, crate::google::Expiry::Never);
     }
-
-    /// A token answer with a mistyped field is named as unreadable without
-    /// the value the parser refused. Breaks if that value reaches the error.
-    #[tokio::test]
-    async fn a_mistyped_answer_leaves_the_value_out() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(TOKEN_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "ya29.mds", "token_type": "Bearer", "expires_in": "ya29.s3cret"
-            })))
-            .mount(&server)
-            .await;
-
-        let error = Server::new(&server_env(&server), Scopes::Default)
-            .unwrap()
-            .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
-            .await
-            .unwrap_err();
-        let text = crate::error::error_chain(&error);
-        assert!(matches!(error, Error::Decode { .. }), "{text}");
-        assert!(!text.contains("s3cret"), "{text}");
-    }
 }

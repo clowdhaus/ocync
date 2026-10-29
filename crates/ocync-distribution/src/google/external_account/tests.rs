@@ -413,7 +413,7 @@ fn selects_the_source_in_upstream_order() {
 /// it also names. Breaks if a later source is tried once AWS is selected.
 #[test]
 fn a_malformed_aws_source_is_an_error() {
-    let source = serde_json::from_value::<SourceFile>(serde_json::json!({
+    let source = crate::json::value_as::<SourceFile>(serde_json::json!({
         "environment_id": "aws1",
         "region_url": 7,
         "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials",
@@ -421,7 +421,7 @@ fn a_malformed_aws_source_is_an_error() {
     let error = source.err().expect("refused");
     assert_eq!(
         error.to_string(),
-        "invalid type: integer `7`, expected a string"
+        "invalid type: integer, expected a string"
     );
 }
 

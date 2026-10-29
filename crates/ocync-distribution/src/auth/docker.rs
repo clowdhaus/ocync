@@ -284,7 +284,11 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
         tracing::debug!(helper = %program, registry, status = %output.status, "credential helper exited with error");
         return Err(Error::CredentialHelperFailed {
             helper: program,
-            reason: format!("exited with {}: {}", output.status, stderr.trim()),
+            reason: format!(
+                "exited with {}: {}",
+                output.status,
+                crate::error::truncate_quoted(stderr.trim())
+            ),
         });
     }
 
@@ -456,8 +460,9 @@ mod tests {
     fn a_mistyped_config_leaves_the_password_out() {
         let path = std::env::temp_dir().join(format!("ocync-docker-{}.json", std::process::id()));
         std::fs::write(&path, r#"{"auths": {"ghcr.io": "dXNlcjpzM2NyZXQ="}}"#).unwrap();
-        let error = DockerConfig::load_from(&path).unwrap_err();
+        let result = DockerConfig::load_from(&path);
         std::fs::remove_file(&path).unwrap();
+        let error = result.unwrap_err();
         let text = error.to_string();
         assert!(text.contains("expected struct AuthEntry"), "{text}");
         assert!(!text.contains("dXNlcjpzM2NyZXQ="), "{text}");
