@@ -116,8 +116,10 @@ pub enum Error {
         reason: String,
     },
 
-    /// An HTTP request to the registry failed.
-    #[error("HTTP request failed: {0}")]
+    /// An HTTP request to the registry failed. The HTTP client's text
+    /// leaves out its causes, such as a refused connection or a failed DNS
+    /// lookup, so this names them.
+    #[error("HTTP request failed: {}", error_chain(&**.0))]
     Http(#[source] Arc<reqwest::Error>),
 
     /// The registry returned a non-success HTTP status.
@@ -278,12 +280,16 @@ impl Error {
 
 /// `error` and each of its sources, joined as upstream prints them, so a
 /// reason kept as text still names its cause. A cause the text already ends
-/// with is not repeated: some errors print their cause and also return it as
-/// their source.
+/// with is not repeated, nor are the rest once the text ends with a cause
+/// and all of its own: some errors print their causes and also return them
+/// as their source.
 pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(e) = source {
+        if text.ends_with(&error_chain(e)) {
+            break;
+        }
         let cause = e.to_string();
         if !text.ends_with(&cause) {
             text.push_str(": ");
@@ -314,6 +320,28 @@ pub(crate) fn truncate_quoted(body: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed request names its cause once, and joining its sources adds
+    /// nothing. Breaks if the text stops at "error sending request", or a
+    /// cause the text already holds is repeated.
+    #[tokio::test]
+    async fn an_http_error_names_its_cause_once() {
+        crate::install_crypto_provider();
+        let refused = std::net::TcpStream::connect("127.0.0.1:1")
+            .unwrap_err()
+            .to_string();
+        let err = Error::from(
+            reqwest::Client::new()
+                .get("http://127.0.0.1:1/v2/")
+                .send()
+                .await
+                .unwrap_err(),
+        );
+        let text = err.to_string();
+        assert!(text.ends_with(&refused), "{text}");
+        assert_eq!(text.matches(&refused).count(), 1, "{text}");
+        assert_eq!(error_chain(&err), text);
+    }
 
     #[test]
     fn truncate_quoted_short() {
