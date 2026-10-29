@@ -409,6 +409,25 @@ fn selects_the_source_in_upstream_order() {
     ));
 }
 
+/// A `credential_source` naming no source, of any JSON type, says which
+/// keys it needs. Breaks if the reason is lost to the generic text.
+#[test]
+fn a_source_naming_none_says_what_it_needs() {
+    for source in [
+        serde_json::json!({"region": "x"}),
+        serde_json::json!("token.txt"),
+    ] {
+        let error = crate::json::value_as::<SourceFile>(source)
+            .err()
+            .expect("refused");
+        assert_eq!(
+            error.to_string(),
+            "invalid value: a credential_source with no source, expected one naming \
+             environment_id, executable, url or file"
+        );
+    }
+}
+
 /// An AWS source with a malformed field is an error, not the URL source
 /// it also names. Breaks if a later source is tried once AWS is selected.
 #[test]

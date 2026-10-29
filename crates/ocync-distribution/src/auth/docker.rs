@@ -279,6 +279,17 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Credentia
         }
     })?;
 
+    helper_credentials(program, registry, &output)
+}
+
+/// The credentials a helper's `output` holds. Its stderr and a refused
+/// value from its stdout are kept out of the error past what can be quoted,
+/// as either can hold the secret.
+fn helper_credentials(
+    program: String,
+    registry: &str,
+    output: &std::process::Output,
+) -> Result<Credentials, Error> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::debug!(helper = %program, registry, status = %output.status, "credential helper exited with error");
@@ -452,6 +463,32 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    /// A helper that fails has its stderr cut to what can be quoted, and one
+    /// whose answer is mistyped is refused without the refused value.
+    /// Breaks if either reaches the error whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_failure_leaves_the_secret_out() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = |code: i32, stdout: &str, stderr: String| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.into_bytes(),
+        };
+        let failed = output(1, "", format!("{}s3cret", "x".repeat(200)));
+        let error = helper_credentials("helper".into(), "r", &failed).unwrap_err();
+        assert!(!error.to_string().contains("s3cret"), "{error}");
+        let mistyped = output(0, r#"{"Username": "u", "Secret": 7}"#, String::new());
+        let error = helper_credentials("helper".into(), "r", &mistyped).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("invalid type: integer, expected a string"),
+            "{text}"
+        );
+        assert!(!text.contains('7'), "{text}");
+    }
 
     /// A config whose auth entry is a string, not an object, is refused
     /// without quoting the string, which holds the encoded password. Breaks

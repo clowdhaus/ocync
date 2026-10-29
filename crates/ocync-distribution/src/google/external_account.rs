@@ -73,8 +73,8 @@ impl<'de> Deserialize<'de> for SourceFile {
             serde_json::from_value(value).map(Self::File)
         } else {
             return Err(D::Error::invalid_value(
-                serde::de::Unexpected::Map,
-                &"a credential_source naming environment_id, executable, url or file",
+                serde::de::Unexpected::Other("a credential_source with no source"),
+                &"one naming environment_id, executable, url or file",
             ));
         };
         source.map_err(D::Error::custom)
