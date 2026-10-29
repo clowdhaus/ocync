@@ -472,6 +472,9 @@ enum Failure {
     /// The service's answer could not be read.
     #[error("unreadable response: {0}")]
     Decode(#[source] crate::json::Unreadable),
+    /// The service's answer is longer than any answer it gives.
+    #[error("the answer is over {} bytes", crate::json::MAX_SMALL_ANSWER)]
+    TooLarge,
     /// A header to send, such as a credential's session token, holds a byte
     /// a header cannot carry.
     #[error("request has a header that cannot be sent: {0}")]
@@ -544,7 +547,9 @@ impl retry::Retryable for Failure {
                 _ => None,
             },
             Self::ClockSkewed { .. } => Some(retry::Kind::Server),
-            Self::Credentials(_) | Self::Decode(_) | Self::InvalidHeader(_) => None,
+            Self::Credentials(_) | Self::Decode(_) | Self::TooLarge | Self::InvalidHeader(_) => {
+                None
+            }
         }
     }
 
@@ -554,6 +559,7 @@ impl retry::Retryable for Failure {
             Self::Credentials(_)
             | Self::Transport(_)
             | Self::Decode(_)
+            | Self::TooLarge
             | Self::InvalidHeader(_) => None,
         }
     }
@@ -765,7 +771,7 @@ impl Api {
                 headers.insert(HeaderName::from_static(name), value);
             }
         }
-        let response = self.http.send(outgoing).await?;
+        let mut response = self.http.send(outgoing).await?;
         let measured = match self.skew_correction {
             SkewCorrection::On => ClockSkew::measure(response.headers(), sent, SystemTime::now()),
             SkewCorrection::Off => None,
@@ -780,7 +786,10 @@ impl Api {
             .get(X_AMZ_RETRY_AFTER)
             .and_then(|v| v.to_str().ok()?.parse().ok())
             .map(Duration::from_millis);
-        let bytes = response.bytes().await?;
+        let bytes = crate::json::read_capped(&mut response, crate::json::MAX_SMALL_ANSWER)
+            .await?
+            .map(Bytes::from)
+            .ok_or(Failure::TooLarge)?;
         if status.is_success() {
             return Ok(bytes);
         }
@@ -1384,6 +1393,26 @@ pub(crate) mod tests {
         ] {
             assert_eq!(host_header(&Url::parse(url).unwrap()), host);
         }
+    }
+
+    /// An answer longer than any AWS answer is refused, not buffered, and
+    /// not re-sent. Breaks if the body is read whatever its length.
+    #[tokio::test]
+    async fn an_oversized_answer_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                b' ';
+                crate::json::MAX_SMALL_ANSWER
+                    + 1
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::from_parts(parts(&server.uri())).unwrap();
+        let err = client.call(&Probe {}).await.unwrap_err();
+        assert!(matches!(err.failure, Failure::TooLarge), "{err}");
     }
 
     /// The request carries the AWS JSON protocol headers and a signature

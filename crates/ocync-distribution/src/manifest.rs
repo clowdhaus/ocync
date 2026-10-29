@@ -204,7 +204,7 @@ impl RegistryClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
+            let message = crate::json::error_body(resp).await;
             return Err(Error::RegistryError { status, message });
         }
 
@@ -257,12 +257,12 @@ async fn classify_referrers_response(resp: reqwest::Response) -> Result<Option<I
 
     match status {
         StatusCode::OK => {
-            let index: ImageIndex = crate::json::answer(resp).await?;
+            let index: ImageIndex = crate::json::answer(resp, crate::json::NO_LIMIT).await?;
             Ok(Some(index))
         }
         StatusCode::NOT_FOUND => Ok(None),
         _ => {
-            let message = resp.text().await.unwrap_or_default();
+            let message = crate::json::error_body(resp).await;
             Err(Error::RegistryError { status, message })
         }
     }

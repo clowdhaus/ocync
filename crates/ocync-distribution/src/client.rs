@@ -519,7 +519,7 @@ impl RegistryClient {
         if status.is_success() || status == StatusCode::UNAUTHORIZED {
             Ok(())
         } else {
-            let message = resp.text().await.unwrap_or_default();
+            let message = crate::json::error_body(resp).await;
             Err(Error::RegistryError { status, message })
         }
     }
@@ -779,7 +779,7 @@ async fn classify_response(
     }
 
     let registry = base_url.host_str().unwrap_or("unknown");
-    let body = resp.text().await.unwrap_or_default();
+    let body = crate::json::error_body(resp).await;
     let message = if body.is_empty() {
         format!("{registry}/{repository}")
     } else {

@@ -520,7 +520,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let err = crate::json::answer::<u64>(response).await.unwrap_err();
+        let err = crate::json::answer::<u64>(response, crate::json::MAX_SMALL_ANSWER)
+            .await
+            .unwrap_err();
         assert_eq!(
             CredentialFailure::of_unreadable(&err),
             CredentialFailure::Transient

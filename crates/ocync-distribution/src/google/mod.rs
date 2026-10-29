@@ -26,7 +26,7 @@ use http::HeaderValue;
 use serde_json::Value;
 use url::Url;
 
-use crate::json::MAX_CREDENTIAL_ANSWER;
+use crate::json::MAX_SMALL_ANSWER;
 
 use crate::scheme::{Scheme, UnsupportedScheme};
 
@@ -387,7 +387,7 @@ pub(crate) enum Error {
     #[error("failed to sign the AWS subject token")]
     AwsSigning(#[source] crate::aws::SigningError),
     /// An answer was longer than any token response.
-    #[error("{call}, answer over {MAX_CREDENTIAL_ANSWER} bytes")]
+    #[error("{call}, answer over {MAX_SMALL_ANSWER} bytes")]
     BodyTooLarge { call: Call },
 }
 
@@ -449,21 +449,15 @@ impl Error {
     }
 
     /// An error for an answer whose status is not a success, its body read
-    /// up to [`MAX_CREDENTIAL_ANSWER`] for its OAuth error code and quoted cut short.
-    async fn status(call: Call, mut response: reqwest::Response) -> Self {
+    /// up to [`MAX_SMALL_ANSWER`] for its OAuth error code and quoted cut short.
+    async fn status(call: Call, response: reqwest::Response) -> Self {
         let status = response.status();
-        let mut body = Vec::new();
-        while body.len() <= MAX_CREDENTIAL_ANSWER {
-            match response.chunk().await {
-                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-                Ok(None) | Err(_) => break,
-            }
-        }
+        let body = crate::json::error_body(response).await;
         Self::Status {
             call,
             status,
-            body: truncate_quoted(&String::from_utf8_lossy(&body)).to_owned(),
-            code: OAuthCode::read(&body),
+            body: truncate_quoted(&body).to_owned(),
+            code: OAuthCode::read(body.as_bytes()),
         }
     }
 }
@@ -500,11 +494,11 @@ async fn send_once(
     request: reqwest::Request,
 ) -> Result<Vec<u8>, Error> {
     let transport = |source| Error::transport(call, source);
-    let response = client.execute(request).await.map_err(transport)?;
+    let mut response = client.execute(request).await.map_err(transport)?;
     if !response.status().is_success() {
         return Err(Error::status(call, response).await);
     }
-    crate::json::read_capped(response, MAX_CREDENTIAL_ANSWER)
+    crate::json::read_capped(&mut response, MAX_SMALL_ANSWER)
         .await
         .map_err(transport)?
         .ok_or(Error::BodyTooLarge { call })

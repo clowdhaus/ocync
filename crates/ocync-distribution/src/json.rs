@@ -160,29 +160,28 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(text.as_ref())?)
 }
 
-/// The longest registry answer [`answer`] reads: far above any token
-/// answer, tag list page or referrers index, and a bound on the memory an
-/// endpoint that never stops sending can take.
-const MAX_ANSWER: usize = 64 * 1024 * 1024;
+/// The longest credential answer or error body read: well past any token,
+/// JWT, credentials document, zone or registry error a cloud or registry
+/// returns, and short of a body that would exhaust memory.
+pub(crate) const MAX_SMALL_ANSWER: usize = 1024 * 1024;
 
-/// The longest answer read from a cloud credential endpoint: well past any
-/// token, JWT, credentials document or zone a Google, AWS or metadata
-/// endpoint returns, and short of a body that would exhaust memory.
-pub(crate) const MAX_CREDENTIAL_ANSWER: usize = 1024 * 1024;
+/// The limit on a tag list page or referrers index: none, as a registry may
+/// return a whole repository's in one page.
+pub(crate) const NO_LIMIT: usize = usize::MAX;
 
 /// `response`'s body, or `None` once it is known to pass `max` bytes: from
 /// its declared length before any is read, else as it arrives.
 pub(crate) async fn read_capped(
-    mut response: reqwest::Response,
+    response: &mut reqwest::Response,
     max: usize,
 ) -> Result<Option<Vec<u8>>, reqwest::Error> {
-    if response
+    let declared = response
         .content_length()
-        .is_some_and(|length| usize::try_from(length).map_or(true, |length| length > max))
-    {
+        .map(|length| usize::try_from(length).unwrap_or(usize::MAX));
+    if declared.is_some_and(|length| length > max) {
         return Ok(None);
     }
-    let mut body = Vec::new();
+    let mut body = Vec::with_capacity(declared.unwrap_or_default());
     while let Some(chunk) = response.chunk().await? {
         if body.len() + chunk.len() > max {
             return Ok(None);
@@ -192,21 +191,47 @@ pub(crate) async fn read_capped(
     Ok(Some(body))
 }
 
+/// The text of an error answer's body, read up to [`MAX_SMALL_ANSWER`]
+/// bytes and as far as it arrives.
+pub(crate) async fn error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < MAX_SMALL_ANSWER {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body.truncate(MAX_SMALL_ANSWER);
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 /// Read `response`'s body, which holds or may hold a credential, as JSON of
-/// type `T`. A body that does not arrive is [`Error::Http`], one over
-/// [`MAX_ANSWER`] bytes is [`Error::AnswerTooLarge`], and one that is not
-/// the JSON expected is [`Error::UnreadableAnswer`], with no value from it.
+/// type `T`. A body that does not arrive is [`Error::Http`], one over `max`
+/// bytes is [`Error::AnswerTooLarge`], and one that is not the JSON expected
+/// is [`Error::UnreadableAnswer`], with no value from it. The errors name
+/// the address without its query, which can carry a key.
 pub(crate) async fn answer<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
+    max: usize,
 ) -> Result<T, Error> {
-    let url = Box::new(response.url().clone());
-    let Some(body) = read_capped(response, MAX_ANSWER).await? else {
+    let Some(body) = read_capped(&mut response, max).await? else {
         return Err(Error::AnswerTooLarge {
-            url,
-            max: MAX_ANSWER,
+            url: shown_url(&response),
+            max,
         });
     };
-    parse(&body).map_err(|source| Error::UnreadableAnswer { url, source })
+    parse(&body).map_err(|source| Error::UnreadableAnswer {
+        url: shown_url(&response),
+        source,
+    })
+}
+
+/// The address that sent `response`, without its query or fragment.
+fn shown_url(response: &reqwest::Response) -> Box<reqwest::Url> {
+    let mut url = response.url().clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    Box::new(url)
 }
 
 /// Read `value`, which holds or may hold a credential, as type `T`.
@@ -240,7 +265,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let err = answer::<u64>(response).await.unwrap_err();
+        let err = answer::<u64>(response, MAX_SMALL_ANSWER).await.unwrap_err();
         assert_eq!(
             err.to_string(),
             format!(
@@ -276,12 +301,12 @@ mod tests {
                     .await
                     .unwrap();
             });
-            let response = crate::test_http_client()
+            let mut response = crate::test_http_client()
                 .get(format!("http://{address}/"))
                 .send()
                 .await
                 .unwrap();
-            read_capped(response, 4).await.unwrap()
+            read_capped(&mut response, 4).await.unwrap()
         }
         // Declared too long and never sent in full: refused before reading.
         assert_eq!(read("content-length: 5\r\n", "1234").await, None);
@@ -292,26 +317,29 @@ mod tests {
         );
     }
 
-    /// An answer longer than [`MAX_ANSWER`] is refused once it passes the
-    /// limit. Breaks if the whole body is read whatever its length.
+    /// An answer longer than its limit is refused, naming the address
+    /// without its query. Breaks if the whole body is read whatever its
+    /// length, or the query reaches the error.
     #[tokio::test]
     async fn an_answer_over_the_limit_is_refused() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::any())
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_ANSWER + 1]),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![
+                b' ';
+                MAX_SMALL_ANSWER
+                    + 1
+            ]))
             .mount(&server)
             .await;
         let response = crate::test_http_client()
-            .get(server.uri())
+            .get(format!("{}/token?key=s3cret", server.uri()))
             .send()
             .await
             .unwrap();
-        let err = answer::<u64>(response).await.unwrap_err();
+        let err = answer::<u64>(response, MAX_SMALL_ANSWER).await.unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!("answer from {}/ over 67108864 bytes", server.uri())
+            format!("answer from {}/token over 1048576 bytes", server.uri())
         );
     }
 
