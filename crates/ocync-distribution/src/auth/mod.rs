@@ -161,15 +161,6 @@ impl Token {
         }
     }
 
-    /// Create a Bearer token that expires at a specific instant.
-    pub fn with_expiry(value: impl Into<String>, expires_at: Instant) -> Self {
-        Self {
-            value: value.into(),
-            expires_at: Some(expires_at),
-            scheme: AuthScheme::Bearer,
-        }
-    }
-
     /// Set the auth scheme (default is Bearer).
     pub fn with_scheme(mut self, scheme: AuthScheme) -> Self {
         self.scheme = scheme;
@@ -377,7 +368,7 @@ mod tests {
 
     #[test]
     fn token_with_zero_ttl_is_expired() {
-        let token = Token::with_expiry("abc123", Instant::now() - Duration::from_secs(1));
+        let token = Token::with_ttl("abc123", Duration::ZERO);
         assert!(token.is_expired());
         assert!(token.should_refresh());
     }

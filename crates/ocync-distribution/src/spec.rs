@@ -441,21 +441,6 @@ impl ManifestKind {
             }),
         }
     }
-
-    /// Return the digests of all content referenced by this manifest.
-    ///
-    /// For an image manifest this includes the config and all layers.
-    /// For an index this includes the digests of the child manifests.
-    pub fn referenced_digests(&self) -> Vec<&Digest> {
-        match self {
-            Self::Image(m) => {
-                let mut digests = vec![&m.config.digest];
-                digests.extend(m.layers.iter().map(|l| &l.digest));
-                digests
-            }
-            Self::Index(m) => m.manifests.iter().map(|d| &d.digest).collect(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -643,42 +628,6 @@ mod tests {
         let other = MediaType::Other("text/plain".into());
         let err = ManifestKind::from_json(&other, &image).unwrap_err();
         assert!(matches!(err, Error::UnsupportedMediaType { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn referenced_digests_image() {
-        let json = serde_json::json!({
-            "schemaVersion": 2,
-            "config": test_descriptor(),
-            "layers": [test_layer_descriptor()]
-        });
-        let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(&MediaType::OciManifest, &bytes).unwrap();
-        let digests = m.referenced_digests();
-        assert_eq!(digests.len(), 2); // config + 1 layer
-    }
-
-    #[test]
-    fn referenced_digests_index() {
-        let json = serde_json::json!({
-            "schemaVersion": 2,
-            "manifests": [
-                {
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": TEST_DIGEST,
-                    "size": 1000
-                },
-                {
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": TEST_DIGEST,
-                    "size": 2000
-                }
-            ]
-        });
-        let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(&MediaType::OciIndex, &bytes).unwrap();
-        let digests = m.referenced_digests();
-        assert_eq!(digests.len(), 2);
     }
 
     // - Platform::matches tests --
