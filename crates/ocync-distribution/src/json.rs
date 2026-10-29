@@ -228,7 +228,8 @@ pub(crate) async fn answer<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// The address that sent `response`, without its query or fragment.
+/// The address that sent `response`, without its query or fragment. The
+/// client has already moved any user and password into a header.
 fn shown_url(response: &reqwest::Response) -> Box<reqwest::Url> {
     let mut url = response.url().clone();
     url.set_query(None);
@@ -320,8 +321,8 @@ mod tests {
     }
 
     /// An answer longer than its limit is refused, naming the address
-    /// without its query. Breaks if the whole body is read whatever its
-    /// length, or the query reaches the error.
+    /// without its user, password or query. Breaks if the whole body is read
+    /// whatever its length, or any of those reaches the error.
     #[tokio::test]
     async fn an_answer_over_the_limit_is_refused() {
         let server = wiremock::MockServer::start().await;
@@ -334,7 +335,7 @@ mod tests {
             .mount(&server)
             .await;
         let response = crate::test_http_client()
-            .get(format!("{}/token?key=s3cret", server.uri()))
+            .get(server.uri().replace("://", "://user:s3cret@") + "/token?key=s3cret")
             .send()
             .await
             .unwrap();

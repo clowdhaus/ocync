@@ -786,13 +786,13 @@ impl Api {
             .get(X_AMZ_RETRY_AFTER)
             .and_then(|v| v.to_str().ok()?.parse().ok())
             .map(Duration::from_millis);
-        let bytes = crate::json::read_capped(&mut response, crate::json::MAX_SMALL_ANSWER)
-            .await?
-            .map(Bytes::from)
-            .ok_or(Failure::TooLarge)?;
         if status.is_success() {
-            return Ok(bytes);
+            return crate::json::read_capped(&mut response, crate::json::MAX_SMALL_ANSWER)
+                .await?
+                .map(Bytes::from)
+                .ok_or(Failure::TooLarge);
         }
+        let bytes = crate::json::error_body(response).await.into_bytes();
         let modeled = request.modeled_errors;
         let error = ServiceError {
             retry_after,
@@ -1413,6 +1413,26 @@ pub(crate) mod tests {
         let client = Client::from_parts(parts(&server.uri())).unwrap();
         let err = client.call(&Probe {}).await.unwrap_err();
         assert!(matches!(err.failure, Failure::TooLarge), "{err}");
+    }
+
+    /// An error answer longer than the limit is still the service's error,
+    /// classified by its status, so a large proxy error page is retried or
+    /// refused as before. Breaks if the limit applies to error answers.
+    #[tokio::test]
+    async fn an_oversized_error_answer_is_the_service_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_bytes(vec![
+                b' ';
+                crate::json::MAX_SMALL_ANSWER
+                    + 1
+            ]))
+            .mount(&server)
+            .await;
+
+        let client = Client::from_parts(parts(&server.uri())).unwrap();
+        let err = client.call(&Probe {}).await.unwrap_err();
+        assert!(matches!(err.failure, Failure::Service(_)), "{err}");
     }
 
     /// The request carries the AWS JSON protocol headers and a signature
