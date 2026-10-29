@@ -221,7 +221,7 @@ async fn sync_blob_transfer_retries_on_source_500() {
     assert_eq!(report.stats.blobs_transferred, 2);
 }
 
-/// Hands out `token-0`, then `token-1` after an invalidation, and so on.
+/// Hands out `token-0`, then `token-1` after a refusal, and so on.
 struct RotatingAuth(AtomicU32);
 
 impl AuthProvider for RotatingAuth {
@@ -237,7 +237,7 @@ impl AuthProvider for RotatingAuth {
         Box::pin(async move { Ok(token) })
     }
 
-    fn invalidate(&self, _refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn refuse(&self, _refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {})
     }

@@ -27,14 +27,10 @@ use crate::scheme::Scheme;
 ///
 /// Stores the parsed realm + service from the first `/v2/` ping so
 /// subsequent token exchanges skip the ping entirely.
+#[derive(Debug, Default)]
 pub(crate) struct ChallengeCache(Mutex<Option<WwwAuthenticate>>);
 
 impl ChallengeCache {
-    /// Create an empty challenge cache.
-    pub(crate) fn new() -> Self {
-        Self(Mutex::new(None))
-    }
-
     /// Read the cached challenge (clones to release the lock before await).
     pub(crate) async fn get(&self) -> Option<WwwAuthenticate> {
         self.0.lock().await.clone()

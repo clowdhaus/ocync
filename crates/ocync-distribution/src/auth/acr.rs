@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use super::token_cache::TokenCache;
-use super::{AuthProvider, Scope, Token, registry_origin, scopes_cache_key};
+use super::{AuthProvider, Refusal, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::CredentialCache;
 use crate::error::{CredentialFailure, Error, OAuthCode, error_chain, truncate_quoted};
@@ -124,8 +124,8 @@ trait AzureTokenSource: Send + Sync + fmt::Debug {
     fn get_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>>;
 
     /// Reset cached credential source so the chain re-probes.
-    /// Called on `invalidate()` to support credential rotation in watch
-    /// mode. Default no-op for test mocks. Exceeds upstream which never
+    /// Called when the token endpoint refuses the refresh token, to
+    /// support credential rotation in watch mode. Default no-op for test mocks. Exceeds upstream which never
     /// resets the cached source.
     fn reset(&self) {}
 }
@@ -304,7 +304,7 @@ const SOURCE_NONE: usize = usize::MAX;
 /// source for subsequent calls.
 ///
 /// Unlike upstream `azure_identity` which never resets the cached source,
-/// `reset_cached_source()` allows re-probing after `invalidate()` --
+/// `reset_cached_source()` allows re-probing after a refused refresh token --
 /// needed for credential rotation in watch mode.
 struct AzureCredentialChain {
     authority: &'static str,
@@ -662,6 +662,25 @@ impl AcrAuth {
         }
     }
 
+    /// The access-token exchange failed with `error`. If the token endpoint
+    /// refused `refresh_token`, drop it if it is still the one kept, and
+    /// then re-probe the credential chain it came from.
+    fn judge_refresh_token(&self, refresh_token: &str, error: &Error) {
+        if !matches!(
+            error,
+            Error::CloudCredentials {
+                failure: CredentialFailure::Refused,
+                ..
+            }
+        ) {
+            return;
+        }
+        let refused = refresh_token.to_owned();
+        if self.refresh_cache.refuse_if(move |kept| *kept == refused) == Refusal::Current {
+            self.api.reset();
+        }
+    }
+
     async fn ensure_refresh_token(&self) -> Result<String, Error> {
         self.refresh_cache
             .get_or_refresh_sharing_failure(async {
@@ -713,7 +732,8 @@ impl AuthProvider for AcrAuth {
                         &refresh_token,
                         &scope_str,
                     )
-                    .await?;
+                    .await
+                    .inspect_err(|e| self.judge_refresh_token(&refresh_token, e))?;
                     let ttl = extract_jwt_exp(&access_token)
                         .ok()
                         .map(ttl_from_unix_exp)
@@ -724,17 +744,12 @@ impl AuthProvider for AcrAuth {
         })
     }
 
-    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let refused = refused.clone();
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len();
-            tracing::debug!(service = %self.service, entries, "invalidating ACR token cache");
-            if self.tokens.drop_refused(&refused) {
-                // The refused token is the one kept, so the credentials
-                // behind it are suspect: acquire them again on next use.
-                self.refresh_cache.clear();
-                self.api.reset();
-            }
+            // The refresh token and credential chain stay: only the
+            // exchanges that use them judge them.
+            let refusal = self.tokens.refuse(&refused).await;
+            tracing::debug!(service = %self.service, ?refusal, "registry refused a token");
         })
     }
 }
@@ -880,9 +895,11 @@ mod tests {
     #[derive(Debug)]
     struct MockAzureTokenSource {
         tokens: Mutex<VecDeque<String>>,
-        /// Shared counter so tests can verify `invalidate()` calls
+        /// Shared counter so tests can verify a refused refresh token calls
         /// `api.reset()` even after the mock is moved into `AcrAuth`.
         reset_count: std::sync::Arc<AtomicUsize>,
+        /// How many times `get_token` was called.
+        get_count: std::sync::Arc<AtomicUsize>,
     }
 
     impl MockAzureTokenSource {
@@ -892,6 +909,7 @@ mod tests {
                     std::iter::repeat_n(access_token.to_owned(), 10).collect::<Vec<_>>(),
                 )),
                 reset_count: std::sync::Arc::new(AtomicUsize::new(0)),
+                get_count: std::sync::Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -899,6 +917,7 @@ mod tests {
             Self {
                 tokens: Mutex::new(VecDeque::from(tokens)),
                 reset_count: std::sync::Arc::new(AtomicUsize::new(0)),
+                get_count: std::sync::Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -906,6 +925,9 @@ mod tests {
     impl AzureTokenSource for MockAzureTokenSource {
         fn get_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>> {
             Box::pin(async move {
+                self.get_count.fetch_add(1, Ordering::Relaxed);
+                // Yield so callers that ask meanwhile find the call in flight.
+                tokio::task::yield_now().await;
                 self.tokens.lock().await.pop_front().ok_or_else(|| {
                     Error::cloud_credentials(
                         "mock-acr",
@@ -1342,8 +1364,55 @@ mod tests {
         // .expect(2) on exchange mock verifies full re-acquisition happened.
     }
 
+    /// A refusal of the registry token drops the token and keeps the
+    /// refresh token and the credential chain, so the next token costs one
+    /// access-token exchange and nothing else. Breaks if a registry 401
+    /// judges the credentials behind the token, or a refusal of another
+    /// token resets the chain.
     #[tokio::test]
-    async fn invalidation_clears_all_caches() {
+    async fn a_registry_refusal_drops_only_the_access_token() {
+        let server = MockServer::start().await;
+        let refresh_jwt = fake_jwt_with_exp("", 10800);
+        let access_jwt = fake_jwt_with_exp("", 4500);
+        Mock::given(method("POST"))
+            .and(path("/oauth2/exchange"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"refresh_token": &refresh_jwt})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": &access_jwt})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mock = MockAzureTokenSource::succeeding("aad-tok");
+        let reset_count = mock.reset_count.clone();
+        let get_count = mock.get_count.clone();
+
+        let auth = AcrAuth::with_api(&server.uri(), "myregistry.azurecr.io", mock);
+        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        auth.refuse(Token::new("other")).await;
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        auth.refuse(refused).await;
+        auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(reset_count.load(Ordering::Relaxed), 0);
+        assert_eq!(get_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// A token endpoint that refuses the refresh token drops it and resets
+    /// the chain, so the next token acquires both again. Breaks if a refused
+    /// exchange keeps the refresh token or leaves the chain on the source
+    /// that produced it.
+    #[tokio::test]
+    async fn a_refused_exchange_drops_the_refresh_token_and_resets_the_chain() {
         let server = MockServer::start().await;
         let refresh_jwt = fake_jwt_with_exp("", 10800);
         let access_jwt = fake_jwt_with_exp("", 4500);
@@ -1358,6 +1427,12 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"access_token": &access_jwt})),
@@ -1367,23 +1442,66 @@ mod tests {
 
         let mock = MockAzureTokenSource::succeeding("aad-tok");
         let reset_count = mock.reset_count.clone();
+        let get_count = mock.get_count.clone();
 
         let auth = AcrAuth::with_api(&server.uri(), "myregistry.azurecr.io", mock);
-        let refused = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-        assert_eq!(reset_count.load(Ordering::Relaxed), 0);
-        auth.invalidate(&Token::new("other")).await;
-        assert_eq!(
-            reset_count.load(Ordering::Relaxed),
-            0,
-            "a refusal of another token must not reset the chain"
-        );
-        auth.invalidate(&refused).await;
-        assert_eq!(
-            reset_count.load(Ordering::Relaxed),
-            1,
-            "a refusal of the kept token must call api.reset()"
-        );
+        assert!(auth.get_token(&[Scope::pull("repo")]).await.is_err());
+        assert_eq!(reset_count.load(Ordering::Relaxed), 1);
         auth.get_token(&[Scope::pull("repo")]).await.unwrap();
+        assert_eq!(get_count.load(Ordering::Relaxed), 2);
+    }
+
+    /// A refusal of a refresh token that has been replaced, or a failure
+    /// that is not a refusal, keeps what is kept and leaves the chain.
+    /// Breaks if either drops the refresh token or resets the chain.
+    #[tokio::test]
+    async fn only_a_refusal_of_the_kept_refresh_token_judges_it() {
+        let mock = MockAzureTokenSource::succeeding("aad-tok");
+        let reset_count = mock.reset_count.clone();
+        let get_count = mock.get_count.clone();
+        let auth = AcrAuth::with_api(
+            "https://myregistry.azurecr.io",
+            "myregistry.azurecr.io",
+            mock,
+        );
+        auth.refresh_cache
+            .set("new".to_owned(), Duration::from_secs(3600));
+        let refused = Error::cloud_credentials("acr", CredentialFailure::Refused, "refused");
+        let transient = Error::cloud_credentials("acr", CredentialFailure::Transient, "down");
+
+        auth.judge_refresh_token("old", &refused);
+        auth.judge_refresh_token("new", &transient);
+        assert_eq!(auth.ensure_refresh_token().await.unwrap(), "new");
+        assert_eq!(reset_count.load(Ordering::Relaxed), 0);
+        assert_eq!(get_count.load(Ordering::Relaxed), 0);
+
+        auth.judge_refresh_token("new", &refused);
+        assert_eq!(reset_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// Callers waiting on a credential refresh that fails share its error,
+    /// across scopes. Breaks if each waiter repeats the failed acquisition.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiters_on_a_failed_refresh_share_its_error() {
+        let mock = MockAzureTokenSource::with_tokens(vec![]);
+        let get_count = mock.get_count.clone();
+        let auth = AcrAuth::with_api(
+            "https://myregistry.azurecr.io",
+            "myregistry.azurecr.io",
+            mock,
+        );
+
+        let (first, second, third) = tokio::join!(
+            auth.get_token(&[Scope::pull("repo-a")]),
+            auth.get_token(&[Scope::pull("repo-b")]),
+            auth.get_token(&[Scope::pull("repo-c")]),
+        );
+
+        for result in [first, second, third] {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("mock: no more tokens"), "got: {err}");
+        }
+        assert_eq!(get_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

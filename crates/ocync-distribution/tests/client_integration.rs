@@ -20,21 +20,21 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// has been moved into the client.
 #[derive(Debug, Clone)]
 struct MockAuthState {
-    invalidate_count: Arc<AtomicU32>,
+    refuse_count: Arc<AtomicU32>,
     recorded_scopes: Arc<Mutex<Vec<Vec<Scope>>>>,
 }
 
 impl MockAuthState {
     fn new() -> Self {
         Self {
-            invalidate_count: Arc::new(AtomicU32::new(0)),
+            refuse_count: Arc::new(AtomicU32::new(0)),
             recorded_scopes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Return the number of times `invalidate()` was called.
-    fn invalidate_count(&self) -> u32 {
-        self.invalidate_count.load(Ordering::SeqCst)
+    /// Return the number of times `refuse()` was called.
+    fn refuse_count(&self) -> u32 {
+        self.refuse_count.load(Ordering::SeqCst)
     }
 
     /// Return all scopes recorded across `get_token()` calls.
@@ -43,7 +43,7 @@ impl MockAuthState {
     }
 }
 
-/// A mock auth provider that tracks token requests, scopes, and invalidation calls.
+/// A mock auth provider that tracks token requests, scopes, and refusal calls.
 struct MockAuth {
     token_value: String,
     state: MockAuthState,
@@ -87,15 +87,15 @@ impl AuthProvider for MockAuth {
         Box::pin(async move { Ok(token) })
     }
 
-    fn invalidate(&self, _refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        self.state.invalidate_count.fetch_add(1, Ordering::SeqCst);
+    fn refuse(&self, _refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.state.refuse_count.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {})
     }
 }
 
 /// A mock auth provider that returns a new token (`token-0`, `token-1`, ...)
 /// on every `get_token` call, and records the values it is asked to
-/// invalidate.
+/// refuse.
 struct RotatingMockAuth {
     call_count: AtomicU32,
     refused: Arc<Mutex<Vec<String>>>,
@@ -126,7 +126,7 @@ impl AuthProvider for RotatingMockAuth {
         Box::pin(async move { Ok(Token::new(token_value)) })
     }
 
-    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         self.refused
             .lock()
             .unwrap()
@@ -170,7 +170,7 @@ async fn get_success_no_retry() {
 }
 
 #[tokio::test]
-async fn get_401_triggers_invalidate_and_retry() {
+async fn get_401_triggers_refuse_and_retry() {
     let server = MockServer::start().await;
 
     // First call: 401, second call: 200
@@ -205,11 +205,11 @@ async fn get_401_triggers_invalidate_and_retry() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // The client should have invalidated exactly once before retrying.
+    // The client should have refused the token exactly once before retrying.
     assert_eq!(
-        state.invalidate_count(),
+        state.refuse_count(),
         1,
-        "expected exactly 1 invalidation on 401 retry"
+        "expected exactly 1 refusal on 401 retry"
     );
 }
 
@@ -241,15 +241,15 @@ async fn get_double_401_returns_unauthorized() {
     let err = result.unwrap_err();
     assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED));
 
-    // Double-401 should still have invalidated once (before the retry attempt).
+    // Double-401 should still have refused the token once (before the retry attempt).
     assert_eq!(
-        state.invalidate_count(),
+        state.refuse_count(),
         1,
-        "expected 1 invalidation even on double-401"
+        "expected 1 refusal even on double-401"
     );
 }
 
-/// A refused request is retried once, and the token invalidated is the one
+/// A refused request is retried once, and the token refused is the one
 /// the request carried, not whatever the provider would hand out now.
 /// Breaks if the client retries again, or names another token, so a
 /// provider drops a replacement.
@@ -484,11 +484,11 @@ async fn head_401_triggers_retry() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // The client should have invalidated exactly once before retrying.
+    // The client should have refused the token exactly once before retrying.
     assert_eq!(
-        state.invalidate_count(),
+        state.refuse_count(),
         1,
-        "expected exactly 1 invalidation on HEAD 401 retry"
+        "expected exactly 1 refusal on HEAD 401 retry"
     );
 }
 
@@ -520,11 +520,11 @@ async fn head_double_401_returns_unauthorized() {
     let err = result.unwrap_err();
     assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED));
 
-    // Double-401 should still have invalidated once (before the retry attempt).
+    // Double-401 should still have refused the token once (before the retry attempt).
     assert_eq!(
-        state.invalidate_count(),
+        state.refuse_count(),
         1,
-        "expected 1 invalidation even on HEAD double-401"
+        "expected 1 refusal even on HEAD double-401"
     );
 }
 

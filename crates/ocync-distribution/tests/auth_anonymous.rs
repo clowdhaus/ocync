@@ -155,7 +155,7 @@ async fn scope_upgrade_fetches_new_token() {
 }
 
 #[tokio::test]
-async fn invalidate_clears_cache() {
+async fn refusal_clears_cache() {
     let server = setup_auth_server().await;
 
     let body = serde_json::json!({ "token": "fresh-token", "expires_in": 3600 });
@@ -173,7 +173,7 @@ async fn invalidate_clears_cache() {
     let scopes = [Scope::pull("library/nginx")];
 
     let refused = auth.get_token(&scopes).await.unwrap();
-    auth.invalidate(&refused).await;
+    auth.refuse(refused).await;
     let _ = auth.get_token(&scopes).await.unwrap();
 }
 

@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio::time::Instant;
 
-use crate::auth::{EARLY_REFRESH_WINDOW, is_fresh};
+use crate::auth::{EARLY_REFRESH_WINDOW, Refusal, is_fresh};
 use crate::flight::{Flights, Landed};
 
 /// Time until `until`, or zero once it has passed.
@@ -26,10 +26,10 @@ pub(crate) fn remaining(until: SystemTime) -> Duration {
 /// metadata session token. Time is tokio's, so a test with paused time
 /// moves it.
 ///
-/// A landing never stores a value the registry refused after its refresh
-/// began (see [`Self::refuse_if`]); the callers that waited on it still get
-/// its value. No other value can be stored while a refresh is in flight, as
-/// the callers that need one wait on it.
+/// A landing never stores a value refused after its refresh began (see
+/// [`Self::refuse_if`]); the callers that waited on it still get its value.
+/// No other value can be stored while a refresh is in flight, as the
+/// callers that need one wait on it.
 ///
 /// `E` is the error [`Self::get_or_refresh_sharing_failure`] hands to the
 /// callers that waited on a refresh that failed. A cache that never shares
@@ -41,13 +41,14 @@ pub(crate) struct CredentialCache<T, E = Infallible> {
     flights: Flights<(), Result<T, E>>,
 }
 
+/// Says whether a value is the one a refusal named.
+type IsRefused<T> = Box<dyn Fn(&T) -> bool + Send + Sync>;
+
 struct State<T> {
     entry: Option<CacheEntry<T>>,
-    /// Counts the refusals so far, so a refresh can tell whether one came
-    /// after it began.
-    epoch: u64,
-    /// The last value the registry refused.
-    refused: Option<Refused<T>>,
+    /// The refusals made since the refresh in flight began, or `None` while
+    /// no refresh is in flight.
+    refused: Option<Vec<IsRefused<T>>>,
 }
 
 struct CacheEntry<T> {
@@ -55,12 +56,6 @@ struct CacheEntry<T> {
     /// When the value expires, or `None` when its lifetime runs past what
     /// the clock can hold.
     expires_at: Option<Instant>,
-}
-
-struct Refused<T> {
-    is_refused: Box<dyn Fn(&T) -> bool + Send + Sync>,
-    /// The epoch at which the refusal was made.
-    at: u64,
 }
 
 impl<T> CacheEntry<T> {
@@ -90,7 +85,6 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         Self {
             state: RwLock::new(State {
                 entry: None,
-                epoch: 0,
                 refused: None,
             }),
             refresh_window: window,
@@ -99,39 +93,28 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
     }
 
     /// Run `refresh` for the callers that need a value, unless one is in
-    /// flight: `share` picks what its waiters get from its result. The
-    /// result comes with the epoch at which the refresh began.
+    /// flight: `share` picks what its waiters get from its result.
     async fn refresh<F>(
         &self,
         refresh: impl Future<Output = Result<(T, Duration), F>>,
         share: impl FnOnce(&Result<(T, Duration), F>) -> Option<Result<T, E>>,
-    ) -> Landed<(u64, Result<(T, Duration), F>), Result<T, E>> {
-        let land = |(began, result): &(u64, Result<(T, Duration), F>)| {
+    ) -> Landed<Result<(T, Duration), F>, Result<T, E>> {
+        let land = |result: &Result<(T, Duration), F>, _| {
+            let refused = self.write().refused.take().unwrap_or_default();
             if let Ok((value, ttl)) = result {
-                self.store(value, *ttl, *began);
+                if !refused.iter().any(|is_refused| is_refused(value)) {
+                    self.write().entry = Some(CacheEntry::new(value.clone(), *ttl));
+                }
             }
             share(result)
         };
         let fetch = || {
-            let began = self.read().epoch;
-            async move { (began, refresh.await) }
+            self.write().refused = Some(Vec::new());
+            refresh
         };
         self.flights
             .run(&(), || self.fresh().map(Ok), fetch, land)
             .await
-    }
-
-    /// Keep a value from a refresh that began at epoch `began`, unless the
-    /// registry has refused it since.
-    fn store(&self, value: &T, ttl: Duration, began: u64) {
-        let mut state = self.write();
-        let refused = state
-            .refused
-            .as_ref()
-            .is_some_and(|refused| refused.at > began && (refused.is_refused)(value));
-        if !refused {
-            state.entry = Some(CacheEntry::new(value.clone(), ttl));
-        }
     }
 
     /// The value, if fresh.
@@ -168,38 +151,35 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
             )
         };
         match self.refresh(refresh, share).await {
-            Landed::Own((_, result)) => result.map(|(value, _)| value),
+            Landed::Own(result) => result.map(|(value, _)| value),
             Landed::Shared(result) => result,
         }
     }
 
-    /// Clear the cached value. A caller that asks afterwards joins the
-    /// refresh in flight, if any: it fetches a new value rather than the
-    /// refused one, so the refusals that arrive while it runs cost one
-    /// refresh.
-    pub(crate) fn clear(&self) {
-        self.write().entry = None;
-    }
-
-    /// The registry refused a value for which `is_refused` is true. Drop
-    /// the cached value if it is that one, and remember `is_refused`, so a
-    /// refresh that began before this call and lands that value is not
-    /// stored. A refresh that begins afterwards stores it: the source is
-    /// issuing it again.
-    pub(crate) fn refuse_if(&self, is_refused: impl Fn(&T) -> bool + Send + Sync + 'static) {
+    /// The source or registry refused a value for which `is_refused` is
+    /// true. Drop the cached value if it is that one, and remember the
+    /// refusal until the refresh in flight, if any, lands, so that refresh
+    /// does not store that value. A refresh that begins afterwards stores
+    /// it: the source is issuing it again.
+    pub(crate) fn refuse_if(
+        &self,
+        is_refused: impl Fn(&T) -> bool + Send + Sync + 'static,
+    ) -> Refusal {
         let mut state = self.write();
-        if state
+        let refusal = if state
             .entry
             .as_ref()
             .is_some_and(|entry| is_refused(&entry.value))
         {
             state.entry = None;
+            Refusal::Current
+        } else {
+            Refusal::Stale
+        };
+        if let Some(refused) = &mut state.refused {
+            refused.push(Box::new(is_refused));
         }
-        state.epoch += 1;
-        state.refused = Some(Refused {
-            is_refused: Box::new(is_refused),
-            at: state.epoch,
-        });
+        refusal
     }
 
     /// Replace the cached value (test helper).
@@ -224,7 +204,7 @@ impl<T: Clone> CredentialCache<T> {
             result.as_ref().ok().map(|(value, _)| Ok(value.clone()))
         };
         match self.refresh(refresh, share).await {
-            Landed::Own((_, result)) => result.map(|(value, _)| value),
+            Landed::Own(result) => result.map(|(value, _)| value),
             Landed::Shared(Ok(value)) => Ok(value),
             Landed::Shared(Err(never)) => match never {},
         }
@@ -279,10 +259,10 @@ mod tests {
         assert_eq!(refreshes.get(), 1);
     }
 
-    /// A caller that asks after a clear joins the refresh in flight. Breaks
-    /// if a burst of refusals starts one refresh per refusal.
+    /// A caller that asks after a refusal joins the refresh in flight.
+    /// Breaks if a burst of refusals starts one refresh per refusal.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_clear_joins_the_refresh_in_flight() {
+    async fn a_refusal_joins_the_refresh_in_flight() {
         use std::cell::Cell;
 
         let cache: CredentialCache<_> = CredentialCache::new();
@@ -298,7 +278,7 @@ mod tests {
         };
         let (before, after) = tokio::join!(cache.get_or_refresh(load(1)), async {
             tokio::task::yield_now().await;
-            cache.clear();
+            cache.refuse_if(|kept| *kept == 0);
             cache.get_or_refresh(load(2)).await
         });
         assert_eq!((before, after), (Ok(1), Ok(1)));
@@ -347,9 +327,9 @@ mod tests {
     async fn a_refusal_drops_only_the_value_it_names() {
         let cache: CredentialCache<_> = CredentialCache::new();
         cache.set(2, Duration::from_secs(1000));
-        cache.refuse_if(|kept| *kept == 1);
+        assert_eq!(cache.refuse_if(|kept| *kept == 1), Refusal::Stale);
         assert_eq!(cache.get_or_refresh(slow_load(3)).await, Ok(2));
-        cache.refuse_if(|kept| *kept == 2);
+        assert_eq!(cache.refuse_if(|kept| *kept == 2), Refusal::Current);
         assert_eq!(cache.get_or_refresh(slow_load(3)).await, Ok(3));
     }
 
@@ -366,6 +346,22 @@ mod tests {
         });
         assert_eq!(landed, Ok(1));
         assert_eq!(cache.get_or_refresh(slow_load(2)).await, Ok(2));
+    }
+
+    /// Every value refused while a refresh is in flight is remembered, not
+    /// only the last. Breaks if a second refusal makes the cache forget the
+    /// first, and the refresh lands the first value.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refresh_does_not_land_any_value_refused_while_it_ran() {
+        let cache: CredentialCache<_> = CredentialCache::new();
+        cache.set(1, Duration::from_secs(10));
+        let (landed, ()) = tokio::join!(cache.get_or_refresh(slow_load(1)), async {
+            tokio::task::yield_now().await;
+            cache.refuse_if(|kept| *kept == 1);
+            cache.refuse_if(|kept| *kept == 2);
+        });
+        assert_eq!(landed, Ok(1));
+        assert_eq!(cache.get_or_refresh(slow_load(3)).await, Ok(3));
     }
 
     /// A refresh that begins after the refusal stores the value, as the

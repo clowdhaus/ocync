@@ -358,7 +358,7 @@ impl RegistryClient {
                 status: StatusCode::UNAUTHORIZED,
                 message,
             }) => {
-                self.invalidate_auth(sent.as_ref()).await;
+                self.refuse_auth(sent).await;
                 Err(Error::UploadTokenRefused { message })
             }
             Err(error) => Err(error),

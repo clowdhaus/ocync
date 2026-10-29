@@ -132,16 +132,6 @@ pub struct Token {
     scheme: AuthScheme,
 }
 
-/// Two tokens are equal when they send the same `Authorization` header,
-/// whatever their expiry.
-impl PartialEq for Token {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value && self.scheme == other.scheme
-    }
-}
-
-impl Eq for Token {}
-
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Token")
@@ -189,6 +179,12 @@ impl Token {
     /// The raw token value.
     pub fn value(&self) -> &str {
         &self.value
+    }
+
+    /// Whether the two tokens send the same `Authorization` header,
+    /// whatever their expiry.
+    pub(crate) fn sends_same_header(&self, other: &Token) -> bool {
+        self.value == other.value && self.scheme == other.scheme
     }
 
     /// The auth scheme for this token.
@@ -259,6 +255,15 @@ impl fmt::Debug for Credentials {
     }
 }
 
+/// What a refusal of a credential found stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The refused credential was the one stored, and is dropped.
+    Current,
+    /// Another credential, or none, was stored, and it is kept.
+    Stale,
+}
+
 /// Trait for providers that can obtain authentication tokens for registries.
 ///
 /// Uses `Pin<Box<dyn Future>>` for object safety, allowing `Box<dyn AuthProvider>`.
@@ -276,14 +281,15 @@ pub trait AuthProvider: Send + Sync {
         scopes: &[Scope],
     ) -> Pin<Box<dyn Future<Output = Result<Token, Error>> + Send + '_>>;
 
-    /// Drop a stored token or credential only if it is `refused`, the token
-    /// the registry rejected with 401, so the next `get_token` call does
-    /// not reuse it. A stored value that has since replaced `refused` is
-    /// kept, as other requests may be using it. A fetch already in flight
-    /// may still answer the next call.
+    /// The registry rejected `refused` with 401. Drop the stored token only
+    /// if it is `refused`, so the next `get_token` call does not reuse it.
+    /// A stored token that has since replaced `refused` is kept, as other
+    /// requests may be using it. A fetch already in flight may still answer
+    /// the next call. The cloud credential a token was exchanged with is
+    /// judged only by the exchange that uses it, not by this call.
     ///
     /// Called by the client when a request returns 401.
-    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 #[cfg(test)]

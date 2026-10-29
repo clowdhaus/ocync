@@ -4,33 +4,25 @@
 //! however many callers need it: the callers that ask while it is in
 //! flight get its result, a failure included, so a failing endpoint costs
 //! one exchange per wave of callers, not one per caller. Callers for
-//! distinct scopes proceed in parallel.
+//! distinct scopes proceed in parallel. The cache also owns the registry's
+//! cached `WWW-Authenticate` challenge, which a refused token calls into
+//! question along with the tokens.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use super::Token;
+use super::token_exchange::ChallengeCache;
+use super::{Refusal, Token};
 use crate::error::Error;
-use crate::flight::{Flights, Landed};
-
-/// The live tokens, each stamped with the epoch at which it was stored.
-#[derive(Debug, Default)]
-struct Tokens {
-    by_key: HashMap<String, (Token, u64)>,
-    /// Counts the stores, so a fetch can tell whether its key was stored
-    /// since it began.
-    epoch: u64,
-}
+use crate::flight::{Flights, Landed, Standing};
 
 /// Coalescing token cache. See the module docs.
-///
-/// A fetch that lands never overwrites a token stored for its key after the
-/// fetch began; the callers that waited on it still get its token.
 #[derive(Debug, Default)]
 pub(super) struct TokenCache {
-    cache: Mutex<Tokens>,
-    flights: Flights<String, (u64, Result<Token, Error>)>,
+    tokens: Mutex<HashMap<String, Token>>,
+    flights: Flights<String, Result<Token, Error>>,
+    challenge: ChallengeCache,
 }
 
 impl TokenCache {
@@ -38,19 +30,25 @@ impl TokenCache {
         Self::default()
     }
 
-    fn tokens(&self) -> MutexGuard<'_, Tokens> {
-        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    fn tokens(&self) -> MutexGuard<'_, HashMap<String, Token>> {
+        self.tokens.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Number of entries currently in the token cache. Used for log
-    /// diagnostics on invalidation.
+    /// The registry's cached challenge.
+    pub(super) fn challenge(&self) -> &ChallengeCache {
+        &self.challenge
+    }
+
+    /// Number of tokens currently cached.
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.tokens().by_key.len()
+        self.tokens().len()
     }
 
     /// Look up a cached token for `key`, or invoke `fetch` to produce
     /// one. Concurrent callers for the same `key` share one fetch and its
-    /// result; a caller that asks after a failure fetches again.
+    /// result; a caller that asks after a failure fetches again. A fetch
+    /// detached by a refusal serves its waiters but stores nothing.
     pub(super) async fn get_or_fetch<F, Fut>(&self, key: String, fetch: F) -> Result<Token, Error>
     where
         F: FnOnce() -> Fut,
@@ -58,59 +56,48 @@ impl TokenCache {
     {
         let stored = || {
             self.tokens()
-                .by_key
                 .get(&key)
-                .map(|(token, _)| token)
                 .filter(|token| token.is_valid())
                 .cloned()
-                // The epoch of a stored token is not read.
-                .map(|token| (0, Ok(token)))
+                .map(Ok)
         };
-        let fetch = || {
-            let began = self.tokens().epoch;
-            async move { (began, fetch().await) }
-        };
-        let land = |landed: &(u64, Result<Token, Error>)| {
-            let (began, result) = landed;
-            if let Ok(token) = result {
-                let mut tokens = self.tokens();
-                let overtaken = tokens
-                    .by_key
-                    .get(&key)
-                    .is_some_and(|(_, stored_at)| stored_at > began);
-                if !overtaken {
-                    tokens.epoch += 1;
-                    let stored_at = tokens.epoch;
-                    tokens
-                        .by_key
-                        .insert(key.clone(), (token.clone(), stored_at));
-                }
+        let land = |result: &Result<Token, Error>, standing| {
+            if let (Ok(token), Standing::Attached) = (result, standing) {
+                self.tokens().insert(key.clone(), token.clone());
             }
-            Some(landed.clone())
+            Some(result.clone())
         };
         match self.flights.run(&key, stored, fetch, land).await {
-            Landed::Own((_, result)) | Landed::Shared((_, result)) => result,
+            Landed::Own(result) | Landed::Shared(result) => result,
         }
     }
 
-    /// Drop every cached token that is `refused`, and if any was, detach
-    /// the exchanges in flight: a caller that asks afterwards exchanges
-    /// again rather than joining one that may be using the credential
-    /// behind the refused token. A detached exchange still serves the
-    /// callers waiting on it, and stores its token only if nothing newer is
-    /// stored for its scope. Returns whether any token was dropped. When
-    /// none was, the cache and the exchanges in flight are left alone.
-    pub(super) fn drop_refused(&self, refused: &Token) -> bool {
-        let mut dropped = false;
-        self.flights.forget(|| {
-            self.tokens().by_key.retain(|_, (token, _)| {
-                let keep = token != refused;
-                dropped |= !keep;
-                keep
-            });
+    /// The registry refused `refused`. Drop every cached token that sends
+    /// the same header, detach the exchanges in flight for those scopes,
+    /// and drop the challenge: a caller that asks afterwards exchanges
+    /// again rather than joining an exchange that may be using what the
+    /// refused token was built on. A detached exchange serves the callers
+    /// waiting on it but stores nothing. When no cached token was the
+    /// refused one, the cache, the challenge and the exchanges in flight are
+    /// left alone.
+    pub(super) async fn refuse(&self, refused: &Token) -> Refusal {
+        let dropped = self.flights.forget(|| {
+            let mut tokens = self.tokens();
+            let dropped: Vec<String> = tokens
+                .iter()
+                .filter(|(_, token)| token.sends_same_header(refused))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in &dropped {
+                tokens.remove(key);
+            }
             dropped
         });
-        dropped
+        if dropped.is_empty() {
+            return Refusal::Stale;
+        }
+        self.challenge.clear().await;
+        Refusal::Current
     }
 }
 
@@ -122,6 +109,7 @@ mod tests {
 
     use tokio::sync::Barrier;
 
+    use super::super::token_exchange::WwwAuthenticate;
     use super::*;
 
     /// Trivial token builder that doesn't expire so cache hits are stable.
@@ -271,7 +259,7 @@ mod tests {
             cache.get_or_fetch("scope".to_string(), || exchange("first")),
             async {
                 tokio::task::yield_now().await;
-                cache.drop_refused(&token(refused));
+                cache.refuse(&token(refused)).await;
                 cache
                     .get_or_fetch("scope".to_string(), || exchange("second"))
                     .await
@@ -302,73 +290,137 @@ mod tests {
         assert_eq!(exchanges, 1);
     }
 
-    /// An exchange detached by a drop does not overwrite the token a later
-    /// exchange stored for its scope. Breaks if a landing stores over a
-    /// token stored after it began.
+    /// A token stale enough that its scope is exchanged again.
+    fn stale(value: &str) -> Token {
+        Token::with_ttl(value, Duration::from_secs(10))
+    }
+
+    /// Yield `count` times, then answer `value`.
+    async fn after(count: usize, value: &'static str) -> Result<Token, Error> {
+        for _ in 0..count {
+            tokio::task::yield_now().await;
+        }
+        Ok(token(value))
+    }
+
+    /// An exchange detached by a refusal serves its caller but does not
+    /// overwrite the token a later exchange stored for its scope. Breaks if
+    /// a detached landing stores over a newer token.
     #[tokio::test(flavor = "current_thread")]
     async fn a_detached_exchange_does_not_overwrite_a_newer_token() {
         let cache = TokenCache::new();
-        let kept = Token::with_ttl("kept", Duration::from_secs(10));
         cache
-            .get_or_fetch("scope".to_string(), || async { Ok(kept.clone()) })
+            .get_or_fetch("scope".to_string(), || async { Ok(stale("kept")) })
             .await
             .unwrap();
-        let slow = async {
-            for _ in 0..5 {
+        let (old, new) = tokio::join!(
+            cache.get_or_fetch("scope".to_string(), || after(5, "old")),
+            async {
                 tokio::task::yield_now().await;
-            }
-            Ok(token("old"))
-        };
-        let (old, new) = tokio::join!(cache.get_or_fetch("scope".to_string(), || slow), async {
-            tokio::task::yield_now().await;
-            cache.drop_refused(&kept);
-            cache
-                .get_or_fetch("scope".to_string(), || async { Ok(token("new")) })
-                .await
-        },);
+                cache.refuse(&stale("kept")).await;
+                cache
+                    .get_or_fetch("scope".to_string(), || after(0, "new"))
+                    .await
+            },
+        );
         assert_eq!(old.unwrap().value(), "old");
         assert_eq!(new.unwrap().value(), "new");
         let kept = cache
-            .get_or_fetch("scope".to_string(), || async { Ok(token("unexpected")) })
+            .get_or_fetch("scope".to_string(), || after(0, "unexpected"))
             .await
             .unwrap();
         assert_eq!(kept.value(), "new");
     }
 
-    /// An exchange for one scope that lands after another scope's keeps its
-    /// token. Breaks if a store for one scope makes the landing of another
-    /// look overtaken, and every caller of it exchanges again.
+    /// An exchange detached by a refusal that lands before the retry's
+    /// exchange stores nothing, so a caller that asks meanwhile joins the
+    /// retry. Breaks if the detached landing stores its token, and the
+    /// caller gets the token that was refused for.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_store_for_another_scope_does_not_overtake_an_exchange() {
+    async fn a_detached_exchange_that_lands_first_does_not_block_the_retry() {
         let cache = TokenCache::new();
-        let slow = async {
-            for _ in 0..3 {
+        cache
+            .get_or_fetch("scope".to_string(), || async { Ok(stale("kept")) })
+            .await
+            .unwrap();
+        let (old, retry, meanwhile) = tokio::join!(
+            cache.get_or_fetch("scope".to_string(), || after(2, "old")),
+            async {
                 tokio::task::yield_now().await;
-            }
-            Ok(token("a"))
-        };
-        let (a, b) = tokio::join!(
-            cache.get_or_fetch("scope-a".to_string(), || slow),
-            cache.get_or_fetch("scope-b".to_string(), || async { Ok(token("b")) }),
+                cache.refuse(&stale("kept")).await;
+                cache
+                    .get_or_fetch("scope".to_string(), || after(6, "retry"))
+                    .await
+            },
+            async {
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                cache
+                    .get_or_fetch("scope".to_string(), || after(0, "unexpected"))
+                    .await
+            },
         );
-        assert_eq!((a.unwrap().value(), b.unwrap().value()), ("a", "b"));
-        let exchanges = std::cell::Cell::new(0);
-        for scope in ["scope-a", "scope-b"] {
+        assert_eq!(old.unwrap().value(), "old");
+        assert_eq!(retry.unwrap().value(), "retry");
+        assert_eq!(meanwhile.unwrap().value(), "retry");
+        let kept = cache
+            .get_or_fetch("scope".to_string(), || after(0, "unexpected"))
+            .await
+            .unwrap();
+        assert_eq!(kept.value(), "retry");
+    }
+
+    /// A refusal that matches one scope's token detaches only that scope's
+    /// exchange: the other scope's is still joined, so it costs one
+    /// exchange. Breaks if a refusal detaches every scope's exchanges.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refusal_detaches_only_the_scopes_it_matched() {
+        let cache = TokenCache::new();
+        for (scope, value) in [("scope-a", "a-kept"), ("scope-b", "b-kept")] {
             cache
-                .get_or_fetch(scope.to_string(), || async {
-                    exchanges.set(exchanges.get() + 1);
-                    Ok(token("again"))
-                })
+                .get_or_fetch(scope.to_string(), || async { Ok(stale(value)) })
                 .await
                 .unwrap();
         }
-        assert_eq!(exchanges.get(), 0);
+        let exchanges = std::cell::RefCell::new(Vec::new());
+        let exchange = |scope: &'static str, value: &'static str| {
+            let exchanges = &exchanges;
+            async move {
+                exchanges.borrow_mut().push(scope);
+                after(2, value).await
+            }
+        };
+        let (_, _, b_again, a_again) = tokio::join!(
+            cache.get_or_fetch("scope-a".to_string(), || exchange("a", "a1")),
+            cache.get_or_fetch("scope-b".to_string(), || exchange("b", "b1")),
+            async {
+                tokio::task::yield_now().await;
+                cache.refuse(&stale("a-kept")).await;
+                cache
+                    .get_or_fetch("scope-b".to_string(), || exchange("b", "b2"))
+                    .await
+            },
+            async {
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+                cache
+                    .get_or_fetch("scope-a".to_string(), || exchange("a", "a2"))
+                    .await
+            },
+        );
+        assert_eq!(b_again.unwrap().value(), "b1");
+        assert_eq!(a_again.unwrap().value(), "a2");
+        let mut exchanges = exchanges.into_inner();
+        exchanges.sort_unstable();
+        assert_eq!(exchanges, ["a", "a", "b"]);
     }
 
-    /// Only the refused token is dropped. Breaks if a refusal drops every
-    /// token, or one that is not the refused one.
+    /// Only the refused token is dropped, and the verdict says whether it
+    /// was kept. Breaks if a refusal drops every token, or one that is not
+    /// the refused one.
     #[tokio::test(flavor = "current_thread")]
-    async fn drop_refused_drops_only_the_refused_token() {
+    async fn a_refusal_drops_only_the_refused_token() {
         let cache = TokenCache::new();
         for (scope, value) in [("scope-a", "a"), ("scope-b", "b")] {
             cache
@@ -378,10 +430,10 @@ mod tests {
         }
         assert_eq!(cache.len(), 2);
 
-        assert!(!cache.drop_refused(&token("other")));
+        assert_eq!(cache.refuse(&token("other")).await, Refusal::Stale);
         assert_eq!(cache.len(), 2);
 
-        assert!(cache.drop_refused(&token("a")));
+        assert_eq!(cache.refuse(&token("a")).await, Refusal::Current);
         assert_eq!(cache.len(), 1);
 
         // The refused scope reaches the fetcher again; the other does not.
@@ -398,5 +450,28 @@ mod tests {
             assert_eq!(t.value(), expected);
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refusal that matches a token drops the challenge, and one that
+    /// matches none keeps it. Breaks if either clears it wrongly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refusal_drops_the_challenge_only_when_a_token_matched() {
+        let cache = TokenCache::new();
+        cache
+            .get_or_fetch("scope".to_string(), || async { Ok(token("kept")) })
+            .await
+            .unwrap();
+        cache
+            .challenge()
+            .set(Some(WwwAuthenticate {
+                realm: "https://auth.example/token".to_owned(),
+                service: None,
+            }))
+            .await;
+
+        cache.refuse(&token("other")).await;
+        assert!(cache.challenge().get().await.is_some());
+        cache.refuse(&token("kept")).await;
+        assert!(cache.challenge().get().await.is_none());
     }
 }

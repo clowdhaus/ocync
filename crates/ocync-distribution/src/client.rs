@@ -569,7 +569,7 @@ impl RegistryClient {
     /// Perform an authenticated GET request.
     ///
     /// Acquires an AIMD permit for the given operation, attaches auth headers,
-    /// and retries once on 401 (invalidating the cached token first). Reports
+    /// and retries once on 401 (refusing the token sent first). Reports
     /// throttle on 429 so the AIMD window adapts.
     pub async fn get(
         &self,
@@ -662,10 +662,10 @@ impl RegistryClient {
         result
     }
 
-    /// Send a request with 401 retry and token invalidation.
+    /// Send a request with 401 retry and token refusal.
     ///
     /// Builds the request via `build_request` (called with fresh auth headers),
-    /// sends it, and if a 401 is returned, invalidates the cached token and
+    /// sends it, and if a 401 is returned, refuses the token it sent and
     /// retries once. Does NOT acquire an AIMD permit - callers manage their
     /// own permits.
     async fn send_with_retry(
@@ -681,20 +681,21 @@ impl RegistryClient {
             return Ok(resp);
         }
 
-        tracing::debug!(context, "got 401, invalidating token and retrying");
-        self.invalidate_auth(sent.as_ref()).await;
+        tracing::debug!(context, "got 401, refusing the token and retrying");
+        self.refuse_auth(sent).await;
         let retry = self.auth_token(scopes).await?;
         Ok(build_request(auth_headers(retry.as_ref())?).send().await?)
     }
 
-    /// Invalidate the token the registry refused with 401, if one was sent.
+    /// Tell the auth provider the registry refused `refused` with 401, if a
+    /// token was sent.
     ///
     /// Call this before retrying a request after a 401 response so the auth
     /// provider fetches a fresh token instead of returning the stale one.
     /// The provider keeps any token that has replaced `refused`.
-    pub(crate) async fn invalidate_auth(&self, refused: Option<&Token>) {
+    pub(crate) async fn refuse_auth(&self, refused: Option<Token>) {
         if let (Some(auth), Some(refused)) = (&self.auth, refused) {
-            auth.invalidate(refused).await;
+            auth.refuse(refused).await;
         }
     }
 
@@ -848,7 +849,7 @@ mod tests {
             Box::pin(async { Ok(Token::new("stub-token".to_owned())) })
         }
 
-        fn invalidate(&self, _refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        fn refuse(&self, _refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(async {})
         }
     }

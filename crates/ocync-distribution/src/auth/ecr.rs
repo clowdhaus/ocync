@@ -289,12 +289,12 @@ impl AuthProvider for EcrAuth {
         Box::pin(async move { self.get_token_inner().await })
     }
 
-    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let refused = refused.clone();
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            tracing::debug!(registry = %self.hostname, "invalidating cached ECR token");
-            self.credential_cache
-                .refuse_if(move |kept| *kept == refused);
+            let refusal = self
+                .credential_cache
+                .refuse_if(move |kept| kept.sends_same_header(&refused));
+            tracing::debug!(registry = %self.hostname, ?refusal, "registry refused a token");
         })
     }
 }
@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_invalidation_forces_refetch() {
+    async fn auth_refusal_forces_refetch() {
         let encoded1 = BASE64.encode("AWS:first-token");
         let encoded2 = BASE64.encode("AWS:second-token");
         let auth = EcrAuth::with_api(
@@ -601,7 +601,7 @@ mod tests {
         let t1 = auth.get_token(&[]).await.unwrap();
         assert_eq!(t1.value(), encoded1);
 
-        auth.invalidate(&t1).await;
+        auth.refuse(t1).await;
 
         let t2 = auth.get_token(&[]).await.unwrap();
         assert_eq!(t2.value(), encoded2);
@@ -628,7 +628,7 @@ mod tests {
                 for _ in 0..yields {
                     tokio::task::yield_now().await;
                 }
-                auth.invalidate(stale).await;
+                auth.refuse(stale.clone()).await;
                 auth.get_token(&[]).await.unwrap()
             }
         };

@@ -27,8 +27,6 @@ pub struct BasicAuth {
     credentials: Credentials,
     /// Per-scope coalescing token cache.
     tokens: TokenCache,
-    /// Cached `WWW-Authenticate` challenge to skip redundant `/v2/` pings.
-    challenge_cache: token_exchange::ChallengeCache,
 }
 
 impl fmt::Debug for BasicAuth {
@@ -49,7 +47,6 @@ impl BasicAuth {
             http,
             credentials,
             tokens: TokenCache::new(),
-            challenge_cache: token_exchange::ChallengeCache::new(),
         }
     }
 }
@@ -69,7 +66,7 @@ impl AuthProvider for BasicAuth {
             self.tokens
                 .get_or_fetch(key.clone(), || async {
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-                    let cached_challenge = self.challenge_cache.get().await;
+                    let cached_challenge = self.tokens.challenge().get().await;
                     let (token, challenge) = token_exchange::exchange(
                         &self.http,
                         &self.base_url,
@@ -82,21 +79,17 @@ impl AuthProvider for BasicAuth {
                         tracing::warn!(base_url = %self.base_url, scope = %key, error = %e, "token exchange failed");
                         e
                     })?;
-                    self.challenge_cache.set(challenge).await;
+                    self.tokens.challenge().set(challenge).await;
                     Ok(token)
                 })
                 .await
         })
     }
 
-    fn invalidate(&self, refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let refused = refused.clone();
+    fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let entries = self.tokens.len();
-            tracing::debug!(base_url = %self.base_url, entries, "invalidating token cache");
-            if self.tokens.drop_refused(&refused) {
-                self.challenge_cache.clear().await;
-            }
+            let refusal = self.tokens.refuse(&refused).await;
+            tracing::debug!(base_url = %self.base_url, ?refusal, "registry refused a token");
         })
     }
 }
@@ -229,7 +222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_auth_invalidate_clears_cache() {
+    async fn basic_auth_refusal_clears_cache() {
         let server = MockServer::start().await;
         mount_v2_challenge(&server, 2).await;
         mount_token_endpoint(&server, "fresh-tok", 2).await;
@@ -241,7 +234,12 @@ mod tests {
         );
         let scopes = [Scope::pull("library/nginx")];
         let refused = auth.get_token(&scopes).await.unwrap();
-        auth.invalidate(&refused).await;
+        // A refusal of some other token keeps both caches.
+        auth.refuse(Token::new("other")).await;
+        assert!(auth.tokens.challenge().get().await.is_some());
+        auth.get_token(&scopes).await.unwrap();
+        auth.refuse(refused).await;
+        assert!(auth.tokens.challenge().get().await.is_none());
         auth.get_token(&scopes).await.unwrap();
     }
 

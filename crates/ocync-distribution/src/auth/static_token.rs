@@ -14,7 +14,7 @@ use crate::error::Error;
 /// scenarios where the caller already has a valid bearer token
 /// that doesn't require a token-exchange flow.
 ///
-/// When `invalidate()` is called (after a 401 from the registry),
+/// When `refuse()` is called (after a 401 from the registry),
 /// the token is marked as revoked and subsequent `get_token()` calls
 /// return an error, breaking the infinite retry loop.
 pub struct StaticTokenAuth {
@@ -68,7 +68,7 @@ impl AuthProvider for StaticTokenAuth {
         })
     }
 
-    fn invalidate(&self, _refused: &Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn refuse(&self, _refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {
             tracing::warn!(
                 registry = %self.registry,
@@ -104,7 +104,7 @@ mod tests {
     #[tokio::test]
     async fn static_token_errors_after_invalidate() {
         let auth = StaticTokenAuth::new("ghcr.io", "revoked-token");
-        auth.invalidate(&Token::new("revoked-token")).await;
+        auth.refuse(Token::new("revoked-token")).await;
         let err = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
         assert!(err.to_string().contains("invalidated"), "error: {err}");
         assert!(err.to_string().contains("ghcr.io"), "error: {err}");
