@@ -628,12 +628,6 @@ mod tests {
 
     /// Assert that realm validation rejects with an error containing `needle`.
     #[track_caller]
-    fn assert_realm_rejected(result: Result<(), Error>, needle: &str) {
-        let err = result.unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains(needle), "expected '{needle}' in error: {msg}");
-    }
-
     #[test]
     fn parse_www_authenticate_bearer() {
         let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io""#;
@@ -1201,144 +1195,227 @@ mod tests {
 
     // --- Layer 1: structural validation ---
 
-    #[test]
-    fn validate_realm_rejects_http_when_registry_is_https() {
-        let realm = reqwest::Url::parse("http://evil.com/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "http");
+    /// What a realm check decides.
+    #[derive(Debug, Clone, Copy)]
+    enum Realm {
+        Allowed,
+        /// Refused, with this text in the error.
+        Rejected(&'static str),
     }
 
+    /// A realm is checked against its registry before any credential is
+    /// sent to it: scheme, userinfo and host, the cloud metadata and
+    /// loopback denylist, and the domain binding. Breaks if a row's realm
+    /// is let through when it should be refused, refused when it should
+    /// pass, or refused for another reason.
     #[test]
-    fn validate_realm_rejects_userinfo() {
-        let realm = reqwest::Url::parse("https://user:pass@evil.com/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "userinfo");
-    }
-
-    #[test]
-    fn validate_realm_rejects_non_web_scheme() {
-        let realm = reqwest::Url::parse("ftp://evil.com/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "unsupported scheme");
-    }
-
-    #[test]
-    fn validate_realm_rejects_no_host() {
-        let realm = reqwest::Url::parse("data:text/plain,hello").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "no host");
-    }
-
-    #[test]
-    fn validate_realm_allows_https_cross_domain() {
-        let realm = reqwest::Url::parse("https://auth.docker.io/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry-1.docker.io").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
-    }
-
-    #[test]
-    fn validate_realm_allows_http_when_registry_is_http() {
-        let realm = reqwest::Url::parse("http://my-registry:5000/token").unwrap();
-        let registry = reqwest::Url::parse("http://my-registry:5000").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
-    }
-
-    #[test]
-    fn validate_realm_allows_same_host_different_port() {
-        let realm = reqwest::Url::parse("https://host:8443/token").unwrap();
-        let registry = reqwest::Url::parse("https://host:5000").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
-    }
-
-    // --- Layer 2: IP denylist ---
-
-    #[test]
-    fn validate_realm_rejects_link_local_ipv4() {
-        let realm = reqwest::Url::parse("https://169.254.169.254/latest/meta-data").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "link-local");
-    }
-
-    #[test]
-    fn validate_realm_rejects_ipv4_mapped_ipv6_metadata() {
-        let realm = reqwest::Url::parse("https://[::ffff:169.254.169.254]/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "link-local");
-    }
-
-    #[test]
-    fn validate_realm_rejects_aws_ipv6_imds() {
-        let realm = reqwest::Url::parse("https://[fd00:ec2::254]/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "AWS IPv6 IMDS");
-    }
-
-    #[test]
-    fn validate_realm_rejects_unspecified_ipv4() {
-        let realm = reqwest::Url::parse("http://0.0.0.0/token").unwrap();
-        let registry = reqwest::Url::parse("http://0.0.0.0").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "unspecified");
-    }
-
-    #[test]
-    fn validate_realm_rejects_link_local_ipv6() {
-        let realm = reqwest::Url::parse("http://[fe80::1]/token").unwrap();
-        let registry = reqwest::Url::parse("http://[fe80::1]").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "link-local");
-    }
-
-    #[test]
-    fn validate_realm_rejects_unspecified_ipv6() {
-        let realm = reqwest::Url::parse("http://[::]/token").unwrap();
-        let registry = reqwest::Url::parse("http://[::]").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "unspecified");
-    }
-
-    #[test]
-    fn validate_realm_rejects_alibaba_metadata() {
-        let realm = reqwest::Url::parse("https://100.100.100.200/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "Alibaba");
-    }
-
-    #[test]
-    fn validate_realm_rejects_loopback_when_registry_is_not_loopback() {
-        let realm = reqwest::Url::parse("https://127.0.0.1/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "loopback");
-    }
-
-    /// A loopback realm is allowed for a registry on this host, plain or
-    /// IPv4-mapped. Breaks if an IPv4-mapped loopback registry is refused.
-    #[test]
-    fn validate_realm_allows_loopback_when_registry_is_loopback() {
-        for host in ["127.0.0.1", "[::ffff:127.0.0.1]"] {
-            let realm = reqwest::Url::parse(&format!("http://{host}:9999/token")).unwrap();
-            let registry = reqwest::Url::parse(&format!("http://{host}:5000")).unwrap();
-            validate_realm_url(&realm, &registry).unwrap_or_else(|e| panic!("{host}: {e}"));
+    fn realms_are_checked_before_credentials_are_sent() {
+        let cases = [
+            // rejects http when registry is https
+            (
+                "http://evil.com/token",
+                "https://registry.example.com",
+                Realm::Rejected("http"),
+            ),
+            // rejects userinfo
+            (
+                "https://user:pass@evil.com/token",
+                "https://registry.example.com",
+                Realm::Rejected("userinfo"),
+            ),
+            // rejects non web scheme
+            (
+                "ftp://evil.com/token",
+                "https://registry.example.com",
+                Realm::Rejected("unsupported scheme"),
+            ),
+            // rejects no host
+            (
+                "data:text/plain,hello",
+                "https://registry.example.com",
+                Realm::Rejected("no host"),
+            ),
+            // allows https cross domain
+            (
+                "https://auth.docker.io/token",
+                "https://registry-1.docker.io",
+                Realm::Allowed,
+            ),
+            // allows http when registry is http
+            (
+                "http://my-registry:5000/token",
+                "http://my-registry:5000",
+                Realm::Allowed,
+            ),
+            // allows same host different port
+            (
+                "https://host:8443/token",
+                "https://host:5000",
+                Realm::Allowed,
+            ),
+            // rejects link local ipv4
+            (
+                "https://169.254.169.254/latest/meta-data",
+                "https://registry.example.com",
+                Realm::Rejected("link-local"),
+            ),
+            // rejects ipv4 mapped ipv6 metadata
+            (
+                "https://[::ffff:169.254.169.254]/token",
+                "https://registry.example.com",
+                Realm::Rejected("link-local"),
+            ),
+            // rejects aws ipv6 imds
+            (
+                "https://[fd00:ec2::254]/token",
+                "https://registry.example.com",
+                Realm::Rejected("AWS IPv6 IMDS"),
+            ),
+            // rejects unspecified ipv4
+            (
+                "http://0.0.0.0/token",
+                "http://0.0.0.0",
+                Realm::Rejected("unspecified"),
+            ),
+            // rejects link local ipv6
+            (
+                "http://[fe80::1]/token",
+                "http://[fe80::1]",
+                Realm::Rejected("link-local"),
+            ),
+            // rejects unspecified ipv6
+            (
+                "http://[::]/token",
+                "http://[::]",
+                Realm::Rejected("unspecified"),
+            ),
+            // rejects alibaba metadata
+            (
+                "https://100.100.100.200/token",
+                "https://registry.example.com",
+                Realm::Rejected("Alibaba"),
+            ),
+            // rejects loopback when registry is not loopback
+            (
+                "https://127.0.0.1/token",
+                "https://registry.example.com",
+                Realm::Rejected("loopback"),
+            ),
+            // allows loopback when registry is loopback
+            (
+                "http://127.0.0.1:9999/token",
+                "http://127.0.0.1:5000",
+                Realm::Allowed,
+            ),
+            // allows loopback when registry is loopback
+            (
+                "http://[::ffff:127.0.0.1]:9999/token",
+                "http://[::ffff:127.0.0.1]:5000",
+                Realm::Allowed,
+            ),
+            // allows private ip
+            (
+                "https://192.168.1.50/token",
+                "https://192.168.1.50",
+                Realm::Allowed,
+            ),
+            // rejects localhost when registry is not loopback
+            (
+                "https://localhost:9999/token",
+                "https://registry.example.com",
+                Realm::Rejected("localhost"),
+            ),
+            // allows localhost when registry is localhost
+            (
+                "http://localhost:9999/token",
+                "http://localhost:5000",
+                Realm::Allowed,
+            ),
+            // rejects ipv6 loopback when registry is not loopback
+            (
+                "https://[::1]/token",
+                "https://registry.example.com",
+                Realm::Rejected("loopback"),
+            ),
+            // rejects ipv4 mapped ipv6 loopback when registry is not loopback
+            (
+                "https://[::ffff:127.0.0.1]/token",
+                "https://registry.example.com",
+                Realm::Rejected("loopback"),
+            ),
+            // rejects ipv4 translated metadata
+            (
+                "https://[::ffff:0:a9fe:a9fe]/token",
+                "https://registry.example.com",
+                Realm::Rejected("link-local"),
+            ),
+            // rejects nat64 metadata
+            (
+                "https://[64:ff9b::a9fe:a9fe]/token",
+                "https://registry.example.com",
+                Realm::Rejected("link-local"),
+            ),
+            // allows same host
+            ("https://ghcr.io/token", "https://ghcr.io", Realm::Allowed),
+            // allows sibling subdomain
+            (
+                "https://auth.docker.io/token",
+                "https://registry-1.docker.io",
+                Realm::Allowed,
+            ),
+            // rejects unrelated domain
+            (
+                "https://attacker.com/steal",
+                "https://registry.example.com",
+                Realm::Rejected("does not match"),
+            ),
+            // rejects different tld
+            (
+                "https://auth.docker.com/token",
+                "https://registry-1.docker.io",
+                Realm::Rejected("does not match"),
+            ),
+            // rejects short host cross domain
+            (
+                "https://evil.io/token",
+                "https://ghcr.io",
+                Realm::Rejected("does not match"),
+            ),
+            // allows ip realm skips domain binding
+            (
+                "http://127.0.0.1:9999/token",
+                "http://127.0.0.1:5000",
+                Realm::Allowed,
+            ),
+            // allows domain realm for ip registry
+            (
+                "https://auth.example.com/token",
+                "https://192.168.1.50",
+                Realm::Allowed,
+            ),
+            // rejects subdomain of short host
+            (
+                "https://auth.quay.io/token",
+                "https://quay.io",
+                Realm::Rejected("does not match"),
+            ),
+        ];
+        for (realm, registry, expected) in cases {
+            let result = validate_realm_url(
+                &reqwest::Url::parse(realm).unwrap(),
+                &reqwest::Url::parse(registry).unwrap(),
+            );
+            match expected {
+                Realm::Allowed => result.unwrap_or_else(|e| panic!("{realm} for {registry}: {e}")),
+                Realm::Rejected(needle) => {
+                    let err = result.expect_err(realm).to_string();
+                    assert!(err.contains(needle), "{realm} for {registry}: {err}");
+                }
+            }
         }
     }
 
-    #[test]
-    fn validate_realm_allows_private_ip() {
-        let realm = reqwest::Url::parse("https://192.168.1.50/token").unwrap();
-        let registry = reqwest::Url::parse("https://192.168.1.50").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
-    }
-
-    #[test]
-    fn validate_realm_rejects_localhost_when_registry_is_not_loopback() {
-        let realm = reqwest::Url::parse("https://localhost:9999/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "localhost");
-    }
-
-    #[test]
-    fn validate_realm_allows_localhost_when_registry_is_localhost() {
-        let realm = reqwest::Url::parse("http://localhost:9999/token").unwrap();
-        let registry = reqwest::Url::parse("http://localhost:5000").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
-    }
+    // --- Layer 2: IP denylist ---
 
     // --- Layer 3: integration tests ---
 
@@ -1464,101 +1541,7 @@ mod tests {
 
     // --- IPv6 edge cases (bypass prevention) ---
 
-    #[test]
-    fn validate_realm_rejects_ipv6_loopback_when_registry_is_not_loopback() {
-        let realm = reqwest::Url::parse("https://[::1]/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "loopback");
-    }
-
-    #[test]
-    fn validate_realm_rejects_ipv4_mapped_ipv6_loopback_when_registry_is_not_loopback() {
-        let realm = reqwest::Url::parse("https://[::ffff:127.0.0.1]/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "loopback");
-    }
-
-    #[test]
-    fn validate_realm_rejects_ipv4_translated_metadata() {
-        // RFC 6145 IPv4-translated: ::ffff:0:a9fe:a9fe embeds 169.254.169.254.
-        let realm = reqwest::Url::parse("https://[::ffff:0:a9fe:a9fe]/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "link-local");
-    }
-
-    #[test]
-    fn validate_realm_rejects_nat64_metadata() {
-        // RFC 6052 NAT64 well-known prefix: 64:ff9b::a9fe:a9fe embeds 169.254.169.254.
-        let realm = reqwest::Url::parse("https://[64:ff9b::a9fe:a9fe]/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "link-local");
-    }
-
     // --- Layer 4: domain binding ---
-
-    #[test]
-    fn validate_realm_allows_same_host() {
-        let realm = reqwest::Url::parse("https://ghcr.io/token").unwrap();
-        let registry = reqwest::Url::parse("https://ghcr.io").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
-    }
-
-    #[test]
-    fn validate_realm_allows_sibling_subdomain() {
-        // Docker Hub: registry-1.docker.io -> auth.docker.io (same parent docker.io).
-        let realm = reqwest::Url::parse("https://auth.docker.io/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry-1.docker.io").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
-    }
-
-    #[test]
-    fn validate_realm_rejects_unrelated_domain() {
-        let realm = reqwest::Url::parse("https://attacker.com/steal").unwrap();
-        let registry = reqwest::Url::parse("https://registry.example.com").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "does not match");
-    }
-
-    #[test]
-    fn validate_realm_rejects_different_tld() {
-        let realm = reqwest::Url::parse("https://auth.docker.com/token").unwrap();
-        let registry = reqwest::Url::parse("https://registry-1.docker.io").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "does not match");
-    }
-
-    #[test]
-    fn validate_realm_rejects_short_host_cross_domain() {
-        // ghcr.io has only 2 labels -- require exact match.
-        let realm = reqwest::Url::parse("https://evil.io/token").unwrap();
-        let registry = reqwest::Url::parse("https://ghcr.io").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "does not match");
-    }
-
-    #[test]
-    fn validate_realm_allows_ip_realm_skips_domain_binding() {
-        // IP-based realms skip domain binding (Layer 2 already validated).
-        let realm = reqwest::Url::parse("http://127.0.0.1:9999/token").unwrap();
-        let registry = reqwest::Url::parse("http://127.0.0.1:5000").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
-    }
-
-    #[test]
-    fn validate_realm_allows_domain_realm_for_ip_registry() {
-        // When the registry is IP-based, domain binding is skipped since
-        // Layer 2 already validated the IP. IP-based registries are
-        // typically private/local and under the operator's control.
-        let realm = reqwest::Url::parse("https://auth.example.com/token").unwrap();
-        let registry = reqwest::Url::parse("https://192.168.1.50").unwrap();
-        validate_realm_url(&realm, &registry).unwrap();
-    }
-
-    #[test]
-    fn validate_realm_rejects_subdomain_of_short_host() {
-        // Registry is quay.io (2 labels), realm is sub.quay.io --
-        // since registry has <= 2 labels and hosts don't match exactly, reject.
-        let realm = reqwest::Url::parse("https://auth.quay.io/token").unwrap();
-        let registry = reqwest::Url::parse("https://quay.io").unwrap();
-        assert_realm_rejected(validate_realm_url(&realm, &registry), "does not match");
-    }
 
     /// An exchange that started from the cached challenge, and was cleared
     /// while it ran, does not store the challenge it learned, and one that

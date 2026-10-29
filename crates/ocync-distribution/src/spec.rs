@@ -611,49 +611,37 @@ mod tests {
         assert!(idx.manifests[0].platform.is_some());
     }
 
+    /// The media type picks how a manifest is read: an image for the OCI
+    /// and Docker v2 manifest types, an index for the OCI index and Docker
+    /// manifest list, and any other type is refused. Breaks if a type is
+    /// read as the wrong kind or an unknown type is accepted.
     #[test]
-    fn manifest_from_json_oci_image() {
-        let json = serde_json::json!({
+    fn the_media_type_picks_the_manifest_kind() {
+        let image = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
             "config": test_descriptor(),
             "layers": [test_layer_descriptor()]
-        });
-        let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(&MediaType::OciManifest, &bytes).unwrap();
-        assert!(matches!(m, ManifestKind::Image(_)));
-    }
-
-    #[test]
-    fn manifest_from_json_docker_v2() {
-        let json = serde_json::json!({
-            "schemaVersion": 2,
-            "config": test_descriptor(),
-            "layers": [test_layer_descriptor()]
-        });
-        let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(&MediaType::DockerManifestV2, &bytes).unwrap();
-        assert!(matches!(m, ManifestKind::Image(_)));
-    }
-
-    #[test]
-    fn manifest_from_json_index() {
-        let json = serde_json::json!({
+        }))
+        .unwrap();
+        let index = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
             "manifests": [{
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
                 "digest": TEST_DIGEST,
                 "size": 1000
             }]
-        });
-        let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(&MediaType::OciIndex, &bytes).unwrap();
-        assert!(matches!(m, ManifestKind::Index(_)));
-    }
-
-    #[test]
-    fn manifest_from_json_unsupported() {
-        let r = ManifestKind::from_json(&MediaType::Other("text/plain".into()), b"{}");
-        assert!(r.is_err());
+        }))
+        .unwrap();
+        for media_type in [MediaType::OciManifest, MediaType::DockerManifestV2] {
+            let m = ManifestKind::from_json(&media_type, &image).unwrap();
+            assert!(matches!(m, ManifestKind::Image(_)), "{media_type:?}");
+        }
+        for media_type in [MediaType::OciIndex, MediaType::DockerManifestList] {
+            let m = ManifestKind::from_json(&media_type, &index).unwrap();
+            assert!(matches!(m, ManifestKind::Index(_)), "{media_type:?}");
+        }
+        let other = MediaType::Other("text/plain".into());
+        assert!(ManifestKind::from_json(&other, b"{}").is_err());
     }
 
     #[test]
@@ -772,81 +760,32 @@ mod tests {
 
     // --- PlatformFilter parsing tests ---
 
+    /// A platform filter is `os/arch` or `os/arch/variant`, each part
+    /// non-empty, and prints back as written. Breaks if a missing or empty
+    /// part is accepted, or a refusal does not say which part is wrong.
     #[test]
-    fn platform_filter_parse_os_arch() {
-        let f: PlatformFilter = "linux/amd64".parse().unwrap();
-        assert_eq!(f.to_string(), "linux/amd64");
-    }
-
-    #[test]
-    fn platform_filter_parse_os_arch_variant() {
-        let f: PlatformFilter = "linux/arm64/v8".parse().unwrap();
-        assert_eq!(f.to_string(), "linux/arm64/v8");
-    }
-
-    #[test]
-    fn platform_filter_parse_empty_fails() {
-        let err = "".parse::<PlatformFilter>().unwrap_err();
-        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
-        let Error::InvalidPlatformFilter { input, reason } = &err else {
-            panic!("expected InvalidPlatformFilter, got {err:?}");
-        };
-        assert_eq!(input, "");
-        assert!(reason.contains("os/arch"), "reason: {reason}");
-    }
-
-    #[test]
-    fn platform_filter_parse_os_only_fails() {
-        let err = "linux".parse::<PlatformFilter>().unwrap_err();
-        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
-        let Error::InvalidPlatformFilter { input, reason } = &err else {
-            panic!("expected InvalidPlatformFilter, got {err:?}");
-        };
-        assert_eq!(input, "linux");
-        assert!(reason.contains("os/arch"), "reason: {reason}");
-    }
-
-    #[test]
-    fn platform_filter_parse_empty_os_fails() {
-        let err = "/amd64".parse::<PlatformFilter>().unwrap_err();
-        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
-        let Error::InvalidPlatformFilter { input, reason } = &err else {
-            panic!("expected InvalidPlatformFilter, got {err:?}");
-        };
-        assert_eq!(input, "/amd64");
-        assert!(reason.contains("non-empty"), "reason: {reason}");
-    }
-
-    #[test]
-    fn platform_filter_parse_empty_arch_fails() {
-        let err = "linux/".parse::<PlatformFilter>().unwrap_err();
-        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
-        let Error::InvalidPlatformFilter { input, reason } = &err else {
-            panic!("expected InvalidPlatformFilter, got {err:?}");
-        };
-        assert_eq!(input, "linux/");
-        assert!(reason.contains("non-empty"), "reason: {reason}");
-    }
-
-    #[test]
-    fn platform_filter_parse_empty_variant_fails() {
-        let err = "linux/amd64/".parse::<PlatformFilter>().unwrap_err();
-        assert!(matches!(err, Error::InvalidPlatformFilter { .. }));
-        let Error::InvalidPlatformFilter { input, reason } = &err else {
-            panic!("expected InvalidPlatformFilter, got {err:?}");
-        };
-        assert_eq!(input, "linux/amd64/");
-        assert!(
-            reason.contains("variant") && reason.contains("non-empty"),
-            "reason: {reason}"
-        );
-    }
-
-    #[test]
-    fn platform_filter_display_roundtrip() {
-        let input = "linux/arm64/v8";
-        let f: PlatformFilter = input.parse().unwrap();
-        assert_eq!(f.to_string(), input);
+    fn platform_filters_parse_or_name_the_missing_part() {
+        for input in ["linux/amd64", "linux/arm64/v8"] {
+            let f: PlatformFilter = input.parse().unwrap();
+            assert_eq!(f.to_string(), input);
+        }
+        let refused: [(&str, &[&str]); 5] = [
+            ("", &["os/arch"]),
+            ("linux", &["os/arch"]),
+            ("/amd64", &["non-empty"]),
+            ("linux/", &["non-empty"]),
+            ("linux/amd64/", &["variant", "non-empty"]),
+        ];
+        for (given, needles) in refused {
+            let err = given.parse::<PlatformFilter>().unwrap_err();
+            let Error::InvalidPlatformFilter { input, reason } = &err else {
+                panic!("{given:?}: expected InvalidPlatformFilter, got {err:?}");
+            };
+            assert_eq!(input, given);
+            for needle in needles {
+                assert!(reason.contains(needle), "{given:?}: {reason}");
+            }
+        }
     }
 
     #[test]

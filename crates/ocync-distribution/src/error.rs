@@ -567,32 +567,104 @@ mod tests {
 
     // --- Display (pre-existing variants, guards against accidental message changes) ---
 
+    /// Each error shows what a user needs to act on: the input, the reason,
+    /// the header or path. Breaks if a message drops a field it names.
     #[test]
-    fn display_invalid_reference() {
-        let err = Error::InvalidReference {
-            input: "!!!".into(),
-            reason: "bad chars".into(),
-        };
-        assert!(err.to_string().contains("!!!"));
-        assert!(err.to_string().contains("bad chars"));
-    }
-
-    #[test]
-    fn display_invalid_digest() {
-        let err = Error::InvalidDigest {
-            digest: "bad".into(),
-            reason: "missing colon".into(),
-        };
-        assert!(err.to_string().contains("bad"));
-        assert!(err.to_string().contains("missing colon"));
-    }
-
-    #[test]
-    fn display_unsupported_media_type() {
-        let err = Error::UnsupportedMediaType {
-            media_type: "text/plain".into(),
-        };
-        assert!(err.to_string().contains("text/plain"));
+    fn errors_show_their_fields() {
+        let cases: Vec<(Error, &[&str])> = vec![
+            // invalid reference
+            (
+                Error::InvalidReference {
+                    input: "!!!".into(),
+                    reason: "bad chars".into(),
+                },
+                &["!!!", "bad chars"],
+            ),
+            // invalid digest
+            (
+                Error::InvalidDigest {
+                    digest: "bad".into(),
+                    reason: "missing colon".into(),
+                },
+                &["bad", "missing colon"],
+            ),
+            // unsupported media type
+            (
+                Error::UnsupportedMediaType {
+                    media_type: "text/plain".into(),
+                },
+                &["text/plain"],
+            ),
+            // url construction
+            (
+                Error::UrlConstruction {
+                    path: "/v2/".into(),
+                    reason: "relative URL without a base".into(),
+                },
+                &["/v2/", "relative URL without a base"],
+            ),
+            // upload protocol
+            (
+                Error::UploadProtocol {
+                    reason: "missing Location header".into(),
+                },
+                &["missing Location header"],
+            ),
+            // registry protocol
+            (
+                Error::RegistryProtocol {
+                    reason: "missing Docker-Content-Digest header".into(),
+                },
+                &["missing Docker-Content-Digest header"],
+            ),
+            // ecr api
+            (
+                Error::EcrApi {
+                    reason: "BatchCheckLayerAvailability throttled".into(),
+                },
+                &["BatchCheckLayerAvailability throttled"],
+            ),
+            // invalid header value
+            (
+                Error::InvalidHeaderValue {
+                    header: "Authorization".into(),
+                    reason: "invalid byte in header value".into(),
+                },
+                &["Authorization", "invalid byte in header value"],
+            ),
+            // invalid manifest
+            (
+                Error::InvalidManifest {
+                    reason: "unsupported schemaVersion 1, expected 2".into(),
+                },
+                &["schemaVersion"],
+            ),
+            // credential config
+            (
+                Error::CredentialConfig {
+                    reason: "failed to read config at ~/.docker/config.json: No such file".into(),
+                },
+                &["credential config error", "config.json"],
+            ),
+            // io
+            (
+                Error::Io {
+                    context: "staging write",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "access denied",
+                    )
+                    .into(),
+                },
+                &["staging write", "access denied"],
+            ),
+        ];
+        for (err, needles) in &cases {
+            let msg = err.to_string();
+            for needle in *needles {
+                assert!(msg.contains(needle), "{needle:?} missing from: {msg}");
+            }
+        }
     }
 
     // --- status_code ---
@@ -870,116 +942,6 @@ mod tests {
     }
 
     // --- Display (new variants) ---
-
-    #[test]
-    fn display_url_construction() {
-        let err = Error::UrlConstruction {
-            path: "/v2/".into(),
-            reason: "relative URL without a base".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("/v2/"), "should contain path: {msg}");
-        assert!(
-            msg.contains("relative URL without a base"),
-            "should contain reason: {msg}"
-        );
-    }
-
-    #[test]
-    fn display_upload_protocol() {
-        let err = Error::UploadProtocol {
-            reason: "missing Location header".into(),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("missing Location header"),
-            "should contain reason: {msg}"
-        );
-    }
-
-    #[test]
-    fn display_registry_protocol() {
-        let err = Error::RegistryProtocol {
-            reason: "missing Docker-Content-Digest header".into(),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("missing Docker-Content-Digest header"),
-            "should contain reason: {msg}"
-        );
-    }
-
-    #[test]
-    fn display_ecr_api() {
-        let err = Error::EcrApi {
-            reason: "BatchCheckLayerAvailability throttled".into(),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("BatchCheckLayerAvailability throttled"),
-            "should contain reason: {msg}"
-        );
-    }
-
-    #[test]
-    fn display_invalid_header_value() {
-        let err = Error::InvalidHeaderValue {
-            header: "Authorization".into(),
-            reason: "invalid byte in header value".into(),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Authorization"),
-            "should contain header name: {msg}"
-        );
-        assert!(
-            msg.contains("invalid byte in header value"),
-            "should contain reason: {msg}"
-        );
-    }
-
-    #[test]
-    fn display_invalid_manifest() {
-        let err = Error::InvalidManifest {
-            reason: "unsupported schemaVersion 1, expected 2".into(),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("schemaVersion"),
-            "should contain reason: {msg}"
-        );
-    }
-
-    #[test]
-    fn display_credential_config() {
-        let err = Error::CredentialConfig {
-            reason: "failed to read config at ~/.docker/config.json: No such file".into(),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("credential config error"),
-            "should contain variant prefix: {msg}"
-        );
-        assert!(
-            msg.contains("config.json"),
-            "should contain path detail: {msg}"
-        );
-    }
-
-    #[test]
-    fn display_io() {
-        let err = Error::Io {
-            context: "staging write",
-            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied")
-                .into(),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("staging write"),
-            "should contain context: {msg}"
-        );
-        assert!(msg.contains("access denied"), "should contain cause: {msg}");
-    }
 
     // --- Structured fields ---
 

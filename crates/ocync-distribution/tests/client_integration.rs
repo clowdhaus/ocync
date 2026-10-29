@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use http::StatusCode;
+use http::{Method, StatusCode};
 use ocync_distribution::Error;
 use ocync_distribution::RepositoryName;
 use ocync_distribution::auth::{AuthProvider, Scope, Token};
@@ -213,40 +213,50 @@ async fn get_401_triggers_refuse_and_retry() {
     );
 }
 
+/// A request answered 401 twice fails as unauthorized after refusing the
+/// token once, for GET and HEAD alike. Breaks if a retry is skipped or the
+/// refusal is sent twice.
 #[tokio::test]
-async fn get_double_401_returns_unauthorized() {
-    let server = MockServer::start().await;
+async fn a_second_401_fails_after_one_refusal() {
+    for verb in [Method::GET, Method::HEAD] {
+        let server = MockServer::start().await;
+        Mock::given(method(verb.as_str()))
+            .and(path("/v2/repo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
 
-    Mock::given(method("GET"))
-        .and(path("/v2/repo/manifests/latest"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(&server)
-        .await;
+        let (auth, state) = MockAuth::new("bad-token");
+        let client = RegistryClientBuilder::new(mock_base_url(&server))
+            .auth(auth)
+            .build()
+            .unwrap();
 
-    let (auth, state) = MockAuth::new("bad-token");
-    let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .auth(auth)
-        .build()
-        .unwrap();
-
-    let repo = RepositoryName::new("repo").unwrap();
-    let result = client
-        .get(
-            &repo,
-            "manifests/latest",
-            None,
-            ocync_distribution::aimd::RegistryAction::ManifestRead,
-        )
-        .await;
-    let err = result.unwrap_err();
-    assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED));
-
-    // Double-401 should still have refused the token once (before the retry attempt).
-    assert_eq!(
-        state.refuse_count(),
-        1,
-        "expected 1 refusal even on double-401"
-    );
+        let repo = RepositoryName::new("repo").unwrap();
+        let err = if verb == Method::GET {
+            client
+                .get(
+                    &repo,
+                    "manifests/latest",
+                    None,
+                    ocync_distribution::aimd::RegistryAction::ManifestRead,
+                )
+                .await
+                .unwrap_err()
+        } else {
+            client
+                .head(
+                    &repo,
+                    "manifests/latest",
+                    None,
+                    ocync_distribution::aimd::RegistryAction::ManifestHead,
+                )
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED), "{verb}");
+        assert_eq!(state.refuse_count(), 1, "{verb}");
+    }
 }
 
 /// A refused request is retried once, and the token refused is the one
@@ -397,38 +407,27 @@ async fn no_auth_provider_sends_no_header() {
     assert_eq!(resp.status(), 200);
 }
 
+/// A ping succeeds whether `/v2/` answers 200 or asks for sign-in with a
+/// 401. Breaks if a 401 ping is treated as a failure.
 #[tokio::test]
-async fn ping_success() {
-    let server = MockServer::start().await;
+async fn ping_takes_200_and_401() {
+    for status in [200, 401] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-    Mock::given(method("GET"))
-        .and(path("/v2/"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&server)
-        .await;
-
-    let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .build()
-        .unwrap();
-
-    client.ping().await.unwrap();
-}
-
-#[tokio::test]
-async fn ping_401_is_ok() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v2/"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(&server)
-        .await;
-
-    let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .build()
-        .unwrap();
-
-    client.ping().await.unwrap();
+        let client = RegistryClientBuilder::new(mock_base_url(&server))
+            .build()
+            .unwrap();
+        client
+            .ping()
+            .await
+            .unwrap_or_else(|e| panic!("{status}: {e}"));
+    }
 }
 
 #[tokio::test]
@@ -489,42 +488,6 @@ async fn head_401_triggers_retry() {
         state.refuse_count(),
         1,
         "expected exactly 1 refusal on HEAD 401 retry"
-    );
-}
-
-#[tokio::test]
-async fn head_double_401_returns_unauthorized() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("HEAD"))
-        .and(path("/v2/repo/manifests/latest"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(&server)
-        .await;
-
-    let (auth, state) = MockAuth::new("bad-token");
-    let client = RegistryClientBuilder::new(mock_base_url(&server))
-        .auth(auth)
-        .build()
-        .unwrap();
-
-    let repo = RepositoryName::new("repo").unwrap();
-    let result = client
-        .head(
-            &repo,
-            "manifests/latest",
-            None,
-            ocync_distribution::aimd::RegistryAction::ManifestHead,
-        )
-        .await;
-    let err = result.unwrap_err();
-    assert_eq!(err.status_code(), Some(StatusCode::UNAUTHORIZED));
-
-    // Double-401 should still have refused the token once (before the retry attempt).
-    assert_eq!(
-        state.refuse_count(),
-        1,
-        "expected 1 refusal even on HEAD double-401"
     );
 }
 

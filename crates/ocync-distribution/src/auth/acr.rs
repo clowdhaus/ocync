@@ -1084,82 +1084,56 @@ mod tests {
         assert_eq!(failure, CredentialFailure::Transient);
     }
 
+    /// A failed exchange names its cause, and only a 401 judges the
+    /// credential refused. A redirect is never followed, so a 307 cannot
+    /// replay the credential elsewhere. Breaks if a redirect is followed,
+    /// an unreadable answer is taken as a refusal, or a 401 is not.
     #[tokio::test]
-    async fn acr_exchange_propagates_401() {
+    async fn a_failed_exchange_names_its_cause() {
         crate::install_crypto_provider();
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/exchange"))
-            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
-            .mount(&server)
-            .await;
-
-        let err = exchange_refresh_token(
-            &no_redirect_http_client(),
-            &server.uri(),
-            "myregistry.azurecr.io",
-            "bad-token",
-        )
-        .await
-        .unwrap_err()
-        .error;
-        assert!(err.to_string().contains("401"), "got: {err}");
-        assert!(err.is_auth_error(), "{err}");
-    }
-
-    /// A redirect from an exchange endpoint must be treated as an error,
-    /// not followed -- prevents credential forwarding via 307 replay.
-    #[tokio::test]
-    async fn exchange_rejects_redirect() {
-        crate::install_crypto_provider();
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/exchange"))
-            .respond_with(
+        let cases = [
+            (
+                ResponseTemplate::new(401).set_body_string("unauthorized"),
+                "401",
+                CredentialFailure::Refused,
+            ),
+            (
                 ResponseTemplate::new(307)
                     .insert_header("Location", "http://evil.example.com/steal"),
+                "307",
+                CredentialFailure::Transient,
+            ),
+            (
+                ResponseTemplate::new(200).set_body_string("not json"),
+                "unreadable answer from",
+                CredentialFailure::Transient,
+            ),
+        ];
+        for (answer, cause, judged) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth2/exchange"))
+                .respond_with(answer)
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let err = exchange_refresh_token(
+                &no_redirect_http_client(),
+                &server.uri(),
+                "myregistry.azurecr.io",
+                "aad-tok",
             )
-            .mount(&server)
-            .await;
-
-        let err = exchange_refresh_token(
-            &no_redirect_http_client(),
-            &server.uri(),
-            "myregistry.azurecr.io",
-            "aad-tok",
-        )
-        .await
-        .unwrap_err()
-        .error;
-        assert!(err.to_string().contains("307"), "got: {err}");
-    }
-
-    /// A 200 response with malformed JSON must produce a parse error,
-    /// not panic or return garbage.
-    #[tokio::test]
-    async fn exchange_rejects_malformed_json() {
-        crate::install_crypto_provider();
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/exchange"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
-            .mount(&server)
-            .await;
-
-        let err = exchange_refresh_token(
-            &no_redirect_http_client(),
-            &server.uri(),
-            "myregistry.azurecr.io",
-            "aad-tok",
-        )
-        .await
-        .unwrap_err()
-        .error;
-        assert!(
-            err.to_string().contains("unreadable answer from"),
-            "got: {err}"
-        );
-        assert!(!err.is_auth_error(), "{err}");
+            .await
+            .unwrap_err()
+            .error;
+            assert!(err.to_string().contains(cause), "{cause}: {err}");
+            assert_eq!(
+                err.is_auth_error(),
+                judged == CredentialFailure::Refused,
+                "{cause}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1189,30 +1163,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(access, "acr-access-tok");
-    }
-
-    /// Negative test for /oauth2/token error path.
-    #[tokio::test]
-    async fn acr_token_propagates_401() {
-        crate::install_crypto_provider();
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth2/token"))
-            .respond_with(ResponseTemplate::new(401).set_body_string("bad refresh"))
-            .mount(&server)
-            .await;
-
-        let err = exchange_access_token(
-            &no_redirect_http_client(),
-            &server.uri(),
-            "myregistry.azurecr.io",
-            "bad-refresh",
-            "repository:repo:pull",
-        )
-        .await
-        .unwrap_err()
-        .error;
-        assert!(err.to_string().contains("401"), "got: {err}");
     }
 
     /// Build a fake JWT with an `exp` claim set to `now + ttl_secs`.

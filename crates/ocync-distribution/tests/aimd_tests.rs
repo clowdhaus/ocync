@@ -15,9 +15,11 @@ use ocync_distribution::aimd::{
 // Window key registry mapping
 // ---------------------------------------------------------------------------
 
+/// ECR, FIPS endpoint included, gives each of its 9 actions its own
+/// window. Breaks if two actions share one, so one's throttling slows the
+/// other.
 #[test]
 fn ecr_every_action_gets_distinct_key() {
-    let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
     let actions = [
         RegistryAction::ManifestHead,
         RegistryAction::ManifestRead,
@@ -29,42 +31,16 @@ fn ecr_every_action_gets_distinct_key() {
         RegistryAction::BlobUploadComplete,
         RegistryAction::TagList,
     ];
-    let keys: Vec<WindowKey> = actions
-        .iter()
-        .map(|&a| window_key_for_registry(host, a))
-        .collect();
-    let unique: std::collections::HashSet<_> = keys.iter().collect();
-    assert_eq!(
-        unique.len(),
-        9,
-        "ECR should map all 9 actions to distinct window keys"
-    );
-}
-
-#[test]
-fn ecr_fips_every_action_gets_distinct_key() {
-    let host = "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com";
-    let actions = [
-        RegistryAction::ManifestHead,
-        RegistryAction::ManifestRead,
-        RegistryAction::ManifestWrite,
-        RegistryAction::BlobHead,
-        RegistryAction::BlobRead,
-        RegistryAction::BlobUploadInit,
-        RegistryAction::BlobUploadChunk,
-        RegistryAction::BlobUploadComplete,
-        RegistryAction::TagList,
-    ];
-    let keys: Vec<WindowKey> = actions
-        .iter()
-        .map(|&a| window_key_for_registry(host, a))
-        .collect();
-    let unique: std::collections::HashSet<_> = keys.iter().collect();
-    assert_eq!(
-        unique.len(),
-        9,
-        "ECR FIPS should map all 9 actions to distinct window keys"
-    );
+    for host in [
+        "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+        "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com",
+    ] {
+        let keys: std::collections::HashSet<WindowKey> = actions
+            .iter()
+            .map(|&a| window_key_for_registry(host, a))
+            .collect();
+        assert_eq!(keys.len(), 9, "{host}");
+    }
 }
 
 #[test]

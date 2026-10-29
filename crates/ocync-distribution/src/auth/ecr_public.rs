@@ -291,6 +291,7 @@ mod tests {
 
     use super::super::recovery::Judgment;
     use super::*;
+    use crate::auth::testing::mount_v2_and_token;
 
     /// A throttle that outlasts its retries is not an auth error, and an
     /// access denial is. Breaks if every AWS failure exits as refused
@@ -384,24 +385,6 @@ mod tests {
         }
     }
 
-    fn mount_v2_and_token(server: &MockServer, token_value: &str) -> Vec<Mock> {
-        vec![
-            Mock::given(method("GET")).and(path("/v2/")).respond_with(
-                ResponseTemplate::new(401).insert_header(
-                    "WWW-Authenticate",
-                    format!(
-                        r#"Bearer realm="{}/token",service="public.ecr.aws""#,
-                        server.uri()
-                    ),
-                ),
-            ),
-            Mock::given(method("GET")).and(path("/token")).respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": token_value, "expires_in": 300})),
-            ),
-        ]
-    }
-
     #[tokio::test]
     async fn auth_name() {
         let encoded = BASE64.encode("AWS:test");
@@ -434,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn token_exchange_with_sdk_credentials() {
         let server = MockServer::start().await;
-        for mock in mount_v2_and_token(&server, "bearer-tok") {
+        for mock in mount_v2_and_token(&server, "public.ecr.aws", "bearer-tok") {
             mock.mount(&server).await;
         }
 
@@ -451,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn sdk_credentials_cached_across_scopes() {
         let server = MockServer::start().await;
-        for mock in mount_v2_and_token(&server, "cached") {
+        for mock in mount_v2_and_token(&server, "public.ecr.aws", "cached") {
             mock.mount(&server).await;
         }
 
@@ -475,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn sdk_credentials_refresh_on_expiry() {
         let server = MockServer::start().await;
-        for mock in mount_v2_and_token(&server, "refreshed") {
+        for mock in mount_v2_and_token(&server, "public.ecr.aws", "refreshed") {
             mock.mount(&server).await;
         }
 

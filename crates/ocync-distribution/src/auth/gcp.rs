@@ -393,6 +393,7 @@ mod tests {
     use wiremock::{Mock, ResponseTemplate};
 
     use super::*;
+    use crate::auth::testing::mount_v2_and_token;
 
     /// Only a refusal, by Google or by AWS for an AWS subject token, is an
     /// auth error: a failure that may pass, a token exchange for a pool that
@@ -546,24 +547,6 @@ mod tests {
         auth.google_token().await.unwrap().expose().to_owned()
     }
 
-    fn mount_v2_and_token(server: &MockServer, token_value: &str) -> Vec<Mock> {
-        vec![
-            Mock::given(method("GET")).and(path("/v2/")).respond_with(
-                ResponseTemplate::new(401).insert_header(
-                    "WWW-Authenticate",
-                    format!(
-                        r#"Bearer realm="{}/token",service="us-docker.pkg.dev""#,
-                        server.uri()
-                    ),
-                ),
-            ),
-            Mock::given(method("GET")).and(path("/token")).respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": token_value, "expires_in": 300})),
-            ),
-        ]
-    }
-
     #[tokio::test]
     async fn auth_name() {
         let auth = GcpAuth::with_api(
@@ -579,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn exchanges_as_oauth2accesstoken() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
+        mount_v2_and_token(&server, "us-docker.pkg.dev", "registry")
             .remove(0)
             .mount(&server)
             .await;
@@ -613,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_exchange_drops_the_google_token() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
+        mount_v2_and_token(&server, "us-docker.pkg.dev", "registry")
             .remove(0)
             .mount(&server)
             .await;
@@ -649,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_identity_fetches_one_more_google_token() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
+        mount_v2_and_token(&server, "us-docker.pkg.dev", "registry")
             .remove(0)
             .mount(&server)
             .await;
@@ -684,7 +667,7 @@ mod tests {
         use base64::Engine;
 
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
+        mount_v2_and_token(&server, "us-docker.pkg.dev", "registry")
             .remove(0)
             .mount(&server)
             .await;
@@ -736,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn a_later_token_may_be_refused_and_replaced() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
+        mount_v2_and_token(&server, "us-docker.pkg.dev", "registry")
             .remove(0)
             .mount(&server)
             .await;
@@ -778,7 +761,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_scope_keeps_the_google_token() {
         let server = MockServer::start().await;
-        mount_v2_and_token(&server, "registry")
+        mount_v2_and_token(&server, "us-docker.pkg.dev", "registry")
             .remove(0)
             .mount(&server)
             .await;
@@ -837,7 +820,7 @@ mod tests {
         mount_user_token(&server, 1).await;
         let host = user_host(&server);
         let shared = SharedGoogleToken::default();
-        for mock in mount_v2_and_token(&server, "registry-token") {
+        for mock in mount_v2_and_token(&server, "us-docker.pkg.dev", "registry-token") {
             mock.mount(&server).await;
         }
         let us = adc_auth(&server.uri(), &host, &shared).await;

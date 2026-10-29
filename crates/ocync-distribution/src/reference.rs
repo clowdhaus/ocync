@@ -249,15 +249,6 @@ mod tests {
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     #[test]
-    fn full_with_tag() {
-        let r: Reference = "ghcr.io/clowdhaus/ocync:v1.0".parse().unwrap();
-        assert_eq!(r.registry(), "ghcr.io");
-        assert_eq!(r.repository(), "clowdhaus/ocync");
-        assert_eq!(r.tag(), Some("v1.0"));
-        assert!(r.digest().is_none());
-    }
-
-    #[test]
     fn full_with_digest() {
         let input = format!("ghcr.io/clowdhaus/ocync@{TEST_DIGEST}");
         let r: Reference = input.parse().unwrap();
@@ -273,62 +264,6 @@ mod tests {
         let r: Reference = input.parse().unwrap();
         assert_eq!(r.tag(), Some("v1.0"));
         assert_eq!(r.digest().unwrap().to_string(), TEST_DIGEST);
-    }
-
-    #[test]
-    fn docker_hub_shorthand_library() {
-        let r: Reference = "nginx".parse().unwrap();
-        assert_eq!(r.registry(), "docker.io");
-        assert_eq!(r.repository(), "library/nginx");
-        assert!(r.tag().is_none());
-    }
-
-    #[test]
-    fn docker_hub_user_repo() {
-        let r: Reference = "myuser/myrepo".parse().unwrap();
-        assert_eq!(r.registry(), "docker.io");
-        assert_eq!(r.repository(), "myuser/myrepo");
-    }
-
-    #[test]
-    fn docker_hub_with_tag() {
-        let r: Reference = "nginx:latest".parse().unwrap();
-        assert_eq!(r.registry(), "docker.io");
-        assert_eq!(r.repository(), "library/nginx");
-        assert_eq!(r.tag(), Some("latest"));
-    }
-
-    #[test]
-    fn with_port() {
-        let r: Reference = "localhost:5000/myrepo:v1".parse().unwrap();
-        assert_eq!(r.registry(), "localhost:5000");
-        assert_eq!(r.repository(), "myrepo");
-        assert_eq!(r.tag(), Some("v1"));
-    }
-
-    #[test]
-    fn ecr() {
-        let r: Reference = "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app:latest"
-            .parse()
-            .unwrap();
-        assert_eq!(r.registry(), "123456789012.dkr.ecr.us-east-1.amazonaws.com");
-        assert_eq!(r.repository(), "my-app");
-        assert_eq!(r.tag(), Some("latest"));
-    }
-
-    #[test]
-    fn no_tag_no_digest() {
-        let r: Reference = "ghcr.io/clowdhaus/ocync".parse().unwrap();
-        assert_eq!(r.registry(), "ghcr.io");
-        assert_eq!(r.repository(), "clowdhaus/ocync");
-        assert!(r.tag().is_none());
-        assert!(r.digest().is_none());
-    }
-
-    #[test]
-    fn empty_string_error() {
-        let r = "".parse::<Reference>();
-        assert!(r.is_err());
     }
 
     #[test]
@@ -363,114 +298,106 @@ mod tests {
         assert_eq!(r, r2);
     }
 
+    /// A reference splits into registry, repository and tag, with Docker
+    /// Hub and `library/` filled in for short names. Breaks if a port, an
+    /// IP, a nested path, a trailing colon or a 128-character tag is read
+    /// wrongly.
     #[test]
-    fn deeply_nested_repository() {
-        let r: Reference = "ghcr.io/a/b/c/d/e/f:tag".parse().unwrap();
-        assert_eq!(r.registry(), "ghcr.io");
-        assert_eq!(r.repository(), "a/b/c/d/e/f");
-        assert_eq!(r.tag(), Some("tag"));
+    fn parses_registry_repository_and_tag() {
+        let long_tag = "a".repeat(128);
+        let long = format!("ghcr.io/repo:{long_tag}");
+        let cases = [
+            (
+                "ghcr.io/clowdhaus/ocync:v1.0",
+                "ghcr.io",
+                "clowdhaus/ocync",
+                Some("v1.0"),
+            ),
+            (
+                "ghcr.io/clowdhaus/ocync",
+                "ghcr.io",
+                "clowdhaus/ocync",
+                None,
+            ),
+            ("nginx", "docker.io", "library/nginx", None),
+            ("nginx:latest", "docker.io", "library/nginx", Some("latest")),
+            ("myuser/myrepo", "docker.io", "myuser/myrepo", None),
+            (
+                "myuser/myrepo:latest",
+                "docker.io",
+                "myuser/myrepo",
+                Some("latest"),
+            ),
+            (
+                "localhost:5000/myrepo:v1",
+                "localhost:5000",
+                "myrepo",
+                Some("v1"),
+            ),
+            ("localhost/repo:tag", "localhost", "repo", Some("tag")),
+            (
+                "192.168.1.1:5000/repo:tag",
+                "192.168.1.1:5000",
+                "repo",
+                Some("tag"),
+            ),
+            (
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app:latest",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+                "my-app",
+                Some("latest"),
+            ),
+            (
+                "ghcr.io/a/b/c/d/e/f:tag",
+                "ghcr.io",
+                "a/b/c/d/e/f",
+                Some("tag"),
+            ),
+            ("a.io/b:c", "a.io", "b", Some("c")),
+            (
+                "ghcr.io/repo:v1.0-beta.1_rc",
+                "ghcr.io",
+                "repo",
+                Some("v1.0-beta.1_rc"),
+            ),
+            ("ghcr.io/repo:", "ghcr.io", "repo", None),
+            (
+                "ghcr.io/My-Org/my_repo.v2:tag",
+                "ghcr.io",
+                "My-Org/my_repo.v2",
+                Some("tag"),
+            ),
+            (long.as_str(), "ghcr.io", "repo", Some(long_tag.as_str())),
+        ];
+        for (input, registry, repository, tag) in cases {
+            let r: Reference = input.parse().unwrap();
+            assert_eq!(r.registry(), registry, "{input}");
+            assert_eq!(r.repository(), repository, "{input}");
+            assert_eq!(r.tag(), tag, "{input}");
+            assert!(r.digest().is_none(), "{input}");
+        }
     }
 
+    /// A malformed reference is refused, naming what is wrong. Breaks if a
+    /// character that would change a request URL, or an overlong tag, is
+    /// accepted.
     #[test]
-    fn ip_address_with_port() {
-        let r: Reference = "192.168.1.1:5000/repo:tag".parse().unwrap();
-        assert_eq!(r.registry(), "192.168.1.1:5000");
-        assert_eq!(r.repository(), "repo");
-        assert_eq!(r.tag(), Some("tag"));
-    }
-
-    #[test]
-    fn localhost_without_port() {
-        let r: Reference = "localhost/repo:tag".parse().unwrap();
-        assert_eq!(r.registry(), "localhost");
-        assert_eq!(r.repository(), "repo");
-        assert_eq!(r.tag(), Some("tag"));
-    }
-
-    #[test]
-    fn tag_with_special_chars() {
-        let r: Reference = "ghcr.io/repo:v1.0-beta.1_rc".parse().unwrap();
-        assert_eq!(r.tag(), Some("v1.0-beta.1_rc"));
-    }
-
-    #[test]
-    fn single_char_components() {
-        let r: Reference = "a.io/b:c".parse().unwrap();
-        assert_eq!(r.registry(), "a.io");
-        assert_eq!(r.repository(), "b");
-        assert_eq!(r.tag(), Some("c"));
-    }
-
-    #[test]
-    fn trailing_colon_empty_tag() {
-        let r: Reference = "ghcr.io/repo:".parse().unwrap();
-        assert!(r.tag().is_none());
-    }
-
-    #[test]
-    fn docker_hub_nested_user_repo() {
-        let r: Reference = "myuser/myrepo:latest".parse().unwrap();
-        assert_eq!(r.registry(), "docker.io");
-        assert_eq!(r.repository(), "myuser/myrepo");
-        assert_eq!(r.tag(), Some("latest"));
-    }
-
-    #[test]
-    fn repository_rejects_question_mark() {
-        let r = "ghcr.io/repo?evil:tag".parse::<Reference>();
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("invalid character"));
-    }
-
-    #[test]
-    fn repository_rejects_hash() {
-        let r = "ghcr.io/repo#fragment:tag".parse::<Reference>();
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn repository_rejects_space() {
-        let r = "ghcr.io/repo name:tag".parse::<Reference>();
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn repository_rejects_control_chars() {
-        let r = "ghcr.io/repo\x01name:tag".parse::<Reference>();
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn repository_allows_valid_characters() {
-        // Uppercase, dots, underscores, hyphens, slashes are all valid.
-        let r: Reference = "ghcr.io/My-Org/my_repo.v2:tag".parse().unwrap();
-        assert_eq!(r.repository(), "My-Org/my_repo.v2");
-    }
-
-    #[test]
-    fn tag_rejects_invalid_chars() {
-        let err = "ghcr.io/repo:v1.0+build".parse::<Reference>().unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("tag") && msg.contains("invalid character"),
-            "error: {msg}"
-        );
-    }
-
-    #[test]
-    fn tag_rejects_overlength() {
-        let long_tag = "a".repeat(129);
-        let input = format!("ghcr.io/repo:{long_tag}");
-        let err = input.parse::<Reference>().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("128"), "error: {msg}");
-    }
-
-    #[test]
-    fn tag_allows_128_chars() {
-        let tag = "a".repeat(128);
-        let input = format!("ghcr.io/repo:{tag}");
-        let r: Reference = input.parse().unwrap();
-        assert_eq!(r.tag().unwrap().len(), 128);
+    fn rejects_malformed_references() {
+        let long = format!("ghcr.io/repo:{}", "a".repeat(129));
+        let cases: [(&str, &[&str]); 7] = [
+            ("", &[]),
+            ("ghcr.io/repo?evil:tag", &["invalid character"]),
+            ("ghcr.io/repo#fragment:tag", &[]),
+            ("ghcr.io/repo name:tag", &[]),
+            ("ghcr.io/repo\x01name:tag", &[]),
+            ("ghcr.io/repo:v1.0+build", &["tag", "invalid character"]),
+            (long.as_str(), &["128"]),
+        ];
+        for (input, needles) in cases {
+            let err = input.parse::<Reference>().unwrap_err().to_string();
+            for needle in needles {
+                assert!(err.contains(needle), "{input:?}: {err}");
+            }
+        }
     }
 }
