@@ -253,8 +253,8 @@ impl AuthProvider for EcrPublicAuth {
                             |credentials| async move { self.exchange(scopes, &credentials).await },
                             judge_token_endpoint,
                             |refused| {
-                                let refused = refused.clone();
-                                self.credential_cache.refuse_if(move |kept| *kept == refused);
+                                self.credential_cache
+                                    .refuse(refused.clone(), Credentials::eq);
                             },
                         )
                         .await;

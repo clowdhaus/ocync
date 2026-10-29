@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 use crate::auth::{EARLY_REFRESH_WINDOW, Refusal, is_fresh};
-use crate::flight::{Flights, Landed};
+use crate::flight::{Flights, InFlight, Landed};
 
 /// Time until `until`, or zero once it has passed.
 pub(crate) fn remaining(until: SystemTime) -> Duration {
@@ -27,7 +27,7 @@ pub(crate) fn remaining(until: SystemTime) -> Duration {
 /// moves it.
 ///
 /// A landing never stores a value refused after its refresh began (see
-/// [`Self::refuse_if`]); the callers that waited on it still get its value.
+/// [`Self::refuse`]); the callers that waited on it still get its value.
 /// No other value can be stored while a refresh is in flight, as the
 /// callers that need one wait on it.
 ///
@@ -41,14 +41,16 @@ pub(crate) struct CredentialCache<T, E = Infallible> {
     flights: Flights<(), Result<T, E>>,
 }
 
-/// Says whether a value is the one a refusal named.
-type IsRefused<T> = Box<dyn Fn(&T) -> bool + Send + Sync>;
+/// Says whether two values are the same credential, whatever else they
+/// hold, such as an expiry.
+type Same<T> = fn(&T, &T) -> bool;
 
 struct State<T> {
     entry: Option<CacheEntry<T>>,
-    /// The refusals made while the refresh in flight ran. Cleared when a
-    /// refresh starts and when it lands.
-    refused: Vec<IsRefused<T>>,
+    /// The distinct values refused while the refresh in flight ran, with
+    /// how each is compared. Cleared when a refresh starts and when it
+    /// lands.
+    refused: Vec<(T, Same<T>)>,
 }
 
 struct CacheEntry<T> {
@@ -103,7 +105,7 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
             let mut state = self.write();
             let refused = std::mem::take(&mut state.refused);
             if let Ok((value, ttl)) = result {
-                if !refused.iter().any(|is_refused| is_refused(value)) {
+                if !refused.iter().any(|(refused, same)| same(value, refused)) {
                     state.entry = Some(CacheEntry::new(value.clone(), *ttl));
                 }
             }
@@ -155,32 +157,31 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         }
     }
 
-    /// The source or registry refused a value for which `is_refused` is
-    /// true. Drop the cached value if it is that one. If a refresh is in
-    /// flight, remember the refusal until it lands, so it does not store
-    /// that value. A refresh that begins afterwards stores it: the source is
-    /// issuing it again.
-    pub(crate) fn refuse_if(
-        &self,
-        is_refused: impl Fn(&T) -> bool + Send + Sync + 'static,
-    ) -> Refusal {
+    /// The source or registry refused `refused`, which `same` tells from
+    /// other values. Drop the cached value if it is that one. If a refresh
+    /// is in flight, remember the refusal until it lands, so it does not
+    /// store that value; one value refused again is remembered once. A
+    /// refresh that begins afterwards stores it: the source is issuing it
+    /// again.
+    pub(crate) fn refuse(&self, refused: T, same: Same<T>) -> Refusal {
         // Under the flight lock, as a landing is: no refresh starts or
         // lands between telling whether one is running and recording the
         // refusal against it.
-        self.flights.inspect(&(), |refreshing| {
+        self.flights.inspect(&(), |in_flight| {
             let mut state = self.write();
             let refusal = if state
                 .entry
                 .as_ref()
-                .is_some_and(|entry| is_refused(&entry.value))
+                .is_some_and(|entry| same(&entry.value, &refused))
             {
                 state.entry = None;
                 Refusal::Current
             } else {
                 Refusal::Stale
             };
-            if refreshing {
-                state.refused.push(Box::new(is_refused));
+            let known = state.refused.iter().any(|(known, _)| same(known, &refused));
+            if in_flight == InFlight::Running && !known {
+                state.refused.push((refused, same));
             }
             refusal
         })
@@ -282,7 +283,7 @@ mod tests {
         };
         let (before, after) = tokio::join!(cache.get_or_refresh(load(1)), async {
             tokio::task::yield_now().await;
-            cache.refuse_if(|kept| *kept == 0);
+            cache.refuse(0, u32::eq);
             cache.get_or_refresh(load(2)).await
         });
         assert_eq!((before, after), (Ok(1), Ok(1)));
@@ -331,9 +332,9 @@ mod tests {
     async fn a_refusal_drops_only_the_value_it_names() {
         let cache: CredentialCache<_> = CredentialCache::new();
         cache.set(2, Duration::from_secs(1000));
-        assert_eq!(cache.refuse_if(|kept| *kept == 1), Refusal::Stale);
+        assert_eq!(cache.refuse(1, u32::eq), Refusal::Stale);
         assert_eq!(cache.get_or_refresh(slow_load(3)).await, Ok(2));
-        assert_eq!(cache.refuse_if(|kept| *kept == 2), Refusal::Current);
+        assert_eq!(cache.refuse(2, u32::eq), Refusal::Current);
         assert_eq!(cache.get_or_refresh(slow_load(3)).await, Ok(3));
     }
 
@@ -346,7 +347,7 @@ mod tests {
         cache.set(1, Duration::from_secs(10));
         let (landed, ()) = tokio::join!(cache.get_or_refresh(slow_load(1)), async {
             tokio::task::yield_now().await;
-            cache.refuse_if(|kept| *kept == 1);
+            cache.refuse(1, u32::eq);
         });
         assert_eq!(landed, Ok(1));
         assert_eq!(cache.get_or_refresh(slow_load(2)).await, Ok(2));
@@ -361,8 +362,8 @@ mod tests {
         cache.set(1, Duration::from_secs(10));
         let (landed, ()) = tokio::join!(cache.get_or_refresh(slow_load(1)), async {
             tokio::task::yield_now().await;
-            cache.refuse_if(|kept| *kept == 1);
-            cache.refuse_if(|kept| *kept == 2);
+            cache.refuse(1, u32::eq);
+            cache.refuse(2, u32::eq);
         });
         assert_eq!(landed, Ok(1));
         assert_eq!(cache.get_or_refresh(slow_load(3)).await, Ok(3));
@@ -374,7 +375,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_refresh_after_the_refusal_lands_the_same_value() {
         let cache: CredentialCache<_> = CredentialCache::new();
-        cache.refuse_if(|kept| *kept == 1);
+        cache.refuse(1, u32::eq);
         assert_eq!(cache.get_or_refresh(slow_load(1)).await, Ok(1));
         assert_eq!(cache.get_or_refresh(slow_load(2)).await, Ok(1));
     }
@@ -385,7 +386,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_refusal_with_no_refresh_in_flight_records_nothing() {
         let cache: CredentialCache<u32> = CredentialCache::new();
-        cache.refuse_if(|kept| *kept == 1);
+        cache.refuse(1, u32::eq);
         assert!(cache.read().refused.is_empty());
 
         // A refresh polled once, then dropped, leaves no flight behind.
@@ -397,14 +398,33 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
-        cache.refuse_if(|kept| *kept == 2);
+        cache.refuse(2, u32::eq);
         assert_eq!(cache.read().refused.len(), 1);
         drop(stalled);
-        cache.refuse_if(|kept| *kept == 3);
+        cache.refuse(3, u32::eq);
         assert_eq!(cache.read().refused.len(), 1);
 
         // The next refresh starts with none, and lands with none.
         assert_eq!(cache.get_or_refresh(slow_load(4)).await, Ok(4));
         assert!(cache.read().refused.is_empty());
+    }
+
+    /// A value refused again while a refresh is in flight is recorded
+    /// once, so the list holds the distinct values refused, not the
+    /// refusals. Breaks if each refusal adds an entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn many_refusals_of_one_value_record_one_entry() {
+        let cache: CredentialCache<u32> = CredentialCache::new();
+        cache.set(1, Duration::from_secs(10));
+        let (landed, ()) = tokio::join!(cache.get_or_refresh(slow_load(1)), async {
+            tokio::task::yield_now().await;
+            for _ in 0..5 {
+                cache.refuse(1, u32::eq);
+            }
+            assert_eq!(cache.read().refused.len(), 1);
+            cache.refuse(2, u32::eq);
+            assert_eq!(cache.read().refused.len(), 2);
+        });
+        assert_eq!(landed, Ok(1));
     }
 }

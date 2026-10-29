@@ -135,8 +135,13 @@ impl CachedGoogleToken {
     /// Drop the kept token if it is `refused`, so one registry's refusal
     /// does not discard a token another has fetched since.
     fn refuse(&self, refused: &google::Secret) {
-        let refused = refused.clone();
-        self.token.refuse_if(move |kept| kept.token == refused);
+        // Only the token is compared, so the expiry is a placeholder.
+        let refused = AccessToken {
+            token: refused.clone(),
+            expiry: Expiry::Never,
+        };
+        self.token
+            .refuse(refused, |kept, refused| kept.token == refused.token);
     }
 }
 

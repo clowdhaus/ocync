@@ -727,7 +727,7 @@ impl AcrAuth {
     /// the one kept, and then re-probe the credential chain it came from.
     fn refuse_refresh_token(&self, refresh_token: &str) {
         let refused = refresh_token.to_owned();
-        if self.refresh_cache.refuse_if(move |kept| *kept == refused) == Refusal::Current {
+        if self.refresh_cache.refuse(refused, String::eq) == Refusal::Current {
             self.reset_chain();
         }
     }
@@ -1759,6 +1759,39 @@ mod tests {
         assert_eq!(get_count.load(Ordering::Relaxed), 0);
 
         auth.refuse_refresh_token("new");
+        assert_eq!(reset_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// A refusal of the refresh token kept, made while the refresh that
+    /// replaces it in the early-refresh window is in flight, resets the
+    /// chain: the token stays kept until that refresh lands. Breaks if a
+    /// refresh in flight makes the refusal read as one of a replaced token.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refusal_during_the_early_refresh_window_resets_the_chain() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/exchange"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(
+                        serde_json::json!({"refresh_token": fake_jwt_with_exp(r#""n":2"#, 10800)}),
+                    )
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let mock = MockAzureTokenSource::succeeding("aad-tok");
+        let reset_count = mock.reset_count.clone();
+        let auth = AcrAuth::with_api(&server.uri(), "myregistry.azurecr.io", mock);
+        auth.refresh_cache
+            .set("old".to_owned(), Duration::from_secs(10));
+
+        let (refreshed, ()) = tokio::join!(auth.ensure_refresh_token(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            auth.refuse_refresh_token("old");
+        });
+
+        refreshed.unwrap();
         assert_eq!(reset_count.load(Ordering::Relaxed), 1);
     }
 

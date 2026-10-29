@@ -293,7 +293,7 @@ impl AuthProvider for EcrAuth {
         Box::pin(async move {
             let refusal = self
                 .credential_cache
-                .refuse_if(move |kept| kept.sends_same_header(&refused));
+                .refuse(refused, Token::sends_same_header);
             tracing::debug!(registry = %self.hostname, ?refusal, "registry refused a token");
         })
     }

@@ -9,6 +9,7 @@
 //! identity is refused, not the credential: it is remembered, and exchanges
 //! that use it again are not retried until a refresh yields a different one.
 
+use std::fmt;
 use std::future::Future;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -46,11 +47,24 @@ pub(super) fn judge_token_endpoint(error: &Error) -> Judgment {
 
 /// The recovery of one provider's exchanges with one kind of cloud
 /// credential `C`.
-#[derive(Debug)]
 pub(super) struct Recovery<C> {
     /// The credential the token endpoint refused although it was fetched
     /// fresh for the retry.
     refused_fresh: Mutex<Option<C>>,
+}
+
+impl<C> fmt::Debug for Recovery<C> {
+    /// Says whether a credential is remembered, never which.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let remembered = self
+            .refused_fresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        f.debug_struct("Recovery")
+            .field("remembers_a_refused_credential", &remembered)
+            .finish()
+    }
 }
 
 impl<C> Default for Recovery<C> {
@@ -112,5 +126,21 @@ impl<C: Clone + PartialEq> Recovery<C> {
 
     fn is_refused_fresh(&self, credential: &C) -> bool {
         self.refused_fresh().as_ref() == Some(credential)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Debug names whether a credential is remembered and never prints it.
+    /// Breaks if the remembered credential reaches a log through Debug.
+    #[test]
+    fn debug_does_not_print_the_credential() {
+        let recovery = Recovery::<String>::default();
+        *recovery.refused_fresh() = Some("hunter2-secret".to_owned());
+        let printed = format!("{recovery:?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(printed.contains("true"), "{printed}");
     }
 }

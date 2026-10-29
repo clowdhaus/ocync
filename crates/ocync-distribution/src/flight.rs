@@ -33,6 +33,15 @@ pub(crate) enum Landed<R, V> {
     Shared(V),
 }
 
+/// Whether a fetch is in flight for a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InFlight {
+    /// A fetch has begun and not yet landed or been dropped.
+    Running,
+    /// No fetch is in flight.
+    Idle,
+}
+
 /// Whether a fetch is still the one under its key when it lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Standing {
@@ -91,9 +100,13 @@ impl<K: Eq + Hash, V> Flights<K, V> {
     /// Run `inspect`, given whether a fetch for `key` is in flight, under
     /// the lock fetches are started and landed under: no fetch starts or
     /// lands until it returns, so what it records is ordered against both.
-    pub(crate) fn inspect<T>(&self, key: &K, inspect: impl FnOnce(bool) -> T) -> T {
+    pub(crate) fn inspect<T>(&self, key: &K, inspect: impl FnOnce(InFlight) -> T) -> T {
         let in_flight = self.lock();
-        inspect(in_flight.contains_key(key))
+        inspect(if in_flight.contains_key(key) {
+            InFlight::Running
+        } else {
+            InFlight::Idle
+        })
     }
 
     /// Run `drop_stored`, which drops stored values and returns their
@@ -263,7 +276,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_fetch_is_running_until_it_lands_or_is_dropped() {
         let flights = Flights::<(), u32>::default();
-        let running = || flights.inspect(&(), |running| running);
+        let running = || flights.inspect(&(), |in_flight| in_flight == InFlight::Running);
         assert!(!running());
         let fetch = || async {
             tokio::task::yield_now().await;
@@ -345,7 +358,7 @@ mod tests {
                     |value: &u32, _| Some(*value),
                 ))
             }));
-            let running = flights.inspect(&(), |running| running);
+            let running = flights.inspect(&(), |in_flight| in_flight == InFlight::Running);
             let _ = done.send((panicked.is_err(), running));
         });
         let (panicked, running) = outcome
