@@ -218,7 +218,8 @@ fn validate_ipv6(
 /// **Layer 4 -- domain binding:** the realm host must be the registry host,
 /// or share a parent domain with it (e.g. `auth.docker.io` and
 /// `registry-1.docker.io` both have parent `docker.io`). Hosts with 2 or
-/// fewer labels require an exact match. IP-based realms skip this check.
+/// fewer labels require an exact match. An IP realm must be the registry's
+/// own address, and an IP and a name never bind.
 fn validate_realm_url(realm: &reqwest::Url, registry_base: &reqwest::Url) -> Result<(), Error> {
     let registry_str = registry_base.as_str().trim_end_matches('/');
 
@@ -309,11 +310,10 @@ fn is_loopback(url: &reqwest::Url) -> bool {
 /// Verify the realm host is related to the registry host.
 ///
 /// Rules:
-/// - An IP realm has no domain to bind to. It is allowed for an IP
-///   registry, whose realm Layer 2 already checked, and as a loopback
-///   address for a `localhost` registry. A registry known by name may not
-///   send credentials to an IP address.
-/// - A domain realm for an IP registry skips this check.
+/// - An IP host has no domain to bind to, so an IP realm must be the
+///   registry's own address, and a realm and registry where one is an IP
+///   and the other a name are refused. A loopback realm, IPv4-mapped or
+///   not, or `localhost`, is allowed for a loopback registry.
 /// - If either host has 2 or fewer labels (e.g. `ghcr.io`), require exact
 ///   host match.
 /// - Otherwise, strip the leftmost label from each and compare the
@@ -327,30 +327,22 @@ fn validate_domain_binding(
     registry_base: &reqwest::Url,
     registry_str: &str,
 ) -> Result<(), Error> {
-    let realm_host = match realm.host_str() {
-        Some(h) => h,
-        // IP addresses and missing hosts are handled by earlier layers.
-        None => return Ok(()),
-    };
-    let registry_host = match registry_base.host_str() {
-        Some(h) => h,
-        None => return Ok(()),
-    };
-
-    match (realm.host(), registry_base.host()) {
-        (Some(Host::Domain(_)), Some(Host::Domain(_))) => {}
-        (Some(Host::Ipv4(_) | Host::Ipv6(_)), Some(Host::Domain(_)))
-            if !(is_loopback(realm) && is_loopback(registry_base)) =>
-        {
+    let (realm_host, registry_host) = match (realm.host(), registry_base.host()) {
+        (Some(Host::Domain(realm_host)), Some(Host::Domain(registry_host))) => {
+            (realm_host, registry_host)
+        }
+        _ if is_loopback(realm) && is_loopback(registry_base) => return Ok(()),
+        (Some(realm_ip), Some(registry_ip)) if realm_ip == registry_ip => return Ok(()),
+        _ => {
             return Err(realm_err(
                 registry_str,
                 format!(
-                    "realm URL '{realm}' is an IP address but registry host '{registry_host}' is a name"
+                    "realm URL '{realm}' is not on the registry's address '{}'",
+                    registry_base.host_str().unwrap_or_default()
                 ),
             ));
         }
-        _ => return Ok(()),
-    }
+    };
 
     // Exact match is always allowed.
     if realm_host.eq_ignore_ascii_case(registry_host) {
@@ -1219,16 +1211,38 @@ mod tests {
                 "https://[2001:db8::1]:5000",
                 Verdict::Allowed,
             ),
-            // a registry known by name may not send credentials to an IP
+            // a registry known by name may not send credentials to an IP,
+            // nor an IP registry to a name or another address
             (
                 "https://203.0.113.9/steal",
                 "https://registry.example.com",
-                Verdict::Rejected("is an IP address but registry host"),
+                Verdict::Rejected("is not on the registry's address"),
             ),
             (
                 "https://[2001:db8::1]/steal",
                 "https://registry.example.com",
-                Verdict::Rejected("is an IP address but registry host"),
+                Verdict::Rejected("is not on the registry's address"),
+            ),
+            (
+                "https://auth.example.com/token",
+                "https://192.168.1.50",
+                Verdict::Rejected("is not on the registry's address"),
+            ),
+            (
+                "https://203.0.113.9/steal",
+                "https://192.168.1.50",
+                Verdict::Rejected("is not on the registry's address"),
+            ),
+            (
+                "http://10.0.0.1:9999/token",
+                "http://localhost:5000",
+                Verdict::Rejected("is not on the registry's address"),
+            ),
+            // allows another port on the registry's own address
+            (
+                "https://192.168.1.50:5001/token",
+                "https://192.168.1.50:5000",
+                Verdict::Allowed,
             ),
             // allows a loopback realm for a localhost registry
             (
@@ -1315,8 +1329,7 @@ mod tests {
                 "https://registry.example.com",
                 Verdict::Rejected("loopback"),
             ),
-            // allows loopback when registry is loopback; an IP realm skips
-            // the domain binding, which only compares hostnames
+            // allows loopback when registry is loopback
             (
                 "http://127.0.0.1:9999/token",
                 "http://127.0.0.1:5000",
@@ -1391,12 +1404,6 @@ mod tests {
                 "https://evil.io/token",
                 "https://ghcr.io",
                 Verdict::Rejected("does not match"),
-            ),
-            // allows domain realm for ip registry
-            (
-                "https://auth.example.com/token",
-                "https://192.168.1.50",
-                Verdict::Allowed,
             ),
             // quay.io has only two labels, so even its own subdomain needs an
             // exact match
