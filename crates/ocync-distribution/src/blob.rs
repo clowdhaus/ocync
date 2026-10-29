@@ -811,6 +811,7 @@ mod tests {
         futures_util::stream::iter(chunks)
     }
 
+    /// GHCR: single PATCH with Content-Length, no Content-Range.
     #[tokio::test]
     async fn blob_push_stream_ghcr_uses_single_patch() {
         let server = wiremock::MockServer::start().await;
@@ -1367,12 +1368,15 @@ mod tests {
     /// takes a buffered or chunked path.
     #[tokio::test]
     async fn blob_push_stream_uses_streaming_put() {
+        let size = Some(b"streaming upload blob data".len() as u64);
         for host in ["registry.example.com", "us-docker.pkg.dev"] {
-            streams_one_put(host).await;
+            for known_size in [None, size] {
+                streams_one_put(host, known_size).await;
+            }
         }
     }
 
-    async fn streams_one_put(host: &str) {
+    async fn streams_one_put(host: &str, known_size: Option<u64>) {
         let server = wiremock::MockServer::start().await;
         let data = b"streaming upload blob data";
         let digest = test_digest(data);
@@ -1411,7 +1415,7 @@ mod tests {
 
         let repo = RepositoryName::new("stream/repo").unwrap();
         let result = client
-            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
+            .blob_push_stream(&repo, &digest, known_size, data_stream(data, 4))
             .await
             .unwrap();
 

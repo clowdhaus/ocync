@@ -434,7 +434,7 @@ Rejected. Partitioning concurrency permits by measured throughput does not reduc
 
 ### Chunk-level upload resume
 
-Rejected. Medium implementation complexity. Only helps for multi-GB blobs on ECR/Hub/ACR (not GAR/GHCR, which reject a second PATCH in one upload). The existing retry (restart pull+push) is sufficient. Revisit when users report large-blob failure issues.
+Rejected. Medium implementation complexity. Only helps for multi-GB blobs on ECR/Hub/ACR (not GAR, which rejects a second PATCH in one upload, nor GHCR, where a second PATCH overwrites the first). The existing retry (restart pull+push) is sufficient. Revisit when users report large-blob failure issues.
 
 ### Full dynamic priority scheduler
 
