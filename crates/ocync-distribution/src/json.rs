@@ -183,21 +183,25 @@ pub(crate) async fn read_capped(
     {
         return Ok(None);
     }
-    let mut body = Vec::new();
+    // Joined once at the end, so a long body is not copied as it grows.
+    let mut chunks = Vec::new();
+    let mut length = 0;
     while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > max {
+        length += chunk.len();
+        if length > max {
             return Ok(None);
         }
-        body.extend_from_slice(&chunk);
+        chunks.push(chunk);
     }
-    Ok(Some(body))
+    Ok(Some(chunks.concat()))
 }
 
-/// The start of `response`'s body, up to [`MAX_SMALL_ANSWER`] bytes.
+/// Read the start of `response`'s body into `body`, up to
+/// [`MAX_SMALL_ANSWER`] bytes. On a failed read, `body` keeps what arrived.
 pub(crate) async fn read_start(
     response: &mut reqwest::Response,
-) -> Result<Vec<u8>, reqwest::Error> {
-    let mut body = Vec::new();
+    body: &mut Vec<u8>,
+) -> Result<(), reqwest::Error> {
     while body.len() < MAX_SMALL_ANSWER {
         let Some(chunk) = response.chunk().await? else {
             break;
@@ -205,13 +209,16 @@ pub(crate) async fn read_start(
         body.extend_from_slice(&chunk);
     }
     body.truncate(MAX_SMALL_ANSWER);
-    Ok(body)
+    Ok(())
 }
 
 /// The text of an error answer's body, read up to [`MAX_SMALL_ANSWER`]
-/// bytes; empty when it does not arrive.
+/// bytes and as far as it arrives, so a cut-off answer still names its
+/// error code.
 pub(crate) async fn error_body(mut response: reqwest::Response) -> String {
-    let body = read_start(&mut response).await.unwrap_or_default();
+    let mut body = Vec::new();
+    // What arrived is the answer's text, whether or not the rest followed.
+    let _ = read_start(&mut response, &mut body).await;
     String::from_utf8_lossy(&body).into_owned()
 }
 
@@ -326,6 +333,30 @@ mod tests {
             read("connection: close\r\n", "1234").await,
             Some(b"1234".to_vec())
         );
+    }
+
+    /// An error answer cut off partway keeps what arrived, so its error code
+    /// is still read. Breaks if a failed read drops the bytes received.
+    #[tokio::test]
+    async fn a_cut_off_error_body_keeps_what_arrived() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = stream.read(&mut [0; 1024]).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 100\r\n\r\n{\"error\":\"invalid_grant\"")
+                .await
+                .unwrap();
+        });
+        let response = crate::test_http_client()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(error_body(response).await, "{\"error\":\"invalid_grant\"");
     }
 
     /// An answer longer than its limit is refused, naming the address

@@ -792,7 +792,8 @@ impl Api {
                 .map(Bytes::from)
                 .ok_or(Failure::TooLarge);
         }
-        let bytes = crate::json::read_start(&mut response).await?;
+        let mut bytes = Vec::new();
+        crate::json::read_start(&mut response, &mut bytes).await?;
         let modeled = request.modeled_errors;
         let error = ServiceError {
             retry_after,
