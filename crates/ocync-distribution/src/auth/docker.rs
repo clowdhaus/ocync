@@ -449,6 +449,20 @@ mod tests {
 
     use super::*;
 
+    /// A config whose auth entry is a string, not an object, is refused
+    /// without quoting the string, which holds the encoded password. Breaks
+    /// if the parser's message reaches the error.
+    #[test]
+    fn a_mistyped_config_leaves_the_password_out() {
+        let path = std::env::temp_dir().join(format!("ocync-docker-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"auths": {"ghcr.io": "dXNlcjpzM2NyZXQ="}}"#).unwrap();
+        let error = DockerConfig::load_from(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        let text = error.to_string();
+        assert!(text.contains("expected struct AuthEntry"), "{text}");
+        assert!(!text.contains("dXNlcjpzM2NyZXQ="), "{text}");
+    }
+
     #[test]
     fn parse_config_with_auths() {
         let json = r#"{
