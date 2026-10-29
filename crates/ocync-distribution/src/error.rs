@@ -1,11 +1,16 @@
 //! Error types for OCI distribution operations.
 
+use std::sync::Arc;
+
 use thiserror::Error;
 
 use crate::Digest;
 
 /// Errors returned by OCI distribution operations.
-#[derive(Debug, Error)]
+///
+/// Cloneable, so a failure can be handed to every caller that waited on it:
+/// the causes that cannot be cloned are shared.
+#[derive(Debug, Clone, Error)]
 pub enum Error {
     /// The image reference string could not be parsed.
     #[error("invalid image reference '{input}': {reason}")]
@@ -43,7 +48,7 @@ pub enum Error {
 
     /// A manifest could not be deserialized from JSON.
     #[error("manifest deserialization failed: {0}")]
-    ManifestParse(#[from] serde_json::Error),
+    ManifestParse(#[source] Arc<serde_json::Error>),
 
     /// A manifest was deserialized successfully but is semantically invalid.
     ///
@@ -113,7 +118,7 @@ pub enum Error {
 
     /// An HTTP request to the registry failed.
     #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[source] Arc<reqwest::Error>),
 
     /// The registry returned a non-success HTTP status.
     #[error("registry returned {status}: {message}")]
@@ -199,7 +204,7 @@ pub enum Error {
         /// What operation was attempted (e.g. "staging create", "staging read").
         context: &'static str,
         /// The underlying I/O error.
-        source: std::io::Error,
+        source: Arc<std::io::Error>,
     },
 }
 
@@ -210,6 +215,18 @@ pub enum Transience {
     Transient,
     /// It fails again, as refused credentials do.
     Final,
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::ManifestParse(Arc::new(error))
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(Arc::new(error))
+    }
 }
 
 impl Error {
@@ -422,7 +439,7 @@ mod tests {
             },
             Error::Io {
                 context: "test",
-                source: std::io::Error::other("disk full"),
+                source: std::io::Error::other("disk full").into(),
             },
         ];
         for err in &variants {
@@ -570,7 +587,7 @@ mod tests {
             },
             Error::Io {
                 context: "test",
-                source: std::io::Error::other("disk full"),
+                source: std::io::Error::other("disk full").into(),
             },
         ];
         for err in &variants {
@@ -679,7 +696,8 @@ mod tests {
     fn display_io() {
         let err = Error::Io {
             context: "staging write",
-            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied")
+                .into(),
         };
         let msg = err.to_string();
         assert!(
@@ -721,7 +739,8 @@ mod tests {
     fn io_preserves_source_error_kind() {
         let err = Error::Io {
             context: "staging read",
-            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied")
+                .into(),
         };
         match &err {
             Error::Io { source, .. } => {
