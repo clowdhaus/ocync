@@ -384,8 +384,13 @@ mod tests {
             .unwrap();
         let err = Error::from(response.bytes().await.unwrap_err());
         let text = err.to_string();
-        let top = text.split(": ").take(2).collect::<Vec<_>>().join(": ");
-        assert!(text.len() > top.len(), "{text}");
+        assert!(
+            text.ends_with(
+                "error reading a body from connection: end of file before message length reached"
+            ),
+            "{text}"
+        );
+        assert_eq!(error_chain(&err), text);
     }
 
     /// A body that fails to decode is named as such, without the parser's
