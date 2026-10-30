@@ -66,9 +66,27 @@ Two of those exemptions are explicit in the harness rather than automatic, and b
 
 **A run whose instance metadata is unknown does not append to `bench/results/{registry}.json`.** That archive is tracked in git and read as a history of comparable runs; a laptop run landing in it puts uncomparable numbers under the same key. The timestamped summary is still written. This matters here more than elsewhere, because `prepare` is the scenario most likely to be run off the rig.
 
+## The corpus lock
+
+`bench/corpus.lock.json` pins every (source, tag) the benchmark syncs to the manifest digest it resolved to, so runs on different dates sync the same content. It is tracked in git and written only by `cargo xtask bench-lock`.
+
+```json
+{ "locked_at": "2026-10-30-120000",
+  "images": { "<source>:<tag>": { "digest": "sha256:...", "children": ["sha256:..."] } } }
+```
+
+`children` is an index's child manifest digests in order, empty for a single manifest. Digests are parsed as `sha256:` plus 64 lowercase hex characters when the file is read, and unknown fields are refused.
+
+- **`cargo xtask bench-lock [--corpus ...] [--partial-overrides ...]`** resolves every ref in the corpus and in the partial overrides (the partial scenario syncs those) with a manifest GET, since the children are in the body. The digest is the `Docker-Content-Digest` header, or the SHA-256 of the body when a registry sends none. It needs the network and Docker Hub credentials from the environment or SSM (anonymous works for a small corpus), not `BENCH_TARGET_REGISTRY`, and writes nothing to a cloud. A ref that cannot be resolved fails the command and is named with its status, never skipped. It does not cover `corpus-prepare.yaml`, whose wildcards transfer nothing.
+- **A moved source is refused.** `bench` and every scenario except prepare resolve each ref they will sync again and compare with the lock. Any digest or children difference, or a ref missing from the lock, is an error listing every one (expected against actual). Re-lock with `cargo xtask bench-lock`; a new lock starts a new comparison series.
+- **`corpus_locked_at`** in each run record is the lock's `locked_at`. Records under different values are different series and are never read as one. Records written before the lock lack the field.
+- A floating tag stays in the corpus only where the source publishes no immutable tag for the same content. A version or date tag is preferred because the lock then records what the corpus names, not only what it resolved to once.
+
 ## Benchmark fairness invariants
 
 The harness enforces these automatically -- do not bypass them.
+
+**Before the build and again at the start of every scenario except prepare:** every source ref the scenario syncs still resolves to its locked digest (see [The corpus lock](#the-corpus-lock)).
 
 **Before any tool runs (once per scenario):**
 0. **CDN pre-warm** -- HEAD every source manifest AND GET every unique blob (following 302 redirects to CloudFront, consuming full body) with OCI token exchange to populate both manifest and blob CDN edge caches. Wait 6 minutes for CloudFront propagation. Without this, the first tool hits cold CDN while the last tool gets near-100% hits -- a massive unfair advantage from execution order.
@@ -81,7 +99,7 @@ The harness enforces these automatically -- do not bypass them.
 5. **10s cooldown** -- allows process cleanup between tool runs. CDN state is handled by pre-warm (invariant 0), not by inter-tool cooldown.
 
 **After every tool run (cold and warm):**
-6. **Verify sync correctness** -- list tags in every target ECR repo (per-repo output), confirm all expected tags are present. An unverified benchmark may report fast times for incomplete syncs.
+6. **Verify synced content by digest** -- list every image in each target ECR repo, tagged or not (per-repo output). Each expected tag must name the digest in `bench/corpus.lock.json`, and every child manifest the lock lists for an index must be in the repo. A tool that converted a format, dropped a platform or transferred nothing fails the run instead of being credited with a fast time. This is the only post-sync check; there is no tag-presence fallback.
 
 **Never run benchmarks manually via SSH.** The `bench-remote` xtask handles all of the above. Manual `cargo xtask bench` on the instance skips TMPDIR setup and other safeguards. SSH is for debugging only.
 

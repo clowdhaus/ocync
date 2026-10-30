@@ -156,6 +156,26 @@ pub(crate) fn load_overrides(path: &str) -> Result<PartialOverrides, String> {
         .map_err(|e| format!("failed to parse overrides file {path}: {e}"))
 }
 
+/// Load only the image entries of a corpus YAML file.
+///
+/// Skips the corpus settings, whose `${BENCH_TARGET_REGISTRY}` only a run
+/// against a target needs, so a command that only reads sources works anywhere.
+/// Image entries are read as written, with no variable expansion.
+pub(crate) fn load_images(path: &str) -> Result<Vec<ImageEntry>, String> {
+    /// The part of a corpus file that names sources.
+    #[derive(Deserialize)]
+    struct Images {
+        images: Vec<ImageEntry>,
+    }
+
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read corpus file {path}: {e}"))?;
+    let parsed: Images = serde_yaml::from_str(&raw)
+        .map_err(|e| format!("failed to parse corpus file {path}: {e}"))?;
+    validate_images(&parsed.images)?;
+    Ok(parsed.images)
+}
+
 /// Validates corpus invariants.
 fn validate(corpus: &Corpus) -> Result<(), String> {
     if corpus.settings.target_registry.is_empty() {
@@ -164,10 +184,15 @@ fn validate(corpus: &Corpus) -> Result<(), String> {
     if corpus.settings.target_prefix.is_empty() {
         return Err("corpus target_prefix must not be empty".into());
     }
-    if corpus.images.is_empty() {
+    validate_images(&corpus.images)
+}
+
+/// Validates that there are images and that each names a tag.
+fn validate_images(images: &[ImageEntry]) -> Result<(), String> {
+    if images.is_empty() {
         return Err("corpus has no images".into());
     }
-    for (i, img) in corpus.images.iter().enumerate() {
+    for (i, img) in images.iter().enumerate() {
         if img.tags.is_empty() {
             return Err(format!("corpus image {i} ({}) has no tags", img.source));
         }

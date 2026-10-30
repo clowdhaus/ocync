@@ -3,7 +3,9 @@
 pub(crate) mod config_gen;
 pub(crate) mod corpus;
 pub(crate) mod ecr;
+pub(crate) mod lock;
 pub(crate) mod proxy;
+pub(crate) mod registry;
 pub(crate) mod regression;
 pub(crate) mod remote;
 pub(crate) mod report;
@@ -162,6 +164,29 @@ fn docker_hub_auth_from_env() -> Option<corpus::DockerHubAuth> {
         .ok()
         .filter(|s| !s.is_empty())?;
     Some(corpus::DockerHubAuth { username, token })
+}
+
+/// Docker Hub credentials from env vars (cloud-init) or SSM (local dev), or
+/// `None` for anonymous pulls.
+///
+/// The SSM fallback needs IAM permissions the bench instance's Terraform does
+/// not grant; it serves local dev with personal credentials.
+fn dockerhub_auth() -> Option<corpus::DockerHubAuth> {
+    if let Some(auth) = docker_hub_auth_from_env() {
+        eprintln!(
+            "bench: Docker Hub auth configured (username={})",
+            auth.username
+        );
+        return Some(auth);
+    }
+    if let Some(token) = read_ssm_parameter("/ocync/bench/dockerhub-access-token") {
+        let username = read_ssm_parameter("/ocync/bench/dockerhub-username")
+            .unwrap_or_else(|| "ocync-bench".into());
+        eprintln!("bench: Docker Hub auth configured via SSM (username={username})");
+        return Some(corpus::DockerHubAuth { username, token });
+    }
+    eprintln!("bench: Docker Hub auth not available, using anonymous pulls");
+    None
 }
 
 /// Write a progress line to stderr.
@@ -351,23 +376,35 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         None => filtered,
     };
 
-    // Inject Docker Hub auth from env vars (cloud-init) or SSM (local dev).
-    // The SSM fallback needs IAM permissions the bench instance's Terraform
-    // does not grant; it serves local dev with personal credentials.
-    if let Some(auth) = docker_hub_auth_from_env() {
-        eprintln!(
-            "bench: Docker Hub auth configured (username={})",
-            auth.username
-        );
-        corpus.dockerhub_auth = Some(auth);
-    } else if let Some(token) = read_ssm_parameter("/ocync/bench/dockerhub-access-token") {
-        let username = read_ssm_parameter("/ocync/bench/dockerhub-username")
-            .unwrap_or_else(|| "ocync-bench".into());
-        eprintln!("bench: Docker Hub auth configured via SSM (username={username})");
-        corpus.dockerhub_auth = Some(corpus::DockerHubAuth { username, token });
-    } else {
-        eprintln!("bench: Docker Hub auth not available, using anonymous pulls");
+    corpus.dockerhub_auth = dockerhub_auth();
+
+    let scenarios: Vec<Scenario> = match args.scenario {
+        Scenario::All => vec![
+            Scenario::Sync,
+            Scenario::Partial,
+            Scenario::Scale,
+            Scenario::Prepare,
+        ],
+        other => vec![other],
     };
+
+    // Prepare reads its own wildcard corpus and transfers nothing, so it is
+    // neither locked nor checked against the lock.
+    let transfers = scenarios.iter().any(|s| !matches!(s, Scenario::Prepare));
+    let lock = if transfers {
+        Some(lock::Lock::load(lock::LOCK_PATH)?)
+    } else {
+        None
+    };
+    if let Some(lock) = &lock {
+        // Before the build and the CDN pre-warm, so a moved source costs
+        // seconds rather than a wasted run.
+        let mut refs = BTreeSet::new();
+        for &scenario in &scenarios {
+            refs.extend(scenario_refs(&args, scenario, &corpus)?);
+        }
+        lock::ensure_unmoved(lock, &refs, corpus.dockerhub_auth.as_ref()).await?;
+    }
 
     let tools = &args.tool_selection.tools;
 
@@ -434,23 +471,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         scenarios: Vec::new(),
     };
 
-    let scenarios: Vec<Scenario> = match args.scenario {
-        Scenario::All => vec![
-            Scenario::Sync,
-            Scenario::Partial,
-            Scenario::Scale,
-            Scenario::Prepare,
-        ],
-        other => vec![other],
-    };
-
     // Pre-warm CDN so all tools see identically cached source manifests.
     //
     // The prepare scenario needs none of it. It runs one tool, pulls no blobs,
     // and reads a different corpus than the one warmed here, so warming for it
     // is hundreds of pointless requests against registries that rate-limit.
     // A mixed run still warms, because the scenarios beside it do transfer.
-    let transfers = scenarios.iter().any(|s| !matches!(s, Scenario::Prepare));
     if args.skip_prewarm {
         eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
     } else if !transfers {
@@ -460,6 +486,16 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     for scenario in scenarios {
+        // A source that moved since the last check would put different content
+        // under the numbers this scenario produces.
+        if !matches!(scenario, Scenario::Prepare) {
+            let Some(lock) = &lock else {
+                unreachable!("the lock is loaded whenever a scenario transfers");
+            };
+            let refs = scenario_refs(&args, scenario, &corpus)?;
+            lock::ensure_unmoved(lock, &refs, corpus.dockerhub_auth.as_ref()).await?;
+        }
+
         // Randomize tool execution order to prevent systematic bias from
         // CDN warming, network burst credit depletion, etc.
         let mut shuffled = tools.to_vec();
@@ -472,18 +508,24 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
         match scenario {
             Scenario::Sync => {
-                let (cold, warm) =
-                    run_sync(&args, &corpus, &shuffled, &ecr_client, &output_dir, seed).await?;
+                let Some(lock) = &lock else {
+                    unreachable!("the lock is loaded whenever a scenario transfers");
+                };
+                let (cold, warm) = run_sync(
+                    &args,
+                    &corpus,
+                    lock,
+                    &shuffled,
+                    &ecr_client,
+                    &output_dir,
+                    seed,
+                )
+                .await?;
                 report.scenarios.push(cold);
                 report.scenarios.push(warm);
             }
             Scenario::Partial => {
-                let overrides = corpus::load_overrides(&args.partial_overrides)?;
-                let partial_corpus = corpus.with_overrides(&overrides.overrides);
-                let partial_corpus = match args.limit {
-                    Some(n) => partial_corpus.limit(n),
-                    None => partial_corpus,
-                };
+                let partial_corpus = partial_corpus(&args, &corpus)?;
                 let result = run_partial(
                     &args,
                     &corpus,
@@ -532,6 +574,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let record = report::RunRecord {
         timestamp: report.timestamp.clone(),
         git_ref,
+        corpus_locked_at: lock.as_ref().map(|l| l.locked_at.clone()),
         machine: report::MachineInfo {
             provider: registry.provider(),
             instance_type: report.instance.instance_type.clone(),
@@ -595,6 +638,35 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
+}
+
+/// The corpus the partial scenario syncs after its priming pass: the base
+/// corpus with the override tags applied, then cut to `--limit`.
+fn partial_corpus(args: &BenchArgs, base: &Corpus) -> Result<Corpus, String> {
+    let overrides = corpus::load_overrides(&args.partial_overrides)?;
+    let partial = base.with_overrides(&overrides.overrides);
+    Ok(match args.limit {
+        Some(n) => partial.limit(n),
+        None => partial,
+    })
+}
+
+/// Every (source, tag) a scenario syncs, none for the scenarios that sync
+/// nothing from the main corpus.
+fn scenario_refs(
+    args: &BenchArgs,
+    scenario: Scenario,
+    corpus: &Corpus,
+) -> Result<BTreeSet<lock::ImageRef>, String> {
+    Ok(match scenario {
+        Scenario::Sync | Scenario::Scale => lock::refs_of(&corpus.images),
+        Scenario::Partial => {
+            let mut refs = lock::refs_of(&corpus.images);
+            refs.extend(lock::refs_of(&partial_corpus(args, corpus)?.images));
+            refs
+        }
+        Scenario::Prepare | Scenario::All => BTreeSet::new(),
+    })
 }
 
 /// The ocync run of the cold sync scenario, the only run a baseline is
@@ -840,6 +912,7 @@ fn check_source_errors(
 async fn run_sync(
     args: &BenchArgs,
     corpus: &Corpus,
+    lock: &lock::Lock,
     tools: &[Tool],
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
@@ -882,7 +955,7 @@ async fn run_sync(
             cold_runs.push(cold);
 
             let tool_name = tool.to_string();
-            ecr::verify_sync(ecr_client, corpus, &tool_name, "cold").await?;
+            ecr::verify_sync(ecr_client, corpus, lock, &tool_name, "cold").await?;
 
             progress(&format!("  warm: {tool}"));
             let warm = run_single_tool(
@@ -901,7 +974,7 @@ async fn run_sync(
             ));
             warm_runs.push(warm);
 
-            ecr::verify_sync(ecr_client, corpus, &tool_name, "warm").await?;
+            ecr::verify_sync(ecr_client, corpus, lock, &tool_name, "warm").await?;
 
             Ok(())
         }
@@ -1185,15 +1258,6 @@ impl PrewarmRateController {
     }
 }
 
-/// Normalize Docker Hub's registry hostname to its API endpoint.
-fn normalize_registry(raw: &str) -> &str {
-    if raw == "docker.io" {
-        "registry-1.docker.io"
-    } else {
-        raw
-    }
-}
-
 /// Per-registry CDN pre-warm statistics.
 #[derive(Default)]
 struct PrewarmStats {
@@ -1210,6 +1274,7 @@ struct PrewarmStats {
 /// NOT cached by CDN and would warm nothing.
 async fn cdn_prewarm(corpus: &Corpus) {
     let total = corpus.total_tags();
+    let auth = corpus.dockerhub_auth.as_ref();
     eprintln!("bench: pre-warming CDN ({total} manifests)...");
 
     let client = reqwest::Client::builder()
@@ -1222,16 +1287,14 @@ async fn cdn_prewarm(corpus: &Corpus) {
     let mut errors = 0u64;
 
     for image in &corpus.images {
-        let (raw_registry, repo) = match image.source.find('/') {
-            Some(i) => (&image.source[..i], &image.source[i + 1..]),
-            None => continue,
+        let Some((registry, repo)) = registry::split_source(&image.source) else {
+            continue;
         };
-        let registry = normalize_registry(raw_registry);
-        let token = match oci_token(&client, registry, repo, corpus).await {
-            Some(t) => t,
-            None => {
+        let token = match registry::oci_token(&client, registry, repo, auth).await {
+            Ok(t) => t,
+            Err(e) => {
                 errors += image.tags.len() as u64;
-                eprintln!("  CDN pre-warm: {registry}/{repo}: auth failed, skipping");
+                eprintln!("  CDN pre-warm: {registry}/{repo}: auth failed ({e}), skipping");
                 continue;
             }
         };
@@ -1292,22 +1355,21 @@ async fn cdn_prewarm(corpus: &Corpus) {
     let mut token_cache: HashMap<(String, String), String> = HashMap::new();
 
     for image in &corpus.images {
-        let (raw_registry, repo) = match image.source.find('/') {
-            Some(i) => (&image.source[..i], &image.source[i + 1..]),
-            None => continue,
+        let Some((registry, repo)) = registry::split_source(&image.source) else {
+            continue;
         };
-        let registry = normalize_registry(raw_registry);
 
         let cache_key = (registry.to_owned(), repo.to_owned());
         let token = if let Some(t) = token_cache.get(&cache_key) {
             t.clone()
         } else {
-            match oci_token(&client, registry, repo, corpus).await {
-                Some(t) => {
+            match registry::oci_token(&client, registry, repo, auth).await {
+                Ok(t) => {
                     token_cache.insert(cache_key, t.clone());
                     t
                 }
-                None => continue,
+                // The manifest pass above already reported this repository.
+                Err(_) => continue,
             }
         };
 
@@ -1319,13 +1381,7 @@ async fn cdn_prewarm(corpus: &Corpus) {
             let resp = client
                 .get(&url)
                 .header("Authorization", format!("Bearer {token}"))
-                .header(
-                    "Accept",
-                    "application/vnd.oci.image.manifest.v1+json,\
-                     application/vnd.docker.distribution.manifest.v2+json,\
-                     application/vnd.oci.image.index.v1+json,\
-                     application/vnd.docker.distribution.manifest.list.v2+json",
-                )
+                .header("Accept", registry::MANIFEST_ACCEPT)
                 .send()
                 .await;
 
@@ -1664,68 +1720,6 @@ fn collect_image_blobs(
         }
     }
     true
-}
-
-/// OCI token exchange for a single repository scope.
-///
-/// Follows the standard flow: challenge /v2/, parse `WWW-Authenticate`,
-/// request a bearer token from the auth realm. For Docker Hub, includes
-/// basic auth credentials if available in the corpus.
-async fn oci_token(
-    client: &reqwest::Client,
-    registry: &str,
-    repo: &str,
-    corpus: &Corpus,
-) -> Option<String> {
-    // Step 1: challenge the registry to get the auth parameters.
-    let challenge = client
-        .get(format!("https://{registry}/v2/"))
-        .send()
-        .await
-        .ok()?;
-
-    let www_auth = challenge
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())?;
-
-    // Parse: Bearer realm="https://...",service="...",scope="..."
-    let realm = parse_auth_param(www_auth, "realm")?;
-    let service = parse_auth_param(www_auth, "service").unwrap_or_default();
-
-    // Step 2: exchange for a bearer token.
-    let scope = format!("repository:{repo}:pull");
-    let mut token_req = client
-        .get(&realm)
-        .query(&[("service", &service), ("scope", &scope)]);
-
-    // Docker Hub: include basic auth for authenticated pull rates.
-    if registry.contains("docker.io") {
-        if let Some(ref auth) = corpus.dockerhub_auth {
-            token_req = token_req.basic_auth(&auth.username, Some(&auth.token));
-        }
-    }
-
-    let token_resp = token_req.send().await.ok()?;
-    if !token_resp.status().is_success() {
-        return None;
-    }
-
-    let text = token_resp.text().await.ok()?;
-    #[expect(clippy::disallowed_methods, reason = "a parse error is dropped unread")]
-    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
-    body.get("token")
-        .or_else(|| body.get("access_token"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned())
-}
-
-/// Extract a parameter value from a `WWW-Authenticate: Bearer ...` header.
-fn parse_auth_param(header: &str, key: &str) -> Option<String> {
-    let pattern = format!("{key}=\"");
-    let start = header.find(&pattern)? + pattern.len();
-    let end = header[start..].find('"')? + start;
-    Some(header[start..end].to_owned())
 }
 
 /// Parses an ocync timing JSONL file into a phase-name to milliseconds map.

@@ -28,6 +28,12 @@ pub(crate) struct RunRecord {
     pub(crate) timestamp: String,
     /// Short git commit hash at the time of the run.
     pub(crate) git_ref: String,
+    /// When the corpus lock the run synced against was written. Runs under
+    /// different locks synced different content and are different series;
+    /// absent from records written before the lock existed and from runs that
+    /// sync no locked corpus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) corpus_locked_at: Option<String>,
     /// Machine and cloud provider metadata.
     pub(crate) machine: MachineInfo,
     /// Versions of binaries the benchmarked tools relay their transfers
@@ -1112,6 +1118,7 @@ mod tests {
         let record = RunRecord {
             timestamp: "2026-04-18-021040".into(),
             git_ref: "d121864".into(),
+            corpus_locked_at: None,
             machine: MachineInfo {
                 provider: Some(Provider::Aws),
                 instance_type: "c6in.4xlarge".into(),
@@ -1160,11 +1167,34 @@ mod tests {
     }
 
     #[test]
+    fn corpus_locked_at_is_written_when_set_and_old_archive_records_still_parse() {
+        let archive = include_str!("../../../bench/results/ecr.json");
+        let mut records: Vec<RunRecord> = serde_json::from_str(archive).unwrap();
+        assert!(!records.is_empty());
+        assert!(
+            records.iter().all(|r| r.corpus_locked_at.is_none()),
+            "records written before the lock lack the field"
+        );
+
+        let record = &mut records[0];
+        let without = serde_json::to_string(record).unwrap();
+        assert!(!without.contains("corpus_locked_at"), "{without}");
+
+        record.corpus_locked_at = Some("2026-10-30-120000".into());
+        let with = serde_json::to_string(record).unwrap();
+        assert!(
+            with.contains(r#""corpus_locked_at":"2026-10-30-120000""#),
+            "{with}"
+        );
+    }
+
+    #[test]
     fn append_record_creates_new_file() {
         let dir = tempfile::tempdir().unwrap();
         let record = RunRecord {
             timestamp: "2026-04-18-100000".into(),
             git_ref: "abc1234".into(),
+            corpus_locked_at: None,
             machine: MachineInfo {
                 provider: Some(Provider::Aws),
                 instance_type: "c6in.4xlarge".into(),
@@ -1201,6 +1231,7 @@ mod tests {
         let record = RunRecord {
             timestamp: "2026-04-18-110000".into(),
             git_ref: "def5678".into(),
+            corpus_locked_at: None,
             machine: MachineInfo {
                 provider: Some(Provider::Aws),
                 instance_type: "c7g.xlarge".into(),
@@ -1232,6 +1263,7 @@ mod tests {
         let record = RunRecord {
             timestamp: "2026-04-18-120000".into(),
             git_ref: "aaa1111".into(),
+            corpus_locked_at: None,
             machine: MachineInfo {
                 provider: Some(Provider::Aws),
                 instance_type: "unknown".into(),
