@@ -210,8 +210,7 @@ impl RegistryClient {
 
         // Exhaustive, so a new `ProviderKind` fails to compile until its
         // upload path is chosen here.
-        let provider = self.aimd.provider();
-        match provider {
+        match self.provider {
             Some(ProviderKind::Ghcr) => {
                 return self
                     .blob_push_stream_ghcr(repository, expected_digest, known_size, stream)
@@ -485,12 +484,14 @@ impl UploadUrl {
 
 /// Extract and resolve the `Location` header from an upload response,
 /// refusing any URL whose origin (scheme, host or port) differs from
-/// `base_url`'s.
+/// `base_url`'s, except an `https` upgrade of the same host on an `http`
+/// registry.
 ///
 /// Every step of the upload chain (initiate, each PATCH, finalize PUT)
 /// goes through here. The chain carries the registry's bearer token, so a
 /// `Location` on another host, port or scheme (an `http` downgrade of an
-/// `https` registry included) would leak it on the next request.
+/// `https` registry included) would leak it on the next request. An
+/// upgrade to `https` on the same host cannot leak it.
 fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<UploadUrl, Error> {
     let raw = resp
         .headers()
@@ -505,7 +506,10 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Upl
     let resolved = base_url.join(raw).map_err(|e| Error::UploadProtocol {
         reason: format!("failed to resolve upload URL: {e}"),
     })?;
-    if resolved.origin() != base_url.origin() {
+    let https_upgrade = base_url.scheme() == "http"
+        && resolved.scheme() == "https"
+        && resolved.host() == base_url.host();
+    if resolved.origin() != base_url.origin() && !https_upgrade {
         return Err(Error::UploadProtocol {
             reason: format!(
                 "upload Location origin {} differs from registry origin {}; refusing to forward credentials cross-origin (a proxy in front of the registry must forward the original scheme, such as with X-Forwarded-Proto, or return relative Locations)",
@@ -600,42 +604,79 @@ mod tests {
     /// relative, keeping its query. Anything off the registry's origin or
     /// missing is refused: another host, another port, a scheme downgrade
     /// (the bearer token would go out in the clear), a scheme-relative URL
-    /// to another host, and a missing header. Breaks if the query that
-    /// carries upload state is dropped, a relative path is not joined to the
-    /// registry, or a `Location` that differs only in scheme or port is
-    /// accepted.
+    /// to another host, and a missing header. The one exception is an
+    /// `https` upgrade of an `http` registry on the same host, any port.
+    /// Breaks if the query that carries upload state is dropped, a relative
+    /// path is not joined to the registry, a `Location` that differs only
+    /// in scheme or port is accepted, or the upgrade is refused or extended
+    /// to another host.
     #[test]
     fn the_upload_location_must_share_the_registry_origin() {
-        let base = url::Url::parse("https://registry.example.com").unwrap();
+        const HTTPS: &str = "https://registry.example.com";
+        const HTTP: &str = "http://registry.example.com";
         let cases = [
             (
+                HTTPS,
                 Some("https://registry.example.com/upload/uuid-1"),
                 Some("https://registry.example.com/upload/uuid-1"),
             ),
             (
+                HTTPS,
                 Some("https://registry.example.com:443/upload/uuid-1"),
                 Some("https://registry.example.com/upload/uuid-1"),
             ),
             (
+                HTTPS,
                 Some("/v2/repo/blobs/uploads/uuid-1"),
                 Some("https://registry.example.com/v2/repo/blobs/uploads/uuid-1"),
             ),
             (
+                HTTPS,
                 Some("/v2/repo/blobs/uploads/uuid-1?_state=token123&foo=bar"),
                 Some(
                     "https://registry.example.com/v2/repo/blobs/uploads/uuid-1?_state=token123&foo=bar",
                 ),
             ),
-            (Some("http://registry.example.com/upload/uuid-1"), None),
             (
+                HTTPS,
+                Some("http://registry.example.com/upload/uuid-1"),
+                None,
+            ),
+            (
+                HTTPS,
                 Some("https://registry.example.com:8443/upload/uuid-1"),
                 None,
             ),
-            (Some("https://attacker.example.net/upload/uuid-1"), None),
-            (Some("//attacker.example.net/upload/uuid-1"), None),
-            (None, None),
+            (
+                HTTPS,
+                Some("https://attacker.example.net/upload/uuid-1"),
+                None,
+            ),
+            (HTTPS, Some("//attacker.example.net/upload/uuid-1"), None),
+            (HTTPS, None, None),
+            (
+                HTTP,
+                Some("https://registry.example.com/upload/uuid-1"),
+                Some("https://registry.example.com/upload/uuid-1"),
+            ),
+            (
+                "http://registry.example.com:5000",
+                Some("https://registry.example.com:8443/upload/uuid-1"),
+                Some("https://registry.example.com:8443/upload/uuid-1"),
+            ),
+            (
+                HTTP,
+                Some("https://attacker.example.net/upload/uuid-1"),
+                None,
+            ),
+            (
+                HTTP,
+                Some("http://registry.example.com:8080/upload/uuid-1"),
+                None,
+            ),
         ];
-        for (header, expected) in cases {
+        for (base, header, expected) in cases {
+            let base = url::Url::parse(base).unwrap();
             let mut resp = http::Response::builder();
             if let Some(location) = header {
                 resp = resp.header("Location", location);
@@ -644,8 +685,29 @@ mod tests {
             let result = extract_location(&resp, &base)
                 .ok()
                 .map(|upload| upload.to_url().to_string());
-            assert_eq!(result.as_deref(), expected, "{header:?}");
+            assert_eq!(result.as_deref(), expected, "{base} {header:?}");
         }
+    }
+
+    /// A refused `Location` names both origins and the remedy for a proxy
+    /// that drops the original scheme. Breaks if the error loses either.
+    #[test]
+    fn a_refused_upload_location_names_the_origins_and_the_remedy() {
+        let base = url::Url::parse("https://registry.example.com").unwrap();
+        let resp = reqwest::Response::from(
+            http::Response::builder()
+                .header("Location", "http://registry.example.com/upload/uuid-1")
+                .body("")
+                .unwrap(),
+        );
+        let msg = extract_location(&resp, &base).err().unwrap().to_string();
+        assert!(
+            msg.contains(
+                "upload Location origin http://registry.example.com differs from registry origin https://registry.example.com"
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("X-Forwarded-Proto"), "{msg}");
     }
 
     /// Build a `RegistryClient` with the given hostname, routing all traffic
@@ -1036,10 +1098,6 @@ mod tests {
         assert!(
             msg.contains("differs from registry origin"),
             "expected same-origin rejection error, got: {msg}"
-        );
-        assert!(
-            msg.contains("X-Forwarded-Proto"),
-            "error must name the remedy, got: {msg}"
         );
     }
 

@@ -116,13 +116,6 @@ impl FromStr for Reference {
             )
         };
 
-        if repository.is_empty() {
-            return Err(Error::InvalidReference {
-                input: s.into(),
-                reason: "empty repository".into(),
-            });
-        }
-
         // The character rule lives in `RepositoryName`; the error names the
         // whole reference.
         let repository = RepositoryName::within(repository, s)?;
@@ -371,6 +364,7 @@ mod tests {
         let long = format!("ghcr.io/repo:{}", "a".repeat(129));
         let cases = [
             ("", "empty string"),
+            ("ghcr.io/", "repository name must be non-empty"),
             (
                 "ghcr.io/repo?evil:tag",
                 "repository name contains invalid character '?'",
@@ -396,6 +390,7 @@ mod tests {
         for (input, needle) in cases {
             let err = input.parse::<Reference>().unwrap_err().to_string();
             assert!(err.contains(needle), "{input:?}: {err}");
+            assert!(err.contains(&format!("'{input}'")), "{input:?}: {err}");
         }
     }
 }

@@ -614,6 +614,26 @@ pub(crate) fn resolve_cache_ttl(config: &Config) -> Duration {
         .map_or(DEFAULT_CACHE_TTL, CacheTtl::get)
 }
 
+/// Disk staging rooted at `dir`, with stale blobs evicted down to `limit`.
+/// A limit of 0 turns staging off, as the config documents, after removing
+/// what earlier runs staged there.
+fn open_staging(dir: PathBuf, limit: Option<u64>) -> BlobStage {
+    let stage = BlobStage::new(dir);
+    if let Err(e) = stage.cleanup_tmp_files() {
+        tracing::warn!(error = %e, "failed to clean staging tmp files");
+    }
+    // Evict stale blobs from previous runs before starting new work.
+    if let Some(limit) = limit {
+        if let Err(e) = stage.evict(limit) {
+            tracing::warn!(error = %e, "failed to evict staged blobs");
+        }
+    }
+    if limit == Some(0) {
+        return BlobStage::disabled();
+    }
+    stage
+}
+
 /// Run the sync command: load config, resolve mappings, and execute.
 ///
 /// The `shutdown` signal, if provided, will be forwarded to the engine for
@@ -705,22 +725,14 @@ pub(crate) async fn run(
     // small (local I/O) relative to the network savings when blobs overlap.
     let needs_staging = mappings.iter().any(|m| m.targets.len() > 1) || mappings.len() > 1;
     let staging = if needs_staging {
-        let stage = BlobStage::new(cache_dir.join("blobs"));
-        if let Err(e) = stage.cleanup_tmp_files() {
-            tracing::warn!(error = %e, "failed to clean staging tmp files");
-        }
-        // Evict stale blobs from previous runs before starting new work.
-        let staging_limit = config
-            .global
-            .as_ref()
-            .and_then(|g| g.staging_size_limit)
-            .map(ByteSize::get);
-        if let Some(limit) = staging_limit {
-            if let Err(e) = stage.evict(limit) {
-                tracing::warn!(error = %e, "failed to evict staged blobs");
-            }
-        }
-        stage
+        open_staging(
+            cache_dir.join("blobs"),
+            config
+                .global
+                .as_ref()
+                .and_then(|g| g.staging_size_limit)
+                .map(ByteSize::get),
+        )
     } else {
         BlobStage::disabled()
     };
@@ -1955,6 +1967,32 @@ mod tests {
     /// A parsed version range, for filters built in the tests below.
     fn range(text: &str) -> ocync_sync::version::Range {
         ocync_sync::version::Range::parse(text).unwrap()
+    }
+
+    /// A staging size limit of 0 disables staging, a positive limit or none
+    /// keeps it on. Breaks if `0` only evicts and leaves staging enabled, or
+    /// a positive limit disables it.
+    #[test]
+    fn a_zero_staging_limit_disables_staging() {
+        let digest: ocync_distribution::Digest =
+            format!("sha256:{}", "a".repeat(64)).parse().unwrap();
+        // want: (staging enabled, an earlier run's blob kept)
+        let cases = [
+            ("zero limit", Some(0), (false, false)),
+            ("positive limit", Some(1_000_000_000), (true, true)),
+            ("no limit", None, (true, true)),
+        ];
+        for (name, limit, want) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let earlier = BlobStage::new(dir.path().to_path_buf());
+            let mut writer = earlier.begin_write(&digest).unwrap();
+            writer.write_chunk(b"staged by an earlier run").unwrap();
+            writer.finish().unwrap();
+
+            let stage = open_staging(dir.path().to_path_buf(), limit);
+            let got = (stage.is_enabled(), earlier.exists(&digest));
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     #[test]

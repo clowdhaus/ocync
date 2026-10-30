@@ -10,7 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::aimd::{AimdController, RegistryAction};
-use crate::auth::{AuthProvider, Scope, Token};
+use crate::auth::{AuthProvider, ProviderKind, Scope, Token};
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
@@ -234,6 +234,7 @@ impl RegistryClientBuilder {
             self.max_concurrent,
         );
         Ok(RegistryClient {
+            provider: aimd.provider(),
             base_url: self.url,
             http,
             blob_download_http,
@@ -264,6 +265,9 @@ pub struct RegistryClient {
     pub(crate) blob_download_http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
+    /// The provider detected from the registry host, taken from the AIMD
+    /// controller at build so both agree on it.
+    pub(crate) provider: Option<ProviderKind>,
     /// Cap on concurrent blob uploads; see [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`].
     pub(crate) blob_upload_sem: Arc<Semaphore>,
     /// Cap on concurrent blob downloads, held by [`Self::blob_pull`]'s

@@ -217,7 +217,7 @@ impl TryFrom<String> for Range {
     type Error = Error;
 
     fn try_from(s: String) -> Result<Self, Error> {
-        Range::parse(&s)
+        Range::from_source(s)
     }
 }
 
@@ -238,15 +238,22 @@ impl Range {
     ///
     /// [`Error::InvalidVersionRange`] naming the offending text and why.
     pub fn parse(s: &str) -> Result<Self, Error> {
-        parse_constraints(s)
-            .map(|constraints| Range {
-                source: s.to_owned(),
+        Self::from_source(s.to_owned())
+    }
+
+    /// Parse an owned string, keeping it as the display text so the
+    /// deserialize path copies it once, not twice.
+    fn from_source(source: String) -> Result<Self, Error> {
+        match parse_constraints(&source) {
+            Ok(constraints) => Ok(Range {
+                source,
                 constraints,
-            })
-            .map_err(|reason| Error::InvalidVersionRange {
-                range: s.to_owned(),
+            }),
+            Err(reason) => Err(Error::InvalidVersionRange {
+                range: source,
                 reason,
-            })
+            }),
+        }
     }
 
     /// `true` if every constraint matches `v.prefix`. Both sides are

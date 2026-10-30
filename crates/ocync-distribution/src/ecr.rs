@@ -67,9 +67,12 @@ pub(crate) fn api_client(
     profile: Option<&str>,
     aws_credentials: &crate::AwsCredentialProviders,
 ) -> Result<crate::aws::Client, Error> {
-    let region = ecr_region(hostname)
-        .ok_or_else(|| crate::aws::ConfigError::NoRegionInHostname(hostname.to_owned()))
-        .map_err(|e| config_failed(hostname, e))?;
+    let region = ecr_region(hostname).ok_or_else(|| {
+        config_failed(
+            hostname,
+            crate::aws::ConfigError::NoRegionInHostname(hostname.to_owned()),
+        )
+    })?;
     crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr, aws_credentials)
         .map_err(|e| config_failed(hostname, e))
 }

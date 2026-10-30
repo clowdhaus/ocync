@@ -268,11 +268,8 @@ impl RepositoryName {
     /// [`Reference`](crate::Reference) parsing accepts.
     pub fn new(name: impl Into<String>) -> Result<Self, Error> {
         let name = name.into();
-        Self::check(&name).map_err(|reason| Error::InvalidReference {
-            input: name.clone(),
-            reason,
-        })?;
-        Ok(Self(name))
+        let reference = name.clone();
+        Self::within(name, &reference)
     }
 
     /// [`Self::new`] for a name taken from `reference`, so the error names

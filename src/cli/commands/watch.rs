@@ -1,6 +1,7 @@
 //! The `watch` subcommand - daemon mode for periodic sync with graceful shutdown.
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,13 @@ use crate::cli::health::HealthState;
 use crate::cli::shutdown::ShutdownSignal;
 use crate::cli::{CliError, ExitCode};
 use crate::{SyncArgs, WatchArgs};
+
+/// Whether the warm cache must be reloaded because the re-read config moved
+/// its file or changed its TTL. The TTL is applied only when the cache is
+/// loaded, so an edited TTL on an unchanged path needs the reload too.
+fn cache_needs_reload(active: (&Path, Duration), next: (&Path, Duration)) -> bool {
+    active != next
+}
 
 /// Run the watch command: loop forever, running sync then waiting for the
 /// configured interval or a shutdown signal.
@@ -58,8 +66,9 @@ pub(crate) async fn run(
                 &cache_path,
                 cache_ttl,
             )));
-            // Track the active cache path so we can detect config changes.
+            // Track the active cache path and TTL so we can detect config changes.
             let mut active_cache_path = cache_path;
+            let mut active_cache_ttl = cache_ttl;
 
             // Spawn the health server as a background local task.
             let health_handle = {
@@ -90,27 +99,34 @@ pub(crate) async fn run(
                 // Re-resolve cache_dir and cache_ttl each cycle so that
                 // config file edits (e.g. changing cache_dir or cache_ttl)
                 // take effect without restarting watch mode.
-                if let Ok(cfg) = load_config(&args.config) {
-                    config_failures = 0;
-                    let (_dir, path) = synchronize::resolve_cache_path(&cfg, &args.config);
-                    let ttl = synchronize::resolve_cache_ttl(&cfg);
-                    // If the cache path changed, persist the old cache and
-                    // reload from the new location.
-                    if path != active_cache_path {
-                        if let Err(e) = cache.borrow().persist(&active_cache_path) {
-                            tracing::warn!(
-                                error = %e,
-                                "failed to persist cache before path change"
-                            );
+                match load_config(&args.config) {
+                    Ok(cfg) => {
+                        config_failures = 0;
+                        let (_dir, path) = synchronize::resolve_cache_path(&cfg, &args.config);
+                        let ttl = synchronize::resolve_cache_ttl(&cfg);
+                        // If the cache path or TTL changed, persist the old
+                        // cache and reload with the new values.
+                        if cache_needs_reload(
+                            (&active_cache_path, active_cache_ttl),
+                            (&path, ttl),
+                        ) {
+                            if let Err(e) = cache.borrow().persist(&active_cache_path) {
+                                tracing::warn!(
+                                    error = %e,
+                                    "failed to persist cache before reload"
+                                );
+                            }
+                            *cache.borrow_mut() = TransferStateCache::load(&path, ttl);
+                            active_cache_path = path;
+                            active_cache_ttl = ttl;
                         }
-                        *cache.borrow_mut() = TransferStateCache::load(&path, ttl);
-                        active_cache_path = path;
                     }
-                } else {
+                    Err(e) => {
                     config_failures += 1;
                     tracing::error!(
+                        error = %e,
                         consecutive_failures = config_failures,
-                        "failed to reload config for cache resolution, using previous value"
+                        "failed to reload config for cache resolution; the cache keeps its current path and TTL, and the sync below reads the file again"
                     );
 
                     // After repeated failures, apply exponential backoff
@@ -133,6 +149,7 @@ pub(crate) async fn run(
                             }
                         }
                         continue;
+                    }
                     }
                 }
 
@@ -202,4 +219,29 @@ pub(crate) async fn run(
         .await;
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A changed cache path or TTL reloads the cache and an unchanged pair
+    /// does not. Breaks if an edited `cache_ttl` on the same path is ignored,
+    /// or an unchanged config reloads the cache every cycle.
+    #[test]
+    fn the_cache_reloads_when_its_path_or_ttl_changes() {
+        let hour = Duration::from_secs(3600);
+        let day = Duration::from_secs(86_400);
+        let a = Path::new("/cache/a");
+        let b = Path::new("/cache/b");
+        let cases = [
+            ("neither changed", (a, hour), (a, hour), false),
+            ("path changed", (a, hour), (b, hour), true),
+            ("ttl changed", (a, hour), (a, day), true),
+            ("both changed", (a, hour), (b, day), true),
+        ];
+        for (name, active, next, expected) in cases {
+            assert_eq!(cache_needs_reload(active, next), expected, "{name}");
+        }
+    }
 }

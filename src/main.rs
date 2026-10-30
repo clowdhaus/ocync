@@ -225,8 +225,7 @@ pub(crate) struct TagsArgs {
     #[arg(long)]
     pub(crate) glob: Vec<String>,
     /// Include tags matching a semver range (e.g., `>=1.0, <2.0`).
-    ///
-    /// Parsed at argument time so a bad range is refused before any registry request.
+    // Parsed at argument time so a bad range is refused before any registry request.
     #[arg(long, value_parser = Range::parse)]
     pub(crate) semver: Option<Range>,
     /// Exclude tags matching a pattern (repeatable).

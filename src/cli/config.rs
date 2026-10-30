@@ -676,6 +676,17 @@ pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String
 // Duration and size values
 // ---------------------------------------------------------------------------
 
+/// `digits` as a `u64` times `unit`, or `None` if it holds anything but ASCII
+/// digits (`u64::parse` alone would accept a leading `+`) or overflows.
+fn scaled(digits: &str, unit: u64) -> Option<u64> {
+    digits
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| digits.parse::<u64>().ok())
+        .flatten()
+        .and_then(|n| n.checked_mul(unit))
+}
+
 /// The warm cache TTL, parsed when the config is read so an out-of-range
 /// value is a config error rather than a failure at use.
 ///
@@ -705,12 +716,7 @@ impl TryFrom<String> for CacheTtl {
             Some('d') => (&text[..text.len() - 1], 86400),
             _ => (text.as_str(), 1),
         };
-        digits
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| digits.parse::<u64>().ok())
-            .flatten()
-            .and_then(|n| n.checked_mul(seconds_per_unit))
+        scaled(digits, seconds_per_unit)
             .map(|secs| Self(Duration::from_secs(secs)))
             .ok_or_else(invalid)
     }
@@ -761,14 +767,7 @@ impl TryFrom<String> for ByteSize {
         .into_iter()
         .find_map(|(suffix, unit)| text.strip_suffix(suffix).map(|digits| (digits, unit)))
         .ok_or_else(invalid)?;
-        digits
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| digits.parse::<u64>().ok())
-            .flatten()
-            .and_then(|n| n.checked_mul(bytes_per_unit))
-            .map(Self)
-            .ok_or_else(invalid)
+        scaled(digits, bytes_per_unit).map(Self).ok_or_else(invalid)
     }
 }
 
@@ -1204,6 +1203,9 @@ mappings:
     #[test]
     fn serialize_roundtrip() {
         let yaml = r#"
+global:
+  cache_ttl: 6h
+  staging_size_limit: 1GB
 registries:
   ecr:
     url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
@@ -1213,6 +1215,7 @@ mappings:
     tags:
       glob: "*"
       sort: semver
+      semver: ">=1.0, <2.0"
       latest: 5
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
@@ -1223,6 +1226,23 @@ mappings:
             roundtripped.registries["ecr"].auth_type,
             Some(AuthType::Ecr)
         );
+        let global = roundtripped.global.as_ref().unwrap();
+        assert_eq!(
+            global.cache_ttl.map(CacheTtl::get),
+            Some(Duration::from_secs(21_600))
+        );
+        assert_eq!(
+            global.staging_size_limit.map(ByteSize::get),
+            Some(1_000_000_000)
+        );
+        let semver = roundtripped.mappings[0]
+            .tags
+            .as_ref()
+            .unwrap()
+            .semver
+            .as_ref()
+            .unwrap();
+        assert_eq!(semver.to_string(), ">=1.0, <2.0");
     }
 
     #[test]
@@ -1741,13 +1761,16 @@ mappings:
             ("cache_ttl", "12hours"),
             ("cache_ttl", "99999999999999999999"),
             ("cache_ttl", "1000000000000000d"),
+            ("cache_ttl", "+5m"),
             ("staging_size_limit", "2gigabytes"),
             ("staging_size_limit", ""),
             ("staging_size_limit", "99999999999999999999B"),
             ("staging_size_limit", "99999999999TB"),
+            ("staging_size_limit", "+5MB"),
         ];
+        let dir = tempfile::tempdir().unwrap();
         for (field, value) in cases {
-            let path = std::env::temp_dir().join("ocync_config_unusable_ttl_and_size.yaml");
+            let path = dir.path().join("config.yaml");
             std::fs::write(
                 &path,
                 format!(
