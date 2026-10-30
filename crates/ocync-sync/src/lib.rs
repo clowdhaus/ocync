@@ -26,8 +26,7 @@ pub(crate) mod shared;
 pub mod shutdown;
 /// Content-addressable disk staging for multi-target blob reuse.
 pub mod staging;
-/// Tag version parsing and semver range matching.
-pub mod version;
+pub(crate) mod version;
 
 use std::time::Duration;
 
@@ -36,6 +35,8 @@ use uuid::Uuid;
 
 pub use error::Error;
 pub use shutdown::ShutdownSignal;
+/// A parsed version range for filtering tags.
+pub use version::Range;
 
 /// Serde helper: skip serializing when value equals its type's default.
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {

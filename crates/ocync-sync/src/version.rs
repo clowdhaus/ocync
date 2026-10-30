@@ -197,16 +197,6 @@ enum Op {
     Eq,
 }
 
-/// Two ranges are equal when they match the same tags as written, so the
-/// text kept for display does not count.
-impl PartialEq for Range {
-    fn eq(&self, other: &Self) -> bool {
-        self.constraints == other.constraints
-    }
-}
-
-impl Eq for Range {}
-
 impl std::fmt::Display for Range {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.source)
@@ -515,17 +505,6 @@ mod range_tests {
         for (name, range) in cases {
             assert!(Range::parse(range).is_err(), "{name}: {range}");
         }
-    }
-
-    /// Ranges are equal by what they match, not by how they were written.
-    /// Breaks if the display text enters the comparison, or if different
-    /// bounds compare equal.
-    #[test]
-    fn equality_ignores_the_text_and_keeps_the_bounds() {
-        let range = |s| Range::parse(s).unwrap();
-        assert_eq!(range(">=1.0,<2.0"), range(" >=1.0 , < 2.0"));
-        assert_ne!(range(">=1.0,<2.0"), range(">=1.0,<3.0"));
-        assert_ne!(range(">=1.0"), range(">1.0"));
     }
 }
 

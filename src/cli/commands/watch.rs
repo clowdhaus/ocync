@@ -111,34 +111,34 @@ pub(crate) async fn run(
                         }
                     }
                     Err(e) => {
-                    config_failures += 1;
-                    tracing::error!(
-                        error = %e,
-                        consecutive_failures = config_failures,
-                        "failed to reload config for cache resolution; the cache keeps its current path, and the sync below reads the file again"
-                    );
-
-                    // After repeated failures, apply exponential backoff
-                    // before the next cycle to avoid log spam.
-                    if config_failures >= BACKOFF_THRESHOLD {
-                        let backoff_secs = interval
-                            .as_secs()
-                            .saturating_mul(1 << (config_failures - BACKOFF_THRESHOLD).min(4))
-                            .min(MAX_BACKOFF_SECS);
-                        let backoff = Duration::from_secs(backoff_secs);
-                        tracing::warn!(
-                            backoff_secs = backoff.as_secs(),
-                            "config reload failing repeatedly, applying backoff"
+                        config_failures += 1;
+                        tracing::error!(
+                            error = %e,
+                            consecutive_failures = config_failures,
+                            "failed to reload config; keeping the current cache path"
                         );
-                        tokio::select! {
-                            () = tokio::time::sleep(backoff) => {}
-                            () = shutdown.notified() => {
-                                tracing::info!("shutdown signal received during backoff");
-                                break ExitCode::Success;
+
+                        // After repeated failures, apply exponential backoff
+                        // before the next cycle to avoid log spam.
+                        if config_failures >= BACKOFF_THRESHOLD {
+                            let backoff_secs = interval
+                                .as_secs()
+                                .saturating_mul(1 << (config_failures - BACKOFF_THRESHOLD).min(4))
+                                .min(MAX_BACKOFF_SECS);
+                            let backoff = Duration::from_secs(backoff_secs);
+                            tracing::warn!(
+                                backoff_secs = backoff.as_secs(),
+                                "config reload failing repeatedly, applying backoff"
+                            );
+                            tokio::select! {
+                                () = tokio::time::sleep(backoff) => {}
+                                () = shutdown.notified() => {
+                                    tracing::info!("shutdown signal received during backoff");
+                                    break ExitCode::Success;
+                                }
                             }
+                            continue;
                         }
-                        continue;
-                    }
                     }
                 }
 

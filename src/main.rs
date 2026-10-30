@@ -15,8 +15,8 @@ use anstyle::{Ansi256Color, Color, Style};
 use clap::builder::Styles;
 use clap::{Parser, Subcommand, ValueEnum};
 use ocync_distribution::{CRYPTO_BUILD, CryptoBuild, Reference, TlsFips};
+use ocync_sync::Range;
 use ocync_sync::progress::NullProgress;
-use ocync_sync::version::Range;
 
 const PINK: Option<Color> = Some(Color::Ansi256(Ansi256Color(213)));
 const PURPLE: Option<Color> = Some(Color::Ansi256(Ansi256Color(141)));

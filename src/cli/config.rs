@@ -539,8 +539,8 @@ pub(crate) enum GlobOrList {
     List(Vec<String>),
 }
 
+use ocync_sync::Range;
 use ocync_sync::filter::{SortOrder, is_literal_pattern};
-use ocync_sync::version::Range;
 
 /// Placeholder type for the removed `tags.semver_prerelease` field. Triggers
 /// a custom Deserialize error if the field appears in user config, with a
@@ -722,9 +722,21 @@ impl TryFrom<String> for CacheTtl {
     }
 }
 
+/// Written in the largest whole unit (`d`, `h`, `m`, else `s`), and zero as
+/// `"0"`, so a TTL written as `12h` reads back as `12h`.
 impl From<CacheTtl> for String {
     fn from(ttl: CacheTtl) -> String {
-        format!("{}s", ttl.0.as_secs())
+        let secs = ttl.0.as_secs();
+        if secs == 0 {
+            return "0".to_owned();
+        }
+        [(86_400, 'd'), (3_600, 'h'), (60, 'm')]
+            .into_iter()
+            .find(|(per_unit, _)| secs.is_multiple_of(*per_unit))
+            .map_or_else(
+                || format!("{secs}s"),
+                |(per_unit, unit)| format!("{}{unit}", secs / per_unit),
+            )
     }
 }
 
@@ -1790,19 +1802,27 @@ mappings:
         }
     }
 
+    /// Each TTL form parses to its seconds and serializes in the largest
+    /// whole unit, so what the user wrote comes back. Breaks if a unit is
+    /// misread or a TTL is written back in seconds only.
     #[test]
     fn valid_ttl_forms_parse_to_their_durations() {
+        // (text, seconds, serialized)
         let cases = [
-            ("0", 0),
-            ("60", 60),
-            ("1s", 1),
-            ("30m", 1_800),
-            ("12h", 43_200),
-            ("7d", 604_800),
+            ("0", 0, "0"),
+            ("0s", 0, "0"),
+            ("60", 60, "1m"),
+            ("1s", 1, "1s"),
+            ("90s", 90, "90s"),
+            ("30m", 1_800, "30m"),
+            ("12h", 43_200, "12h"),
+            ("7d", 604_800, "7d"),
+            ("36h", 129_600, "36h"),
         ];
-        for (text, secs) in cases {
+        for (text, secs, serialized) in cases {
             let ttl = CacheTtl::try_from(text.to_string()).unwrap();
             assert_eq!(ttl.get(), Duration::from_secs(secs), "{text}");
+            assert_eq!(String::from(ttl), serialized, "{text}");
         }
     }
 
