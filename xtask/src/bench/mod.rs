@@ -220,9 +220,10 @@ pub(crate) fn value_name<T: ValueEnum>(value: &T) -> String {
         .to_owned()
 }
 
-/// Cloud a benchmark instance runs in.
+/// A cloud: the one a bench stack is deployed in, or the one a registry
+/// belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum Provider {
     /// Amazon Web Services.
     Aws,
@@ -232,9 +233,20 @@ pub(crate) enum Provider {
     Azure,
 }
 
+impl Provider {
+    /// The spelling on the command line, in serialized records and in paths.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Aws => "aws",
+            Self::Gcp => "gcp",
+            Self::Azure => "azure",
+        }
+    }
+}
+
 impl std::fmt::Display for Provider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&value_name(self))
+        f.write_str(self.as_str())
     }
 }
 
@@ -352,12 +364,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench: Docker Hub auth not available, using anonymous pulls");
     };
 
-    let tools = args.tools.clone();
+    let tools = &args.tools;
 
     eprintln!(
         "bench: scenario={} tools={} images={} tags={}",
         value_name(&args.scenario),
-        runner::join_tools(&tools),
+        runner::join_tools(tools),
         corpus.images.len(),
         corpus.total_tags(),
     );
@@ -377,7 +389,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // relays its transfers through, whose version moves that tool's numbers.
     let mut tool_versions: BTreeMap<Tool, String> = BTreeMap::new();
     let mut relay_versions: BTreeMap<String, String> = BTreeMap::new();
-    for &tool in &tools {
+    for &tool in tools {
         let version = runner::check_tool(tool, workspace_root).await?;
         eprintln!("  {}: {version}", tool);
         tool_versions.insert(tool, version);
@@ -385,7 +397,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // Relays are shared between tools, so they are resolved once over the whole
     // set rather than per tool.
-    for (binary, version) in runner::check_relays(&tools).await? {
+    for (binary, version) in runner::check_relays(tools).await? {
         eprintln!("  {binary} (relay): {version}");
         relay_versions.insert(binary, version);
     }
@@ -445,7 +457,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     for scenario in scenarios {
         // Randomize tool execution order to prevent systematic bias from
         // CDN warming, network burst credit depletion, etc.
-        let mut shuffled = tools.clone();
+        let mut shuffled = tools.to_vec();
         let seed = shuffle_tools(&mut shuffled);
         let tool_order: Vec<String> = shuffled.iter().map(ToString::to_string).collect();
         eprintln!(
@@ -534,7 +546,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             .scenarios
             .iter()
             .map(|s| report::ScenarioRecord {
-                name: s.kind.label().to_string(),
+                name: s.kind.label(),
                 shuffle_seed: s.shuffle_seed,
                 tool_order: s.tool_order.iter().map(ToString::to_string).collect(),
                 tools: s
@@ -647,7 +659,7 @@ impl std::fmt::Display for Pass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Prime => f.write_str("prime"),
-            Self::Measured(kind) => write!(f, "{}", kind.slug()),
+            Self::Measured(kind) => f.write_str(&kind.slug()),
         }
     }
 }
@@ -724,9 +736,7 @@ async fn run_single_tool(
             "  {}: wall_clock={:.1}s exit={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
             tool,
             result.wall_clock.as_secs_f64(),
-            result
-                .exit_code
-                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            exit_display(result.exit_code),
             rss_display,
             metrics.requests,
             report::format_bytes(metrics.response_bytes),
@@ -775,8 +785,14 @@ fn ensure_exited_zero(tool: Tool, pass: Pass, exit_code: Option<i32>) -> Result<
         return Ok(());
     }
     Err(format!(
-        "{tool} {pass} failed (exit {exit_code:?}); aborting, a failed run cannot be compared"
+        "{tool} {pass} failed (exit {}); aborting, a failed run cannot be compared",
+        exit_display(exit_code)
     ))
+}
+
+/// An exit code for a log line; `signal` when the process had none.
+fn exit_display(exit_code: Option<i32>) -> String {
+    exit_code.map_or_else(|| "signal".to_string(), |c| c.to_string())
 }
 
 /// Abort on source registry errors (status >= 400) that indicate tainted
@@ -1886,12 +1902,12 @@ mod tests {
             (
                 "non-zero",
                 Some(1),
-                "ocync scale-10 failed (exit Some(1)); aborting, a failed run cannot be compared",
+                "ocync scale-10 failed (exit 1); aborting, a failed run cannot be compared",
             ),
             (
                 "killed by a signal",
                 None,
-                "ocync scale-10 failed (exit None); aborting, a failed run cannot be compared",
+                "ocync scale-10 failed (exit signal); aborting, a failed run cannot be compared",
             ),
         ] {
             assert_eq!(
@@ -1930,6 +1946,14 @@ mod tests {
             (Provider::Azure, "azure"),
         ] {
             assert_eq!(provider.to_string(), expected);
+        }
+        for provider in Provider::value_variants() {
+            assert_eq!(provider.as_str(), value_name(provider), "clap spelling");
+            assert_eq!(
+                serde_json::to_string(provider).unwrap(),
+                format!("\"{}\"", provider.as_str()),
+                "serde spelling"
+            );
         }
     }
 

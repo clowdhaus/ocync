@@ -123,25 +123,37 @@ pub(crate) fn generate_ca(common_name: &str) -> Result<(String, String), Error> 
     Ok((cert.pem(), key.serialize_pem()))
 }
 
-/// Write the CA private key so no other user can read it at any point: a new
-/// file is created owner-only, and an existing one is restricted before the
-/// key goes into it.
+/// Write the CA private key so no other user can read it at any point: the key
+/// goes into a sibling file created owner-only, then replaces `path` by rename,
+/// so an existing key is only ever replaced whole, never emptied.
 pub(crate) async fn write_private_key(path: &Path, key_pem: &str) -> Result<(), Error> {
     use tokio::io::AsyncWriteExt;
 
+    let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
+    temp_name.push(".tmp");
+    let temp = path.with_file_name(temp_name);
+
+    match tokio::fs::remove_file(&temp).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(path).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .await?;
+    let mut file = options.open(&temp).await?;
+    let written = async {
+        file.write_all(key_pem.as_bytes()).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&temp, path).await
     }
-    file.write_all(key_pem.as_bytes()).await?;
-    file.flush().await?;
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -150,20 +162,21 @@ pub(crate) async fn load_ca(cert_path: &Path, key_path: &Path) -> Result<CaSigne
     let cert_pem = tokio::fs::read_to_string(cert_path).await?;
     let key_pem = tokio::fs::read_to_string(key_path).await?;
 
-    let pem_error = |path: &Path| {
-        let path = path.display().to_string();
-        move |e: rcgen::Error| Error::Pem {
-            path,
-            reason: e.to_string(),
-        }
-    };
-    let key = KeyPair::from_pem(&key_pem).map_err(pem_error(key_path))?;
-    let issuer = Issuer::from_ca_cert_pem(&cert_pem, key).map_err(pem_error(cert_path))?;
+    let key = KeyPair::from_pem(&key_pem).map_err(|e| pem_error(key_path, e))?;
+    let issuer = Issuer::from_ca_cert_pem(&cert_pem, key).map_err(|e| pem_error(cert_path, e))?;
 
     Ok(CaSigner {
         issuer,
         leaf_cache: RwLock::new(HashMap::new()),
     })
+}
+
+/// Name `path` as the file `e` rejected.
+fn pem_error(path: &Path, e: rcgen::Error) -> Error {
+    Error::Pem {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    }
 }
 
 /// Generate a new leaf certificate for `sni_host`, signed by `issuer`.
@@ -263,6 +276,11 @@ mod tests {
             let meta = std::fs::metadata(&path).unwrap();
             assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{name}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "new key", "{name}");
+            let entries: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(entries, ["ca.key"], "{name}: no temp file left behind");
         }
     }
 

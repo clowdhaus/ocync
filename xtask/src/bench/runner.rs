@@ -36,11 +36,11 @@ impl std::fmt::Display for Tool {
     }
 }
 
-/// The tools as a comma-separated list, the form `--tools` takes.
+/// The tools as a comma-separated list in the spelling `--tools` parses.
 pub(crate) fn join_tools(tools: &[Tool]) -> String {
     tools
         .iter()
-        .map(ToString::to_string)
+        .map(super::value_name)
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -643,10 +643,19 @@ mod tests {
 
     #[test]
     fn join_tools_is_the_form_tools_flag_parses() {
-        assert_eq!(
-            join_tools(&[Tool::Ocync, Tool::Dregsy, Tool::Regsync]),
-            "ocync,dregsy,regsync"
-        );
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: crate::bench::BenchArgs,
+        }
+
+        let tools = [Tool::Regsync, Tool::Ocync, Tool::Dregsy];
+        let joined = join_tools(&tools);
+        assert_eq!(joined, "regsync,ocync,dregsy");
+        let parsed = Cli::try_parse_from(["xtask", "--tools", &joined, "prepare"]).unwrap();
+        assert_eq!(parsed.args.tools, tools);
     }
 
     #[test]

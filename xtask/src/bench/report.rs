@@ -47,8 +47,8 @@ pub(crate) struct RunRecord {
 /// Machine metadata for a benchmark run.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct MachineInfo {
-    /// Cloud provider, absent when the target registry is none of the three
-    /// clouds' own.
+    /// Cloud of the target registry, absent when the registry belongs to none
+    /// of the three clouds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider: Option<Provider>,
     /// Instance type (e.g. `c6in.4xlarge`), or `"unknown"`.
@@ -314,11 +314,10 @@ impl InstanceInfo {
 /// Returns `(arch, cpu_manufacturer, vcpus, memory_mib, network_performance)`.
 #[expect(
     clippy::disallowed_methods,
-    reason = "reads the AWS CLI's instance type answer, which holds no credential"
+    reason = "parses the AWS CLI's instance type answer, which holds no credential"
 )]
 fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize, u64, String)> {
-    let output = std::process::Command::new("aws")
-        .args([
+    let output = command_stdout(std::process::Command::new("aws").args([
             "ec2",
             "describe-instance-types",
             "--instance-types",
@@ -327,12 +326,9 @@ fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize,
             "InstanceTypes[0].{Arch:ProcessorInfo.SupportedArchitectures[0],Cpu:ProcessorInfo.Manufacturer,Vcpus:VCpuInfo.DefaultVCpus,Mem:MemoryInfo.SizeInMiB,Net:NetworkInfo.NetworkPerformance}",
             "--output",
             "json",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+        ]))?;
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&output).ok()?;
 
     let arch = json["Arch"].as_str().unwrap_or_default().to_string();
     let cpu_manufacturer = json["Cpu"].as_str().unwrap_or_default().to_string();
@@ -1331,7 +1327,7 @@ mod tests {
 
         let cold = find_scenario(&report.scenarios, ScenarioKind::Cold).unwrap();
 
-        assert_eq!(cold.kind.label().to_string(), "Cold sync");
+        assert_eq!(cold.kind.label(), "Cold sync");
         assert!(find_scenario(&report.scenarios, ScenarioKind::Warm).is_none());
         assert!(find_scenario(&report.scenarios, ScenarioKind::Scale { images: 25 }).is_none());
     }
