@@ -1,24 +1,18 @@
 //! High-concurrency, mostly-disjoint mapping reproducer.
 //!
 //! Mirrors the production failure mode: 10 mappings to one target registry,
-//! mostly disjoint blob sets, `max_concurrent_transfers=50`. One pair
-//! shares a single layer so `elect_leaders` picks exactly one leader
-//! (matching the `total_leaders=1 images=10` log observed against ECR).
+//! mostly disjoint blob sets, `max_concurrent_transfers=50`. One pair shares a
+//! single layer so `elect_leaders` picks exactly one leader (the
+//! `total_leaders=1 images=10` seen against ECR).
 //!
-//! The engine reports `ImageStatus::Synced` only when the blob loop and
-//! manifest push both succeed. If the engine silently short-circuits a blob
-//! push (returning `Skipped`/`Mounted` for a blob that was never actually
-//! transferred), the per-target request counts will be lower than the
-//! per-image stats claim -- and these assertions fire.
-//!
-//! Three variants:
-//! - [`sync_ten_fully_disjoint_mappings_high_concurrency`] -- baseline
-//!   with zero shared blobs, exercises the no-leader path.
-//! - [`sync_ten_disjoint_mappings_one_shared_blob_high_concurrency`] --
-//!   one shared blob, one elected leader, follower mounts.
-//! - [`sync_ten_disjoint_mappings_one_shared_blob_with_batch_checker`] --
-//!   same shape, plus a `BatchBlobChecker` returning `existing=[]` for
-//!   every repo (exercises the ECR cache-pre-population path).
+//! The engine reports `Synced` only when the blob loop and manifest push both
+//! succeed. If it silently short-circuits a blob push (`Skipped`/`Mounted` for
+//! a blob never transferred), the target's request counts fall below the
+//! per-image stats and the assertions fire. The variants:
+//! - no shared blobs: no leader
+//! - one shared blob: one leader, the follower mounts
+//! - one shared blob plus a `BatchBlobChecker` returning `existing=[]` for
+//!   every repo (the ECR cache pre-population path)
 
 mod helpers;
 
@@ -27,23 +21,18 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ocync_distribution::spec::RepositoryName;
 use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
 use ocync_sync::ImageStatus;
-use ocync_sync::engine::{RegistryAlias, SyncEngine, TagPair, TargetEntry};
-use ocync_sync::progress::NullProgress;
-use ocync_sync::staging::BlobStage;
-use wiremock::matchers::{method, path_regex, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use ocync_sync::engine::{RegistryAlias, TagPair, TargetEntry};
+use wiremock::MockServer;
 
 use helpers::*;
 
-/// Production-shape reproducer. Asserts every image syncs and that the
-/// report's per-blob stats reconcile against the target server's actual
-/// PUT and mount POST counts.
+/// Every image syncs and the report's per-blob stats reconcile with the target
+/// server's actual PUT and mount POST counts.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_disjoint_mappings_one_shared_blob_high_concurrency() {
     let fixture = build_ten_image_fixture(/* shared_pair = */ true).await;
@@ -51,10 +40,8 @@ async fn sync_ten_disjoint_mappings_one_shared_blob_high_concurrency() {
     assert_report_matches_target_receipts(&fixture, &report).await;
 }
 
-/// As above, but each `TargetEntry` carries an ECR-style batch checker
-/// that returns `existing=[]` for every call. Confirms the cache
-/// pre-population path doesn't introduce false-Skipped or false-Mounted
-/// terminals at high concurrency.
+/// As above, with an ECR-style batch checker returning `existing=[]` on every
+/// target: cache pre-population must not produce a false `Skipped` or `Mounted`.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_disjoint_mappings_one_shared_blob_with_batch_checker() {
     let fixture = build_ten_image_fixture(/* shared_pair = */ true).await;
@@ -62,8 +49,7 @@ async fn sync_ten_disjoint_mappings_one_shared_blob_with_batch_checker() {
     assert_report_matches_target_receipts(&fixture, &report).await;
 }
 
-/// Sanity baseline: zero shared blobs. `elect_leaders` returns 0 (no
-/// leader log fires). Every image processes independently.
+/// Baseline with zero shared blobs: no leader, every image independent.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_fully_disjoint_mappings_high_concurrency() {
     let fixture = build_ten_image_fixture(/* shared_pair = */ false).await;
@@ -73,17 +59,14 @@ async fn sync_ten_fully_disjoint_mappings_high_concurrency() {
     assert_eq!(report.stats.blobs_mounted, 0);
 }
 
-// ---------------------------------------------------------------------------
-// Shared fixture + assertions
-// ---------------------------------------------------------------------------
-
 struct TenImageFixture {
-    source_server: MockServer,
+    /// Held so the source mocks outlive the run.
+    _source_server: MockServer,
     target_server: MockServer,
     source_client: Arc<ocync_distribution::RegistryClient>,
     target_client: Arc<ocync_distribution::RegistryClient>,
     images: Vec<ManifestParts>,
-    // (source_repo, target_repo) per image index.
+    /// `(source_repo, target_repo)` per image index.
     repos: Vec<(String, String)>,
 }
 
@@ -119,34 +102,14 @@ async fn build_ten_image_fixture(shared_pair: bool) -> TenImageFixture {
     for (_, tgt) in &repos {
         mount_manifest_head_not_found(&target_server, tgt, "latest").await;
         mount_manifest_push(&target_server, tgt, "latest").await;
-        // Blob HEAD 404 for every digest this repo might be asked about
-        // (without a batch checker, the engine HEADs every blob).
-        for parts in &images {
-            mount_blob_not_found(&target_server, tgt, &parts.config_desc.digest).await;
-            for desc in &parts.layer_descs {
-                mount_blob_not_found(&target_server, tgt, &desc.digest).await;
-            }
-        }
         mount_blob_push(&target_server, tgt).await;
-
-        // Mount mocks: 201 for any cross-repo mount of any of our digests.
+        // Without a batch checker the engine HEADs every blob. Any of our
+        // digests may also be mounted from another repo.
         for parts in &images {
-            for desc in &parts.layer_descs {
-                Mock::given(method("POST"))
-                    .and(path_regex(format!("^/v2/{tgt}/blobs/uploads/$")))
-                    .and(query_param("mount", desc.digest.to_string()))
-                    .respond_with(ResponseTemplate::new(201))
-                    .with_priority(1)
-                    .mount(&target_server)
-                    .await;
+            parts.mount_target_blob_misses(&target_server, tgt).await;
+            for digest in parts.blob_digests() {
+                mount_blob_mount_accepted(&target_server, tgt, &digest).await;
             }
-            Mock::given(method("POST"))
-                .and(path_regex(format!("^/v2/{tgt}/blobs/uploads/$")))
-                .and(query_param("mount", parts.config_desc.digest.to_string()))
-                .respond_with(ResponseTemplate::new(201))
-                .with_priority(1)
-                .mount(&target_server)
-                .await;
         }
     }
 
@@ -154,7 +117,7 @@ async fn build_ten_image_fixture(shared_pair: bool) -> TenImageFixture {
     let target_client = mock_client(&target_server);
 
     TenImageFixture {
-        source_server,
+        _source_server: source_server,
         target_server,
         source_client,
         target_client,
@@ -192,30 +155,18 @@ async fn run_engine_default(
         })
         .collect();
 
-    // Engine default is 10 (DEFAULT_MAX_CONCURRENT_TRANSFERS); the test
-    // deliberately oversubscribes at 50 to exercise the per-target
-    // blob upload semaphore (cap 64) under a workload that would
-    // otherwise demand 50 * BLOB_CONCURRENCY=6 = 300 concurrent streams.
-    let engine = SyncEngine::new(fast_retry(), concurrency(50));
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        engine.run(
-            mappings,
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        ),
-    )
-    .await
-    .expect("engine hung past 30s -- leader/follower stall or auth deadlock")
+    // Above the engine default of 10 on purpose: it oversubscribes the
+    // per-target upload semaphore (cap 64) with 50 * BLOB_CONCURRENCY(6) = 300
+    // wanted streams.
+    tokio::time::timeout(Duration::from_secs(30), run_sync(mappings))
+        .await
+        .expect("engine hung past 30s: leader/follower stall or auth deadlock")
 }
 
 async fn assert_report_matches_target_receipts(
     fixture: &TenImageFixture,
     report: &ocync_sync::SyncReport,
 ) {
-    // Every image must claim Synced.
     assert_eq!(report.images.len(), 10, "expected 10 image results");
     for r in &report.images {
         assert!(
@@ -227,7 +178,6 @@ async fn assert_report_matches_target_receipts(
         );
     }
 
-    // Per-image declared blob count: config + N layers.
     let declared: Vec<u64> = fixture
         .images
         .iter()
@@ -286,7 +236,7 @@ async fn assert_report_matches_target_receipts(
     // target actually received.
     assert_eq!(
         blob_puts, stats_transferred,
-        "report claims {stats_transferred} blobs transferred but target received {blob_puts} PUT uploads -- engine is short-circuiting blob pushes",
+        "report claims {stats_transferred} blobs transferred but target received {blob_puts} PUT uploads: engine is short-circuiting blob pushes",
     );
     assert_eq!(
         blob_mounts, stats_mounted,
@@ -296,10 +246,6 @@ async fn assert_report_matches_target_receipts(
         manifest_puts, 10,
         "expected 10 manifest PUTs, got {manifest_puts}"
     );
-
-    // Suppress unused-field warnings for fields kept on the fixture
-    // for diagnostic clarity at failure time.
-    let _ = &fixture.source_server;
 }
 
 fn parse_image_index(source: &str) -> usize {
@@ -310,22 +256,16 @@ fn parse_image_index(source: &str) -> usize {
         .unwrap_or_else(|| panic!("source did not match src/img-<N>:latest: {source}"))
 }
 
-// ---------------------------------------------------------------------------
-// Test-local batch checker mirroring ECR's BatchCheckLayerAvailability
-// against an empty target. Asserts the caller passes the expected repo
-// (per-mock contract fidelity).
-// ---------------------------------------------------------------------------
-
+/// Mirrors ECR's `BatchCheckLayerAvailability` against an empty target, and
+/// asserts it is called for the expected repo.
 struct EmptyExistingChecker {
     expected_repo: String,
-    call_count: Arc<AtomicUsize>,
 }
 
 impl EmptyExistingChecker {
     fn new(expected_repo: &str) -> Self {
         Self {
             expected_repo: expected_repo.to_owned(),
-            call_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -341,9 +281,6 @@ impl BatchBlobChecker for EmptyExistingChecker {
             self.expected_repo,
             "batch checker called with wrong repo",
         );
-        Box::pin(async {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(BlobExistence::new(digests, &HashSet::new()))
-        })
+        Box::pin(async { Ok(BlobExistence::new(digests, &HashSet::new())) })
     }
 }

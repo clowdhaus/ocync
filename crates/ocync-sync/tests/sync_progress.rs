@@ -32,10 +32,10 @@ impl ProgressReporter for RecordingProgress {
 
 /// Run a two-image sync with the given heartbeat cadence.
 ///
-/// `source_delay` is applied to the source manifest GET, giving discovery a
-/// known duration for the cadence assertion to measure against. Real time, not
-/// a paused clock: virtual time auto-advances to any pending deadline, which
-/// would make a heartbeat fire for any interval at all.
+/// `source_delay` delays the source manifest GET, giving discovery a known
+/// duration to measure the cadence against. Real time, not a paused clock:
+/// virtual time advances to any pending deadline, so a heartbeat would fire
+/// for any interval and the assertions below would pass for the wrong reason.
 async fn run_with_heartbeat(
     interval: Duration,
     source_delay: Duration,
@@ -47,8 +47,8 @@ async fn run_with_heartbeat(
         let parts = ManifestBuilder::new(format!("config-{tag}").as_bytes())
             .layer(format!("layer-{tag}").as_bytes())
             .build();
-        // Registered before `mount_source` so this delayed responder is the
-        // one that answers the manifest GET.
+        // Mounted before `mount_source` so this delayed responder answers the
+        // manifest GET (equal priority: first mounted wins).
         Mock::given(method("GET"))
             .and(path(format!("/v2/library/app/manifests/{tag}")))
             .respond_with(
@@ -87,15 +87,12 @@ async fn run_with_heartbeat(
     (report, snapshots)
 }
 
-/// A run that outlives the heartbeat cadence reports itself as in progress.
+/// A run that outlives the heartbeat cadence reports itself as in progress;
+/// otherwise it is indistinguishable from a wedged run.
 ///
-/// Without this the engine is silent between the first image starting and the
-/// last one finishing, which is indistinguishable from a wedged run.
-///
-/// The source responds after a known delay, so the cadence is measurable
-/// rather than assumed. Asserting only "at least one" would pass for any
-/// interval at all; the lower bound below is what ties the count to the
-/// period, and it fails if the interval is widened past the delay.
+/// The lower bound ties the snapshot count to the period: asserting "at least
+/// one" would pass for any interval, and this fails if the interval is widened
+/// past the delay.
 #[tokio::test]
 async fn heartbeat_fires_while_work_is_in_flight() {
     let (report, snapshots) =
@@ -108,9 +105,8 @@ async fn heartbeat_fires_while_work_is_in_flight() {
         snapshots.len()
     );
 
-    // The branch is guarded on work remaining, so every snapshot must show at
-    // least one tag discovering or one transfer executing. A snapshot with
-    // both at zero would mean the heartbeat outlived the work it describes.
+    // The branch is guarded on work remaining: a snapshot with nothing
+    // discovering or executing means the heartbeat outlived its work.
     for s in &snapshots {
         assert!(
             s.in_discovery + s.in_flight > 0,
@@ -123,12 +119,8 @@ async fn heartbeat_fires_while_work_is_in_flight() {
     }
 }
 
-/// The heartbeat is timer-gated, not emitted unconditionally: a run that
-/// finishes well inside one interval reports nothing.
-///
-/// Real time for the same reason as the test above: a paused clock advances to
-/// any pending deadline, so even a ten-minute interval would fire and this
-/// would pass for the wrong reason.
+/// The heartbeat is timer-gated: a run that finishes well inside one interval
+/// reports nothing. Real time, for the reason given on `run_with_heartbeat`.
 #[tokio::test]
 async fn heartbeat_stays_silent_for_a_short_run() {
     let (report, snapshots) = run_with_heartbeat(Duration::from_secs(600), Duration::ZERO).await;
@@ -141,9 +133,9 @@ async fn heartbeat_stays_silent_for_a_short_run() {
     );
 }
 
-/// Shutdown freezes discovery, so undiscovered tags stop being work the engine
-/// can do. The heartbeat branch must go with them: if it stays enabled it
-/// starves the loop's exit and the engine hangs for a full interval.
+/// Shutdown freezes discovery, so undiscovered tags stop being work. The
+/// heartbeat branch must go with them: if it stays armed it starves the loop's
+/// exit and the engine hangs for a full interval.
 #[tokio::test]
 async fn heartbeat_does_not_stall_shutdown_with_discovery_outstanding() {
     let source_server = MockServer::start().await;
@@ -167,8 +159,8 @@ async fn heartbeat_does_not_stall_shutdown_with_discovery_outstanding() {
     let shutdown = ShutdownSignal::new();
     shutdown.trigger();
 
-    // An interval far longer than the test's patience: if the guard regresses,
-    // the engine waits this out instead of exiting and the timeout fires.
+    // Far longer than the timeout below: a regressed guard waits this out
+    // instead of exiting.
     let engine = SyncEngine::new(fast_retry(), concurrency(10))
         .with_heartbeat_interval(Duration::from_secs(600));
 

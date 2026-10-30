@@ -1,156 +1,150 @@
-//! Integration tests for [`BlobStage`].
-//!
-//! Covers the round-trip, crash recovery, eviction, streaming write/read, and
-//! disabled-mode paths.
+//! Integration tests for [`BlobStage`]: round-trip, crash recovery, eviction,
+//! streaming writes and disabled mode.
+
+mod helpers;
 
 use std::io;
 
+use ocync_distribution::Digest;
 use ocync_sync::staging::BlobStage;
 
-const DIGEST_A: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-const DIGEST_B: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+use helpers::{digest_a, digest_b};
+
 const DIGEST_C: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-fn digest_a() -> ocync_distribution::Digest {
-    DIGEST_A.parse().unwrap()
-}
-
-fn digest_b() -> ocync_distribution::Digest {
-    DIGEST_B.parse().unwrap()
-}
-
-fn digest_c() -> ocync_distribution::Digest {
+fn digest_c() -> Digest {
     DIGEST_C.parse().unwrap()
 }
 
-fn stage_blob(stage: &BlobStage, digest: &ocync_distribution::Digest, data: &[u8]) {
+fn stage_blob(stage: &BlobStage, digest: &Digest, data: &[u8]) {
     let mut writer = stage.begin_write(digest).unwrap();
     writer.write_chunk(data).unwrap();
     writer.finish().unwrap();
 }
 
-fn read_staged(stage: &BlobStage, digest: &ocync_distribution::Digest) -> Vec<u8> {
+fn read_staged(stage: &BlobStage, digest: &Digest) -> Vec<u8> {
     let mut file = stage.open_read(digest).unwrap();
     let mut buf = Vec::new();
     io::Read::read_to_end(&mut file, &mut buf).unwrap();
     buf
 }
 
-// ---------------------------------------------------------------------------
-// Round-trip
-// ---------------------------------------------------------------------------
-
-#[test]
-fn exists_returns_false_for_unstaged_blob() {
+/// An enabled stage over a fresh temp directory (kept alive by the guard).
+fn enabled_stage() -> (tempfile::TempDir, BlobStage) {
     let dir = tempfile::tempdir().unwrap();
     let stage = BlobStage::new(dir.path().to_path_buf());
-    assert!(!stage.exists(&digest_a()));
+    (dir, stage)
+}
+
+/// Chunks written through `begin_write` read back as their concatenation.
+#[test]
+fn stage_and_read_roundtrip() {
+    let cases: [(&str, &[&[u8]]); 2] = [
+        ("one chunk", &[b"hello staging world"]),
+        ("two chunks", &[b"hello ", b"world"]),
+    ];
+    for (name, chunks) in cases {
+        let (_dir, stage) = enabled_stage();
+
+        let mut writer = stage.begin_write(&digest_a()).unwrap();
+        for chunk in chunks {
+            writer.write_chunk(chunk).unwrap();
+        }
+        writer.finish().unwrap();
+
+        assert!(stage.exists(&digest_a()), "{name}");
+        assert_eq!(read_staged(&stage, &digest_a()), chunks.concat(), "{name}");
+    }
 }
 
 #[test]
 fn write_creates_parent_dirs() {
     let dir = tempfile::tempdir().unwrap();
-    // Nest the staging directory several levels deep.
-    let base = dir.path().join("a").join("b").join("c");
-    let stage = BlobStage::new(base);
+    let stage = BlobStage::new(dir.path().join("a").join("b").join("c"));
 
     stage_blob(&stage, &digest_a(), b"data");
     assert!(stage.exists(&digest_a()));
 }
 
-// ---------------------------------------------------------------------------
-// Streaming write via StagedWriter
-// ---------------------------------------------------------------------------
-
+/// A blob that was never staged does not exist, in either mode.
 #[test]
-fn begin_write_and_finish_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
-
-    let mut writer = stage.begin_write(&digest_a()).unwrap();
-    writer.write_chunk(b"hello ").unwrap();
-    writer.write_chunk(b"world").unwrap();
-    writer.finish().unwrap();
-
-    assert!(stage.exists(&digest_a()));
-    let data = read_staged(&stage, &digest_a());
-    assert_eq!(data, b"hello world");
+fn exists_is_false_for_an_unstaged_blob() {
+    let (_dir, enabled) = enabled_stage();
+    for (name, stage) in [("enabled", enabled), ("disabled", BlobStage::disabled())] {
+        assert!(!stage.exists(&digest_a()), "{name}");
+    }
 }
 
 #[test]
-fn begin_write_on_disabled_returns_unsupported() {
+fn is_enabled_reflects_mode() {
+    let (_dir, enabled) = enabled_stage();
+    assert!(enabled.is_enabled());
+    assert!(!BlobStage::disabled().is_enabled());
+}
+
+/// A disabled stage refuses reads and writes with `Unsupported`.
+#[test]
+fn disabled_stage_rejects_io() {
     let stage = BlobStage::disabled();
-    let err = stage.begin_write(&digest_a()).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    let cases: [(&str, io::Result<()>); 2] = [
+        ("begin_write", stage.begin_write(&digest_a()).map(drop)),
+        ("open_read", stage.open_read(&digest_a()).map(drop)),
+    ];
+    for (name, result) in cases {
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::Unsupported,
+            "{name}"
+        );
+    }
 }
 
+/// Cleanup and eviction succeed and do nothing when there is nothing to act
+/// on: a disabled stage, or an enabled one whose `blobs/` directory does not
+/// exist yet.
 #[test]
-fn open_read_on_disabled_returns_unsupported() {
-    let stage = BlobStage::disabled();
-    let err = stage.open_read(&digest_a()).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+fn cleanup_and_evict_are_noops_without_blobs() {
+    let (_dir, empty) = enabled_stage();
+    for (name, stage) in [("disabled", BlobStage::disabled()), ("empty dir", empty)] {
+        stage
+            .cleanup_tmp_files()
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        stage.evict(0).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Crash recovery: cleanup_tmp_files
-// ---------------------------------------------------------------------------
-
+/// Cleanup removes an orphaned `.tmp.` file and keeps the real blob.
 #[test]
 fn cleanup_tmp_files_removes_orphaned_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
-
-    // Write a real blob so the directory structure exists.
+    let (dir, stage) = enabled_stage();
     stage_blob(&stage, &digest_a(), b"real data");
 
-    // Plant a fake orphaned tmp file alongside the real blob.
-    let algo_dir = dir.path().join("blobs").join("sha256");
-    let orphan =
-        algo_dir.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tmp.99999");
+    let orphan = dir
+        .path()
+        .join("blobs")
+        .join("sha256")
+        .join(format!("{}.tmp.99999", "a".repeat(64)));
     std::fs::write(&orphan, b"incomplete").unwrap();
-
     assert!(orphan.exists(), "orphan must exist before cleanup");
 
     stage.cleanup_tmp_files().unwrap();
 
     assert!(!orphan.exists(), "orphan must be removed after cleanup");
-    // The real blob must survive.
-    assert!(stage.exists(&digest_a()));
+    assert!(stage.exists(&digest_a()), "the real blob must survive");
 }
 
-#[test]
-fn cleanup_tmp_files_is_noop_when_dir_missing() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
-    // No blobs written; blobs/ dir does not exist yet.
-    stage.cleanup_tmp_files().unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// Eviction
-// ---------------------------------------------------------------------------
-
+/// Eviction removes the smallest files first until the total fits: 10, 20 and
+/// 30 byte blobs under a 40 byte limit lose the first two (60, then 50, then 30).
 #[test]
 fn evict_removes_smallest_files_first() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
+    let (_dir, stage) = enabled_stage();
+    stage_blob(&stage, &digest_a(), &[0u8; 10]);
+    stage_blob(&stage, &digest_b(), &[1u8; 20]);
+    stage_blob(&stage, &digest_c(), &[2u8; 30]);
 
-    // Write three blobs with known content so we can measure sizes.
-    let small = vec![0u8; 10];
-    let medium = vec![1u8; 20];
-    let large = vec![2u8; 30];
-
-    stage_blob(&stage, &digest_a(), &small);
-    stage_blob(&stage, &digest_b(), &medium);
-    stage_blob(&stage, &digest_c(), &large);
-
-    // Total = 60 bytes. Limit to 40 bytes, so 20+ bytes must be evicted.
-    // Sorted by ascending size: A(10), B(20), C(30).
     stage.evict(40).unwrap();
 
-    // A (10 bytes) evicted first. Total = 50 -- still over 40.
     assert!(!stage.exists(&digest_a()), "smallest blob must be evicted");
-    // B (20 bytes) evicted next. Total = 30 -- now under 40. C is kept.
     assert!(
         !stage.exists(&digest_b()),
         "second-smallest blob must be evicted"
@@ -160,82 +154,29 @@ fn evict_removes_smallest_files_first() {
 
 #[test]
 fn evict_noop_when_under_threshold() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
-
+    let (_dir, stage) = enabled_stage();
     stage_blob(&stage, &digest_a(), b"small");
 
     stage.evict(1_000_000).unwrap();
 
-    // Nothing should be evicted.
     assert!(stage.exists(&digest_a()));
 }
 
-#[test]
-fn evict_noop_when_blobs_dir_missing() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
-    // No writes; blobs/ dir doesn't exist.
-    stage.evict(0).unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// Disabled mode
-// ---------------------------------------------------------------------------
-
-#[test]
-fn disabled_is_not_enabled() {
-    let stage = BlobStage::disabled();
-    assert!(!stage.is_enabled());
-}
-
-#[test]
-fn enabled_is_enabled() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
-    assert!(stage.is_enabled());
-}
-
-#[test]
-fn disabled_exists_returns_false() {
-    let stage = BlobStage::disabled();
-    assert!(!stage.exists(&digest_a()));
-}
-
-#[test]
-fn disabled_cleanup_tmp_files_is_noop() {
-    let stage = BlobStage::disabled();
-    stage.cleanup_tmp_files().unwrap();
-}
-
-#[test]
-fn disabled_evict_is_noop() {
-    let stage = BlobStage::disabled();
-    stage.evict(0).unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// StagedWriter drop cleanup
-// ---------------------------------------------------------------------------
-
-/// Verify that dropping a `StagedWriter` without calling `finish()` removes
-/// the temporary file and does NOT stage the blob.
+/// Dropping a `StagedWriter` without `finish()` removes the temp file and does
+/// not stage the blob.
 #[test]
 fn staged_writer_drop_removes_temp_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
+    let (dir, stage) = enabled_stage();
     let digest = digest_a();
 
-    // Collect the temp file path before dropping.
-    let tmp_path = {
-        let mut writer = stage.begin_write(&digest).unwrap();
-        writer
-            .write_chunk(b"partial data that should be cleaned up")
-            .unwrap();
-        // Extract the tmp_path from the debug repr for verification.
-        // We know the tmp file exists because begin_write creates it.
-        let blobs_dir = dir.path().join("blobs").join("sha256");
-        let entries: Vec<_> = std::fs::read_dir(&blobs_dir)
+    let mut writer = stage.begin_write(&digest).unwrap();
+    writer
+        .write_chunk(b"partial data that should be cleaned up")
+        .unwrap();
+
+    let blobs_dir = dir.path().join("blobs").join("sha256");
+    let tmp_files = || -> Vec<_> {
+        std::fs::read_dir(&blobs_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -244,21 +185,16 @@ fn staged_writer_drop_removes_temp_file() {
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.contains(".tmp."))
             })
-            .collect();
-        assert_eq!(entries.len(), 1, "temp file must exist before drop");
-        let tmp = entries[0].clone();
-        // Drop the writer WITHOUT calling finish().
-        drop(writer);
-        tmp
+            .collect()
     };
+    assert_eq!(tmp_files().len(), 1, "temp file must exist before drop");
 
-    // Temp file must be removed by Drop impl.
+    drop(writer);
+
     assert!(
-        !tmp_path.exists(),
+        tmp_files().is_empty(),
         "temp file must be removed after drop without finish()"
     );
-
-    // The blob must NOT be staged.
     assert!(
         !stage.exists(&digest),
         "blob must not be staged when writer is dropped without finish()"

@@ -1,19 +1,20 @@
-//! Shutdown integration tests: graceful shutdown stops new work, drains in-flight
-//! transfers, and engine exits cleanly with an untriggered shutdown signal.
+//! Shutdown integration tests: shutdown stops new work, drains in-flight
+//! transfers, and an untriggered signal does not keep the engine alive.
 
 mod helpers;
+
+use std::time::Duration;
 
 use ocync_sync::engine::TagPair;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::{ImageStatus, RunOutcome};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::MockServer;
 
 use helpers::*;
 
-/// Trigger shutdown immediately and verify the engine stops accepting new
-/// discovery work. In-flight execution may or may not complete depending on
-/// timing, but the engine must return within a bounded time.
+/// With shutdown triggered before the run, the engine stops taking discovery
+/// work and returns. Whether in-flight work completes depends on timing, so
+/// the only invariant is that it returns with at most the two images.
 #[tokio::test]
 async fn sync_shutdown_stops_new_work() {
     let source_server = MockServer::start().await;
@@ -22,33 +23,10 @@ async fn sync_shutdown_stops_new_work() {
     let parts = ManifestBuilder::new(b"config-shutdown")
         .layer(b"layer-shutdown")
         .build();
-
-    // Source: serve manifest and blobs (but add delays so shutdown can interrupt).
-    mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
-    mount_source_manifest(&source_server, "repo", "v2", &parts.bytes).await;
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &parts.config_desc.digest,
-        &parts.config_data,
-    )
-    .await;
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &parts.layer_descs[0].digest,
-        &parts.layers_data[0],
-    )
-    .await;
-
-    // Target: everything works.
-    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_manifest_head_not_found(&target_server, "repo", "v2").await;
-    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1").await;
-    mount_manifest_push(&target_server, "repo", "v2").await;
+    for tag in ["v1", "v2"] {
+        parts.mount_source(&source_server, "repo", tag).await;
+        parts.mount_target(&target_server, "repo", tag).await;
+    }
 
     let mapping = mapping_from_servers(
         &source_server,
@@ -56,26 +34,19 @@ async fn sync_shutdown_stops_new_work() {
         "repo",
         vec![TagPair::same("v1"), TagPair::same("v2")],
     );
-
     let shutdown = ShutdownSignal::new();
-    // Trigger shutdown immediately before the engine even starts running.
     shutdown.trigger();
 
     let report = run_sync_with_shutdown(vec![mapping], &shutdown).await;
 
-    // With shutdown triggered before run, discovery futures may or may not
-    // complete. The key invariant: the engine returns (doesn't hang) and
-    // reports whatever results it did gather.
     assert!(
         report.images.len() <= 2,
         "should have at most 2 images (may have fewer if shutdown interrupted discovery)"
     );
 }
 
-/// Trigger shutdown while a transfer is still in flight (blob GET has a
-/// 2-second delay). The 25-second drain deadline gives the transfer enough
-/// time to complete. Verifies that in-flight work finishes instead of being
-/// abandoned prematurely.
+/// Shutdown fires while the layer GET is still in flight (2s delay). The 25s
+/// drain deadline lets it finish instead of abandoning it.
 #[tokio::test]
 async fn sync_shutdown_drains_in_flight() {
     let source_server = MockServer::start().await;
@@ -84,10 +55,6 @@ async fn sync_shutdown_drains_in_flight() {
     let parts = ManifestBuilder::new(b"config-drain")
         .layer(b"layer-drain")
         .build();
-
-    // Source: manifest responds immediately, config blob responds immediately,
-    // but layer blob has a 2-second delay (simulates a slow transfer in progress
-    // when shutdown fires).
     mount_source_manifest(&source_server, "repo", "v1", &parts.bytes).await;
     mount_blob_pull(
         &source_server,
@@ -96,25 +63,15 @@ async fn sync_shutdown_drains_in_flight() {
         &parts.config_data,
     )
     .await;
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/repo/blobs/{}",
-            parts.layer_descs[0].digest
-        )))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(parts.layers_data[0].clone())
-                .insert_header("content-length", parts.layers_data[0].len().to_string())
-                .set_delay(std::time::Duration::from_secs(2)),
-        )
-        .mount(&source_server)
-        .await;
-
-    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
-    mount_blob_not_found(&target_server, "repo", &parts.config_desc.digest).await;
-    mount_blob_not_found(&target_server, "repo", &parts.layer_descs[0].digest).await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1").await;
+    mount_blob_pull_delayed(
+        &source_server,
+        "repo",
+        &parts.layer_descs[0].digest,
+        &parts.layers_data[0],
+        Duration::from_secs(2),
+    )
+    .await;
+    parts.mount_target(&target_server, "repo", "v1").await;
 
     let mapping = mapping_from_servers(
         &source_server,
@@ -122,34 +79,21 @@ async fn sync_shutdown_drains_in_flight() {
         "repo",
         vec![TagPair::same("v1")],
     );
-
     let shutdown = ShutdownSignal::new();
-
-    // Trigger shutdown after 50ms. The blob GET takes 2s, so the transfer
-    // will still be in flight when shutdown fires. The 25s drain deadline
-    // gives the transfer plenty of time to complete.
-    let signal = shutdown.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        signal.trigger();
-    });
+    trigger_shutdown_after(&shutdown, Duration::from_millis(50));
 
     let report = run_sync_with_shutdown(vec![mapping], &shutdown).await;
 
-    // The in-flight transfer should complete within the drain deadline (2s < 25s).
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.blobs_transferred, 2);
 }
 
-/// The engine must exit after all work completes even when a shutdown signal
-/// is registered but never triggered. Before the fix, the select! loop's
-/// shutdown branch stayed enabled with an always-pending `notified().await`,
-/// preventing the `else` exit from firing.
-///
-/// This test uses a 10-second timeout to detect the hang -- if the engine
-/// doesn't exit within 10s of completing all transfers, the test fails.
+/// The engine exits after all work completes even though a registered shutdown
+/// signal never fires. Breaks if the select loop's shutdown branch stays armed
+/// on an always-pending wait, which blocks the `else` exit. The 10s timeout
+/// detects the hang.
 #[tokio::test]
 async fn sync_exits_with_untriggered_shutdown_signal() {
     let source_server = MockServer::start().await;
@@ -158,7 +102,6 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
     let parts = ManifestBuilder::new(b"config-shutdown-exit")
         .layer(b"layer-shutdown-exit")
         .build();
-
     parts.mount_source(&source_server, "repo", "v1").await;
     parts.mount_target(&target_server, "repo", "v1").await;
 
@@ -168,17 +111,15 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
         "repo",
         vec![TagPair::same("v1")],
     );
-
-    // Create shutdown signal but DO NOT trigger it -- this is the production
-    // scenario where the user never sends SIGTERM.
+    // The production case: the user never sends SIGTERM.
     let shutdown = ShutdownSignal::new();
 
     let report = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        Duration::from_secs(10),
         run_sync_with_shutdown(vec![mapping], &shutdown),
     )
     .await
-    .expect("engine hung -- did not exit within 10s after completing all work");
+    .expect("engine hung: did not exit within 10s after completing all work");
 
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));

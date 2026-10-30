@@ -1,18 +1,15 @@
-//! Builder types for constructing test manifests with sensible defaults.
+//! Builders for test manifests with real digests, plus the `*Parts` they return.
 
 #![allow(dead_code, unused_imports, unreachable_pub)]
 
 use ocync_distribution::Digest;
 use ocync_distribution::spec::{Descriptor, ImageIndex, ImageManifest, MediaType, Platform};
+use wiremock::MockServer;
 
 use super::fixtures::{blob_descriptor, blob_digest};
+use super::mocks::*;
 
-/// Builder for constructing `ImageManifest` with sensible test defaults.
-///
-/// Simplifies the common pattern of creating test manifests with real blob
-/// data (matching digests and sizes). Call [`layer`](Self::layer) to add
-/// layers, then [`build`](Self::build) to get the manifest plus all parts
-/// needed for mock setup.
+/// Builds an `ImageManifest` over real blob data (matching digests and sizes).
 #[must_use = "builders do nothing until .build() is called"]
 pub struct ManifestBuilder {
     config_data: Vec<u8>,
@@ -20,7 +17,7 @@ pub struct ManifestBuilder {
 }
 
 impl ManifestBuilder {
-    /// Create a new builder with the given config blob data.
+    /// Start a manifest whose config blob is `config_data`.
     pub fn new(config_data: &[u8]) -> Self {
         Self {
             config_data: config_data.to_vec(),
@@ -28,13 +25,13 @@ impl ManifestBuilder {
         }
     }
 
-    /// Add a layer blob to the manifest.
+    /// Append a layer blob.
     pub fn layer(mut self, data: &[u8]) -> Self {
         self.layers_data.push(data.to_vec());
         self
     }
 
-    /// Build the manifest, returning all parts needed for mock setup.
+    /// Serialize the manifest and keep the blobs it describes.
     pub fn build(self) -> ManifestParts {
         let config_desc = blob_descriptor(&self.config_data, MediaType::OciConfig);
         let layer_descs: Vec<Descriptor> = self
@@ -54,11 +51,9 @@ impl ManifestBuilder {
         };
 
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let hash = ocync_distribution::sha256::Sha256::digest(&bytes);
-        let digest = Digest::from_sha256(hash);
+        let digest = blob_digest(&bytes);
 
         ManifestParts {
-            manifest,
             bytes,
             digest,
             config_data: self.config_data,
@@ -69,11 +64,9 @@ impl ManifestBuilder {
     }
 }
 
-/// Output of [`ManifestBuilder::build`] with all parts needed for mock setup.
+/// Output of [`ManifestBuilder::build`].
 #[derive(Clone)]
 pub struct ManifestParts {
-    #[allow(dead_code)]
-    pub manifest: ImageManifest,
     pub bytes: Vec<u8>,
     pub digest: Digest,
     pub config_data: Vec<u8>,
@@ -89,37 +82,84 @@ impl ManifestParts {
             .chain(self.layer_descs.iter().map(|d| d.digest.clone()))
     }
 
-    /// Mount all source mocks (manifest GET + blob GETs) for this image.
-    pub async fn mount_source(&self, server: &wiremock::MockServer, repo: &str, tag: &str) {
-        super::mocks::mount_source_manifest(server, repo, tag, &self.bytes).await;
-        super::mocks::mount_blob_pull(server, repo, &self.config_desc.digest, &self.config_data)
-            .await;
+    /// Mount the source blob GETs (config and layers).
+    pub async fn mount_blob_pulls(&self, server: &MockServer, repo: &str) {
+        mount_blob_pull(server, repo, &self.config_desc.digest, &self.config_data).await;
         for (data, desc) in self.layers_data.iter().zip(self.layer_descs.iter()) {
-            super::mocks::mount_blob_pull(server, repo, &desc.digest, data).await;
+            mount_blob_pull(server, repo, &desc.digest, data).await;
         }
     }
 
-    /// Mount target mocks: HEAD 404, blob-not-found for all blobs, push endpoints.
-    pub async fn mount_target(&self, server: &wiremock::MockServer, repo: &str, tag: &str) {
-        super::mocks::mount_manifest_head_not_found(server, repo, tag).await;
-        super::mocks::mount_blob_not_found(server, repo, &self.config_desc.digest).await;
-        for desc in &self.layer_descs {
-            super::mocks::mount_blob_not_found(server, repo, &desc.digest).await;
+    /// Mount source mocks: manifest GET on `reference` plus every blob GET.
+    pub async fn mount_source(&self, server: &MockServer, repo: &str, reference: &str) {
+        mount_source_manifest(server, repo, reference, &self.bytes).await;
+        self.mount_blob_pulls(server, repo).await;
+    }
+
+    /// As [`mount_source`](Self::mount_source), but the manifest and each blob
+    /// must be requested exactly `pulls` times (`0` asserts it is never touched).
+    pub async fn mount_source_expecting(
+        &self,
+        server: &MockServer,
+        repo: &str,
+        reference: &str,
+        pulls: u64,
+    ) {
+        source_manifest_mock(repo, reference, &self.bytes, MediaType::OciManifest)
+            .expect(pulls)
+            .mount(server)
+            .await;
+        self.mount_blob_pulls_expecting(server, repo, pulls).await;
+    }
+
+    /// As [`mount_blob_pulls`](Self::mount_blob_pulls), but each blob must be
+    /// requested exactly `pulls` times.
+    pub async fn mount_blob_pulls_expecting(&self, server: &MockServer, repo: &str, pulls: u64) {
+        blob_pull_mock(repo, &self.config_desc.digest, &self.config_data)
+            .expect(pulls)
+            .mount(server)
+            .await;
+        for (data, desc) in self.layers_data.iter().zip(self.layer_descs.iter()) {
+            blob_pull_mock(repo, &desc.digest, data)
+                .expect(pulls)
+                .mount(server)
+                .await;
         }
-        super::mocks::mount_blob_push(server, repo).await;
-        super::mocks::mount_manifest_push(server, repo, tag).await;
+    }
+
+    /// Mount blob HEAD 404s for the config and every layer.
+    pub async fn mount_target_blob_misses(&self, server: &MockServer, repo: &str) {
+        mount_blob_not_found(server, repo, &self.config_desc.digest).await;
+        for desc in &self.layer_descs {
+            mount_blob_not_found(server, repo, &desc.digest).await;
+        }
+    }
+
+    /// Mount target mocks: manifest HEAD 404, blob HEAD 404s, push endpoints.
+    pub async fn mount_target(&self, server: &MockServer, repo: &str, reference: &str) {
+        mount_manifest_head_not_found(server, repo, reference).await;
+        self.mount_target_blob_misses(server, repo).await;
+        mount_blob_push(server, repo).await;
+        mount_manifest_push(server, repo, reference).await;
+    }
+
+    /// As [`mount_target`](Self::mount_target), and the target accepts a
+    /// cross-repo mount of every blob.
+    pub async fn mount_target_accepting_mounts(
+        &self,
+        server: &MockServer,
+        repo: &str,
+        reference: &str,
+    ) {
+        self.mount_target(server, repo, reference).await;
+        for digest in self.blob_digests() {
+            mount_blob_mount_accepted(server, repo, &digest).await;
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// ArtifactBuilder
-// ---------------------------------------------------------------------------
-
-/// Builder for constructing OCI artifact manifests (signatures, SBOMs, etc).
-///
-/// Artifacts differ from images in having `artifact_type` set and being
-/// referenced by digest (not tag). Each artifact has exactly one config blob
-/// and one layer blob.
+/// Builds an OCI artifact manifest (signature, SBOM): one config blob, one
+/// layer blob, `artifact_type` set, referenced by digest rather than tag.
 #[must_use = "builders do nothing until .build() is called"]
 pub struct ArtifactBuilder {
     config_data: Vec<u8>,
@@ -128,8 +168,7 @@ pub struct ArtifactBuilder {
 }
 
 impl ArtifactBuilder {
-    /// Create an artifact with the given config and layer blobs.
-    /// Defaults to cosign signature artifact type.
+    /// An artifact of the cosign signature type over the given blobs.
     pub fn new(config_data: &[u8], layer_data: &[u8]) -> Self {
         Self {
             config_data: config_data.to_vec(),
@@ -138,13 +177,13 @@ impl ArtifactBuilder {
         }
     }
 
-    /// Override the default artifact type.
+    /// Replace the artifact type.
     pub fn artifact_type(mut self, t: &str) -> Self {
         self.artifact_type = t.to_string();
         self
     }
 
-    /// Build the artifact manifest and all parts needed for mock setup.
+    /// Serialize the artifact manifest and keep its blobs.
     pub fn build(self) -> ArtifactParts {
         let config_desc = blob_descriptor(&self.config_data, MediaType::OciConfig);
         let layer_desc = blob_descriptor(&self.layer_data, MediaType::OciLayerGzip);
@@ -160,11 +199,9 @@ impl ArtifactBuilder {
         };
 
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let hash = ocync_distribution::sha256::Sha256::digest(&bytes);
-        let digest = Digest::from_sha256(hash);
+        let digest = blob_digest(&bytes);
 
         ArtifactParts {
-            manifest,
             bytes,
             digest,
             config_data: self.config_data,
@@ -179,7 +216,6 @@ impl ArtifactBuilder {
 /// Output of [`ArtifactBuilder::build`].
 #[derive(Clone)]
 pub struct ArtifactParts {
-    pub manifest: ImageManifest,
     pub bytes: Vec<u8>,
     pub digest: Digest,
     pub config_data: Vec<u8>,
@@ -190,26 +226,22 @@ pub struct ArtifactParts {
 }
 
 impl ArtifactParts {
-    /// Mount source mocks: manifest GET by digest + blob GETs.
-    pub async fn mount_source(&self, server: &wiremock::MockServer, repo: &str) {
-        let digest_str = self.digest.to_string();
-        super::mocks::mount_source_manifest(server, repo, &digest_str, &self.bytes).await;
-        super::mocks::mount_blob_pull(server, repo, &self.config_desc.digest, &self.config_data)
-            .await;
-        super::mocks::mount_blob_pull(server, repo, &self.layer_desc.digest, &self.layer_data)
-            .await;
+    /// Mount source mocks: manifest GET by digest plus blob GETs.
+    pub async fn mount_source(&self, server: &MockServer, repo: &str) {
+        mount_source_manifest(server, repo, &self.digest.to_string(), &self.bytes).await;
+        mount_blob_pull(server, repo, &self.config_desc.digest, &self.config_data).await;
+        mount_blob_pull(server, repo, &self.layer_desc.digest, &self.layer_data).await;
     }
 
-    /// Mount target mocks: blob HEAD 404s + blob push + manifest push by digest.
-    pub async fn mount_target(&self, server: &wiremock::MockServer, repo: &str) {
-        super::mocks::mount_blob_not_found(server, repo, &self.config_desc.digest).await;
-        super::mocks::mount_blob_not_found(server, repo, &self.layer_desc.digest).await;
-        super::mocks::mount_blob_push(server, repo).await;
-        let digest_str = self.digest.to_string();
-        super::mocks::mount_manifest_push(server, repo, &digest_str).await;
+    /// Mount target mocks: blob HEAD 404s, blob push, manifest push by digest.
+    pub async fn mount_target(&self, server: &MockServer, repo: &str) {
+        mount_blob_not_found(server, repo, &self.config_desc.digest).await;
+        mount_blob_not_found(server, repo, &self.layer_desc.digest).await;
+        mount_blob_push(server, repo).await;
+        mount_manifest_push(server, repo, &self.digest.to_string()).await;
     }
 
-    /// Build a referrers index descriptor for this artifact.
+    /// This artifact as a descriptor in a referrers index.
     pub fn referrers_descriptor(&self) -> Descriptor {
         Descriptor {
             media_type: MediaType::OciManifest,
@@ -222,11 +254,7 @@ impl ArtifactParts {
     }
 }
 
-// ---------------------------------------------------------------------------
-// IndexBuilder
-// ---------------------------------------------------------------------------
-
-/// Builder for constructing OCI image index (multi-arch) manifests.
+/// Builds an OCI image index (multi-arch) over child manifests.
 #[must_use = "builders do nothing until .build() is called"]
 #[derive(Default)]
 pub struct IndexBuilder {
@@ -235,9 +263,7 @@ pub struct IndexBuilder {
 
 impl IndexBuilder {
     pub fn new() -> Self {
-        Self {
-            children: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Add a child manifest with an optional platform annotation.
@@ -246,7 +272,7 @@ impl IndexBuilder {
         self
     }
 
-    /// Build the index, returning all parts needed for mock setup.
+    /// Serialize the index and keep its children.
     pub fn build(self) -> IndexParts {
         let manifests: Vec<Descriptor> = self
             .children
@@ -271,13 +297,11 @@ impl IndexBuilder {
         };
 
         let bytes = serde_json::to_vec(&index).unwrap();
-        let hash = ocync_distribution::sha256::Sha256::digest(&bytes);
-        let digest = Digest::from_sha256(hash);
+        let digest = blob_digest(&bytes);
 
         let children: Vec<ManifestParts> = self.children.into_iter().map(|(p, _)| p).collect();
 
         IndexParts {
-            index,
             bytes,
             digest,
             children,
@@ -288,66 +312,62 @@ impl IndexBuilder {
 /// Output of [`IndexBuilder::build`].
 #[derive(Clone)]
 pub struct IndexParts {
-    pub index: ImageIndex,
     pub bytes: Vec<u8>,
     pub digest: Digest,
     pub children: Vec<ManifestParts>,
 }
 
 impl IndexParts {
-    /// Mount source mocks: index GET by tag + child manifest GETs by digest + all blob GETs.
-    pub async fn mount_source(&self, server: &wiremock::MockServer, repo: &str, tag: &str) {
-        // Index manifest by tag.
-        super::mocks::mount_source_manifest_with_content_type(
-            server,
-            repo,
-            tag,
-            &self.bytes,
-            MediaType::OciIndex,
-        )
-        .await;
-
-        // Each child manifest by digest + its blobs.
-        for child in &self.children {
-            let digest_str = child.digest.to_string();
-            super::mocks::mount_source_manifest(server, repo, &digest_str, &child.bytes).await;
-            super::mocks::mount_blob_pull(
-                server,
-                repo,
-                &child.config_desc.digest,
-                &child.config_data,
-            )
+    /// Mount source mocks: index GET by tag, then each child manifest by
+    /// digest with its blobs.
+    pub async fn mount_source(&self, server: &MockServer, repo: &str, tag: &str) {
+        source_manifest_mock(repo, tag, &self.bytes, MediaType::OciIndex)
+            .mount(server)
             .await;
-            for (data, desc) in child.layers_data.iter().zip(child.layer_descs.iter()) {
-                super::mocks::mount_blob_pull(server, repo, &desc.digest, data).await;
-            }
+        for child in &self.children {
+            child
+                .mount_source(server, repo, &child.digest.to_string())
+                .await;
         }
     }
 
-    /// Mount target mocks: index HEAD 404 + all child blob HEAD 404s + push endpoints.
-    pub async fn mount_target(&self, server: &wiremock::MockServer, repo: &str, tag: &str) {
-        super::mocks::mount_manifest_head_not_found(server, repo, tag).await;
-        for child in &self.children {
-            super::mocks::mount_blob_not_found(server, repo, &child.config_desc.digest).await;
-            for desc in &child.layer_descs {
-                super::mocks::mount_blob_not_found(server, repo, &desc.digest).await;
-            }
+    /// As [`mount_source`](Self::mount_source), but the index must be pulled
+    /// exactly once and child `i` (manifest and blobs) `child_pulls[i]` times.
+    pub async fn mount_source_expecting(
+        &self,
+        server: &MockServer,
+        repo: &str,
+        tag: &str,
+        child_pulls: &[u64],
+    ) {
+        assert_eq!(child_pulls.len(), self.children.len());
+        source_manifest_mock(repo, tag, &self.bytes, MediaType::OciIndex)
+            .expect(1)
+            .mount(server)
+            .await;
+        for (child, pulls) in self.children.iter().zip(child_pulls) {
+            child
+                .mount_source_expecting(server, repo, &child.digest.to_string(), *pulls)
+                .await;
         }
-        super::mocks::mount_blob_push(server, repo).await;
-        super::mocks::mount_manifest_push(server, repo, tag).await;
-        // Push each child manifest by digest.
+    }
+
+    /// Mount target mocks: index HEAD 404, every child's blob HEAD 404s, push
+    /// endpoints for the index tag and each child digest.
+    pub async fn mount_target(&self, server: &MockServer, repo: &str, tag: &str) {
+        mount_manifest_head_not_found(server, repo, tag).await;
         for child in &self.children {
-            let digest_str = child.digest.to_string();
-            super::mocks::mount_manifest_push(server, repo, &digest_str).await;
+            child.mount_target_blob_misses(server, repo).await;
+        }
+        mount_blob_push(server, repo).await;
+        mount_manifest_push(server, repo, tag).await;
+        for child in &self.children {
+            mount_manifest_push(server, repo, &child.digest.to_string()).await;
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// ReferrersIndexBuilder
-// ---------------------------------------------------------------------------
-
-/// Builder for constructing OCI referrers index responses.
+/// Builds an OCI referrers index response.
 #[must_use = "builders do nothing until .build() is called"]
 #[derive(Default)]
 pub struct ReferrersIndexBuilder {
@@ -356,23 +376,21 @@ pub struct ReferrersIndexBuilder {
 
 impl ReferrersIndexBuilder {
     pub fn new() -> Self {
-        Self {
-            descriptors: Vec::new(),
-        }
+        Self::default()
     }
 
-    /// Add a raw descriptor to the referrers index.
+    /// Add a raw descriptor.
     pub fn descriptor(mut self, desc: Descriptor) -> Self {
         self.descriptors.push(desc);
         self
     }
 
-    /// Add an artifact's referrers descriptor (convenience over `.descriptor()`).
+    /// Add an artifact's descriptor.
     pub fn artifact(self, parts: &ArtifactParts) -> Self {
         self.descriptor(parts.referrers_descriptor())
     }
 
-    /// Build the referrers index as serialized bytes.
+    /// Serialize the index.
     pub fn build(self) -> Vec<u8> {
         let index = ImageIndex {
             schema_version: 2,
@@ -386,15 +404,20 @@ impl ReferrersIndexBuilder {
     }
 }
 
-/// A `linux/<arch>` platform.
-pub fn linux(arch: &str) -> Platform {
+/// An `os/arch` platform with no variant.
+pub fn platform(os: &str, arch: &str) -> Platform {
     Platform {
         architecture: arch.to_string(),
-        os: "linux".to_string(),
+        os: os.to_string(),
         variant: None,
         os_version: None,
         os_features: None,
     }
+}
+
+/// A `linux/<arch>` platform.
+pub fn linux(arch: &str) -> Platform {
+    platform("linux", arch)
 }
 
 /// Tags that all point at one manifest, as alpine's floating tags do.
@@ -403,8 +426,8 @@ pub const SHARED_TAGS: [&str; 4] = ["latest", "3", "3.24", "3.24.3"];
 /// Mount a two-child (amd64, arm64) index under every tag in
 /// [`SHARED_TAGS`] at both servers, returning the two children.
 pub async fn mount_shared_index(
-    source: &wiremock::MockServer,
-    target: &wiremock::MockServer,
+    source: &MockServer,
+    target: &MockServer,
 ) -> (ManifestParts, ManifestParts) {
     let amd64 = ManifestBuilder::new(b"cfg-amd64")
         .layer(b"layer-amd64")

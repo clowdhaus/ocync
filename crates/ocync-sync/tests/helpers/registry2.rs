@@ -11,7 +11,7 @@ use ocync_distribution::spec::{MediaType, RepositoryName};
 use super::builders::ManifestBuilder;
 use super::fixtures::blob_digest;
 
-/// The container starters `ocync-distribution`'s own `registry:2` tests use.
+/// The container starters of `ocync-distribution`'s `registry:2` tests.
 #[path = "../../../ocync-distribution/tests/common/mod.rs"]
 mod common;
 
@@ -43,11 +43,6 @@ impl Corpus {
         data[0] = (image & 0xff) as u8;
         data[1] = (layer & 0xff) as u8;
         data
-    }
-
-    /// The bytes of all of an image's blobs.
-    pub fn image_bytes(&self, image: usize) -> u64 {
-        (self.config(image).len() + self.layers * self.layer_bytes) as u64
     }
 }
 

@@ -1,9 +1,7 @@
-//! Immutable tag skip optimization integration tests: zero-API-call skip for
-//! tags matching an immutable glob that already exist at all targets.
+//! Immutable tag skip integration tests: a tag matching the immutable glob that
+//! already exists at every target is skipped with no API calls.
 
 mod helpers;
-
-use std::collections::HashSet;
 
 use ocync_sync::engine::{ResolvedMapping, TagPair, TargetEntry};
 use ocync_sync::filter::build_glob_set;
@@ -12,57 +10,51 @@ use wiremock::MockServer;
 
 use helpers::*;
 
-// ---------------------------------------------------------------------------
-// Immutable tags skip optimization
-// ---------------------------------------------------------------------------
-
-/// Helper: build a `GlobSet` for the standard semver immutable pattern.
-fn immutable_semver_glob() -> globset::GlobSet {
-    build_glob_set(&["v[0-9]*.[0-9]*.[0-9]*".into()]).unwrap()
+/// A mapping whose immutable glob is the standard semver pattern.
+fn immutable_mapping(
+    source: &MockServer,
+    source_repo: &str,
+    target_repo: &str,
+    targets: Vec<TargetEntry>,
+    tags: Vec<TagPair>,
+) -> ResolvedMapping {
+    ResolvedMapping {
+        immutable_glob: Some(build_glob_set(&["v[0-9]*.[0-9]*.[0-9]*".into()]).unwrap()),
+        ..resolved_mapping(mock_client(source), source_repo, target_repo, targets, tags)
+    }
 }
 
-/// When a tag matches the `immutable_glob` pattern AND exists in the target's
-/// `existing_tags`, the engine must skip with zero API calls - no HEAD, no pull.
-///
-/// Negative assertion: if the optimization were NOT taken, the source server
-/// would receive at least one HEAD request and the test would fail.
+/// A target that already holds `existing_tags`.
+fn target_with_tags(name: &str, server: &MockServer, existing_tags: &[&str]) -> TargetEntry {
+    TargetEntry {
+        existing_tags: existing_tags.iter().map(|t| t.to_string()).collect(),
+        ..target_entry(name, mock_client(server))
+    }
+}
+
+/// A tag that matches the glob and exists at the target is skipped with no
+/// source or target request at all.
 #[tokio::test]
 async fn immutable_tag_skip_when_present_at_target() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    // Do NOT mount any mocks - if the engine issues any request, the mock
-    // server returns 500 which would cause the test to produce a failure
-    // status instead of a skip.
-
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    let target_tags: HashSet<String> = ["v1.2.3", "v1.0.0", "v2.0.0"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    let targets = vec![TargetEntry {
-        existing_tags: target_tags,
-        ..target_entry("target-reg", target_client)
-    }];
-    let tags = vec![TagPair::same("v1.2.3"), TagPair::same("v1.0.0")];
-
-    let mapping = ResolvedMapping {
-        immutable_glob: Some(immutable_semver_glob()),
-        ..resolved_mapping(
-            source_client,
-            "library/nginx",
-            "mirror/nginx",
-            targets,
-            tags,
-        )
-    };
+    // No mocks are mounted: any request would 404, and the request counts
+    // below would catch it.
+    let mapping = immutable_mapping(
+        &source_server,
+        "library/nginx",
+        "mirror/nginx",
+        vec![target_with_tags(
+            "target-reg",
+            &target_server,
+            &["v1.2.3", "v1.0.0", "v2.0.0"],
+        )],
+        vec![TagPair::same("v1.2.3"), TagPair::same("v1.0.0")],
+    );
 
     let report = run_sync(vec![mapping]).await;
 
-    // Both tags should be skipped as immutable.
     assert_eq!(report.images.len(), 2);
     for image in &report.images {
         assert!(
@@ -80,26 +72,22 @@ async fn immutable_tag_skip_when_present_at_target() {
     assert_eq!(report.stats.images_skipped, 2);
     assert_eq!(report.stats.immutable_tag_skips, 2);
 
-    // Negative assertion: zero requests issued to either server.
     let source_requests = source_server.received_requests().await.unwrap();
     let target_requests = target_server.received_requests().await.unwrap();
     assert_eq!(
         source_requests.len(),
         0,
-        "immutable skip must issue zero source requests, got {}",
-        source_requests.len(),
+        "immutable skip must issue zero source requests"
     );
     assert_eq!(
         target_requests.len(),
         0,
-        "immutable skip must issue zero target requests, got {}",
-        target_requests.len(),
+        "immutable skip must issue zero target requests"
     );
 }
 
-/// When a tag matches the `immutable_glob` pattern but does NOT exist in the
-/// target's `existing_tags`, the engine must fall through to normal discovery (not
-/// skip). This tests a new tag that needs to be synced for the first time.
+/// A tag that matches the glob but is absent from the target's `existing_tags`
+/// falls through to normal discovery and syncs.
 #[tokio::test]
 async fn immutable_tag_not_skipped_when_absent_from_target() {
     let source_server = MockServer::start().await;
@@ -108,42 +96,27 @@ async fn immutable_tag_not_skipped_when_absent_from_target() {
     let parts = ManifestBuilder::new(b"immutable-config")
         .layer(b"immutable-layer")
         .build();
-
-    // Source: serve the manifest and blobs.
     parts
         .mount_source(&source_server, "library/nginx", "v3.0.0")
         .await;
-
-    // Target: manifest HEAD 404, blobs not found, push endpoints.
     parts
         .mount_target(&target_server, "mirror/nginx", "v3.0.0")
         .await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    // v3.0.0 is NOT in the target's existing_tags - it's a new tag.
-    let target_tags: HashSet<String> = ["v1.0.0", "v2.0.0"].iter().map(|s| s.to_string()).collect();
-
-    let targets = vec![TargetEntry {
-        existing_tags: target_tags,
-        ..target_entry("target-reg", target_client)
-    }];
-
-    let mapping = ResolvedMapping {
-        immutable_glob: Some(immutable_semver_glob()),
-        ..resolved_mapping(
-            source_client,
-            "library/nginx",
-            "mirror/nginx",
-            targets,
-            vec![TagPair::same("v3.0.0")],
-        )
-    };
+    let mapping = immutable_mapping(
+        &source_server,
+        "library/nginx",
+        "mirror/nginx",
+        vec![target_with_tags(
+            "target-reg",
+            &target_server,
+            &["v1.0.0", "v2.0.0"],
+        )],
+        vec![TagPair::same("v3.0.0")],
+    );
 
     let report = run_sync(vec![mapping]).await;
 
-    // Tag must be synced, not skipped.
     assert_eq!(report.images.len(), 1);
     assert!(
         matches!(report.images[0].status, ImageStatus::Synced),
@@ -153,8 +126,8 @@ async fn immutable_tag_not_skipped_when_absent_from_target() {
     assert_eq!(report.stats.immutable_tag_skips, 0);
 }
 
-/// Tags that do NOT match the `immutable_glob` pattern fall through to the
-/// normal HEAD + digest compare path, even when the tag exists at the target.
+/// A tag that does not match the glob takes the HEAD and digest compare path
+/// even when it exists at the target.
 #[tokio::test]
 async fn non_matching_tag_falls_through_to_head_check() {
     let source_server = MockServer::start().await;
@@ -164,40 +137,23 @@ async fn non_matching_tag_falls_through_to_head_check() {
     let layer_digest = make_digest("11");
     let manifest = simple_image_manifest(&config_digest, &layer_digest);
     let (manifest_bytes, manifest_digest) = serialize_manifest(&manifest);
-
-    // Source: serve manifest for HEAD.
     mount_source_manifest(&source_server, "repo", "latest", &manifest_bytes).await;
-
-    // Target: manifest HEAD returns matching digest -> should skip via digest match.
     mount_manifest_head_matching(&target_server, "repo", "latest", &manifest_digest).await;
 
-    let source_client = mock_client(&source_server);
-    let target_client = mock_client(&target_server);
-
-    // "latest" exists at target but does NOT match the pattern.
-    let target_tags: HashSet<String> = ["latest", "v1.0.0"].iter().map(|s| s.to_string()).collect();
-
-    let targets = vec![TargetEntry {
-        existing_tags: target_tags,
-        ..target_entry("target", target_client)
-    }];
-
-    let mapping = ResolvedMapping {
-        immutable_glob: Some(immutable_semver_glob()),
-        ..resolved_mapping(
-            source_client,
-            "repo",
-            "repo",
-            targets,
-            vec![TagPair::same("latest")],
-        )
-    };
+    let mapping = immutable_mapping(
+        &source_server,
+        "repo",
+        "repo",
+        vec![target_with_tags(
+            "target",
+            &target_server,
+            &["latest", "v1.0.0"],
+        )],
+        vec![TagPair::same("latest")],
+    );
 
     let report = run_sync(vec![mapping]).await;
 
-    // "latest" does not match the immutable pattern, so it falls through to
-    // HEAD + digest compare. The digest matches, so it should be skipped
-    // with DigestMatch reason, NOT ImmutableTag.
     assert_eq!(report.images.len(), 1);
     assert!(
         matches!(
@@ -215,9 +171,8 @@ async fn non_matching_tag_falls_through_to_head_check() {
     );
 }
 
-/// Multi-target: tag must exist in ALL targets' `existing_tags` for the skip to
-/// fire. When target A has the tag but target B does not, the engine must fall
-/// through to normal discovery for both targets (not skip one and sync the other).
+/// The tag must exist at ALL targets for the skip to fire: with it at target A
+/// but not B, both targets sync.
 #[tokio::test]
 async fn immutable_tag_not_skipped_when_missing_from_one_target() {
     let source_server = MockServer::start().await;
@@ -227,43 +182,23 @@ async fn immutable_tag_not_skipped_when_missing_from_one_target() {
     let parts = ManifestBuilder::new(b"mt-config")
         .layer(b"mt-layer")
         .build();
-
-    // Source: serve manifest and blobs.
     parts.mount_source(&source_server, "repo", "v1.0.0").await;
-
-    // Target A: manifest HEAD 404, push endpoints (needs sync).
     parts.mount_target(&target_a_server, "repo", "v1.0.0").await;
-
-    // Target B: manifest HEAD 404, push endpoints (needs sync).
     parts.mount_target(&target_b_server, "repo", "v1.0.0").await;
 
-    let source_client = mock_client(&source_server);
-
-    // Target A has the tag, target B does not.
-    let tags_a: HashSet<String> = ["v1.0.0"].iter().map(|s| s.to_string()).collect();
-
-    let targets = vec![
-        TargetEntry {
-            existing_tags: tags_a,
-            ..target_entry("target-a", mock_client(&target_a_server))
-        },
-        target_entry("target-b", mock_client(&target_b_server)),
-    ];
-
-    let mapping = ResolvedMapping {
-        immutable_glob: Some(immutable_semver_glob()),
-        ..resolved_mapping(
-            source_client,
-            "repo",
-            "repo",
-            targets,
-            vec![TagPair::same("v1.0.0")],
-        )
-    };
+    let mapping = immutable_mapping(
+        &source_server,
+        "repo",
+        "repo",
+        vec![
+            target_with_tags("target-a", &target_a_server, &["v1.0.0"]),
+            target_entry("target-b", mock_client(&target_b_server)),
+        ],
+        vec![TagPair::same("v1.0.0")],
+    );
 
     let report = run_sync(vec![mapping]).await;
 
-    // Both targets must be synced (not skipped) since target B is missing the tag.
     assert_eq!(report.images.len(), 2);
     for image in &report.images {
         assert!(
