@@ -80,9 +80,9 @@ impl fmt::Display for ImageRef {
 }
 
 /// Every (source, tag) in `entries`.
-pub(crate) fn refs_of(entries: &[ImageEntry]) -> BTreeSet<ImageRef> {
+pub(crate) fn refs_of<'a>(entries: impl IntoIterator<Item = &'a ImageEntry>) -> BTreeSet<ImageRef> {
     entries
-        .iter()
+        .into_iter()
         .flat_map(|entry| {
             entry.tags.iter().map(|tag| ImageRef {
                 source: entry.source.clone(),
@@ -233,7 +233,8 @@ enum Difference {
         expected: Digest,
         actual: Digest,
     },
-    /// The registry no longer has the tag.
+    /// The registry answers 404, or 401 after a new token, as it does for a
+    /// deleted repository.
     Gone { image: ImageRef },
 }
 
@@ -246,7 +247,10 @@ impl fmt::Display for Difference {
                 expected,
                 actual,
             } => write!(f, "{image}: expected {expected}, now {actual}"),
-            Self::Gone { image } => write!(f, "{image}: no longer at the source (404)"),
+            Self::Gone { image } => write!(
+                f,
+                "{image}: no longer at the source (404, or 401 after a new token)"
+            ),
         }
     }
 }
@@ -272,8 +276,8 @@ impl fmt::Display for RecheckError {
 impl std::error::Error for RecheckError {}
 
 /// Judge the refs that resolved against `lock`. Equal digests mean identical
-/// manifest bytes, children included. A tag the registry answers 404 for has
-/// moved; any other failure only leaves the check incomplete.
+/// manifest bytes, children included. A tag answered 404, or 401 after a new
+/// token, has moved; any other failure only leaves the check incomplete.
 fn check_unmoved(
     lock: &Lock,
     resolved: &BTreeMap<ImageRef, Digest>,
@@ -293,10 +297,12 @@ fn check_unmoved(
             Some(_) => {}
         }
     }
-    let (gone, unreachable): (Vec<_>, Vec<_>) = failed
-        .iter()
-        .cloned()
-        .partition(|(_, e)| e.status == Some(StatusCode::NOT_FOUND));
+    let (gone, unreachable): (Vec<_>, Vec<_>) = failed.iter().cloned().partition(|(_, e)| {
+        matches!(
+            e.status,
+            Some(StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED)
+        )
+    });
     differences.extend(
         gone.into_iter()
             .map(|(image, _)| Difference::Gone { image }),
@@ -342,7 +348,12 @@ pub(crate) async fn ensure_unmoved(
         "bench: checking {} source refs against the lock...",
         refs.len()
     );
-    let (resolved, failed) = resolve(client, refs, auth, fetch_digest).await;
+    let access = Access {
+        client,
+        tokens: Tokens::default(),
+        auth,
+    };
+    let (resolved, failed) = access.resolve(refs, Access::fetch_digest).await;
     check_unmoved(lock, &resolved, &failed)
 }
 
@@ -441,72 +452,117 @@ fn child_digests(body: &[u8]) -> Result<Vec<Digest>, String> {
     Ok(parsed.manifests.into_iter().map(|c| c.digest).collect())
 }
 
-/// Resolve every ref with `fetch`. Returns what resolved and each ref that did
-/// not, so the caller decides what an incomplete answer means. A 401 means the
-/// token expired mid-run, so it is exchanged again once.
-async fn resolve<T>(
-    client: &reqwest::Client,
-    refs: &BTreeSet<ImageRef>,
-    auth: Option<&DockerHubAuth>,
-    fetch: impl AsyncFn(&reqwest::Client, &Repository<'_>, &str, &str) -> Result<T, FetchError>,
-) -> (BTreeMap<ImageRef, T>, Vec<(ImageRef, FetchError)>) {
-    let mut tokens = Tokens::default();
-    let mut resolved = BTreeMap::new();
-    let mut failed = Vec::new();
-    for image in refs {
-        let outcome = async {
-            let repo = registry::split_source(&image.source)
-                .ok_or_else(|| FetchError::from("source names no registry".to_owned()))?;
-            let token = tokens.get(client, &repo, auth).await.clone()?;
-            match fetch(client, &repo, &image.tag, &token).await {
-                Err(e) if e.status == Some(StatusCode::UNAUTHORIZED) => {
-                    let token = tokens.renew(client, &repo, auth).await.clone()?;
-                    fetch(client, &repo, &image.tag, &token).await
-                }
-                other => other,
-            }
-        }
-        .await;
-        match outcome {
-            Ok(found) => {
-                resolved.insert(image.clone(), found);
-            }
-            Err(e) => failed.push((image.clone(), e)),
-        }
-    }
-    (resolved, failed)
+/// The client, token store and credentials manifest requests go through.
+struct Access<'a> {
+    /// Client for every request.
+    client: &'a reqwest::Client,
+    /// Bearer tokens, exchanged as each repository is first asked for.
+    tokens: Tokens,
+    /// Docker Hub credentials for the token exchange, if any.
+    auth: Option<&'a DockerHubAuth>,
 }
 
-/// Request a manifest, retrying what [`registry::send_retrying`] retries. Any
-/// other failing status is reported at once, with the status.
-async fn request_manifest(
-    client: &reqwest::Client,
-    method: Method,
-    repo: &Repository<'_>,
-    tag: &str,
-    token: &str,
-) -> Result<reqwest::Response, FetchError> {
-    let url = format!(
-        "https://{}/v2/{}/manifests/{tag}",
-        repo.host.api_host(),
-        repo.path
-    );
-    let response = registry::send_retrying(&format!("{repo}:{tag}"), || {
-        client
-            .request(method.clone(), &url)
-            .bearer_auth(token)
-            .header("Accept", registry::MANIFEST_ACCEPT)
-    })
-    .await
-    .map_err(|e| format!("manifest request {e}"))?;
-    let status = response.status();
-    if status.is_success() {
-        Ok(response)
-    } else {
-        Err(FetchError {
-            status: Some(status),
-            reason: format!("manifest request returned {status}"),
+impl Access<'_> {
+    /// Resolve every ref with `fetch`. Returns what resolved and each ref that
+    /// did not, so the caller decides what an incomplete answer means.
+    async fn resolve<T>(
+        &self,
+        refs: &BTreeSet<ImageRef>,
+        fetch: impl AsyncFn(&Self, &Repository<'_>, &str) -> Result<T, FetchError>,
+    ) -> (BTreeMap<ImageRef, T>, Vec<(ImageRef, FetchError)>) {
+        let mut resolved = BTreeMap::new();
+        let mut failed = Vec::new();
+        for image in refs {
+            let outcome = match registry::split_source(&image.source) {
+                Some(repo) => fetch(self, &repo, &image.tag).await,
+                None => Err("source names no registry".to_owned().into()),
+            };
+            match outcome {
+                Ok(found) => {
+                    resolved.insert(image.clone(), found);
+                }
+                Err(e) => failed.push((image.clone(), e)),
+            }
+        }
+        (resolved, failed)
+    }
+
+    /// Request a manifest, retrying what [`registry::send_retrying`] retries
+    /// and renewing an expired token once. Any other failing status is
+    /// reported at once, with the status.
+    async fn request_manifest(
+        &self,
+        method: Method,
+        repo: &Repository<'_>,
+        tag: &str,
+    ) -> Result<reqwest::Response, FetchError> {
+        let url = format!(
+            "https://{}/v2/{}/manifests/{tag}",
+            repo.host.api_host(),
+            repo.path
+        );
+        let response = self
+            .tokens
+            .send(
+                self.client,
+                repo,
+                self.auth,
+                Some(&format!("{repo}:{tag}")),
+                |token| {
+                    self.client
+                        .request(method.clone(), &url)
+                        .bearer_auth(token)
+                        .header("Accept", registry::MANIFEST_ACCEPT)
+                },
+            )
+            .await
+            .map_err(|e| format!("manifest request {e}"))?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(response)
+        } else {
+            Err(FetchError {
+                status: Some(status),
+                reason: format!("manifest request returned {status}"),
+            })
+        }
+    }
+
+    /// GET a manifest, hash its exact bytes and read them with `read`.
+    async fn get_manifest<T>(
+        &self,
+        repo: &Repository<'_>,
+        tag: &str,
+        read: impl FnOnce(Digest, &[u8]) -> Result<T, String>,
+    ) -> Result<T, FetchError> {
+        let response = self.request_manifest(Method::GET, repo, tag).await?;
+        let header = content_digest(&response);
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| format!("manifest body unreadable: {e}"))?;
+        Ok(read(body_digest(header.as_deref(), &body)?, &body)?)
+    }
+
+    /// The digest a tag names: HEAD, then a GET to hash the body when the
+    /// registry sends no digest header.
+    async fn fetch_digest(&self, repo: &Repository<'_>, tag: &str) -> Result<Digest, FetchError> {
+        let head = self.request_manifest(Method::HEAD, repo, tag).await?;
+        match probe(content_digest(&head).as_deref())? {
+            Probe::Header(digest) => Ok(digest),
+            Probe::NeedBody => self.get_manifest(repo, tag, |digest, _| Ok(digest)).await,
+        }
+    }
+
+    /// The digest and children of a tag, from a GET of its exact bytes.
+    async fn fetch_entry(&self, repo: &Repository<'_>, tag: &str) -> Result<Entry, FetchError> {
+        self.get_manifest(repo, tag, |digest, body| {
+            Ok(Entry {
+                digest,
+                children: child_digests(body)?,
+            })
         })
+        .await
     }
 }
 
@@ -517,54 +573,6 @@ fn content_digest(response: &reqwest::Response) -> Option<String> {
         .get("docker-content-digest")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
-}
-
-/// GET a manifest, hash its exact bytes and read them with `read`.
-async fn get_manifest<T>(
-    client: &reqwest::Client,
-    repo: &Repository<'_>,
-    tag: &str,
-    token: &str,
-    read: impl FnOnce(Digest, &[u8]) -> Result<T, String>,
-) -> Result<T, FetchError> {
-    let response = request_manifest(client, Method::GET, repo, tag, token).await?;
-    let header = content_digest(&response);
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| format!("manifest body unreadable: {e}"))?;
-    Ok(read(body_digest(header.as_deref(), &body)?, &body)?)
-}
-
-/// The digest a tag names: HEAD, then a GET to hash the body when the registry
-/// sends no digest header.
-async fn fetch_digest(
-    client: &reqwest::Client,
-    repo: &Repository<'_>,
-    tag: &str,
-    token: &str,
-) -> Result<Digest, FetchError> {
-    let head = request_manifest(client, Method::HEAD, repo, tag, token).await?;
-    match probe(content_digest(&head).as_deref())? {
-        Probe::Header(digest) => Ok(digest),
-        Probe::NeedBody => get_manifest(client, repo, tag, token, |digest, _| Ok(digest)).await,
-    }
-}
-
-/// The digest and children of a tag, from a GET of its exact bytes.
-async fn fetch_entry(
-    client: &reqwest::Client,
-    repo: &Repository<'_>,
-    tag: &str,
-    token: &str,
-) -> Result<Entry, FetchError> {
-    get_manifest(client, repo, tag, token, |digest, body| {
-        Ok(Entry {
-            digest,
-            children: child_digests(body)?,
-        })
-    })
-    .await
 }
 
 /// Arguments for the `bench-lock` subcommand.
@@ -598,12 +606,23 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
     let entries = corpus::load_images(args.paths.corpus())?;
     let overrides = corpus::load_overrides(args.paths.partial_overrides())?;
 
+    // An override for a source outside the corpus is ignored by the run.
     let mut refs = refs_of(&entries);
-    refs.extend(refs_of(&overrides.overrides));
+    refs.extend(refs_of(
+        overrides
+            .overrides
+            .iter()
+            .filter(|o| entries.iter().any(|e| e.source == o.source)),
+    ));
 
     let auth = crate::bench::docker_hub_auth();
     eprintln!("bench-lock: resolving {} source refs...", refs.len());
-    let (images, failed) = resolve(&http_client()?, &refs, auth.as_ref(), fetch_entry).await;
+    let access = Access {
+        client: &http_client()?,
+        tokens: Tokens::default(),
+        auth: auth.as_ref(),
+    };
+    let (images, failed) = access.resolve(&refs, Access::fetch_entry).await;
     if !failed.is_empty() {
         return Err(unresolved(&failed).into());
     }
@@ -836,15 +855,18 @@ mod tests {
         assert!(text.contains("cargo xtask bench-lock") && text.contains("new comparison series"));
         assert!(text.contains("could not resolve 1 source ref(s)"));
 
-        // Catches: a tag deleted at the source being waved through as an outage.
-        let Err(RecheckError::Moved(text)) = check_unmoved(
-            &lock,
-            &resolved_of(&[("s/a:1", '1')]),
-            &[failure("s/gone:1", Some(404))],
-        ) else {
-            panic!("a 404 for a locked ref is a moved source");
-        };
-        assert!(text.contains("s/gone:1: no longer at the source (404)"));
+        // Catches: a tag or repository deleted at the source (Docker Hub and
+        // quay answer 401) being waved through as an outage.
+        for status in [404, 401] {
+            let Err(RecheckError::Moved(text)) = check_unmoved(
+                &lock,
+                &resolved_of(&[("s/a:1", '1')]),
+                &[failure("s/gone:1", Some(status))],
+            ) else {
+                panic!("a {status} for a locked ref is a moved source");
+            };
+            assert!(text.contains("s/gone:1: no longer at the source"));
+        }
 
         for status in [Some(503), Some(429), None] {
             let check = check_unmoved(&lock, &resolved_of(&[]), &[failure("s/b:1", status)]);

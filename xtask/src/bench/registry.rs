@@ -1,8 +1,8 @@
 //! Registry access shared by the CDN pre-warm and the corpus lock: hostname
 //! normalization, the manifest `Accept` list and the OCI bearer-token flow.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::time::Duration;
 
 use crate::bench::corpus::DockerHubAuth;
@@ -159,64 +159,76 @@ impl RepoKey {
 }
 
 /// Bearer tokens by repository, so a repository with several tags is
-/// authorized once. A token a registry has since expired is replaced with
-/// [`Tokens::renew`] after a 401.
+/// authorized once. Shared by reference, because blob tasks run together; no
+/// borrow is held across an exchange.
 #[derive(Default)]
 pub(crate) struct Tokens {
     /// Latest exchange for each repository; a failure is kept so it is
     /// reported for every tag and not retried at once.
-    by_repository: HashMap<RepoKey, Result<String, String>>,
+    by_repository: RefCell<HashMap<RepoKey, Result<String, String>>>,
 }
 
 impl Tokens {
-    /// The token for `repo`, exchanging for one the first time it is asked.
-    pub(crate) async fn get(
-        &mut self,
+    /// The token for `repo`, exchanged for the first time it is asked, or when
+    /// the one held is `rejected`, which the registry refused. A token another
+    /// request already replaced is returned as it is.
+    async fn token(
+        &self,
         client: &reqwest::Client,
         repo: &Repository<'_>,
         dockerhub_auth: Option<&DockerHubAuth>,
-    ) -> &Result<String, String> {
-        match self.by_repository.entry(RepoKey::from(repo)) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(oci_token(client, repo, dockerhub_auth).await),
+        rejected: Option<&str>,
+    ) -> Result<String, String> {
+        let key = RepoKey::from(repo);
+        let held = self.by_repository.borrow().get(&key).cloned();
+        if let Some(held) =
+            held.filter(|held| rejected.is_none() || held.as_deref().ok() != rejected)
+        {
+            return held;
         }
+        let exchanged = oci_token(client, repo, dockerhub_auth).await;
+        self.by_repository
+            .borrow_mut()
+            .insert(key, exchanged.clone());
+        exchanged
     }
 
-    /// Exchange for a new token for `repo`, replacing the one held.
-    pub(crate) async fn renew(
-        &mut self,
-        client: &reqwest::Client,
-        repo: &Repository<'_>,
-        dockerhub_auth: Option<&DockerHubAuth>,
-    ) -> &Result<String, String> {
-        let renewed = oci_token(client, repo, dockerhub_auth).await;
-        self.by_repository.insert(RepoKey::from(repo), renewed);
-        self.get(client, repo, dockerhub_auth).await
-    }
-
-    /// Send the request `build` makes with the token for `repo`. A 401 means
-    /// the token expired, so a new one is exchanged and the request sent once
-    /// more.
+    /// Send, with the token for `repo`, the request `build` makes. With a
+    /// `retrying` label a transient failure is retried by [`send_retrying`].
     pub(crate) async fn send(
-        &mut self,
+        &self,
         client: &reqwest::Client,
         repo: &Repository<'_>,
         dockerhub_auth: Option<&DockerHubAuth>,
+        retrying: Option<&str>,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, String> {
-        let token = self.get(client, repo, dockerhub_auth).await.clone()?;
-        let response = build(&token).send().await.map_err(|e| e.to_string())?;
-        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
-            return Ok(response);
-        }
-        let token = self.renew(client, repo, dockerhub_auth).await.clone()?;
-        build(&token).send().await.map_err(|e| e.to_string())
+        send_renewing(
+            async || self.token(client, repo, dockerhub_auth, None).await,
+            async |old| self.token(client, repo, dockerhub_auth, Some(old)).await,
+            async |token| match retrying {
+                Some(what) => send_retrying(what, || build(token)).await,
+                None => build(token).send().await.map_err(|e| e.to_string()),
+            },
+        )
+        .await
     }
+}
 
-    /// The token last exchanged for `repo`, if that succeeded.
-    pub(crate) fn cached(&self, repo: &RepoKey) -> Option<&str> {
-        self.by_repository.get(repo)?.as_deref().ok()
+/// Send with the current token. A 401 means the token expired, so exchange for
+/// another once and send again; whatever that answers is returned, so a
+/// registry that still refuses is reported, not asked again.
+async fn send_renewing<E>(
+    token: impl AsyncFn() -> Result<String, E>,
+    renew: impl AsyncFn(&str) -> Result<String, E>,
+    send: impl AsyncFn(&str) -> Result<reqwest::Response, E>,
+) -> Result<reqwest::Response, E> {
+    let used = token().await?;
+    let response = send(&used).await?;
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(response);
     }
+    send(&renew(&used).await?).await
 }
 
 /// OCI token exchange for a single repository scope.
@@ -303,6 +315,10 @@ fn parse_auth_param(header: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use futures_util::FutureExt;
+
     use super::*;
 
     #[test]
@@ -388,5 +404,40 @@ mod tests {
             Some("registry.docker.io")
         );
         assert_eq!(parse_auth_param(header, "scope"), None);
+    }
+
+    /// Run `send_renewing` with a send that answers `statuses` in turn, and
+    /// report the final status, the sends made and the exchanges made.
+    fn renewing(statuses: &[u16]) -> (u16, usize, usize) {
+        let sends = Cell::new(0);
+        let exchanges = Cell::new(0);
+        let response = send_renewing(
+            async || Ok::<_, String>("old".to_owned()),
+            async |rejected: &str| {
+                assert_eq!(rejected, "old", "the refused token is what is replaced");
+                exchanges.set(exchanges.get() + 1);
+                Ok("new".to_owned())
+            },
+            async |_token: &str| {
+                let status = statuses[sends.get().min(statuses.len() - 1)];
+                sends.set(sends.get() + 1);
+                let response = http::Response::builder().status(status).body("");
+                Ok(reqwest::Response::from(response.unwrap()))
+            },
+        )
+        .now_or_never()
+        .expect("nothing here waits")
+        .unwrap();
+        (response.status().as_u16(), sends.get(), exchanges.get())
+    }
+
+    #[test]
+    fn a_401_renews_the_token_once_and_a_second_401_is_returned() {
+        // Catches: exchanging a token for a request that was accepted.
+        assert_eq!(renewing(&[200]), (200, 1, 0));
+        // Catches: reporting an expired token as a refused source.
+        assert_eq!(renewing(&[401, 200]), (200, 2, 1));
+        // Catches: asking again and again of a registry that keeps refusing.
+        assert_eq!(renewing(&[401, 401, 200]), (401, 2, 1));
     }
 }

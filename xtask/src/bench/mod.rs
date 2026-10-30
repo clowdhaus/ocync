@@ -375,7 +375,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // The lock is read only when a scenario syncs from it: prepare reads its own
     // wildcard corpus and transfers nothing, so it needs no lock.
-    let (transfers, prepare) = plan(args.scenario, &corpus, args.paths.partial_overrides())?;
+    let transfers = plan(args.scenario, &corpus, args.paths.partial_overrides())?;
+    let prepare = matches!(args.scenario, Scenario::Prepare | Scenario::All);
     let lock = (!transfers.is_empty())
         .then(|| lock::Lock::load(&args.paths.lock_path()))
         .transpose()?;
@@ -389,7 +390,14 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             .iter()
             .flat_map(|transfer| scenario_refs(transfer, &corpus))
             .collect();
-        lock::ensure_unmoved(&http, lock, &refs, auth).await?;
+        lock::ensure_unmoved(&http, lock, &refs, auth)
+            .await
+            .map_err(|e| match e {
+                lock::RecheckError::Lookup(text) => format!(
+                    "{text}\nUse --skip-registries <host> to leave a registry out, or retry later."
+                ),
+                lock::RecheckError::Moved(text) => text,
+            })?;
     }
 
     let tools = &args.tool_selection.tools;
@@ -468,7 +476,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     } else if transfers.is_empty() {
         eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
     } else {
-        cdn_prewarm(&corpus).await;
+        cdn_prewarm(&corpus, &http).await;
     }
 
     // A scenario after the first re-checks the sources, so a move during a long
@@ -641,7 +649,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
              run is not comparable to the archived ones); summary only"
         );
     } else {
-        report::append_record(results_dir, reg_key, record)?;
+        report::append_record(results_dir, reg_key, record)
+            .map_err(|e| with_stop_reason(e, stopped.as_deref()))?;
         eprintln!("bench: run record appended to bench/results/{reg_key}.json");
     }
 
@@ -681,14 +690,13 @@ impl std::fmt::Display for Transfer {
     }
 }
 
-/// The scenarios a run executes, in order: those that sync from the lock, and
-/// whether prepare follows. The overrides are read once, and only for a run
-/// that has a partial scenario.
+/// The scenarios a run executes, in order, that sync from the lock. The
+/// overrides are read once, and only for a run that has a partial scenario.
 fn plan(
     requested: Scenario,
     corpus: &Corpus,
     overrides_path: &str,
-) -> Result<(Vec<Transfer>, bool), String> {
+) -> Result<Vec<Transfer>, String> {
     let partial = || {
         let overrides = corpus::load_overrides(overrides_path)?;
         Ok::<_, String>(Transfer::Partial(
@@ -696,11 +704,11 @@ fn plan(
         ))
     };
     Ok(match requested {
-        Scenario::Sync => (vec![Transfer::Sync], false),
-        Scenario::Partial => (vec![partial()?], false),
-        Scenario::Scale => (vec![Transfer::Scale], false),
-        Scenario::Prepare => (Vec::new(), true),
-        Scenario::All => (vec![Transfer::Sync, partial()?, Transfer::Scale], true),
+        Scenario::Sync => vec![Transfer::Sync],
+        Scenario::Partial => vec![partial()?],
+        Scenario::Scale => vec![Transfer::Scale],
+        Scenario::Prepare => Vec::new(),
+        Scenario::All => vec![Transfer::Sync, partial()?, Transfer::Scale],
     })
 }
 
@@ -711,6 +719,14 @@ fn scenario_refs(transfer: &Transfer, corpus: &Corpus) -> BTreeSet<lock::ImageRe
         refs.extend(lock::refs_of(&partial.images));
     }
     refs
+}
+
+/// `error`, plus why the run stopped early if it did.
+fn with_stop_reason(error: String, stopped: Option<&str>) -> String {
+    stopped.map_or_else(
+        || error.clone(),
+        |reason| format!("{error}; also the run stopped early: {reason}"),
+    )
 }
 
 /// Combine a pass's result with its cleanup's, keeping both messages: a repo
@@ -1331,83 +1347,21 @@ struct PrewarmStats {
     errors: u64,
 }
 
-/// Pull every source manifest once to warm CDN edge caches.
+/// Pull every unique source blob once to warm CDN edge caches.
 ///
 /// Runs before any tool so all tools see identically warm CDN. Uses
 /// OCI token exchange for authentication so requests succeed (2xx) and
 /// `CloudFront` actually caches the responses. Unauthenticated 401s are
-/// NOT cached by CDN and would warm nothing.
-async fn cdn_prewarm(corpus: &Corpus) {
-    let total = corpus.total_tags();
+/// NOT cached by CDN and would warm nothing. The source manifests need no pass
+/// of their own: the lock check has just requested every one.
+async fn cdn_prewarm(corpus: &Corpus, client: &reqwest::Client) {
     let auth = corpus.dockerhub_auth.as_ref();
-    eprintln!("bench: pre-warming CDN ({total} manifests)...");
+    let tokens = registry::Tokens::default();
+    eprintln!("bench: manifests were warmed by the lock check; pre-warming blob CDN...");
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap();
-    let mut tokens = registry::Tokens::default();
-
-    let mut hits = 0u64;
-    let mut misses = 0u64;
-    let mut errors = 0u64;
-
-    for image in &corpus.images {
-        let Some(source) = registry::split_source(&image.source) else {
-            continue;
-        };
-        let (registry, repo) = (source.host.api_host(), source.path);
-        if let Err(e) = tokens.get(&client, &source, auth).await {
-            errors += image.tags.len() as u64;
-            eprintln!("  CDN pre-warm: {registry}/{repo}: auth failed ({e}), skipping");
-            continue;
-        }
-
-        for tag in &image.tags {
-            let url = format!("https://{registry}/v2/{repo}/manifests/{tag}");
-            let resp = tokens
-                .send(&client, &source, auth, |token| {
-                    client.head(&url).bearer_auth(token)
-                })
-                .await;
-            match resp {
-                Ok(r) if r.status().is_success() || r.status().is_redirection() => {
-                    let x_cache = r
-                        .headers()
-                        .get("x-cache")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    if x_cache.to_ascii_lowercase().contains("hit") {
-                        hits += 1;
-                    } else {
-                        misses += 1;
-                    }
-                }
-                Ok(r) => {
-                    errors += 1;
-                    eprintln!("  CDN pre-warm: {registry}/{repo}:{tag} -> {}", r.status());
-                }
-                Err(e) => {
-                    errors += 1;
-                    eprintln!("  CDN pre-warm: {registry}/{repo}:{tag} -> {e}");
-                }
-            }
-        }
-    }
-
-    // The lock check already requested every one of these manifests, so the hit
-    // count says nothing about how cold the edge was before this run.
-    eprintln!(
-        "bench: manifest CDN pre-warm done ({hits} hits, {misses} misses, {errors} errors; \
-         after the lock check requested them, so hits do not show a cold edge)"
-    );
-
-    // Phase 2: Warm blob CDN by fetching unique blobs.
-    //
     // Blob URLs are served via 302 redirects to CloudFront -- completely
     // different cache keys from manifests. Without this pass the first
     // tool to run pays a CDN miss penalty on every blob.
-    eprintln!("bench: pre-warming blob CDN...");
 
     // Redirect-following client with a generous timeout for large blobs.
     let blob_client = reqwest::Client::builder()
@@ -1426,18 +1380,13 @@ async fn cdn_prewarm(corpus: &Corpus) {
         let key = registry::RepoKey::from(&source);
         let (registry, repo) = (source.host.api_host(), source.path);
 
-        // The manifest pass above already reported a repository that fails.
-        if tokens.get(&client, &source, auth).await.is_err() {
-            continue;
-        }
-
         // GET one manifest per image to discover blob digests.
         // All tags for the same image reference the same layers, so the
         // first tag is sufficient.
         if let Some(tag) = image.tags.first() {
             let url = format!("https://{registry}/v2/{repo}/manifests/{tag}");
             let resp = tokens
-                .send(&client, &source, auth, |token| {
+                .send(client, &source, auth, None, |token| {
                     client
                         .get(&url)
                         .bearer_auth(token)
@@ -1445,18 +1394,27 @@ async fn cdn_prewarm(corpus: &Corpus) {
                 })
                 .await;
 
-            if let Ok(r) = resp {
-                if let Ok(body) = r.text().await {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "a public image manifest; a parse error is dropped unread"
-                    )]
-                    if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&body) {
-                        let token = tokens.cached(&key).unwrap_or_default();
-                        extract_blob_digests(&client, &manifest, &key, token, &mut unique_blobs)
+            match resp {
+                Ok(r) => {
+                    if let Ok(body) = r.text().await {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "a public image manifest; a parse error is dropped unread"
+                        )]
+                        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&body) {
+                            extract_blob_digests(
+                                client,
+                                &manifest,
+                                &key,
+                                &tokens,
+                                auth,
+                                &mut unique_blobs,
+                            )
                             .await;
+                        }
                     }
                 }
+                Err(e) => eprintln!("  CDN pre-warm: {registry}/{repo}:{tag}: {e}, skipping"),
             }
         }
     }
@@ -1490,16 +1448,6 @@ async fn cdn_prewarm(corpus: &Corpus) {
     // Total pre-warm timeout: 8 minutes (leaves 2 min headroom in 10-min budget).
     let prewarm_deadline = Instant::now() + Duration::from_secs(480);
 
-    // Each repository's current token. A blob answered 401 exchanges a new one
-    // for the repository's later blobs too.
-    let live_tokens: std::cell::RefCell<HashMap<registry::RepoKey, String>> =
-        std::cell::RefCell::new(
-            blobs_vec
-                .iter()
-                .filter_map(|(key, _)| Some((key.clone(), tokens.cached(key)?.to_owned())))
-                .collect(),
-        );
-
     let sem = tokio::sync::Semaphore::new(20);
     const MAX_RETRIES: u32 = 3;
 
@@ -1510,19 +1458,10 @@ async fn cdn_prewarm(corpus: &Corpus) {
             let blob_client = &blob_client;
             let per_registry_stats = &per_registry_stats;
             let rate_controllers = &rate_controllers;
-            let live_tokens = &live_tokens;
+            let tokens = &tokens;
             let registry = key.host.clone();
             let digest = digest.clone();
             async move {
-                if !live_tokens.borrow().contains_key(key) {
-                    per_registry_stats
-                        .borrow_mut()
-                        .entry(registry.clone())
-                        .or_default()
-                        .errors += 1;
-                    return;
-                }
-
                 // Check pre-warm timeout before starting.
                 if Instant::now() > prewarm_deadline {
                     return;
@@ -1544,7 +1483,12 @@ async fn cdn_prewarm(corpus: &Corpus) {
 
                 let mut retries = 0u32;
                 loop {
-                    let resp = get_blob(blob_client, key, &digest, live_tokens, auth).await;
+                    let url = format!("https://{}/v2/{}/blobs/{digest}", key.host, key.path);
+                    let resp = tokens
+                        .send(client, &key.repository(), auth, None, |token| {
+                            blob_client.get(&url).bearer_auth(token)
+                        })
+                        .await;
                     match resp {
                         Ok(r) if r.status().as_u16() == 429 => {
                             rate_controllers
@@ -1658,35 +1602,6 @@ async fn cdn_prewarm(corpus: &Corpus) {
     tokio::time::sleep(Duration::from_secs(wait_secs)).await;
 }
 
-/// GET a blob with the repository's current token. A 401 means the token
-/// expired, so one is exchanged unless another blob already replaced it, and
-/// the request is sent once more.
-async fn get_blob(
-    client: &reqwest::Client,
-    key: &registry::RepoKey,
-    digest: &str,
-    live_tokens: &std::cell::RefCell<HashMap<registry::RepoKey, String>>,
-    auth: Option<&corpus::DockerHubAuth>,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let url = format!("https://{}/v2/{}/blobs/{digest}", key.host, key.path);
-    let used = live_tokens.borrow().get(key).cloned().unwrap_or_default();
-    let response = client.get(&url).bearer_auth(&used).send().await?;
-    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return Ok(response);
-    }
-    let current = live_tokens.borrow().get(key).cloned().unwrap_or_default();
-    let fresh = if current == used {
-        match registry::oci_token(client, &key.repository(), auth).await {
-            Ok(fresh) => fresh,
-            Err(_) => return Ok(response),
-        }
-    } else {
-        current
-    };
-    live_tokens.borrow_mut().insert(key.clone(), fresh.clone());
-    client.get(&url).bearer_auth(fresh).send().await
-}
-
 /// Collect layer and config blob digests from a manifest JSON value.
 ///
 /// Works for both image manifests (`layers` + `config`) and index manifests
@@ -1695,7 +1610,8 @@ async fn extract_blob_digests(
     client: &reqwest::Client,
     manifest: &serde_json::Value,
     repo: &registry::RepoKey,
-    token: &str,
+    tokens: &registry::Tokens,
+    auth: Option<&corpus::DockerHubAuth>,
     blobs: &mut HashSet<(registry::RepoKey, String)>,
 ) {
     // Image manifest: has `layers` array.
@@ -1712,15 +1628,14 @@ async fn extract_blob_digests(
                 None => continue,
             };
             let url = format!("https://{}/v2/{}/manifests/{digest}", repo.host, repo.path);
-            let resp = client
-                .get(&url)
-                .header("Authorization", format!("Bearer {token}"))
-                .header(
-                    "Accept",
-                    "application/vnd.oci.image.manifest.v1+json,\
-                     application/vnd.docker.distribution.manifest.v2+json",
-                )
-                .send()
+            let resp = tokens
+                .send(client, &repo.repository(), auth, None, |token| {
+                    client.get(&url).bearer_auth(token).header(
+                        "Accept",
+                        "application/vnd.oci.image.manifest.v1+json,\
+                         application/vnd.docker.distribution.manifest.v2+json",
+                    )
+                })
                 .await;
             if let Ok(r) = resp {
                 if let Ok(body) = r.text().await {
@@ -2093,9 +2008,7 @@ images:
         )
         .unwrap();
         let corpus = two_image_corpus();
-        let (transfers, prepare) =
-            plan(Scenario::All, &corpus, overrides.to_str().unwrap()).unwrap();
-        assert!(prepare);
+        let transfers = plan(Scenario::All, &corpus, overrides.to_str().unwrap()).unwrap();
         let names: Vec<String> = transfers.iter().map(ToString::to_string).collect();
         assert_eq!(names, ["Sync", "Partial", "Scale"]);
 
@@ -2131,8 +2044,17 @@ images:
         for requested in [Scenario::Partial, Scenario::All] {
             assert!(plan(requested, &corpus, missing).is_err());
         }
-        let (transfers, prepare) = plan(Scenario::Prepare, &corpus, missing).unwrap();
-        assert!(transfers.is_empty() && prepare, "prepare reads no lock");
+        let transfers = plan(Scenario::Prepare, &corpus, missing).unwrap();
+        assert!(transfers.is_empty(), "prepare reads no lock");
+    }
+
+    #[test]
+    fn a_failure_after_the_stop_keeps_the_stop_reason() {
+        // Catches: a record that cannot be appended replacing the scenario
+        // failure that stopped the run.
+        let text = with_stop_reason("disk full".into(), Some("sync failed"));
+        assert!(text.contains("disk full") && text.contains("sync failed"));
+        assert_eq!(with_stop_reason("disk full".into(), None), "disk full");
     }
 
     #[test]
