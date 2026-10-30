@@ -906,7 +906,7 @@ struct MappingDescriptor {
     dropped_names: Vec<String>,
 }
 
-/// Per-mapping aggregated outcome derived from [`SyncReport.images`].
+/// Per-mapping aggregated outcome derived from [`SyncReport::images`].
 /// Used for log emission and watch-mode change detection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MappingOutcome {

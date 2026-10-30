@@ -1171,15 +1171,16 @@ impl PrewarmRateController {
 
     /// Record a successful response -- multiplicative increase.
     ///
-    /// Decreases interval by 10% (floor [`MIN_INTERVAL`]).
+    /// Decreases interval by 10% (floor [`MIN_INTERVAL`](Self::MIN_INTERVAL)).
     fn on_success(&mut self) {
         self.interval = self.interval.mul_f64(0.9).max(Self::MIN_INTERVAL);
     }
 
     /// Record a 429 throttle -- multiplicative decrease.
     ///
-    /// Doubles interval (cap [`MAX_INTERVAL`]). If a throttle already
-    /// occurred within the congestion epoch, this call is suppressed.
+    /// Doubles interval (cap [`MAX_INTERVAL`](Self::MAX_INTERVAL)). If a
+    /// throttle already occurred within the congestion epoch, this call is
+    /// suppressed.
     fn on_throttle(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_throttle) > self.epoch {

@@ -4,7 +4,7 @@
 //! Settings, the shared config and credentials files, signing, endpoint
 //! resolution, retries, clock-skew correction and error parsing are owned
 //! here, with no AWS SDK crate, and the credential chain in
-//! [`credentials`].
+//! `credentials`.
 
 mod calendar;
 mod config;

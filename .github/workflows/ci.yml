@@ -70,6 +70,13 @@ jobs:
           components: clippy
       - if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Here rather than its own job: it reuses the dependencies clippy just
+      # compiled, and Lint is a required check. Private items too, since most
+      # doc links point at crate-internal code.
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo doc --workspace --no-deps --document-private-items --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     name: Test (${{ matrix.runner }})

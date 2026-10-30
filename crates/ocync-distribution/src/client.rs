@@ -575,9 +575,10 @@ pub(crate) fn auth_headers(token: Option<&Token>) -> Result<HeaderMap, Error> {
     Ok(headers)
 }
 
-/// Report the AIMD permit outcome: [`AimdPermit::throttled`] on 429,
-/// [`AimdPermit::success`] otherwise. The permit's drop treats a transport
-/// error as success.
+/// Report the AIMD permit outcome:
+/// [`throttled`](crate::aimd::AimdPermit::throttled) on 429,
+/// [`success`](crate::aimd::AimdPermit::success) otherwise. The permit's drop
+/// treats a transport error as success.
 pub(crate) fn report_permit(
     permit: crate::aimd::AimdPermit<'_>,
     result: &Result<reqwest::Response, Error>,

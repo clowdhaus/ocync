@@ -6,7 +6,7 @@
 //! multi-GB benchmark corpora impractical).
 //!
 //! The proxy:
-//! - Listens on 127.0.0.1:<port> for HTTP/1.1 CONNECT requests
+//! - Listens on `127.0.0.1:<port>` for HTTP/1.1 CONNECT requests
 //! - Terminates client TLS with a dynamically-issued leaf cert signed by
 //!   a single long-lived CA (CA cert must already be trusted by the
 //!   client, e.g. installed into the system trust store)
