@@ -19,7 +19,7 @@ use clap::{Args, Subcommand};
 
 use corpus::Corpus;
 use regression::Baseline;
-use report::{BenchReport, ScenarioKind, ScenarioResult, ToolRun};
+use report::{BenchReport, ScenarioKind, ScenarioResult, ToolRun, find_scenario};
 use runner::Tool;
 
 /// Arguments for the bench subcommand.
@@ -341,12 +341,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // Check each tool binary and collect versions, along with any binary a tool
     // relays its transfers through, whose version moves that tool's numbers.
-    let mut tool_versions: BTreeMap<String, String> = BTreeMap::new();
+    let mut tool_versions: BTreeMap<Tool, String> = BTreeMap::new();
     let mut relay_versions: BTreeMap<String, String> = BTreeMap::new();
     for &tool in &tools {
         let version = runner::check_tool(tool, workspace_root).await?;
         eprintln!("  {}: {version}", tool);
-        tool_versions.insert(tool.to_string(), version);
+        tool_versions.insert(tool, version);
     }
 
     // Relays are shared between tools, so they are resolved once over the whole
@@ -416,7 +416,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         // CDN warming, network burst credit depletion, etc.
         let mut shuffled = tools.clone();
         let seed = shuffle_tools(&mut shuffled);
-        let tool_order: Vec<_> = shuffled.iter().map(|t| t.to_string()).collect();
+        let tool_order: Vec<String> = shuffled.iter().map(ToString::to_string).collect();
         eprintln!(
             "bench: tool order for {scenario:?}: {} (seed: {seed})",
             tool_order.join(", ")
@@ -424,16 +424,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
         match scenario {
             Scenario::Sync => {
-                let (cold, warm) = run_sync(
-                    &args,
-                    &corpus,
-                    &shuffled,
-                    &ecr_client,
-                    &output_dir,
-                    seed,
-                    &tool_order,
-                )
-                .await?;
+                let (cold, warm) =
+                    run_sync(&args, &corpus, &shuffled, &ecr_client, &output_dir, seed).await?;
                 report.scenarios.push(cold);
                 report.scenarios.push(warm);
             }
@@ -452,7 +444,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     &ecr_client,
                     &output_dir,
                     seed,
-                    &tool_order,
                 )
                 .await?;
                 report.scenarios.push(result);
@@ -513,9 +504,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             .scenarios
             .iter()
             .map(|s| report::ScenarioRecord {
-                name: s.scenario.clone(),
+                name: s.kind.label(),
                 shuffle_seed: s.shuffle_seed,
-                tool_order: s.tool_order.clone(),
+                tool_order: s.tool_order.iter().map(ToString::to_string).collect(),
                 tools: s
                     .runs
                     .iter()
@@ -523,7 +514,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                         tool: r.tool.to_string(),
                         version: report
                             .tool_versions
-                            .get(r.tool.binary())
+                            .get(&r.tool)
                             .cloned()
                             .unwrap_or_default(),
                         wall_clock_secs: r.wall_clock_secs,
@@ -563,9 +554,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 /// The ocync run of the cold sync scenario, the only run a baseline is
 /// comparable against.
 fn cold_ocync_run(scenarios: &[ScenarioResult]) -> Option<&ToolRun> {
-    scenarios
-        .iter()
-        .find(|s| s.kind == ScenarioKind::Cold)?
+    find_scenario(scenarios, ScenarioKind::Cold)?
         .runs
         .iter()
         .find(|r| r.tool == Tool::Ocync)
@@ -616,32 +605,20 @@ fn check_regression(
 
 /// Which run of a scenario a tool process is, named in its proxy log file.
 /// Each run needs its own, or a later one truncates the earlier one's
-/// `{tool}-{phase}-proxy.jsonl`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    /// The measured cold sync.
-    Cold,
-    /// The measured warm sync.
-    Warm,
+/// `{tool}-{pass}-proxy.jsonl`.
+#[derive(Clone, Copy, Debug)]
+enum Pass {
     /// The unmeasured sync that populates the target before a partial run.
     Prime,
-    /// The measured partial sync.
-    Partial,
-    /// The scale run at this many images.
-    Scale(usize),
-    /// The dry-run prepare measurement.
-    Prepare,
+    /// The measured run of a scenario.
+    Measured(ScenarioKind),
 }
 
-impl std::fmt::Display for Phase {
+impl std::fmt::Display for Pass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Cold => f.write_str("cold"),
-            Self::Warm => f.write_str("warm"),
             Self::Prime => f.write_str("prime"),
-            Self::Partial => f.write_str("partial"),
-            Self::Scale(images) => write!(f, "scale-{images}"),
-            Self::Prepare => f.write_str("prepare"),
+            Self::Measured(kind) => f.write_str(&kind.slug()),
         }
     }
 }
@@ -653,7 +630,7 @@ async fn run_single_tool(
     corpus: &Corpus,
     config_dir: &Path,
     output_dir: &Path,
-    phase: Phase,
+    pass: Pass,
     dry_run: bool,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
     // 1. Generate config.
@@ -680,7 +657,7 @@ async fn run_single_tool(
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
     let (proxy_handle, proxy_url) = if !args.no_proxy {
-        let log_path = output_dir.join(format!("{tool}-{phase}-proxy.jsonl"));
+        let log_path = output_dir.join(format!("{tool}-{pass}-proxy.jsonl"));
         let handle = proxy::start(
             &args.proxy_binary,
             &args.proxy_ca,
@@ -822,7 +799,6 @@ async fn run_sync(
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
     shuffle_seed: u64,
-    tool_order: &[String],
 ) -> Result<(ScenarioResult, ScenarioResult), Box<dyn std::error::Error>> {
     progress("bench: running cold+warm scenario");
     let mut cold_runs = Vec::new();
@@ -854,7 +830,7 @@ async fn run_sync(
                 corpus,
                 config_dir.path(),
                 output_dir,
-                Phase::Cold,
+                Pass::Measured(ScenarioKind::Cold),
                 false,
             )
             .await?;
@@ -884,7 +860,7 @@ async fn run_sync(
                 corpus,
                 config_dir.path(),
                 output_dir,
-                Phase::Warm,
+                Pass::Measured(ScenarioKind::Warm),
                 false,
             )
             .await?;
@@ -919,23 +895,20 @@ async fn run_sync(
     Ok((
         ScenarioResult {
             kind: ScenarioKind::Cold,
-            scenario: "Cold sync".to_string(),
             runs: cold_runs,
             shuffle_seed,
-            tool_order: tool_order.to_vec(),
+            tool_order: tools.to_vec(),
         },
         ScenarioResult {
             kind: ScenarioKind::Warm,
-            scenario: "Warm sync (no-op)".to_string(),
             runs: warm_runs,
             shuffle_seed,
-            tool_order: tool_order.to_vec(),
+            tool_order: tools.to_vec(),
         },
     ))
 }
 
 /// Partial scenario: prime with base corpus, then sync with partial corpus.
-#[allow(clippy::too_many_arguments)]
 async fn run_partial(
     args: &BenchArgs,
     base_corpus: &Corpus,
@@ -944,7 +917,6 @@ async fn run_partial(
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
     shuffle_seed: u64,
-    tool_order: &[String],
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
     progress("bench: running partial scenario");
     let mut runs = Vec::new();
@@ -965,7 +937,7 @@ async fn run_partial(
                 base_corpus,
                 config_dir.path(),
                 output_dir,
-                Phase::Prime,
+                Pass::Prime,
                 false,
             )
             .await?;
@@ -985,7 +957,7 @@ async fn run_partial(
                 partial_corpus,
                 config_dir.path(),
                 output_dir,
-                Phase::Partial,
+                Pass::Measured(ScenarioKind::Partial),
                 false,
             )
             .await?;
@@ -1014,10 +986,9 @@ async fn run_partial(
 
     Ok(ScenarioResult {
         kind: ScenarioKind::Partial,
-        scenario: "Partial sync (~5% changed)".to_string(),
         runs,
         shuffle_seed,
-        tool_order: tool_order.to_vec(),
+        tool_order: tools.to_vec(),
     })
 }
 
@@ -1060,7 +1031,7 @@ async fn run_scale(
                     &subset,
                     config_dir.path(),
                     output_dir,
-                    Phase::Scale(size),
+                    Pass::Measured(ScenarioKind::Scale { images: size }),
                     false,
                 )
                 .await?;
@@ -1085,7 +1056,6 @@ async fn run_scale(
 
         scale_results.push(ScenarioResult::unshuffled(
             ScenarioKind::Scale { images: size },
-            format!("Scale ({size} images)"),
             runs,
         ));
     }
@@ -1128,7 +1098,7 @@ async fn run_prepare(
         &corpus,
         config_dir.path(),
         output_dir,
-        Phase::Prepare,
+        Pass::Measured(ScenarioKind::Prepare),
         true,
     )
     .await?;
@@ -1144,11 +1114,7 @@ async fn run_prepare(
         .into());
     }
 
-    Ok(ScenarioResult::unshuffled(
-        ScenarioKind::Prepare,
-        "Prepare (dry-run)",
-        vec![run],
-    ))
+    Ok(ScenarioResult::unshuffled(ScenarioKind::Prepare, vec![run]))
 }
 
 /// Sleep for 30 seconds between benchmark runs to let rate limits recover.
@@ -2074,17 +2040,12 @@ mod tests {
     fn cold_ocync_run_skips_scale_and_prepare_runs() {
         let scale = ScenarioResult::unshuffled(
             ScenarioKind::Scale { images: 10 },
-            "Scale (10 images)",
             vec![tool_run(Tool::Ocync, 1.0)],
         );
-        let prepare = ScenarioResult::unshuffled(
-            ScenarioKind::Prepare,
-            "Prepare (dry-run)",
-            vec![tool_run(Tool::Ocync, 2.0)],
-        );
+        let prepare =
+            ScenarioResult::unshuffled(ScenarioKind::Prepare, vec![tool_run(Tool::Ocync, 2.0)]);
         let cold = ScenarioResult::unshuffled(
             ScenarioKind::Cold,
-            "Cold sync",
             vec![tool_run(Tool::Dregsy, 9.0), tool_run(Tool::Ocync, 3.0)],
         );
         let scenarios = vec![scale, prepare, cold];
@@ -2094,14 +2055,18 @@ mod tests {
     }
 
     #[test]
-    fn phase_names_the_proxy_log_per_run() {
-        assert_eq!(Phase::Cold.to_string(), "cold");
-        assert_eq!(Phase::Warm.to_string(), "warm");
-        assert_eq!(Phase::Prime.to_string(), "prime");
-        assert_eq!(Phase::Partial.to_string(), "partial");
-        assert_eq!(Phase::Prepare.to_string(), "prepare");
-        assert_eq!(Phase::Scale(10).to_string(), "scale-10");
-        assert_ne!(Phase::Scale(10).to_string(), Phase::Scale(25).to_string());
+    fn every_pass_names_its_own_proxy_log() {
+        let passes = [
+            Pass::Prime,
+            Pass::Measured(ScenarioKind::Cold),
+            Pass::Measured(ScenarioKind::Warm),
+            Pass::Measured(ScenarioKind::Partial),
+            Pass::Measured(ScenarioKind::Scale { images: 10 }),
+            Pass::Measured(ScenarioKind::Scale { images: 25 }),
+            Pass::Measured(ScenarioKind::Prepare),
+        ];
+        let names: BTreeSet<String> = passes.iter().map(ToString::to_string).collect();
+        assert_eq!(names.len(), passes.len(), "{names:?}");
     }
 
     #[test]

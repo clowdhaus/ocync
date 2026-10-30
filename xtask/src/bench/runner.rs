@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// Benchmark tool variant.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// Benchmark tool variant. Declaration order is the order of columns in the
+/// reports, so ocync leads.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) enum Tool {
     /// The ocync OCI sync tool.
     Ocync,

@@ -170,23 +170,21 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     let git_sha = resolve_commit(Path::new("."), &git_ref)?;
     eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
 
-    // Build the bench command args. Shell-escape all user-supplied
-    // values to prevent injection via crafted tool names, registry
-    // names, or scenario strings.
-    let mut bench_args = format!("--tools '{}'", shell_escape(&args.tools));
+    // The benchmark's arguments, unquoted: `remote_script` quotes each one.
+    let mut bench_args = vec!["--tools".to_string(), args.tools.clone()];
     if let Some(limit) = args.limit {
-        bench_args.push_str(&format!(" --limit {limit}"));
+        bench_args.extend(["--limit".to_string(), limit.to_string()]);
     }
-    if let Some(ref skip) = args.skip_registries {
-        bench_args.push_str(&format!(" --skip-registries '{}'", shell_escape(skip)));
+    if let Some(skip) = &args.skip_registries {
+        bench_args.extend(["--skip-registries".to_string(), skip.clone()]);
     }
     if args.skip_prewarm {
-        bench_args.push_str(" --skip-prewarm");
+        bench_args.push("--skip-prewarm".to_string());
     }
     if args.no_proxy {
-        bench_args.push_str(" --no-proxy");
+        bench_args.push("--no-proxy".to_string());
     }
-    bench_args.push_str(&format!(" '{}'", shell_escape(&args.scenario)));
+    bench_args.push(args.scenario.clone());
 
     // Determine the target registry from the provider.
     let registry_env = match config.provider.as_str() {
@@ -260,7 +258,9 @@ impl RemoteOutcome {
 
 /// Command that receives the script on stdin. `setsid -w` makes the script
 /// lead its own process group, so `$$` is a group id `--force` can kill, and
-/// waits so the script's exit status is the command's.
+/// waits so the script's exit status is the command's. The benchmark runner is
+/// a member of this group and, being a child of the script, outlives the SSH
+/// session without a session of its own.
 const REMOTE_COMMAND: &str = "setsid -w bash -s";
 
 /// Pipe a script to the remote instance via SSH and stream stdout.
@@ -450,15 +450,38 @@ const RUN_IN_PROGRESS_LINE: &str = "bench-remote: a benchmark is already running
 /// Seconds `--force` waits for a killed run to release the run lock.
 const KILL_WAIT_SECS: u32 = 30;
 
+/// Exit status `flock -E` reports when the lock is held by someone else. No
+/// other `flock` failure, such as 127 for a missing binary, uses it.
+const FLOCK_HELD_EXIT: u8 = 75;
+
+/// Shell that classifies the status `$rc` of a `flock -E` attempt: 0 means the
+/// lock is taken, [`FLOCK_HELD_EXIT`] means it is held by someone else (the
+/// caller's `held` branch), and anything else is a failure that must not be
+/// mistaken for a held lock.
+fn flock_status_check(held: &str) -> String {
+    format!(
+        r#"if [ "$rc" -eq {FLOCK_HELD_EXIT} ]; then
+  {held}
+elif [ "$rc" -ne 0 ]; then
+  echo "bench-remote: error: flock failed (exit $rc); is util-linux installed?"
+  exit 1
+fi"#
+    )
+}
+
 /// Shell that takes the run lock on fd 9, handling a live holder per
-/// `existing`, and then forgets the previous run's process group.
+/// `existing`, and then records this script's process group in `$PGID_FILE`.
 ///
 /// Needs `$LOCK_FILE` and `$PGID_FILE`. The lock is held until every process
 /// holding fd 9 exits, so it spans checkout, build and the benchmark and
-/// outlives the SSH session, and the kernel drops it when they die. Liveness
-/// is the lock alone. `$PGID_FILE`, written by each process group leader
-/// of the run (the script, then the benchmark), only says whom to kill, and is read only while the lock is
-/// held by someone else.
+/// outlives the SSH session, and the kernel drops it when they die. Every
+/// process that can hold fd 9 is in the process group `$PGID_FILE` names, which
+/// is never removed: liveness is the lock alone, and the file only says whom
+/// `--force` kills. It is read only while the lock is held by someone else.
+///
+/// Only `flock` exit status [`FLOCK_HELD_EXIT`] means "held". Any other failure
+/// stops the script without the refusal line, so it is never taken for a live
+/// run.
 ///
 /// A new run never attaches to an old one, since the old one may be running a
 /// binary built from different source.
@@ -468,24 +491,28 @@ fn existing_run_guard(existing: ExistingRun) -> String {
             r#"echo "{RUN_IN_PROGRESS_LINE}"
   exit 3"#
         ),
-        ExistingRun::Kill => format!(
-            r#"OLD_PGID=$(cat "$PGID_FILE" 2>/dev/null || true)
+        ExistingRun::Kill => {
+            let wait_status = flock_status_check(&format!(
+                r#"echo "bench-remote: error: the run lock is still held after {KILL_WAIT_SECS}s"
+  exit 1"#
+            ));
+            format!(
+                r#"OLD_PGID=$(cat "$PGID_FILE" 2>/dev/null || true)
   if [[ "$OLD_PGID" =~ ^[0-9]+$ ]] && [ "$OLD_PGID" -gt 1 ]; then
     echo "bench-remote: --force killing process group $OLD_PGID"
     kill -9 -- "-$OLD_PGID" 2>/dev/null || true
   fi
-  if ! flock -w {KILL_WAIT_SECS} 9; then
-    echo "bench-remote: error: the run lock is still held after {KILL_WAIT_SECS}s"
-    exit 1
-  fi"#
-        ),
+  rc=0; flock -w {KILL_WAIT_SECS} -E {FLOCK_HELD_EXIT} 9 || rc=$?
+  {wait_status}"#
+            )
+        }
     };
+    let status = flock_status_check(&on_held);
     format!(
         r#"exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  {on_held}
-fi
-rm -f "$PGID_FILE""#
+rc=0; flock -n -E {FLOCK_HELD_EXIT} 9 || rc=$?
+{status}
+echo "$$" > "$PGID_FILE""#
     )
 }
 
@@ -493,38 +520,55 @@ rm -f "$PGID_FILE""#
 /// ended.
 ///
 /// Fixed text: the benchmark's arguments arrive as `"$@"`, never as script
-/// source. Run as its own session leader (`setsid`), so `$$` is the process
-/// group of the harness and every tool it spawns, and `--force` can kill them
-/// together. Needs `$PGID_FILE` and `$EXIT_FILE`. The exit status is captured
-/// with `if` because `set -e` would otherwise end the script before recording
-/// it.
+/// source. It runs in the remote script's process group, so `--force` kills the
+/// harness and every tool it spawns with the rest of the run. Needs
+/// `$EXIT_FILE`. The exit status is captured with `if` because `set -e` would
+/// otherwise end the script before recording it.
 const BENCH_RUNNER: &str = r#"set -euo pipefail
-echo "$$" > "$PGID_FILE"
 if cargo xtask bench "$@" 2>&1; then BENCH_EXIT=0; else BENCH_EXIT=$?; fi
 echo "$BENCH_EXIT" > "$EXIT_FILE"
 echo "[bench-remote] exit code: $BENCH_EXIT"
-rm -f "$PGID_FILE"
 exit "$BENCH_EXIT""#;
 
 /// Removes untracked files left by previous builds, keeping the build cache,
 /// results and the run's own files. The run-file pattern is quoted so the
-/// shell cannot expand it against the files present.
+/// shell cannot expand it against the files present. Runs with fd 9 closed
+/// like every git command in the script, see [`remote_script`].
 const GIT_CLEAN: &str =
-    "git clean -fdx -e target/ -e bench/results/ -e 'bench/.bench-run.*' -e bench/.tmp/";
+    "git clean -fdx -e target/ -e bench/results/ -e 'bench/.bench-run.*' -e bench/.tmp/ 9>&-";
 
-/// The script piped to `bash -s` on the instance.
+/// Shell that starts the benchmark runner in the background in the script's
+/// own process group, passing `bench_args` as one quoted word each so no
+/// value is ever shell source.
+fn runner_launch(bench_args: &[String]) -> String {
+    let quoted: Vec<String> = bench_args
+        .iter()
+        .map(|arg| format!("'{}'", shell_escape(arg)))
+        .collect();
+    format!(
+        r#"bash "$RUNNER_FILE" {} >> "$LOG_FILE" 2>&1 &"#,
+        quoted.join(" ")
+    )
+}
+
+/// The script piped to [`REMOTE_COMMAND`] on the instance.
 ///
-/// Every value is already shell-escaped or trusted: `bench_args` and
-/// `registry_env` are shell text, and a [`CommitSha`] is hex.
+/// Every value is already shell-escaped or trusted: `bench_args` are quoted
+/// here, `registry_env` is shell text, and a [`CommitSha`] is hex.
+///
+/// Git commands run with fd 9 (the run lock) closed: git can daemonize a
+/// background gc that calls `setsid`, which would hold the lock from outside
+/// the process group `--force` kills.
 fn remote_script(
     git_ref: &str,
     git_sha: &CommitSha,
-    bench_args: &str,
+    bench_args: &[String],
     registry_env: &str,
     existing: ExistingRun,
 ) -> String {
     let existing_run = existing_run_guard(existing);
     let escaped_git_ref = shell_escape(git_ref);
+    let runner_launch = runner_launch(bench_args);
     format!(
         r#"#!/bin/bash
 set -euo pipefail
@@ -554,17 +598,16 @@ EXIT_FILE=bench/.bench-run.exit
 RUNNER_FILE=bench/.bench-run.sh
 # The run lock is held from here to the end of the benchmark, so a second
 # invocation cannot delete target/ under a run that is still checking out or
-# building. The script leads its own process group (see REMOTE_COMMAND), so
-# --force can end a run that has not started the benchmark yet.
+# building. The script leads its own process group (see REMOTE_COMMAND) and
+# the benchmark runner stays in it, so --force can end the run at any stage.
 {existing_run}
-echo "$$" > "$PGID_FILE"
 
 # Pull code and build. Use exact SHA (not branch name) so force-pushes
 # between our local push and the instance's fetch cannot change what gets
 # built. The SHA is resolved locally before pushing and is immutable.
 echo '[1/4] Checking out {git_sha} ({escaped_git_ref})...'
-git fetch origin
-git checkout '{git_sha}' --detach
+git fetch origin 9>&-
+git checkout '{git_sha}' --detach 9>&-
 # Remove untracked files left by previous builds or deleted from the repo.
 {GIT_CLEAN}
 
@@ -596,16 +639,17 @@ rm -rf "$TMPDIR"
 mkdir -p "$TMPDIR"
 {registry_env}
 
-# Launch detached with output to log file, as its own process group so
-# --force can kill the harness and every tool it spawned. fd 9 (the run lock)
-# is inherited, so the lock outlives this SSH session.
+# Launch in the background with output to the log file. The runner stays in
+# this script's process group, so --force kills the harness and every tool it
+# spawned. fd 9 (the run lock) is inherited, so the lock outlives this SSH
+# session.
 > "$LOG_FILE"
 rm -f "$EXIT_FILE"
 cat > "$RUNNER_FILE" <<'RUNNER_EOF'
 {BENCH_RUNNER}
 RUNNER_EOF
-export PGID_FILE EXIT_FILE
-setsid bash "$RUNNER_FILE" {bench_args} >> "$LOG_FILE" 2>&1 &
+export EXIT_FILE
+{runner_launch}
 BENCH_PID=$!
 echo "bench-remote: started (PID $BENCH_PID), streaming log..."
 
@@ -646,7 +690,7 @@ fn git_rev_parse(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::erro
 
 /// A full commit object name: 40 lowercase hex digits, safe to place in a
 /// shell command unescaped.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct CommitSha(String);
 
 impl CommitSha {
@@ -815,7 +859,11 @@ mod tests {
         remote_script(
             "main",
             &CommitSha::parse(SHA).unwrap(),
-            "--tools 'ocync' 'all'",
+            &[
+                "--tools".to_string(),
+                "ocync".to_string(),
+                "all".to_string(),
+            ],
             "export BENCH_TARGET_REGISTRY=registry.example.com",
             existing,
         )
@@ -830,21 +878,57 @@ mod tests {
                     .find(needle)
                     .unwrap_or_else(|| panic!("{needle:?} missing from the script"))
             };
-            let guard = at("flock -n 9");
-            // The first occurrence is the script's own; the runner's comes later.
-            let record = at(r#"echo "$$" > "$PGID_FILE""#);
-            assert!(guard < record, "{existing:?}: group recorded before guard");
-            assert!(
-                record < at("git checkout"),
-                "{existing:?}: group recorded after checkout"
-            );
+            let guard = at("flock -n");
             assert!(
                 guard < at("git checkout"),
                 "{existing:?}: guard after checkout"
             );
             assert!(guard < at("rm -rf target/"), "{existing:?}: guard after rm");
-            assert!(at("setsid bash") > at("rm -rf target/"));
+            assert!(at(r#"bash "$RUNNER_FILE""#) > at("rm -rf target/"));
+            assert!(
+                !script.contains("setsid bash"),
+                "{existing:?}: the runner must stay in the script's group"
+            );
+            assert!(
+                !script.contains("rm -f \"$PGID_FILE\""),
+                "{existing:?}: the group file must never be removed"
+            );
+            assert_eq!(
+                script.matches(r#"> "$PGID_FILE""#).count(),
+                1,
+                "{existing:?}: only the guard records the group"
+            );
         }
+    }
+
+    #[test]
+    fn git_runs_with_the_run_lock_closed() {
+        let script = script_for(ExistingRun::Refuse);
+        let git_lines: Vec<&str> = script
+            .lines()
+            .filter(|line| line.starts_with("git "))
+            .collect();
+        assert_eq!(git_lines.len(), 3, "fetch, checkout, clean: {git_lines:?}");
+
+        // Each line runs against a stand-in `git` that reports whether fd 9
+        // was open when it was called.
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen");
+        let probe = format!(
+            "git() {{ if [ -e /dev/fd/9 ]; then echo open; else echo closed; fi >> \"$SEEN\"; }}\n\
+             exec 9>/dev/null\n{}",
+            git_lines.join("\n")
+        );
+        let status = Command::new("bash")
+            .args(["-c", &probe])
+            .env("SEEN", &seen)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            "closed\nclosed\nclosed\n"
+        );
     }
 
     #[test]
@@ -912,15 +996,18 @@ mod tests {
         assert!(!stray.exists(), "the stray file survived");
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum Previous {
         /// A run holds the lock, in its own process group.
         Live,
+        /// The run's group leader is gone, but another member of the group
+        /// still holds the lock.
+        LeaderGone,
         /// No run holds the lock, and a stale group file names a bystander.
         Dead,
     }
 
-    /// Starts `sleep` as its own session leader, so its pid is its group id.
+    /// Starts `script` as its own session leader, so its pid is its group id.
     fn session_leader(script: &str, lock: &Path) -> std::process::Child {
         Command::new("setsid")
             .args(["bash", "-c", script])
@@ -930,91 +1017,116 @@ mod tests {
             .unwrap()
     }
 
+    /// Whether any process is left in process group `pgid`.
+    fn group_alive(pgid: u32) -> bool {
+        Command::new("bash")
+            .args(["-c", r#"kill -0 -- "-$0" 2>/dev/null"#, &pgid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Runs the guard for `existing` followed by `echo proceeded`, with
+    /// `path` as the guard's `PATH` when given.
+    fn run_guard(
+        existing: ExistingRun,
+        lock: &Path,
+        pgid_file: &Path,
+        path: Option<&Path>,
+    ) -> std::process::Output {
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(format!(
+                "set -euo pipefail\necho \"guard pid $$\"\n{}\necho proceeded",
+                existing_run_guard(existing)
+            ))
+            .env("LOCK_FILE", lock)
+            .env("PGID_FILE", pgid_file);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        command.output().unwrap()
+    }
+
     #[test]
     fn existing_run_guard_refuses_kills_or_proceeds() {
         use std::os::unix::process::ExitStatusExt;
 
         const REFUSAL: &str = "bench-remote: a benchmark is already running on this instance";
         // (policy, previous run, guard exit, refusal printed, proceeded,
-        //  group file left behind, previous run survives)
+        //  previous run survives)
         let rows = [
+            (ExistingRun::Refuse, Previous::Live, 3, true, false, true),
+            (ExistingRun::Kill, Previous::Live, 0, false, true, false),
             (
                 ExistingRun::Refuse,
-                Previous::Live,
+                Previous::LeaderGone,
                 3,
                 true,
                 false,
                 true,
-                true,
             ),
             (
                 ExistingRun::Kill,
-                Previous::Live,
+                Previous::LeaderGone,
                 0,
                 false,
                 true,
                 false,
-                false,
             ),
-            (
-                ExistingRun::Refuse,
-                Previous::Dead,
-                0,
-                false,
-                true,
-                false,
-                true,
-            ),
-            (
-                ExistingRun::Kill,
-                Previous::Dead,
-                0,
-                false,
-                true,
-                false,
-                true,
-            ),
+            (ExistingRun::Refuse, Previous::Dead, 0, false, true, true),
+            (ExistingRun::Kill, Previous::Dead, 0, false, true, true),
         ];
-        for (n, (existing, previous, code, refusal, proceeded, file_left, survives)) in
+        for (n, (existing, previous, code, refusal, proceeded, survives)) in
             rows.into_iter().enumerate()
         {
             let dir = tempfile::tempdir().unwrap();
             let lock = dir.path().join("run.lock");
             let pgid_file = dir.path().join("run.pgid");
 
-            // The live run takes the lock before saying so; the dead row's
-            // bystander only exists so a stale group file has someone to hit.
+            // The live run takes the lock before saying so. In the
+            // leader-gone row a `sleep` in the group inherits fd 9 and the
+            // leader exits. The dead row's bystander only exists so a stale
+            // group file has someone to hit.
             let script = match previous {
                 Previous::Live => r#"exec 9>"$LOCK_FILE"; flock -n 9; echo held; exec sleep 30"#,
+                Previous::LeaderGone => r#"exec 9>"$LOCK_FILE"; flock -n 9; sleep 30 & echo held"#,
                 Previous::Dead => "echo idle; exec sleep 30",
             };
-            let mut other = session_leader(script, &lock);
+            let mut leader = session_leader(script, &lock);
+            let pgid = leader.id();
             let mut ready = String::new();
-            BufReader::new(other.stdout.take().unwrap())
+            BufReader::new(leader.stdout.take().unwrap())
                 .read_line(&mut ready)
                 .unwrap();
-            std::fs::write(&pgid_file, other.id().to_string()).unwrap();
+            std::fs::write(&pgid_file, pgid.to_string()).unwrap();
+            let leader_exit = (previous == Previous::LeaderGone).then(|| leader.wait().unwrap());
+            if let Some(exit) = leader_exit {
+                assert!(exit.success(), "row {n}: setup leader: {exit}");
+                assert!(group_alive(pgid), "row {n}: the lock holder is gone");
+            }
 
-            let out = Command::new("bash")
-                .arg("-c")
-                .arg(format!(
-                    "set -euo pipefail\n{}\necho proceeded",
-                    existing_run_guard(existing)
-                ))
-                .env("LOCK_FILE", &lock)
-                .env("PGID_FILE", &pgid_file)
-                .output()
-                .unwrap();
+            let out = run_guard(existing, &lock, &pgid_file, None);
             let stdout = String::from_utf8(out.stdout).unwrap();
 
             let survived = if survives {
-                let alive = other.try_wait().unwrap().is_none();
-                other.kill().ok();
-                other.wait().unwrap();
+                let alive = group_alive(pgid);
+                Command::new("bash")
+                    .args(["-c", r#"kill -9 -- "-$0" 2>/dev/null"#, &pgid.to_string()])
+                    .status()
+                    .unwrap();
+                leader.wait().unwrap();
                 alive
             } else {
                 // The guard, not this test, must have ended it: by SIGKILL.
-                other.wait().unwrap().signal() == Some(9)
+                let by_guard = leader_exit.is_some() || leader.wait().unwrap().signal() == Some(9);
+                // A killed member may linger as a zombie until it is reaped.
+                let gone = (0..100).any(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    !group_alive(pgid)
+                });
+                by_guard && gone
             };
             assert_eq!(
                 out.status.code(),
@@ -1031,42 +1143,110 @@ mod tests {
                 proceeded,
                 "row {n}: proceeded: {stdout}"
             );
-            assert_eq!(pgid_file.exists(), file_left, "row {n}: group file");
+            // A guard that proceeds records its own group, and one that stops
+            // leaves the previous run's group named.
+            let guard_pid = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("guard pid "))
+                .unwrap();
+            let previous_pgid = pgid.to_string();
+            let recorded = if proceeded { guard_pid } else { &previous_pgid };
+            assert_eq!(
+                std::fs::read_to_string(&pgid_file).unwrap().trim(),
+                recorded,
+                "row {n}: group file"
+            );
             assert!(survived, "row {n}: previous run survival, want {survives}");
         }
     }
 
     #[test]
-    fn bench_runner_records_a_failing_run() {
+    fn a_flock_that_fails_is_an_error_not_a_held_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // A `flock` that exits 127 ahead of any real one on the guard's PATH.
+        let stub = bin.join("flock");
+        std::fs::write(&stub, "#!/bin/sh\nexit 127\n").unwrap();
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+
+        for existing in [ExistingRun::Refuse, ExistingRun::Kill] {
+            let out = run_guard(
+                existing,
+                &dir.path().join("run.lock"),
+                &dir.path().join("run.pgid"),
+                Some(Path::new(&path)),
+            );
+            let stdout = String::from_utf8(out.stdout).unwrap();
+
+            assert_eq!(out.status.code(), Some(1), "{existing:?}: {stdout}");
+            assert!(
+                stdout.contains("bench-remote: error: flock failed (exit 127)"),
+                "{existing:?}: {stdout}"
+            );
+            assert!(
+                !stdout.contains(RUN_IN_PROGRESS_LINE),
+                "{existing:?}: {stdout}"
+            );
+            assert!(!stdout.contains("proceeded"), "{existing:?}: {stdout}");
+        }
+    }
+
+    #[test]
+    fn the_remote_command_runs_the_script_as_a_group_leader() {
+        use std::os::unix::process::CommandExt;
+
+        // The script exits 9 unless `setsid -w` made it lead its own group,
+        // and 5 otherwise, which the command must pass through. The command
+        // itself starts as a group leader, as `ssh` does under a shell, so
+        // `setsid` forks and only `-w` carries the script's status back.
+        let mut child = Command::new("bash")
+            .args(["-c", REMOTE_COMMAND])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"[ \"$(ps -o pgid= -p $$ | tr -d ' ')\" = \"$$\" ] || exit 9\nexit 5\n")
+            .unwrap();
+
+        assert_eq!(child.wait().unwrap().code(), Some(5));
+    }
+
+    #[test]
+    fn bench_runner_records_a_failing_run_and_passes_its_arguments_whole() {
         let dir = tempfile::tempdir().unwrap();
         let file = |name: &str| dir.path().join(name);
         // `cargo` is a function so the test needs no executable on disk. It
-        // fails with 7 and records what the runner handed it.
-        let script = format!(
-            "cargo() {{ echo \"$*\" > \"$SEEN_ARGS\"; cat \"$PGID_FILE\" > \"$SEEN_PGID\"; \
-             echo \"$$\" > \"$SEEN_PID\"; return 7; }}\n{}",
-            BENCH_RUNNER
-        );
+        // fails with 7 and records one argument per line.
+        std::fs::write(
+            file("runner.sh"),
+            format!(
+                "cargo() {{ printf '%s\\n' \"$@\" > \"$SEEN_ARGS\"; return 7; }}\n{BENCH_RUNNER}"
+            ),
+        )
+        .unwrap();
+        let bench_args = ["--tools", "oc ync", "it's", "cold"].map(String::from);
 
+        // The launch line is the one the remote script runs.
         let status = Command::new("bash")
-            .args(["-c", &script, "runner", "--tools", "ocync", "cold"])
-            .env("PGID_FILE", file("pgid"))
+            .args(["-c", &format!("{}\nwait $!", runner_launch(&bench_args))])
+            .env("RUNNER_FILE", file("runner.sh"))
+            .env("LOG_FILE", file("log"))
             .env("EXIT_FILE", file("exit"))
             .env("SEEN_ARGS", file("args"))
-            .env("SEEN_PGID", file("seen-pgid"))
-            .env("SEEN_PID", file("seen-pid"))
             .status()
             .unwrap();
 
         let read = |name: &str| std::fs::read_to_string(file(name)).unwrap();
         assert_eq!(status.code(), Some(7));
         assert_eq!(read("exit").trim(), "7");
-        assert_eq!(read("args").trim(), "xtask bench --tools ocync cold");
-        assert_eq!(
-            read("seen-pgid"),
-            read("seen-pid"),
-            "group file names the runner"
-        );
-        assert!(!file("pgid").exists(), "group file removed at the end");
+        assert_eq!(read("args"), "xtask\nbench\n--tools\noc ync\nit's\ncold\n");
     }
 }

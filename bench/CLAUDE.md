@@ -35,7 +35,7 @@ cargo xtask bench-remote --provider aws --fetch
 cargo xtask bench-remote --provider aws --force --scenario sync
 ```
 
-**A run in progress is refused unless `--force`.** A run lock on the instance (`bench/.bench-run.lock`) is held from the start of checkout until the benchmark and every tool it spawned have exited, so a second `bench-remote` cannot delete `target/` under a build. `--force` kills the benchmark's whole process group, then takes the lock. `--fetch` conflicts with `--force` and `--git-ref`, since it starts nothing.
+**A run in progress is refused unless `--force`.** A run lock on the instance (`bench/.bench-run.lock`) is held from the start of checkout until the benchmark and every tool it spawned have exited, so a second `bench-remote` cannot delete `target/` under a build. The remote script, the build and the benchmark runner share one process group, recorded in `bench/.bench-run.pgid` and never removed (the lock, not the file, says whether a run is live). `--force` kills that group, then takes the lock. Git runs with the lock's fd closed so a daemonized git cannot hold it from outside the group. Only `flock` exit 75 means held; any other `flock` failure aborts without the refusal. `--fetch` conflicts with `--force` and `--git-ref`, since it starts nothing.
 
 **What it does:**
 1. `git push` the current branch

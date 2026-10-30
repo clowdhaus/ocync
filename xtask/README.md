@@ -32,9 +32,11 @@ A run already in progress on the instance, including one still checking out or b
 |--------|------|---------|-------------|
 | `--provider` | string | (required) | Cloud provider; reads `bench/terraform/<provider>/bench.json` |
 | `--scenario` | string | `all` | Scenario to run (passed through to `bench`) |
-| `--tools` | string | `ocync,dregsy,regsync` | Tools to benchmark |
-| `--iterations` | string | `1` | Cold-sync iterations (picks median) |
+| `--tools` | string | `ocync` | Tools to benchmark |
 | `--limit` | integer | all | Use first N corpus images only |
+| `--skip-registries` | string | | Comma-separated source registries to skip |
+| `--skip-prewarm` | flag | | Skip CDN pre-warming |
+| `--no-proxy` | flag | | Run without bench-proxy on the instance |
 | `--fetch` | flag | | Fetch results from last run (partial results while one is live) without re-running; conflicts with `--force` and `--git-ref` |
 | `--force` | flag | | Kill a running benchmark and start fresh; without it a live run is refused |
 | `--git-ref` | string | current branch | Git ref to checkout on the instance |
