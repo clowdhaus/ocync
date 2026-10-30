@@ -179,7 +179,6 @@ pub(crate) async fn start(
 pub(crate) async fn stop(
     mut handle: ProxyHandle,
 ) -> Result<Vec<ProxyEntry>, Box<dyn std::error::Error>> {
-    // Send SIGTERM so the proxy can flush its log and exit cleanly.
     if let Some(pid) = handle.child.id() {
         let _ = std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])
@@ -188,7 +187,6 @@ pub(crate) async fn stop(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // If still running after SIGTERM, fall back to SIGKILL.
     match handle.child.try_wait()? {
         Some(_) => {} // Exited gracefully.
         None => {
@@ -270,7 +268,6 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
     let mut auth_token_requests = 0u64;
     let mut referrer_calls = 0u64;
 
-    // Track GET requests to blob URLs for duplicate detection.
     let mut blob_get_counts: HashMap<String, u64> = HashMap::new();
 
     for entry in entries {
@@ -325,7 +322,6 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
             }
         }
 
-        // Auth request tracking.
         if entry.method == "GET" {
             if entry.url == "/v2/" {
                 auth_v2_pings += 1;

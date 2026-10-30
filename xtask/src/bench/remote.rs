@@ -159,7 +159,6 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         None => current_branch()?,
     };
 
-    // Push current branch so the instance can pull it.
     eprintln!("bench-remote: pushing {git_ref}...");
     let push = Command::new("git")
         .args(["push", "origin", &git_ref])
@@ -168,10 +167,9 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         return Err("git push failed".into());
     }
 
-    // Resolve to exact SHA after pushing. The remote script checks out this
-    // SHA, not the branch name. This makes the build immune to force-pushes
-    // that land between our push and the instance's fetch -- the SHA is
-    // immutable even if the branch ref moves.
+    // The remote script checks out this SHA, not the branch name, so a
+    // force-push landing between our push and the instance's fetch cannot
+    // change what is built.
     let git_sha = resolve_commit(Path::new("."), &git_ref)?;
     eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
 
@@ -191,7 +189,6 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     }
     bench_args.push(value_name(&args.scenario));
 
-    // Determine the target registry from the provider.
     let registry_env = match config.provider {
         Provider::Aws => {
             "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com".to_string()
@@ -318,12 +315,10 @@ fn ssh_stream(
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    // Write script to stdin, then close to signal EOF.
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(script.as_bytes())?;
     }
 
-    // Stream stdout line by line for real-time progress.
     let mut sentinel = None;
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
@@ -343,7 +338,6 @@ fn fetch_results(
     config: &BenchConfig,
     local_output: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Find the most recent results directory.
     let ls_output = ssh_run(
         config,
         "ls -td ~/ocync/bench/results/2* 2>/dev/null | head -1",
@@ -369,7 +363,6 @@ fn fetch_results(
         std::fs::remove_dir_all(&local_dir)?;
     }
 
-    // SCP the results directory (no trailing slash on source).
     eprintln!(
         "bench-remote: copying {remote_dir} to {}",
         local_dir.display()
@@ -385,7 +378,6 @@ fn fetch_results(
         return Err("scp failed".into());
     }
 
-    // Also fetch all per-registry JSON archives (excluding baseline.json).
     let json_files = ssh_run(
         config,
         "ls ~/ocync/bench/results/*.json 2>/dev/null | grep -v baseline",
@@ -430,7 +422,6 @@ fn fetch_results(
         }
     }
 
-    // Print the summary.
     let summary = ssh_run(
         config,
         &format!("cat {remote_dir}/summary.md 2>/dev/null || true"),

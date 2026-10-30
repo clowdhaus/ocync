@@ -73,13 +73,10 @@ impl std::fmt::Debug for CaSigner {
 impl CaSigner {
     /// Look up or generate a leaf certificate for `sni_host`.
     ///
-    /// Synchronous because rustls's `ResolvesServerCert::resolve` is
-    /// itself sync - it's invoked on the connection-driving task and
-    /// cannot call `.await`. Using a synchronous `std::sync::RwLock`
-    /// avoids the "runtime-in-runtime" panic from `block_on`-ing a
-    /// `tokio::sync::RwLock` from within the executor. Leaf generation
-    /// (ECDSA keygen + one CA sign) takes ~1 ms; cache hits take only
-    /// a read-lock so contention is negligible in practice.
+    /// Synchronous because rustls's `ResolvesServerCert::resolve` is sync and
+    /// runs on the connection-driving task, so a `tokio::sync::RwLock` would
+    /// panic from `block_on` inside the runtime. Leaf generation (ECDSA keygen
+    /// plus one CA sign) takes ~1 ms; a cache hit takes only a read lock.
     pub(crate) fn leaf_for(&self, sni_host: &str) -> Result<Arc<CertifiedKey>, Error> {
         if let Ok(guard) = self.leaf_cache.read() {
             if let Some(cached) = guard.get(sni_host) {

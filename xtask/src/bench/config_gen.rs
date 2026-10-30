@@ -78,7 +78,6 @@ fn registry_key(hostname: &str) -> String {
 pub(crate) fn ocync_config(corpus: &Corpus) -> String {
     let mut out = String::new();
 
-    // Collect unique source registries in deterministic order.
     let mut source_registries: Vec<&str> = corpus
         .images
         .iter()
@@ -196,7 +195,6 @@ pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
 /// gcr.io, nvcr.io -- see regclient issue #1060) and `credHelper: docker-credential-ecr-login`
 /// for the ECR target, followed by a flat `sync:` list.
 pub(crate) fn regsync_config(corpus: &Corpus) -> String {
-    // Collect unique source registries in deterministic order.
     let mut source_registries: Vec<&str> = corpus
         .images
         .iter()

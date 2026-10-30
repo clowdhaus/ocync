@@ -126,7 +126,6 @@ impl Corpus {
                 img.tags.clone_from(&ovr.tags);
             }
         }
-        // dockerhub_auth is carried forward via clone.
         result
     }
 }
@@ -201,7 +200,6 @@ fn expand_env_vars(input: &str) -> Result<String, String> {
                     .map_err(|_| format!("environment variable {var_name} is not set"))?;
                 result.push_str(&val);
             } else {
-                // Unclosed brace -- emit literally.
                 result.push_str("${");
                 result.push_str(&var_name);
             }

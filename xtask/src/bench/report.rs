@@ -351,7 +351,6 @@ fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize,
 
 /// Read a value from the EC2 Instance Metadata Service (`IMDSv2`).
 fn read_imds(path: &str) -> Option<String> {
-    // IMDSv2: get a session token first, then use it.
     let token = command_stdout(std::process::Command::new("curl").args([
         "-s",
         "-f",
@@ -479,7 +478,6 @@ fn summary_markdown(report: &BenchReport) -> String {
     out.push_str("# Benchmark Results\n\n");
     out.push_str(&format!("Run: {}\n\n", report.timestamp));
 
-    // Instance metadata.
     let inst = &report.instance;
     out.push_str("## Instance\n\n");
     out.push_str(&format!("- **Type**: {}\n", inst.instance_type));
@@ -500,7 +498,6 @@ fn summary_markdown(report: &BenchReport) -> String {
         report.corpus_size, report.total_tags
     ));
 
-    // Tool versions section.
     out.push_str("## Tool Versions\n\n");
     for (tool, version) in &report.tool_versions {
         out.push_str(&format!("- **{tool}**: {version}\n"));
@@ -516,7 +513,6 @@ fn summary_markdown(report: &BenchReport) -> String {
     // scenario keeps only the tools that ran in it.
     let columns = tool_columns(report);
 
-    // Per-scenario detailed tables.
     for scenario in &report.scenarios {
         out.push_str(&format!("## {}\n\n", scenario.kind.label()));
 
@@ -729,7 +725,6 @@ pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<()
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
 
-    // summary.md
     let md = summary_markdown(report);
     let md_path = output_dir.join("summary.md");
     std::fs::write(&md_path, md).map_err(|e| format!("write {}: {e}", md_path.display()))?;
@@ -842,7 +837,6 @@ fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), Stri
 
     let mut updated = false;
 
-    // Cold scenario.
     if let Some(scenario) = find_scenario(&report.scenarios, ScenarioKind::Cold) {
         let snippet = scenario_markdown(report, scenario, "Cold sync");
         match replace_between_markers(&content, BENCH_COLD_START, BENCH_COLD_END, &snippet)? {
@@ -859,7 +853,6 @@ fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), Stri
         }
     }
 
-    // Warm scenario.
     if let Some(scenario) = find_scenario(&report.scenarios, ScenarioKind::Warm) {
         let snippet = scenario_markdown(report, scenario, "Warm sync (no changes)");
         match replace_between_markers(&content, BENCH_WARM_START, BENCH_WARM_END, &snippet)? {

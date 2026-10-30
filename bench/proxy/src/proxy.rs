@@ -10,12 +10,14 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use http::header::{
     CONNECTION, CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
     TRANSFER_ENCODING, UPGRADE,
@@ -31,7 +33,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde::Serialize;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
@@ -283,9 +285,6 @@ async fn handle_connection(
 /// bytes had been consumed into the internal buffer but not yet returned
 /// through `AsyncRead`.
 fn into_parts(reader: BufReader<TcpStream>) -> (TcpStream, Vec<u8>) {
-    // tokio::io::BufReader exposes `buffer()` for the already-buffered
-    // (unread) portion. We capture those bytes before dropping the
-    // wrapper so TLS can see the client's ClientHello.
     let buffered = reader.buffer().to_vec();
     let inner = reader.into_inner();
     (inner, buffered)
@@ -408,7 +407,6 @@ async fn handle_request(
     let status = upstream_resp.status();
     let resp_headers = forward_headers(upstream_resp.headers());
 
-    // Extract CDN cache headers before consuming the response.
     let x_cache = upstream_resp
         .headers()
         .get("x-cache")
@@ -436,7 +434,6 @@ async fn handle_request(
         })
         .map_err(|e| BodyError(e.to_string()))
     });
-    // Attach a final future that fires after the stream drains.
     let request_counter_for_log = request_counter.clone();
     let logging_stream = LogOnDrop::new(stream, move || {
         let entry_bytes = byte_counter.load(Ordering::Relaxed);
@@ -538,16 +535,6 @@ fn now_iso8601() -> String {
     now.format(&time::format_description::well_known::Iso8601::DEFAULT)
         .unwrap_or_else(|_| String::new())
 }
-
-// ---------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------
-
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-use futures_util::Stream;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A `Stream` wrapper that fires `on_drop` once, when the inner stream ends
 /// (yields `None`) or the value is dropped, whichever comes first. Logs a
@@ -660,10 +647,6 @@ mod tests {
 
     use super::*;
 
-    // -----------------------------------------------------------------
-    // forward_headers
-    // -----------------------------------------------------------------
-
     #[test]
     fn forward_headers_strips_hop_by_hop() {
         let mut incoming = http::HeaderMap::new();
@@ -720,10 +703,6 @@ mod tests {
         assert_eq!(out.get(HOST).unwrap(), "registry.example.com");
         assert!(out.contains_key("accept"));
     }
-
-    // -----------------------------------------------------------------
-    // PrefixedStream
-    // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn prefixed_stream_emits_prefix_then_inner() {
@@ -789,10 +768,6 @@ mod tests {
         server.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"hello");
     }
-
-    // -----------------------------------------------------------------
-    // LogOnDrop
-    // -----------------------------------------------------------------
 
     /// A stream of `items` wrapped to count how often its callback fires.
     fn counting_stream(
@@ -880,10 +855,6 @@ mod tests {
             "spawned task should write one JSONL entry"
         );
     }
-
-    // -----------------------------------------------------------------
-    // LogWriter
-    // -----------------------------------------------------------------
 
     /// Build a [`ProxyEntry`] with sensible defaults for tests.
     fn test_entry(method: &str, status: u16) -> ProxyEntry<'_> {
