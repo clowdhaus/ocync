@@ -148,8 +148,6 @@ pub(crate) struct ToolRun {
     pub(crate) tool: Tool,
     /// Wall-clock time in seconds.
     pub(crate) wall_clock_secs: f64,
-    /// Process exit code, if captured.
-    pub(crate) exit_code: Option<i32>,
     /// Peak resident set size in KB (from `/usr/bin/time -v`).
     pub(crate) peak_rss_kb: Option<u64>,
     /// HTTP proxy metrics, if a proxy was attached.
@@ -957,7 +955,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 47.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(65536),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
@@ -965,7 +962,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Dregsy,
                         wall_clock_secs: 521.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(131072),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
@@ -1092,7 +1088,6 @@ mod tests {
         let run = |tool| ToolRun {
             tool,
             wall_clock_secs: 47.0,
-            exit_code: Some(0),
             peak_rss_kb: Some(65536),
             proxy_metrics: None,
             phase_timing_ms: BTreeMap::new(),
@@ -1279,7 +1274,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Ocync,
                     wall_clock_secs: 47.0,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(65536),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
@@ -1322,7 +1316,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Ocync,
                     wall_clock_secs: 2.5,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(51200),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
@@ -1403,7 +1396,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 273.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(59468),
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 4131,
@@ -1419,7 +1411,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Dregsy,
                         wall_clock_secs: 2182.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(304500),
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 11190,
@@ -1496,7 +1487,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 273.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(59468),
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 4131,
@@ -1512,7 +1502,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Dregsy,
                         wall_clock_secs: 2182.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(304500),
                         // dregsy has no proxy metrics in this test.
                         proxy_metrics: None,
@@ -1553,7 +1542,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 120.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(65536),
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 1000,
@@ -1563,8 +1551,7 @@ mod tests {
                     },
                     ToolRun {
                         tool: Tool::Dregsy,
-                        wall_clock_secs: 120.0, // same wall clock
-                        exit_code: Some(0),
+                        wall_clock_secs: 120.0,   // same wall clock
                         peak_rss_kb: Some(65536), // same RSS
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 2000, // different requests
@@ -1630,7 +1617,6 @@ mod tests {
                     vec![ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 429.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(51200),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
@@ -1641,7 +1627,6 @@ mod tests {
                     vec![ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 2.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(40960),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
@@ -1684,7 +1669,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Ocync,
                     wall_clock_secs: 3.0,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(40960),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
@@ -1720,7 +1704,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 250.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(60_000),
                         proxy_metrics: Some(ProxyMetrics {
                             referrer_calls: 79,
@@ -1731,7 +1714,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Dregsy,
                         wall_clock_secs: 2000.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(300_000),
                         proxy_metrics: Some(ProxyMetrics::default()),
                         phase_timing_ms: BTreeMap::new(),
@@ -1739,7 +1721,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Regsync,
                         wall_clock_secs: 2200.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(280_000),
                         proxy_metrics: Some(ProxyMetrics::default()),
                         phase_timing_ms: BTreeMap::new(),
@@ -1771,7 +1752,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Dregsy,
                     wall_clock_secs: 2000.0,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(300_000),
                     proxy_metrics: Some(ProxyMetrics::default()),
                     phase_timing_ms: BTreeMap::new(),
@@ -1802,7 +1782,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Ocync,
                     wall_clock_secs: 250.0,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(60_000),
                     proxy_metrics: Some(ProxyMetrics {
                         referrer_calls: 79,

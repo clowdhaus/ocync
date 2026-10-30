@@ -308,10 +308,6 @@ fn git_ref() -> String {
 
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Guard: refuse to run if TMPDIR resolves to tmpfs. Staging writes
-    // multi-GB blobs and tmpfs is RAM-backed, causing OOM/ENOSPC.
-    // The bench-remote xtask sets TMPDIR=$HOME/ocync/bench/.tmp (on EBS).
-    //
     // The prepare scenario is exempt because it stages nothing: `--dry-run`
     // resolves mappings and stops, so there is no blob to write anywhere.
     // Applying the guard to it would refuse the one scenario cheap enough to
@@ -320,7 +316,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         reject_tmpfs_tmpdir()?;
     }
 
-    // 1. Parse corpus (apply skip-registries filter, then limit).
     let loaded = corpus::load(&args.corpus)?;
     let filtered = if args.skip_registries.is_empty() {
         loaded
@@ -367,7 +362,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         corpus.total_tags(),
     );
 
-    // 3. Validate prerequisites.
     let ecr_client = ecr::client().await;
     ecr::validate_credentials(&ecr_client).await?;
 
@@ -396,14 +390,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         relay_versions.insert(binary, version);
     }
 
-    // 4. Determine output directory.
     let timestamp = utc_timestamp();
     let output_dir = match &args.output {
         Some(dir) => PathBuf::from(dir),
         None => PathBuf::from(format!("bench/results/{timestamp}")),
     };
 
-    // 5. Create report.
     let instance = report::InstanceInfo::collect();
     eprintln!(
         "bench: instance={} cpu={} vcpus={} mem={}MiB net={} region={}",
@@ -425,7 +417,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         scenarios: Vec::new(),
     };
 
-    // 6. Expand All into individual scenarios, then dispatch each.
     let scenarios: Vec<Scenario> = match args.scenario {
         Scenario::All => vec![
             Scenario::Sync,
@@ -514,11 +505,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         }
     }
 
-    // 7. Write report.
     report::write_report(&output_dir, &report)?;
     eprintln!("bench: summary written to {}", output_dir.display());
 
-    // 8. Append compact run record to per-registry JSON archive.
     let target_registry = &corpus.settings.target_registry;
     let registry = RegistryKind::of(target_registry);
     let reg_key = registry.archive_stem();
@@ -584,7 +573,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench: run record appended to bench/results/{reg_key}.json");
     }
 
-    // 9. Handle regression mode.
     if args.regression {
         check_regression(&report, args.threshold_pct)?;
     }
@@ -674,27 +662,19 @@ async fn run_single_tool(
     pass: Pass,
     dry_run: bool,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
-    // 1. Generate config.
     let config_content = match tool {
         Tool::Ocync => config_gen::ocync_config(corpus),
         Tool::Dregsy => config_gen::dregsy_config(corpus),
         Tool::Regsync => config_gen::regsync_config(corpus),
     };
 
-    // 2. Write config to disk.
     let config_path = config_dir.join(format!("{}.yaml", tool));
     std::fs::write(&config_path, &config_content)
         .map_err(|e| format!("write config {}: {e}", config_path.display()))?;
 
-    // 3. Start bench-proxy (unless --no-proxy).
-    //
-    // The proxy binary, CA cert, and CA private key are configured via the
-    // `--proxy-binary`, `--proxy-ca`, and `--proxy-ca-key` CLI flags, which
-    // default to paths populated by the instance bootstrap (user-data.sh).
-    //
-    // The log lives under `output_dir` (not the auto-cleaned tempdir) so
-    // post-run analysis (`grep mount= …proxy.jsonl`) can inspect exactly
-    // which API calls the tool issued.
+    // The proxy log lives under `output_dir`, not the auto-cleaned tempdir, so
+    // post-run analysis (`grep mount= …proxy.jsonl`) can inspect exactly which
+    // API calls the tool issued.
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
     let (proxy_handle, proxy_url) = if !args.no_proxy {
@@ -714,8 +694,6 @@ async fn run_single_tool(
         (None, None)
     };
 
-    // 4. Run the tool.
-    //
     // The bench-proxy CA must be installed in the system trust store (via
     // update-ca-trust on AL2023) so that rustls-native-certs and OpenSSL
     // both trust the MITM'd connections. HTTPS_PROXY alone is sufficient.
@@ -729,8 +707,6 @@ async fn run_single_tool(
     )
     .await?;
 
-    // 6. Stop proxy, parse log, aggregate metrics. Abort on source
-    //    registry errors that indicate tainted benchmark data.
     let proxy_metrics = if let Some(handle) = proxy_handle {
         let entries = proxy::stop(handle).await?;
         check_source_errors(&entries, &corpus.settings.target_registry)?;
@@ -778,14 +754,29 @@ async fn run_single_tool(
         BTreeMap::new()
     };
 
+    // Checked last so a source-registry error, which names the cause, is
+    // reported first.
+    ensure_exited_zero(tool, pass, result.exit_code)?;
+
     Ok(ToolRun {
         tool,
         wall_clock_secs: result.wall_clock.as_secs_f64(),
-        exit_code: result.exit_code,
         peak_rss_kb: result.peak_rss_kb,
         proxy_metrics,
         phase_timing_ms,
     })
+}
+
+/// Fails unless a tool pass exited 0. A pass that failed did less work, so its
+/// numbers cannot be compared; for `--dry-run` that includes a mapping that
+/// could not be resolved.
+fn ensure_exited_zero(tool: Tool, pass: Pass, exit_code: Option<i32>) -> Result<(), String> {
+    if exit_code == Some(0) {
+        return Ok(());
+    }
+    Err(format!(
+        "{tool} {pass} failed (exit {exit_code:?}); aborting, a failed run cannot be compared"
+    ))
 }
 
 /// Abort on source registry errors (status >= 400) that indicate tainted
@@ -846,9 +837,6 @@ async fn run_sync(
     let mut warm_runs = Vec::new();
 
     for &tool in tools {
-        // Clean slate before every tool (including the first).
-        // Drop page cache so no tool benefits from a previous tool's
-        // source pulls cached in RAM. Clean staging tmpdir.
         prepare_clean_slate();
 
         // Delete repos first to guarantee a truly empty target, then recreate.
@@ -862,7 +850,6 @@ async fn run_sync(
         // sees a fully populated cache.
         let config_dir = tempfile::tempdir()?;
 
-        // Cold run.
         progress(&format!("  cold: {tool}"));
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
             let cold = run_single_tool(
@@ -875,25 +862,15 @@ async fn run_sync(
                 false,
             )
             .await?;
-            if cold.exit_code != Some(0) {
-                return Err(format!(
-                    "{tool} cold sync failed (exit {:?}); aborting -- \
-                     tainted data cannot be compared",
-                    cold.exit_code
-                )
-                .into());
-            }
             progress(&format!(
                 "  cold: {tool} complete ({:.1}s)",
                 cold.wall_clock_secs
             ));
             cold_runs.push(cold);
 
-            // Verify cold sync: every expected tag must exist at target.
             let tool_name = tool.to_string();
             ecr::verify_sync(ecr_client, corpus, &tool_name, "cold").await?;
 
-            // Warm run: target still populated, same config_dir.
             progress(&format!("  warm: {tool}"));
             let warm = run_single_tool(
                 args,
@@ -905,21 +882,12 @@ async fn run_sync(
                 false,
             )
             .await?;
-            if warm.exit_code != Some(0) {
-                return Err(format!(
-                    "{tool} warm sync failed (exit {:?}); aborting -- \
-                     tainted data cannot be compared",
-                    warm.exit_code
-                )
-                .into());
-            }
             progress(&format!(
                 "  warm: {tool} complete ({:.1}s)",
                 warm.wall_clock_secs
             ));
             warm_runs.push(warm);
 
-            // Verify warm sync: tags should still all be present.
             ecr::verify_sync(ecr_client, corpus, &tool_name, "warm").await?;
 
             Ok(())
@@ -972,7 +940,7 @@ async fn run_partial(
             // Prime with base corpus (unmeasured). Reuse the same
             // config_dir so ocync's TransferStateCache persists.
             let config_dir = tempfile::tempdir()?;
-            let prime = run_single_tool(
+            run_single_tool(
                 args,
                 tool,
                 base_corpus,
@@ -982,16 +950,8 @@ async fn run_partial(
                 false,
             )
             .await?;
-            if prime.exit_code != Some(0) {
-                return Err(format!(
-                    "{tool} partial prime failed (exit {:?}); aborting",
-                    prime.exit_code
-                )
-                .into());
-            }
             progress(&format!("  partial: {} measuring", tool));
 
-            // Measured run with partial corpus (same config_dir).
             let run = run_single_tool(
                 args,
                 tool,
@@ -1002,13 +962,6 @@ async fn run_partial(
                 false,
             )
             .await?;
-            if run.exit_code != Some(0) {
-                return Err(format!(
-                    "{tool} partial sync failed (exit {:?}); aborting",
-                    run.exit_code
-                )
-                .into());
-            }
             progress(&format!(
                 "  partial: {} complete ({:.1}s)",
                 tool, run.wall_clock_secs
@@ -1076,13 +1029,6 @@ async fn run_scale(
                     false,
                 )
                 .await?;
-                if run.exit_code != Some(0) {
-                    return Err(format!(
-                        "{tool} scale sync failed at {size} images (exit {:?}); aborting",
-                        run.exit_code
-                    )
-                    .into());
-                }
                 runs.push(run);
                 Ok(())
             }
@@ -1144,25 +1090,12 @@ async fn run_prepare(
     )
     .await?;
 
-    // `--dry-run` exits non-zero when a mapping could not be resolved. That is
-    // the measurement failing, not a finding: a run that skipped mappings did
-    // less work and its wall clock means nothing.
-    if run.exit_code != Some(0) {
-        return Err(format!(
-            "ocync prepare dry-run failed (exit {:?}); the timing would not be comparable",
-            run.exit_code
-        )
-        .into());
-    }
-
     Ok(ScenarioResult::unshuffled(ScenarioKind::Prepare, vec![run]))
 }
 
-/// Sleep for 30 seconds between benchmark runs to let rate limits recover.
-/// Ensure a verified clean slate before each tool run.
-///
-/// Runs before every tool (including the first) to guarantee no tool
-/// benefits from a previous tool's cached data or leftover state.
+/// Drops the page cache and clears the staging tmpdir, before every tool
+/// including the first, so none benefits from a previous tool's source pulls
+/// cached in RAM or leftover state.
 fn prepare_clean_slate() {
     drop_page_cache();
     clean_staging_tmpdir();
@@ -1271,7 +1204,6 @@ async fn cdn_prewarm(corpus: &Corpus) {
         .build()
         .unwrap();
 
-    // Group images by registry so we can reuse tokens per scope.
     let mut hits = 0u64;
     let mut misses = 0u64;
     let mut errors = 0u64;
@@ -1508,7 +1440,6 @@ async fn cdn_prewarm(corpus: &Corpus) {
                                     .errors += 1;
                                 break;
                             }
-                            // Wait for backoff before retry.
                             let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
                             if let Some(d) = delay {
                                 tokio::time::sleep(d).await;
@@ -1570,7 +1501,6 @@ async fn cdn_prewarm(corpus: &Corpus) {
         .collect();
     futures_util::future::join_all(futs).await;
 
-    // Log per-registry stats with discovered rates.
     let (total_hits, total_misses, total_errors) = {
         let stats = per_registry_stats.borrow();
         let mut hits_sum = 0u64;
@@ -1804,6 +1734,7 @@ fn parse_timing_file(path: &Path) -> BTreeMap<String, u64> {
     map
 }
 
+/// Sleeps between benchmark runs to let rate limits recover.
 async fn cooldown() {
     eprintln!("bench: cooling down for 10s...");
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1948,6 +1879,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_that_does_not_exit_zero_aborts_the_run() {
+        let pass = Pass::Measured(ScenarioKind::Scale { images: 10 });
+        assert_eq!(ensure_exited_zero(Tool::Ocync, pass, Some(0)), Ok(()));
+        for (name, exit_code, expected) in [
+            (
+                "non-zero",
+                Some(1),
+                "ocync scale-10 failed (exit Some(1)); aborting, a failed run cannot be compared",
+            ),
+            (
+                "killed by a signal",
+                None,
+                "ocync scale-10 failed (exit None); aborting, a failed run cannot be compared",
+            ),
+        ] {
+            assert_eq!(
+                ensure_exited_zero(Tool::Ocync, pass, exit_code),
+                Err(expected.to_string()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn command_stdout_is_trimmed_text_from_a_successful_command() {
         use std::process::Command;
         let run = |program: &str, args: &[&str]| command_stdout(Command::new(program).args(args));
@@ -2086,7 +2041,6 @@ mod tests {
         ToolRun {
             tool,
             wall_clock_secs,
-            exit_code: Some(0),
             peak_rss_kb: None,
             proxy_metrics: None,
             phase_timing_ms: BTreeMap::new(),
