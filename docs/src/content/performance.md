@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: How ocync finishes a cold sync to ECR 3.1 to 3.8 times faster than regsync and 2.5 to 5.2 times faster than dregsy, with fewer requests and cross-repo blob mounting.
+description: How ocync finishes a cold sync to ECR about 3 times faster than regsync and 4 times faster than dregsy, with fewer requests, about 10 GB fewer bytes than regsync, and cross-repo blob mounting.
 order: 6
 ---
 
@@ -8,27 +8,39 @@ order: 6
 
 <!-- Auto-updated by `cargo xtask bench`; shows first scenario (cold sync) only. -->
 <!-- BENCH:START -->
-Measured 2026-04-26 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 39 images, 51 tags. Cold sync to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement.
+Measured 2026-10-30 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 40 images, 55 tags. Cold sync to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement.
 
 | Metric | ocync | dregsy | regsync |
 |---|---:|---:|---:|
-| Wall clock | **3m 49s** | 15m 16s | 12m 57s |
-| Peak RSS | 65.2 MB | 331.0 MB | **28.0 MB** |
-| Requests | **7373** | 11301 | 9532 |
-| Response bytes | 55.4 GB | **55.3 GB** | 65.3 GB |
-| Source blob GETs | 1451 | **1372** | 1695 |
-| Source blob bytes | 55.4 GB | **55.3 GB** | 65.3 GB |
-| Mounts (success/attempt) | **448/454** | 325/325 | 0/0 |
-| Duplicate blob GETs | **0** | 1 | **0** |
-| CDN hits/misses | **1045/11** | 971/5 | 988/0 |
+| Wall clock | **4m 10s** | 18m 5s | 12m 29s |
+| Peak RSS | 54.2 MB | 344.2 MB | **27.6 MB** |
+| Requests | **6995** | 11541 | 9588 |
+| Response bytes | 55.0 GB | **54.9 GB** | 65.1 GB |
+| Source blob GETs | 1428 | **1399** | 1692 |
+| Source blob bytes | 55.0 GB | **54.9 GB** | 65.1 GB |
+| Mounts (success/attempt) | **356/356** | 341/341 | 0/0 |
+| Duplicate blob GETs | **0** | 48 | **0** |
+| CDN hits/misses | 898/174 | 546/504 | **1006/2** |
 | Rate-limit 429s | **0** | **0** | **0** |
 
 > **Artifact sync (OCI 1.1 referrers).** ocync issues `GET /v2/<repo>/referrers/...` to discover attestations (SBOM, SLSA) and transfers any referenced artifacts. Comparable tools do not implement this. The Source blob GETs and Source blob bytes columns above include this artifact content for ocync.
 >
-> Referrers calls -- dregsy: 0, regsync: 0, ocync: 51.
+> Referrers calls -- ocync: 52, dregsy: 0, regsync: 0.
 <!-- BENCH:END -->
 
-Six full-corpus cold syncs compared all three tools between 19 and 26 April 2026, on the same instance type, to ECR in us-east-2 (the 19 April run in us-east-1). Each was a single run per tool, and most corpus tags track `latest`, so the content synced may differ between dates; see the [benchmark design](/design/benchmark) for how this is being tightened. Across them ocync was 3.1 to 3.8 times faster than regsync and 2.5 to 5.2 times faster than dregsy, and made 19 to 25% fewer requests than regsync and 32 to 39% fewer than dregsy. ocync drew 0, 23, 21, 17, 5 and 0 rate-limit 429s, backing off on each; regsync and dregsy drew none. ocync fetched 3 blobs twice in one run and none in the others. ocync's no-change sync took 1.4 to 2.3 s in the four latest runs and about 150 s in the two before, when regsync took 12 to 15 s. Only ECR has been measured as a target.
+The 30 October 2026 run (ocync 0.8.2) was one run per tool, in the order ocync, dregsy, regsync. It was made before the corpus lock and the per-tool content check existed, so whether the three tools copied identical content was not checked. Its CDN misses were uneven: 174 for ocync, 504 for dregsy and 2 for regsync. Separately, the pre-warm read only each image's first tag, and 11 images in the corpus sync more than one version. The [benchmark design](/design/benchmark) describes the fixes, and repeated rounds that replace single runs.
+
+Two comparison runs exist from code with the fix that ended ocync's 429s. The 26 April run measured that change's branch about an hour before it merged, on a commit no longer in the repository's history; the 30 October run measured `main`. Their corpora differ (51 and 55 tags, and most tags then tracked `latest`, so the content differed too), so they are two data points, not a series.
+
+| | 26 April | 30 October |
+|---|---:|---:|
+| ocync speed vs regsync, cold | 3.39x | 2.99x |
+| ocync speed vs dregsy, cold | 3.99x | 4.33x |
+| Requests: ocync / dregsy / regsync | 7373 / 11301 / 9532 | 6995 / 11541 / 9588 |
+| Response bytes: ocync / dregsy / regsync | 55.4 / 55.3 / 65.3 GB | 55.0 / 54.9 / 65.1 GB |
+| 429s, any tool | 0 | 0 |
+
+ocync moved about 10 GB less than regsync and slightly more than dregsy. Only ECR has been measured as a target.
 
 ## How tools compare
 
@@ -65,19 +77,19 @@ Six full-corpus cold syncs compared all three tools between 19 and 26 April 2026
 ### Warm sync efficiency
 
 <!-- BENCH-WARM:START -->
-Measured 2026-04-26 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 39 images, 51 tags. Warm sync (no changes) to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement.
+Measured 2026-10-30 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 40 images, 55 tags. Warm sync (no changes) to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement.
 
 | Metric | ocync | dregsy | regsync |
 |---|---:|---:|---:|
-| Wall clock | **2s** | 2m 4s | 12s |
-| Peak RSS | **18.5 MB** | 34.2 MB | 21.0 MB |
-| Requests | **147** | 3145 | 170 |
-| Response bytes | 135.1 KB | 1.9 MB | **124.5 KB** |
-| Source blob GETs | **0** | 227 | **0** |
-| Source blob bytes | 125.7 KB | 1.9 MB | **120.4 KB** |
+| Wall clock | **2s** | 1m 46s | 11s |
+| Peak RSS | **17.3 MB** | 36.8 MB | 20.7 MB |
+| Requests | **156** | 3486 | 179 |
+| Response bytes | 143.1 KB | 2.0 MB | **128.3 KB** |
+| Source blob GETs | **0** | 279 | **0** |
+| Source blob bytes | 133.7 KB | 2.0 MB | **128.3 KB** |
 | Mounts (success/attempt) | **0/0** | **0/0** | **0/0** |
-| Duplicate blob GETs | **0** | **0** | **0** |
-| CDN hits/misses | 0/0 | **165/0** | 0/0 |
+| Duplicate blob GETs | **0** | 48 | **0** |
+| CDN hits/misses | 0/0 | **225/0** | 0/0 |
 | Rate-limit 429s | **0** | **0** | **0** |
 <!-- BENCH-WARM:END -->
 
@@ -91,7 +103,7 @@ Discovery and execution overlap. While images are being transferred, `ocync` is 
 
 ### Global blob deduplication
 
-Container images share layers heavily. A sync run touching 39 images may reference only a fraction as many unique blobs. `ocync` tracks every blob globally and transfers each unique blob exactly once.
+Container images share layers heavily. A sync run touching 40 images may reference only a fraction as many unique blobs. `ocync` tracks every blob globally and transfers each unique blob exactly once.
 
 ### Cross-repo blob mounting
 

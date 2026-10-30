@@ -3,7 +3,7 @@
 Sync OCI container images across registries - efficiently.
 
 <p align="center">
-  <img src="docs/public/ecr-banner.svg" alt="ocync - 3x faster than regsync, 19% fewer requests, adaptive rate control" width="900">
+  <img src="docs/public/ecr-banner.svg" alt="ocync - 3x faster than regsync with 15% fewer bytes, 23% fewer requests, adaptive rate control" width="900">
 </p>
 
 [![CI](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml/badge.svg)](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml)
@@ -11,7 +11,7 @@ Sync OCI container images across registries - efficiently.
 [![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2025/06/26/Rust-1.94.0.html)
 [![ECR Public](https://img.shields.io/badge/ECR_Public-clowdhaus%2Focync-ff9900.svg?logo=amazonecs)](https://gallery.ecr.aws/clowdhaus/ocync)
 
-ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. In cold syncs of a 55 GB corpus (39 images) to ECR it finished 3.1 to 3.8 times faster than regsync and 2.5 to 5.2 times faster than dregsy, with 19 to 25% fewer requests than regsync and 32 to 39% fewer than dregsy. See [Performance](https://clowdhaus.github.io/ocync/performance) for the conditions and the full comparison.
+ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. In two cold syncs of a 55 GB corpus to ECR it finished about 3 times faster than regsync and 4 times faster than dregsy. It made 23 to 27% fewer requests than regsync and 35 to 39% fewer than dregsy, moved about 10 GB (15%) less than regsync and slightly more than dregsy, and no tool drew a 429. See [Performance](https://clowdhaus.github.io/ocync/performance) for the conditions and the full comparison.
 
 ocync is purpose-built for one job: efficiently mirroring images from upstream registries (Docker Hub, GHCR, GAR, Chainguard) to a private registry (ECR, GAR, ACR). It is not a build tool, a registry, or a content rewriter - it copies bytes verbatim and lets the registry do its job. Multi-architecture indexes, manifests, blobs, and OCI 1.1 referrers (signatures, SBOMs, attestations) all flow through bit-for-bit.
 
