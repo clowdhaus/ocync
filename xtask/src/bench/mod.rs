@@ -1938,34 +1938,20 @@ mod tests {
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn days_to_civil_unix_epoch() {
-        // Day 0 = 1970-01-01.
-        assert_eq!(days_to_civil(0), (1970, 1, 1));
-    }
-
-    #[test]
-    fn days_to_civil_known_date() {
-        // 2026-04-15 = day 20558 since epoch.
-        // (date -d '2026-04-15' +%s) / 86400 = 20558
-        assert_eq!(days_to_civil(20558), (2026, 4, 15));
-    }
-
-    #[test]
-    fn days_to_civil_leap_year_boundary() {
-        // 2000-02-29 = day 11016.
-        assert_eq!(days_to_civil(11016), (2000, 2, 29));
-        // 2000-03-01 = day 11017.
-        assert_eq!(days_to_civil(11017), (2000, 3, 1));
-    }
-
-    #[test]
-    fn days_to_civil_non_leap_century() {
-        // 1900 is not a leap year (divisible by 100 but not 400).
-        // 1900-02-28 is valid, 1900-03-01 follows.
-        // 1900-03-01 = day -25567 ... negative days not supported (u64).
-        // Use 2100-02-28 instead: day 47540, 2100-03-01 = day 47541.
-        assert_eq!(days_to_civil(47540), (2100, 2, 28));
-        assert_eq!(days_to_civil(47541), (2100, 3, 1));
+    fn days_to_civil_known_dates() {
+        // Day counts are `date -d <date> +%s` / 86400.
+        for (days, expected) in [
+            (0, (1970, 1, 1)),
+            (20558, (2026, 4, 15)),
+            // 2000 is a leap year (divisible by 400).
+            (11016, (2000, 2, 29)),
+            (11017, (2000, 3, 1)),
+            // 2100 is not (divisible by 100 but not 400).
+            (47540, (2100, 2, 28)),
+            (47541, (2100, 3, 1)),
+        ] {
+            assert_eq!(days_to_civil(days), expected, "day {days}");
+        }
     }
 
     #[test]

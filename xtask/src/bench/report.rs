@@ -180,42 +180,24 @@ pub(crate) enum ScenarioKind {
 impl ScenarioKind {
     /// Human-readable scenario name, the heading of its report section and
     /// its name in the JSON archive (e.g. `"Cold sync"`).
-    pub(crate) fn label(self) -> impl std::fmt::Display {
-        Label(self)
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::Cold => "Cold sync".into(),
+            Self::Warm => "Warm sync (no-op)".into(),
+            Self::Partial => "Partial sync (~5% changed)".into(),
+            Self::Scale { images } => format!("Scale ({images} images)"),
+            Self::Prepare => "Prepare (dry-run)".into(),
+        }
     }
 
     /// File-name stem for this scenario's measured runs (e.g. `"scale-10"`).
-    pub(crate) fn slug(self) -> impl std::fmt::Display {
-        Slug(self)
-    }
-}
-
-/// Writes [`ScenarioKind::label`].
-struct Label(ScenarioKind);
-
-impl std::fmt::Display for Label {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            ScenarioKind::Cold => f.write_str("Cold sync"),
-            ScenarioKind::Warm => f.write_str("Warm sync (no-op)"),
-            ScenarioKind::Partial => f.write_str("Partial sync (~5% changed)"),
-            ScenarioKind::Scale { images } => write!(f, "Scale ({images} images)"),
-            ScenarioKind::Prepare => f.write_str("Prepare (dry-run)"),
-        }
-    }
-}
-
-/// Writes [`ScenarioKind::slug`].
-struct Slug(ScenarioKind);
-
-impl std::fmt::Display for Slug {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            ScenarioKind::Cold => f.write_str("cold"),
-            ScenarioKind::Warm => f.write_str("warm"),
-            ScenarioKind::Partial => f.write_str("partial"),
-            ScenarioKind::Scale { images } => write!(f, "scale-{images}"),
-            ScenarioKind::Prepare => f.write_str("prepare"),
+    pub(crate) fn slug(self) -> String {
+        match self {
+            Self::Cold => "cold".into(),
+            Self::Warm => "warm".into(),
+            Self::Partial => "partial".into(),
+            Self::Scale { images } => format!("scale-{images}"),
+            Self::Prepare => "prepare".into(),
         }
     }
 }
@@ -1006,58 +988,33 @@ mod tests {
     }
 
     #[test]
-    fn format_duration_seconds() {
-        assert_eq!(format_duration(Duration::from_secs(47)), "47s");
+    fn format_duration_shows_minutes_only_when_there_are_some() {
+        for (secs, expected) in [(0, "0s"), (47, "47s"), (192, "3m 12s"), (120, "2m")] {
+            assert_eq!(
+                format_duration(Duration::from_secs(secs)),
+                expected,
+                "{secs}s"
+            );
+        }
     }
 
     #[test]
-    fn format_duration_minutes() {
-        assert_eq!(format_duration(Duration::from_secs(192)), "3m 12s");
-    }
-
-    #[test]
-    fn format_duration_exact_minutes() {
-        assert_eq!(format_duration(Duration::from_secs(120)), "2m");
-    }
-
-    #[test]
-    fn format_bytes_gb() {
-        assert_eq!(format_bytes(2_100_000_000), "2.1 GB");
-    }
-
-    #[test]
-    fn format_bytes_mb() {
-        assert_eq!(format_bytes(450_000_000), "450.0 MB");
-    }
-
-    #[test]
-    fn format_duration_zero() {
-        assert_eq!(format_duration(Duration::ZERO), "0s");
-    }
-
-    #[test]
-    fn format_bytes_exact_boundaries() {
-        assert_eq!(format_bytes(999), "999 B");
-        assert_eq!(format_bytes(1_000), "1.0 KB");
-        assert_eq!(format_bytes(999_999), "1000.0 KB");
-        assert_eq!(format_bytes(1_000_000), "1.0 MB");
-        assert_eq!(format_bytes(999_999_999), "1000.0 MB");
-        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
-    }
-
-    #[test]
-    fn format_bytes_kb() {
-        assert_eq!(format_bytes(1_500), "1.5 KB");
-    }
-
-    #[test]
-    fn format_bytes_small() {
-        assert_eq!(format_bytes(42), "42 B");
-    }
-
-    #[test]
-    fn format_bytes_zero() {
-        assert_eq!(format_bytes(0), "0 B");
+    fn format_bytes_scales_to_the_decimal_unit() {
+        for (bytes, expected) in [
+            (0, "0 B"),
+            (42, "42 B"),
+            (999, "999 B"),
+            (1_000, "1.0 KB"),
+            (1_500, "1.5 KB"),
+            (999_999, "1000.0 KB"),
+            (1_000_000, "1.0 MB"),
+            (450_000_000, "450.0 MB"),
+            (999_999_999, "1000.0 MB"),
+            (1_000_000_000, "1.0 GB"),
+            (2_100_000_000, "2.1 GB"),
+        ] {
+            assert_eq!(format_bytes(bytes), expected, "{bytes}");
+        }
     }
 
     #[test]
