@@ -369,8 +369,9 @@ impl std::fmt::Debug for BatchChecker {
 }
 
 impl BatchChecker {
-    /// Create a batch checker for an ECR hostname, failing when it names no
-    /// region.
+    /// Create a batch checker for an ECR hostname. Fails when the hostname
+    /// names no region, or a configured endpoint URL is combined with FIPS
+    /// or dual-stack.
     ///
     /// `profile` must match the one passed to [`crate::auth::ecr::EcrAuth::new`],
     /// or the checker authenticates as another identity and silently fails

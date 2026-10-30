@@ -111,7 +111,12 @@ fn decode_ecr_credentials(
     ))
 }
 
-/// AWS ECR Public authentication provider. See the module docs.
+/// AWS ECR Public authentication provider.
+///
+/// Registry credentials sit in a `CredentialCache`, refreshed before they
+/// expire so watch mode keeps running. Bearer tokens are coalesced per scope
+/// in a `TokenCache`: concurrent fetches for one scope make one exchange,
+/// while distinct scopes run in parallel.
 pub struct EcrPublicAuth {
     base_url: String,
     http: reqwest::Client,

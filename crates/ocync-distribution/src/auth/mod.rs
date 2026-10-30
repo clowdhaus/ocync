@@ -193,7 +193,7 @@ impl Token {
     }
 
     /// Whether this token should be proactively refreshed (remaining lifetime
-    /// is at most [`EARLY_REFRESH_WINDOW`]).
+    /// is at most `EARLY_REFRESH_WINDOW`).
     pub fn should_refresh(&self) -> bool {
         !is_fresh(self.expires_at, EARLY_REFRESH_WINDOW)
     }

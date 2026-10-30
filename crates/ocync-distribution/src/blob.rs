@@ -424,8 +424,10 @@ impl RegistryClient {
         let mut upload_url = self
             .initiate_blob_upload(repository, &scopes, "blob push acr initiate")
             .await?;
-        // An empty blob sends no PATCH: the OCI distribution spec accepts
-        // the finalize PUT alone.
+        // Each next URL comes from `extract_location`, which refuses a
+        // `Location` on another host; a URL built any other way would
+        // carry the bearer token unchecked. An empty blob sends no PATCH:
+        // the OCI distribution spec accepts the finalize PUT alone.
         let mut offset: u64 = 0;
         while offset < total_len {
             let chunk_len = (ACR_PATCH_CHUNK_SIZE as u64).min(total_len - offset);
@@ -482,8 +484,9 @@ impl RegistryClient {
 /// Extract and resolve the `Location` header from an upload response,
 /// enforcing same-origin against `base_url`.
 ///
-/// The upload chain carries the registry's bearer token, so a `Location`
-/// on another host would leak it on the next request.
+/// Every step of the upload chain (initiate, each PATCH, finalize PUT)
+/// goes through here. The chain carries the registry's bearer token, so a
+/// `Location` on another host would leak it on the next request.
 fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<String, Error> {
     let raw = resp
         .headers()

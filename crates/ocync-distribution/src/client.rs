@@ -63,8 +63,8 @@ const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: usize = DEFAULT_BLOB_UPLOAD_CONCURRENCY
 ///
 /// The fallback upload paths (GHCR single-PATCH, ACR chunked PATCH) buffer
 /// the whole blob because the target cannot accept a streaming body. With
-/// 64 concurrent uploads and no byte cap, 1 GB layers (common for CUDA/ML
-/// images) would hold ~64 GB resident. 512 MB is ~32x a typical 16 MB
+/// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] uploads and no byte cap, 1 GB layers
+/// (common for CUDA/ML images) would hold ~64 GB resident. 512 MB is ~32x a typical 16 MB
 /// layer, so modest layers do not serialise, while a single oversized layer
 /// (e.g. 2 GB GPU runtime) runs alone.
 const DEFAULT_BUFFERED_BLOB_BYTES: usize = 512 * 1024 * 1024;
@@ -134,9 +134,10 @@ impl RegistryClientBuilder {
         self
     }
 
-    /// Set the cap on concurrent blob uploads. It must stay under the
-    /// server's HTTP/2 stream limit; see [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`],
-    /// the default.
+    /// Set the cap on concurrent blob uploads. Each upload holds an HTTP/2
+    /// stream open on the one connection per origin, so the cap must stay
+    /// under the server's `SETTINGS_MAX_CONCURRENT_STREAMS` less headroom for
+    /// manifest, mount and auth requests. Default: 64.
     pub fn blob_upload_concurrency(mut self, n: usize) -> Self {
         self.blob_upload_concurrency = n.max(1);
         self
@@ -154,11 +155,11 @@ impl RegistryClientBuilder {
     /// fallback upload paths (GHCR / ACR); the streaming PUT path does not
     /// buffer and is unaffected. Uploads that would exceed the budget queue.
     ///
-    /// `n` is clamped to at least 1. A budget below
-    /// [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`] still admits unknown-size
-    /// uploads, since each request is capped at the budget.
+    /// `n` is clamped to at least 1. A budget below the 16 MB an
+    /// unknown-size upload requests still admits it, since each request is
+    /// capped at the budget.
     ///
-    /// Default: [`DEFAULT_BUFFERED_BLOB_BYTES`].
+    /// Default: 512 MB.
     pub fn buffered_blob_bytes(mut self, n: usize) -> Self {
         self.buffered_blob_bytes = n.max(1);
         self
@@ -324,7 +325,8 @@ impl RegistryClient {
     /// `expected` is the manifest-declared blob size, `None` for an opaque
     /// stream.
     ///
-    /// - `Some(n)`: acquire `min(n, budget)` permits. An oversized blob
+    /// - `Some(n)`: acquire `min(n, budget)` permits, at least one, so an
+    ///   empty blob still counts against the budget. An oversized blob
     ///   takes the whole budget and others queue until it completes, though
     ///   its memory exceeds the budget.
     /// - `None`: acquire [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`]. The blob

@@ -609,7 +609,11 @@ const ACR_REFRESH_TOKEN_DEFAULT_TTL: Duration = Duration::from_secs(3 * 60 * 60)
 /// Default ACR access token TTL fallback (60 minutes).
 const ACR_ACCESS_TOKEN_DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
 
-/// ACR authentication provider. See the module docs.
+/// ACR authentication provider.
+///
+/// The ACR refresh token is cached and refreshed before it expires. Access
+/// tokens are coalesced per scope in a `TokenCache`: concurrent fetches for
+/// one scope make one exchange, while distinct scopes run in parallel.
 pub struct AcrAuth {
     base_url: String,
     service: String,

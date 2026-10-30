@@ -1,10 +1,10 @@
 //! AIMD concurrency controller - adaptive rate limiting via additive increase, multiplicative decrease.
 //!
-//! Each registry action gets its own [`AimdWindow`], which grows the allowed concurrency
+//! Each registry action gets its own `AimdWindow`, which grows the allowed concurrency
 //! by one unit per successful response and halves on a 429 (Too Many Requests). A
 //! congestion epoch prevents multiple halvings from the same burst of 429s.
 //!
-//! [`AimdController`] manages one set of windows per registry host under an
+//! `AimdController` manages one set of windows per registry host under an
 //! aggregate concurrency cap. Windows of registries with documented TPS
 //! ceilings are also paced by a `TokenBucket`.
 

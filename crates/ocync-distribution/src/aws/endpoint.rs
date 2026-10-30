@@ -217,7 +217,7 @@ pub(super) enum DualStack {
 }
 
 /// Resolve the endpoint URL for `service` in `region`. A configured
-/// `endpoint_url` wins.
+/// `endpoint_url` wins, and cannot be combined with FIPS or dual-stack.
 pub(super) fn resolve(
     service: Service,
     region: &Region,

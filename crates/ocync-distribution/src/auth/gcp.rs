@@ -1,7 +1,7 @@
 //! Google Artifact Registry / Container Registry authentication provider.
 //!
 //! Obtains `OAuth2` access tokens from Application Default Credentials,
-//! resolved in [`crate::google`], then performs standard OCI Bearer token
+//! resolved in `crate::google`, then performs standard OCI Bearer token
 //! exchange using `oauth2accesstoken` as the username. This is the Rust
 //! equivalent of:
 //!
@@ -195,7 +195,12 @@ impl GcpTokenSource for AdcTokenSource {
 }
 
 /// Google Artifact Registry / Container Registry authentication provider.
-/// See the module docs.
+///
+/// The Google token sits in a `CredentialCache` the run's GAR and GCR
+/// providers share, refreshed before it expires so watch mode keeps
+/// running. Bearer tokens are coalesced per scope in a `TokenCache`:
+/// concurrent fetches for one scope make one exchange, while distinct
+/// scopes run in parallel.
 pub struct GcpAuth {
     base_url: String,
     /// For error context.

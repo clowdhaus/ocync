@@ -4,9 +4,9 @@
 //! retries the ones it drives. The prepare phase has no such layer above it:
 //! it runs before the engine exists, so a transient failure there fails a
 //! whole mapping or image. The operations that run there retry themselves,
-//! through [`retrying`], and share one schedule so they cannot drift apart.
+//! through `retrying`, and share one schedule so they cannot drift apart.
 //! Each passes the predicate for its own errors, built on
-//! [`is_transient_transport`]. The AWS API calls run the same loop under the AWS
+//! `is_transient_transport`. The AWS API calls run the same loop under the AWS
 //! SDK's retry policy instead (see `crate::aws`).
 
 use std::cell::Cell;

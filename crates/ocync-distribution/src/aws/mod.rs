@@ -894,7 +894,8 @@ struct ProviderKey {
 }
 
 /// The AWS credentials one run's clients share, by profile and region,
-/// rather than one load per client. Create one per run, so the next watch
+/// rather than one load per client, reloaded shortly before they expire.
+/// Create one per run, so the next watch
 /// cycle reads the shared AWS files again and drops credentials AWS may have
 /// revoked.
 #[derive(Default)]
