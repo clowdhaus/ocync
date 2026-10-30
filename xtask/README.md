@@ -26,15 +26,19 @@ cargo xtask bench-remote --provider aws --scenario cold
 
 Pushes the current branch, SSHs into the bench instance, builds, runs benchmarks with live streamed output, then SCPs results back.
 
+A run already in progress on the instance, including one still checking out or building, is refused: the command prints that and fails, leaving the run alone. `--force` kills the run and everything it started, then begins fresh. `--fetch` copies the newest results on the instance, which are a live run's partial results only once its benchmark has started (while it checks out or builds, they are the previous run's). It cannot be combined with any option that shapes a run.
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--provider` | string | (required) | Cloud provider; reads `bench/terraform/<provider>/bench.json` |
 | `--scenario` | string | `all` | Scenario to run (passed through to `bench`) |
-| `--tools` | string | `ocync,dregsy,regsync` | Tools to benchmark |
-| `--iterations` | string | `1` | Cold-sync iterations (picks median) |
+| `--tools` | string | `ocync` | Tools to benchmark |
 | `--limit` | integer | all | Use first N corpus images only |
-| `--fetch` | flag | | Fetch results from last run without re-running |
-| `--force` | flag | | Kill any running benchmark and start fresh |
+| `--skip-registries` | string | | Comma-separated source registries to skip |
+| `--skip-prewarm` | flag | | Skip CDN pre-warming |
+| `--no-proxy` | flag | | Run without bench-proxy on the instance |
+| `--fetch` | flag | | Copy the newest results on the instance without running (a live run's partial results once its benchmark has started); conflicts with every run option |
+| `--force` | flag | | Kill a running benchmark and start fresh; without it a live run is refused |
 | `--git-ref` | string | current branch | Git ref to checkout on the instance |
 | `--output` | path | `bench/results` | Local directory to save fetched results |
 
@@ -90,7 +94,7 @@ cargo xtask bench-remote --provider aws --scenario all
 # Fetch results from last run without re-running
 cargo xtask bench-remote --provider aws --fetch
 
-# Kill stuck benchmark and start fresh
+# Kill a running benchmark and start fresh (without --force a live run is refused)
 cargo xtask bench-remote --provider aws --force --scenario cold
 
 # Regression check against baseline (on instance)
@@ -105,7 +109,7 @@ cd bench/terraform/aws && terraform destroy
 | File | Description |
 |------|-------------|
 | `bench/results/<timestamp>/summary.md` | Comparison table with per-scenario metrics |
-| `bench/results/<timestamp>/<tool>-proxy.jsonl` | Raw per-request proxy log per tool |
+| `bench/results/<timestamp>/<tool>-<pass>-proxy.jsonl` | Raw per-request proxy log per tool and pass (e.g. `ocync-scale-10-proxy.jsonl`) |
 | `bench/results/{registry}.json` | Per-registry run record archive (tracked in git) |
 | `bench/results/baseline.json` | Regression baseline (created on first `--regression` run) |
 

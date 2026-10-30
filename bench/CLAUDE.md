@@ -28,8 +28,14 @@ cargo xtask bench-remote --provider aws --scenario sync \
 cargo xtask bench-remote --provider aws --scenario all
 
 # Fetch results from the last run without re-running
+# (the newest results on the instance; a live run's partial ones once its benchmark has started)
 cargo xtask bench-remote --provider aws --fetch
+
+# Replace a run that is still going
+cargo xtask bench-remote --provider aws --force --scenario sync
 ```
+
+**A run in progress is refused unless `--force`.** A run lock on the instance (`bench/.bench-run.lock`) is held from the start of checkout until the benchmark and every tool it spawned have exited, so a second `bench-remote` cannot delete `target/` under a build. The remote script, the build and the benchmark runner share one process group, recorded in `bench/.bench-run.pgid` and never removed (the lock, not the file, says whether a run is live). `--force` kills that group, then takes the lock. Git runs with the lock's fd closed so a daemonized git cannot hold it from outside the group. Only `flock` exit 75 means held; any other `flock` failure aborts without the refusal. `--fetch` conflicts with every option that shapes a run, since it starts nothing. A run fetches results only after the script prints `benchmark started`; a failure before that (lock held after the wait, `flock` failed, build failed) returns an error and leaves local results alone.
 
 **What it does:**
 1. `git push` the current branch
@@ -145,24 +151,24 @@ Terraform writes `bench.json` to the provider directory with connection details.
 
 ## Analyzing proxy logs
 
-Raw per-request data lives in `<tool>-proxy.jsonl` files in `bench/results/<timestamp>/`.
+Raw per-request data lives in `<tool>-<pass>-proxy.jsonl` files in `bench/results/<timestamp>/`, one per tool and pass (`<pass>` is `prime`, `cold`, `warm`, `partial`, `scale-<images>` or `prepare`, e.g. `ocync-scale-10-proxy.jsonl`).
 
 ```bash
 # Count requests by method
-jq -r '.method' <tool>-proxy.jsonl | sort | uniq -c | sort -rn
+jq -r '.method' <tool>-<pass>-proxy.jsonl | sort | uniq -c | sort -rn
 
 # Source blob pulls only (non-target hosts)
 # NOTE: filter by exact target_registry, NOT by substring "ecr" — public.ecr.aws
 # is a SOURCE host. The aggregate() metric uses `host != target_registry`.
 jq -r --arg target "$BENCH_TARGET_REGISTRY" \
   'select(.method=="GET" and (.url | contains("/blobs/sha256:")) and .host != $target)' \
-  <tool>-proxy.jsonl | wc -l
+  <tool>-<pass>-proxy.jsonl | wc -l
 
 # Mount attempts and success rate
-jq -r 'select(.url | contains("mount="))' <tool>-proxy.jsonl | jq -r '.status' | sort | uniq -c
+jq -r 'select(.url | contains("mount="))' <tool>-<pass>-proxy.jsonl | jq -r '.status' | sort | uniq -c
 
 # Total response bytes
-jq '[.response_bytes] | add' <tool>-proxy.jsonl
+jq '[.response_bytes] | add' <tool>-<pass>-proxy.jsonl
 ```
 
 ## Run record archive
