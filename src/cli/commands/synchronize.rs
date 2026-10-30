@@ -28,8 +28,8 @@ use serde::Serialize;
 
 use crate::SyncArgs;
 use crate::cli::config::{
-    AuthType, ByteSize, CacheTtl, Config, GlobOrList, MappingConfig, RegistryConfig, TagsConfig,
-    load_config, resolve_target_names,
+    AuthType, CacheTtl, Config, GlobOrList, MappingConfig, RegistryConfig, StagingLimit,
+    TagsConfig, load_config, resolve_target_names,
 };
 use crate::cli::output::{format_bytes, format_duration};
 use crate::cli::{
@@ -615,23 +615,28 @@ pub(crate) fn resolve_cache_ttl(config: &Config) -> Duration {
 }
 
 /// Disk staging rooted at `dir`, with stale blobs evicted down to `limit`.
-/// A limit of 0 turns staging off, as the config documents, after removing
-/// what earlier runs staged there.
-fn open_staging(dir: PathBuf, limit: Option<u64>) -> BlobStage {
+/// A disabled limit turns staging off, as the config documents, after
+/// removing what earlier runs staged there.
+fn open_staging(dir: PathBuf, limit: Option<StagingLimit>) -> BlobStage {
     let stage = BlobStage::new(dir);
     if let Err(e) = stage.cleanup_tmp_files() {
         tracing::warn!(error = %e, "failed to clean staging tmp files");
     }
     // Evict stale blobs from previous runs before starting new work.
-    if let Some(limit) = limit {
-        if let Err(e) = stage.evict(limit) {
-            tracing::warn!(error = %e, "failed to evict staged blobs");
-        }
+    let keep_bytes = match limit {
+        None => return stage,
+        Some(StagingLimit::Disabled) => 0,
+        Some(StagingLimit::Bytes(bytes)) => bytes.get(),
+    };
+    if let Err(e) = stage.evict(keep_bytes) {
+        tracing::warn!(error = %e, "failed to evict staged blobs");
     }
-    if limit == Some(0) {
-        return BlobStage::disabled();
+    // Only `Disabled` keeps no bytes: `Bytes` is non-zero.
+    if keep_bytes == 0 {
+        BlobStage::disabled()
+    } else {
+        stage
     }
-    stage
 }
 
 /// Run the sync command: load config, resolve mappings, and execute.
@@ -727,11 +732,7 @@ pub(crate) async fn run(
     let staging = if needs_staging {
         open_staging(
             cache_dir.join("blobs"),
-            config
-                .global
-                .as_ref()
-                .and_then(|g| g.staging_size_limit)
-                .map(ByteSize::get),
+            config.global.as_ref().and_then(|g| g.staging_size_limit),
         )
     } else {
         BlobStage::disabled()
@@ -1978,8 +1979,14 @@ mod tests {
             format!("sha256:{}", "a".repeat(64)).parse().unwrap();
         // want: (staging enabled, an earlier run's blob kept)
         let cases = [
-            ("zero limit", Some(0), (false, false)),
-            ("positive limit", Some(1_000_000_000), (true, true)),
+            ("disabled", Some(StagingLimit::Disabled), (false, false)),
+            (
+                "a limit above the staged size",
+                Some(StagingLimit::Bytes(
+                    std::num::NonZeroU64::new(1_000_000_000).unwrap(),
+                )),
+                (true, true),
+            ),
             ("no limit", None, (true, true)),
         ];
         for (name, limit, want) in cases {

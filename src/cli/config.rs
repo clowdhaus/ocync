@@ -1,7 +1,7 @@
 //! Configuration file schema types and YAML deserialization.
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::time::Duration;
 
@@ -160,7 +160,7 @@ pub(crate) struct GlobalConfig {
     /// Uses SI decimal prefixes: 1 GB = 1,000,000,000 bytes.
     /// `0` disables disk staging. When absent, no eviction is performed.
     #[schemars(with = "Option<String>")]
-    pub staging_size_limit: Option<ByteSize>,
+    pub staging_size_limit: Option<StagingLimit>,
 }
 
 /// A count that must be at least 1, so a 0 reads as the rule it broke,
@@ -732,19 +732,17 @@ impl From<CacheTtl> for String {
 /// a config error rather than a failure at use.
 ///
 /// Accepts `"0"` or an unsigned integer with a suffix `B`, `KB`, `MB`, `GB`
-/// or `TB`, using SI decimal prefixes.
+/// or `TB`, using SI decimal prefixes. Any size of zero turns staging off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(try_from = "String", into = "String")]
-pub(crate) struct ByteSize(u64);
-
-impl ByteSize {
-    /// The size in bytes.
-    pub(crate) fn get(self) -> u64 {
-        self.0
-    }
+pub(crate) enum StagingLimit {
+    /// Disk staging is off.
+    Disabled,
+    /// Staged blobs are evicted down to this many bytes.
+    Bytes(NonZeroU64),
 }
 
-impl TryFrom<String> for ByteSize {
+impl TryFrom<String> for StagingLimit {
     type Error = String;
 
     fn try_from(text: String) -> Result<Self, String> {
@@ -754,7 +752,7 @@ impl TryFrom<String> for ByteSize {
             )
         };
         if text == "0" {
-            return Ok(Self(0));
+            return Ok(Self::Disabled);
         }
         // Longest suffix first, as "B" ends every other one.
         let (digits, bytes_per_unit) = [
@@ -767,13 +765,17 @@ impl TryFrom<String> for ByteSize {
         .into_iter()
         .find_map(|(suffix, unit)| text.strip_suffix(suffix).map(|digits| (digits, unit)))
         .ok_or_else(invalid)?;
-        scaled(digits, bytes_per_unit).map(Self).ok_or_else(invalid)
+        let bytes = scaled(digits, bytes_per_unit).ok_or_else(invalid)?;
+        Ok(NonZeroU64::new(bytes).map_or(Self::Disabled, Self::Bytes))
     }
 }
 
-impl From<ByteSize> for String {
-    fn from(size: ByteSize) -> String {
-        format!("{}B", size.0)
+impl From<StagingLimit> for String {
+    fn from(limit: StagingLimit) -> String {
+        match limit {
+            StagingLimit::Disabled => "0".into(),
+            StagingLimit::Bytes(bytes) => format!("{bytes}B"),
+        }
     }
 }
 
@@ -1232,8 +1234,8 @@ mappings:
             Some(Duration::from_secs(21_600))
         );
         assert_eq!(
-            global.staging_size_limit.map(ByteSize::get),
-            Some(1_000_000_000)
+            global.staging_size_limit,
+            Some(StagingLimit::Bytes(NonZeroU64::new(1_000_000_000).unwrap()))
         );
         let semver = roundtripped.mappings[0]
             .tags
@@ -1673,8 +1675,8 @@ mappings:
             Some(Duration::from_secs(6 * 3600))
         );
         assert_eq!(
-            global.staging_size_limit.map(ByteSize::get),
-            Some(1_000_000_000)
+            global.staging_size_limit,
+            Some(StagingLimit::Bytes(NonZeroU64::new(1_000_000_000).unwrap()))
         );
     }
 
@@ -1808,6 +1810,7 @@ mappings:
     fn valid_size_forms_parse_to_their_bytes() {
         let cases = [
             ("0", 0),
+            ("0B", 0),
             ("512B", 512),
             ("500KB", 500_000),
             ("500MB", 500_000_000),
@@ -1815,9 +1818,10 @@ mappings:
             ("1TB", 1_000_000_000_000),
         ];
         for (text, bytes) in cases {
+            let want = NonZeroU64::new(bytes).map_or(StagingLimit::Disabled, StagingLimit::Bytes);
             assert_eq!(
-                ByteSize::try_from(text.to_string()).unwrap().get(),
-                bytes,
+                StagingLimit::try_from(text.to_string()).unwrap(),
+                want,
                 "{text}"
             );
         }

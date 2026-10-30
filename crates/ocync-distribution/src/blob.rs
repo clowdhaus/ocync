@@ -482,10 +482,14 @@ impl UploadUrl {
     }
 }
 
+/// The standard `https` port, the only one an upgraded upload `Location`
+/// may name.
+const HTTPS_PORT: u16 = 443;
+
 /// Extract and resolve the `Location` header from an upload response,
 /// refusing any URL whose origin (scheme, host or port) differs from
-/// `base_url`'s, except an `https` upgrade of the same host on an `http`
-/// registry.
+/// `base_url`'s, except an upgrade of an `http` registry to `https` on the
+/// same host and the standard port.
 ///
 /// Every step of the upload chain (initiate, each PATCH, finalize PUT)
 /// goes through here. The chain carries the registry's bearer token, so a
@@ -508,7 +512,8 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Upl
     })?;
     let https_upgrade = base_url.scheme() == "http"
         && resolved.scheme() == "https"
-        && resolved.host() == base_url.host();
+        && resolved.host() == base_url.host()
+        && resolved.port_or_known_default() == Some(HTTPS_PORT);
     if resolved.origin() != base_url.origin() && !https_upgrade {
         return Err(Error::UploadProtocol {
             reason: format!(
@@ -605,7 +610,7 @@ mod tests {
     /// missing is refused: another host, another port, a scheme downgrade
     /// (the bearer token would go out in the clear), a scheme-relative URL
     /// to another host, and a missing header. The one exception is an
-    /// `https` upgrade of an `http` registry on the same host, any port.
+    /// `https` upgrade of an `http` registry on the same host and port 443.
     /// Breaks if the query that carries upload state is dropped, a relative
     /// path is not joined to the registry, a `Location` that differs only
     /// in scheme or port is accepted, or the upgrade is refused or extended
@@ -661,8 +666,8 @@ mod tests {
             ),
             (
                 "http://registry.example.com:5000",
-                Some("https://registry.example.com:8443/upload/uuid-1"),
-                Some("https://registry.example.com:8443/upload/uuid-1"),
+                Some("https://registry.example.com/upload/uuid-1"),
+                Some("https://registry.example.com/upload/uuid-1"),
             ),
             (
                 HTTP,
@@ -672,6 +677,11 @@ mod tests {
             (
                 HTTP,
                 Some("http://registry.example.com:8080/upload/uuid-1"),
+                None,
+            ),
+            (
+                HTTP,
+                Some("https://registry.example.com:8443/upload/uuid-1"),
                 None,
             ),
         ];
