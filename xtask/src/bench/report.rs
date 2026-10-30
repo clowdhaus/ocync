@@ -170,6 +170,19 @@ pub(crate) struct ScenarioResult {
     pub(crate) tool_order: Vec<String>,
 }
 
+impl ScenarioResult {
+    /// A scenario whose tool order was not shuffled, so the record carries no
+    /// seed and no order.
+    pub(crate) fn unshuffled(scenario: impl Into<String>, runs: Vec<ToolRun>) -> Self {
+        Self {
+            scenario: scenario.into(),
+            runs,
+            shuffle_seed: 0,
+            tool_order: Vec::new(),
+        }
+    }
+}
+
 /// Instance metadata captured at benchmark runtime.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct InstanceInfo {
@@ -757,10 +770,12 @@ fn scenario_markdown(report: &BenchReport, scenario: &ScenarioResult, descriptio
 }
 
 /// Finds a scenario whose name starts with `prefix` (case-insensitive).
-fn find_scenario<'a>(report: &'a BenchReport, prefix: &str) -> Option<&'a ScenarioResult> {
+pub(crate) fn find_scenario<'a>(
+    scenarios: &'a [ScenarioResult],
+    prefix: &str,
+) -> Option<&'a ScenarioResult> {
     let prefix_lower = prefix.to_lowercase();
-    report
-        .scenarios
+    scenarios
         .iter()
         .find(|s| s.scenario.to_lowercase().starts_with(&prefix_lower))
 }
@@ -816,7 +831,7 @@ fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), Stri
     let mut updated = false;
 
     // Cold scenario.
-    if let Some(scenario) = find_scenario(report, "cold") {
+    if let Some(scenario) = find_scenario(&report.scenarios, "cold") {
         let snippet = scenario_markdown(report, scenario, "Cold sync");
         match replace_between_markers(&content, BENCH_COLD_START, BENCH_COLD_END, &snippet)? {
             Some(new_content) => {
@@ -833,7 +848,7 @@ fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), Stri
     }
 
     // Warm scenario.
-    if let Some(scenario) = find_scenario(report, "warm") {
+    if let Some(scenario) = find_scenario(&report.scenarios, "warm") {
         let snippet = scenario_markdown(report, scenario, "Warm sync (no changes)");
         match replace_between_markers(&content, BENCH_WARM_START, BENCH_WARM_END, &snippet)? {
             Some(new_content) => {
@@ -1292,7 +1307,7 @@ mod tests {
     #[test]
     fn scenario_markdown_context_line() {
         let report = sample_report();
-        let scenario = find_scenario(&report, "cold").unwrap();
+        let scenario = find_scenario(&report.scenarios, "cold").unwrap();
         let md = scenario_markdown(&report, scenario, "Cold sync");
         assert!(md.contains("Measured 2026-04-15"));
         assert!(md.contains("c7g.xlarge"));
@@ -1328,7 +1343,7 @@ mod tests {
                 tool_order: Vec::new(),
             }],
         };
-        let scenario = find_scenario(&report, "warm").unwrap();
+        let scenario = find_scenario(&report.scenarios, "warm").unwrap();
         let md = scenario_markdown(&report, scenario, "Warm sync (no changes)");
         assert!(md.contains("Warm sync (no changes) to ECR"));
         assert!(md.contains("| Wall clock | 2s |"), "md:\n{md}");
@@ -1337,10 +1352,10 @@ mod tests {
     #[test]
     fn find_scenario_case_insensitive() {
         let report = sample_report();
-        assert!(find_scenario(&report, "cold").is_some());
-        assert!(find_scenario(&report, "Cold").is_some());
-        assert!(find_scenario(&report, "COLD").is_some());
-        assert!(find_scenario(&report, "warm").is_none());
+        assert!(find_scenario(&report.scenarios, "cold").is_some());
+        assert!(find_scenario(&report.scenarios, "Cold").is_some());
+        assert!(find_scenario(&report.scenarios, "COLD").is_some());
+        assert!(find_scenario(&report.scenarios, "warm").is_none());
     }
 
     #[test]

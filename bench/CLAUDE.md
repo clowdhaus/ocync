@@ -28,8 +28,14 @@ cargo xtask bench-remote --provider aws --scenario sync \
 cargo xtask bench-remote --provider aws --scenario all
 
 # Fetch results from the last run without re-running
+# (a run still live yields its partial results)
 cargo xtask bench-remote --provider aws --fetch
+
+# Replace a run that is still going
+cargo xtask bench-remote --provider aws --force --scenario sync
 ```
+
+**A run in progress is refused unless `--force`.** A run lock on the instance (`bench/.bench-run.lock`) is held from the start of checkout until the benchmark and every tool it spawned have exited, so a second `bench-remote` cannot delete `target/` under a build. `--force` kills the benchmark's whole process group, then takes the lock. `--fetch` conflicts with `--force` and `--git-ref`, since it starts nothing.
 
 **What it does:**
 1. `git push` the current branch

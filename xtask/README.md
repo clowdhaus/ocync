@@ -26,6 +26,8 @@ cargo xtask bench-remote --provider aws --scenario cold
 
 Pushes the current branch, SSHs into the bench instance, builds, runs benchmarks with live streamed output, then SCPs results back.
 
+A run already in progress on the instance, including one still checking out or building, is refused: the command prints that and fails, leaving the run alone. `--force` kills the run and everything it started, then begins fresh. `--fetch` copies the live run's partial results and cannot be combined with `--force` or `--git-ref`.
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--provider` | string | (required) | Cloud provider; reads `bench/terraform/<provider>/bench.json` |
@@ -33,8 +35,8 @@ Pushes the current branch, SSHs into the bench instance, builds, runs benchmarks
 | `--tools` | string | `ocync,dregsy,regsync` | Tools to benchmark |
 | `--iterations` | string | `1` | Cold-sync iterations (picks median) |
 | `--limit` | integer | all | Use first N corpus images only |
-| `--fetch` | flag | | Fetch results from last run without re-running |
-| `--force` | flag | | Kill any running benchmark and start fresh |
+| `--fetch` | flag | | Fetch results from last run (partial results while one is live) without re-running; conflicts with `--force` and `--git-ref` |
+| `--force` | flag | | Kill a running benchmark and start fresh; without it a live run is refused |
 | `--git-ref` | string | current branch | Git ref to checkout on the instance |
 | `--output` | path | `bench/results` | Local directory to save fetched results |
 
@@ -90,7 +92,7 @@ cargo xtask bench-remote --provider aws --scenario all
 # Fetch results from last run without re-running
 cargo xtask bench-remote --provider aws --fetch
 
-# Kill stuck benchmark and start fresh
+# Kill a running benchmark and start fresh (without --force a live run is refused)
 cargo xtask bench-remote --provider aws --force --scenario cold
 
 # Regression check against baseline (on instance)

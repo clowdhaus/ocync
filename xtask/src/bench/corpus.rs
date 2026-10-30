@@ -547,8 +547,9 @@ images:
             username: "bench".to_string(),
             token: "dckr_pat_secret".to_string(),
         };
-        let debug_output = format!("{auth:?}");
-        assert!(debug_output.contains("bench"));
-        assert!(!debug_output.contains("dckr_pat_secret"), "{debug_output}");
+        assert_eq!(
+            format!("{auth:?}"),
+            r#"DockerHubAuth { username: "bench", token: "[REDACTED]" }"#
+        );
     }
 }

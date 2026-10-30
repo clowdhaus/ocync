@@ -144,14 +144,14 @@ fn read_ssm_parameter(name: &str) -> Option<String> {
 ///
 /// Set by cloud-init on bench instances. Returns `None` if either
 /// variable is missing or empty.
-fn docker_hub_auth_from_env() -> Option<(String, String)> {
+fn docker_hub_auth_from_env() -> Option<corpus::DockerHubAuth> {
     let username = std::env::var("DOCKERHUB_USERNAME")
         .ok()
         .filter(|s| !s.is_empty())?;
     let token = std::env::var("DOCKERHUB_ACCESS_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())?;
-    Some((username, token))
+    Some(corpus::DockerHubAuth { username, token })
 }
 
 /// Write a progress line to stderr.
@@ -297,9 +297,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // Inject Docker Hub auth from env vars (cloud-init) or SSM (local dev).
     // Note: SSM fallback requires IAM permissions not in the current Terraform
     // (removed when migrating to SSH). Kept for local dev with personal creds.
-    if let Some((username, token)) = docker_hub_auth_from_env() {
-        eprintln!("bench: Docker Hub auth configured (username={username})");
-        corpus.dockerhub_auth = Some(corpus::DockerHubAuth { username, token });
+    if let Some(auth) = docker_hub_auth_from_env() {
+        eprintln!(
+            "bench: Docker Hub auth configured (username={})",
+            auth.username
+        );
+        corpus.dockerhub_auth = Some(auth);
     } else if let Some(token) = read_ssm_parameter("/ocync/bench/dockerhub-access-token") {
         let username = read_ssm_parameter("/ocync/bench/dockerhub-username")
             .unwrap_or_else(|| "ocync-bench".into());
@@ -458,9 +461,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                 // Scale scenario uses ocync only per spec.
                 if tools.contains(&Tool::Ocync) {
                     let ocync_only = vec![Tool::Ocync];
-                    let points =
+                    let scale_results =
                         run_scale(&args, &corpus, &ocync_only, &ecr_client, &output_dir).await?;
-                    report.scenarios.extend(points);
+                    report.scenarios.extend(scale_results);
                 } else {
                     eprintln!("bench: scale scenario requires ocync (skipping)");
                 }
@@ -557,24 +560,26 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// The ocync run of the cold sync scenario, the only run a baseline is
+/// comparable against.
+fn cold_ocync_run(scenarios: &[ScenarioResult]) -> Option<&ToolRun> {
+    report::find_scenario(scenarios, "cold")?
+        .runs
+        .iter()
+        .find(|r| r.tool == "ocync")
+}
+
 /// Compare the current ocync run against a stored baseline.
 ///
-/// Uses the first ocync run found across all scenarios (typically the cold
-/// sync median when running `all`). Returns an error if regression is detected.
+/// Uses the ocync run of the cold sync scenario, never a scale or prepare run.
+/// Returns an error if regression is detected.
 fn check_regression(
     report: &BenchReport,
     threshold: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let baseline_path = PathBuf::from("bench/results/baseline.json");
 
-    // Find the ocync cold-sync run for regression comparison.
-    let ocync_run = report
-        .scenarios
-        .iter()
-        .flat_map(|s| &s.runs)
-        .find(|r| r.tool == "ocync");
-
-    if let Some(run) = ocync_run {
+    if let Some(run) = cold_ocync_run(&report.scenarios) {
         let current = Baseline {
             wall_clock_secs: run.wall_clock_secs,
             requests: run.proxy_metrics.as_ref().map_or(0, |m| m.requests),
@@ -979,6 +984,12 @@ async fn run_partial(
     })
 }
 
+/// Phase label of the scale run at `size` images. Each size needs its own, or
+/// a later size truncates the earlier one's `{tool}-{phase}-proxy.jsonl`.
+fn scale_phase(size: usize) -> String {
+    format!("scale-{size}")
+}
+
 /// Scale scenario: run at increasing corpus sizes [10, 25, 50, all], one
 /// scenario result per size so each carries the full metric table.
 async fn run_scale(
@@ -997,7 +1008,7 @@ async fn run_scale(
         .collect();
     sizes.dedup();
 
-    let mut points = Vec::new();
+    let mut scale_results = Vec::new();
 
     for &size in &sizes {
         progress(&format!("  scale: {size} images"));
@@ -1018,7 +1029,7 @@ async fn run_scale(
                     &subset,
                     config_dir.path(),
                     output_dir,
-                    "scale",
+                    &scale_phase(size),
                     false,
                 )
                 .await?;
@@ -1041,15 +1052,13 @@ async fn run_scale(
             cooldown().await;
         }
 
-        points.push(ScenarioResult {
-            scenario: format!("Scale ({size} images)"),
+        scale_results.push(ScenarioResult::unshuffled(
+            format!("Scale ({size} images)"),
             runs,
-            shuffle_seed: 0,
-            tool_order: Vec::new(),
-        });
+        ));
     }
 
-    Ok(points)
+    Ok(scale_results)
 }
 
 /// Measure the pre-engine phase on its own.
@@ -1103,12 +1112,7 @@ async fn run_prepare(
         .into());
     }
 
-    Ok(ScenarioResult {
-        scenario: "Prepare (dry-run)".to_string(),
-        runs: vec![run],
-        shuffle_seed: 0,
-        tool_order: Vec::new(),
-    })
+    Ok(ScenarioResult::unshuffled("Prepare (dry-run)", vec![run]))
 }
 
 /// Sleep for 30 seconds between benchmark runs to let rate limits recover.
@@ -1987,7 +1991,9 @@ mod tests {
             std::env::remove_var("DOCKERHUB_USERNAME");
             std::env::remove_var("DOCKERHUB_ACCESS_TOKEN");
         }
-        assert_eq!(result, Some(("testuser".into(), "testtoken".into())));
+        let auth = result.unwrap();
+        assert_eq!(auth.username, "testuser");
+        assert_eq!(auth.token, "testtoken");
     }
 
     #[test]
@@ -2003,7 +2009,7 @@ mod tests {
             std::env::remove_var("DOCKERHUB_USERNAME");
             std::env::remove_var("DOCKERHUB_ACCESS_TOKEN");
         }
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -2014,7 +2020,44 @@ mod tests {
             std::env::remove_var("DOCKERHUB_USERNAME");
             std::env::remove_var("DOCKERHUB_ACCESS_TOKEN");
         }
-        assert_eq!(docker_hub_auth_from_env(), None);
+        assert!(docker_hub_auth_from_env().is_none());
+    }
+
+    fn ocync_run(wall_clock_secs: f64) -> ToolRun {
+        ToolRun {
+            tool: "ocync".to_string(),
+            wall_clock_secs,
+            exit_code: Some(0),
+            peak_rss_kb: None,
+            proxy_metrics: None,
+            phase_timing_ms: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn cold_ocync_run_skips_scale_and_prepare_runs() {
+        let scenarios = vec![
+            ScenarioResult::unshuffled("Scale (10 images)", vec![ocync_run(1.0)]),
+            ScenarioResult::unshuffled("Prepare (dry-run)", vec![ocync_run(2.0)]),
+            ScenarioResult::unshuffled("Cold sync", vec![ocync_run(3.0)]),
+        ];
+        let run = cold_ocync_run(&scenarios).unwrap();
+        assert_eq!(run.wall_clock_secs, 3.0);
+    }
+
+    #[test]
+    fn cold_ocync_run_is_none_without_a_cold_scenario() {
+        let scenarios = vec![
+            ScenarioResult::unshuffled("Scale (10 images)", vec![ocync_run(1.0)]),
+            ScenarioResult::unshuffled("Prepare (dry-run)", vec![ocync_run(2.0)]),
+        ];
+        assert!(cold_ocync_run(&scenarios).is_none());
+    }
+
+    #[test]
+    fn scale_phase_differs_per_size() {
+        assert_eq!(scale_phase(10), "scale-10");
+        assert_ne!(scale_phase(10), scale_phase(25));
     }
 
     #[test]
