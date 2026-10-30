@@ -346,25 +346,37 @@ impl BlobDedupMap {
     }
 }
 
+/// Digest and repository fixtures shared by the unit tests of this module and
+/// of [`crate::cache`].
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use ocync_distribution::Digest;
+    use ocync_distribution::spec::RepositoryName;
 
-    fn test_digest() -> Digest {
+    /// The digest of empty content.
+    pub(crate) fn test_digest() -> Digest {
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
             .parse()
             .unwrap()
     }
 
-    fn other_digest() -> Digest {
+    /// A digest distinct from [`test_digest`].
+    pub(crate) fn other_digest() -> Digest {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .parse()
             .unwrap()
     }
 
-    fn repo(name: &str) -> RepositoryName {
+    /// A valid repository name.
+    pub(crate) fn repo(name: &str) -> RepositoryName {
         RepositoryName::new(name).unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{other_digest, repo, test_digest};
+    use super::*;
 
     /// A new run marks present states `Remembered`, which a missing batch
     /// answer drops. State this run recorded, at the same repo or
@@ -653,6 +665,26 @@ mod tests {
         assert!(persisted.repo_state("reg.io", &d, &repo("c")).is_none());
         assert!(persisted.repo_state("reg.io", &d, &repo("e")).is_none());
         assert!(persisted.repos_iter("reg.io", &d2).next().is_none());
+    }
+
+    /// Only `Verified` and `Completed` blobs count as present; an upload in
+    /// flight and a failure do not.
+    #[test]
+    fn blob_present_at_excludes_uploading_and_failed() {
+        let mut map = BlobDedupMap::default();
+        let d = test_digest();
+        map.set_blob_verified("reg.io", &d, &repo("a"));
+        map.set_blob_completed("reg.io", &d, &repo("b"));
+        assert!(matches!(
+            map.claim_blob_upload("reg.io", &d, &repo("c")),
+            ClaimAction::Claimed
+        ));
+        map.set_blob_failed("reg.io", &d, &repo("d"), "oops".into());
+
+        assert!(map.blob_present_at("reg.io", &d, &repo("a")));
+        assert!(map.blob_present_at("reg.io", &d, &repo("b")));
+        assert!(!map.blob_present_at("reg.io", &d, &repo("c")));
+        assert!(!map.blob_present_at("reg.io", &d, &repo("d")));
     }
 
     /// A second image syncing into the holder's own repo waits for the

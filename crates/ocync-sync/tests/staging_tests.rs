@@ -23,6 +23,19 @@ fn digest_c() -> ocync_distribution::Digest {
     DIGEST_C.parse().unwrap()
 }
 
+fn stage_blob(stage: &BlobStage, digest: &ocync_distribution::Digest, data: &[u8]) {
+    let mut writer = stage.begin_write(digest).unwrap();
+    writer.write_chunk(data).unwrap();
+    writer.finish().unwrap();
+}
+
+fn read_staged(stage: &BlobStage, digest: &ocync_distribution::Digest) -> Vec<u8> {
+    let mut file = stage.open_read(digest).unwrap();
+    let mut buf = Vec::new();
+    io::Read::read_to_end(&mut file, &mut buf).unwrap();
+    buf
+}
+
 // ---------------------------------------------------------------------------
 // Round-trip
 // ---------------------------------------------------------------------------
@@ -33,11 +46,11 @@ fn stage_and_read_roundtrip() {
     let stage = BlobStage::new(dir.path().to_path_buf());
 
     let data = b"hello staging world";
-    stage.write(&digest_a(), data).unwrap();
+    stage_blob(&stage, &digest_a(), data);
 
     assert!(stage.exists(&digest_a()));
 
-    let read_back = stage.read(&digest_a()).unwrap();
+    let read_back = read_staged(&stage, &digest_a());
     assert_eq!(read_back, data);
 }
 
@@ -55,7 +68,7 @@ fn write_creates_parent_dirs() {
     let base = dir.path().join("a").join("b").join("c");
     let stage = BlobStage::new(base);
 
-    stage.write(&digest_a(), b"data").unwrap();
+    stage_blob(&stage, &digest_a(), b"data");
     assert!(stage.exists(&digest_a()));
 }
 
@@ -74,7 +87,7 @@ fn begin_write_and_finish_roundtrip() {
     writer.finish().unwrap();
 
     assert!(stage.exists(&digest_a()));
-    let data = stage.read(&digest_a()).unwrap();
+    let data = read_staged(&stage, &digest_a());
     assert_eq!(data, b"hello world");
 }
 
@@ -83,12 +96,9 @@ fn open_read_returns_file_contents() {
     let dir = tempfile::tempdir().unwrap();
     let stage = BlobStage::new(dir.path().to_path_buf());
 
-    stage.write(&digest_a(), b"read me").unwrap();
+    stage_blob(&stage, &digest_a(), b"read me");
 
-    let mut file = stage.open_read(&digest_a()).unwrap();
-    let mut buf = Vec::new();
-    io::Read::read_to_end(&mut file, &mut buf).unwrap();
-    assert_eq!(buf, b"read me");
+    assert_eq!(read_staged(&stage, &digest_a()), b"read me");
 }
 
 #[test]
@@ -115,7 +125,7 @@ fn cleanup_tmp_files_removes_orphaned_files() {
     let stage = BlobStage::new(dir.path().to_path_buf());
 
     // Write a real blob so the directory structure exists.
-    stage.write(&digest_a(), b"real data").unwrap();
+    stage_blob(&stage, &digest_a(), b"real data");
 
     // Plant a fake orphaned tmp file alongside the real blob.
     let algo_dir = dir.path().join("blobs").join("sha256");
@@ -154,9 +164,9 @@ fn evict_removes_smallest_files_first() {
     let medium = vec![1u8; 20];
     let large = vec![2u8; 30];
 
-    stage.write(&digest_a(), &small).unwrap();
-    stage.write(&digest_b(), &medium).unwrap();
-    stage.write(&digest_c(), &large).unwrap();
+    stage_blob(&stage, &digest_a(), &small);
+    stage_blob(&stage, &digest_b(), &medium);
+    stage_blob(&stage, &digest_c(), &large);
 
     // Total = 60 bytes. Limit to 40 bytes, so 20+ bytes must be evicted.
     // Sorted by ascending size: A(10), B(20), C(30).
@@ -177,7 +187,7 @@ fn evict_noop_when_under_threshold() {
     let dir = tempfile::tempdir().unwrap();
     let stage = BlobStage::new(dir.path().to_path_buf());
 
-    stage.write(&digest_a(), b"small").unwrap();
+    stage_blob(&stage, &digest_a(), b"small");
 
     stage.evict(1_000_000).unwrap();
 
@@ -214,20 +224,6 @@ fn enabled_is_enabled() {
 fn disabled_exists_returns_false() {
     let stage = BlobStage::disabled();
     assert!(!stage.exists(&digest_a()));
-}
-
-#[test]
-fn disabled_write_returns_unsupported_error() {
-    let stage = BlobStage::disabled();
-    let err = stage.write(&digest_a(), b"data").unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-}
-
-#[test]
-fn disabled_read_returns_unsupported_error() {
-    let stage = BlobStage::disabled();
-    let err = stage.read(&digest_a()).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
 }
 
 #[test]

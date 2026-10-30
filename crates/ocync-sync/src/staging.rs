@@ -27,8 +27,8 @@ use tokio::sync::Notify;
 
 use crate::shared::{Claim, ClaimGuard, Work, claim};
 
-/// Sequence for temporary file names, shared by [`BlobStage::write`] and
-/// [`BlobStage::begin_write`] so the two never collide on one digest.
+/// Sequence for temporary file names, so concurrent [`BlobStage::begin_write`]
+/// calls on one digest never collide.
 static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Best-effort directory fsync after an atomic rename, so the rename survives
@@ -118,46 +118,6 @@ impl BlobStage {
             // No outcome is ever recorded; the disk check above decides.
             Claim::Done(_) => StagePullAction::Exists,
         }
-    }
-
-    /// Atomically write `data` as the staged blob for `digest`.
-    ///
-    /// Returns [`io::ErrorKind::Unsupported`] if staging is disabled.
-    pub fn write(&self, digest: &Digest, data: &[u8]) -> Result<(), io::Error> {
-        let dest = self.blob_path(digest).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Unsupported, "blob staging is disabled")
-        })?;
-
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = dest.with_extension(format!("tmp.{}.{seq}", std::process::id()));
-
-        {
-            use std::io::Write as _;
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(data)?;
-            file.sync_all()?;
-        }
-
-        std::fs::rename(&tmp_path, &dest)?;
-
-        best_effort_dir_fsync(&dest);
-
-        Ok(())
-    }
-
-    /// Read a staged blob into memory.
-    ///
-    /// Returns [`io::ErrorKind::Unsupported`] if staging is disabled.
-    /// Returns [`io::ErrorKind::NotFound`] if the blob is not staged.
-    pub fn read(&self, digest: &Digest) -> Result<Vec<u8>, io::Error> {
-        let path = self.blob_path(digest).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Unsupported, "blob staging is disabled")
-        })?;
-        std::fs::read(&path)
     }
 
     /// Delete orphaned `.tmp.*` files left by a crash. Call once at startup,
@@ -369,11 +329,17 @@ mod tests {
         Digest::from_sha256(ocync_distribution::sha256::Sha256::digest(b"blob"))
     }
 
+    fn stage_blob(stage: &BlobStage, digest: &Digest, data: &[u8]) {
+        let mut writer = stage.begin_write(digest).unwrap();
+        writer.write_chunk(data).unwrap();
+        writer.finish().unwrap();
+    }
+
     #[test]
     fn a_staged_blob_is_read_from_disk_not_pulled() {
         let dir = tempfile::tempdir().unwrap();
         let stage = BlobStage::new(dir.path().to_path_buf());
-        stage.write(&digest(), b"blob").unwrap();
+        stage_blob(&stage, &digest(), b"blob");
         assert!(matches!(
             stage.claim_or_check(&digest()),
             StagePullAction::Exists

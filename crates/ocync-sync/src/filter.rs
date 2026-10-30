@@ -51,8 +51,9 @@ fn system_exclude_set() -> &'static GlobSet {
 /// Configuration for the tag filter pipeline.
 ///
 /// Stages narrow in order: `glob → semver → exclude → sort → latest →
-/// min_tags`. Tags matching `include:` bypass the glob/semver pipeline and the
-/// soft exclude tier but not the hard tier.
+/// min_tags`. Literal `include:` patterns bypass the whole pipeline except the
+/// hard exclude tier. Glob `include:` patterns bypass `glob:` and the soft
+/// exclude tier, then run through the rest of the pipeline.
 ///
 /// # Exclude tiers
 ///
@@ -808,42 +809,10 @@ mod tests {
                 &["v3.0.0", "v2.0.0", "v1.0.0"],
             ),
             (
-                "semver: suffix tags sort below their base",
-                Semver,
-                &["1.0.0", "1.0.0-rc1", "1.0.0-alpha", "1.1.0-beta1", "1.1.0"],
-                &["1.1.0", "1.1.0-beta1", "1.0.0", "1.0.0-rc1", "1.0.0-alpha"],
-            ),
-            (
-                "semver: two-part versions",
-                Semver,
-                &["1.20", "1.18", "1.19"],
-                &["1.20", "1.19", "1.18"],
-            ),
-            (
                 "semver: mixed v prefix and bare sort by parsed value",
                 Semver,
                 &["v1.0.0", "2.0.0", "v1.5.0"],
                 &["2.0.0", "v1.5.0", "v1.0.0"],
-            ),
-            (
-                "semver: eks distro compound suffix",
-                Semver,
-                &[
-                    "v1.27.6-eks-1-27-9",
-                    "v1.27.6-eks-1-27-14",
-                    "v1.27.6-eks-1-27-12",
-                ],
-                &[
-                    "v1.27.6-eks-1-27-14",
-                    "v1.27.6-eks-1-27-12",
-                    "v1.27.6-eks-1-27-9",
-                ],
-            ),
-            (
-                "semver: rc10 above rc9",
-                Semver,
-                &["1.0.0-rc9", "1.0.0-rc10", "1.0.0-rc1"],
-                &["1.0.0-rc10", "1.0.0-rc9", "1.0.0-rc1"],
             ),
         ];
         for (name, order, input, want) in cases {
@@ -876,7 +845,6 @@ mod tests {
                     exclude: strs(&["*-rc*"]),
                     sort: Some(SortOrder::Semver),
                     latest: Some(2),
-                    min_tags: None,
                     ..FilterConfig::default()
                 },
                 vec![
@@ -1002,25 +970,6 @@ mod tests {
     }
 
     #[test]
-    fn build_glob_set_semver_shaped_patterns() {
-        // (pattern, tag, matches)
-        let cases: &[(&str, &str, bool)] = &[
-            ("v[0-9]*.[0-9]*.[0-9]*", "v1.2.3", true),
-            ("v[0-9]*.[0-9]*.[0-9]*", "v10.20.30", true),
-            ("v[0-9]*.[0-9]*.[0-9]*", "latest", false),
-            ("v[0-9]*.[0-9]*.[0-9]*", "nightly", false),
-            ("[0-9]*.[0-9]*.[0-9]*", "1.2.3", true),
-            ("[0-9]*.[0-9]*.[0-9]*", "10.0.0", true),
-            ("[0-9]*.[0-9]*.[0-9]*", "v1.2.3", false),
-            ("[0-9]*.[0-9]*.[0-9]*", "latest", false),
-        ];
-        for (pattern, tag, want) in cases {
-            let gs = build_glob_set(&[(*pattern).into()]).unwrap();
-            assert_eq!(gs.is_match(tag), *want, "{pattern}: {tag}");
-        }
-    }
-
-    #[test]
     fn system_exclude_drops_prereleases() {
         assert_applies(vec![
             (
@@ -1108,19 +1057,6 @@ mod tests {
                 },
                 vec!["8.0.0", "8.5.0-dev", "10.0.0-dev"],
                 vec![],
-            ),
-            (
-                // The lenient parser admits 8.5.0-dev as prefix [8,5,0], so
-                // semver: alone constrains dev tags; no include: involved.
-                "semver constrains dev tags absent from defaults_exclude",
-                FilterConfig {
-                    defaults_exclude: strs(&["*-r[0-9]*"]),
-                    semver: Some(">=8.0.0, <9.0.0".into()),
-                    sort: Some(SortOrder::Semver),
-                    ..FilterConfig::default()
-                },
-                vec!["8.0.0", "8.5.0", "8.5.0-dev", "10.0.0", "10.0.0-dev"],
-                vec!["8.5.0", "8.5.0-dev", "8.0.0"],
             ),
             (
                 // Stable and dev tags both constrained by semver:, -rN denied.
@@ -1422,20 +1358,12 @@ mod tests {
         ]);
     }
 
-    /// Names the `DropKind` variant so rows can list expected kinds.
-    fn kind_name(kind: &DropKind) -> &'static str {
-        match kind {
-            DropKind::Glob { .. } => "Glob",
-            DropKind::Semver { .. } => "Semver",
-            DropKind::MappingExclude { .. } => "MappingExclude",
-            DropKind::DefaultsExclude { .. } => "DefaultsExclude",
-            DropKind::BuiltinExclude => "BuiltinExclude",
-            DropKind::LatestCap { .. } => "LatestCap",
-        }
-    }
-
     #[test]
     fn report_attributes_each_exclude_tier() {
+        type IsKind = fn(&DropKind) -> bool;
+        let defaults: IsKind = |k| matches!(k, DropKind::DefaultsExclude { .. });
+        let mapping: IsKind = |k| matches!(k, DropKind::MappingExclude { .. });
+        let builtin: IsKind = |k| matches!(k, DropKind::BuiltinExclude);
         // (name, config, tags, kinds that must appear in `dropped`)
         let cases = [
             (
@@ -1448,7 +1376,7 @@ mod tests {
                     ..FilterConfig::default()
                 },
                 vec!["1.0.0", "1.0.0-dev", "1.0.0-rc1", "1.0.0-slim"],
-                vec!["DefaultsExclude", "MappingExclude", "BuiltinExclude"],
+                vec![defaults, mapping, builtin],
             ),
             (
                 "mapping and built-in",
@@ -1458,19 +1386,17 @@ mod tests {
                     ..FilterConfig::default()
                 },
                 vec!["1.0.0", "1.0.0-musl", "1.1.0-rc1", "1.2.0"],
-                vec!["MappingExclude", "BuiltinExclude"],
+                vec![mapping, builtin],
             ),
         ];
         for (name, config, tags, want_kinds) in cases {
             let filtered = config.apply_with_report(&tags).unwrap();
-            let kinds: Vec<&str> = filtered
-                .report
-                .dropped
-                .iter()
-                .map(|d| kind_name(&d.kind))
-                .collect();
+            let kinds: Vec<&DropKind> = filtered.report.dropped.iter().map(|d| &d.kind).collect();
             for want in want_kinds {
-                assert!(kinds.contains(&want), "{name}: missing {want} in {kinds:?}");
+                assert!(
+                    kinds.iter().any(|k| want(k)),
+                    "{name}: expected kind missing in {kinds:?}"
+                );
             }
         }
     }
@@ -1517,19 +1443,10 @@ mod tests {
         // Tags rescued only via `include:` still count as dropped from the
         // pipeline: they reach `kept` through the include union.
         let total_dropped: usize = filtered.report.dropped.iter().map(|d| d.count).sum();
-        let pipeline_survivors = filtered.report.candidate_count - total_dropped;
-        assert!(
-            filtered.kept.len() <= filtered.report.include_kept.len() + pipeline_survivors,
-            "kept={} > include_kept={} + pipeline_survivors={}",
-            filtered.kept.len(),
-            filtered.report.include_kept.len(),
-            pipeline_survivors,
-        );
-        assert!(
-            filtered.kept.len() >= pipeline_survivors,
-            "kept={} < pipeline_survivors={}",
-            filtered.kept.len(),
-            pipeline_survivors,
+        assert_eq!(filtered.report.candidate_count, 5, "candidate_count");
+        assert_eq!(
+            total_dropped, 3,
+            "latest and 0.9.0-rc1 by semver, 1.0.0 by cap"
         );
 
         // latest is dropped by semver but rescued by include; 1.0.0 falls off

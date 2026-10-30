@@ -20,6 +20,7 @@ use ocync_distribution::auth::ecr_public::EcrPublicAuth;
 use ocync_distribution::auth::gcp::{GcpAuth, SharedGoogleToken};
 use ocync_distribution::auth::static_token::StaticTokenAuth;
 use ocync_distribution::{AwsCredentialProviders, RegistryClient};
+use ocync_sync::RunOutcome;
 
 use std::sync::Once;
 #[cfg(test)]
@@ -86,12 +87,12 @@ pub(crate) enum ExitCode {
 }
 
 impl ExitCode {
-    /// Map a [`SyncReport`](ocync_sync::SyncReport) exit code to a CLI exit code.
-    pub(crate) fn from_report(code: i32) -> Self {
-        match code {
-            0 => Self::Success,
-            1 => Self::PartialFailure,
-            _ => Self::Failure,
+    /// Map a [`SyncReport`](ocync_sync::SyncReport) outcome to a CLI exit code.
+    pub(crate) fn from_report(outcome: RunOutcome) -> Self {
+        match outcome {
+            RunOutcome::Clean => Self::Success,
+            RunOutcome::Partial => Self::PartialFailure,
+            RunOutcome::AllFailed => Self::Failure,
         }
     }
 }

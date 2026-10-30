@@ -311,7 +311,7 @@ mod tests {
                     reference: "latest".into(),
                     source: registry_404,
                 },
-                &["latest", "manifest"],
+                &["latest", "manifest", "not found"],
             ),
             (
                 "blob transfer",
@@ -325,6 +325,7 @@ mod tests {
                 &[
                     "blob transfer",
                     "sha256:def0000000000000000000000000000000000000000000000000000000000000",
+                    "permission denied",
                 ],
             ),
             (
@@ -381,22 +382,6 @@ mod tests {
                 Error::ManifestLogic {
                     reference: "latest".into(),
                     reason: "no match".into(),
-                },
-                None,
-            ),
-            ("filter error", Error::LatestWithoutSort, None),
-            (
-                "required artifacts missing",
-                Error::RequiredArtifactsMissing {
-                    reference: "sha256:abc".into(),
-                },
-                None,
-            ),
-            (
-                "artifact sync",
-                Error::ArtifactSync {
-                    reference: "sha256:def".into(),
-                    reason: "failed".into(),
                 },
                 None,
             ),

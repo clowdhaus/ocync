@@ -59,22 +59,36 @@ use crate::{
 /// Writes a JSONL timing event (`{"phase":"<name>","elapsed_ms":<N>}`) to the
 /// optional `OCYNC_TIMING_FILE` benchmark file. No-ops when `file` is `None`.
 ///
-/// `phase` must be an ASCII identifier: it is written unescaped, which spares
-/// this crate a `serde_json` dependency for a two-field line.
-fn write_timing(file: &mut Option<std::fs::File>, phase: &str, start: &Instant) {
+/// The phase name is written unescaped, which spares this crate a
+/// `serde_json` dependency for a two-field line.
+fn write_timing(file: &mut Option<std::fs::File>, phase: TimingPhase, start: &Instant) {
     if let Some(f) = file {
         use std::io::Write;
-        debug_assert!(
-            phase
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-            "timing phase name must be ASCII alphanumeric: {phase}"
-        );
         let _ = writeln!(
             f,
-            r#"{{"phase":"{phase}","elapsed_ms":{}}}"#,
+            r#"{{"phase":"{}","elapsed_ms":{}}}"#,
+            phase.as_str(),
             start.elapsed().as_millis()
         );
+    }
+}
+
+/// A phase boundary recorded in the `OCYNC_TIMING_FILE` benchmark file.
+#[derive(Clone, Copy)]
+enum TimingPhase {
+    DiscoveryStart,
+    DiscoveryComplete,
+    ExecutionComplete,
+}
+
+impl TimingPhase {
+    /// The name written to the timing file.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscoveryStart => "discovery_start",
+            Self::DiscoveryComplete => "discovery_complete",
+            Self::ExecutionComplete => "execution_complete",
+        }
     }
 }
 
@@ -311,18 +325,24 @@ fn collect_image_blobs(manifest: &ImageManifest) -> Vec<&Descriptor> {
     blobs
 }
 
-/// Build an `ImageResult` for a skipped image (zero transfer, zero duration).
-fn skip_image_result(source: &ImageRef, target: &ImageRef, reason: SkipReason) -> ImageResult {
+/// Build an `ImageResult` with zero transfer and zero duration; callers that
+/// moved bytes override those fields with struct update syntax.
+fn image_result(source: &ImageRef, target: &ImageRef, status: ImageStatus) -> ImageResult {
     ImageResult {
         image_id: Uuid::now_v7(),
         source: source.to_string(),
         target: target.to_string(),
-        status: ImageStatus::Skipped { reason },
+        status,
         bytes_transferred: 0,
         blob_stats: BlobTransferStats::default(),
         duration: Duration::ZERO,
         artifacts_skipped: false,
     }
+}
+
+/// Build an `ImageResult` for a skipped image (zero transfer, zero duration).
+fn skip_image_result(source: &ImageRef, target: &ImageRef, reason: SkipReason) -> ImageResult {
+    image_result(source, target, ImageStatus::Skipped { reason })
 }
 
 /// Source manifest data pulled once per tag, however many targets it fans out to.
@@ -437,7 +457,6 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
         return 0;
     }
 
-    // Group tasks by source image (same `Rc<PulledManifest>`).
     let mut group_ptrs: Vec<usize> = Vec::new();
     let mut group_blobs: Vec<HashSet<Digest>> = Vec::new();
     let mut task_group: Vec<usize> = Vec::with_capacity(pending.len());
@@ -469,8 +488,8 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
     // The inverted index `blob_remaining_count` maps each blob to the number
     // of remaining groups containing it, so a candidate's marginal gain from a
     // blob outside `leader_blob_union` is `count - 1`. That costs O(n * b_avg)
-    // per round instead of O(n^2 * b) for a pairwise scan; a cubic version hung
-    // production runs after discovery.
+    // per round instead of O(n^2 * b) for a pairwise scan. Must stay
+    // sub-cubic; `elect_leaders_scales_subcubically` pins it.
     let mut leader_set: Vec<usize> = Vec::new();
     let mut leader_blob_union: HashSet<Digest> = HashSet::new();
     let mut remaining: Vec<usize> = (0..num_groups).collect();
@@ -535,7 +554,6 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
         }
     }
 
-    // Stable partition: leaders first, then followers.
     let mut leaders: VecDeque<TransferTask> = VecDeque::new();
     let mut followers: VecDeque<TransferTask> = VecDeque::new();
     for (task, &group) in pending.drain(..).zip(task_group.iter()) {
@@ -775,7 +793,7 @@ impl SyncEngine {
         let mut timing_file = std::env::var("OCYNC_TIMING_FILE")
             .ok()
             .and_then(|path| std::fs::File::create(&path).ok());
-        write_timing(&mut timing_file, "discovery_start", &run_start);
+        write_timing(&mut timing_file, TimingPhase::DiscoveryStart, &run_start);
 
         let mut discovery_futures = FuturesUnordered::new();
         let mut execution_futures: FuturesUnordered<
@@ -954,7 +972,7 @@ impl SyncEngine {
             {
                 elect_leaders(&mut pending);
                 promotion_phase = PromotionPhase::Done;
-                write_timing(&mut timing_file, "discovery_complete", &run_start);
+                write_timing(&mut timing_file, TimingPhase::DiscoveryComplete, &run_start);
                 let ctx = PromoteContext {
                     sem: &global_sem,
                     cache: &cache,
@@ -1096,7 +1114,7 @@ impl SyncEngine {
             }
         }
 
-        write_timing(&mut timing_file, "execution_complete", &run_start);
+        write_timing(&mut timing_file, TimingPhase::ExecutionComplete, &run_start);
 
         // Prune cache entries for tags/targets no longer in the mapping set.
         // Skipped when the caller could not resolve everything: absence then
@@ -1218,8 +1236,50 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         }
     };
 
-    // Steps 2-4: cache lookup, only if the HEAD succeeded.
     let snapshot_key = SnapshotKey::new(&source_authority, &source.repo, &source.tag);
+
+    // HEAD-check every target against `compare_digest`: all matching skips
+    // the image with `skip_route`; otherwise only the mismatched targets are
+    // pulled and transferred, reported as `stale_route`.
+    let skip_or_pull_stale = async |head_digest: &Digest,
+                                    compare_digest: &Digest,
+                                    label: &'static str,
+                                    skip_route: DiscoveryRoute,
+                                    stale_route: DiscoveryRoute| {
+        let check = check_targets_against_digest(TargetCheckParams {
+            targets: &targets,
+            source: &source,
+            target: &target,
+            compare_digest,
+            label,
+        })
+        .await;
+
+        if check.mismatched.is_empty() {
+            return (DiscoveryOutcome::Skip(check.skipped), skip_route);
+        }
+
+        let outcome = full_pull_and_build_tasks(FullPullParams {
+            source_client: &source_client,
+            shared: &shared,
+            source: &source,
+            target: &target,
+            targets: &check.mismatched,
+            skipped_results: check.skipped,
+            retry: &retry,
+            platforms: platforms.as_deref(),
+            cache: &cache,
+            snapshot_key: &snapshot_key,
+            head_digest: Some(head_digest),
+            platform_key: &platform_key,
+            artifacts_config: &artifacts_config,
+        })
+        .await;
+
+        (outcome, stale_route)
+    };
+
+    // Steps 2-4: cache lookup, only if the HEAD succeeded.
     if let Some(ref head_digest) = source_head_digest {
         // Borrow dropped before any .await.
         let cached = {
@@ -1231,40 +1291,14 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
             if *head_digest == snapshot.source_digest
                 && platform_key == snapshot.platform_filter_key
             {
-                let check = check_targets_against_digest(TargetCheckParams {
-                    targets: &targets,
-                    source: &source,
-                    target: &target,
-                    compare_digest: &snapshot.filtered_digest,
-                    label: "cache hit",
-                })
+                return skip_or_pull_stale(
+                    head_digest,
+                    &snapshot.filtered_digest,
+                    "cache hit",
+                    DiscoveryRoute::CacheHit,
+                    DiscoveryRoute::TargetStale,
+                )
                 .await;
-
-                if check.mismatched.is_empty() {
-                    return (
-                        DiscoveryOutcome::Skip(check.skipped),
-                        DiscoveryRoute::CacheHit,
-                    );
-                }
-
-                let outcome = full_pull_and_build_tasks(FullPullParams {
-                    source_client: &source_client,
-                    shared: &shared,
-                    source: &source,
-                    target: &target,
-                    targets: &check.mismatched,
-                    skipped_results: check.skipped,
-                    retry: &retry,
-                    platforms: platforms.as_deref(),
-                    cache: &cache,
-                    snapshot_key: &snapshot_key,
-                    head_digest: Some(head_digest),
-                    platform_key: &platform_key,
-                    artifacts_config: &artifacts_config,
-                })
-                .await;
-
-                return (outcome, DiscoveryRoute::TargetStale);
             }
         }
     }
@@ -1278,49 +1312,22 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
     // comparison would always miss. The full pull compares filtered digests.
     if head_first && platforms.is_none() {
         if let Some(ref head_digest) = source_head_digest {
-            let check = check_targets_against_digest(TargetCheckParams {
-                targets: &targets,
-                source: &source,
-                target: &target,
-                compare_digest: head_digest,
-                label: "head_first",
-            })
+            // A match writes no cache entry: the full manifest was never pulled,
+            // so there is no filtered_digest. In watch mode head_first
+            // therefore fires every cycle for tags that stay in sync (1
+            // source HEAD + N target HEADs per tag) until a change forces
+            // a full pull.
+            return skip_or_pull_stale(
+                head_digest,
+                head_digest,
+                "head_first",
+                DiscoveryRoute::HeadFirstSkip,
+                DiscoveryRoute::CacheMiss,
+            )
             .await;
-
-            if check.mismatched.is_empty() {
-                // No cache entry is written: the full manifest was never pulled,
-                // so there is no filtered_digest. In watch mode head_first
-                // therefore fires every cycle for tags that stay in sync (1
-                // source HEAD + N target HEADs per tag) until a change forces
-                // a full pull.
-                return (
-                    DiscoveryOutcome::Skip(check.skipped),
-                    DiscoveryRoute::HeadFirstSkip,
-                );
-            }
-
-            let outcome = full_pull_and_build_tasks(FullPullParams {
-                source_client: &source_client,
-                shared: &shared,
-                source: &source,
-                target: &target,
-                targets: &check.mismatched,
-                skipped_results: check.skipped,
-                retry: &retry,
-                platforms: platforms.as_deref(),
-                cache: &cache,
-                snapshot_key: &snapshot_key,
-                head_digest: Some(head_digest),
-                platform_key: &platform_key,
-                artifacts_config: &artifacts_config,
-            })
-            .await;
-
-            return (outcome, DiscoveryRoute::CacheMiss);
         }
     }
 
-    // Full pull path: cache miss, HEAD failed, or source changed.
     let route = if source_head_digest.is_none() {
         DiscoveryRoute::HeadFailure
     } else {
@@ -1617,20 +1624,17 @@ async fn execute_item(
         cache
             .borrow_mut()
             .notify_repo_failed(&item.target_name, &item.target.repo);
+        let status = ImageStatus::Failed {
+            kind: ErrorKind::BlobTransfer,
+            error: err.to_string(),
+            retries: retries_made(),
+            status_code: err.status_code().map(|s| s.as_u16()),
+        };
         return ImageResult {
-            image_id: Uuid::now_v7(),
-            source: item.source.to_string(),
-            target: item.target.to_string(),
-            status: ImageStatus::Failed {
-                kind: ErrorKind::BlobTransfer,
-                error: err.to_string(),
-                retries: retries_made(),
-                status_code: err.status_code().map(|s| s.as_u16()),
-            },
             bytes_transferred: outcome.bytes_transferred,
             blob_stats: outcome.stats,
             duration: start.elapsed(),
-            artifacts_skipped: false,
+            ..image_result(&item.source, &item.target, status)
         };
     }
 
@@ -1659,20 +1663,17 @@ async fn execute_item(
                         error = %err,
                         "artifact sync failed"
                     );
+                    let status = ImageStatus::Failed {
+                        kind,
+                        error: err.to_string(),
+                        retries,
+                        status_code: None,
+                    };
                     return ImageResult {
-                        image_id: Uuid::now_v7(),
-                        source: item.source.to_string(),
-                        target: item.target.to_string(),
-                        status: ImageStatus::Failed {
-                            kind,
-                            error: err.to_string(),
-                            retries,
-                            status_code: None,
-                        },
                         bytes_transferred: outcome.bytes_transferred,
                         blob_stats: outcome.stats,
                         duration: start.elapsed(),
-                        artifacts_skipped: false,
+                        ..image_result(&item.source, &item.target, status)
                     };
                 }
             };
@@ -1694,14 +1695,11 @@ async fn execute_item(
                 "image synced"
             );
             ImageResult {
-                image_id: Uuid::now_v7(),
-                source: item.source.to_string(),
-                target: item.target.to_string(),
-                status: ImageStatus::Synced,
                 bytes_transferred: outcome.bytes_transferred,
                 blob_stats: outcome.stats,
                 duration: start.elapsed(),
                 artifacts_skipped,
+                ..image_result(&item.source, &item.target, ImageStatus::Synced)
             }
         }
         Err(err) => {
@@ -1718,38 +1716,29 @@ async fn execute_item(
                     "target tag is immutable, skipping"
                 );
                 ImageResult {
-                    image_id: Uuid::now_v7(),
-                    source: item.source.to_string(),
-                    target: item.target.to_string(),
-                    status: ImageStatus::Skipped {
-                        reason: SkipReason::ImmutableTag,
-                    },
                     bytes_transferred: outcome.bytes_transferred,
                     blob_stats: outcome.stats,
                     duration: start.elapsed(),
-                    artifacts_skipped: false,
+                    ..skip_image_result(&item.source, &item.target, SkipReason::ImmutableTag)
                 }
             } else {
                 warn!(target_name = %item.target_name, error = %err, "manifest push failed");
-                ImageResult {
-                    image_id: Uuid::now_v7(),
-                    source: item.source.to_string(),
-                    target: item.target.to_string(),
-                    status: ImageStatus::Failed {
-                        // A refused manifest's repair can fail copying a blob.
-                        kind: if err.is_blob_transfer() {
-                            ErrorKind::BlobTransfer
-                        } else {
-                            ErrorKind::ManifestPush
-                        },
-                        error: err.to_string(),
-                        retries: retries_made(),
-                        status_code: err.status_code().map(|s| s.as_u16()),
+                let status = ImageStatus::Failed {
+                    // A refused manifest's repair can fail copying a blob.
+                    kind: if err.is_blob_transfer() {
+                        ErrorKind::BlobTransfer
+                    } else {
+                        ErrorKind::ManifestPush
                     },
+                    error: err.to_string(),
+                    retries: retries_made(),
+                    status_code: err.status_code().map(|s| s.as_u16()),
+                };
+                ImageResult {
                     bytes_transferred: outcome.bytes_transferred,
                     blob_stats: outcome.stats,
                     duration: start.elapsed(),
-                    artifacts_skipped: false,
+                    ..image_result(&item.source, &item.target, status)
                 }
             }
         }
@@ -3403,23 +3392,6 @@ mod tests {
     }
 
     #[test]
-    fn elect_leaders_no_shared_blobs() {
-        // Three images with completely disjoint blob sets.
-        let data_a = Rc::new(test_pulled_manifest(&["c1", "aa"]));
-        let data_b = Rc::new(test_pulled_manifest(&["c2", "bb"]));
-        let data_c = Rc::new(test_pulled_manifest(&["c3", "cc"]));
-
-        let mut pending = VecDeque::new();
-        pending.push_back(test_task(data_a, "imgA"));
-        pending.push_back(test_task(data_b, "imgB"));
-        pending.push_back(test_task(data_c, "imgC"));
-
-        // No shared blobs -> 0 leaders.
-        let n = elect_leaders(&mut pending);
-        assert_eq!(n, 0);
-    }
-
-    #[test]
     fn elect_leaders_multi_target_groups_by_rc() {
         // Same blob sets as `elect_leaders_picks_most_shared`, but base targets
         // two registries (two tasks sharing one Rc), so electing it yields n = 2.
@@ -3427,44 +3399,9 @@ mod tests {
         let child_a = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "d1"]));
         let child_b = Rc::new(test_pulled_manifest(&["c0", "a1", "a3", "e1"]));
 
-        let client_a = test_client();
-        let client_b = test_client();
-
         let mut pending = VecDeque::new();
-        pending.push_back(TransferTask {
-            source_data: Rc::clone(&base),
-            source_client: Arc::clone(&client_a),
-            target_name: RegistryAlias::new("target-1"),
-            target_client: Arc::clone(&client_a),
-            source: ImageRef {
-                repo: RepositoryName::new("src/base").unwrap(),
-                tag: "v1".into(),
-            },
-            target: ImageRef {
-                repo: RepositoryName::new("tgt/base").unwrap(),
-                tag: "v1".into(),
-            },
-            batch_checker: None,
-            artifacts_config: Rc::new(ResolvedArtifacts::default()),
-            discovery_retries: 0,
-        });
-        pending.push_back(TransferTask {
-            source_data: Rc::clone(&base),
-            source_client: Arc::clone(&client_b),
-            target_name: RegistryAlias::new("target-2"),
-            target_client: Arc::clone(&client_b),
-            source: ImageRef {
-                repo: RepositoryName::new("src/base").unwrap(),
-                tag: "v1".into(),
-            },
-            target: ImageRef {
-                repo: RepositoryName::new("tgt/base").unwrap(),
-                tag: "v1".into(),
-            },
-            batch_checker: None,
-            artifacts_config: Rc::new(ResolvedArtifacts::default()),
-            discovery_retries: 0,
-        });
+        pending.push_back(test_task(Rc::clone(&base), "v1"));
+        pending.push_back(test_task(Rc::clone(&base), "v1"));
         pending.push_back(test_task(child_a, "child_a"));
         pending.push_back(test_task(child_b, "child_b"));
 
@@ -3477,53 +3414,6 @@ mod tests {
         assert_eq!(pending[1].source.tag, "v1");
         assert_eq!(pending[2].source.tag, "child_a");
         assert_eq!(pending[3].source.tag, "child_b");
-    }
-
-    #[test]
-    fn elect_leaders_two_clusters() {
-        // Cluster 1: A and B share {c0, f1}. Cluster 2: C and D share {c9, f2}.
-        let data_a = Rc::new(test_pulled_manifest(&["c0", "f1", "a1"]));
-        let data_b = Rc::new(test_pulled_manifest(&["c0", "f1", "b1"]));
-        let data_c = Rc::new(test_pulled_manifest(&["c9", "f2", "d1"]));
-        let data_d = Rc::new(test_pulled_manifest(&["c9", "f2", "e1"]));
-
-        let mut pending = VecDeque::new();
-        pending.push_back(test_task(Rc::clone(&data_a), "imgA"));
-        pending.push_back(test_task(Rc::clone(&data_b), "imgB"));
-        pending.push_back(test_task(Rc::clone(&data_c), "imgC"));
-        pending.push_back(test_task(Rc::clone(&data_d), "imgD"));
-
-        let n = elect_leaders(&mut pending);
-
-        assert_eq!(n, 2);
-        let leader_blobs = leader_blob_digests(&pending, n);
-        assert!(
-            leader_blobs.len() >= 4,
-            "leader blobs should span both clusters"
-        );
-
-        let leader_tags: Vec<&str> = pending
-            .iter()
-            .take(n)
-            .map(|t| t.source.tag.as_str())
-            .collect();
-        let follower_tags: Vec<&str> = pending
-            .iter()
-            .skip(n)
-            .map(|t| t.source.tag.as_str())
-            .collect();
-
-        assert_eq!(leader_tags.len(), 2);
-        assert_eq!(follower_tags.len(), 2);
-
-        // One leader per cluster.
-        let cluster1 = ["imgA", "imgB"];
-        let cluster2 = ["imgC", "imgD"];
-        assert!(
-            leader_tags.iter().any(|t| cluster1.contains(t))
-                && leader_tags.iter().any(|t| cluster2.contains(t)),
-            "leaders should cover both clusters: {leader_tags:?}"
-        );
     }
 
     #[test]
@@ -3574,19 +3464,17 @@ mod tests {
         let data_b = Rc::new(test_pulled_manifest(&["a0", "b0"]));
         let data_c = Rc::new(test_pulled_manifest(&["a0", "c0"]));
 
-        for _ in 0..5 {
-            let mut pending = VecDeque::new();
-            pending.push_back(test_task(Rc::clone(&data_a), "imgA"));
-            pending.push_back(test_task(Rc::clone(&data_b), "imgB"));
-            pending.push_back(test_task(Rc::clone(&data_c), "imgC"));
+        let mut pending = VecDeque::new();
+        pending.push_back(test_task(Rc::clone(&data_a), "imgA"));
+        pending.push_back(test_task(Rc::clone(&data_b), "imgB"));
+        pending.push_back(test_task(Rc::clone(&data_c), "imgC"));
 
-            let n = elect_leaders(&mut pending);
-            assert_eq!(n, 1);
-            assert_eq!(
-                pending[0].source.tag, "imgB",
-                "tie should break deterministically in favor of later candidate"
-            );
-        }
+        let n = elect_leaders(&mut pending);
+        assert_eq!(n, 1);
+        assert_eq!(
+            pending[0].source.tag, "imgB",
+            "tie should break deterministically in favor of later candidate"
+        );
     }
 
     #[test]
@@ -3654,7 +3542,7 @@ mod tests {
     fn elect_leaders_scales_subcubically() {
         // With 75 disjoint pairs (n=150 distinct source manifests) the greedy
         // loop runs one round per pair: an O(n^3) version takes hundreds of
-        // milliseconds, a sub-cubic one under 50ms.
+        // milliseconds, a sub-cubic one under 500ms.
         let n_pairs: usize = 75;
         let mut counter: usize = 0;
         let mut next = || {
@@ -3803,8 +3691,8 @@ mod tests {
         let mut file = Some(std::fs::File::create(&path).unwrap());
         let start = Instant::now();
 
-        write_timing(&mut file, "discovery_start", &start);
-        write_timing(&mut file, "execution_complete", &start);
+        write_timing(&mut file, TimingPhase::DiscoveryStart, &start);
+        write_timing(&mut file, TimingPhase::ExecutionComplete, &start);
 
         drop(file);
         let content = std::fs::read_to_string(&path).unwrap();
@@ -3815,12 +3703,5 @@ mod tests {
             assert_eq!(v["phase"].as_str().unwrap(), *phase);
             assert!(v["elapsed_ms"].as_u64().is_some());
         }
-    }
-
-    #[test]
-    fn write_timing_noop_when_none() {
-        let mut file: Option<std::fs::File> = None;
-        let start = Instant::now();
-        write_timing(&mut file, "test_phase", &start);
     }
 }

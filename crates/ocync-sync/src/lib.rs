@@ -7,30 +7,17 @@
     )
 )]
 
-/// Persistent transfer state cache wrapping [`plan::BlobDedupMap`].
 pub mod cache;
-/// Error types for sync operations.
-pub mod error;
-
-/// Tag filtering pipeline: glob, semver, exclude, sort, and latest.
-pub mod filter;
-/// Sync planning and transfer ordering.
-pub mod plan;
-/// Progress reporting trait and types.
-pub mod progress;
-/// Retry configuration and backoff logic.
-pub mod retry;
-/// Per-run work shared between tasks that need the same content.
-pub(crate) mod shared;
-/// Tag-version parser, comparator, and range matcher.
-pub(crate) mod version;
-
-/// Sync engine - pipelined concurrent orchestration of image transfers.
 pub mod engine;
-/// Cooperative shutdown signal for the sync engine.
+pub mod error;
+pub mod filter;
+pub mod plan;
+pub mod progress;
+pub mod retry;
+pub(crate) mod shared;
 pub mod shutdown;
-/// Content-addressable disk staging for multi-target blob reuse.
 pub mod staging;
+pub(crate) mod version;
 
 use std::time::Duration;
 
@@ -70,20 +57,29 @@ impl SyncReport {
             .any(|i| matches!(i.status, ImageStatus::Synced | ImageStatus::Skipped { .. }))
     }
 
-    /// Process exit code: 0 with no failed image, 1 when some failed and some
-    /// synced or were skipped, 2 when every image failed.
-    pub fn exit_code(&self) -> i32 {
-        let has_success = self.has_success();
+    /// How the run went, folded from the per-image results.
+    pub fn outcome(&self) -> RunOutcome {
         let has_failure = self
             .images
             .iter()
             .any(|i| matches!(i.status, ImageStatus::Failed { .. }));
-        match (has_success, has_failure) {
-            (_, false) => 0,
-            (true, true) => 1,
-            (false, true) => 2,
+        match (self.has_success(), has_failure) {
+            (_, false) => RunOutcome::Clean,
+            (true, true) => RunOutcome::Partial,
+            (false, true) => RunOutcome::AllFailed,
         }
     }
+}
+
+/// How a sync run went, as the process exit code reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// No image failed, including a run with no images.
+    Clean,
+    /// Some images failed and some synced or were skipped.
+    Partial,
+    /// Every image failed.
+    AllFailed,
 }
 
 /// Result of syncing a single image.
@@ -283,20 +279,20 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_by_outcome() {
+    fn outcome_by_results() {
         let cases = [
-            ("empty report", vec![], 0),
+            ("empty report", vec![], RunOutcome::Clean),
             (
                 "all synced",
                 vec![ImageStatus::Synced, ImageStatus::Synced],
-                0,
+                RunOutcome::Clean,
             ),
             (
                 "all skipped",
                 vec![ImageStatus::Skipped {
                     reason: SkipReason::DigestMatch,
                 }],
-                0,
+                RunOutcome::Clean,
             ),
             (
                 "mixed success and failure",
@@ -304,7 +300,7 @@ mod tests {
                     ImageStatus::Synced,
                     failed(ErrorKind::BlobTransfer, "timeout", 3, None),
                 ],
-                1,
+                RunOutcome::Partial,
             ),
             (
                 "all failed",
@@ -312,25 +308,12 @@ mod tests {
                     failed(ErrorKind::ManifestPull, "a", 1, None),
                     failed(ErrorKind::ManifestPush, "b", 2, None),
                 ],
-                2,
+                RunOutcome::AllFailed,
             ),
         ];
         for (name, statuses, want) in cases {
-            assert_eq!(make_report(statuses).exit_code(), want, "{name}");
+            assert_eq!(make_report(statuses).outcome(), want, "{name}");
         }
-    }
-
-    #[test]
-    fn sync_stats_default_is_zeroed() {
-        let stats = SyncStats::default();
-        assert_eq!(stats.images_synced, 0);
-        assert_eq!(stats.images_skipped, 0);
-        assert_eq!(stats.images_failed, 0);
-        assert_eq!(stats.blobs_transferred, 0);
-        assert_eq!(stats.blobs_skipped, 0);
-        assert_eq!(stats.blobs_mounted, 0);
-        assert_eq!(stats.bytes_transferred, 0);
-        assert_eq!(stats.artifacts_skipped, 0);
     }
 
     #[test]
@@ -361,14 +344,6 @@ mod tests {
                 "{json} json"
             );
         }
-    }
-
-    #[test]
-    fn blob_transfer_stats_default_is_zeroed() {
-        let stats = BlobTransferStats::default();
-        assert_eq!(stats.transferred, 0);
-        assert_eq!(stats.skipped, 0);
-        assert_eq!(stats.mounted, 0);
     }
 
     #[test]

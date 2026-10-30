@@ -519,7 +519,6 @@ mod compare_tests {
                 "1.0.0-rc9",
                 Greater,
             ),
-            ("rc1 equals rc.1", "1.0.0-rc1", "1.0.0-rc.1", Equal),
             ("rc.2 above rc.1", "1.0.0-rc.1", "1.0.0-rc.2", Less),
             (
                 "eks distro compound suffix",

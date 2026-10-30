@@ -47,7 +47,7 @@ impl RetryConfig {
         let multiplier = self.backoff_multiplier.saturating_pow(attempt);
         let backoff = self.initial_backoff.saturating_mul(multiplier);
         let capped = backoff.min(self.max_backoff);
-        jitter(capped)
+        ocync_distribution::retry::jittered(capped)
     }
 }
 
@@ -102,14 +102,8 @@ struct OciError {
 
 /// Whether a transport-level (non-HTTP) error should be retried.
 ///
-/// True for connection failures, request timeouts, mid-stream send failures
-/// and truncated response bodies (which `reqwest` reports as decode
-/// failures). These are transient and OCI operations are idempotent. An
-/// answer that arrived whole and is not the JSON expected is final.
-///
-/// `is_request()` covers connect failures and timeouts (both `Kind::Request`
-/// on the async hyper path); `is_body()` and `is_decode()` cover the
-/// response-body phase. The `should_retry_transport_*` tests pin this.
+/// Which transport failures count is defined once, by
+/// `ocync_distribution::retry::is_transient_transport`.
 ///
 /// Only `Error::Http` is inspected. Other variants are not retried:
 /// - `Io`: local filesystem, never transient
@@ -132,14 +126,6 @@ pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
         );
         false
     }
-}
-
-/// Scale `base` by a random factor in \[0.75, 1.25) to decorrelate concurrent
-/// retries. `fastrand`'s thread-local PRNG makes each call one `f64` draw with
-/// no syscall.
-fn jitter(base: Duration) -> Duration {
-    let factor = 0.75 + fastrand::f64() * 0.5;
-    base.mul_f64(factor)
 }
 
 tokio::task_local! {
@@ -285,16 +271,6 @@ mod tests {
         ];
         for (name, cfg, attempt, base) in cases {
             assert_in_jitter_range(cfg.backoff_for(attempt), base, name);
-        }
-    }
-
-    #[test]
-    fn jitter_stays_in_range() {
-        // Many draws to cover the range; zero must stay zero.
-        for base in [Duration::from_secs(10), Duration::ZERO] {
-            for _ in 0..100 {
-                assert_in_jitter_range(jitter(base), base, "jitter");
-            }
         }
     }
 
@@ -454,35 +430,6 @@ mod tests {
             assert_eq!(calls.get(), expected_calls, "{failures:?}");
             assert_eq!(started.elapsed() > Duration::ZERO, waits, "{failures:?}");
         }
-    }
-
-    /// A real connection failure (refused port) is retryable through
-    /// `is_request()` alone. Breaks if a reqwest upgrade stops wrapping
-    /// connect failures as `Kind::Request`; the predicate set then needs
-    /// re-evaluating.
-    #[tokio::test]
-    async fn should_retry_transport_on_connect_failure() {
-        ocync_distribution::install_crypto_provider();
-        // Nothing listens on port 1: a real connect error.
-        let client = reqwest::Client::new();
-        let reqwest_err = client
-            .get("http://127.0.0.1:1")
-            .send()
-            .await
-            .expect_err("connect to port 1 should fail");
-        assert!(
-            reqwest_err.is_connect(),
-            "expected is_connect(), got: {reqwest_err}"
-        );
-        assert!(
-            reqwest_err.is_request(),
-            "is_request() must cover connect failures (predicate-set invariant); got: {reqwest_err}"
-        );
-        let err = ocync_distribution::Error::from(reqwest_err);
-        assert!(
-            should_retry_transport(&err),
-            "connection refused should be retryable"
-        );
     }
 
     /// A real request timeout is retryable through `is_request()` alone.

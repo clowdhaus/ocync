@@ -89,16 +89,6 @@ mod tests {
         assert!(signal.is_triggered(), "second trigger");
     }
 
-    #[test]
-    fn debug_shows_triggered_state() {
-        let signal = ShutdownSignal::new();
-        let debug = format!("{signal:?}");
-        assert!(debug.contains("triggered: false"));
-        signal.trigger();
-        let debug = format!("{signal:?}");
-        assert!(debug.contains("triggered: true"));
-    }
-
     #[tokio::test]
     async fn notified_returns_immediately_when_already_triggered() {
         let signal = ShutdownSignal::new();

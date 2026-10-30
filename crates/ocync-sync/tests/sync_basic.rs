@@ -12,7 +12,7 @@ use ocync_distribution::RegistryClientBuilder;
 use ocync_distribution::auth::{AuthProvider, Scope, Token};
 use ocync_distribution::spec::MediaType;
 use ocync_sync::engine::TagPair;
-use ocync_sync::{ImageStatus, SkipReason};
+use ocync_sync::{ImageStatus, RunOutcome, SkipReason};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -57,7 +57,7 @@ async fn sync_happy_path() {
     assert_eq!(report.stats.images_failed, 0);
     assert_eq!(report.stats.blobs_transferred, 2);
     assert_eq!(report.stats.blobs_skipped, 0);
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.outcome(), RunOutcome::Clean);
 }
 
 #[tokio::test]
@@ -96,7 +96,7 @@ async fn sync_skip_on_digest_match() {
     assert_eq!(report.images[0].bytes_transferred, 0);
     assert_eq!(report.stats.images_skipped, 1);
     assert_eq!(report.stats.images_synced, 0);
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.outcome(), RunOutcome::Clean);
 }
 
 #[tokio::test]
@@ -163,7 +163,7 @@ async fn sync_manifest_pull_failure() {
         assert_eq!(kind.to_string(), "manifest pull");
     }
     assert_eq!(report.stats.images_failed, 1);
-    assert_eq!(report.exit_code(), 2);
+    assert_eq!(report.outcome(), RunOutcome::AllFailed);
 }
 
 #[tokio::test]
@@ -389,7 +389,7 @@ async fn sync_multiple_targets() {
         report.stats.blobs_transferred, 4,
         "2 blobs per target x 2 targets"
     );
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.outcome(), RunOutcome::Clean);
 }
 
 #[tokio::test]
@@ -424,7 +424,7 @@ async fn sync_empty_mappings() {
 
     assert!(report.images.is_empty());
     assert_eq!(report.stats.images_synced, 0);
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.outcome(), RunOutcome::Clean);
 }
 
 #[tokio::test]
@@ -464,7 +464,7 @@ async fn sync_blob_transfer_failure() {
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Failed { .. });
     assert_eq!(report.stats.images_failed, 1);
-    assert_eq!(report.exit_code(), 2);
+    assert_eq!(report.outcome(), RunOutcome::AllFailed);
 }
 
 #[tokio::test]
@@ -588,7 +588,7 @@ async fn sync_empty_tags_produces_no_images() {
 
     assert!(report.images.is_empty());
     assert_eq!(report.stats.images_synced, 0);
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.outcome(), RunOutcome::Clean);
 }
 
 #[tokio::test]

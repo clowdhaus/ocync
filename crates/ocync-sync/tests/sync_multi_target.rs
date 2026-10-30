@@ -5,7 +5,7 @@ mod helpers;
 
 use ocync_distribution::spec::{MediaType, Platform, PlatformFilter};
 use ocync_sync::engine::TagPair;
-use ocync_sync::{ErrorKind, ImageStatus, SkipReason};
+use ocync_sync::{ErrorKind, ImageStatus, RunOutcome, SkipReason};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -367,7 +367,7 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
     assert_eq!(report.stats.blobs_transferred, 2);
 
     // Exit code: 0 (skipped is success, not failure).
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.outcome(), RunOutcome::Clean);
     // wiremock expect(N) verifies: 1 source manifest pull, 1 target manifest HEAD,
     // 1 config blob pull, 1 layer blob pull, 1 manifest PUT (rejected).
 }
