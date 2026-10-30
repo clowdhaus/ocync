@@ -8,16 +8,10 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Loading
-// ---------------------------------------------------------------------------
-
 /// Load, expand env vars, and validate a config file from disk.
 ///
-/// Reads the raw YAML, expands `${VAR}` expressions in the text, then
-/// deserializes and validates. Expanding before deserialization ensures
-/// that registry URLs and references containing env vars are resolved
-/// before structural validation runs.
+/// Env vars are expanded in the raw text before deserialization so registry
+/// URLs and references that contain them are resolved before validation.
 pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| ConfigError::Parse(format!("failed to read {}: {e}", path.display())))?;
@@ -27,7 +21,6 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
     let config: Config = serde_yaml::from_str(&expanded)
         .map_err(|e| ConfigError::Parse(format!("failed to parse {}: {e}", path.display())))?;
 
-    // Structural validation.
     for (name, registry) in &config.registries {
         validate_registry(name, registry)?;
     }
@@ -63,11 +56,9 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
-/// Read a config file and expand env vars for display.
+/// Read a config file and return its YAML with `${VAR}` expressions expanded.
 ///
-/// Returns the raw YAML with `${VAR}` expressions expanded. When
-/// `show_secrets` is false, the expansion blocks secret-pattern variables.
-/// When `show_secrets` is true, all variables are expanded freely.
+/// When `show_secrets` is false, secret-pattern variables are blocked.
 pub(crate) fn expand_config_for_display(
     path: &Path,
     show_secrets: bool,
@@ -77,10 +68,6 @@ pub(crate) fn expand_config_for_display(
 
     expand_env_vars(&raw, show_secrets)
 }
-
-// ---------------------------------------------------------------------------
-// Error
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConfigError {
@@ -96,10 +83,6 @@ pub(crate) enum ConfigError {
     #[error("config validation error: {0}")]
     Validation(String),
 }
-
-// ---------------------------------------------------------------------------
-// Top-level config
-// ---------------------------------------------------------------------------
 
 /// Top-level configuration defining registries, mappings, and sync behavior.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -123,10 +106,6 @@ pub(crate) struct Config {
     /// Image mapping rules defining what to sync and where.
     pub mappings: Vec<MappingConfig>,
 }
-
-// ---------------------------------------------------------------------------
-// Global config
-// ---------------------------------------------------------------------------
 
 /// Global engine settings that apply across all sync operations.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -191,11 +170,8 @@ where
 }
 
 fn default_max_concurrent_transfers() -> NonZeroUsize {
-    // Mirror the engine's DEFAULT_MAX_CONCURRENT_TRANSFERS. The previous
-    // value of 50 multiplied by BLOB_CONCURRENCY=6 (= 300 streams) blew
-    // past the per-connection HTTP/2 stream budget on every major
-    // registry; see DEFAULT_BLOB_UPLOAD_CONCURRENCY in
-    // ocync-distribution for the derivation. Keep these two in lockstep.
+    // Keep in lockstep with the engine default; see DEFAULT_BLOB_UPLOAD_CONCURRENCY
+    // in ocync-distribution for the HTTP/2 stream budget derivation.
     ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS
 }
 
@@ -209,10 +185,6 @@ impl Default for GlobalConfig {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
 
 /// Authentication method for a registry.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -325,10 +297,6 @@ impl std::fmt::Debug for BasicCredentials {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Defaults
-// ---------------------------------------------------------------------------
-
 /// Default values inherited by all mappings unless individually overridden.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct DefaultsConfig {
@@ -355,10 +323,6 @@ pub(crate) struct DefaultsConfig {
     #[serde(default)]
     pub artifacts: Option<ArtifactsConfig>,
 }
-
-// ---------------------------------------------------------------------------
-// Mappings
-// ---------------------------------------------------------------------------
 
 /// A single image mapping rule: source repo, target registries, and tag filters.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -394,10 +358,6 @@ pub(crate) struct MappingConfig {
     pub artifacts: Option<ArtifactsConfig>,
 }
 
-// ---------------------------------------------------------------------------
-// Artifacts
-// ---------------------------------------------------------------------------
-
 /// Configuration for OCI artifact (signatures, SBOMs, attestations) sync.
 ///
 /// Controls whether referrers are discovered and transferred alongside their
@@ -427,10 +387,6 @@ fn default_true() -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
-// TargetsValue - single group name or inline list
-// ---------------------------------------------------------------------------
-
 /// Target specification: either a named group or an inline list of registry aliases.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
@@ -440,10 +396,6 @@ pub(crate) enum TargetsValue {
     /// An inline list of registry aliases.
     List(Vec<String>),
 }
-
-// ---------------------------------------------------------------------------
-// Tags
-// ---------------------------------------------------------------------------
 
 /// Tag filter and selection rules for a mapping.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -501,12 +453,9 @@ pub(crate) struct TagsConfig {
 impl TagsConfig {
     /// Returns the exact tag names if this config requires no enumeration.
     ///
-    /// Returns `Some` when `glob` contains only literal strings (no wildcard
-    /// characters) and no other filter fields (`semver`, `latest`, `sort`,
-    /// `min_tags`, `exclude`, `include`) are set. In this case the tags can
-    /// be used directly without listing all tags from the registry.
+    /// `Some` only when `glob` holds literal strings (no wildcards) and no
+    /// other filter field is set, so the tags can be used without listing.
     pub(crate) fn exact_tags(&self) -> Option<Vec<String>> {
-        // Any field that requires the full tag list forces enumeration.
         if self.semver.is_some()
             || self.latest.is_some()
             || self.sort.is_some()
@@ -519,7 +468,7 @@ impl TagsConfig {
         let patterns = match &self.glob {
             Some(GlobOrList::Single(s)) => vec![s.clone()],
             Some(GlobOrList::List(v)) => v.clone(),
-            None => return None, // No glob = sync all tags = must enumerate.
+            None => return None,
         };
         if patterns.iter().all(|p| is_literal_pattern(p)) {
             Some(patterns)
@@ -553,7 +502,6 @@ impl<'de> Deserialize<'de> for RemovedSemverPrerelease {
     where
         D: serde::Deserializer<'de>,
     {
-        // Consume the value so the deserializer is in a clean state.
         let _: serde::de::IgnoredAny = Deserialize::deserialize(deserializer)?;
         Err(<D::Error as serde::de::Error>::custom(
             "tags.semver_prerelease has been removed. \
@@ -575,10 +523,6 @@ impl JsonSchema for RemovedSemverPrerelease {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Environment variable expansion
-// ---------------------------------------------------------------------------
-
 const BLOCKED_PATTERNS: &[&str] = &[
     "SECRET",
     "PASSWORD",
@@ -588,7 +532,6 @@ const BLOCKED_PATTERNS: &[&str] = &[
     "API_KEY",
 ];
 
-/// Check whether a variable name matches a blocked pattern.
 fn is_blocked(var_name: &str) -> bool {
     let upper = var_name.to_uppercase();
     BLOCKED_PATTERNS
@@ -598,15 +541,12 @@ fn is_blocked(var_name: &str) -> bool {
 
 /// Expand `${VAR}`, `${VAR:-default}`, and `${VAR:?error}` expressions.
 ///
-/// Only the `${...}` form is supported - bare `$VAR` without braces is
-/// treated as literal text. This avoids ambiguity with shell-like strings.
+/// Only the braced form is supported; bare `$VAR` is literal text.
 ///
-/// When `allow_secrets` is false, variables matching [`BLOCKED_PATTERNS`]
-/// (SECRET, TOKEN, etc.) are rejected to prevent accidental secret leakage
-/// into display output. This is used by `expand_config_for_display` when
-/// `--show-secrets` is not set. Config loading always passes `true` because
-/// it operates on raw YAML text without field-level context - blocking
-/// secret-patterned vars during loading would reject legitimate auth config.
+/// When `allow_secrets` is false, variables matching `BLOCKED_PATTERNS`
+/// (SECRET, TOKEN, etc.) are rejected so display output cannot leak them.
+/// Config loading always passes `true`: it works on raw YAML without
+/// field-level context, and blocking would reject legitimate auth config.
 pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String, ConfigError> {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -671,10 +611,6 @@ pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String
 
     Ok(result)
 }
-
-// ---------------------------------------------------------------------------
-// Duration and size values
-// ---------------------------------------------------------------------------
 
 /// `digits` as a `u64` times `unit`, or `None` if it holds anything but ASCII
 /// digits (`u64::parse` alone would accept a leading `+`) or overflows.
@@ -794,11 +730,6 @@ impl From<StagingLimit> for String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Validation helpers
-// ---------------------------------------------------------------------------
-
-/// Validate per-registry settings.
 fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), ConfigError> {
     if let Some(ref auth_type) = registry.auth_type {
         match auth_type {
@@ -846,10 +777,7 @@ fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), Config
     Ok(())
 }
 
-/// Validate artifact sync configuration.
-///
-/// `require_artifacts: true` with `enabled: false` is contradictory - you
-/// cannot require artifacts while disabling their transfer.
+/// Rejects `require_artifacts: true` with `enabled: false`, which is contradictory.
 fn validate_artifacts(context: &str, artifacts: &ArtifactsConfig) -> Result<(), ConfigError> {
     if artifacts.require_artifacts && !artifacts.enabled {
         return Err(ConfigError::Validation(format!(
@@ -883,13 +811,8 @@ fn validate_tags(context: &str, tags: &TagsConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Validate a mapping's tags block, falling back to defaults when present.
-///
-/// A mapping must have its own `tags` block OR inherit from `defaults.tags`.
-/// If neither is present, this returns a validation error.
-///
-/// Platform strings are also validated: each entry must be `os/arch` or
-/// `os/arch/variant`.
+/// A mapping must have its own `tags` block or inherit `defaults.tags`.
+/// Its platform strings are validated too.
 fn validate_mapping(mapping: &MappingConfig, has_default_tags: bool) -> Result<(), ConfigError> {
     if mapping.tags.is_none() && !has_default_tags {
         return Err(ConfigError::Validation(format!(
@@ -903,8 +826,7 @@ fn validate_mapping(mapping: &MappingConfig, has_default_tags: bool) -> Result<(
     Ok(())
 }
 
-/// Validate that every platform string has the form `os/arch` or
-/// `os/arch/variant`.
+/// Every platform string must be `os/arch` or `os/arch/variant`.
 fn validate_platforms(mapping_from: &str, platforms: &[String]) -> Result<(), ConfigError> {
     if platforms.is_empty() {
         return Err(ConfigError::Validation(format!(
@@ -923,8 +845,8 @@ fn validate_platforms(mapping_from: &str, platforms: &[String]) -> Result<(), Co
     Ok(())
 }
 
-/// Resolve a `TargetsValue` into a list of registry names, producing clear
-/// errors that distinguish unknown groups from unknown registries.
+/// Resolve a `TargetsValue` into registry names; the error distinguishes
+/// an unknown group from an unknown registry.
 pub(crate) fn resolve_target_names(
     targets: &TargetsValue,
     config: &Config,
@@ -997,10 +919,6 @@ fn validate_references(config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,8 +958,6 @@ mod tests {
         std::fs::write(&json_path, format!("{json}\n")).unwrap();
     }
 
-    // - Deserialization ----------------------------------------------------
-
     #[test]
     fn deserialize_minimal_config() {
         let yaml = r#"
@@ -1054,23 +970,6 @@ mappings:
         assert_eq!(config.mappings.len(), 1);
         assert_eq!(config.mappings[0].from, "library/nginx");
         assert!(config.registries.is_empty());
-    }
-
-    #[test]
-    fn deserialize_registry_with_ecr() {
-        let yaml = r#"
-registries:
-  my-ecr:
-    url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
-    auth_type: ecr
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let reg = &config.registries["my-ecr"];
-        assert_eq!(reg.auth_type, Some(AuthType::Ecr));
     }
 
     #[test]
@@ -1278,8 +1177,6 @@ mappings:
         assert!(err.is_err());
     }
 
-    // - Env var expansion --------------------------------------------------
-
     #[test]
     fn expand_simple() {
         unsafe { std::env::set_var("OCYNC_TEST_HOST", "example.com") };
@@ -1324,44 +1221,6 @@ mappings:
     }
 
     #[test]
-    fn no_expansion_needed() {
-        let result = expand_env_vars("plain string no vars", false).unwrap();
-        assert_eq!(result, "plain string no vars");
-    }
-
-    #[test]
-    fn expand_malformed_unclosed_brace() {
-        let result = expand_env_vars("prefix-${UNCLOSED", false).unwrap();
-        assert_eq!(result, "prefix-${UNCLOSED");
-    }
-
-    #[test]
-    fn expand_value_with_colon_in_yaml() {
-        // A var value containing ":" should not break YAML structure when the
-        // field is already quoted in the YAML source.
-        unsafe { std::env::set_var("OCYNC_TEST_COLON", "host:8080") };
-        let yaml = "url: \"${OCYNC_TEST_COLON}\"";
-        let expanded = expand_env_vars(yaml, true).unwrap();
-        assert_eq!(expanded, "url: \"host:8080\"");
-        // Verify it parses as valid YAML.
-        let map: HashMap<String, String> = serde_yaml::from_str(&expanded).unwrap();
-        assert_eq!(map["url"], "host:8080");
-        unsafe { std::env::remove_var("OCYNC_TEST_COLON") };
-    }
-
-    #[test]
-    fn expand_value_with_hash_in_yaml() {
-        // A var value containing "#" should not be treated as a YAML comment
-        // when the field is quoted.
-        unsafe { std::env::set_var("OCYNC_TEST_HASH", "value#with#hashes") };
-        let yaml = "key: \"${OCYNC_TEST_HASH}\"";
-        let expanded = expand_env_vars(yaml, true).unwrap();
-        let map: HashMap<String, String> = serde_yaml::from_str(&expanded).unwrap();
-        assert_eq!(map["key"], "value#with#hashes");
-        unsafe { std::env::remove_var("OCYNC_TEST_HASH") };
-    }
-
-    #[test]
     fn expand_unquoted_colon_value_breaks_yaml() {
         // Demonstrates the known limitation: unquoted values containing ":"
         // can produce invalid YAML. Users must quote values in their config.
@@ -1373,8 +1232,6 @@ mappings:
         assert_eq!(expanded, "url: host:8080");
         unsafe { std::env::remove_var("OCYNC_TEST_BARE_COLON") };
     }
-
-    // - Validation ---------------------------------------------------------
 
     #[test]
     fn latest_without_sort() {
@@ -1463,25 +1320,6 @@ mappings:
     }
 
     #[test]
-    fn empty_platform_parts_rejected() {
-        for bad in &["/", "/amd64", "linux/", "//", "linux//v8"] {
-            let err = validate_platforms("test", &[bad.to_string()]).unwrap_err();
-            match err {
-                ConfigError::Validation(msg) => {
-                    assert!(msg.contains(bad), "expected '{bad}' in: {msg}")
-                }
-                other => panic!("expected Validation for '{bad}', got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn empty_platforms_list_rejected() {
-        let err = validate_platforms("test", &[]).unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)));
-    }
-
-    #[test]
     fn deserialize_mapping_with_platforms() {
         let yaml = r#"
 mappings:
@@ -1517,89 +1355,6 @@ mappings:
     }
 
     #[test]
-    fn invalid_platform_in_defaults_rejected() {
-        let yaml = r#"
-defaults:
-  platforms:
-    - linux-amd64
-mappings:
-  - from: library/nginx
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let defaults = config.defaults.as_ref().unwrap();
-        let err = validate_platforms("defaults", defaults.platforms.as_ref().unwrap()).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("linux-amd64")),
-            other => panic!("expected Validation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unknown_registry_source_reference() {
-        let yaml = r#"
-registries:
-  docker-hub:
-    url: registry-1.docker.io
-mappings:
-  - from: nginx
-    source: nonexistent
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = validate_references(&config).unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)));
-    }
-
-    #[test]
-    fn unknown_registry_in_target_list() {
-        let yaml = r#"
-registries:
-  ecr-east:
-    url: 111111111111.dkr.ecr.us-east-1.amazonaws.com
-mappings:
-  - from: nginx
-    targets:
-      - ecr-east
-      - ecr-west-missing
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = validate_references(&config).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("ecr-west-missing")),
-            other => panic!("wrong error: {other}"),
-        }
-    }
-
-    #[test]
-    fn unknown_registry_via_group_members() {
-        let yaml = r#"
-registries:
-  ecr-east:
-    url: 111111111111.dkr.ecr.us-east-1.amazonaws.com
-target_groups:
-  all:
-    - ecr-east
-    - ghost-registry
-mappings:
-  - from: nginx
-    targets: all
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = validate_references(&config).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("ghost-registry")),
-            other => panic!("wrong error: {other}"),
-        }
-    }
-
-    #[test]
     fn valid_references_pass() {
         let yaml = r#"
 registries:
@@ -1620,53 +1375,6 @@ mappings:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         validate_references(&config).unwrap();
     }
-
-    #[test]
-    fn unknown_defaults_target() {
-        let yaml = r#"
-registries:
-  hub:
-    url: registry-1.docker.io
-defaults:
-  targets:
-    - nonexistent-ecr
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = validate_references(&config).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("nonexistent-ecr")),
-            other => panic!("wrong error: {other}"),
-        }
-    }
-
-    #[test]
-    fn unknown_group_name_gives_clear_error() {
-        let yaml = r#"
-registries:
-  hub:
-    url: registry-1.docker.io
-mappings:
-  - from: nginx
-    targets: typo-group
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = validate_references(&config).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => {
-                assert!(msg.contains("typo-group"));
-                assert!(msg.contains("target group or registry"));
-            }
-            other => panic!("wrong error: {other}"),
-        }
-    }
-
-    // - GlobalConfig -------------------------------------------------------
 
     #[test]
     fn deserialize_global_all_fields() {
@@ -1855,40 +1563,6 @@ mappings:
         }
     }
 
-    // - Per-registry fields ------------------------------------------------
-
-    #[test]
-    fn deserialize_registry_max_concurrent() {
-        let yaml = r#"
-registries:
-  chainguard:
-    url: cgr.dev
-    max_concurrent: 10
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let reg = &config.registries["chainguard"];
-        assert_eq!(reg.max_concurrent.map(NonZeroUsize::get), Some(10));
-    }
-
-    #[test]
-    fn registry_max_concurrent_defaults_none() {
-        let yaml = r#"
-registries:
-  hub:
-    url: registry-1.docker.io
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(config.registries["hub"].max_concurrent.is_none());
-    }
-
     #[test]
     fn registry_max_concurrent_zero_is_refused() {
         let yaml = r#"
@@ -1906,96 +1580,6 @@ mappings:
             .to_string();
         assert!(err.contains("max_concurrent"), "{err}");
         assert!(err.contains("must be at least 1"), "{err}");
-    }
-
-    // - Auth-type validation -------------------------------------------------
-
-    #[test]
-    fn validate_basic_without_credentials_is_error() {
-        let yaml = r#"
-registries:
-  ghcr:
-    url: ghcr.io
-    auth_type: basic
-mappings:
-  - from: library/nginx
-    source: ghcr
-    targets: [ghcr]
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = validate_registry("ghcr", config.registries.get("ghcr").unwrap());
-        assert!(err.is_err());
-        assert!(
-            err.unwrap_err().to_string().contains("credentials"),
-            "error should mention credentials"
-        );
-    }
-
-    #[test]
-    fn validate_basic_with_credentials_is_ok() {
-        let yaml = r#"
-registries:
-  ghcr:
-    url: ghcr.io
-    auth_type: basic
-    credentials:
-      username: myuser
-      password: mypass
-mappings:
-  - from: library/nginx
-    source: ghcr
-    targets: [ghcr]
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let result = validate_registry("ghcr", config.registries.get("ghcr").unwrap());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validate_token_without_token_field_is_error() {
-        let yaml = r#"
-registries:
-  quay:
-    url: quay.io
-    auth_type: token
-mappings:
-  - from: library/nginx
-    source: quay
-    targets: [quay]
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let err = validate_registry("quay", config.registries.get("quay").unwrap());
-        assert!(err.is_err());
-        assert!(
-            err.unwrap_err().to_string().contains("token"),
-            "error should mention token"
-        );
-    }
-
-    #[test]
-    fn validate_token_with_token_field_is_ok() {
-        let yaml = r#"
-registries:
-  quay:
-    url: quay.io
-    auth_type: token
-    token: ghp_abc123
-mappings:
-  - from: library/nginx
-    source: quay
-    targets: [quay]
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let result = validate_registry("quay", config.registries.get("quay").unwrap());
-        assert!(result.is_ok());
     }
 
     #[test]
@@ -2051,43 +1635,6 @@ mappings:
     }
 
     #[test]
-    fn parses_registry_with_aws_profile() {
-        let yaml = r#"
-registries:
-  vendor:
-    url: 222222222222.dkr.ecr.us-east-1.amazonaws.com
-    auth_type: ecr
-    aws_profile: vendor
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let reg = &config.registries["vendor"];
-        assert_eq!(reg.auth_type, Some(AuthType::Ecr));
-        assert_eq!(reg.aws_profile.as_deref(), Some("vendor"));
-    }
-
-    #[test]
-    fn registry_aws_profile_defaults_to_none() {
-        let yaml = r#"
-registries:
-  ecr:
-    url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
-    auth_type: ecr
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.registries["ecr"].aws_profile, None);
-    }
-
-    // - ArtifactsConfig -------------------------------------------------------
-
-    #[test]
     fn deserialize_artifacts_config() {
         let yaml = r#"
 defaults:
@@ -2118,145 +1665,6 @@ mappings:
     }
 
     #[test]
-    fn require_artifacts_with_disabled_is_error() {
-        let artifacts = ArtifactsConfig {
-            enabled: false,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            require_artifacts: true,
-        };
-        let err = validate_artifacts("test-mapping", &artifacts).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => {
-                assert!(msg.contains("require_artifacts"), "msg: {msg}");
-                assert!(msg.contains("enabled"), "msg: {msg}");
-            }
-            other => panic!("expected Validation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn require_artifacts_with_enabled_is_ok() {
-        let artifacts = ArtifactsConfig {
-            enabled: true,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            require_artifacts: true,
-        };
-        validate_artifacts("test-mapping", &artifacts).unwrap();
-    }
-
-    #[test]
-    fn disabled_artifacts_without_require_is_ok() {
-        let artifacts = ArtifactsConfig {
-            enabled: false,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            require_artifacts: false,
-        };
-        validate_artifacts("test-mapping", &artifacts).unwrap();
-    }
-
-    // - TagsConfig::exact_tags() -------------------------------------------
-
-    #[test]
-    fn exact_tags_plain_list() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::List(vec!["latest".into(), "3.20".into()])),
-            ..Default::default()
-        };
-        assert_eq!(
-            tags.exact_tags(),
-            Some(vec!["latest".into(), "3.20".into()])
-        );
-    }
-
-    #[test]
-    fn exact_tags_single() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::Single("v1.0.0".into())),
-            ..Default::default()
-        };
-        assert_eq!(tags.exact_tags(), Some(vec!["v1.0.0".into()]));
-    }
-
-    #[test]
-    fn exact_tags_with_wildcard_returns_none() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::Single("v1.*".into())),
-            ..Default::default()
-        };
-        assert!(tags.exact_tags().is_none());
-    }
-
-    #[test]
-    fn exact_tags_with_semver_returns_none() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::Single("latest".into())),
-            semver: Some(Range::parse(">=1.0").unwrap()),
-            ..Default::default()
-        };
-        assert!(tags.exact_tags().is_none());
-    }
-
-    #[test]
-    fn exact_tags_with_latest_returns_none() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::Single("latest".into())),
-            latest: Some(5),
-            sort: Some(SortOrder::Semver),
-            ..Default::default()
-        };
-        assert!(tags.exact_tags().is_none());
-    }
-
-    #[test]
-    fn exact_tags_no_glob_returns_none() {
-        let tags = TagsConfig::default();
-        assert!(tags.exact_tags().is_none());
-    }
-
-    #[test]
-    fn exact_tags_question_mark_returns_none() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::Single("v1.?".into())),
-            ..Default::default()
-        };
-        assert!(tags.exact_tags().is_none());
-    }
-
-    #[test]
-    fn exact_tags_bracket_returns_none() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::Single("[0-9]*".into())),
-            ..Default::default()
-        };
-        assert!(tags.exact_tags().is_none());
-    }
-
-    #[test]
-    fn exact_tags_with_exclude_returns_none() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::List(vec!["v1.0".into(), "v2.0".into()])),
-            exclude: Some(GlobOrList::Single("v2.0".into())),
-            ..Default::default()
-        };
-        assert!(tags.exact_tags().is_none());
-    }
-
-    #[test]
-    fn exact_tags_with_include_returns_none() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::List(vec!["v2.13.0".into()])),
-            include: Some(GlobOrList::Single("latest".into())),
-            ..Default::default()
-        };
-        assert!(tags.exact_tags().is_none());
-    }
-
-    // - ArtifactsConfig -------------------------------------------------------
-
-    #[test]
     fn artifacts_defaults_enabled() {
         let yaml = r#"
 mappings:
@@ -2274,86 +1682,354 @@ mappings:
     // - aws_profile validation -----------------------------------------------
 
     #[test]
-    fn aws_profile_with_ecr_auth_type_passes() {
-        let registry = RegistryConfig {
-            url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_string(),
-            auth_type: Some(AuthType::Ecr),
-            max_concurrent: None,
-            credentials: None,
-            token: None,
-            head_first: false,
-            aws_profile: Some("vendor".to_string()),
-        };
-        validate_registry("vendor", &registry).unwrap();
+    fn exact_tags_literals() {
+        let cases = [
+            (
+                "plain list",
+                GlobOrList::List(vec!["latest".into(), "3.20".into()]),
+                vec!["latest", "3.20"],
+            ),
+            (
+                "single",
+                GlobOrList::Single("v1.0.0".into()),
+                vec!["v1.0.0"],
+            ),
+        ];
+        for (name, glob, want) in cases {
+            let tags = TagsConfig {
+                glob: Some(glob),
+                ..Default::default()
+            };
+            assert_eq!(
+                tags.exact_tags(),
+                Some(want.iter().map(|s| s.to_string()).collect()),
+                "{name}"
+            );
+        }
     }
 
     #[test]
-    fn aws_profile_without_auth_type_fails() {
-        let registry = RegistryConfig {
-            url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_string(),
+    fn exact_tags_none_when_enumeration_needed() {
+        let glob = |s: &str| Some(GlobOrList::Single(s.into()));
+        let cases = [
+            (
+                "wildcard",
+                TagsConfig {
+                    glob: glob("v1.*"),
+                    ..Default::default()
+                },
+            ),
+            (
+                "question mark",
+                TagsConfig {
+                    glob: glob("v1.?"),
+                    ..Default::default()
+                },
+            ),
+            (
+                "bracket",
+                TagsConfig {
+                    glob: glob("[0-9]*"),
+                    ..Default::default()
+                },
+            ),
+            ("no glob", TagsConfig::default()),
+            (
+                "semver",
+                TagsConfig {
+                    glob: glob("latest"),
+                    semver: Some(Range::parse(">=1.0").unwrap()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "latest",
+                TagsConfig {
+                    glob: glob("latest"),
+                    latest: Some(5),
+                    sort: Some(SortOrder::Semver),
+                    ..Default::default()
+                },
+            ),
+            (
+                "exclude",
+                TagsConfig {
+                    glob: Some(GlobOrList::List(vec!["v1.0".into(), "v2.0".into()])),
+                    exclude: glob("v2.0"),
+                    ..Default::default()
+                },
+            ),
+            (
+                "include",
+                TagsConfig {
+                    glob: Some(GlobOrList::List(vec!["v2.13.0".into()])),
+                    include: glob("latest"),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, tags) in cases {
+            assert!(tags.exact_tags().is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_references_name_the_culprit() {
+        let cases = [
+            (
+                "mapping source",
+                "registries:\n  docker-hub:\n    url: registry-1.docker.io\nmappings:\n  - from: nginx\n    source: nonexistent\n    tags:\n      glob: \"*\"\n",
+                vec!["nonexistent"],
+            ),
+            (
+                "mapping target list",
+                "registries:\n  ecr-east:\n    url: 111111111111.dkr.ecr.us-east-1.amazonaws.com\nmappings:\n  - from: nginx\n    targets:\n      - ecr-east\n      - ecr-west-missing\n    tags:\n      glob: \"*\"\n",
+                vec!["ecr-west-missing"],
+            ),
+            (
+                "group member",
+                "registries:\n  ecr-east:\n    url: 111111111111.dkr.ecr.us-east-1.amazonaws.com\ntarget_groups:\n  all:\n    - ecr-east\n    - ghost-registry\nmappings:\n  - from: nginx\n    targets: all\n    tags:\n      glob: \"*\"\n",
+                vec!["ghost-registry"],
+            ),
+            (
+                "defaults target",
+                "registries:\n  hub:\n    url: registry-1.docker.io\ndefaults:\n  targets:\n    - nonexistent-ecr\nmappings:\n  - from: nginx\n    tags:\n      glob: \"*\"\n",
+                vec!["nonexistent-ecr"],
+            ),
+            (
+                "unknown group name",
+                "registries:\n  hub:\n    url: registry-1.docker.io\nmappings:\n  - from: nginx\n    targets: typo-group\n    tags:\n      glob: \"*\"\n",
+                vec!["typo-group", "target group or registry"],
+            ),
+        ];
+        for (name, yaml, wants) in cases {
+            let config: Config = serde_yaml::from_str(yaml).unwrap();
+            match validate_references(&config).unwrap_err() {
+                ConfigError::Validation(msg) => {
+                    for want in wants {
+                        assert!(msg.contains(want), "{name}: expected '{want}' in: {msg}");
+                    }
+                }
+                other => panic!("{name}: wrong error: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_platforms_rejected() {
+        let cases: [(&str, &[&str], &str); 7] = [
+            ("defaults, no slash", &["linux-amd64"], "linux-amd64"),
+            ("slash only", &["/"], "/"),
+            ("empty os", &["/amd64"], "/amd64"),
+            ("empty arch", &["linux/"], "linux/"),
+            ("two slashes", &["//"], "//"),
+            ("empty arch with variant", &["linux//v8"], "linux//v8"),
+            ("empty list", &[], "must not be empty"),
+        ];
+        for (name, platforms, want) in cases {
+            let platforms: Vec<String> = platforms.iter().map(|p| p.to_string()).collect();
+            match validate_platforms("test", &platforms).unwrap_err() {
+                ConfigError::Validation(msg) => {
+                    assert!(msg.contains(want), "{name}: expected '{want}' in: {msg}")
+                }
+                other => panic!("{name}: expected Validation, got {other:?}"),
+            }
+        }
+    }
+
+    fn bare_registry() -> RegistryConfig {
+        RegistryConfig {
+            url: "example.com".to_string(),
             auth_type: None,
             max_concurrent: None,
             credentials: None,
             token: None,
             head_first: false,
-            aws_profile: Some("vendor".to_string()),
-        };
-        let err = validate_registry("vendor", &registry)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("aws_profile"),
-            "error must mention aws_profile: {err}"
-        );
-        assert!(
-            err.contains("auth_type"),
-            "error must mention auth_type: {err}"
-        );
-        assert!(err.contains("ecr"), "error must mention ecr: {err}");
+            aws_profile: None,
+        }
+    }
+
+    fn registry_from_yaml(yaml: &str) -> RegistryConfig {
+        serde_yaml::from_str(yaml).unwrap()
     }
 
     #[test]
-    fn aws_profile_with_non_ecr_auth_type_fails() {
-        let registry = RegistryConfig {
-            url: "ghcr.io".to_string(),
-            auth_type: Some(AuthType::Basic),
-            max_concurrent: None,
-            credentials: Some(BasicCredentials {
-                username: "u".into(),
-                password: "p".into(),
-            }),
-            token: None,
-            head_first: false,
-            aws_profile: Some("vendor".to_string()),
-        };
-        let err = validate_registry("vendor", &registry)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("aws_profile"),
-            "error must mention aws_profile: {err}"
-        );
-        assert!(err.contains("ecr"), "error must mention ecr: {err}");
+    fn invalid_registries_rejected() {
+        let cases = [
+            (
+                "basic without credentials",
+                registry_from_yaml("url: ghcr.io\nauth_type: basic\n"),
+                vec!["credentials"],
+            ),
+            (
+                "token alias without token",
+                registry_from_yaml("url: quay.io\nauth_type: token\n"),
+                vec!["token"],
+            ),
+            (
+                "aws_profile without auth_type",
+                RegistryConfig {
+                    aws_profile: Some("vendor".to_string()),
+                    ..bare_registry()
+                },
+                vec!["aws_profile", "auth_type", "ecr"],
+            ),
+            (
+                "aws_profile with basic auth",
+                RegistryConfig {
+                    auth_type: Some(AuthType::Basic),
+                    credentials: Some(BasicCredentials {
+                        username: "u".into(),
+                        password: "p".into(),
+                    }),
+                    aws_profile: Some("vendor".to_string()),
+                    ..bare_registry()
+                },
+                vec!["aws_profile", "ecr"],
+            ),
+            (
+                "empty aws_profile",
+                RegistryConfig {
+                    auth_type: Some(AuthType::Ecr),
+                    aws_profile: Some(String::new()),
+                    ..bare_registry()
+                },
+                vec!["aws_profile", "empty"],
+            ),
+        ];
+        for (name, registry, wants) in cases {
+            let err = validate_registry("example", &registry)
+                .unwrap_err()
+                .to_string();
+            for want in wants {
+                assert!(err.contains(want), "{name}: expected '{want}' in: {err}");
+            }
+        }
     }
 
     #[test]
-    fn aws_profile_empty_string_fails() {
-        let registry = RegistryConfig {
-            url: "123456789012.dkr.ecr.us-east-1.amazonaws.com".to_string(),
-            auth_type: Some(AuthType::Ecr),
-            max_concurrent: None,
-            credentials: None,
-            token: None,
-            head_first: false,
-            aws_profile: Some(String::new()),
-        };
-        let err = validate_registry("vendor", &registry)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("aws_profile"),
-            "error must mention aws_profile: {err}"
-        );
-        assert!(err.contains("empty"), "error must mention empty: {err}");
+    fn valid_registries_pass() {
+        let cases = [
+            (
+                "basic with credentials",
+                registry_from_yaml(
+                    "url: ghcr.io\nauth_type: basic\ncredentials:\n  username: myuser\n  password: mypass\n",
+                ),
+            ),
+            (
+                "token alias with token",
+                registry_from_yaml("url: quay.io\nauth_type: token\ntoken: ghp_abc123\n"),
+            ),
+            (
+                "aws_profile with ecr",
+                RegistryConfig {
+                    auth_type: Some(AuthType::Ecr),
+                    aws_profile: Some("vendor".to_string()),
+                    ..bare_registry()
+                },
+            ),
+        ];
+        for (name, registry) in cases {
+            validate_registry("example", &registry)
+                .unwrap_or_else(|e| panic!("{name}: expected valid registry: {e}"));
+        }
+    }
+
+    #[test]
+    fn deserialize_registry_optional_fields() {
+        let cases = [
+            (
+                "ecr",
+                "url: x\nauth_type: ecr\n",
+                None,
+                Some(AuthType::Ecr),
+                None,
+            ),
+            (
+                "max_concurrent",
+                "url: cgr.dev\nmax_concurrent: 10\n",
+                Some(10),
+                None,
+                None,
+            ),
+            (
+                "all absent",
+                "url: registry-1.docker.io\n",
+                None,
+                None,
+                None,
+            ),
+            (
+                "aws_profile",
+                "url: x\nauth_type: ecr\naws_profile: vendor\n",
+                None,
+                Some(AuthType::Ecr),
+                Some("vendor"),
+            ),
+        ];
+        for (name, yaml, max_concurrent, auth_type, aws_profile) in cases {
+            let reg = registry_from_yaml(yaml);
+            assert_eq!(
+                reg.max_concurrent.map(NonZeroUsize::get),
+                max_concurrent,
+                "{name}"
+            );
+            assert_eq!(reg.auth_type, auth_type, "{name}");
+            assert_eq!(reg.aws_profile.as_deref(), aws_profile, "{name}");
+        }
+    }
+
+    #[test]
+    fn artifacts_enabled_false_with_require_is_contradictory() {
+        let cases = [
+            ("disabled and required", false, true, true),
+            ("enabled and required", true, true, false),
+            ("disabled, not required", false, false, false),
+        ];
+        for (name, enabled, require_artifacts, want_err) in cases {
+            let artifacts = ArtifactsConfig {
+                enabled,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                require_artifacts,
+            };
+            match (validate_artifacts("test-mapping", &artifacts), want_err) {
+                (Err(ConfigError::Validation(msg)), true) => {
+                    assert!(msg.contains("require_artifacts"), "{name}: {msg}");
+                    assert!(msg.contains("enabled"), "{name}: {msg}");
+                }
+                (Ok(()), false) => {}
+                (other, _) => panic!("{name}: unexpected result {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn expand_passes_literal_text_through() {
+        let cases = [
+            ("no vars", "plain string no vars"),
+            ("unclosed brace", "prefix-${UNCLOSED"),
+        ];
+        for (name, input) in cases {
+            assert_eq!(expand_env_vars(input, false).unwrap(), input, "{name}");
+        }
+    }
+
+    #[test]
+    fn expanded_value_survives_quoted_yaml() {
+        // Quoted fields keep ":" and "#" inside the value rather than
+        // breaking the YAML structure or starting a comment.
+        let cases = [
+            ("colon", "OCYNC_TEST_COLON", "host:8080", "url"),
+            ("hash", "OCYNC_TEST_HASH", "value#with#hashes", "key"),
+        ];
+        for (name, var, value, key) in cases {
+            unsafe { std::env::set_var(var, value) };
+            let yaml = format!("{key}: \"${{{var}}}\"");
+            let expanded = expand_env_vars(&yaml, true).unwrap();
+            let map: HashMap<String, String> = serde_yaml::from_str(&expanded).unwrap();
+            assert_eq!(map[key], value, "{name}");
+            unsafe { std::env::remove_var(var) };
+        }
     }
 }

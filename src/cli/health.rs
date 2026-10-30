@@ -1,8 +1,7 @@
 //! Health and readiness endpoints for watch mode.
 //!
-//! Exposes `/healthz` (liveness - always 200) and `/readyz` (readiness -
-//! 200 if last sync within `2 * interval`, 503 otherwise) for Kubernetes
-//! probes.
+//! `/healthz` (liveness) is always 200; `/readyz` (readiness) is 200 if the
+//! last sync was within `2 * interval`, 503 otherwise. For Kubernetes probes.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,8 +31,7 @@ impl HealthState {
         self.last_success = Some(Instant::now());
     }
 
-    /// Returns `true` if the sync loop is ready: at least one success
-    /// within `2 * interval`. Used by the `/readyz` endpoint.
+    /// At least one success within `2 * interval`.
     fn is_ready(&self) -> bool {
         match self.last_success {
             Some(last) => last.elapsed() < self.interval * 2,
@@ -52,10 +50,6 @@ fn format_response(status: StatusCode, body: &str) -> String {
     )
 }
 
-/// Route a request path to a formatted HTTP response based on health state.
-///
-/// - `/healthz` - liveness: always 200 (process is running).
-/// - `/readyz`  - readiness: 200 if last sync within `2 * interval`, 503 otherwise.
 fn handle_request(path: &str, state: &HealthState) -> String {
     match path {
         "/healthz" => format_response(StatusCode::OK, "ok\n"),
@@ -65,15 +59,11 @@ fn handle_request(path: &str, state: &HealthState) -> String {
     }
 }
 
-/// Start the health server on a pre-bound listener.
+/// Serve `/healthz` and `/readyz` on a pre-bound listener until the task is
+/// cancelled. Must run inside a `spawn_local` on the `current_thread` runtime.
 ///
-/// Serves `/healthz` (liveness) and `/readyz` (readiness) until the task
-/// is cancelled. Must be called from within a `spawn_local` on the
-/// `current_thread` runtime.
-///
-/// Accepts a `TcpListener` rather than a port number so the caller
-/// controls binding (avoids TOCTOU races in tests and lets production
-/// code report bind errors before spawning).
+/// Takes a listener, not a port, so the caller reports bind errors before
+/// spawning and tests avoid bind-discover-rebind races.
 pub(crate) async fn serve(listener: TcpListener, state: Rc<RefCell<HealthState>>) {
     loop {
         let (mut stream, _addr) = match listener.accept().await {
@@ -84,11 +74,10 @@ pub(crate) async fn serve(listener: TcpListener, state: Rc<RefCell<HealthState>>
             }
         };
 
-        // Read enough to extract the request line (path is always in the
-        // first ~50 bytes). Headers beyond this are irrelevant for routing.
+        // Only the request line is needed for routing.
         let mut buf = [0u8; 256];
         let n = match stream.read(&mut buf).await {
-            Ok(0) => continue, // client closed immediately (e.g. TCP probe)
+            Ok(0) => continue, // closed immediately (TCP probe)
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(error = %e, "health server read failed, continuing");
@@ -109,178 +98,164 @@ pub(crate) async fn serve(listener: TcpListener, state: Rc<RefCell<HealthState>>
 mod tests {
     use super::*;
 
-    // - handler unit tests (no TCP, no port) --
+    const OK: &str = "HTTP/1.1 200 OK\r\n";
+    const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\n";
+    const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\n";
 
-    #[test]
-    fn healthz_returns_200_before_first_sync() {
-        let state = HealthState::new(Duration::from_secs(60));
-        let resp = handle_request("/healthz", &state);
-        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(resp.ends_with("ok\n"));
-    }
-
-    #[test]
-    fn healthz_returns_200_after_successful_sync() {
-        let mut state = HealthState::new(Duration::from_secs(60));
-        state.record_success();
-        let resp = handle_request("/healthz", &state);
-        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(resp.ends_with("ok\n"));
-    }
-
-    #[test]
-    fn healthz_returns_200_when_stale() {
-        let interval = Duration::from_millis(10);
+    /// A state whose last success was `age` ago, or never.
+    fn state(interval: Duration, age: Option<Duration>) -> HealthState {
         let mut state = HealthState::new(interval);
-        state.last_success = Some(Instant::now() - interval * 3);
-        let resp = handle_request("/healthz", &state);
-        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(resp.ends_with("ok\n"));
+        state.last_success = age.map(|age| Instant::now() - age);
+        state
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// Cases shared by the handler and TCP tests:
+    /// (name, state, path, status line, body suffix). Liveness stays 200 while
+    /// readiness is 503, whatever the state.
+    fn route_cases() -> Vec<(
+        &'static str,
+        HealthState,
+        &'static str,
+        &'static str,
+        &'static str,
+    )> {
+        let short = Duration::from_millis(10);
+        vec![
+            (
+                "healthz before first sync",
+                state(MINUTE, None),
+                "/healthz",
+                OK,
+                "ok\n",
+            ),
+            (
+                "healthz after success",
+                state(MINUTE, Some(Duration::ZERO)),
+                "/healthz",
+                OK,
+                "ok\n",
+            ),
+            (
+                "healthz when stale",
+                state(short, Some(short * 3)),
+                "/healthz",
+                OK,
+                "ok\n",
+            ),
+            (
+                "readyz before first sync",
+                state(MINUTE, None),
+                "/readyz",
+                UNAVAILABLE,
+                "sync stale\n",
+            ),
+            (
+                "readyz after success",
+                state(MINUTE, Some(Duration::ZERO)),
+                "/readyz",
+                OK,
+                "ok\n",
+            ),
+            (
+                "readyz when stale",
+                state(short, Some(short * 3)),
+                "/readyz",
+                UNAVAILABLE,
+                "sync stale\n",
+            ),
+            (
+                "unknown path",
+                state(MINUTE, None),
+                "/foo",
+                NOT_FOUND,
+                "not found\n",
+            ),
+            (
+                "empty path",
+                state(MINUTE, None),
+                "",
+                NOT_FOUND,
+                "not found\n",
+            ),
+        ]
     }
 
     #[test]
-    fn readyz_returns_503_before_first_sync() {
-        let state = HealthState::new(Duration::from_secs(60));
-        let resp = handle_request("/readyz", &state);
-        assert!(resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
-        assert!(resp.ends_with("sync stale\n"));
+    fn handle_request_routes_by_path_and_state() {
+        for (name, state, path, status, body) in route_cases() {
+            let resp = handle_request(path, &state);
+            assert!(resp.starts_with(status), "{name}: {resp}");
+            assert!(resp.ends_with(body), "{name}: {resp}");
+        }
     }
 
     #[test]
-    fn readyz_returns_200_after_successful_sync() {
-        let mut state = HealthState::new(Duration::from_secs(60));
-        state.record_success();
-        let resp = handle_request("/readyz", &state);
-        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(resp.ends_with("ok\n"));
+    fn is_ready_requires_a_success_within_twice_the_interval() {
+        let cases = [
+            ("no success", MINUTE, None, false),
+            ("recent success", MINUTE, Some(Duration::ZERO), true),
+            (
+                "stale success",
+                Duration::from_millis(10),
+                Some(Duration::from_millis(30)),
+                false,
+            ),
+            // Just inside 2 * interval.
+            (
+                "just inside",
+                MINUTE,
+                Some(MINUTE + Duration::from_secs(59)),
+                true,
+            ),
+            // Just outside 2 * interval.
+            (
+                "just outside",
+                Duration::from_millis(50),
+                Some(Duration::from_millis(101)),
+                false,
+            ),
+        ];
+        for (name, interval, age, want) in cases {
+            assert_eq!(state(interval, age).is_ready(), want, "{name}");
+        }
     }
 
     #[test]
-    fn readyz_returns_503_when_stale() {
-        let interval = Duration::from_millis(10);
-        let mut state = HealthState::new(interval);
-        state.last_success = Some(Instant::now() - interval * 3);
-        let resp = handle_request("/readyz", &state);
-        assert!(resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
-        assert!(resp.ends_with("sync stale\n"));
+    fn format_response_writes_status_headers_and_length() {
+        let cases = [
+            (
+                StatusCode::OK,
+                "ok\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n",
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sync stale\n",
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nsync stale\n",
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "not found\n",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nnot found\n",
+            ),
+        ];
+        for (status, body, want) in cases {
+            assert_eq!(format_response(status, body), want, "{status}");
+        }
     }
 
-    #[test]
-    fn unknown_path_returns_404() {
-        let state = HealthState::new(Duration::from_secs(60));
-        let resp = handle_request("/foo", &state);
-        assert!(resp.starts_with("HTTP/1.1 404 Not Found\r\n"));
-        assert!(resp.ends_with("not found\n"));
-    }
-
-    #[test]
-    fn empty_path_returns_404() {
-        let state = HealthState::new(Duration::from_secs(60));
-        let resp = handle_request("", &state);
-        assert!(resp.starts_with("HTTP/1.1 404 Not Found\r\n"));
-        assert!(resp.ends_with("not found\n"));
-    }
-
-    #[test]
-    fn healthz_200_while_readyz_503() {
-        // Core invariant: liveness is always 200 even when readiness is 503.
-        let state = HealthState::new(Duration::from_secs(60));
-        let liveness = handle_request("/healthz", &state);
-        let readiness = handle_request("/readyz", &state);
-        assert!(
-            liveness.starts_with("HTTP/1.1 200 OK\r\n"),
-            "liveness: {liveness}"
-        );
-        assert!(
-            readiness.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
-            "readiness: {readiness}"
-        );
-    }
-
-    // - state logic unit tests --
-
-    #[test]
-    fn health_state_no_success_is_not_ready() {
-        let state = HealthState::new(Duration::from_secs(60));
-        assert!(!state.is_ready());
-    }
-
-    #[test]
-    fn health_state_recent_success_is_ready() {
-        let mut state = HealthState::new(Duration::from_secs(60));
-        state.record_success();
-        assert!(state.is_ready());
-    }
-
-    #[test]
-    fn health_state_stale_success_is_not_ready() {
-        let interval = Duration::from_millis(10);
-        let mut state = HealthState::new(interval);
-        state.last_success = Some(Instant::now() - interval * 3);
-        assert!(!state.is_ready());
-    }
-
-    #[test]
-    fn health_state_boundary_just_inside_threshold() {
-        // At exactly 2 * interval - epsilon, should still be ready.
-        let interval = Duration::from_secs(60);
-        let mut state = HealthState::new(interval);
-        state.last_success = Some(Instant::now() - interval - Duration::from_secs(59));
-        assert!(state.is_ready());
-    }
-
-    #[test]
-    fn health_state_boundary_just_outside_threshold() {
-        // At exactly 2 * interval + epsilon, should not be ready.
-        let interval = Duration::from_millis(50);
-        let mut state = HealthState::new(interval);
-        state.last_success = Some(Instant::now() - Duration::from_millis(101));
-        assert!(!state.is_ready());
-    }
-
-    // - response formatting --
-
-    #[test]
-    fn format_response_200() {
-        assert_eq!(
-            format_response(StatusCode::OK, "ok\n"),
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n"
-        );
-    }
-
-    #[test]
-    fn format_response_503() {
-        assert_eq!(
-            format_response(StatusCode::SERVICE_UNAVAILABLE, "sync stale\n"),
-            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nsync stale\n"
-        );
-    }
-
-    #[test]
-    fn format_response_404() {
-        assert_eq!(
-            format_response(StatusCode::NOT_FOUND, "not found\n"),
-            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nnot found\n"
-        );
-    }
-
-    // - TCP integration tests (exercises the real `serve()` code path) --
-
-    /// Send a raw HTTP request to the health server and return the response.
-    ///
-    /// Passes a pre-bound `TcpListener` to `serve()`, eliminating the
-    /// port race that occurs with bind-discover-drop-rebind patterns.
-    async fn serve_and_request(state: Rc<RefCell<HealthState>>, request: &[u8]) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    /// Send a raw HTTP request to a real `serve()` on an ephemeral port and
+    /// return the response.
+    async fn serve_and_request(state: HealthState, request: &[u8]) -> String {
         use tokio::net::TcpStream;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let server = tokio::task::spawn_local({
-            let state = Rc::clone(&state);
-            async move { serve(listener, state).await }
-        });
+        let state = Rc::new(RefCell::new(state));
+        let server = tokio::task::spawn_local(async move { serve(listener, state).await });
 
         // Give the server a moment to start accepting.
         tokio::task::yield_now().await;
@@ -296,94 +271,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn serve_healthz_always_200() {
+    async fn serve_answers_over_tcp() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // No record_success - /healthz should still return 200.
-                let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
-
-                let resp =
-                    serve_and_request(state, b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                        .await;
-                assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "got: {resp}");
-                assert!(resp.ends_with("ok\n"), "got: {resp}");
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn serve_readyz_503_before_sync() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
-
-                let resp =
-                    serve_and_request(state, b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                        .await;
-                assert!(
-                    resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
-                    "got: {resp}"
-                );
-                assert!(resp.ends_with("sync stale\n"), "got: {resp}");
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn serve_readyz_200_after_sync() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
-                state.borrow_mut().record_success();
-
-                let resp =
-                    serve_and_request(state, b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                        .await;
-                assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "got: {resp}");
-                assert!(resp.ends_with("ok\n"), "got: {resp}");
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn serve_readyz_503_when_stale() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let interval = Duration::from_millis(10);
-                let state = Rc::new(RefCell::new(HealthState::new(interval)));
-                state.borrow_mut().last_success = Some(Instant::now() - interval * 3);
-
-                let resp =
-                    serve_and_request(state, b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                        .await;
-                assert!(
-                    resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
-                    "got: {resp}"
-                );
-                assert!(resp.ends_with("sync stale\n"), "got: {resp}");
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn serve_unknown_path_404() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let state = Rc::new(RefCell::new(HealthState::new(Duration::from_secs(60))));
-
-                let resp =
-                    serve_and_request(state, b"GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                        .await;
-                assert!(
-                    resp.starts_with("HTTP/1.1 404 Not Found\r\n"),
-                    "got: {resp}"
-                );
-                assert!(resp.ends_with("not found\n"), "got: {resp}");
+                for (name, state, path, status, body) in route_cases() {
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+                    let resp = serve_and_request(state, request.as_bytes()).await;
+                    assert!(resp.starts_with(status), "{name}: got: {resp}");
+                    assert!(resp.ends_with(body), "{name}: got: {resp}");
+                }
             })
             .await;
     }

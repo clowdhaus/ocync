@@ -1,10 +1,9 @@
 //! Verbosity-aware progress reporters for sync output.
 //!
-//! [`TextProgress`] writes per-image status lines to stderr, and a periodic
-//! liveness line to tracing while a run is still in flight. There is no
-//! per-cycle aggregate stdout line: the CLI driver emits a per-mapping
-//! INFO line via tracing after the engine returns, which carries the
-//! source/target context an aggregate cannot.
+//! [`TextProgress`] writes per-image status lines to stderr and a periodic
+//! liveness line to tracing while a run is in flight. There is no per-cycle
+//! aggregate: the CLI driver logs a per-mapping INFO line after the engine
+//! returns, which carries the source/target context an aggregate cannot.
 
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -14,11 +13,9 @@ use ocync_sync::{ImageResult, ImageStatus, SyncReport};
 
 use crate::cli::output::{format_bytes, format_duration};
 
-/// Format a per-image status line, or `None` if the status should be silent
-/// at the given verbosity level.
+/// A per-image status line, or `None` if silent at this verbosity.
 ///
-/// Failed images always produce a line. Synced/skipped images produce a
-/// line only at verbosity >= 1.
+/// Failed images always produce a line; synced and skipped only at verbosity >= 1.
 fn format_image_line(result: &ImageResult, verbosity: u8) -> Option<String> {
     match &result.status {
         ImageStatus::Failed { kind, error, .. } if error.is_empty() => Some(format!(
@@ -52,11 +49,7 @@ fn format_image_line(result: &ImageResult, verbosity: u8) -> Option<String> {
     }
 }
 
-/// Text progress reporter with configurable verbosity.
-///
-/// Per-image status lines (`synced` / `FAILED`) go to stderr. There is no
-/// stdout per-cycle aggregate; the CLI emits per-mapping INFO lines from
-/// the sync driver instead.
+/// Text progress reporter: per-image status lines go to stderr.
 pub(crate) struct TextProgress {
     verbosity: u8,
     stderr: RefCell<Box<dyn Write>>,
@@ -80,9 +73,7 @@ impl TextProgress {
 }
 
 impl ProgressReporter for TextProgress {
-    fn image_started(&self, _source: &str, _target: &str) {
-        // No-op for text output.
-    }
+    fn image_started(&self, _source: &str, _target: &str) {}
 
     fn image_completed(&self, result: &ImageResult) {
         if let Some(line) = format_image_line(result, self.verbosity) {
@@ -93,11 +84,9 @@ impl ProgressReporter for TextProgress {
     }
 
     fn run_heartbeat(&self, snapshot: RunProgress) {
-        // Goes through tracing rather than the stderr writer above: this is a
-        // periodic status line, not per-image output, so it belongs in the log
-        // stream where `--log-format json` and the level filter apply. At
-        // verbosity 0 the per-image lines are suppressed, which makes this the
-        // only thing distinguishing a long run from a hung one.
+        // Tracing, not the stderr writer: a periodic status line belongs in the
+        // log stream where `--log-format json` and the level filter apply. At
+        // verbosity 0 it is the only sign of a long run versus a hung one.
         tracing::info!(
             in_discovery = snapshot.in_discovery,
             pending = snapshot.pending,
@@ -109,11 +98,8 @@ impl ProgressReporter for TextProgress {
     }
 
     fn run_completed(&self, _report: &SyncReport) {
-        // Per-cycle aggregate is no longer emitted here; the CLI driver
-        // emits a per-mapping line via tracing INFO after the engine
-        // returns, which carries the source/target context the aggregate
-        // lacked. The `--json` path writes the structured report to stdout
-        // separately in `write_output`.
+        // The CLI driver logs per-mapping lines and `--json` writes the
+        // structured report separately.
     }
 }
 
@@ -172,176 +158,132 @@ mod tests {
         }
     }
 
-    // - format_image_line tests (shared formatting logic) --
-
-    #[test]
-    fn image_line_failed_always_returns_some() {
-        let result = make_result(
-            ImageStatus::Failed {
-                kind: ErrorKind::ManifestPush,
-                error: "connection refused".into(),
-                retries: 3,
-                status_code: None,
-            },
-            0,
-        );
-        let line = format_image_line(&result, 0).expect("failed should always produce a line");
-        assert!(line.starts_with("FAILED  "), "got: {line}");
-        assert!(line.contains("manifest push"), "got: {line}");
-        assert!(line.contains("connection refused"), "got: {line}");
-    }
-
-    #[test]
-    fn image_line_failed_at_any_verbosity() {
-        let result = make_result(
-            ImageStatus::Failed {
-                kind: ErrorKind::BlobTransfer,
-                error: "timeout".into(),
-                retries: 1,
-                status_code: None,
-            },
-            0,
-        );
-        // Failed lines appear at every verbosity level.
-        for v in [0, 1, 2, 255] {
-            assert!(
-                format_image_line(&result, v).is_some(),
-                "failed should produce a line at verbosity {v}"
-            );
+    fn failed(kind: ErrorKind, error: &str) -> ImageStatus {
+        ImageStatus::Failed {
+            kind,
+            error: error.into(),
+            retries: 0,
+            status_code: None,
         }
     }
 
     #[test]
-    fn image_line_failed_with_empty_error_omits_colon() {
-        let result = make_result(
-            ImageStatus::Failed {
-                kind: ErrorKind::ManifestPull,
-                error: String::new(),
-                retries: 0,
-                status_code: None,
-            },
-            0,
-        );
-        let line = format_image_line(&result, 0).unwrap();
-        assert_eq!(
-            line,
-            "FAILED  source/repo:v1 -> target/repo:v1  (manifest pull)"
-        );
+    fn failed_image_lines_appear_at_every_verbosity() {
+        let cases = [
+            (
+                "with error",
+                failed(ErrorKind::ManifestPush, "connection refused"),
+                "FAILED  source/repo:v1 -> target/repo:v1  (manifest push: connection refused)",
+            ),
+            (
+                "timeout",
+                failed(ErrorKind::BlobTransfer, "timeout"),
+                "FAILED  source/repo:v1 -> target/repo:v1  (blob transfer: timeout)",
+            ),
+            (
+                "empty error omits the colon",
+                failed(ErrorKind::ManifestPull, ""),
+                "FAILED  source/repo:v1 -> target/repo:v1  (manifest pull)",
+            ),
+            (
+                "network error",
+                failed(ErrorKind::BlobTransfer, "network error"),
+                "FAILED  source/repo:v1 -> target/repo:v1  (blob transfer: network error)",
+            ),
+        ];
+        for (name, status, want) in cases {
+            let result = make_result(status, 0);
+            for v in [0, 1, 2, 255] {
+                assert_eq!(
+                    format_image_line(&result, v).as_deref(),
+                    Some(want),
+                    "{name} at verbosity {v}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn image_line_synced_v0_returns_none() {
-        let result = make_result(ImageStatus::Synced, 187_000_000);
-        assert!(format_image_line(&result, 0).is_none());
+    fn synced_and_skipped_image_lines_need_verbosity() {
+        let skipped = |reason| ImageStatus::Skipped { reason };
+        let cases = [
+            (
+                "synced v0 is silent",
+                ImageStatus::Synced,
+                187_000_000,
+                false,
+                0,
+                None,
+            ),
+            (
+                "synced v1 shows bytes and duration",
+                ImageStatus::Synced,
+                187_000_000,
+                false,
+                1,
+                Some("synced  source/repo:v1 -> target/repo:v1  (187.0 MB, 14s)"),
+            ),
+            (
+                "synced zero bytes",
+                ImageStatus::Synced,
+                0,
+                false,
+                1,
+                Some("synced  source/repo:v1 -> target/repo:v1  (0 B, 14s)"),
+            ),
+            (
+                "synced exact format",
+                ImageStatus::Synced,
+                432_000_000,
+                false,
+                1,
+                Some("synced  source/repo:v1 -> target/repo:v1  (432.0 MB, 14s)"),
+            ),
+            (
+                "synced with artifacts skipped",
+                ImageStatus::Synced,
+                432_000_000,
+                true,
+                1,
+                Some(
+                    "synced  source/repo:v1 -> target/repo:v1  (432.0 MB, 14s, artifacts skipped)",
+                ),
+            ),
+            (
+                "skipped v0 is silent",
+                skipped(SkipReason::DigestMatch),
+                0,
+                false,
+                0,
+                None,
+            ),
+            (
+                "skipped v1 shows the reason",
+                skipped(SkipReason::DigestMatch),
+                0,
+                false,
+                1,
+                Some("skipped source/repo:v1 -> target/repo:v1  (digest match)"),
+            ),
+            (
+                "skipped immutable tag",
+                skipped(SkipReason::ImmutableTag),
+                0,
+                false,
+                1,
+                Some("skipped source/repo:v1 -> target/repo:v1  (immutable tag)"),
+            ),
+        ];
+        for (name, status, bytes, artifacts_skipped, verbosity, want) in cases {
+            let mut result = make_result(status, bytes);
+            result.artifacts_skipped = artifacts_skipped;
+            assert_eq!(
+                format_image_line(&result, verbosity).as_deref(),
+                want,
+                "{name}"
+            );
+        }
     }
-
-    #[test]
-    fn image_line_synced_v1_includes_bytes_and_duration() {
-        let result = make_result(ImageStatus::Synced, 187_000_000);
-        let line = format_image_line(&result, 1).expect("synced at v1 should produce a line");
-        assert!(line.starts_with("synced  "), "got: {line}");
-        assert!(line.contains("187.0 MB"), "got: {line}");
-        assert!(line.contains("14s"), "got: {line}");
-    }
-
-    #[test]
-    fn image_line_synced_zero_bytes() {
-        let result = make_result(ImageStatus::Synced, 0);
-        let line = format_image_line(&result, 1).unwrap();
-        assert!(line.contains("0 B"), "got: {line}");
-    }
-
-    #[test]
-    fn image_line_skipped_v0_returns_none() {
-        let result = make_result(
-            ImageStatus::Skipped {
-                reason: SkipReason::DigestMatch,
-            },
-            0,
-        );
-        assert!(format_image_line(&result, 0).is_none());
-    }
-
-    #[test]
-    fn image_line_skipped_v1_includes_reason() {
-        let result = make_result(
-            ImageStatus::Skipped {
-                reason: SkipReason::DigestMatch,
-            },
-            0,
-        );
-        let line = format_image_line(&result, 1).expect("skipped at v1 should produce a line");
-        assert!(line.starts_with("skipped "), "got: {line}");
-        assert!(line.contains("digest match"), "got: {line}");
-    }
-
-    #[test]
-    fn image_line_immutable_tag_reason() {
-        let result = make_result(
-            ImageStatus::Skipped {
-                reason: SkipReason::ImmutableTag,
-            },
-            0,
-        );
-        let line = format_image_line(&result, 1).unwrap();
-        assert!(line.starts_with("skipped "), "got: {line}");
-        assert!(line.contains("immutable tag"), "got: {line}");
-    }
-
-    #[test]
-    fn image_line_exact_format_synced() {
-        let result = make_result(ImageStatus::Synced, 432_000_000);
-        let line = format_image_line(&result, 1).unwrap();
-        assert_eq!(
-            line,
-            "synced  source/repo:v1 -> target/repo:v1  (432.0 MB, 14s)"
-        );
-    }
-
-    #[test]
-    fn image_line_synced_with_artifacts_skipped() {
-        let mut result = make_result(ImageStatus::Synced, 432_000_000);
-        result.artifacts_skipped = true;
-        let line = format_image_line(&result, 1).unwrap();
-        assert_eq!(
-            line,
-            "synced  source/repo:v1 -> target/repo:v1  (432.0 MB, 14s, artifacts skipped)"
-        );
-    }
-
-    #[test]
-    fn image_line_exact_format_failed() {
-        let result = make_result(
-            ImageStatus::Failed {
-                kind: ErrorKind::BlobTransfer,
-                error: "network error".into(),
-                retries: 2,
-                status_code: None,
-            },
-            0,
-        );
-        let line = format_image_line(&result, 0).unwrap();
-        assert_eq!(
-            line,
-            "FAILED  source/repo:v1 -> target/repo:v1  (blob transfer: network error)"
-        );
-    }
-
-    #[test]
-    fn image_line_exact_format_skipped() {
-        let result = make_result(
-            ImageStatus::Skipped {
-                reason: SkipReason::DigestMatch,
-            },
-            0,
-        );
-        let line = format_image_line(&result, 1).unwrap();
-        assert_eq!(
-            line,
-            "skipped source/repo:v1 -> target/repo:v1  (digest match)"
-        );
-    }
-    // - TextProgress IO tests (stderr only) --
 
     fn text_progress(verbosity: u8) -> (TextProgress, Buf) {
         let stderr_buf: Buf = Rc::new(RefCell::new(Vec::new()));
@@ -351,40 +293,29 @@ mod tests {
     }
 
     #[test]
-    fn text_image_completed_writes_to_stderr_at_v1() {
-        let (progress, stderr) = text_progress(1);
-        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
-        let out = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(out.starts_with("synced  "), "got: {out}");
+    fn text_image_completed_writes_to_stderr_by_verbosity() {
+        let cases = [
+            ("synced at v1", 1, ImageStatus::Synced, Some("synced  ")),
+            ("synced at v0", 0, ImageStatus::Synced, None),
+            (
+                "failed at v0",
+                0,
+                failed(ErrorKind::BlobTransfer, "timeout"),
+                Some("FAILED  "),
+            ),
+        ];
+        for (name, verbosity, status, want_prefix) in cases {
+            let (progress, stderr) = text_progress(verbosity);
+            progress.image_completed(&make_result(status, 1024));
+            let out = String::from_utf8(stderr.borrow().clone()).unwrap();
+            match want_prefix {
+                Some(prefix) => assert!(out.starts_with(prefix), "{name}: got: {out}"),
+                None => assert!(out.is_empty(), "{name}: got: {out}"),
+            }
+        }
     }
 
-    #[test]
-    fn text_image_completed_silent_at_v0() {
-        let (progress, stderr) = text_progress(0);
-        progress.image_completed(&make_result(ImageStatus::Synced, 1024));
-        assert!(stderr.borrow().is_empty());
-    }
-
-    #[test]
-    fn text_failed_always_writes_to_stderr() {
-        let (progress, stderr) = text_progress(0);
-        progress.image_completed(&make_result(
-            ImageStatus::Failed {
-                kind: ErrorKind::BlobTransfer,
-                error: "timeout".into(),
-                retries: 1,
-                status_code: None,
-            },
-            0,
-        ));
-        let out = String::from_utf8(stderr.borrow().clone()).unwrap();
-        assert!(out.starts_with("FAILED  "), "got: {out}");
-    }
-
-    /// `run_completed` is intentionally a no-op now -- the per-cycle
-    /// aggregate moved to per-mapping INFO lines emitted by the CLI driver.
-    /// Lock that contract: even with a non-empty report, nothing reaches
-    /// stderr from this method.
+    /// `run_completed` is a no-op: even with a non-empty report nothing reaches stderr.
     #[test]
     fn text_run_completed_emits_nothing() {
         let (progress, stderr) = text_progress(2);

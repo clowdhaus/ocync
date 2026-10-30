@@ -1,4 +1,4 @@
-//! The `validate` subcommand - offline config validation.
+//! The `validate` subcommand: offline config validation.
 
 use crate::ValidateArgs;
 use crate::cli::config::load_config;
@@ -52,62 +52,31 @@ mappings:
     }
 
     #[test]
-    fn validate_invalid_yaml() {
-        let path = write_temp_config("validate_bad_yaml", "{{{{ not yaml");
-        let args = ValidateArgs {
-            config: path.clone(),
-        };
-        let result = run(&args);
-        assert!(result.is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn validate_missing_tags_block() {
-        let path = write_temp_config(
-            "validate_no_tags",
-            r#"
-mappings:
-  - from: library/nginx
-"#,
-        );
-        let args = ValidateArgs {
-            config: path.clone(),
-        };
-        let result = run(&args);
-        assert!(result.is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn validate_unknown_source_registry() {
-        let path = write_temp_config(
-            "validate_bad_ref",
-            r#"
-registries:
-  hub:
-    url: registry-1.docker.io
-mappings:
-  - from: nginx
-    source: nonexistent
-    tags:
-      glob: "*"
-"#,
-        );
-        let args = ValidateArgs {
-            config: path.clone(),
-        };
-        let result = run(&args);
-        assert!(result.is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn validate_nonexistent_file() {
-        let args = ValidateArgs {
-            config: std::path::PathBuf::from("/tmp/ocync_test_does_not_exist.yaml"),
-        };
-        let result = run(&args);
-        assert!(result.is_err());
+    fn validate_rejects_bad_configs() {
+        let cases = [
+            ("invalid yaml", Some("validate_bad_yaml"), "{{{{ not yaml"),
+            (
+                "missing tags block",
+                Some("validate_no_tags"),
+                "\nmappings:\n  - from: library/nginx\n",
+            ),
+            (
+                "unknown source registry",
+                Some("validate_bad_ref"),
+                "\nregistries:\n  hub:\n    url: registry-1.docker.io\nmappings:\n  - from: nginx\n    source: nonexistent\n    tags:\n      glob: \"*\"\n",
+            ),
+            ("nonexistent file", None, ""),
+        ];
+        for (name, file, content) in cases {
+            let path = match file {
+                Some(file) => write_temp_config(file, content),
+                None => std::path::PathBuf::from("/tmp/ocync_test_does_not_exist.yaml"),
+            };
+            let result = run(&ValidateArgs {
+                config: path.clone(),
+            });
+            assert!(result.is_err(), "{name}");
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

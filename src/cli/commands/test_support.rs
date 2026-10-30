@@ -1,9 +1,8 @@
 //! Shared scaffolding for the prepare-phase concurrency tests.
 //!
-//! `sync` and `analyze` resolve mappings through the same code and have to
-//! prove the same property: that independent network work overlaps. Both need
-//! a registry that answers slowly and records when each request arrived, so it
-//! lives here rather than being written twice.
+//! `sync` and `analyze` resolve mappings through the same code and prove the
+//! same property: independent network work overlaps. Both need a registry that
+//! answers slowly and records when each request arrived.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,12 +18,9 @@ pub(crate) fn arrivals() -> Arrivals {
     Arc::new(Mutex::new(Vec::new()))
 }
 
-/// The largest number of requests that were in flight at once.
-///
-/// A request is in flight from its arrival until `delay` later, so the answer
-/// is the most arrivals falling inside any window of that length. Under
-/// sequential work consecutive arrivals are at least `delay` apart, so every
-/// window holds exactly one and this returns 1.
+/// The largest number of requests in flight at once: the most arrivals inside
+/// any window of `delay`. Sequential work spaces arrivals at least `delay`
+/// apart, so this returns 1.
 pub(crate) fn max_in_flight(recorded: &Arrivals, delay: Duration) -> usize {
     let arrivals = recorded.lock().expect("no panic in a stub");
     arrivals
@@ -39,8 +35,7 @@ pub(crate) fn max_in_flight(recorded: &Arrivals, delay: Duration) -> usize {
         .unwrap_or(0)
 }
 
-/// Responds with a fixed body after `delay`, recording when each request
-/// arrived.
+/// Responds with a fixed body after `delay`, recording each arrival.
 pub(crate) struct SlowRecorder {
     arrivals: Arrivals,
     delay: Duration,
@@ -59,10 +54,8 @@ impl SlowRecorder {
         }
     }
 
-    /// A single-layer OCI image manifest.
-    ///
-    /// The client computes the digest from the bytes it receives, so nothing
-    /// here has to agree with a header.
+    /// A single-layer OCI image manifest. The client digests the bytes it
+    /// receives, so no header has to agree.
     pub(crate) fn image_manifest(arrivals: &Arrivals, delay: Duration) -> Self {
         Self {
             arrivals: Arc::clone(arrivals),
@@ -92,10 +85,8 @@ impl Respond for SlowRecorder {
             .lock()
             .expect("no panic in a stub")
             .push(Instant::now());
-        // `set_body_raw` rather than `set_body_json`: the latter forces
-        // `application/json`, and the client picks its manifest parser from
-        // the content type, so a manifest served that way is rejected as an
-        // unsupported media type.
+        // `set_body_json` forces `application/json`, and the client picks its
+        // manifest parser from the content type, so it would reject the manifest.
         let body = serde_json::to_vec(&self.body).expect("stub body serializes");
         ResponseTemplate::new(200)
             .set_body_raw(body, self.content_type.unwrap_or("application/json"))
@@ -103,10 +94,8 @@ impl Respond for SlowRecorder {
     }
 }
 
-/// A config whose `mappings` entries all point at `server`.
-///
-/// `tags` is the filter each mapping carries, written as it would appear under
-/// a mapping's `tags:` block.
+/// A config whose `mappings` all point at `server`; `tags` is the body of each
+/// mapping's `tags:` block.
 pub(crate) fn config_yaml(server: &MockServer, repos: &[String], tags: &str) -> String {
     let mut yaml = format!(
         "registries:\n  src:\n    url: {uri}\n  dst:\n    url: {uri}\n\

@@ -1,6 +1,6 @@
-//! Pretty-printer for `--dry-run`. Renders per-mapping stage attrition,
-//! Pareto-sorted drop attribution, include-rescue listing, and `min_tags`
-//! status from a `filter::FilterReport`.
+//! Pretty-printer for `--dry-run`: per-mapping stage attrition, Pareto-sorted
+//! drop attribution, include-rescue listing and `min_tags` status, rendered
+//! from a `filter::FilterReport`.
 
 use std::collections::HashSet;
 use std::io::{self, Write};
@@ -10,15 +10,13 @@ use ocync_sync::engine::{ResolvedMapping, TagPair};
 use crate::cli::commands::synchronize::{DroppedTarget, UnresolvedMapping};
 use ocync_sync::filter::{DropKind, FilterReport};
 
-/// Default sample cap per drop reason and per include-rescue list. Removed
-/// when verbose. Five lines is enough to spot the pattern (rc1..rc5,
-/// 1.20.0..1.20.4) without flooding the terminal.
+/// Sample cap per drop reason and per include-rescue list; lifted when verbose.
+/// Five is enough to spot a pattern (rc1..rc5) without flooding the terminal.
 const SAMPLE_CAP: usize = 5;
 
 /// Print dry-run output for the resolved mappings to stdout.
 ///
-/// `verbose` is the global `cli.verbose >= 1` toggle; when true, all
-/// rejected tags per drop reason are printed (no sample cap).
+/// `verbose` lifts the sample cap so every rejected tag is printed.
 pub(crate) fn print(
     mappings: &[ResolvedMapping],
     unresolved: &[UnresolvedMapping],
@@ -27,12 +25,12 @@ pub(crate) fn print(
 ) {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    // Stdout write errors during dry-run are almost always SIGPIPE (e.g.
-    // `ocync sync --dry-run | head`). Swallow them: the user explicitly
-    // asked us to stop writing.
+    // Write errors here are almost always SIGPIPE (`... | head`): the reader
+    // asked us to stop.
     let _ = write_to(&mut handle, mappings, unresolved, dropped, verbose);
 }
 
+/// Render the dry-run output for `mappings` to `w`.
 pub(crate) fn write_to<W: Write>(
     w: &mut W,
     mappings: &[ResolvedMapping],
@@ -40,10 +38,10 @@ pub(crate) fn write_to<W: Write>(
     dropped: &[DroppedTarget],
     verbose: bool,
 ) -> io::Result<()> {
-    // Written before the plan: the plan describes what a sync would do, and
-    // these are the parts of the config it could not describe at all. Without
-    // them a wholly denied dry run prints "no mappings to sync", which reads
-    // as a filter problem while the exit code reports a credential failure.
+    // Before the plan: these are the parts of the config it could not
+    // describe. Without them a wholly denied dry run prints "no mappings to
+    // sync", which reads as a filter problem while the exit code reports a
+    // credential failure.
     for u in unresolved {
         writeln!(w, "dry-run: {} -- UNRESOLVED: {}", u.from, u.error)?;
     }
@@ -83,8 +81,7 @@ fn write_mapping<W: Write>(w: &mut W, m: &ResolvedMapping, verbose: bool) -> io:
     )?;
 
     let Some(report) = m.filter_report.as_ref() else {
-        // Exact-tag fast path: no report available. Fall back to a simple
-        // tag list (matches the pre-Thread-2 print_dry_run behavior).
+        // Exact-tag fast path: source tags were never enumerated.
         return write_simple_tag_list(w, &m.tags);
     };
 
@@ -107,15 +104,12 @@ fn write_mapping<W: Write>(w: &mut W, m: &ResolvedMapping, verbose: bool) -> io:
     Ok(())
 }
 
-/// Render a flat tag list (used on the exact-tag fast path where no
-/// `FilterReport` is available because source tags were never enumerated).
+/// A flat tag list for the exact-tag fast path, which has no `FilterReport`.
 fn write_simple_tag_list<W: Write>(w: &mut W, tags: &[TagPair]) -> io::Result<()> {
     writeln!(w, "  tags ({}):", tags.len())?;
     write_tag_pairs(w, tags)
 }
 
-/// Render one indented line per [`TagPair`]. Shared by the exact-tag fast
-/// path and the `kept (N):` section.
 fn write_tag_pairs<W: Write>(w: &mut W, tags: &[TagPair]) -> io::Result<()> {
     for tag_pair in tags {
         writeln!(w, "    {tag_pair}")?;
@@ -123,8 +117,7 @@ fn write_tag_pairs<W: Write>(w: &mut W, tags: &[TagPair]) -> io::Result<()> {
     Ok(())
 }
 
-/// Render the include-rescue section: count + sample tag names, with a
-/// `, ...` ellipsis when truncated under `SAMPLE_CAP`.
+/// Include-rescue section: count and sample names, `, ...` when capped.
 fn write_include_path<W: Write>(w: &mut W, report: &FilterReport, verbose: bool) -> io::Result<()> {
     writeln!(w, "  include path:")?;
     let count = report.include_kept.len();
@@ -169,9 +162,8 @@ fn write_kept<W: Write>(w: &mut W, tags: &[TagPair], include_kept: &[String]) ->
     Ok(())
 }
 
-/// Render the `dropped` section. Returns `true` when at least one row was
-/// emitted, so the caller can decide whether `min_tags` status needs an
-/// extra leading blank line.
+/// Returns `true` when at least one row was emitted, so the caller knows
+/// whether the `min_tags` status needs a leading blank line.
 fn write_dropped<W: Write>(w: &mut W, report: &FilterReport, verbose: bool) -> io::Result<bool> {
     let total: usize = report.dropped.iter().map(|d| d.count).sum();
     if total == 0 {
@@ -180,8 +172,7 @@ fn write_dropped<W: Write>(w: &mut W, report: &FilterReport, verbose: bool) -> i
     writeln!(w, "  dropped ({total}):")?;
     for reason in &report.dropped {
         let samples_display = render_samples(&reason.samples, verbose);
-        // `LatestCap` reads as a complete clause ("over latest=N limit"); every
-        // other reason gets a "by " preposition so the line reads as English.
+        // `LatestCap` is already a full clause ("over latest=N limit").
         let display_label = match reason.kind {
             DropKind::LatestCap { .. } => reason.kind.to_string(),
             _ => format!("by {}", reason.kind),
@@ -204,9 +195,8 @@ fn write_dropped<W: Write>(w: &mut W, report: &FilterReport, verbose: bool) -> i
     Ok(true)
 }
 
-/// Render `min_tags` status when configured. When `kept < min_tags`, surface
-/// a clear warning that real-sync will fail with `BelowMinTags`. When the
-/// config is absent, render nothing.
+/// Renders nothing without `min_tags`; warns when `kept < min_tags` that a real
+/// sync fails with `BelowMinTags`.
 fn write_min_tags_status<W: Write>(
     w: &mut W,
     kept: usize,
@@ -230,9 +220,7 @@ fn write_min_tags_status<W: Write>(
     Ok(())
 }
 
-/// Format a sample list with the default cap of `SAMPLE_CAP`, joining with
-/// `, ` and appending `, ...` when truncated. With `verbose`, all samples
-/// are printed without truncation.
+/// Joins samples with `, `, truncating to `SAMPLE_CAP` plus `, ...` unless `verbose`.
 fn render_samples(samples: &[String], verbose: bool) -> String {
     if verbose || samples.len() <= SAMPLE_CAP {
         samples.join(", ")
@@ -295,32 +283,121 @@ mod tests {
         String::from_utf8(buf).expect("formatter output is utf8")
     }
 
-    #[test]
-    fn sample_cap_default_truncates_with_ellipsis() {
-        let report = report_fixture();
-        let out = capture(|w| {
-            write_dropped(w, &report, false)?;
-            Ok(())
-        });
-        // 6 samples -> first 5 listed + ", ..."
-        assert!(
-            out.contains("3.20.3, 3.20.2, 3.20.1, 3.20.0, 3.19.7, ..."),
-            "{out}"
-        );
-        // The 6th sample must NOT appear.
-        assert!(!out.contains("3.19.6"), "{out}");
+    /// Asserts every `present` substring appears in `out` and no `absent` one does.
+    fn assert_output(name: &str, out: &str, present: &[&str], absent: &[&str]) {
+        for want in present {
+            assert!(out.contains(want), "{name}: missing {want:?} in {out}");
+        }
+        for unwanted in absent {
+            assert!(
+                !out.contains(unwanted),
+                "{name}: unexpected {unwanted:?} in {out}"
+            );
+        }
     }
 
     #[test]
-    fn sample_cap_verbose_prints_all_samples() {
-        let report = report_fixture();
-        let out = capture(|w| {
-            write_dropped(w, &report, true)?;
-            Ok(())
-        });
-        // All 6 samples present, no trailing ellipsis.
-        assert!(out.contains("3.19.6"), "{out}");
-        assert!(!out.contains(", ..."), "{out}");
+    fn dropped_samples_respect_the_cap() {
+        let cases: [(&str, bool, &[&str], &[&str]); 2] = [
+            (
+                "capped: first 5 of 6 then ellipsis",
+                false,
+                &["3.20.3, 3.20.2, 3.20.1, 3.20.0, 3.19.7, ..."],
+                &["3.19.6"],
+            ),
+            ("verbose: all 6, no ellipsis", true, &["3.19.6"], &[", ..."]),
+        ];
+        for (name, verbose, present, absent) in cases {
+            let report = report_fixture();
+            let out = capture(|w| {
+                write_dropped(w, &report, verbose)?;
+                Ok(())
+            });
+            assert_output(name, &out, present, absent);
+        }
+    }
+
+    #[test]
+    fn include_path_renders_count_and_rescued_names() {
+        let ten: Vec<String> = (0..10).map(|i| format!("pin-{i}")).collect();
+        let cases: [(&str, Vec<String>, bool, &[&str], &[&str]); 3] = [
+            (
+                "count and names",
+                vec!["latest".into(), "latest-dev".into(), "edge".into()],
+                false,
+                &["include path:", "rescued (3):", "latest, latest-dev, edge"],
+                &[],
+            ),
+            (
+                "long list truncated by default",
+                ten.clone(),
+                false,
+                &["pin-0, pin-1, pin-2, pin-3, pin-4", ", ..."],
+                &["pin-5"],
+            ),
+            (
+                "verbose shows all",
+                ten,
+                true,
+                &["pin-0", "pin-9"],
+                &[", ..."],
+            ),
+        ];
+        for (name, include_kept, verbose, present, absent) in cases {
+            let report = FilterReport {
+                candidate_count: 50,
+                include_kept,
+                pipeline: vec![],
+                dropped: vec![],
+                min_tags: None,
+            };
+            let out = capture(|w| write_include_path(w, &report, verbose));
+            assert_output(name, &out, present, absent);
+        }
+    }
+
+    #[test]
+    fn exact_tag_fast_path_lists_tags_without_pipeline() {
+        let cases: [(&str, Vec<TagPair>, &[&str]); 2] = [
+            (
+                "same source and target",
+                vec![TagPair::same("v1.0.0"), TagPair::same("v1.1.0")],
+                &["tags (2):", "    v1.0.0\n", "    v1.1.0\n"],
+            ),
+            (
+                "rename arrow",
+                vec![TagPair::retag("v1.0.0", "stable"), TagPair::same("latest")],
+                &["    v1.0.0 -> stable\n", "    latest\n"],
+            ),
+        ];
+        for (name, tags, present) in cases {
+            let out = capture(|w| write_simple_tag_list(w, &tags));
+            assert_output(name, &out, present, &["filter:", "kept (", "dropped"]);
+        }
+    }
+
+    #[test]
+    fn min_tags_status_reports_whether_it_is_satisfied() {
+        let cases: [(&str, usize, usize, &[&str], &[&str]); 2] = [
+            (
+                "satisfied",
+                5,
+                3,
+                &["min_tags: 3", "kept 5", "satisfied"],
+                &["FAIL"],
+            ),
+            (
+                "unsatisfied warns real sync will fail",
+                3,
+                10,
+                &["min_tags: 10", "kept 3", "FAIL", "BelowMinTags"],
+                &[],
+            ),
+        ];
+        for (name, kept, min, present, absent) in cases {
+            let out = capture(|w| write_min_tags_status(w, kept, Some(min), false));
+            assert_output(name, &out, present, absent);
+        }
     }
 
     #[test]
@@ -342,9 +419,7 @@ mod tests {
         assert_eq!(out, "dry-run: no mappings to sync\n");
     }
 
-    /// A wholly denied dry run must say so. Printing only "no mappings to
-    /// sync" reads as a filter problem while the exit code reports a
-    /// credential failure.
+    /// A wholly denied dry run must say so, not just "no mappings to sync".
     #[test]
     fn unresolved_mappings_are_named_before_the_plan() {
         let unresolved = [UnresolvedMapping {
@@ -363,56 +438,6 @@ mod tests {
         assert!(out.contains("library/nginx"), "{out}");
         assert!(out.contains("403 Forbidden"), "{out}");
         assert!(out.contains("target backup unreachable"), "{out}");
-    }
-
-    #[test]
-    fn include_path_renders_count_and_rescued_names() {
-        let report = FilterReport {
-            candidate_count: 50,
-            include_kept: vec!["latest".into(), "latest-dev".into(), "edge".into()],
-            pipeline: vec![],
-            dropped: vec![],
-            min_tags: None,
-        };
-        let out = capture(|w| write_include_path(w, &report, false));
-        assert!(out.contains("include path:"), "{out}");
-        // Count and the actual rescued tag names appear together.
-        assert!(out.contains("rescued (3):"), "{out}");
-        assert!(out.contains("latest, latest-dev, edge"), "{out}");
-    }
-
-    #[test]
-    fn include_path_truncates_long_rescue_list_under_default() {
-        let names: Vec<String> = (0..10).map(|i| format!("pin-{i}")).collect();
-        let report = FilterReport {
-            candidate_count: 50,
-            include_kept: names,
-            pipeline: vec![],
-            dropped: vec![],
-            min_tags: None,
-        };
-        let out = capture(|w| write_include_path(w, &report, false));
-        // First 5 names appear, ellipsis present.
-        assert!(out.contains("pin-0, pin-1, pin-2, pin-3, pin-4"), "{out}");
-        assert!(out.contains(", ..."), "{out}");
-        // Sixth name is truncated.
-        assert!(!out.contains("pin-5"), "{out}");
-    }
-
-    #[test]
-    fn include_path_verbose_shows_all_rescued() {
-        let names: Vec<String> = (0..10).map(|i| format!("pin-{i}")).collect();
-        let report = FilterReport {
-            candidate_count: 50,
-            include_kept: names,
-            pipeline: vec![],
-            dropped: vec![],
-            min_tags: None,
-        };
-        let out = capture(|w| write_include_path(w, &report, true));
-        assert!(out.contains("pin-0"), "{out}");
-        assert!(out.contains("pin-9"), "{out}");
-        assert!(!out.contains(", ..."), "{out}");
     }
 
     #[test]
@@ -438,51 +463,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exact_tag_fast_path_lists_tags_without_pipeline() {
-        // Same source and target tags: print just the tag.
-        let same = vec![TagPair::same("v1.0.0"), TagPair::same("v1.1.0")];
-        let out = capture(|w| write_simple_tag_list(w, &same));
-        assert!(out.contains("tags (2):"), "{out}");
-        assert!(out.contains("    v1.0.0\n"), "{out}");
-        assert!(out.contains("    v1.1.0\n"), "{out}");
-        // No filter/kept/dropped sections appear.
-        assert!(!out.contains("filter:"), "{out}");
-        assert!(!out.contains("kept ("), "{out}");
-        assert!(!out.contains("dropped"), "{out}");
-    }
-
-    #[test]
-    fn exact_tag_fast_path_renders_rename_arrow() {
-        // source != target: render with `source -> target`.
-        let renamed = vec![TagPair::retag("v1.0.0", "stable"), TagPair::same("latest")];
-        let out = capture(|w| write_simple_tag_list(w, &renamed));
-        assert!(out.contains("    v1.0.0 -> stable\n"), "{out}");
-        assert!(out.contains("    latest\n"), "{out}");
-    }
-
     /// `min_tags: N` configured with kept >= N renders a "satisfied" line.
-    #[test]
-    fn min_tags_status_satisfied_renders_satisfied() {
-        let out = capture(|w| write_min_tags_status(w, 5, Some(3), false));
-        assert!(out.contains("min_tags: 3"), "{out}");
-        assert!(out.contains("kept 5"), "{out}");
-        assert!(out.contains("satisfied"), "{out}");
-        assert!(!out.contains("FAIL"), "{out}");
-    }
-
     /// `min_tags: N` configured with kept < N renders a hard FAIL warning so
     /// the user knows real-sync will reject this configuration.
-    #[test]
-    fn min_tags_status_unsatisfied_warns_real_sync_will_fail() {
-        let out = capture(|w| write_min_tags_status(w, 3, Some(10), false));
-        assert!(out.contains("min_tags: 10"), "{out}");
-        assert!(out.contains("kept 3"), "{out}");
-        assert!(out.contains("FAIL"), "{out}");
-        assert!(out.contains("BelowMinTags"), "{out}");
-    }
-
-    /// `min_tags` not configured: no line emitted.
     #[test]
     fn min_tags_status_absent_when_not_configured() {
         let out = capture(|w| write_min_tags_status(w, 5, None, false));
@@ -492,8 +475,7 @@ mod tests {
         );
     }
 
-    /// When the dropped section emitted rows, the `min_tags` line gets a
-    /// leading blank to separate it visually.
+    /// After dropped rows, the `min_tags` line gets a leading blank separator.
     #[test]
     fn min_tags_status_blank_separator_after_drops() {
         let with_drops = capture(|w| write_min_tags_status(w, 5, Some(3), true));
@@ -502,10 +484,7 @@ mod tests {
         assert!(!without_drops.starts_with('\n'), "{without_drops:?}");
     }
 
-    /// End-to-end: a mapping with `min_tags` configured but unsatisfied
-    /// renders the FAIL warning in the full mapping output. This is the
-    /// scenario that motivated the fix -- dry-run silently passing what
-    /// real-sync would reject.
+    /// Dry-run must not silently pass a mapping that a real sync would reject.
     #[test]
     fn full_mapping_render_surfaces_min_tags_failure() {
         let report = FilterReport {
@@ -533,9 +512,7 @@ mod tests {
         assert!(out.contains("BelowMinTags"), "{out}");
     }
 
-    /// End-to-end: kept tags rescued via include get a `[via include]`
-    /// marker so the operator can visually verify what each include pattern
-    /// is rescuing.
+    /// Include-rescued kept tags are marked so each include pattern's effect is visible.
     #[test]
     fn full_mapping_render_marks_include_rescued_tags() {
         let report = FilterReport {
@@ -554,14 +531,11 @@ mod tests {
             Some(report),
         );
         let out = capture(|w| write_mapping(w, &mapping, false));
-        // latest came through include path, so it is marked.
         assert!(out.contains("    latest  [via include]"), "{out}");
-        // 1.0.0 came through pipeline, no marker.
+        // Came through the pipeline, so unmarked.
         assert!(out.contains("    1.0.0\n"), "{out}");
         assert!(!out.contains("1.0.0  [via include]"), "{out}");
     }
-
-    // -- Test fixture builders -----------------------------------------------
 
     fn mapping_with_kept_and_report(n: usize, report: Option<FilterReport>) -> ResolvedMapping {
         let tags: Vec<TagPair> = (0..n).map(|i| TagPair::same(format!("v{i}"))).collect();
@@ -578,8 +552,7 @@ mod tests {
         use std::rc::Rc;
         use std::sync::Arc;
 
-        // Build a minimal mock client. We never issue requests in formatter
-        // tests; the client is a placeholder for the type system.
+        // Placeholder client: formatter tests issue no requests.
         let client = Arc::new(
             ocync_distribution::RegistryClientBuilder::new(
                 url::Url::parse("http://127.0.0.1").unwrap(),

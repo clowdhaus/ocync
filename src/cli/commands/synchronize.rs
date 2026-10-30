@@ -39,33 +39,25 @@ use crate::cli::{
 /// Default cache TTL: 12 hours.
 pub(crate) const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
 
-/// Default cache file name within the cache directory.
 const CACHE_FILE_NAME: &str = "transfer_state.bin";
 
-/// Sample cap for the source-tag list shown in the no-tags-matched WARN.
-/// Mirrors `dry_run::SAMPLE_CAP` so both surfaces show the same depth of
-/// example data without overwhelming the log line.
+/// Sample cap for the source-tag list in the no-tags-matched WARN. Matches
+/// `dry_run::SAMPLE_CAP` so both surfaces show the same depth.
 const NO_TAGS_SAMPLE_CAP: usize = 5;
 
 /// Cadence of the progress line emitted while the run is preparing.
 ///
-/// Everything before the engine starts is network-bound: each client build
-/// mints a token for ECR, GAR, and ACR, and each mapping lists a repository's
-/// tags. Client and batch-checker construction run one registry at a time;
-/// mapping resolution overlaps up to [`PREPARE_MAPPING_CONCURRENCY`] at once.
-/// No per-image output exists yet, so without this a large config runs for
-/// minutes with nothing in the log.
+/// Everything before the engine starts is network-bound (token mints, tag
+/// listings) and has no per-image output, so without this a large config runs
+/// for minutes with nothing in the log.
 const PREPARE_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Mappings whose resolution may be in flight at once.
 ///
-/// Resolution is network-bound and independent per mapping, so running one at
-/// a time makes the prepare phase cost the sum of every registry's latency
-/// rather than its maximum. This is a ceiling on how many mappings are open,
-/// not on how hard any registry is hit: every request underneath still passes
-/// that registry's AIMD window, which starts at one in flight and widens only
-/// as the registry keeps answering, so a wide config cannot turn into a burst
-/// against a single host.
+/// Running them one at a time makes the prepare phase cost the sum of every
+/// registry's latency rather than its maximum. This caps open mappings, not
+/// load on any registry: every request underneath still passes that registry's
+/// AIMD window, so a wide config cannot burst against a single host.
 pub(crate) const PREPARE_MAPPING_CONCURRENCY: usize = 16;
 
 /// A step of the pre-engine phase.
@@ -96,20 +88,15 @@ impl fmt::Display for PreparePhase {
 /// Counts for the pre-engine phase, held in a [`Cell`].
 #[derive(Debug, Clone, Copy, Default)]
 struct PrepareCounts {
-    /// Which pre-engine step is running.
     phase: PreparePhase,
-    /// Items finished in this step.
     done: usize,
-    /// Items this step will process.
     total: usize,
 }
 
 /// An item the current step has started and not yet finished.
 #[derive(Debug)]
 struct InFlightItem {
-    /// Identity used to remove the item when its guard drops.
     id: u64,
-    /// What the item is, as the operator named it in config.
     name: String,
     /// `tokio`'s clock, not `std`'s, so a paused runtime still ages items.
     started: tokio::time::Instant,
@@ -128,18 +115,16 @@ pub(crate) struct PrepareProgress {
     pub(crate) in_flight: usize,
     /// The in-flight item running longest, and for how long.
     ///
-    /// This is the whole point of tracking names: a step that sits at the same
-    /// `done` count for minutes is otherwise unattributable, and the operator
-    /// cannot tell a huge tag listing from a wedged registry.
+    /// Names the item holding the step up, so a step stuck at one `done` count
+    /// can be told apart as a huge tag listing or a wedged registry.
     pub(crate) slowest: Option<(String, Duration)>,
 }
 
 /// Counters and in-flight set the pre-engine steps update and the progress
 /// ticker reads.
 ///
-/// Plain [`Cell`] and [`RefCell`] rather than channels or locks: the runtime is
-/// `current_thread`, so the ticker and the work it describes never run
-/// concurrently, and no borrow here is held across an await.
+/// The runtime is `current_thread`, so the ticker and the work it describes
+/// never run concurrently; no borrow here is held across an await.
 #[derive(Debug, Default)]
 pub(crate) struct PrepareTracker {
     counts: Cell<PrepareCounts>,
@@ -148,7 +133,7 @@ pub(crate) struct PrepareTracker {
 }
 
 impl PrepareTracker {
-    /// Start a new step, resetting the item counter and in-flight set.
+    /// Start a new step, resetting the counter and in-flight set.
     pub(crate) fn begin(&self, phase: PreparePhase, total: usize) {
         self.counts.set(PrepareCounts {
             phase,
@@ -160,9 +145,8 @@ impl PrepareTracker {
 
     /// Mark `name` in flight until the returned guard drops.
     ///
-    /// A guard rather than paired calls: resolution has many early exits, and
-    /// every one of them must both retire the item and advance the counter or
-    /// the progress line stalls short of its total forever.
+    /// A guard rather than paired calls: every early exit must both retire the
+    /// item and advance the counter, or progress stalls short of its total.
     pub(crate) fn track(&self, name: &str) -> InFlightGuard<'_> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
@@ -181,8 +165,7 @@ impl PrepareTracker {
         let now = tokio::time::Instant::now();
         let slowest = in_flight
             .iter()
-            // Earliest start wins, so the report names the item actually
-            // holding the step up rather than whichever was added last.
+            // Earliest start wins: names the item holding the step up.
             .min_by_key(|item| item.started)
             .map(|item| {
                 (
@@ -208,7 +191,7 @@ impl PrepareTracker {
     }
 }
 
-/// Guard marking one item in flight for as long as it is held.
+/// Marks one item in flight while held.
 #[derive(Debug)]
 pub(crate) struct InFlightGuard<'a> {
     tracker: &'a PrepareTracker,
@@ -225,16 +208,15 @@ impl Drop for InFlightGuard<'_> {
 /// [`PREPARE_PROGRESS_INTERVAL`].
 ///
 /// The ticker fires on wall-clock, not on item boundaries, so a single slow
-/// mapping still reports. A boundary-driven throttle does not: measured on a
-/// three-mapping config it emitted nothing across an 8.6 second run.
+/// mapping still reports. A boundary-driven throttle emitted nothing across an
+/// 8.6 second run on a three-mapping config.
 pub(crate) async fn with_prepare_progress<F: Future>(
     tracker: &PrepareTracker,
     what: &'static str,
     work: F,
 ) -> F::Output {
     tick_while(tracker, PREPARE_PROGRESS_INTERVAL, work, |p, elapsed| {
-        // `slowest` is rendered even when nothing is in flight, which only
-        // happens between steps; `in_flight=0` beside it says why.
+        // Between steps nothing is in flight; `in_flight=0` explains the `-`.
         let (slowest, slowest_secs) = p
             .slowest
             .as_ref()
@@ -255,10 +237,7 @@ pub(crate) async fn with_prepare_progress<F: Future>(
 }
 
 /// Poll `work` to completion, calling `emit` with the tracker's state once per
-/// `interval` until it finishes.
-///
-/// Split from [`with_prepare_progress`] so the cadence is testable against a
-/// recording sink rather than a tracing subscriber.
+/// `interval`. Split out so tests can use a recording sink instead of tracing.
 async fn tick_while<F: Future>(
     tracker: &PrepareTracker,
     interval: Duration,
@@ -266,18 +245,15 @@ async fn tick_while<F: Future>(
     mut emit: impl FnMut(PrepareProgress, Duration),
 ) -> F::Output {
     let mut work = std::pin::pin!(work);
-    // tokio's clock, not `std`: under a paused runtime `std::time::Instant`
-    // does not advance, so the elapsed value would always read zero in tests.
+    // tokio's clock: `std::time::Instant` does not advance under a paused runtime.
     let started = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // `interval` yields immediately; push the first tick out a full period so
-    // a fast run stays silent.
+    // `interval` yields immediately; delay the first tick a full period.
     ticker.reset();
     loop {
         tokio::select! {
-            // `work` first: a tick that becomes ready on the same poll as a
-            // finished future is dropped rather than logged after the fact.
+            // `work` first: a tick ready on the same poll as a finished future is dropped.
             biased;
             out = &mut work => return out,
             _ = ticker.tick() => emit(tracker.snapshot(), started.elapsed()),
@@ -287,16 +263,15 @@ async fn tick_while<F: Future>(
 
 /// Registry clients keyed by config alias.
 ///
-/// A registry whose auth provider could not be built is stored as its failure
-/// rather than dropped, so the error surfaces only on the mappings that
-/// actually reference it.
+/// A registry whose client could not be built is stored as its failure, so the
+/// error surfaces only on the mappings that reference it.
 pub(crate) type ClientMap = HashMap<String, Result<Arc<RegistryClient>, ClientInitError>>;
 
 /// Why a registry's client could not be built.
 ///
-/// Holds the error itself rather than its text: the classification cannot be
-/// recovered from a string, and losing it downgrades a wholly denied run from
-/// the auth exit code to the generic failure code.
+/// Holds the error, not its text: the classification cannot be recovered from a
+/// string, and losing it downgrades a wholly denied run from the auth exit code
+/// to the generic failure code.
 #[derive(Debug)]
 pub(crate) struct ClientInitError(CliError);
 
@@ -316,14 +291,12 @@ impl fmt::Display for RegistryRole {
     }
 }
 
-/// Outcome of resolving a single mapping. Either the mapping is ready for the
-/// engine, or no source tag survived filtering and the caller decides whether
-/// to log a WARN (sync mode: always; watch mode: only on transition).
+/// Outcome of resolving a single mapping: ready for the engine, or no source
+/// tag survived filtering and the caller decides whether to log a WARN (sync
+/// mode: always; watch mode: only on transition).
 ///
-/// The size disparity between variants is intentional: `ResolvedMapping` flows
-/// directly into `Vec<ResolvedMapping>` for the engine, so boxing it would
-/// just add a heap round-trip per success. The error variant is rare; we pay
-/// the disparity instead of the allocation traffic.
+/// The variant size disparity is intentional: `ResolvedMapping` flows straight
+/// into `Vec<ResolvedMapping>`, so boxing it would add an allocation per success.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum MappingResolution {
     Resolved(ResolvedMapping),
@@ -333,8 +306,7 @@ pub(crate) enum MappingResolution {
 /// A target a mapping could not use.
 ///
 /// The mapping still syncs to its other targets, so this is not an
-/// [`UnresolvedMapping`]; it is a hole in an otherwise successful run and has
-/// to be visible as one.
+/// [`UnresolvedMapping`]; it is a hole in an otherwise successful run.
 #[derive(Debug, Serialize)]
 pub(crate) struct DroppedTarget {
     /// Source repository of the mapping that lost the target.
@@ -345,10 +317,8 @@ pub(crate) struct DroppedTarget {
     pub error: String,
 }
 
-/// A mapping that never became transferable work.
-///
-/// Resolution failures are per-mapping: an unreachable registry or a 403 on
-/// one repository's tag listing must not stop the mappings behind it.
+/// A mapping that never became transferable work. Resolution failures are
+/// per-mapping: one must not stop the mappings behind it.
 #[derive(Debug, Serialize)]
 pub(crate) struct UnresolvedMapping {
     /// Source repository path from the mapping config.
@@ -359,7 +329,7 @@ pub(crate) struct UnresolvedMapping {
     ///
     /// Kept out of the JSON document. A bool would collapse every non-auth
     /// classification into the generic failure code, retiring exit 3 and with
-    /// it the `min_tags` tripwire, whose whole job is to stop a run.
+    /// it the `min_tags` tripwire.
     #[serde(skip)]
     pub code: ExitCode,
 }
@@ -381,34 +351,30 @@ pub(crate) fn shared_failure_code(codes: impl IntoIterator<Item = ExitCode>) -> 
     }
 }
 
-/// Diagnostic context for a mapping whose filter rejected every source tag.
-///
-/// Fields together let an operator see, in one log line, the size and
-/// composition of the source repo (image tags vs OCI 1.1 referrer fallbacks),
-/// the active filter clauses, and example image tag names so the cause is
-/// obvious without spelunking.
+/// Diagnostic context for a mapping whose filter rejected every source tag:
+/// source size and composition (image tags vs OCI 1.1 referrer fallbacks), the
+/// active filter, and example tag names, in one log line.
 pub(crate) struct NoTagsInfo {
+    /// Source repository of the mapping.
     pub from: String,
+    /// Source tags that are images.
     pub image_count: usize,
+    /// Source tags that are referrer fallbacks.
     pub artifact_count: usize,
     /// Active filter clauses (e.g. `semver >=1.0.0, latest=5`). `None` only
-    /// when no filter is configured -- distinct from "filter description
-    /// missing" so the formatter can render an explicit fallback string.
+    /// when no filter is configured.
     pub filter_desc: Option<String>,
     /// Up to [`NO_TAGS_SAMPLE_CAP`] image-tag names. Excludes referrer
-    /// fallback tags so the example list is meaningful on cosign-heavy
-    /// repos like `cgr.dev/chainguard/*` (otherwise dominated by
-    /// `sha256-<hex>(.sig|.sbom|.att)` entries).
+    /// fallback tags, which would dominate the list on cosign-heavy repos
+    /// (`sha256-<hex>(.sig|.sbom|.att)`).
     pub samples: Vec<String>,
 }
 
 impl NoTagsInfo {
-    /// Total tags returned by `/v2/<repo>/tags/list`. Derived: image + artifact.
     fn source_total(&self) -> usize {
         self.image_count + self.artifact_count
     }
 
-    /// True when the source had more image tags than `samples` shows.
     fn samples_truncated(&self) -> bool {
         self.image_count > self.samples.len()
     }
@@ -444,18 +410,12 @@ impl fmt::Display for NoTagsInfo {
     }
 }
 
-/// Per-process state that lets watch-mode log on transitions instead of
-/// every cycle. Sync mode passes `None`. State lives in `watch::run` so it
-/// spans loop iterations.
+/// Cross-cycle state that lets watch mode log on transitions instead of every
+/// cycle. Sync mode passes `None`; `watch::run` owns the state across loop
+/// iterations.
 ///
-/// Tracks three pieces of cross-cycle context:
-///
-/// 1. No-tags failure set: mappings whose filter rejected every source tag.
-/// 2. Per-mapping outcomes: the prior cycle's [`MappingOutcome`] keyed by
-///    `mapping.from`, used to detect both repeated and recovery transitions.
-/// 3. Per-cycle emit counter: bumped by every `observe_*` method that
-///    reports a transition; the watch loop reads it to gate the idle
-///    heartbeat.
+/// The emit counter is bumped by every `observe_*` method that reports a
+/// transition; the watch loop reads it to gate the idle heartbeat.
 #[derive(Debug, Default)]
 pub(crate) struct WatchLogState {
     warned_no_tags: HashSet<String>,
@@ -468,16 +428,18 @@ pub(crate) struct WatchLogState {
 }
 
 impl WatchLogState {
+    /// Reset the per-cycle emit counter.
     pub(crate) fn begin_cycle(&mut self) {
         self.cycle_emit_count = 0;
     }
 
+    /// Transitions reported since [`begin_cycle`](Self::begin_cycle).
     pub(crate) fn cycle_emit_count(&self) -> u32 {
         self.cycle_emit_count
     }
 
-    /// Record a no-match observation. Returns `true` on transition into the
-    /// failure state (caller emits a WARN); `false` when already failing.
+    /// Returns `true` on transition into the no-match state (caller emits a
+    /// WARN).
     fn observe_no_match(&mut self, from: &str) -> bool {
         let changed = self.warned_no_tags.insert(from.to_string());
         if changed {
@@ -486,8 +448,8 @@ impl WatchLogState {
         changed
     }
 
-    /// Record a dropped target. Returns `true` on transition into the dropped
-    /// state (caller emits a WARN); `false` while the same target stays down.
+    /// Returns `true` on transition into the dropped state (caller emits a
+    /// WARN).
     ///
     /// Keyed on mapping plus registry so two mappings losing the same mirror
     /// each report once, and a second mirror going down still reports.
@@ -506,21 +468,19 @@ impl WatchLogState {
     /// Forget any target of `from` absent from `still_down`, so a mirror that
     /// recovered warns again if it fails later.
     ///
-    /// Reconciling rather than clearing wholesale is what makes a partial
-    /// recovery work: clearing only when nothing is down leaves a recovered
-    /// mirror suppressed for as long as any sibling stays down.
+    /// Reconciling rather than clearing only when nothing is down: otherwise a
+    /// recovered mirror stays suppressed while any sibling is down.
     fn forget_recovered_targets(&mut self, from: &str, still_down: &[DroppedTarget]) {
         if let Some(down) = self.dropped_targets.get_mut(from) {
             down.retain(|registry| still_down.iter().any(|t| t.registry == *registry));
         }
     }
 
-    /// Record a mapping that could not be resolved. Returns `true` on
-    /// transition into the failure state (caller emits the ERROR).
+    /// Returns `true` on transition into the unresolved state (caller emits
+    /// the ERROR).
     fn observe_mapping_unresolved(&mut self, from: &str) -> bool {
-        // A mapping that stops resolving reports no outcome this cycle, so a
-        // stale entry here would suppress the recovery line when it returns
-        // with identical counts.
+        // A stale outcome would suppress the recovery line when the mapping
+        // returns with identical counts.
         self.last_outcomes.remove(from);
         let changed = self.unresolved.insert(from.to_string());
         if changed {
@@ -534,8 +494,8 @@ impl WatchLogState {
         self.unresolved.remove(from);
     }
 
-    /// Record a successful resolution. Returns `true` when the mapping was
-    /// previously in the failure set (caller emits a recovery INFO).
+    /// Returns `true` when the mapping was previously in the no-match set
+    /// (caller emits a recovery INFO).
     fn observe_resolved(&mut self, from: &str) -> bool {
         let changed = self.warned_no_tags.remove(from);
         if changed {
@@ -546,11 +506,9 @@ impl WatchLogState {
 
     /// Record `outcome` as the latest result for `from`.
     ///
-    /// Returns:
-    /// - `None` when the outcome is identical to the prior cycle (suppress).
-    /// - `Some(false)` on a non-recovery transition (emit normally).
-    /// - `Some(true)` when transitioning from `failed > 0` to `failed == 0`
-    ///   (emit with `[recovered]` marker).
+    /// Returns `None` when identical to the prior cycle (suppress),
+    /// `Some(false)` on a non-recovery transition, and `Some(true)` when
+    /// `failed` went from nonzero to zero (emit with `[recovered]`).
     fn observe_mapping_outcome(&mut self, from: &str, outcome: &MappingOutcome) -> Option<bool> {
         use std::collections::hash_map::Entry;
         match self.last_outcomes.entry(from.to_string()) {
@@ -571,8 +529,8 @@ impl WatchLogState {
         }
     }
 
-    /// Drop entries for mappings no longer in the active set so the state
-    /// does not grow unbounded across edits to the config.
+    /// Drop entries for mappings no longer in the active set, so the state does
+    /// not grow across config edits.
     fn retain_active<'a>(&mut self, active: impl IntoIterator<Item = &'a str>) {
         let active_set: HashSet<&str> = active.into_iter().collect();
         self.warned_no_tags
@@ -585,10 +543,8 @@ impl WatchLogState {
     }
 }
 
-/// Resolve the cache directory and file path from config.
-///
-/// Uses `global.cache_dir` if configured, otherwise places the cache
-/// directory adjacent to the config file at `.ocync/cache/`.
+/// Resolve the cache directory and file path: `global.cache_dir`, else
+/// `.ocync/cache/` beside the config file.
 pub(crate) fn resolve_cache_path(config: &Config, config_file: &Path) -> (PathBuf, PathBuf) {
     let cache_dir = config
         .global
@@ -635,7 +591,6 @@ fn open_staging(dir: PathBuf, limit: Option<StagingLimit>, need: StagingNeed) ->
     if let Err(e) = stage.cleanup_tmp_files() {
         tracing::warn!(error = %e, "failed to clean staging tmp files");
     }
-    // Evict stale blobs from previous runs before starting new work.
     let evict = |keep_bytes: u64| {
         if let Err(e) = stage.evict(keep_bytes) {
             tracing::warn!(error = %e, "failed to evict staged blobs");
@@ -656,8 +611,7 @@ fn open_staging(dir: PathBuf, limit: Option<StagingLimit>, need: StagingNeed) ->
 
 /// Run the sync command: load config, resolve mappings, and execute.
 ///
-/// The `shutdown` signal, if provided, will be forwarded to the engine for
-/// graceful drain on SIGINT/SIGTERM.
+/// The `shutdown` signal is forwarded to the engine for graceful drain.
 pub(crate) async fn run(
     args: &SyncArgs,
     progress: &dyn ocync_sync::progress::ProgressReporter,
@@ -668,14 +622,12 @@ pub(crate) async fn run(
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
 
-    // Client construction, batch-checker setup, and mapping resolution are all
-    // network work with no output of their own. One ticker spans the lot so
-    // the run is never silent for longer than the interval.
+    // One ticker spans client construction, batch-checker setup and mapping
+    // resolution, so the run is never silent for longer than the interval.
     let tracker = PrepareTracker::default();
     let resolution = with_prepare_progress(&tracker, "sync", async {
         let referenced = referenced_registries(&config);
-        // One run's clients share credentials; the next run, such as the
-        // next watch cycle, loads them afresh.
+        // One run's clients share credentials; the next watch cycle reloads them.
         let credentials = RunCredentials::default();
         let clients = build_clients(&config, &referenced, &tracker, &credentials).await;
         let batch_checkers =
@@ -734,15 +686,10 @@ pub(crate) async fn run(
         }
     };
 
-    // Enable disk staging when multiple targets OR multiple images share blobs.
-    // Multi-target: pull once from source, push to N targets from disk.
-    // Multi-image: pull once, push from staging when the same blob appears in
-    // another image (cross-image source dedup).
-    //
-    // Trade-off: this is a conservative heuristic - disjoint mappings pay a
-    // disk round-trip per blob for zero benefit. Tighter detection would
-    // require manifest data (unavailable pre-discovery). The overhead is
-    // small (local I/O) relative to the network savings when blobs overlap.
+    // Stage to disk when several targets or several images may share blobs
+    // (pull once, push from disk). Conservative: disjoint mappings pay a local
+    // disk round-trip per blob for nothing, since tighter detection needs
+    // manifest data that is unavailable before discovery.
     let need = if mappings.iter().any(|m| m.targets.len() > 1) || mappings.len() > 1 {
         StagingNeed::Needed
     } else {
@@ -760,9 +707,7 @@ pub(crate) async fn run(
         .map_or(DEFAULT_MAX_CONCURRENT_TRANSFERS, |g| {
             g.max_concurrent_transfers
         });
-    // Capture per-mapping metadata before the engine consumes `mappings`.
-    // Used to emit one INFO line per mapping after the engine returns,
-    // grouped from the report's per-image outcomes.
+    // Captured before the engine consumes `mappings`.
     let descriptors: Vec<MappingDescriptor> = mappings
         .iter()
         .map(|m| {
@@ -770,9 +715,8 @@ pub(crate) async fn run(
             MappingDescriptor {
                 target_repo: m.target_repo.as_str().to_string(),
                 target_names: m.targets.iter().map(|t| (*t.name).to_string()).collect(),
-                // Taken from the dropped list rather than `m.targets`, which
-                // is already filtered: without it the bracket disappears at
-                // exactly the moment a registry is missing from it.
+                // From the dropped list, since `m.targets` is already filtered;
+                // otherwise the bracket vanishes when a registry is missing.
                 dropped_names: dropped_targets
                     .iter()
                     .filter(|d| d.from == from)
@@ -784,8 +728,8 @@ pub(crate) async fn run(
         .collect();
 
     // Anything absent from the mappings the engine sees looks deleted to the
-    // prune. That includes a mapping whose tag list came back empty, which a
-    // transient short response is indistinguishable from.
+    // prune, including a mapping whose tag list came back empty (a transient
+    // short response looks the same).
     let complete = unresolved.is_empty() && dropped_targets.is_empty() && no_match == 0;
     let engine =
         SyncEngine::new(RetryConfig::default(), max_concurrent).with_cache_pruning(complete);
@@ -793,7 +737,7 @@ pub(crate) async fn run(
         .run(mappings, cache.clone(), staging, progress, shutdown)
         .await;
 
-    // Persist only when we own the cache (sync command). Watch mode persists on shutdown.
+    // Persist only when we own the cache (sync command); watch persists on shutdown.
     if should_persist {
         if let Err(e) = cache.borrow().persist(&cache_path) {
             tracing::error!(error = %e, "failed to persist transfer state cache");
@@ -801,10 +745,9 @@ pub(crate) async fn run(
     }
 
     emit_mapping_outcomes(&descriptors, &report, watch_log.as_deref_mut());
-    // Watch mode: suppress the cycle tail when no per-mapping line emitted
-    // (steady-state idle); sync mode: always emit as the final marker.
-    // Unresolved mappings always force the tail -- they produce no per-mapping
-    // line, so without this a cycle where every mapping 403'd would go quiet.
+    // Watch mode suppresses the tail on idle cycles; sync mode always emits it.
+    // Unresolved or dropped targets force it: they produce no per-mapping line,
+    // so a cycle where every mapping 403'd would otherwise go quiet.
     let cycle_had_activity = !unresolved.is_empty()
         || !dropped_targets.is_empty()
         || watch_log
@@ -829,7 +772,7 @@ pub(crate) async fn run(
     ))
 }
 
-/// Exit code for a dry run, which produces no [`SyncReport`] to fold into.
+/// Exit code for a dry run, which has no [`SyncReport`].
 fn dry_run_exit_code(
     succeeded: usize,
     unresolved: &[UnresolvedMapping],
@@ -852,13 +795,10 @@ fn dry_run_exit_code(
 
 /// Exit code for a run where nothing succeeded.
 ///
-/// Only unresolved mappings are consulted. A dropped target never reaches here
-/// (the caller returns `PartialFailure` first, since something did resolve),
-/// so it cannot make an all-denied run report as anything else.
-///
-/// A run denied everywhere exits with the auth code rather than the generic
-/// failure code, so an operator can tell "fix the credentials" from "fix
-/// something else" without reading the log.
+/// Only unresolved mappings are consulted; a dropped target never reaches here
+/// (the caller returns `PartialFailure` first). A run denied everywhere exits
+/// with the auth code, so "fix the credentials" is distinguishable from the
+/// generic failure.
 fn total_failure_code(unresolved: &[UnresolvedMapping]) -> ExitCode {
     shared_failure_code(unresolved.iter().map(|u| u.code))
 }
@@ -866,8 +806,8 @@ fn total_failure_code(unresolved: &[UnresolvedMapping]) -> ExitCode {
 /// Fold mapping-level resolution failures into the run's exit code.
 ///
 /// A mapping that never reached the engine produces no [`ocync_sync::ImageResult`],
-/// so [`SyncReport::outcome`] cannot see it. Counting each as a failure is
-/// what keeps a run whose mappings all 403'd from exiting 0.
+/// so [`SyncReport::outcome`] cannot see it; counting each as a failure keeps a
+/// run whose mappings all 403'd from exiting 0.
 fn combined_exit_code(
     report: &SyncReport,
     unresolved: &[UnresolvedMapping],
@@ -875,8 +815,7 @@ fn combined_exit_code(
     no_match: usize,
 ) -> ExitCode {
     if unresolved.is_empty() {
-        // A dropped target means images never reached a registry the config
-        // named, so an otherwise clean run is still only partial.
+        // A dropped target means images never reached a configured registry.
         return match ExitCode::from_report(report.outcome()) {
             ExitCode::Success if !dropped.is_empty() => ExitCode::PartialFailure,
             other => other,
@@ -887,17 +826,16 @@ fn combined_exit_code(
     if report.has_success() || no_match > 0 {
         return ExitCode::PartialFailure;
     }
-    // Images that ran and failed for non-auth reasons make this a generic
-    // failure regardless of why the unresolved mappings were dropped.
+    // Images that ran and failed make this a generic failure whatever the
+    // unresolved mappings' cause.
     if !report.images.is_empty() {
         return ExitCode::Failure;
     }
     total_failure_code(unresolved)
 }
 
-/// Per-mapping metadata captured before the engine consumes `mappings`,
-/// so we can join it with the engine's per-image report after the fact
-/// to emit one log line per mapping (with source/target context).
+/// Per-mapping metadata captured before the engine consumes `mappings`, joined
+/// with the per-image report to emit one log line per mapping.
 struct MappingDescriptor {
     from: String,
     target_repo: String,
@@ -910,9 +848,13 @@ struct MappingDescriptor {
 /// Used for log emission and watch-mode change detection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MappingOutcome {
+    /// Images transferred.
     pub synced: u64,
+    /// Images already present.
     pub skipped: u64,
+    /// Images that failed.
     pub failed: u64,
+    /// Bytes transferred by synced images.
     pub bytes: u64,
 }
 
@@ -922,10 +864,8 @@ impl MappingOutcome {
     }
 }
 
-/// Emit one INFO (or WARN, on failures) per mapping summarizing what its
-/// configured tags did this cycle. In watch mode (when `watch_log` is
-/// `Some`), suppress mappings whose outcome is unchanged from the prior
-/// cycle so steady-state pods log only on transition.
+/// Emit one INFO (WARN on failures) per mapping. In watch mode, mappings whose
+/// outcome is unchanged from the prior cycle are suppressed.
 fn emit_mapping_outcomes(
     descriptors: &[MappingDescriptor],
     report: &SyncReport,
@@ -933,9 +873,7 @@ fn emit_mapping_outcomes(
 ) {
     for d in descriptors {
         let outcome = aggregate_mapping_outcome(&d.from, &d.target_repo, report);
-        // No images for this mapping in the report (e.g. the mapping was
-        // resolved to zero tags by an upstream filter that the engine
-        // never saw). The no-tags WARN already covered it; skip here.
+        // No images reached the engine; the no-tags WARN already covered it.
         if outcome.is_empty() {
             continue;
         }
@@ -947,14 +885,10 @@ fn emit_mapping_outcomes(
             None => false,
         };
         let line = format_mapping_outcome(d, &outcome, recovered);
-        // `from` / `to` are intentionally NOT structured fields here -- the
-        // message already names them as `from -> to`, and tracing's text
-        // formatter would otherwise tail the line with a redundant
-        // `from=... to=...` block. The count fields remain because they
-        // carry zero values the terse message elides.
-        //
-        // The two arms differ only in level. `tracing::event!` would let
-        // us pick at runtime, but it requires a const-expression level.
+        // `from` / `to` are not structured fields: the message already names
+        // them, and the text formatter would repeat them. The counts stay
+        // because they carry zero values the terse message elides.
+        // Two arms because `tracing::event!` needs a const level.
         if outcome.failed > 0 {
             tracing::warn!(
                 synced = outcome.synced,
@@ -1019,12 +953,8 @@ fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: 
         String::new()
     };
     let recovered_clause = if recovered { " [recovered]" } else { "" };
-    // Multi-target mappings need the bracket to disambiguate which targets
-    // the line refers to. Single-target mappings: omit -- the destination
-    // is already in the `from -> to` arrow.
-    // Shown whenever more than one registry was configured, which includes the
-    // case where only one survived: that is precisely when the operator needs
-    // to see which.
+    // Shown whenever more than one registry was configured, including when
+    // only one survived: that is when the operator needs to see which.
     let targets_clause = if d.target_names.len() + d.dropped_names.len() > 1 {
         let mut names = d.target_names.join(", ");
         if !d.dropped_names.is_empty() {
@@ -1040,8 +970,8 @@ fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: 
     )
 }
 
-/// One-line cycle tail rolling up totals across all mappings. The caller
-/// is responsible for gating this in watch mode (skip on idle cycles).
+/// One-line cycle tail rolling up totals across all mappings. The caller gates
+/// it in watch mode.
 fn emit_cycle_tail(
     descriptors: &[MappingDescriptor],
     unresolved_count: usize,
@@ -1049,9 +979,7 @@ fn emit_cycle_tail(
     report: &SyncReport,
 ) {
     let line = format_cycle_tail(descriptors.len(), unresolved_count, dropped_count, report);
-    // Counts are already in the message; structured fields would be a
-    // verbatim restatement in text output. JSON aggregators parse the
-    // message (or use the SyncReport via `--json`).
+    // Counts are already in the message; structured fields would repeat them.
     if report.stats.images_failed > 0 || unresolved_count > 0 || dropped_count > 0 {
         tracing::warn!("{line}");
     } else {
@@ -1059,8 +987,7 @@ fn emit_cycle_tail(
     }
 }
 
-/// Render the cycle tail. Split from [`emit_cycle_tail`] so the wording is
-/// testable without a tracing subscriber.
+/// Render the cycle tail, split out so tests need no tracing subscriber.
 fn format_cycle_tail(
     mapping_count: usize,
     unresolved_count: usize,
@@ -1068,8 +995,7 @@ fn format_cycle_tail(
     report: &SyncReport,
 ) -> String {
     let s = &report.stats;
-    // Neither of these reached the engine, so they are absent from every
-    // count above and need their own clauses.
+    // Neither reached the engine, so they are absent from the counts above.
     let unresolved_clause = if unresolved_count > 0 {
         format!(" | {unresolved_count} unresolved")
     } else {
@@ -1098,10 +1024,9 @@ fn format_cycle_tail(
 /// Build a `RegistryClient` for each registry at least one mapping references,
 /// keyed by config alias.
 ///
-/// Auth setup reaches the network (ECR, GAR, ACR all mint a token), so any one
-/// registry can fail. Record the failure against that alias instead of
-/// aborting: registries the failing one shares no mapping with still sync, and
-/// the mappings that do reference it fail with the original error text.
+/// Auth setup reaches the network, so any one registry can fail. The failure is
+/// recorded against that alias instead of aborting: unrelated mappings still
+/// sync, and the mappings that reference it fail with the original error text.
 pub(crate) async fn build_clients(
     config: &Config,
     referenced: &Referenced,
@@ -1114,9 +1039,7 @@ pub(crate) async fn build_clients(
         if !referenced.contains(name) {
             continue;
         }
-        // Minting this registry's token is itself a round trip, so a slow or
-        // wedged provider is named in the progress line rather than showing up
-        // as a stalled count.
+        // Token minting is a round trip; track it so a wedged provider is named.
         let _item = tracker.track(name);
         let entry = match build_registry_client(Registry::Configured(reg), credentials).await {
             Ok(client) => Ok(Arc::new(client)),
@@ -1136,10 +1059,9 @@ pub(crate) async fn build_clients(
 
 /// Registry aliases at least one mapping actually references.
 ///
-/// Building a client mints a token for ECR, GAR, and ACR, so a registry no
-/// mapping uses costs an auth round trip against the rate-limit budget and, on
-/// failure, logs an error nothing depends on. A target value that does not
-/// resolve is left out here; `resolve_mapping` reports it per mapping.
+/// An unused registry would cost an auth round trip against the rate-limit
+/// budget and, on failure, log an error nothing depends on. A target that does
+/// not resolve is left out here; `resolve_mapping` reports it per mapping.
 pub(crate) fn referenced_registries(config: &Config) -> Referenced {
     let known: HashSet<&str> = config.registries.keys().map(String::as_str).collect();
     let defaults = config.defaults.as_ref();
@@ -1149,9 +1071,8 @@ pub(crate) fn referenced_registries(config: &Config) -> Referenced {
             .source
             .as_deref()
             .or(defaults.and_then(|d| d.source.as_deref()))
-            // Only aliases that exist: an unknown one is reported per mapping
-            // during resolution, and counting it here inflates the progress
-            // total past the number of clients actually built.
+            // Unknown aliases are reported per mapping, and counting them would
+            // inflate the progress total past the clients built.
             .filter(|name| known.contains(name))
         {
             referenced.sources.insert(source.to_owned());
@@ -1163,11 +1084,9 @@ pub(crate) fn referenced_registries(config: &Config) -> Referenced {
     referenced
 }
 
-/// Registry aliases the config actually uses, split by role.
-///
-/// Both sets come from one walk: expanding every mapping's target groups is
-/// the most expensive part of the prepare phase, and clients and batch
-/// checkers want different halves of the same answer.
+/// Registry aliases the config uses, split by role. Both sets come from one
+/// walk because expanding target groups is the costliest part of the prepare
+/// phase and clients and batch checkers want different halves.
 #[derive(Debug, Default)]
 pub(crate) struct Referenced {
     /// Aliases named as a source.
@@ -1177,12 +1096,10 @@ pub(crate) struct Referenced {
 }
 
 impl Referenced {
-    /// Whether any mapping names this alias at all.
     fn contains(&self, name: &str) -> bool {
         self.sources.contains(name) || self.targets.contains(name)
     }
 
-    /// How many distinct registries need a client.
     fn len(&self) -> usize {
         self.sources.union(&self.targets).count()
     }
@@ -1190,9 +1107,8 @@ impl Referenced {
 
 /// Target registry aliases a mapping names, with groups expanded.
 ///
-/// Shared with [`resolve_mapping`] so the set built here cannot drift from the
-/// set resolved there: a registry present in one and absent from the other
-/// would surface as a misleading "not found in clients".
+/// Shared with [`resolve_mapping`] so the sets cannot drift: a registry in one
+/// and not the other would surface as a misleading "not found in clients".
 fn mapping_target_names(
     mapping: &MappingConfig,
     config: &Config,
@@ -1212,8 +1128,8 @@ fn mapping_target_names(
     resolve_target_names(targets, config, known, &context).map_err(CliError::Config)
 }
 
-/// Look up a usable client for `name`, turning a missing or failed registry
-/// into a mapping-scoped error rather than a run-wide one.
+/// Look up a usable client for `name`; a missing or failed registry becomes a
+/// mapping-scoped error, not a run-wide one.
 fn client_for(
     clients: &ClientMap,
     name: &str,
@@ -1226,8 +1142,8 @@ fn client_for(
             let msg = format!(
                 "mapping '{mapping_from}': {role} registry '{name}' is unavailable: {cause}"
             );
-            // The cause keeps its classification, so a run that failed only on
-            // credentials still exits with the auth code.
+            // Keeps the cause's classification so a credentials-only failure
+            // still exits with the auth code.
             Err(match cause.exit_code() {
                 ExitCode::AuthError => CliError::Auth(msg),
                 _ => CliError::Input(msg),
@@ -1239,15 +1155,9 @@ fn client_for(
     }
 }
 
-/// Build batch blob checkers for ECR registries.
-///
-/// Creates a [`BatchChecker`] for every registry that a mapping names as a
-/// *target*, whose client built successfully, and that is detected as ECR (via
-/// explicit `auth_type: ecr` or hostname auto-detection). No user
-/// configuration is needed - if we know it's ECR, we use the batch API.
-///
-/// Targets only: the map is read in exactly one place, keyed by target alias,
-/// so a checker for a source-only registry would never be used.
+/// Build a [`BatchChecker`] for every ECR registry (explicit `auth_type: ecr`
+/// or hostname auto-detection) that a mapping names as a target and whose
+/// client built.
 fn build_batch_checkers(
     config: &Config,
     clients: &ClientMap,
@@ -1257,8 +1167,8 @@ fn build_batch_checkers(
 ) -> HashMap<String, Rc<dyn BatchBlobChecker>> {
     let mut checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
-    // Targets only, and only where the client built: the map is read by
-    // target alias, and a registry that already failed has no use for one.
+    // The map is read by target alias, and a registry that already failed has
+    // no use for a checker.
     let usable: Vec<(&String, &RegistryConfig)> = config
         .registries
         .iter()
@@ -1271,10 +1181,8 @@ fn build_batch_checkers(
         // Held for the whole body so every `continue` still retires the item.
         let _item = tracker.track(name);
         let hostname = bare_hostname(&reg.url);
-        // Explicit non-Ecr auth_type is a hard opt-out: don't try to build an
-        // ECR batch checker for a registry the user has declared
-        // is not ECR, even if the hostname pattern matches. Only fall
-        // through to hostname auto-detection when no `auth_type` is set.
+        // An explicit non-Ecr auth_type is a hard opt-out, even when the
+        // hostname matches; auto-detect only when no `auth_type` is set.
         let is_ecr = match reg.auth_type.as_ref() {
             Some(AuthType::Ecr) => true,
             Some(_) => false,
@@ -1285,10 +1193,9 @@ fn build_batch_checkers(
             continue;
         }
 
-        // The checker only gates the manifest commit on ECR's blob-visibility
-        // API. Losing it costs an optimization, not correctness -- `with_retry`
-        // still catches the `BLOB_UPLOAD_UNKNOWN` this would have avoided -- so
-        // a failure here degrades rather than aborting the run.
+        // Losing the checker costs an optimization, not correctness
+        // (`with_retry` still catches the `BLOB_UPLOAD_UNKNOWN` it would have
+        // avoided), so a failure here degrades instead of aborting.
         match BatchChecker::from_hostname(hostname, reg.aws_profile.as_deref(), aws_credentials) {
             Ok(checker) => {
                 checkers.insert(name.clone(), Rc::new(checker));
@@ -1315,17 +1222,16 @@ pub(crate) struct Resolution {
     pub dropped_targets: Vec<DroppedTarget>,
     /// Mappings whose filter legitimately matched nothing.
     ///
-    /// Healthy, but they contribute no images, so without counting them a run
-    /// that was half fine and half denied looks wholly denied.
+    /// Healthy but imageless; uncounted, a half-fine, half-denied run looks
+    /// wholly denied.
     pub no_match: usize,
 }
 
 /// Resolve every configured mapping, isolating per-mapping failures.
 ///
-/// One unreachable registry, one 403 on a tag listing, or one bad repository
-/// name must not cost the run every other mapping. Each failure is logged and
-/// recorded; resolution continues. Returns the mappings that are ready for the
-/// engine plus one [`UnresolvedMapping`] per mapping that is not.
+/// One unreachable registry, 403 or bad repository name must not cost the run
+/// every other mapping. Each failure is logged and recorded as an
+/// [`UnresolvedMapping`]; a config error is the exception and returns `Err`.
 ///
 /// Up to `concurrency` mappings resolve at once, but the result is always in
 /// config order: callers depend on that for deterministic logs, watch-mode
@@ -1345,37 +1251,24 @@ async fn resolve_all(
     let mut dropped_targets = Vec::new();
     let mut no_match = 0usize;
 
-    // Resolution is independent per mapping and spends nearly all of its time
-    // waiting on a registry, so the waits overlap.
+    // `buffer_unordered`, not `buffered`: an ordered queue frees a slot only
+    // when the head yields, so one mapping listing tens of thousands of tags
+    // pins its slot and every finished mapping behind it keeps its own. On a
+    // 95-mapping run that held the window at 2 or 3 of 16 for minutes.
     //
-    // `buffer_unordered` rather than `buffered`, and the difference is the
-    // whole point of the concurrency. An ordered queue frees a slot only when
-    // the head yields, so one mapping listing a repository with tens of
-    // thousands of tags pins its slot and every mapping that finished behind
-    // it keeps its own, leaving the window slack while the rest of the config
-    // waits. On a 95-mapping run that held the window at 2 or 3 of 16 for
-    // minutes at a time and gave back almost all of the speedup.
+    // The bookkeeping below needs config order, so each outcome carries its
+    // index and is re-sorted. That keeps `watch_log`, the counters and the
+    // warning stream identical run to run.
     //
-    // Config order is still what the bookkeeping below needs, so each outcome
-    // carries its index and the results are put back in order once they are
-    // all in. That keeps `watch_log`, the run's counters, and the warning
-    // stream identical run to run however the registries answered.
-    //
-    // One consequence of overlapping: a mapping that a config error would once
-    // have pre-empted may already have run and emitted its own warnings by the
-    // time the error is reached. The run still stops at the first config error
-    // in config order, which is what the exit code and the operator depend on.
+    // Mappings behind a config error may already have run and warned; the run
+    // still stops at the first config error in config order.
     /// One mapping's resolution alongside the targets it lost on the way.
-    ///
-    /// Named for what it holds rather than `MappingOutcome`, which is already
-    /// a `pub(crate)` struct in this file with an unrelated shape.
     type ResolutionAndDropped = (Result<MappingResolution, CliError>, Vec<DroppedTarget>);
 
     let mut indexed: Vec<(usize, ResolutionAndDropped)> =
         futures_util::stream::iter(config.mappings.iter().enumerate().map(|(idx, mapping)| {
             async move {
-                // The guard both names the mapping while it runs and counts it
-                // finished when it ends, however it ends.
+                // Counts the mapping finished however it ends.
                 let _item = tracker.track(&mapping.from);
                 (
                     idx,
@@ -1392,9 +1285,9 @@ async fn resolve_all(
 
     for (mapping, (outcome, dropped)) in config.mappings.iter().zip(outcomes) {
         // Dropped targets come back whatever the outcome, so a mapping that
-        // loses a mirror and then fails on its tag listing still reports the
-        // outage. Reconciled against the previous cycle before anything else,
-        // so a mirror that recovered re-arms even if the mapping then failed.
+        // loses a mirror and then fails on its tag listing still reports it.
+        // Reconciled first so a recovered mirror re-arms even if the mapping
+        // then failed.
         reconcile_dropped_targets(&mapping.from, &dropped, watch_log.as_deref_mut());
         dropped_targets.extend(dropped);
 
@@ -1420,17 +1313,15 @@ async fn resolve_all(
                 // mapping with nothing to do, not a failure.
                 no_match += 1;
             }
-            // A broken config is not a transient failure to route around: a
-            // bad glob, an unparseable platform, an unknown registry alias, or
-            // a `min_tags` tripwire all mean the operator asked for something
-            // the run must not silently do less than. Isolation covers
-            // registries that are down, not configs that are wrong.
+            // A broken config (bad glob, unparseable platform, unknown alias,
+            // `min_tags` tripwire) means the operator asked for something the
+            // run must not silently do less than. Isolation covers registries
+            // that are down, not configs that are wrong.
             Err(err) if err.exit_code() == ExitCode::ConfigError => return Err(err),
             Err(err) => {
-                // Gated like every other watch surface: without it a
-                // permanently broken mapping logs an ERROR every cycle while
-                // `cycle_emit_count` stays at zero, so watch prints "no state
-                // changes" beside the error stream it just produced.
+                // Gated like every watch surface: otherwise a permanently broken
+                // mapping logs an ERROR every cycle while `cycle_emit_count`
+                // stays zero and watch prints "no state changes" beside it.
                 let should_log = match watch_log.as_deref_mut() {
                     Some(state) => state.observe_mapping_unresolved(&mapping.from),
                     None => true,
@@ -1458,9 +1349,9 @@ async fn resolve_all(
 /// WARN once per target that goes down, not once per watch cycle.
 ///
 /// Reconciles rather than accumulates: a mirror that came back is forgotten
-/// even while a sibling stays down, so when it fails again it warns again.
-/// Accumulating suppressed the second outage until every target of the mapping
-/// was simultaneously healthy, which a flapping fleet may never reach.
+/// even while a sibling stays down, so it warns again if it fails again.
+/// Accumulating would suppress that until every target was healthy at once,
+/// which a flapping fleet may never reach.
 fn reconcile_dropped_targets(
     from: &str,
     dropped: &[DroppedTarget],
@@ -1489,10 +1380,8 @@ fn warn_dropped_target(target: &DroppedTarget) {
     );
 }
 
-/// Report a mapping that could not be turned into work.
-///
-/// Shared with `analyze`, which drops the same mapping for the same reasons
-/// and should say so the same way.
+/// Report a mapping that could not be turned into work. Shared with `analyze`
+/// so both say it the same way.
 pub(crate) fn log_unresolved_mapping(from: &str, err: &CliError) {
     tracing::error!(
         from = %from,
@@ -1503,13 +1392,11 @@ pub(crate) fn log_unresolved_mapping(from: &str, err: &CliError) {
 
 /// Build a mapping's target entries, keeping the ones whose registry works.
 ///
-/// One unusable target must not take its siblings with it: a mapping that fans
-/// out to three registries still syncs to the two that work. Mirrors the
-/// per-target degradation the immutable-tag listing already does.
+/// One unusable target must not take its siblings with it.
 ///
-/// Returns the usable entries, the dropped ones, and the last error, which the
-/// caller needs when nothing is left. Reporting is the caller's job: only it
-/// knows whether any target survived, and `sync` and `analyze` word it
+/// Returns the usable entries and the error to surface when nothing is left;
+/// dropped targets are pushed to `dropped`. Reporting is the caller's job: only
+/// it knows whether any target survived, and `sync` and `analyze` word it
 /// differently.
 fn build_targets(
     target_names: Vec<String>,
@@ -1535,10 +1422,8 @@ fn build_targets(
                     registry: name,
                     error: err.to_string(),
                 });
-                // Order-independent, and folded by the same rule the run-level
-                // code uses: target order comes straight from the config file,
-                // and mixed causes report the generic failure rather than
-                // whichever happened to be written last.
+                // Folded by the run-level rule, so the result does not depend
+                // on config target order.
                 codes.push(err.exit_code());
                 if worst_err.is_none() {
                     worst_err = Some(err);
@@ -1546,8 +1431,7 @@ fn build_targets(
             }
         }
     }
-    // Re-classify with the shared rule so the error the caller surfaces
-    // carries the folded code rather than the first one seen.
+    // The surfaced error carries the folded code, not the first one seen.
     let worst_err = worst_err.map(|err| {
         let folded = shared_failure_code(codes);
         if folded == err.exit_code() {
@@ -1559,12 +1443,10 @@ fn build_targets(
     (targets, worst_err)
 }
 
-/// Resolve a single mapping config into a [`MappingResolution`].
+/// Resolve a single mapping config, falling back to `defaults.source`,
+/// `defaults.targets` and `defaults.tags`.
 ///
-/// Returns [`MappingResolution::Resolved`] when at least one tag survives the
-/// filter pipeline, or [`MappingResolution::NoMatchingTags`] carrying the
-/// diagnostic context the caller needs to render a WARN. Pulls fallbacks from
-/// `defaults.source`, `defaults.targets`, and `defaults.tags`.
+/// Returns the targets dropped along the way even when resolution fails.
 pub(crate) async fn resolve_mapping(
     mapping: &MappingConfig,
     config: &Config,
@@ -1572,9 +1454,8 @@ pub(crate) async fn resolve_mapping(
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
     with_report: bool,
 ) -> (Result<MappingResolution, CliError>, Vec<DroppedTarget>) {
-    // Targets are resolved first and returned unconditionally: every `?` in
-    // the rest of resolution would otherwise discard them, and a mapping that
-    // loses a mirror and then hits a rate limit on its tag listing would
+    // Returned unconditionally: a `?` in the rest of resolution would discard
+    // them, and a mapping that loses a mirror and then hits a rate limit would
     // report the outage nowhere.
     let mut dropped = Vec::new();
     let result = resolve_mapping_inner(
@@ -1622,19 +1503,16 @@ async fn resolve_mapping_inner(
         &mapping.from,
         dropped,
     );
-    // Every named target failed, so the mapping has nowhere to sync. Surface
-    // the underlying cause rather than a generic "no targets". A config that
-    // names no targets at all is left alone: that produced a zero-target
-    // mapping before, and the engine handles it.
+    // Every named target failed: surface the cause. A config that names no
+    // targets at all is left to the engine.
     if targets.is_empty()
         && let Some(err) = last_target_err
     {
         return Err(err);
     }
     if targets.is_empty() {
-        // Reachable via `targets: []`. The engine treats it as a degenerate
-        // mapping, but it still costs a source manifest pull per tag, so say
-        // so rather than letting it look like work.
+        // Reachable via `targets: []`; still costs a source manifest pull per
+        // tag, so say so rather than letting it look like work.
         tracing::warn!(
             from = %mapping.from,
             "mapping names no target registries; nothing will be pushed"
@@ -1647,16 +1525,12 @@ async fn resolve_mapping_inner(
     let mapping_tags = mapping.tags.as_ref();
     let defaults_tags = config.defaults.as_ref().and_then(|d| d.tags.as_ref());
 
-    // Fast path: when the config specifies only exact tag names (no
-    // wildcards, semver, latest, exclude), use them directly without
-    // enumerating all tags from the source registry. The fast path is
-    // gated on the mapping having no `defaults.tags` block in play --
-    // otherwise inherited filters (notably `defaults.exclude`) would be
-    // skipped silently.
-    // The image/artifact partition + sample collection happen in the same
-    // pass that prepares input for `select_filtered_tags`, so the filter and
-    // the no-match WARN both see consistent counts. The pre-built `NoTagsInfo`
-    // is only consumed when filtering yields zero tags.
+    // Fast path: exact tag names only (no wildcards, semver, latest, exclude)
+    // skip listing the source. Gated on no `defaults.tags` block, or inherited
+    // filters (notably `defaults.exclude`) would be skipped silently.
+    // The image/artifact partition runs in the same pass that feeds
+    // `select_filtered_tags`, so the filter and the no-match WARN see the same
+    // counts.
     let (filtered, candidate_count, filter_report, no_tags_template): (
         Vec<String>,
         Option<usize>,
@@ -1735,13 +1609,10 @@ async fn resolve_mapping_inner(
 
         let target_repo_path = RepositoryName::new(&target_repo)?;
 
-        // One read-only listing per mirror, all independent, so they overlap
-        // rather than making a mapping's prepare cost scale with its fan-out.
-        // Unbounded across the mapping's own targets on purpose: each target
-        // is a distinct registry with its own AIMD window, so widening here
-        // cannot concentrate load on any one host.
-        // Cloned out first so the listings borrow this vec rather than
-        // `targets`, which has to be mutably reborrowed to store the results.
+        // Listings overlap so prepare cost does not scale with fan-out.
+        // Unbounded across targets on purpose: each is a distinct registry with
+        // its own AIMD window. Clients are cloned out so the listings do not
+        // borrow `targets`, which is mutated below.
         let target_clients: Vec<Arc<RegistryClient>> =
             targets.iter().map(|e| Arc::clone(&e.client)).collect();
         let listings: Vec<Result<Vec<String>, ocync_distribution::Error>> =
@@ -1754,16 +1625,14 @@ async fn resolve_mapping_inner(
             .collect()
             .await;
 
-        // Applied in target order, so a mapping's warnings read the same way
-        // whichever mirror answered first.
+        // Target order, so warnings do not depend on which mirror answered first.
         for (entry, listing) in targets.iter_mut().zip(listings) {
             match listing {
                 Ok(tags) => entry.existing_tags = tags.into_iter().collect(),
                 Err(e) => {
                     tracing::warn!(
-                        // Without `from` this warning names a registry but not
-                        // the mapping, and mappings now resolve concurrently,
-                        // so neighbouring log lines no longer identify it.
+                        // Mappings resolve concurrently, so neighbouring log
+                        // lines do not identify the mapping.
                         from = %mapping.from,
                         registry = %entry.name,
                         error = %e,
@@ -1808,14 +1677,10 @@ async fn resolve_mapping_inner(
     }))
 }
 
-/// Emit a tracing WARN for a [`NoTagsInfo`] with both a human-readable
-/// message (via [`Display`](std::fmt::Display)) and structured fields for
-/// log aggregators.
+/// Emit a tracing WARN for a [`NoTagsInfo`]: the rendered message plus
+/// structured fields for log aggregators.
 fn emit_no_tags_warn(info: &NoTagsInfo) {
-    // `from` is omitted as a structured field -- the message renders it
-    // first, so the text formatter would otherwise tail with a redundant
-    // `from=...`. Counts and filter remain (numeric, terse, useful for
-    // both grep and JSON aggregation).
+    // `from` is not a field: the message already leads with it.
     tracing::warn!(
         source_total = info.source_total(),
         image_count = info.image_count,
@@ -1826,9 +1691,8 @@ fn emit_no_tags_warn(info: &NoTagsInfo) {
 }
 
 /// Build a `FilterConfig` from a mapping `TagsConfig` plus an optional
-/// `defaults.tags` block. Field-level merge: any field set on the mapping
-/// wins; unset fields fall through to `defaults`. The exclude lists are
-/// kept separate by source -- mapping exclude is the hard tier (blocks
+/// `defaults.tags` block. Field-level merge: a field set on the mapping wins.
+/// The exclude lists stay separate: mapping exclude is the hard tier (blocks
 /// `include:`), defaults exclude is the soft tier (bypassable by `include:`).
 fn build_filter(mapping: Option<&TagsConfig>, defaults: Option<&TagsConfig>) -> FilterConfig {
     let pick_glob = |get: fn(&TagsConfig) -> Option<&GlobOrList>| -> Vec<String> {
@@ -1865,10 +1729,8 @@ fn build_filter(mapping: Option<&TagsConfig>, defaults: Option<&TagsConfig>) -> 
     }
 }
 
-/// Resolve `immutable_tags` from a mapping + defaults pair: mapping wins,
-/// then falls through to defaults. Lives outside [`build_filter`] because
-/// `immutable_tags` is consumed by the skip-optimization path, not the
-/// filter pipeline.
+/// Resolve `immutable_tags`, mapping over defaults. Separate from
+/// [`build_filter`] because the skip optimization consumes it, not the filter.
 fn resolve_immutable_pattern<'a>(
     mapping: Option<&'a TagsConfig>,
     defaults: Option<&'a TagsConfig>,
@@ -1878,8 +1740,6 @@ fn resolve_immutable_pattern<'a>(
         .or_else(|| defaults.and_then(|t| t.immutable_tags.as_deref()))
 }
 
-/// Flatten a [`GlobOrList`] into an owned `Vec<String>`. Used by the
-/// merge path which already holds a borrow.
 fn glob_or_list_to_vec_owned(g: &GlobOrList) -> Vec<String> {
     match g {
         GlobOrList::Single(s) => vec![s.clone()],
@@ -1888,25 +1748,19 @@ fn glob_or_list_to_vec_owned(g: &GlobOrList) -> Vec<String> {
 }
 
 /// Result of [`select_filtered_tags`]: kept tags, candidate count, and the
-/// optional filter trace consumed by `--dry-run`.
+/// optional `--dry-run` filter trace.
 type SelectionResult = (
     Vec<String>,
     Option<usize>,
     Option<ocync_sync::filter::FilterReport>,
 );
 
-/// Apply the filter pipeline to `all_tags` from `tags_config`, returning the
-/// kept tags, the candidate count, and an optional `FilterReport`.
+/// Apply the filter pipeline to `all_tags`.
 ///
-/// `with_report = true` (dry-run) calls
-/// [`FilterConfig::apply_with_report`], which does NOT enforce `min_tags` --
-/// the report carries the configured value so the formatter can render the
-/// gap to the user. `with_report = false` (real-sync) calls
-/// [`FilterConfig::apply`], which enforces `min_tags` and returns a
-/// `BelowMinTags` error when violated.
-///
-/// Extracted from [`resolve_mapping`] so the report wire-up is testable
-/// without spinning up a registry mock.
+/// `with_report = true` (dry-run) uses [`FilterConfig::apply_with_report`],
+/// which does NOT enforce `min_tags`: the report carries the configured value
+/// so the gap can be rendered. `with_report = false` uses
+/// [`FilterConfig::apply`], which returns `BelowMinTags` when violated.
 fn select_filtered_tags(
     mapping_tags: Option<&TagsConfig>,
     defaults_tags: Option<&TagsConfig>,
@@ -1924,12 +1778,9 @@ fn select_filtered_tags(
     }
 }
 
-/// One-line summary of mapping + defaults tags suitable for log emission,
-/// e.g. `semver >=1.0.0, latest=5`. Returns `None` when no filter applies.
-///
-/// Single source of truth: delegates to [`FilterConfig::describe`] after
-/// the same merge the engine uses, so dry-run stage labels and the
-/// no-tags-matched WARN rationale cannot drift.
+/// One-line filter summary for logs, e.g. `semver >=1.0.0, latest=5`; `None`
+/// when no filter applies. Delegates to [`FilterConfig::describe`] after the
+/// same merge the engine uses, so dry-run labels and the no-tags WARN agree.
 fn describe_filter(
     mapping_tags: Option<&TagsConfig>,
     defaults_tags: Option<&TagsConfig>,
@@ -1940,23 +1791,21 @@ fn describe_filter(
 /// The `--json` document: the engine's report plus the mappings that never
 /// reached it.
 ///
-/// Without the extra key a consumer that only reads the report would see a
-/// clean run when mappings were dropped before the engine started.
+/// Without the extra keys a consumer reading only the report would see a clean
+/// run when mappings were dropped before the engine started.
 #[derive(Serialize)]
 struct SyncOutput<'a> {
     #[serde(flatten)]
     report: &'a SyncReport,
     /// Mappings dropped during resolution.
     ///
-    /// Always present, empty on a clean run: `analyze` reports the same key
-    /// the same way, and a consumer reading both should not have to handle a
-    /// missing field on one and not the other.
+    /// Always present, empty on a clean run, matching `analyze`.
     unresolved_mappings: &'a [UnresolvedMapping],
     /// Targets a resolved mapping could not use.
     dropped_targets: &'a [DroppedTarget],
 }
 
-/// Write sync output as JSON when `--json` is passed.
+/// Print the `--json` document when `json` is set.
 fn write_output(
     report: &SyncReport,
     unresolved: &[UnresolvedMapping],
@@ -2085,8 +1934,7 @@ mod tests {
     }
 
     /// `defaults.tags.exclude:` reaches a mapping that has its own `tags:`
-    /// block. Today's `or` resolution would drop it. After the merge, the
-    /// patterns land in `FilterConfig.defaults_exclude` (the soft tier).
+    /// block, landing in the soft tier (`defaults_exclude`).
     #[test]
     fn build_filter_defaults_exclude_reaches_mapping_with_own_tags() {
         let mapping = TagsConfig {
@@ -2103,8 +1951,8 @@ mod tests {
         assert!(filter.exclude.is_empty(), "mapping had no exclude");
     }
 
-    /// `mapping.tags.exclude:` lands in the hard tier; `defaults.exclude`
-    /// lands in the soft tier. Both apply (concat semantics).
+    /// `mapping.tags.exclude:` is the hard tier, `defaults.exclude` the soft
+    /// tier; both apply.
     #[test]
     fn build_filter_mapping_exclude_is_hard_tier() {
         let mapping = TagsConfig {
@@ -2120,9 +1968,8 @@ mod tests {
         assert_eq!(filter.defaults_exclude, vec!["*-dev"]);
     }
 
-    /// When mapping has no `tags:` block at all, defaults' filter fields
-    /// flow through. `defaults.exclude` still goes to the soft tier --
-    /// the source decides the tier, not whether the mapping was set.
+    /// With no mapping `tags:` block, defaults flow through; the source
+    /// decides the tier, so `defaults.exclude` stays soft.
     #[test]
     fn build_filter_inherits_defaults_when_mapping_unset() {
         let defaults = TagsConfig {
@@ -2137,23 +1984,22 @@ mod tests {
     }
 
     #[test]
-    fn build_filter_single_glob() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::Single("v1.*".into())),
-            ..Default::default()
-        };
-        let filter = build_filter(Some(&tags), None);
-        assert_eq!(filter.glob, vec!["v1.*"]);
-    }
-
-    #[test]
-    fn build_filter_glob_list() {
-        let tags = TagsConfig {
-            glob: Some(GlobOrList::List(vec!["v1.*".into(), "v2.*".into()])),
-            ..Default::default()
-        };
-        let filter = build_filter(Some(&tags), None);
-        assert_eq!(filter.glob, vec!["v1.*", "v2.*"]);
+    fn build_filter_glob_forms() {
+        let cases = [
+            ("single", GlobOrList::Single("v1.*".into()), vec!["v1.*"]),
+            (
+                "list",
+                GlobOrList::List(vec!["v1.*".into(), "v2.*".into()]),
+                vec!["v1.*", "v2.*"],
+            ),
+        ];
+        for (name, glob, want) in cases {
+            let tags = TagsConfig {
+                glob: Some(glob),
+                ..Default::default()
+            };
+            assert_eq!(build_filter(Some(&tags), None).glob, want, "{name}");
+        }
     }
 
     #[test]
@@ -2191,9 +2037,8 @@ mod tests {
         assert_eq!(filter.min_tags, Some(1));
     }
 
-    /// End-to-end: a `TagsConfig` with `include:` + `semver:` builds a
-    /// `FilterConfig` that, when applied to a tag list, returns both the
-    /// pinned literals and the version-range matches.
+    /// `include:` + `semver:` returns both the pinned literals and the
+    /// version-range matches.
     #[test]
     fn build_filter_include_pin_plus_range_full_flow() {
         let tags_yaml = r#"
@@ -2205,13 +2050,11 @@ latest: 5
         let tags: TagsConfig = serde_yaml::from_str(tags_yaml).expect("yaml parses");
         let filter = build_filter(Some(&tags), None);
 
-        // Confirm the FilterConfig was built with the right include patterns.
         assert_eq!(
             filter.include,
             vec!["latest".to_string(), "latest-dev".to_string()]
         );
 
-        // Apply against a synthesized tag list and verify both arms work.
         let candidate_tags = vec![
             "latest",
             "latest-dev",
@@ -2226,24 +2069,18 @@ latest: 5
         ];
         let result = filter.apply(&candidate_tags).expect("filter applies");
 
-        // Floats survive via include.
         assert!(result.contains(&"latest".to_string()));
         assert!(result.contains(&"latest-dev".to_string()));
-        // Top 5 of the version range (1.25.5-r0 sorts above 1.25.5-rc1 if rc1
-        // weren't dropped, but rc1 IS dropped, so we expect 1.25.0..1.25.5-r0).
         assert!(result.contains(&"1.25.5-r0".to_string()));
-        // Below range: dropped.
         assert!(!result.contains(&"1.24.0".to_string()));
-        // RC: dropped by system-exclude.
         assert!(!result.contains(&"1.25.5-rc1".to_string()));
-        // 5 versions + 2 floats = 7.
+        // Top 5 of the range plus 2 floats.
         assert_eq!(result.len(), 7);
     }
 
-    /// Every fall-through field on the merge model: `sort`, `latest`,
-    /// `min_tags`, `include`, `glob`, `semver`. When the mapping leaves
-    /// each unset, the value comes from `defaults.tags`; when set, the
-    /// mapping wins. One test, six pairs of assertions, no scaffolding.
+    /// Every fall-through field (`sort`, `latest`, `min_tags`, `include`,
+    /// `glob`, `semver`, `immutable_tags`) comes from `defaults.tags` when the
+    /// mapping leaves it unset, and the mapping wins when set.
     #[test]
     fn merge_inherits_all_fall_through_fields() {
         use ocync_sync::filter::SortOrder;
@@ -2259,7 +2096,6 @@ latest: 5
             ..Default::default()
         };
 
-        // 1. Mapping unset on everything: defaults flow through.
         let empty_mapping = TagsConfig::default();
         let inherited = build_filter(Some(&empty_mapping), Some(&defaults));
         assert_eq!(inherited.include, vec!["latest"]);
@@ -2273,7 +2109,6 @@ latest: 5
             Some("v?[0-9]*.[0-9]*.[0-9]*"),
         );
 
-        // 2. Mapping sets every field: mapping wins on every field.
         let override_mapping = TagsConfig {
             include: Some(GlobOrList::Single("override".into())),
             glob: Some(GlobOrList::Single("override*".into())),
@@ -2297,8 +2132,7 @@ latest: 5
         );
     }
 
-    /// `resolve_immutable_pattern` falls back when only one side carries
-    /// a pattern, and returns `None` when neither does.
+    /// Falls back when only one side carries a pattern; `None` when neither does.
     #[test]
     fn resolve_immutable_pattern_handles_partial_set() {
         let with_immutable = TagsConfig {
@@ -2323,11 +2157,9 @@ latest: 5
         assert_eq!(resolve_immutable_pattern(None, None), None);
     }
 
-    /// Realistic Chainguard scenario: `defaults.exclude` filters dev and
-    /// `-rN` revisions across the project, one mapping uses `include:` to
-    /// rescue `latest-dev`, another adds a hard-tier mapping `exclude:`
-    /// for `-slim` variants. Asserts the final keep set + dry-run drop
-    /// attribution by tier.
+    /// `defaults.exclude` filters dev and `-rN` revisions, one mapping rescues
+    /// `latest-dev` with `include:`, another adds a hard-tier `-slim` exclude.
+    /// Asserts the keep set and the dry-run drop attribution by tier.
     #[test]
     fn merge_chainguard_scenario_end_to_end() {
         let defaults_yaml = r#"
@@ -2336,8 +2168,6 @@ exclude: ["*-dev", "*-r[0-9]*"]
         let defaults: TagsConfig =
             serde_yaml::from_str(defaults_yaml).expect("defaults yaml parses");
 
-        // Realistic cgr.dev tag list for a single repo: stable releases,
-        // dev variants, package revisions, slim variants, an RC.
         let tags = vec![
             "1.27",
             "1.27-r0",
@@ -2349,9 +2179,7 @@ exclude: ["*-dev", "*-r[0-9]*"]
             "latest-dev",
         ];
 
-        // --- Mapping A: pure inheritance (no `tags:` block) ---
-        // Today's bug: this mapping silently lost `defaults.exclude`. After
-        // the fix, all dev/-rN variants drop, RC drops via built-in.
+        // Mapping A: pure inheritance must not lose `defaults.exclude`.
         let no_mapping_filter = build_filter(None, Some(&defaults));
         let kept_a = no_mapping_filter
             .apply(&tags)
@@ -2366,7 +2194,7 @@ exclude: ["*-dev", "*-r[0-9]*"]
             "mapping A should keep stable + slim + latest only",
         );
 
-        // --- Mapping B: `include: ["latest-dev"]` rescues from soft tier ---
+        // Mapping B: `include:` rescues from the soft tier.
         let mapping_b: TagsConfig = serde_yaml::from_str(
             r#"
 include: ["latest-dev"]
@@ -2388,7 +2216,7 @@ include: ["latest-dev"]
             "include: doesn't rescue what it doesn't list"
         );
 
-        // --- Mapping C: hard-tier `exclude: ["*-slim"]` stacks on defaults ---
+        // Mapping C: hard-tier exclude stacks on defaults.
         let mapping_c: TagsConfig = serde_yaml::from_str(
             r#"
 exclude: ["*-slim"]
@@ -2403,9 +2231,7 @@ exclude: ["*-slim"]
             "mapping C drops slim (hard tier) + dev/-rN (soft tier) + rc (built-in)",
         );
 
-        // --- Mapping D: dry-run attribution proves the tier breakdown ---
-        // Use mapping C's filter and verify each drop carries the right
-        // DropKind. This is the operator-facing observability check.
+        // Mapping D: each drop carries the right `DropKind`.
         let report = filter_c
             .apply_with_report(&tags)
             .expect("apply_with_report succeeds");
@@ -2453,11 +2279,9 @@ exclude: ["*-slim"]
         );
     }
 
-    /// YAML round-trip: parse a `defaults.tags` block + a per-mapping
-    /// `tags:` block via the production deserializer and confirm the merge
-    /// puts `defaults.exclude` patterns into the soft tier and mapping
-    /// patterns into the hard tier. Catches future serde-aliasing or
-    /// field-renaming regressions that bypass `build_filter`'s logic.
+    /// Through the production deserializer, `defaults.exclude` lands in the
+    /// soft tier and mapping exclude in the hard tier. Catches serde aliasing
+    /// or renaming regressions that bypass `build_filter`.
     #[test]
     fn merge_yaml_round_trip_separates_exclude_tiers() {
         let defaults_yaml = r#"
@@ -2475,26 +2299,20 @@ exclude: ["*-slim"]
 
         let filter = build_filter(Some(&mapping), Some(&defaults));
 
-        // defaults.exclude reaches the soft tier verbatim.
         assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
-        // mapping.exclude is the hard tier, separate from defaults.
         assert_eq!(filter.exclude, vec!["*-slim"]);
-        // mapping fields override; unset fields inherit from defaults.
         assert_eq!(semver_text(&filter).as_deref(), Some(">=1.0"));
         assert_eq!(filter.sort, Some(ocync_sync::filter::SortOrder::Semver));
         assert_eq!(filter.latest, Some(5));
 
-        // End-to-end behavior: 1.27-r0 dropped by defaults soft tier,
-        // 1.27-slim dropped by mapping hard tier, 1.27 survives.
+        // -r0 dropped by the soft tier, -slim by the hard tier.
         let tags = vec!["1.27", "1.27-r0", "1.27-dev", "1.27-slim"];
         let kept = filter.apply(&tags).expect("filter applies");
         assert_eq!(kept, vec!["1.27".to_string()]);
     }
 
-    /// End-to-end YAML proof of the build+runtime case: project-wide
-    /// `defaults.tags.exclude` denies `*-dev` and `*-r[0-9]*`; one mapping
-    /// uses a glob `include:` to rescue `-dev` for a bounded semver range.
-    /// Catches regressions in either the filter pipeline or the merge layer.
+    /// A glob `include:` rescues `-dev` from `defaults.exclude`, bounded by a
+    /// semver range.
     #[test]
     fn merge_glob_include_with_semver_yaml_e2e() {
         let defaults_yaml = r#"
@@ -2512,8 +2330,6 @@ include: ["*-dev"]
 
         let filter = build_filter(Some(&mapping), Some(&defaults));
 
-        // Mapping include reaches the FilterConfig; defaults exclude lands
-        // in the soft tier; semver/sort/latest inherit from defaults.
         assert_eq!(filter.include, vec!["*-dev"]);
         assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
         assert_eq!(semver_text(&filter).as_deref(), Some(">=8.0.0, <9.0.0"));
@@ -2547,10 +2363,7 @@ include: ["*-dev"]
         assert!(!kept.contains(&"7.0.0".to_string()));
     }
 
-    /// Per-mapping `include:` REPLACES `defaults.tags.include`, not concat.
-    /// The merge resolution at `build_filter` picks the mapping value if
-    /// set, else falls through to defaults. This pins the field-replace
-    /// semantics so a future regression cannot quietly stack the lists.
+    /// Per-mapping `include:` REPLACES `defaults.tags.include`, never concats.
     #[test]
     fn merge_mapping_include_replaces_defaults_include() {
         let defaults_yaml = r#"
@@ -2579,15 +2392,22 @@ include: ["1.25.0-rc1"]
     }
 
     #[test]
-    fn glob_or_list_to_vec_owned_single() {
-        let g = GlobOrList::Single("pattern".into());
-        assert_eq!(glob_or_list_to_vec_owned(&g), vec!["pattern"]);
-    }
-
-    #[test]
-    fn glob_or_list_to_vec_owned_list() {
-        let g = GlobOrList::List(vec!["a".into(), "b".into()]);
-        assert_eq!(glob_or_list_to_vec_owned(&g), vec!["a", "b"]);
+    fn glob_or_list_to_vec_owned_forms() {
+        let cases = [
+            (
+                "single",
+                GlobOrList::Single("pattern".into()),
+                vec!["pattern"],
+            ),
+            (
+                "list",
+                GlobOrList::List(vec!["a".into(), "b".into()]),
+                vec!["a", "b"],
+            ),
+        ];
+        for (name, input, want) in cases {
+            assert_eq!(glob_or_list_to_vec_owned(&input), want, "{name}");
+        }
     }
 
     #[test]
@@ -2610,8 +2430,6 @@ include: ["1.25.0-rc1"]
         assert!(describe_filter(None, None).is_none());
     }
 
-    // -- NoTagsInfo Display ---------------------------------------------
-
     fn no_tags_info(
         from: &str,
         image_count: usize,
@@ -2629,45 +2447,8 @@ include: ["1.25.0-rc1"]
     }
 
     #[test]
-    fn no_tags_warn_renders_simple_repo() {
-        // 2 image tags, both shown -- no truncation, no artifact split.
-        let info = no_tags_info(
-            "library/nginx",
-            2,
-            0,
-            Some("semver >=2.0"),
-            &["v1.0", "v1.1"],
-        );
-        assert_eq!(
-            info.to_string(),
-            "library/nginx: 0 of 2 source tags matched filter (semver >=2.0); skipping. Source: [v1.0, v1.1]"
-        );
-    }
-
-    /// Cosign-heavy repos: WARN must split image vs referrer counts so the
-    /// 14289-tag chainguard case is not misread as 14289 missing image tags.
-    #[test]
-    fn no_tags_warn_splits_image_and_artifact_counts() {
-        let info = no_tags_info(
-            "chainguard/nginx",
-            2,
-            14287,
-            Some("semver >=1.0.0, latest=5"),
-            &["latest", "latest-dev"],
-        );
-        let msg = info.to_string();
-        assert!(
-            msg.contains(
-                "0 of 14289 source tags (2 image tags, 14287 referrer artifacts) matched filter"
-            ),
-            "{msg}"
-        );
-    }
-
-    /// Truncation appends `, ...` so the user knows the list is sampled.
-    #[test]
-    fn no_tags_warn_appends_ellipsis_when_truncated() {
-        let info = NoTagsInfo {
+    fn no_tags_warn_renders() {
+        let truncated = NoTagsInfo {
             from: "library/alpine".into(),
             // image_count > samples.len() drives the truncation marker.
             image_count: 100,
@@ -2675,27 +2456,48 @@ include: ["1.25.0-rc1"]
             filter_desc: Some("semver >=99.0".into()),
             samples: (0..5).map(|i| format!("v{i}")).collect(),
         };
-        assert!(info.samples_truncated());
-        let msg = info.to_string();
-        assert!(msg.ends_with("Source: [v0, v1, v2, v3, v4, ...]"), "{msg}");
+        assert!(truncated.samples_truncated());
+        let cases = [
+            (
+                "simple repo, no truncation or artifact split",
+                no_tags_info(
+                    "library/nginx",
+                    2,
+                    0,
+                    Some("semver >=2.0"),
+                    &["v1.0", "v1.1"],
+                ),
+                "library/nginx: 0 of 2 source tags matched filter (semver >=2.0); skipping. Source: [v1.0, v1.1]",
+            ),
+            (
+                "cosign-heavy repo splits image and referrer counts",
+                no_tags_info(
+                    "chainguard/nginx",
+                    2,
+                    14287,
+                    Some("semver >=1.0.0, latest=5"),
+                    &["latest", "latest-dev"],
+                ),
+                "chainguard/nginx: 0 of 14289 source tags (2 image tags, 14287 referrer artifacts) matched filter (semver >=1.0.0, latest=5); skipping. Source: [latest, latest-dev]",
+            ),
+            (
+                "truncated samples end with an ellipsis",
+                truncated,
+                "library/alpine: 0 of 100 source tags matched filter (semver >=99.0); skipping. Source: [v0, v1, v2, v3, v4, ...]",
+            ),
+            (
+                "empty samples and missing filter render markers",
+                no_tags_info("x/y", 0, 0, None, &[]),
+                "x/y: 0 of 0 source tags matched filter (no filter configured); skipping. Source: <empty>",
+            ),
+        ];
+        for (name, info, want) in cases {
+            assert_eq!(info.to_string(), want, "{name}");
+        }
     }
 
-    /// Empty samples render as `<empty>` and a missing filter description
-    /// renders as `no filter configured` -- both ensure the message never
-    /// has bare parens or `[]`.
-    #[test]
-    fn no_tags_warn_renders_empty_markers() {
-        let info = no_tags_info("x/y", 0, 0, None, &[]);
-        let msg = info.to_string();
-        assert!(msg.contains("(no filter configured)"), "{msg}");
-        assert!(msg.ends_with("Source: <empty>"), "{msg}");
-    }
-
-    // -- WatchLogState transitions --------------------------------------
-
-    /// First observation triggers a WARN; repeats within the same failure
-    /// run are suppressed; recovery clears the entry so a relapse warns
-    /// again. Encodes the contract `run()` depends on.
+    /// First observation warns; repeats are suppressed; recovery clears the
+    /// entry so a relapse warns again.
     #[test]
     fn watch_log_state_emits_once_per_transition() {
         let mut state = WatchLogState::default();
@@ -2706,8 +2508,7 @@ include: ["1.25.0-rc1"]
         assert!(state.observe_no_match("repo-a"));
     }
 
-    /// `retain_active` drops entries for mappings no longer in the config
-    /// so the set does not grow unbounded across the watch process.
+    /// `retain_active` drops entries for mappings no longer in the config.
     #[test]
     fn watch_log_state_prunes_removed_mappings() {
         let mut state = WatchLogState::default();
@@ -2717,14 +2518,10 @@ include: ["1.25.0-rc1"]
 
         state.retain_active(["repo-a", "repo-b"]);
 
-        // After pruning, `repo-removed` re-warns (gap means transition);
-        // surviving entries continue to suppress.
         assert!(!state.observe_no_match("repo-a"));
         assert!(!state.observe_no_match("repo-b"));
         assert!(state.observe_no_match("repo-removed"));
     }
-
-    // -- per-mapping outcome aggregation + dedup ---------------------------
 
     fn img(
         source: &str,
@@ -2754,9 +2551,8 @@ include: ["1.25.0-rc1"]
         }
     }
 
-    /// Aggregation groups by `source_repo:` + `target_repo:` prefix so
-    /// images from a different mapping (same source repo, different target)
-    /// don't bleed into this mapping's counts.
+    /// Images from another mapping (same source, different target) must not
+    /// bleed into this mapping's counts.
     #[test]
     fn aggregate_mapping_outcome_groups_by_source_and_target() {
         let report = report_with(vec![
@@ -2787,8 +2583,7 @@ include: ["1.25.0-rc1"]
         assert_eq!(o.bytes, 300);
     }
 
-    /// Empty mappings (no images in the report) skip silently -- the
-    /// no-tags WARN is the right surface for that case, not this one.
+    /// A mapping with no images in the report is skipped silently.
     #[test]
     fn empty_outcome_is_recognized() {
         let outcome = MappingOutcome::default();
@@ -2800,8 +2595,8 @@ include: ["1.25.0-rc1"]
         assert!(!with_skip.is_empty());
     }
 
-    /// First observation emits; identical follow-up suppresses; outcome
-    /// change emits again. Mirrors the no-tags transition contract.
+    /// First observation emits; an identical follow-up is suppressed; a changed
+    /// outcome emits again.
     #[test]
     fn watch_log_state_dedupes_identical_mapping_outcomes() {
         let mut state = WatchLogState::default();
@@ -2816,16 +2611,12 @@ include: ["1.25.0-rc1"]
             ..MappingOutcome::default()
         };
 
-        // First observation: emit, no prior so not a recovery.
         assert_eq!(
             state.observe_mapping_outcome("repo-a", &steady),
             Some(false)
         );
-        // Same outcome twice: suppress.
         assert_eq!(state.observe_mapping_outcome("repo-a", &steady), None);
         assert_eq!(state.observe_mapping_outcome("repo-a", &steady), None);
-        // Different outcome: emit, neither prior nor current was a failure
-        // so not a recovery either.
         assert_eq!(
             state.observe_mapping_outcome("repo-a", &active),
             Some(false)
@@ -2837,10 +2628,8 @@ include: ["1.25.0-rc1"]
         );
     }
 
-    /// Recovery detection: prior outcome with `failed > 0` followed by an
-    /// outcome with `failed == 0` returns `Some(true)` so the caller can
-    /// attach the `[recovered]` marker. Cycle counter advances on each
-    /// transition so the watch loop sees activity.
+    /// `failed > 0` followed by `failed == 0` returns `Some(true)` (the
+    /// `[recovered]` marker) and advances the cycle counter on each transition.
     #[test]
     fn watch_log_state_surfaces_failure_to_clean_transition() {
         let mut state = WatchLogState::default();
@@ -2853,15 +2642,13 @@ include: ["1.25.0-rc1"]
             ..MappingOutcome::default()
         };
 
-        // First observation can never be a recovery (no prior).
         assert_eq!(state.observe_mapping_outcome("r", &failing), Some(false));
         assert_eq!(state.observe_mapping_outcome("r", &healthy), Some(true));
         assert_eq!(state.cycle_emit_count(), 2);
     }
 
-    /// `retain_active` also prunes per-mapping outcome cache so a removed
-    /// mapping doesn't keep its stale entry forever. Re-observation after
-    /// pruning emits as a fresh first-observation.
+    /// `retain_active` also prunes cached outcomes; re-observation after
+    /// pruning emits as a first observation.
     #[test]
     fn watch_log_state_retain_active_also_prunes_outcomes() {
         let mut state = WatchLogState::default();
@@ -2878,99 +2665,81 @@ include: ["1.25.0-rc1"]
         assert_eq!(state.observe_mapping_outcome("keep", &outcome), None);
     }
 
-    /// `format_mapping_outcome` omits zero counts, elides the bytes clause
-    /// when nothing transferred, tags recovery transitions, and drops the
-    /// `[targets]` bracket on single-target mappings (the destination is
-    /// already in the `from -> to` arrow).
+    /// Omits zero counts and the bytes clause when nothing transferred, tags
+    /// recovery, keeps the `[targets]` bracket whenever more than one registry
+    /// was configured (including when one is unreachable), and drops it for a
+    /// single target (the destination is already in the `from -> to` arrow).
     #[test]
-    fn format_mapping_outcome_single_target_omits_bracket() {
-        let d = MappingDescriptor {
-            from: "library/alpine".into(),
-            target_repo: "mirror/alpine".into(),
-            target_names: vec!["ttl".into()],
-            dropped_names: Vec::new(),
+    fn format_mapping_outcome_table() {
+        let outcome = |synced, skipped, failed, bytes| MappingOutcome {
+            synced,
+            skipped,
+            failed,
+            bytes,
         };
-        let synced_only = MappingOutcome {
-            synced: 3,
-            bytes: 1024,
-            ..MappingOutcome::default()
-        };
-        assert_eq!(
-            format_mapping_outcome(&d, &synced_only, false),
-            "library/alpine -> mirror/alpine: synced 3 (1.0 KB)"
-        );
-        let skipped_only = MappingOutcome {
-            skipped: 5,
-            ..MappingOutcome::default()
-        };
-        assert_eq!(
-            format_mapping_outcome(&d, &skipped_only, false),
-            "library/alpine -> mirror/alpine: skipped 5"
-        );
-        let mixed = MappingOutcome {
-            synced: 1,
-            skipped: 2,
-            failed: 1,
-            bytes: 2048,
-        };
-        assert_eq!(
-            format_mapping_outcome(&d, &mixed, false),
-            "library/alpine -> mirror/alpine: synced 1, skipped 2, failed 1 (2.0 KB)"
-        );
-        assert_eq!(
-            format_mapping_outcome(&d, &synced_only, true),
-            "library/alpine -> mirror/alpine: synced 3 (1.0 KB) [recovered]"
-        );
+        let cases = [
+            (
+                "single target, synced only",
+                vec!["ttl"],
+                vec![],
+                outcome(3, 0, 0, 1024),
+                false,
+                "library/alpine -> mirror/alpine: synced 3 (1.0 KB)",
+            ),
+            (
+                "single target, skipped only",
+                vec!["ttl"],
+                vec![],
+                outcome(0, 5, 0, 0),
+                false,
+                "library/alpine -> mirror/alpine: skipped 5",
+            ),
+            (
+                "single target, mixed",
+                vec!["ttl"],
+                vec![],
+                outcome(1, 2, 1, 2048),
+                false,
+                "library/alpine -> mirror/alpine: synced 1, skipped 2, failed 1 (2.0 KB)",
+            ),
+            (
+                "single target, recovered",
+                vec!["ttl"],
+                vec![],
+                outcome(3, 0, 0, 1024),
+                true,
+                "library/alpine -> mirror/alpine: synced 3 (1.0 KB) [recovered]",
+            ),
+            (
+                "multi target keeps the bracket",
+                vec!["ecr-prod", "ghcr-mirror"],
+                vec![],
+                outcome(1, 0, 0, 1024),
+                false,
+                "library/alpine -> mirror/alpine [ecr-prod, ghcr-mirror]: synced 1 (1.0 KB)",
+            ),
+            (
+                "a lost target is still named",
+                vec!["good"],
+                vec!["broken"],
+                outcome(4, 0, 0, 0),
+                false,
+                "library/alpine -> mirror/alpine [good, broken unreachable]: synced 4",
+            ),
+        ];
+        for (name, targets, dropped, o, recovered, want) in cases {
+            let d = MappingDescriptor {
+                from: "library/alpine".into(),
+                target_repo: "mirror/alpine".into(),
+                target_names: targets.into_iter().map(String::from).collect(),
+                dropped_names: dropped.into_iter().map(String::from).collect(),
+            };
+            assert_eq!(format_mapping_outcome(&d, &o, recovered), want, "{name}");
+        }
     }
 
-    /// Multi-target mappings keep the `[targets]` bracket so the operator
-    /// A mapping that lost a target still names its registries: the one line
-    /// whose job is saying where the images went must not go quiet at the
-    /// moment one of them is missing.
-    #[test]
-    fn format_mapping_outcome_names_an_unreachable_target() {
-        let d = MappingDescriptor {
-            from: "library/alpine".into(),
-            target_repo: "mirror/alpine".into(),
-            target_names: vec!["good".into()],
-            dropped_names: vec!["broken".into()],
-        };
-        let outcome = MappingOutcome {
-            synced: 4,
-            ..Default::default()
-        };
-
-        let line = format_mapping_outcome(&d, &outcome, false);
-
-        assert!(line.contains("[good, broken unreachable]"), "{line}");
-    }
-
-    /// can see which destinations the outcome covers.
-    #[test]
-    fn format_mapping_outcome_multi_target_keeps_bracket() {
-        let d = MappingDescriptor {
-            from: "library/alpine".into(),
-            target_repo: "mirror/alpine".into(),
-            target_names: vec!["ecr-prod".into(), "ghcr-mirror".into()],
-            dropped_names: Vec::new(),
-        };
-        let synced = MappingOutcome {
-            synced: 1,
-            bytes: 1024,
-            ..MappingOutcome::default()
-        };
-        assert_eq!(
-            format_mapping_outcome(&d, &synced, false),
-            "library/alpine -> mirror/alpine [ecr-prod, ghcr-mirror]: synced 1 (1.0 KB)"
-        );
-    }
-
-    // -- select_filtered_tags wire-up tests ---------------------------------
-
-    /// `with_report = true` produces a `Some(FilterReport)` whose
-    /// `min_tags` and `include_kept` match the configured input. This is
-    /// the wire-up that `--dry-run` depends on; a regression where
-    /// `with_report` is hardcoded to `false` would fail this test.
+    /// `with_report = true` yields a `FilterReport` carrying the configured
+    /// `min_tags` and `include_kept`; hardcoding `with_report` to `false` fails this.
     #[test]
     fn select_filtered_tags_with_report_populates_min_tags_and_include() {
         use ocync_sync::filter::SortOrder;
@@ -2993,23 +2762,19 @@ include: ["1.25.0-rc1"]
         let (kept, candidate_count, report) =
             select_filtered_tags(Some(&tags_config), None, all_tags, true).unwrap();
 
-        // Wire-up: candidate count flows through.
         assert_eq!(candidate_count, Some(5));
-        // Wire-up: report is Some.
         let report = report.expect("report present when with_report=true");
-        // Report carries min_tags so the formatter can render the gap.
         assert_eq!(report.min_tags, Some(5));
-        // Include rescued by name (latest fails semver but is in include:).
+        // `latest` fails semver but is rescued by `include:`.
         assert_eq!(report.include_kept, vec!["latest".to_string()]);
-        // Kept reflects union semantics: include + top-2 of pipeline
-        // (1.2.0 and 1.1.0). 1.0.0 falls off via latest=2; 0.9.0-rc1 fails
-        // semver and is dropped. 3 < min_tags=5, so real-sync would error.
+        // Union of include and the top 2 (1.2.0, 1.1.0); 3 < min_tags, so
+        // real sync would error.
         assert_eq!(kept.len(), 3);
         assert!(kept.contains(&"latest".to_string()));
     }
 
-    /// `with_report = false` (real-sync hot path) produces `None` for the
-    /// report so we don't pay drop-attribution cost on every watch cycle.
+    /// `with_report = false` yields no report, avoiding drop-attribution cost
+    /// on every watch cycle.
     #[test]
     fn select_filtered_tags_without_report_returns_none() {
         let tags_config = TagsConfig {
@@ -3024,47 +2789,31 @@ include: ["1.25.0-rc1"]
         assert!(report.is_none());
     }
 
-    /// `with_report = false` enforces `min_tags` (real-sync errors when
-    /// the filter doesn't yield enough tags). The dry-run path does NOT
-    /// (covered separately).
+    /// Real sync (`with_report = false`) enforces `min_tags`; the dry run does
+    /// not, so its formatter can surface the gap instead of suppressing the report.
     #[test]
-    fn select_filtered_tags_without_report_enforces_min_tags() {
+    fn select_filtered_tags_enforces_min_tags_only_without_report() {
         let tags_config = TagsConfig {
             min_tags: Some(10),
             ..Default::default()
         };
-        let all_tags = vec!["1.0".into(), "2.0".into()];
-        let result = select_filtered_tags(Some(&tags_config), None, all_tags, false);
-        assert!(
-            result.is_err(),
-            "expected BelowMinTags error from real-sync path"
-        );
+        for (name, with_report) in [("real sync", false), ("dry run", true)] {
+            let all_tags = vec!["1.0".into(), "2.0".into()];
+            let result = select_filtered_tags(Some(&tags_config), None, all_tags, with_report);
+            if with_report {
+                let (kept, candidate_count, report) = result.expect(name);
+                assert_eq!(kept.len(), 2, "{name}");
+                assert_eq!(candidate_count, Some(2), "{name}");
+                let report = report.expect("dry run returns a report despite min_tags");
+                assert_eq!(report.min_tags, Some(10), "{name}");
+            } else {
+                assert!(result.is_err(), "{name}: expected BelowMinTags");
+            }
+        }
     }
 
-    /// `with_report = true` does NOT enforce `min_tags`. The dry-run formatter
-    /// surfaces the gap in its output instead of suppressing the report.
-    #[test]
-    fn select_filtered_tags_with_report_does_not_enforce_min_tags() {
-        let tags_config = TagsConfig {
-            min_tags: Some(10),
-            ..Default::default()
-        };
-        let all_tags = vec!["1.0".into(), "2.0".into()];
-        let (kept, candidate_count, report) =
-            select_filtered_tags(Some(&tags_config), None, all_tags, true).unwrap();
-        assert_eq!(kept.len(), 2);
-        assert_eq!(candidate_count, Some(2));
-        let report = report.expect("dry-run path returns report even when min_tags would error");
-        assert_eq!(report.min_tags, Some(10));
-    }
-
-    // -----------------------------------------------------------------
-    // Failure isolation
-    // -----------------------------------------------------------------
-
-    /// Config with three mappings; the middle one names a registry that does
-    /// not exist. Tag selection uses literal globs so resolution never touches
-    /// the network.
+    /// Three mappings; the middle one names a registry that does not exist.
+    /// Literal globs keep resolution off the network.
     fn three_mapping_config() -> Config {
         serde_yaml::from_str(
             r#"
@@ -3130,8 +2879,7 @@ mappings:
         .expect("no config-class failure in these fixtures")
     }
 
-    /// A mapping that cannot be resolved must not cost the run the mappings
-    /// behind it: the mapping *after* the failure is the one that proves it.
+    /// A mapping that cannot be resolved must not cost the mappings behind it.
     #[tokio::test]
     async fn resolve_all_isolates_a_failing_mapping() {
         let config = three_mapping_config();
@@ -3144,7 +2892,6 @@ mappings:
         assert_eq!(unresolved.len(), 1, "only the bad mapping should fail");
         assert_eq!(unresolved[0].from, "repo/two");
 
-        // The negative half: the mapping *after* the failure still resolved.
         let names: Vec<&str> = resolved.iter().map(|m| m.source_repo.as_str()).collect();
         assert_eq!(names, vec!["repo/one", "repo/three"]);
     }
@@ -3202,16 +2949,14 @@ mappings:
             "the setup error must survive to the mapping failure: {}",
             unresolved[0].error
         );
-        // The classification has to survive too, or a wholly denied run
-        // silently drops from the auth exit code to the generic one.
+        // The classification must survive, or a denied run drops to the generic code.
         assert!(
             matches!(unresolved[0].code, ExitCode::AuthError),
             "a denied registry must stay classified as a denial"
         );
     }
 
-    /// Every mapping resolving means no failures recorded -- the isolation
-    /// path must not manufacture failures on a clean config.
+    /// The isolation path must not manufacture failures on a clean config.
     #[tokio::test]
     async fn resolve_all_reports_no_failures_when_all_mappings_resolve() {
         let config: Config = serde_yaml::from_str(
@@ -3242,10 +2987,7 @@ mappings:
         assert!(unresolved.is_empty());
     }
 
-    /// A mapping fanning out to several targets keeps the ones that work.
-    ///
-    /// This is the same principle as per-mapping isolation, one level down: a
-    /// broken mirror must not stop the other mirrors from receiving the image.
+    /// A broken mirror must not stop the other mirrors from receiving the image.
     #[tokio::test]
     async fn resolve_all_keeps_the_working_targets_when_one_is_unavailable() {
         let config: Config = serde_yaml::from_str(
@@ -3292,16 +3034,15 @@ mappings:
         let targets: Vec<&str> = resolved[0].targets.iter().map(|t| &*t.name).collect();
         assert_eq!(targets, vec!["good"], "the healthy target must survive");
 
-        // Surviving is not enough: a target the images never reached has to
-        // stay visible, or the run reports a clean success it did not have.
+        // The unreached target must stay visible.
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].registry, "broken");
         assert_eq!(dropped[0].from, "repo/one");
         assert!(dropped[0].error.contains("403 Forbidden"));
     }
 
-    /// A dropped target is a hole in an otherwise clean run, so it must move
-    /// the exit code off success and appear in both report surfaces.
+    /// A dropped target must move the exit code off success and appear in the
+    /// cycle tail and the `--json` document.
     #[test]
     fn a_dropped_target_is_visible_in_every_surface() {
         let report = report_from(vec![ocync_sync::ImageStatus::Synced]);
@@ -3338,8 +3079,8 @@ mappings:
         assert_eq!(value["dropped_targets"][0]["registry"], "broken");
     }
 
-    /// Losing every target is different from losing one: there is nowhere left
-    /// to sync, so the mapping is unresolvable and keeps its cause.
+    /// Losing every target leaves nowhere to sync: the mapping is unresolvable
+    /// and keeps its cause.
     #[tokio::test]
     async fn resolve_all_fails_the_mapping_when_every_target_is_gone() {
         let config: Config = serde_yaml::from_str(
@@ -3385,9 +3126,8 @@ mappings:
         assert!(matches!(unresolved[0].code, ExitCode::AuthError));
     }
 
-    /// The guard, not just the helper: `build_clients` must not construct a
-    /// client for a registry no mapping names. `static_token` resolves
-    /// offline, so this stays a unit test.
+    /// `build_clients` must not construct a client for a registry no mapping
+    /// names. `static_token` resolves offline.
     #[tokio::test]
     async fn build_clients_skips_registries_no_mapping_references() {
         let config: Config = serde_yaml::from_str(
@@ -3429,8 +3169,7 @@ mappings:
         assert_eq!(names, vec!["dst", "src"], "'unused' must not be built");
     }
 
-    /// Building a client mints a token for ECR, GAR, and ACR, so a registry no
-    /// mapping references must not be contacted at all.
+    /// A registry no mapping references must not be contacted at all.
     #[test]
     fn referenced_registries_ignores_unused_entries() {
         let config: Config = serde_yaml::from_str(
@@ -3469,50 +3208,30 @@ mappings:
         assert_eq!(used.len(), 2);
     }
 
-    /// The prepare ticker must fire on wall-clock, not on item boundaries.
-    ///
-    /// The throttle this replaced was evaluated only after a mapping finished,
-    /// so a config with few mappings emitted nothing at all: measured on a
-    /// three-mapping config, zero lines across an 8.6 second run.
+    /// The ticker fires on wall-clock, not on item boundaries (a boundary
+    /// throttle scored one item outlasting an interval as silent), and work
+    /// that finishes inside one interval stays silent.
     #[tokio::test(start_paused = true)]
-    async fn prepare_ticker_reports_a_single_slow_step() {
-        let tracker = PrepareTracker::default();
-        tracker.begin(PreparePhase::Mappings, 1);
-        let seen = RefCell::new(Vec::new());
+    async fn prepare_ticker_cadence() {
+        let cases = [
+            ("17s of work at a 5s cadence", 17, 3),
+            ("work inside one interval", 1, 0),
+        ];
+        for (name, work_secs, want) in cases {
+            let tracker = PrepareTracker::default();
+            tracker.begin(PreparePhase::Mappings, 1);
+            let ticks = RefCell::new(0usize);
 
-        // One item that never completes within an interval: the boundary
-        // throttle scored exactly this case as silent.
-        tick_while(
-            &tracker,
-            Duration::from_secs(5),
-            tokio::time::sleep(Duration::from_secs(17)),
-            |p, _| seen.borrow_mut().push(p.total),
-        )
-        .await;
+            tick_while(
+                &tracker,
+                Duration::from_secs(5),
+                tokio::time::sleep(Duration::from_secs(work_secs)),
+                |_, _| *ticks.borrow_mut() += 1,
+            )
+            .await;
 
-        assert_eq!(
-            seen.borrow().len(),
-            3,
-            "17s of work at a 5s cadence must report three times"
-        );
-    }
-
-    /// The negative half: work that finishes inside one interval stays silent,
-    /// so a fast config gains no noise.
-    #[tokio::test(start_paused = true)]
-    async fn prepare_ticker_stays_silent_for_fast_work() {
-        let tracker = PrepareTracker::default();
-        let seen = RefCell::new(0usize);
-
-        tick_while(
-            &tracker,
-            Duration::from_secs(5),
-            tokio::time::sleep(Duration::from_secs(1)),
-            |_, _| *seen.borrow_mut() += 1,
-        )
-        .await;
-
-        assert_eq!(*seen.borrow(), 0);
+            assert_eq!(*ticks.borrow(), want, "{name}");
+        }
     }
 
     /// The ticker reads live counters, not a snapshot taken when it started.
@@ -3542,9 +3261,8 @@ mappings:
         );
     }
 
-    /// The progress line has to reach its total. The counter previously
-    /// advanced only for ECR registries, so any config without one reported
-    /// `done=0 total=N` forever.
+    /// The progress counter must advance for non-ECR registries too, or it
+    /// reports `done=0 total=N` forever.
     #[tokio::test]
     async fn batch_checker_progress_reaches_its_total_without_ecr() {
         let config: Config = serde_yaml::from_str(
@@ -3621,8 +3339,8 @@ mappings:
         assert_eq!(credentials.aws.users(), vec![2]);
     }
 
-    /// A watch cycle re-reporting the same dead mirror is noise; a different
-    /// mirror going down is not.
+    /// Re-reporting the same dead mirror is noise; a different mirror going
+    /// down is a new transition.
     #[test]
     fn dropped_target_warnings_fire_once_per_transition() {
         let mut state = WatchLogState::default();
@@ -3641,9 +3359,7 @@ mappings:
             "the same mirror under another mapping is its own transition"
         );
 
-        // Partial recovery: mirror-a is back, mirror-b is still down. The
-        // all-or-nothing clear this replaced left mirror-a suppressed for as
-        // long as any sibling stayed down.
+        // Partial recovery: mirror-a is back, mirror-b is still down.
         let still_down = [DroppedTarget {
             from: "repo/one".into(),
             registry: "mirror-b".into(),
@@ -3664,8 +3380,8 @@ mappings:
         );
     }
 
-    /// A mapping dropped from config must not leave state behind, or
-    /// re-adding it later silently suppresses its next outage.
+    /// A mapping dropped from config must not leave state behind, or re-adding
+    /// it would suppress its next outage.
     #[test]
     fn retain_active_prunes_dropped_targets_and_unresolved() {
         let mut state = WatchLogState::default();
@@ -3704,7 +3420,6 @@ mappings:
                 .observe_mapping_outcome("repo/one", &outcome)
                 .is_some()
         );
-        // Same counts again: suppressed, as designed.
         assert!(
             state
                 .observe_mapping_outcome("repo/one", &outcome)
@@ -3722,9 +3437,7 @@ mappings:
         );
     }
 
-    /// A mapping naming no targets at all keeps its old zero-target shape
-    /// rather than becoming an error, which is the case the engine documents
-    /// as degenerate but handles.
+    /// A mapping naming no targets stays a zero-target mapping, not an error.
     #[tokio::test]
     async fn a_mapping_with_no_named_targets_still_resolves() {
         let config: Config = serde_yaml::from_str(
@@ -3761,11 +3474,8 @@ mappings:
         );
     }
 
-    /// A broken config must still stop the run. Isolation exists for
-    /// registries that are down, not for configs that are wrong: a bad glob,
-    /// an unparseable platform, an unknown alias, or a `min_tags` tripwire all
-    /// mean the operator asked for something the run must not silently do
-    /// less than.
+    /// A broken config must still stop the run: isolation is for registries
+    /// that are down, not configs that are wrong.
     #[tokio::test]
     async fn a_config_error_is_fatal_rather_than_isolated() {
         let config: Config = serde_yaml::from_str(
@@ -3809,10 +3519,6 @@ mappings:
         );
     }
 
-    // -----------------------------------------------------------------
-    // Exit codes
-    // -----------------------------------------------------------------
-
     fn report_from(statuses: Vec<ocync_sync::ImageStatus>) -> SyncReport {
         report_with(
             statuses
@@ -3835,120 +3541,119 @@ mappings:
     }
 
     /// An unresolved mapping produces no `ImageResult`, so the report alone
-    /// would score the run a clean success. It must not.
+    /// would score the run a clean success; a run denied everywhere keeps the
+    /// auth code, and one non-auth failure makes the set generic.
     #[test]
-    fn combined_exit_code_downgrades_a_clean_report_with_unresolved_mappings() {
-        let report = report_from(vec![ocync_sync::ImageStatus::Synced]);
-        assert_eq!(combined_exit_code(&report, &[], &[], 0), ExitCode::Success);
-        assert_eq!(
-            combined_exit_code(&report, &[unresolved_mapping("repo/two", false)], &[], 0),
-            ExitCode::PartialFailure
-        );
-    }
-
-    /// Nothing synced and mappings unresolved is a total failure, not partial.
-    #[test]
-    fn combined_exit_code_is_failure_when_nothing_succeeded() {
-        let empty = report_with(Vec::new());
-        let failures = [
-            unresolved_mapping("repo/one", false),
-            unresolved_mapping("repo/two", true),
-        ];
-        assert_eq!(
-            combined_exit_code(&empty, &failures, &[], 0),
-            ExitCode::Failure
-        );
-    }
-
-    /// A skipped image still counts as the run having done its job, so an
-    /// unresolved mapping alongside it is a partial failure.
-    #[test]
-    fn combined_exit_code_treats_skipped_images_as_success() {
-        let report = report_from(vec![ocync_sync::ImageStatus::Skipped {
+    fn combined_exit_code_table() {
+        use ocync_sync::ImageStatus;
+        let skipped = || ImageStatus::Skipped {
             reason: ocync_sync::SkipReason::DigestMatch,
-        }]);
-        assert_eq!(
-            combined_exit_code(&report, &[unresolved_mapping("repo/two", false)], &[], 0),
-            ExitCode::PartialFailure
-        );
-    }
-
-    /// Isolating failures must not silently retire the auth exit code: a run
-    /// denied everywhere still reports 4, not the generic 2.
-    #[test]
-    fn combined_exit_code_keeps_the_auth_code_when_every_mapping_was_denied() {
-        let empty = report_with(Vec::new());
-        let denied = [
-            unresolved_mapping("repo/one", true),
-            unresolved_mapping("repo/two", true),
+        };
+        let cases = [
+            (
+                "clean report, nothing unresolved",
+                vec![ImageStatus::Synced],
+                vec![],
+                ExitCode::Success,
+            ),
+            (
+                "clean report downgraded by an unresolved mapping",
+                vec![ImageStatus::Synced],
+                vec![("repo/two", false)],
+                ExitCode::PartialFailure,
+            ),
+            (
+                "nothing succeeded is a total failure",
+                vec![],
+                vec![("repo/one", false), ("repo/two", true)],
+                ExitCode::Failure,
+            ),
+            (
+                "a skipped image counts as the run having worked",
+                vec![skipped()],
+                vec![("repo/two", false)],
+                ExitCode::PartialFailure,
+            ),
+            (
+                "denied everywhere keeps the auth code",
+                vec![],
+                vec![("repo/one", true), ("repo/two", true)],
+                ExitCode::AuthError,
+            ),
+            (
+                "a mixed failure set is not auth",
+                vec![],
+                vec![("repo/one", true), ("repo/two", false)],
+                ExitCode::Failure,
+            ),
         ];
-        assert_eq!(
-            combined_exit_code(&empty, &denied, &[], 0),
-            ExitCode::AuthError
-        );
+        for (name, statuses, unresolved, want) in cases {
+            let report = report_from(statuses);
+            let unresolved: Vec<_> = unresolved
+                .into_iter()
+                .map(|(from, auth)| unresolved_mapping(from, auth))
+                .collect();
+            assert_eq!(
+                combined_exit_code(&report, &unresolved, &[], 0),
+                want,
+                "{name}"
+            );
+        }
     }
 
-    /// One non-auth failure in the set is enough to make it a generic failure.
+    /// `--dry-run` returns before the engine, so it applies the auth rule itself.
     #[test]
-    fn combined_exit_code_does_not_claim_auth_for_a_mixed_failure_set() {
-        let empty = report_with(Vec::new());
-        let mixed = [
-            unresolved_mapping("repo/one", true),
-            unresolved_mapping("repo/two", false),
+    fn dry_run_exit_code_table() {
+        let cases = [
+            ("all resolved", 3, vec![], ExitCode::Success),
+            (
+                "some unresolved",
+                2,
+                vec![("repo/two", false)],
+                ExitCode::PartialFailure,
+            ),
+            (
+                "none resolved",
+                0,
+                vec![("repo/two", false)],
+                ExitCode::Failure,
+            ),
+            (
+                "none resolved, all denied",
+                0,
+                vec![("repo/one", true), ("repo/two", true)],
+                ExitCode::AuthError,
+            ),
+            (
+                "partly denied",
+                1,
+                vec![("repo/one", true), ("repo/two", true)],
+                ExitCode::PartialFailure,
+            ),
         ];
-        assert_eq!(
-            combined_exit_code(&empty, &mixed, &[], 0),
-            ExitCode::Failure
-        );
+        for (name, succeeded, unresolved, want) in cases {
+            let unresolved: Vec<_> = unresolved
+                .into_iter()
+                .map(|(from, auth)| unresolved_mapping(from, auth))
+                .collect();
+            assert_eq!(
+                dry_run_exit_code(succeeded, &unresolved, &[]),
+                want,
+                "{name}"
+            );
+        }
     }
 
     #[test]
-    fn dry_run_exit_code_maps_resolution_counts() {
-        assert_eq!(dry_run_exit_code(3, &[], &[]), ExitCode::Success);
-        assert_eq!(
-            dry_run_exit_code(2, &[unresolved_mapping("repo/two", false)], &[]),
-            ExitCode::PartialFailure
-        );
-        assert_eq!(
-            dry_run_exit_code(0, &[unresolved_mapping("repo/two", false)], &[]),
-            ExitCode::Failure
-        );
-    }
-
-    /// `--dry-run` returns before the engine, so it never sees a `SyncReport`
-    /// and has to apply the auth rule itself. Missing that here silently
-    /// downgraded a denied dry run from 4 to 2.
-    #[test]
-    fn dry_run_exit_code_keeps_the_auth_code_when_every_mapping_was_denied() {
-        let denied = [
-            unresolved_mapping("repo/one", true),
-            unresolved_mapping("repo/two", true),
-        ];
-        assert_eq!(dry_run_exit_code(0, &denied, &[]), ExitCode::AuthError);
-        // Something resolved, so the run was only partly denied.
-        assert_eq!(dry_run_exit_code(1, &denied, &[]), ExitCode::PartialFailure);
-    }
-
-    // -----------------------------------------------------------------
-    // Reporting surfaces
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn cycle_tail_names_unresolved_mappings() {
+    fn cycle_tail_unresolved_clause() {
         let report = report_with(Vec::new());
         let line = format_cycle_tail(4, 2, 0, &report);
-        assert!(line.contains("2 unresolved"), "{line}");
-    }
-
-    #[test]
-    fn cycle_tail_omits_the_clause_when_everything_resolved() {
-        let report = report_with(Vec::new());
+        assert!(line.contains("2 unresolved"), "names them: {line}");
         let line = format_cycle_tail(4, 0, 0, &report);
-        assert!(!line.contains("unresolved"), "{line}");
+        assert!(!line.contains("unresolved"), "omitted when none: {line}");
     }
 
-    /// `--json` consumers must be able to see mappings that never reached the
-    /// engine; otherwise the isolation change hides failures from automation.
+    /// `--json` consumers must see mappings that never reached the engine.
     #[test]
     fn json_output_carries_unresolved_mappings() {
         let report = report_with(Vec::new());
@@ -3966,17 +3671,16 @@ mappings:
 
         assert_eq!(value["unresolved_mappings"][0]["from"], "repo/two");
         assert_eq!(value["unresolved_mappings"][0]["error"], "403 Forbidden");
-        // The classification drives the exit code only; not part of the document.
+        // The classification drives the exit code only.
         assert!(
             value["unresolved_mappings"][0].get("auth").is_none(),
             "{value}"
         );
-        // Flattened, not nested: the report's own keys stay at the top level.
+        // Flattened: the report's own keys stay at the top level.
         assert!(value.get("stats").is_some(), "{value}");
     }
 
-    /// Both keys are always present, so one consumer can read `sync` and
-    /// `analyze` output with the same shape.
+    /// Both keys are always present, matching `analyze`.
     #[test]
     fn json_output_always_carries_the_failure_keys() {
         let report = report_with(Vec::new());
@@ -3991,10 +3695,8 @@ mappings:
         assert_eq!(value["dropped_targets"], serde_json::json!([]));
     }
 
-    /// Full wire-up: `select_filtered_tags` + `ResolvedMapping` construction +
-    /// `dry_run::write_to`, ensuring the report flows from filter through to
-    /// printed output. A regression where `filter_report` drops on the floor
-    /// between `resolve_mapping` and the formatter would fail this test.
+    /// The filter report must flow from `select_filtered_tags` through
+    /// `ResolvedMapping` to the `dry_run::write_to` output.
     #[test]
     fn dry_run_full_wire_up_renders_min_tags_failure() {
         use ocync_distribution::spec::RegistryAuthority;
@@ -4043,18 +3745,12 @@ mappings:
         crate::cli::commands::dry_run::write_to(&mut buf, &[mapping], &[], &[], false).unwrap();
         let out = String::from_utf8(buf).unwrap();
 
-        // The end-to-end output surfaces the BelowMinTags warning.
         assert!(out.contains("min_tags: 5"), "{out}");
         assert!(out.contains("FAIL"), "{out}");
         assert!(out.contains("BelowMinTags"), "{out}");
-        // And carries the full pipeline trace.
         assert!(out.contains("source tags: 10"), "{out}");
         assert!(out.contains("dropped (10):"), "{out}");
     }
-
-    // -----------------------------------------------------------------------
-    // Prepare-phase concurrency
-    // -----------------------------------------------------------------------
 
     use crate::cli::commands::test_support::{
         Arrivals, SlowRecorder, arrivals, config_yaml, max_in_flight, repo_names,
@@ -4086,12 +3782,8 @@ mappings:
         (server, config, clients, arrivals)
     }
 
-    /// Mapping resolution must overlap its network waits.
-    ///
-    /// Every mapping's tag listing is an independent round trip, so resolving
-    /// them one at a time makes the prepare phase cost the sum of every
-    /// registry's latency. Measured on a 95-mapping config that was 11 minutes
-    /// before the engine started.
+    /// Mapping resolution must overlap its network waits: serial resolution on
+    /// a 95-mapping config took 11 minutes before the engine started.
     #[tokio::test]
     async fn resolve_all_resolves_mappings_concurrently() {
         let delay = Duration::from_millis(250);
@@ -4117,14 +3809,8 @@ mappings:
         );
     }
 
-    /// Concurrency is a ceiling, not an invitation to open every mapping at
-    /// once.
-    ///
-    /// A config with hundreds of mappings pointed at one registry must not
-    /// become a burst of hundreds of simultaneous tag listings. The limit is
-    /// what stands between the two, so it is asserted exactly: reaching it
-    /// proves resolution overlaps, and never passing it proves the ceiling is
-    /// real.
+    /// The limit is a ceiling, asserted exactly: reaching it proves overlap,
+    /// never passing it proves the ceiling is real.
     #[tokio::test]
     async fn resolve_all_never_exceeds_its_concurrency_limit() {
         let delay = Duration::from_millis(250);
@@ -4150,11 +3836,8 @@ mappings:
         );
     }
 
-    /// A zero limit must still make progress rather than stall forever.
-    ///
-    /// `buffered(0)` yields nothing and never completes, so the floor is not
-    /// cosmetic: without it a miscomputed limit hangs the run before the
-    /// engine starts, with a progress line reporting `done=0` forever.
+    /// `buffered(0)` never completes, so a zero limit must floor at one or the
+    /// run hangs before the engine starts.
     #[tokio::test]
     async fn resolve_all_treats_a_zero_limit_as_one() {
         let (_server, config, clients, _arrivals) =
@@ -4175,17 +3858,12 @@ mappings:
         assert_eq!(resolution.resolved.len(), 2);
     }
 
-    /// A registry whose repositories do not all answer at the same speed.
+    /// A registry where the `slow` repositories answer after `slow_delay` and
+    /// the rest after `fast_delay`.
     ///
-    /// `slow` repositories answer after `slow_delay`, the rest after
-    /// `fast_delay`, and the slow ones come first in config order.
-    ///
-    /// The uniform fixture above cannot expose an ordered queue. When every
-    /// mapping takes the same time the head is never the straggler, so a
-    /// combinator that frees its slot only at the head behaves exactly like
-    /// one that frees each slot as it finishes. Real configs are the opposite
-    /// of uniform: a repository with tens of thousands of tags sits beside one
-    /// with three.
+    /// Under uniform latency the queue head is never the straggler, so an
+    /// ordered queue looks identical to one that refills as work finishes;
+    /// only a skewed fixture tells them apart.
     async fn skewed_tag_registry(
         total: usize,
         slow: &[usize],
@@ -4209,8 +3887,7 @@ mappings:
             .mount(&server)
             .await;
 
-        // Position matters: the queue is built in config order, so where the
-        // slow mappings sit is the whole variable.
+        // The queue is built in config order, so slow positions matter.
         let repos: Vec<String> = (0..total)
             .map(|i| {
                 if slow.contains(&i) {
@@ -4225,18 +3902,11 @@ mappings:
         let config: Config = serde_yaml::from_str(&yaml).expect("generated config parses");
         let src = test_client(&server.uri());
 
-        // Warm the registry's AIMD window before the measured run.
-        //
-        // The window opens at 1 and widens by `1/w` per success, so a cold
-        // client hands the first mapping the only permit and every other
-        // mapping waits on it regardless of how the queue above is built.
-        // That hides the queue's own behaviour behind the ramp. A real run
-        // reaches this phase against a registry that has been answering for
-        // minutes, so a warm window is the honest starting state.
-        // The window opens at 1 and grows by `1/w` per success, so it reaches
-        // `sqrt(1 + 2n)` after n of them: 8 successes give ~4.3, which only
-        // just clears a limit of 4. 16 give ~5.7, so AIMD is comfortably not
-        // the binding constraint and a slack window can only mean the queue.
+        // Warm the AIMD window: a cold client (window 1) serializes every
+        // mapping and hides the queue's behaviour. The window grows by `1/w`
+        // per success, reaching `sqrt(1 + 2n)` after n: 8 successes give ~4.3,
+        // barely clearing a limit of 4; 16 give ~5.7, so a slack window can
+        // only mean the queue.
         let warmup = RepositoryName::new("repo/img-warmup").expect("fixture repo name is valid");
         for _ in 0..16 {
             src.list_tags(&warmup)
@@ -4251,13 +3921,9 @@ mappings:
         (server, config, clients)
     }
 
-    /// A slow mapping must not hold the window closed behind it.
-    ///
-    /// The concurrency limit is a ceiling on open mappings, but it is also a
-    /// floor: while any mapping has not started, the window has to be full,
-    /// or the run pays for slots it is not using. This is the half that
-    /// `resolve_all_never_exceeds_its_concurrency_limit` cannot see, because
-    /// a maximum is reached in the first instant and never contradicted after.
+    /// A slow mapping must not hold the window closed behind it: while any
+    /// mapping has not started, the window has to be full. This is the half
+    /// `resolve_all_never_exceeds_its_concurrency_limit` cannot see.
     #[tokio::test]
     async fn resolve_all_keeps_its_window_full_while_mappings_wait() {
         let limit = 4;
@@ -4303,20 +3969,15 @@ mappings:
         );
     }
 
-    /// A mapping's targets must be listed concurrently.
-    ///
-    /// The immutable-tag optimization lists every target's existing tags
-    /// before the engine starts. Walking the mirrors one at a time makes a
-    /// mapping's prepare cost scale with its fan-out, which is the opposite of
-    /// what fanning out is for: the listings are independent and read-only.
+    /// A mapping's immutable-tag listings must run across its targets
+    /// concurrently, or prepare cost scales with fan-out.
     #[tokio::test]
     async fn resolve_mapping_lists_target_tags_concurrently() {
         let delay = Duration::from_millis(250);
         let server = wiremock::MockServer::start().await;
         let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        // The source listing is fast and on its own path, so only the target
-        // listings land in the recorder.
+        // Only the target listings land in the recorder.
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/v2/repo/img0/tags/list"))
             .respond_with(
@@ -4384,10 +4045,6 @@ mappings:
     }
 
     /// The progress line must name the item holding the step up.
-    ///
-    /// A count alone leaves a stall unattributable: a step that sits at the
-    /// same `done` for minutes could be one huge tag listing or a wedged
-    /// registry, and the operator cannot tell which without the name.
     #[tokio::test(start_paused = true)]
     async fn prepare_ticker_names_the_item_holding_the_step_up() {
         let tracker = PrepareTracker::default();
@@ -4400,8 +4057,7 @@ mappings:
             async {
                 let slow = tracker.track("repo/slow");
                 tokio::time::sleep(Duration::from_secs(4)).await;
-                // Started later, so it must never be the one reported even
-                // though it is the most recent thing to begin.
+                // Started later, so it must never be the one reported.
                 let quick = tracker.track("repo/quick");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 drop(quick);
@@ -4427,11 +4083,8 @@ mappings:
         );
     }
 
-    /// Retiring an item both counts it and takes it out of the in-flight set.
-    ///
-    /// The guard is what makes that unconditional. Resolution has many early
-    /// exits, and one that forgot to count would strand the progress line
-    /// short of its total for the rest of the run.
+    /// Dropping the guard both counts the item and retires it, so no early
+    /// exit strands the progress line short of its total.
     #[tokio::test]
     async fn prepare_tracker_retires_an_item_when_its_guard_drops() {
         let tracker = PrepareTracker::default();
@@ -4450,10 +4103,8 @@ mappings:
         );
     }
 
-    /// A new step starts from a clean in-flight set.
-    ///
-    /// Steps run back to back under one ticker, so a leaked item from the
-    /// previous step would be reported as the thing holding up the next one.
+    /// A leaked item from the previous step must not be reported as holding up
+    /// the next.
     #[tokio::test]
     async fn prepare_tracker_clears_in_flight_items_between_steps() {
         let tracker = PrepareTracker::default();
@@ -4468,24 +4119,17 @@ mappings:
         assert!(p.slowest.is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // Prepare-phase benchmarks
-    //
-    // Ignored by default: they measure wall-clock against a mock registry with
-    // injected latency, which is too slow for the normal test run. Run with:
-    //
+    // Prepare-phase benchmarks, ignored by default (wall-clock against a mock
+    // registry with injected latency). Run with:
     //   cargo test --bin ocync -- --ignored --nocapture prepare_phase
-    // -----------------------------------------------------------------------
 
     /// Tag count the pagination benchmark serves.
     const BENCH_REPO_TAGS: usize = 3000;
 
-    /// A `tags/list` that behaves the way the real registries do: a request
-    /// carrying no `n` gets every tag in one response with no `Link` header,
-    /// and only an explicit `n` produces pages.
-    ///
-    /// Measured against Docker Hub and matching `distribution/distribution`,
-    /// which sets its internal limit to -1 when `n` is absent.
+    /// A `tags/list` that behaves like real registries: no `n` gets every tag in
+    /// one response with no `Link` header, and only an explicit `n` pages.
+    /// Matches Docker Hub and `distribution/distribution` (limit -1 when `n` is
+    /// absent).
     struct PaginatedTagList {
         requests: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -4495,7 +4139,6 @@ mappings:
             self.requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let all: Vec<String> = (0..BENCH_REPO_TAGS).map(|i| format!("tag{i:04}")).collect();
-            // No `n` means no paging at all, which is the whole point.
             let mut page = all.len();
             let mut last: Option<String> = None;
             for (k, v) in req.url.query_pairs() {
@@ -4527,10 +4170,8 @@ mappings:
         }
     }
 
-    /// How long the prepare phase takes as mapping resolution is widened.
-    ///
-    /// Concurrency 1 is the behaviour this replaced, so the first row is the
-    /// baseline every other row is measured against.
+    /// Prepare-phase time as mapping resolution is widened; concurrency 1 is
+    /// the baseline row.
     #[tokio::test]
     #[ignore = "wall-clock benchmark against a latency-injected mock registry"]
     async fn prepare_phase_benchmark_resolution_concurrency() {
@@ -4548,9 +4189,8 @@ mappings:
 
         let mut baseline: Option<Duration> = None;
         for concurrency in [1usize, 4, 8, 16, 32] {
-            // A fresh server and fresh clients per row: AIMD widens as a
-            // registry keeps answering, so reusing them would hand later rows
-            // a head start the first row never had.
+            // Fresh server and clients per row: reused AIMD windows would give
+            // later rows a head start.
             let (_server, config, clients, arrivals) = slow_tag_registry(mappings, delay).await;
 
             let started = std::time::Instant::now();
@@ -4582,29 +4222,19 @@ mappings:
         );
     }
 
-    /// What the prepare phase costs when the mappings are not all the same
-    /// size, which is the only shape that tells an ordered queue apart from a
-    /// window that refills as work finishes.
+    /// Prepare-phase cost with skewed mapping latency, the only shape that
+    /// tells an ordered queue from a window that refills as work finishes
+    /// (the uniform benchmark reports the same speedup for both).
     ///
-    /// `prepare_phase_benchmark_resolution_concurrency` gives every mapping
-    /// the same latency. Under uniform latency the head of a queue is never
-    /// the straggler, so both behave identically and the benchmark reports the
-    /// same speedup either way. Real configs are the opposite: a repository
-    /// with tens of thousands of tags sits beside one with three, and the slow
-    /// ones are scattered rather than bunched at the front.
-    ///
-    /// The floor is the slowest single mapping, since concurrency removes the
-    /// queueing behind it but not its own duration. A run landing at a
-    /// multiple of the floor is paying for slots it is not using.
+    /// The floor is the slowest single mapping; a run at a multiple of it is
+    /// paying for slots it is not using.
     #[tokio::test]
     #[ignore = "wall-clock benchmark against a latency-injected mock registry"]
     async fn prepare_phase_benchmark_skewed_resolution() {
         let mappings = 95;
         let slow_delay = Duration::from_millis(800);
         let fast_delay = Duration::from_millis(20);
-        // One slow mapping per window: the shape a run actually hits, and the
-        // one an ordered queue handles worst, because each slow mapping pins
-        // its own window instead of sharing one with the others.
+        // One slow mapping per window: the worst case for an ordered queue.
         let slow: Vec<usize> = (0..mappings).step_by(PREPARE_MAPPING_CONCURRENCY).collect();
 
         println!(
@@ -4637,8 +4267,7 @@ mappings:
             let elapsed = started.elapsed();
             assert_eq!(resolution.resolved.len(), mappings);
 
-            // Every mapping still has to run, so the floor is whichever is
-            // larger: the slowest single mapping, or the total work spread
+            // Floor: the larger of the slowest mapping and total work spread
             // evenly across the window.
             let total_work = slow_delay.mul_f64(slow.len() as f64)
                 + fast_delay.mul_f64((mappings - slow.len()) as f64);
@@ -4653,13 +4282,9 @@ mappings:
         println!();
     }
 
-    /// How many round trips one repository's tag listing costs, with and
-    /// without asking for a page size.
-    ///
-    /// Both walks hit the same registry over the same tag set. This is the
-    /// evidence for not sending `n`: the request that asks for nothing gets
-    /// everything in one response, and the one that asks for a page size pays
-    /// per page. It reproduces what Docker Hub does with `library/python`.
+    /// Round trips for one repository's tag listing with and without a page
+    /// size: the evidence for not sending `n`, reproducing Docker Hub's
+    /// behaviour on `library/python`.
     #[tokio::test]
     #[ignore = "benchmark: counts round trips against a paginated mock registry"]
     async fn prepare_phase_benchmark_tag_list_pagination() {
@@ -4673,17 +4298,15 @@ mappings:
             .mount(&server)
             .await;
 
-        // What sending an explicit page size would cost: follow the pagination
-        // it creates, one round trip per page.
+        // Cost of an explicit page size: one round trip per page.
         let http = ocync_distribution::test_http_client();
         let mut url = format!("{}/v2/repo/paged/tags/list?n=1000", server.uri());
         let mut paged_tags = 0usize;
         loop {
             let resp = http.get(&url).send().await.expect("mock answers");
-            // The mock emits exactly one link-value, so the path is whatever
-            // sits between the angle brackets. The client's own parser is
-            // crate-private and stays that way: this baseline deliberately
-            // does not share code with the thing it is measuring.
+            // The mock emits one link-value: the path is between the angle
+            // brackets. Deliberately not the client's parser, which this
+            // baseline measures.
             let next = resp
                 .headers()
                 .get("link")

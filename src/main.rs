@@ -325,12 +325,11 @@ async fn main() -> std::process::ExitCode {
     }
     cli::setup_logging(&cli);
 
-    // Install signal handlers for graceful shutdown.
     let shutdown = cli::shutdown::ShutdownSignal::new();
     cli::shutdown::install_signal_handlers(shutdown.clone());
 
     let effective_verbosity = match &cli.command {
-        // Copy always shows per-image output -- users expect to see what was copied.
+        // Copy always shows per-image output.
         Commands::Copy(_) => cli.verbose.max(1),
         _ => cli.verbose,
     };
@@ -341,9 +340,8 @@ async fn main() -> std::process::ExitCode {
         Box::new(cli::progress::TextProgress::new(effective_verbosity))
     };
 
-    // Dry-run / log-emission verbose toggle: any -v level removes the sample
-    // cap. Distinct from `effective_verbosity` above which drives progress
-    // detail level.
+    // Any -v removes the dry-run sample cap; `effective_verbosity` drives
+    // progress detail instead.
     let verbose = cli.verbose >= 1;
     let result = match cli.command {
         Commands::Sync(args) => {
@@ -418,28 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_sync() {
-        let cli = Cli::parse_from(["ocync", "sync", "--config", "c.yaml"]);
-        assert!(matches!(cli.command, Commands::Sync(_)));
-    }
-
-    #[test]
-    fn parse_sync_dry_run() {
-        let cli = Cli::parse_from(["ocync", "sync", "--config", "c.yaml", "--dry-run"]);
-        if let Commands::Sync(args) = cli.command {
-            assert!(args.dry_run);
-        }
-    }
-
-    #[test]
-    fn parse_sync_json() {
-        let cli = Cli::parse_from(["ocync", "sync", "--config", "c.yaml", "--json"]);
-        if let Commands::Sync(args) = cli.command {
-            assert!(args.json);
-        }
-    }
-
-    #[test]
     fn parse_copy() {
         let cli = Cli::parse_from([
             "ocync",
@@ -448,12 +424,6 @@ mod tests {
             "ghcr.io/myorg/nginx:latest",
         ]);
         assert!(matches!(cli.command, Commands::Copy(_)));
-    }
-
-    #[test]
-    fn parse_copy_rejects_invalid_reference() {
-        let result = Cli::try_parse_from(["ocync", "copy", "", "dst"]);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -504,55 +474,68 @@ mod tests {
     }
 
     #[test]
-    fn verbose_and_quiet_conflict() {
-        let result = Cli::try_parse_from(["ocync", "-v", "-q", "sync", "--config", "c.yaml"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn sync_requires_config() {
-        let result = Cli::try_parse_from(["ocync", "sync"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn log_format_rejects_invalid() {
-        let result = Cli::try_parse_from([
-            "ocync",
-            "--log-format",
-            "garbage",
-            "sync",
-            "--config",
-            "c.yaml",
-        ]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_watch() {
-        let cli = Cli::parse_from(["ocync", "watch", "--config", "c.yaml"]);
-        if let Commands::Watch(args) = cli.command {
-            assert_eq!(args.interval, 300);
-        } else {
-            panic!("expected Watch command");
+    fn parse_sync_flags() {
+        let cases: [(&str, &[&str], bool, bool); 3] = [
+            ("plain", &[], false, false),
+            ("dry run", &["--dry-run"], true, false),
+            ("json", &["--json"], false, true),
+        ];
+        for (name, flags, want_dry_run, want_json) in cases {
+            let mut argv = vec!["ocync", "sync", "--config", "c.yaml"];
+            argv.extend(flags);
+            let Commands::Sync(args) = Cli::parse_from(argv).command else {
+                panic!("{name}: expected Sync command");
+            };
+            assert_eq!(args.dry_run, want_dry_run, "{name}");
+            assert_eq!(args.json, want_json, "{name}");
         }
     }
 
     #[test]
-    fn parse_watch_custom_interval() {
-        let cli = Cli::parse_from(["ocync", "watch", "--config", "c.yaml", "--interval", "60"]);
-        if let Commands::Watch(args) = cli.command {
-            assert_eq!(args.interval, 60);
-        } else {
-            panic!("expected Watch command");
+    fn parse_watch_interval() {
+        let cases: [(&str, &[&str], u64); 2] =
+            [("default", &[], 300), ("custom", &["--interval", "60"], 60)];
+        for (name, flags, want) in cases {
+            let mut argv = vec!["ocync", "watch", "--config", "c.yaml"];
+            argv.extend(flags);
+            let Commands::Watch(args) = Cli::parse_from(argv).command else {
+                panic!("{name}: expected Watch command");
+            };
+            assert_eq!(args.interval, want, "{name}");
         }
     }
 
     #[test]
-    fn watch_interval_zero_rejected() {
-        let result =
-            Cli::try_parse_from(["ocync", "watch", "--config", "c.yaml", "--interval", "0"]);
-        assert!(result.is_err());
+    fn invalid_invocations_are_rejected() {
+        let cases: [(&str, &[&str]); 5] = [
+            (
+                "copy with an empty reference",
+                &["ocync", "copy", "", "dst"],
+            ),
+            (
+                "verbose and quiet conflict",
+                &["ocync", "-v", "-q", "sync", "--config", "c.yaml"],
+            ),
+            ("sync requires config", &["ocync", "sync"]),
+            (
+                "unknown log format",
+                &[
+                    "ocync",
+                    "--log-format",
+                    "garbage",
+                    "sync",
+                    "--config",
+                    "c.yaml",
+                ],
+            ),
+            (
+                "zero watch interval",
+                &["ocync", "watch", "--config", "c.yaml", "--interval", "0"],
+            ),
+        ];
+        for (name, argv) in cases {
+            assert!(Cli::try_parse_from(argv).is_err(), "{name}");
+        }
     }
 
     #[test]

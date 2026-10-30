@@ -1,4 +1,4 @@
-//! The `version` subcommand - shows version and build information.
+//! The `version` subcommand: shows version and build information.
 
 use ocync_distribution::{CRYPTO_BUILD, CryptoBuild, TlsFips};
 

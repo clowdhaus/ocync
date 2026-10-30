@@ -2,10 +2,8 @@
 
 use std::time::Duration;
 
-/// Format a byte count as a human-readable string using SI decimal prefixes.
-///
-/// Matches the same SI convention as size parsing (1 KB = 1,000 bytes) so
-/// that parsed and displayed values round-trip consistently.
+/// Format a byte count with SI decimal prefixes (1 KB = 1,000 bytes), the
+/// convention of size parsing, so parsed and displayed values round-trip.
 pub(crate) fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1_000;
     const MB: u64 = 1_000_000;
@@ -25,12 +23,7 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Format a duration as a human-readable string.
-///
-/// - Sub-second: `"0.3s"`
-/// - Seconds: `"47s"`
-/// - Minutes+: `"2m 13s"`
-/// - Hours+: `"1h 30m"`
+/// Format a duration as `"0.3s"`, `"47s"`, `"2m 13s"` or `"1h 30m"`.
 pub(crate) fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs == 0 {
@@ -48,11 +41,10 @@ pub(crate) fn format_duration(d: Duration) -> String {
 
 /// Strip userinfo (username:password) from a URL for safe logging.
 pub(crate) fn redact_url(url: &str) -> String {
-    // Match pattern: scheme://user:pass@host...
     if let Some(scheme_end) = url.find("://") {
         let after_scheme = &url[scheme_end + 3..];
         if let Some(at_pos) = after_scheme.find('@') {
-            // Check there's no slash before the @, meaning it's actually userinfo
+            // An `@` after a slash is path content, not userinfo.
             if !after_scheme[..at_pos].contains('/') {
                 return format!(
                     "{}://***@{}",
@@ -72,107 +64,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_bytes_zero() {
-        assert_eq!(format_bytes(0), "0 B");
+    fn format_bytes_uses_si_prefixes() {
+        let cases = [
+            (0, "0 B"),
+            (512, "512 B"),
+            (1_000, "1.0 KB"),
+            (1_500, "1.5 KB"),
+            (1_000_000, "1.0 MB"),
+            (5_500_000, "5.5 MB"),
+            (1_000_000_000, "1.0 GB"),
+            (1_000_000_000_000, "1.0 TB"),
+            (5_500_000_000_000, "5.5 TB"),
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(format_bytes(bytes), want, "{bytes} bytes");
+        }
     }
 
     #[test]
-    fn format_bytes_bytes() {
-        assert_eq!(format_bytes(512), "512 B");
+    fn format_duration_picks_the_largest_units() {
+        let cases = [
+            (Duration::ZERO, "0.0s"),
+            (Duration::from_millis(300), "0.3s"),
+            (Duration::from_secs(5), "5s"),
+            (Duration::from_secs(47), "47s"),
+            (Duration::from_secs(60), "1m 0s"),
+            (Duration::from_secs(133), "2m 13s"),
+            (Duration::from_secs(3600), "1h 0m"),
+            (Duration::from_secs(3661), "1h 1m"),
+            (Duration::from_secs(7200), "2h 0m"),
+        ];
+        for (d, want) in cases {
+            assert_eq!(format_duration(d), want, "{d:?}");
+        }
     }
 
     #[test]
-    fn format_bytes_kb() {
-        assert_eq!(format_bytes(1_000), "1.0 KB");
-        assert_eq!(format_bytes(1_500), "1.5 KB");
-    }
-
-    #[test]
-    fn format_bytes_mb() {
-        assert_eq!(format_bytes(1_000_000), "1.0 MB");
-        assert_eq!(format_bytes(5_500_000), "5.5 MB");
-    }
-
-    #[test]
-    fn format_bytes_gb() {
-        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
-    }
-
-    #[test]
-    fn format_bytes_tb() {
-        assert_eq!(format_bytes(1_000_000_000_000), "1.0 TB");
-        assert_eq!(format_bytes(5_500_000_000_000), "5.5 TB");
-    }
-
-    #[test]
-    fn format_duration_sub_second() {
-        assert_eq!(format_duration(Duration::from_millis(300)), "0.3s");
-    }
-
-    #[test]
-    fn format_duration_seconds() {
-        assert_eq!(format_duration(Duration::from_secs(5)), "5s");
-        assert_eq!(format_duration(Duration::from_secs(47)), "47s");
-    }
-
-    #[test]
-    fn format_duration_minutes() {
-        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0s");
-        assert_eq!(format_duration(Duration::from_secs(133)), "2m 13s");
-    }
-
-    #[test]
-    fn format_duration_zero() {
-        assert_eq!(format_duration(Duration::ZERO), "0.0s");
-    }
-
-    #[test]
-    fn format_duration_hours() {
-        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 0m");
-        assert_eq!(format_duration(Duration::from_secs(3661)), "1h 1m");
-        assert_eq!(format_duration(Duration::from_secs(7200)), "2h 0m");
-    }
-
-    #[test]
-    fn redact_url_with_userinfo() {
-        assert_eq!(
-            redact_url("https://user:pass@registry.example.com/v2"),
-            "https://***@registry.example.com/v2"
-        );
-    }
-
-    #[test]
-    fn redact_url_username_only() {
-        assert_eq!(
-            redact_url("https://user@registry.example.com/v2"),
-            "https://***@registry.example.com/v2"
-        );
-    }
-
-    #[test]
-    fn redact_url_without_userinfo() {
-        assert_eq!(
-            redact_url("https://registry.example.com/v2"),
-            "https://registry.example.com/v2"
-        );
-    }
-
-    #[test]
-    fn redact_url_no_scheme() {
-        assert_eq!(redact_url("registry.example.com"), "registry.example.com");
-    }
-
-    #[test]
-    fn redact_url_at_in_path() {
-        // @ after a slash is path content, not userinfo
-        assert_eq!(
-            redact_url("https://registry.example.com/repo@sha256:abc"),
-            "https://registry.example.com/repo@sha256:abc"
-        );
-    }
-
-    #[test]
-    fn redact_url_empty() {
-        assert_eq!(redact_url(""), "");
+    fn redact_url_hides_only_userinfo() {
+        let cases = [
+            (
+                "user and password",
+                "https://user:pass@registry.example.com/v2",
+                "https://***@registry.example.com/v2",
+            ),
+            (
+                "username only",
+                "https://user@registry.example.com/v2",
+                "https://***@registry.example.com/v2",
+            ),
+            (
+                "no userinfo",
+                "https://registry.example.com/v2",
+                "https://registry.example.com/v2",
+            ),
+            ("no scheme", "registry.example.com", "registry.example.com"),
+            // An `@` after a slash is path content.
+            (
+                "at sign in path",
+                "https://registry.example.com/repo@sha256:abc",
+                "https://registry.example.com/repo@sha256:abc",
+            ),
+            ("empty", "", ""),
+        ];
+        for (name, url, want) in cases {
+            assert_eq!(redact_url(url), want, "{name}");
+        }
     }
 }

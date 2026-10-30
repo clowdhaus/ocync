@@ -1,4 +1,4 @@
-//! The `copy` subcommand - copies a single image between registries.
+//! The `copy` subcommand: copies a single image between registries.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -22,10 +22,8 @@ use crate::cli::{
     CliError, ExitCode, Registry, RunCredentials, bare_hostname, build_registry_client,
 };
 
-/// Run the copy command: transfer a single image from source to destination.
-///
-/// The `shutdown` signal, if provided, will be forwarded to the engine for
-/// graceful drain on SIGINT/SIGTERM.
+/// Transfer a single image from source to destination; `shutdown`, if given,
+/// is forwarded to the engine for a graceful drain.
 pub(crate) async fn run(
     args: &CopyArgs,
     progress: &dyn ocync_sync::progress::ProgressReporter,
@@ -37,7 +35,7 @@ pub(crate) async fn run(
         .ok_or_else(|| CliError::Input(format!("source '{}' has no tag", args.source)))?;
     let dst_tag = args.destination.tag().unwrap_or(src_tag);
 
-    // Resolve auth settings from config if provided, otherwise use auto-detection.
+    // Without `--config`, auth is auto-detected.
     let registries = if let Some(ref config_path) = args.config {
         let config = load_config(config_path)?;
         config.registries.into_values().collect::<Vec<_>>()
@@ -56,15 +54,10 @@ pub(crate) async fn run(
         .registry_authority()
         .map_err(|e| CliError::Input(format!("source '{}': {e}", args.source)))?;
 
-    // Build an ECR batch checker for the destination when applicable. Without
-    // this, single-image copy falls back to per-blob HEAD against ECR, whose
-    // HEAD returns false-positive 200s under concurrency; only
-    // `BatchCheckLayerAvailability` is authoritative.
-    //
-    // Resolution: an explicit non-Ecr `auth_type` in registry config is a
-    // hard opt-out -- the user has told us this destination is not ECR even
-    // though the hostname pattern matches. Only fall through to hostname
-    // detection when no `auth_type` is set.
+    // ECR batch checker for the destination: ECR's per-blob HEAD returns
+    // false-positive 200s under concurrency; only `BatchCheckLayerAvailability`
+    // is authoritative. An explicit non-ECR `auth_type` is a hard opt-out even
+    // when the hostname matches; hostname detection applies only without one.
     let dst_hostname = bare_hostname(args.destination.registry());
     let dst_is_ecr = match dst_reg_config.and_then(|r| r.auth_type.as_ref()) {
         Some(AuthType::Ecr) => true,
@@ -79,16 +72,8 @@ pub(crate) async fn run(
         None
     };
 
-    // head_first is a source-side optimization: HEAD-check the target
-    // before pulling the source manifest, skipping the source GET when
-    // the destination already holds the same digest. Defined on the
-    // source registry's config because the optimization conserves the
-    // source registry's rate-limit budget; applies to both `sync` and
-    // `copy` because the savings shape is the same.
-    //
-    // When `--config` is not supplied (one-shot copy by image ref) the
-    // default is false -- no per-invocation override flag yet; see
-    // RegistryConfig::head_first for the field doc.
+    // Read from the source registry's config because it conserves the source's
+    // rate-limit budget. False without `--config`: there is no override flag.
     let head_first = source.config().map(|r| r.head_first).unwrap_or(false);
 
     let mapping = ResolvedMapping {
@@ -116,7 +101,7 @@ pub(crate) async fn run(
 
     let engine = SyncEngine::new(RetryConfig::default(), DEFAULT_MAX_CONCURRENT_TRANSFERS);
     let cache = Rc::new(RefCell::new(TransferStateCache::new()));
-    // Single-target copy: staging is not needed.
+    // A single target needs no staging.
     let staging = BlobStage::disabled();
     let report = engine
         .run(vec![mapping], cache, staging, progress, shutdown)
