@@ -681,7 +681,7 @@ struct PromoteContext<'a> {
 ///
 /// Per-target `RegistryClient::blob_upload_sem` caps long-lived HTTP/2 blob
 /// streams at 64 (registries advertise `SETTINGS_MAX_CONCURRENT_STREAMS` of
-/// 100-128, less metadata headroom). With [`BLOB_CONCURRENCY`] = 6 per image,
+/// 100-128, less metadata headroom). With `BLOB_CONCURRENCY` = 6 per image,
 /// 10 images gives 10 * 6 = 60 streams at saturation, inside that budget.
 /// A cap of 50 (300 streams) deadlocks HTTP/2 against every registry probed
 /// (see `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution`). A higher
@@ -792,7 +792,7 @@ impl SyncEngine {
     /// futures drain it, bounded by a semaphore.
     ///
     /// `staging` enables disk-based blob reuse for multi-target mappings; pass
-    /// [`BlobStage::disabled`] for single-target runs to pay zero overhead.
+    /// `BlobStage::disabled` for single-target runs to pay zero overhead.
     ///
     /// If `shutdown` is `Some`, the engine stops accepting new work when the
     /// signal fires, drains in-flight transfers up to the drain deadline

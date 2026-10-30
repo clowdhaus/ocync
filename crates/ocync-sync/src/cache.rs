@@ -1,4 +1,4 @@
-//! Persistent transfer state cache wrapping [`BlobDedupMap`], so a later run
+//! Persistent transfer state cache wrapping `BlobDedupMap`, so a later run
 //! can skip HEAD checks for blobs already known to exist at a target.
 //!
 //! # Binary format

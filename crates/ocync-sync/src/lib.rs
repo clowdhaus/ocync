@@ -7,7 +7,7 @@
     )
 )]
 
-/// Persistent transfer state cache wrapping [`plan::BlobDedupMap`].
+/// Persistent transfer state cache wrapping `plan::BlobDedupMap`.
 pub mod cache;
 /// Sync engine: pipelined concurrent orchestration of image transfers.
 pub mod engine;

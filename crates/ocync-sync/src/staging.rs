@@ -1,6 +1,6 @@
 //! Content-addressable disk staging for multi-target blob reuse: each blob is
 //! pulled from the source once, written here, and read from this file by every
-//! target push. [`BlobStage::disabled`] makes every operation a no-op for
+//! target push. `BlobStage::disabled` makes every operation a no-op for
 //! single-target runs.
 //!
 //! # File layout
@@ -13,7 +13,7 @@
 //!
 //! Writes go to a `{digest}.tmp.{pid}.{seq}` file, are fsynced and renamed into
 //! place, then the directory is fsynced, so an incomplete write is never
-//! visible as a staged blob. [`BlobStage::cleanup_tmp_files`] removes orphans
+//! visible as a staged blob. `BlobStage::cleanup_tmp_files` removes orphans
 //! left by a crash.
 
 use std::cell::RefCell;
