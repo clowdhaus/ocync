@@ -9,13 +9,7 @@ use std::io;
 use ocync_distribution::Digest;
 use ocync_sync::staging::BlobStage;
 
-use digests::{digest_a, digest_b};
-
-const DIGEST_C: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-fn digest_c() -> Digest {
-    DIGEST_C.parse().unwrap()
-}
+use digests::{digest_a, digest_b, digest_c};
 
 fn stage_blob(stage: &BlobStage, digest: &Digest, data: &[u8]) {
     let mut writer = stage.begin_write(digest).unwrap();

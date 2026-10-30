@@ -136,10 +136,11 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
         )
         .await;
 
-    // A 60s blob that completed would sync the image: the deadline must cut it.
-    assert_eq!(
-        report.stats.images_synced, 0,
-        "the drain deadline should abandon the stuck transfer"
+    // An abandoned image has no result; one that failed or synced would.
+    assert!(
+        report.images.is_empty(),
+        "the drain deadline should abandon the stuck transfer: {:?}",
+        report.images
     );
 }
 
@@ -154,6 +155,7 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
     let engine =
         SyncEngine::new(fast_retry(), concurrency(50)).with_drain_deadline(Duration::from_secs(1));
 
+    let started = std::time::Instant::now();
     let report = pull
         .run_shutting_down_in_flight(
             engine.run(
@@ -167,9 +169,15 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
         )
         .await;
 
-    assert_eq!(
-        report.stats.images_synced, 0,
-        "no images should succeed when drain deadline expires before blob transfer"
+    assert!(
+        report.images.is_empty(),
+        "the 1s deadline should abandon the 3s transfer: {:?}",
+        report.images
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "abandoned before the deadline: {:?}",
+        started.elapsed()
     );
 }
 

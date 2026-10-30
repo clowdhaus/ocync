@@ -219,16 +219,19 @@ fn transient_blobs_are_not_persisted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.bin");
 
+        // A transient state reads as absent even in a live cache, so only an
+        // empty load proves it was not written.
         let mut cache = TransferStateCache::new();
         mark_transient(&mut cache);
-        cache.set_blob_completed("reg.io", digest_b(), repo("repo/b"));
         cache.persist(&path).unwrap();
-
-        let loaded = TransferStateCache::load(&path, long_ttl());
         assert!(
-            !loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+            TransferStateCache::load(&path, long_ttl()).is_empty(),
             "{name} blob should not be persisted"
         );
+
+        cache.set_blob_completed("reg.io", digest_b(), repo("repo/b"));
+        cache.persist(&path).unwrap();
+        let loaded = TransferStateCache::load(&path, long_ttl());
         assert!(
             loaded.blob_present_at("reg.io", &digest_b(), &repo("repo/b")),
             "{name}: the completed blob should survive persist"

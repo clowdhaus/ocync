@@ -13,6 +13,7 @@ pub fn make_digest(suffix: &str) -> Digest {
 
 const DIGEST_A: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const DIGEST_B: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const DIGEST_C: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 /// The digest of the empty blob.
 pub fn digest_a() -> Digest {
@@ -22,6 +23,11 @@ pub fn digest_a() -> Digest {
 /// A digest unequal to [`digest_a`].
 pub fn digest_b() -> Digest {
     DIGEST_B.parse().unwrap()
+}
+
+/// A digest unequal to [`digest_a`] and [`digest_b`].
+pub fn digest_c() -> Digest {
+    DIGEST_C.parse().unwrap()
 }
 
 /// A repository name that must be valid.

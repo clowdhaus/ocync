@@ -131,7 +131,9 @@ pub async fn run_with_shutdown_at<T: std::fmt::Debug>(
                 std::time::Instant::now() < give_up,
                 "the server never received {want} requests to trigger shutdown on"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // Yield rather than sleep: an idle runtime lets a paused clock jump
+            // to the engine's next timeout while real requests are in flight.
+            tokio::task::yield_now().await;
         }
         shutdown.trigger();
         std::future::pending::<()>().await;

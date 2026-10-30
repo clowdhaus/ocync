@@ -16,7 +16,7 @@ use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
 use ocync_sync::engine::TargetEntry;
 use wiremock::http::Method;
 use wiremock::matchers::{method, path, query_param};
-use wiremock::{Mock, MockBuilder, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockBuilder, MockServer, Request, ResponseTemplate};
 
 use super::fixtures::target_entry;
 
@@ -257,35 +257,38 @@ impl PathMatch<'_> {
     }
 }
 
+/// Requests `server` received that satisfy `pred`.
+async fn count_matching(server: &MockServer, pred: impl Fn(&Request) -> bool) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| pred(r))
+        .count()
+}
+
 /// Requests `server` received, of `verb` when given, whose path satisfies `path`.
 pub async fn count_requests(
     server: &MockServer,
     verb: Option<&Method>,
     path: PathMatch<'_>,
 ) -> usize {
-    server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|r| verb.is_none_or(|v| r.method == *v) && path.matches(r.url.path()))
-        .count()
+    count_matching(server, |r| {
+        verb.is_none_or(|v| r.method == *v) && path.matches(r.url.path())
+    })
+    .await
 }
 
 /// Cross-repo mount POSTs (blob upload initiations carrying a `mount` query)
 /// that `server` received.
 pub async fn count_mount_posts(server: &MockServer) -> usize {
-    server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|r| {
-            r.method == Method::POST
-                && r.url.path().ends_with("/blobs/uploads/")
-                && r.url.query_pairs().any(|(k, _)| k == "mount")
-        })
-        .count()
+    count_matching(server, |r| {
+        r.method == Method::POST
+            && r.url.path().ends_with("/blobs/uploads/")
+            && r.url.query_pairs().any(|(k, _)| k == "mount")
+    })
+    .await
 }
 
 /// Blob upload finalizations (PUT) of `digest` that `server` received on a
@@ -296,17 +299,12 @@ pub async fn count_blob_uploads(
     path: PathMatch<'_>,
     digest: &Digest,
 ) -> usize {
-    server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|r| {
-            r.method == Method::PUT
-                && path.matches(r.url.path())
-                && r.url.query().is_some_and(|q| q.contains(digest.hex()))
-        })
-        .count()
+    count_matching(server, |r| {
+        r.method == Method::PUT
+            && path.matches(r.url.path())
+            && r.url.query().is_some_and(|q| q.contains(digest.hex()))
+    })
+    .await
 }
 
 /// How many times a checker was asked, shared with the test.

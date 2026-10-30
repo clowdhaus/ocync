@@ -292,6 +292,15 @@ async fn discovery_skips_without_source_get() {
     }
 }
 
+/// What the source snapshot holds after a run.
+#[derive(Clone, Copy)]
+enum Snapshot {
+    /// The digest the run pulled.
+    Pulled,
+    /// Nothing.
+    Absent,
+}
+
 /// Every way discovery can fail to confirm the target falls back to one source
 /// GET and a full push.
 #[tokio::test]
@@ -302,9 +311,9 @@ async fn discovery_falls_through_to_full_pull() {
         seed: Seed,
         target_heads: u64,
         want: Discovery,
-        /// Whether the snapshot holds the pulled digest afterwards (a failed
-        /// source HEAD must not invent one).
-        snapshot: bool,
+        /// What the snapshot holds afterwards (a failed source HEAD must not
+        /// invent a digest).
+        snapshot: Snapshot,
     }
     let parts = image("pull");
     let cases = [
@@ -314,7 +323,7 @@ async fn discovery_falls_through_to_full_pull() {
             seed: Seed::Cold,
             target_heads: 1,
             want: MISS,
-            snapshot: true,
+            snapshot: Snapshot::Pulled,
         },
         Case {
             name: "source digest changed since the snapshot: a miss, not a head failure",
@@ -322,7 +331,7 @@ async fn discovery_falls_through_to_full_pull() {
             seed: Seed::OldDigest,
             target_heads: 1,
             want: MISS,
-            snapshot: true,
+            snapshot: Snapshot::Pulled,
         },
         Case {
             name: "target stale: discovery and the pre-push check both HEAD the target",
@@ -333,7 +342,7 @@ async fn discovery_falls_through_to_full_pull() {
                 target_stale: 1,
                 ..MISS
             },
-            snapshot: true,
+            snapshot: Snapshot::Pulled,
         },
         Case {
             name: "source HEAD 500",
@@ -344,7 +353,7 @@ async fn discovery_falls_through_to_full_pull() {
                 head_failures: 1,
                 ..MISS
             },
-            snapshot: false,
+            snapshot: Snapshot::Absent,
         },
         Case {
             name: "source HEAD 404 is no usable digest",
@@ -355,7 +364,7 @@ async fn discovery_falls_through_to_full_pull() {
                 head_failures: 1,
                 ..MISS
             },
-            snapshot: false,
+            snapshot: Snapshot::Absent,
         },
         Case {
             name: "source HEAD times out",
@@ -366,7 +375,7 @@ async fn discovery_falls_through_to_full_pull() {
                 head_failures: 1,
                 ..MISS
             },
-            snapshot: false,
+            snapshot: Snapshot::Absent,
         },
         Case {
             name: "source HEAD 500 must not fall back to a valid snapshot",
@@ -377,7 +386,7 @@ async fn discovery_falls_through_to_full_pull() {
                 head_failures: 1,
                 ..MISS
             },
-            snapshot: true,
+            snapshot: Snapshot::Pulled,
         },
     ];
 
@@ -419,7 +428,7 @@ async fn discovery_falls_through_to_full_pull() {
             .map(|s| s.source_digest.clone());
         assert_eq!(
             snapshot,
-            c.snapshot.then(|| parts.digest.clone()),
+            matches!(c.snapshot, Snapshot::Pulled).then(|| parts.digest.clone()),
             "{}",
             c.name
         );

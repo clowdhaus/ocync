@@ -494,9 +494,7 @@ async fn artifact_refused_for_a_lost_blob_is_repaired_in_the_same_run() {
     let sig_manifest = format!("/v2/repo/manifests/{}", sig.digest);
     Mock::given(method("PUT"))
         .and(path(sig_manifest.as_str()))
-        .respond_with(ResponseTemplate::new(400).set_body_string(
-            r#"{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#,
-        ))
+        .respond_with(ResponseTemplate::new(400).set_body_string(MANIFEST_BLOB_UNKNOWN))
         .up_to_n_times(1)
         .mount(&target_server)
         .await;

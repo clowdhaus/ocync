@@ -19,6 +19,11 @@ use wiremock::MockServer;
 
 use super::digests::repo;
 
+/// The answer refusing a manifest because the registry lacks a blob it
+/// references.
+pub const MANIFEST_BLOB_UNKNOWN: &str =
+    r#"{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#;
+
 /// The base URL of `server`.
 pub fn mock_url(server: &MockServer) -> Url {
     Url::parse(&server.uri()).unwrap()

@@ -143,7 +143,8 @@ impl ManifestParts {
 
     /// As [`mount_blob_pulls`](Self::mount_blob_pulls), but each blob must be
     /// requested exactly `pulls` times. `row` names the table row in a failed
-    /// expectation.
+    /// expectation. The blobs must have distinct digests: wiremock answers a
+    /// shared digest from the first matching mock only.
     pub async fn mount_blob_pulls_expecting(
         &self,
         server: &MockServer,
@@ -368,7 +369,8 @@ impl IndexParts {
 
     /// As [`mount_source`](Self::mount_source), but the index must be pulled
     /// exactly once and child `i` (manifest and blobs) `child_pulls[i]` times.
-    /// `row` names the table row in a failed expectation.
+    /// `row` names the table row in a failed expectation. Children must not
+    /// share a blob: wiremock answers it from the first matching mock only.
     pub async fn mount_source_expecting(
         &self,
         server: &MockServer,

@@ -849,11 +849,6 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
     assert_eq!(report.stats.bytes_transferred, layer_data.len() as u64);
 }
 
-/// The answer refusing a manifest because the registry lacks a blob it
-/// references.
-const MANIFEST_BLOB_UNKNOWN: &str =
-    r#"{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#;
-
 /// What the batch check answers about the blobs an earlier run cached.
 #[derive(Clone, Copy, Debug)]
 enum BatchAnswer {
