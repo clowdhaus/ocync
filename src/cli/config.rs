@@ -187,17 +187,6 @@ fn default_max_concurrent_transfers() -> NonZeroUsize {
     ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS
 }
 
-impl Default for GlobalConfig {
-    fn default() -> Self {
-        Self {
-            max_concurrent_transfers: default_max_concurrent_transfers(),
-            cache_dir: None,
-            cache_ttl: None,
-            staging_size_limit: None,
-        }
-    }
-}
-
 /// Authentication method for a registry.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
