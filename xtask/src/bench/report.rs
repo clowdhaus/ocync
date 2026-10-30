@@ -42,8 +42,9 @@ pub(crate) struct RunRecord {
     ///
     /// dregsy transfers nothing itself, so skopeo's version moves dregsy's
     /// numbers. Recorded here rather than only in the per-run summary, which
-    /// is not tracked in git and dies with the instance.
-    #[serde(default)]
+    /// is not tracked in git and dies with the instance. Absent when none was
+    /// recorded, which is not the same as no relay used.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) relays: BTreeMap<String, String>,
     /// Corpus size context.
     pub(crate) corpus: CorpusInfo,
@@ -71,16 +72,17 @@ pub(crate) struct MachineInfo {
     /// Cloud region (e.g. `us-east-1`).
     pub(crate) region: String,
     /// Machine image the instance booted (e.g. `ami-0742fcde83639b335`), or
-    /// `"unknown"` outside a cloud instance.
+    /// `"unknown"` when a live run could not read it. Absent from records
+    /// written before the field existed.
     ///
     /// The image carries the kernel, glibc and NIC driver, so two runs on
     /// different images are not directly comparable however identical the rest
     /// of the metadata looks.
-    #[serde(default = "unknown_string")]
-    pub(crate) image_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) image_id: Option<String>,
 }
 
-/// Default for record fields added after runs were already archived.
+/// The value recorded for instance metadata a live run could not read.
 fn unknown_string() -> String {
     "unknown".to_string()
 }
@@ -1128,7 +1130,7 @@ mod tests {
                 memory_gib: 32.0,
                 network: "Up to 50 Gigabit".into(),
                 region: "us-east-1".into(),
-                image_id: "unknown".into(),
+                image_id: None,
             },
             relays: BTreeMap::new(),
             corpus: CorpusInfo {
@@ -1206,6 +1208,42 @@ mod tests {
     }
 
     #[test]
+    fn a_record_without_relays_or_image_rewrites_byte_identical() {
+        // Catches: rewriting an old record with `"relays":{}` or
+        // `"image_id":"unknown"`, which read as "no relay used" and "image
+        // unreadable" for runs that recorded neither.
+        let old = concat!(
+            r#"{"timestamp":"2026-04-18-021040","git_ref":"d121864","#,
+            r#""machine":{"instance_type":"c6in.4xlarge","arch":"x86_64","vcpus":16,"#,
+            r#""memory_gib":32.0,"network":"n","region":"us-east-1"},"#,
+            r#""corpus":{"images":1,"tags":1},"scenarios":[]}"#,
+        );
+        let record: RunRecord = serde_json::from_str(old).unwrap();
+        assert!(record.relays.is_empty());
+        assert_eq!(record.machine.image_id, None);
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+    }
+
+    #[test]
+    fn recorded_relays_and_image_are_written() {
+        // Catches: the skip dropping a value a run did record.
+        let mut record: RunRecord = serde_json::from_str(
+            r#"{"timestamp":"t","git_ref":"g","machine":{"instance_type":"i","arch":"a",
+            "vcpus":1,"memory_gib":1.0,"network":"n","region":"r"},
+            "corpus":{"images":1,"tags":1},"scenarios":[]}"#,
+        )
+        .unwrap();
+        record.relays.insert("skopeo".into(), "1.0".into());
+        record.machine.image_id = Some("unknown".into());
+        let written = serde_json::to_string(&record).unwrap();
+        assert!(
+            written.contains(r#""relays":{"skopeo":"1.0"}"#),
+            "{written}"
+        );
+        assert!(written.contains(r#""image_id":"unknown""#), "{written}");
+    }
+
+    #[test]
     fn append_record_creates_new_file() {
         let dir = tempfile::tempdir().unwrap();
         let record = RunRecord {
@@ -1220,7 +1258,7 @@ mod tests {
                 memory_gib: 32.0,
                 network: "Up to 50 Gigabit".into(),
                 region: "us-east-1".into(),
-                image_id: "unknown".into(),
+                image_id: None,
             },
             relays: BTreeMap::new(),
             corpus: CorpusInfo {
@@ -1257,7 +1295,7 @@ mod tests {
                 memory_gib: 8.0,
                 network: "Up to 12.5 Gigabit".into(),
                 region: "us-east-1".into(),
-                image_id: "unknown".into(),
+                image_id: None,
             },
             relays: BTreeMap::new(),
             corpus: CorpusInfo { images: 5, tags: 8 },
@@ -1289,7 +1327,7 @@ mod tests {
                 memory_gib: 0.0,
                 network: "unknown".into(),
                 region: "unknown".into(),
-                image_id: "unknown".into(),
+                image_id: None,
             },
             relays: BTreeMap::new(),
             corpus: CorpusInfo { images: 0, tags: 0 },
